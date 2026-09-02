@@ -30,6 +30,17 @@ from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
+    CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
+    CutlassW4A16Config,
+    CutlassW4A8Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -38,15 +49,28 @@ from .api import (
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
-    CuteDslNvfp4Runner,
+    CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
+    CutlassW4A16Runner,
+    CutlassW4A8Runner,
+    CuTileBf16Runner,
+    CuTileNvfp4Runner,
+    CuteDslRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -55,22 +79,46 @@ from .utils import map_to_hybrid_bucket
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
-    CuteDslNvfp4Runner,
+    CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
+    CutlassW4A16Runner,
+    CutlassW4A8Runner,
+    CuTileBf16Runner,
+    CuTileNvfp4Runner,
+    CuteDslRunner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
 ]
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
-    CuteDslConfig: CuteDslNvfp4Runner,
+    CutlassBf16Config: CutlassBf16Runner,
+    CutlassFp8BlockConfig: CutlassFp8BlockRunner,
+    CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
+    CutlassHummingConfig: CutlassHummingRunner,
+    CutlassMxfp8Config: CutlassMxfp8Runner,
+    CutlassMxfp8Mxfp4Config: CutlassMxfp8Mxfp4Runner,
+    CutlassNvfp4Config: CutlassNvfp4Runner,
+    CutlassW4A16Config: CutlassW4A16Runner,
+    CutlassW4A8Config: CutlassW4A8Runner,
+    CuTileBf16Config: CuTileBf16Runner,
+    CuTileNvfp4Config: CuTileNvfp4Runner,
+    CuteDslConfig: CuteDslRunner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorConfig: TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
@@ -79,12 +127,11 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
 class MoELayer:
     """Stateful MoE layer with cross-backend autotune.
 
-    Not thread-safe: the layer and its runners follow the autotuner's
-    sequential ``pack_inputs -> forward`` contract and stash per-call launch
-    state on the runner (``_static_kwargs``) between the two steps, so
-    concurrent calls on one instance can interleave that state. Use one
-    ``MoELayer`` per thread/stream; a stateless calling convention is a
-    tracked follow-up.
+    TRTLLM runners bind their immutable launch metadata to each packed input
+    list, so interleaved ``pack_inputs -> forward`` pairs cannot exchange
+    weights or routing configuration. Other backend adapters may still retain
+    per-call workspace or prepared-weight state; use one ``MoELayer`` per
+    thread/stream until those adapters adopt the same convention.
 
     Example
     -------
@@ -108,20 +155,60 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            runner = runner_cls(config, device=self.device)
+            if config.quant.variant not in runner_cls.supported_quant_variants:
+                continue
             try:
+                # Construction is inside the guard because a runner may reject an
+                # unsupported config while binding backend resources; letting that
+                # escape would abort selection instead of skipping the backend.
+                runner = runner_cls(config, device=self.device)
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
+            runner.build()
             self.runners.append(runner)
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
+            # Show all shared-expert runners so a mismatched config or arch
+            # does not produce an empty hint.
+            hint = ""
+            if config.experts.num_fused_shared_experts > 0:
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_fused_shared_experts
+                )
+                hint = (
+                    f" Note num_fused_shared_experts="
+                    f"{config.experts.num_fused_shared_experts}: fused shared "
+                    f"experts are implemented only by [{supporting}], which must "
+                    f"also be configured and supported on this arch."
+                )
+            local_num_experts = (
+                config.experts.local_num_experts or config.routing.num_experts
+            )
+            if config.experts.local_expert_offset != 0 or (
+                local_num_experts != config.routing.num_experts
+            ):
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_expert_parallelism
+                )
+                hint += (
+                    f" Note the config is an expert-parallel shard "
+                    f"(local_expert_offset={config.experts.local_expert_offset}, "
+                    f"local_num_experts={local_num_experts} of "
+                    f"{config.routing.num_experts}): expert parallelism is "
+                    f"implemented only by [{supporting}], which must also be "
+                    f"configured and supported on this arch."
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
-                f"runners: [{mvp}]."
+                f"runners: [{mvp}].{hint}"
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
@@ -138,7 +225,7 @@ class MoELayer:
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(
@@ -170,7 +257,11 @@ class MoELayer:
         self._last_winner_backend = runner.backend_key
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        return runner.forward(inputs, tactic=tactic)
+        return runner.forward(
+            inputs,
+            tactic=tactic,
+            **runner.launch_kwargs_for(inputs),
+        )
 
     def _select_winner(
         self,
@@ -192,12 +283,14 @@ class MoELayer:
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
+            launch_kwargs = runner.launch_kwargs_for(inputs)
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
-                tuning_config=runner.tuning_config,
+                tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
+                **launch_kwargs,
             )
             # Measure runner at its winning tactic.  Use CUDA-graph timing so
             # the cross-backend comparison reflects production (graph-captured)
@@ -206,7 +299,9 @@ class MoELayer:
             # by that overhead and picks the wrong backend.  Requires a warmed-up
             # layer (the autotune pass above), not a cold capture.
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic: r.forward(i, tactic=t),
+                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
+                    i, tactic=t, **kw
+                ),
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,

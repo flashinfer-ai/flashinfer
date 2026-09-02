@@ -39,9 +39,11 @@ from cutlass import Float32, Int32, Int64, Uint32, Uint64, Uint8
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
+
 from ..api_logging import flashinfer_api
 from ..trace.templates.norm import add_rmsnorm_fp4quant_trace_dispatch
-from ..utils import device_support_pdl
+from ..utils import device_support_pdl, last_positive_power_of_2
 from .fp4_common import (
     # Constants
     FLOAT4_E2M1_MAX,
@@ -52,6 +54,8 @@ from .fp4_common import (
     # PTX intrinsics - basic ops
     st_global_u64,
     get_ptr_as_int64,
+    get_smem_ptr_as_int32,
+    ld_shared_v4_u32,
     rcp_approx_ftz,
     fmin_f32,
     fmax_f32,
@@ -84,6 +88,31 @@ from .fp4_common import (
     load_f32_16_from_smem,
     compute_y_and_max_abs_f32,
 )
+
+
+@cute.jit
+def _load_8_half2_from_smem(
+    sX: cute.Tensor,
+    sW: cute.Tensor,
+    row_idx: Int32,
+    col_offset: Int32,
+    row_stride: int,
+):
+    """Load 16 packed fp16/bf16 values from each shared-memory tile."""
+    x_h2 = cute.make_rmem_tensor((8,), Uint32)
+    w_h2 = cute.make_rmem_tensor((8,), Uint32)
+    base = row_idx * row_stride + col_offset
+
+    x_addr0 = get_smem_ptr_as_int32(sX, base)
+    x_addr1 = get_smem_ptr_as_int32(sX, base + Int32(8))
+    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = ld_shared_v4_u32(x_addr0)
+    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = ld_shared_v4_u32(x_addr1)
+
+    w_addr0 = get_smem_ptr_as_int32(sW, base)
+    w_addr1 = get_smem_ptr_as_int32(sW, base + Int32(8))
+    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_shared_v4_u32(w_addr0)
+    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_shared_v4_u32(w_addr1)
+    return x_h2, w_h2
 
 
 # =============================================================================
@@ -176,6 +205,7 @@ class AddRMSNormFP4QuantKernel:
         scale_format: str | None = None,
         output_both_sf_layouts: bool = False,
         output_norm: bool = False,
+        launch_config: tuple[int, int, int] | None = None,
     ):
         self.dtype = dtype
         self.H = H
@@ -196,11 +226,17 @@ class AddRMSNormFP4QuantKernel:
             "scale_format must be 'e4m3' or 'ue8m0'"
         )
 
-        self.cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
-        self.H_per_cta = H // self.cluster_n
+        if launch_config is None:
+            cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
+            H_per_cta = H // cluster_n
+            launch_config = (
+                cluster_n,
+                self._compute_threads_per_row(H_per_cta),
+                self._compute_num_threads(H_per_cta),
+            )
 
-        self.threads_per_row = self._compute_threads_per_row(self.H_per_cta)
-        self.num_threads = self._compute_num_threads(self.H_per_cta)
+        self.cluster_n, self.threads_per_row, self.num_threads = launch_config
+        self.H_per_cta = H // self.cluster_n
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
 
@@ -267,6 +303,51 @@ class AddRMSNormFP4QuantKernel:
     def _compute_num_threads(H_per_cta: int) -> int:
         """Compute total threads per block."""
         return 128 if H_per_cta <= 16384 else 256
+
+    @staticmethod
+    def _compute_sm100_sm103_launch_config(
+        H_per_cta: int,
+        M: int,
+    ) -> tuple[int, int]:
+        """Select the measured GB200/GB300 launch config."""
+        kernel = AddRMSNormFP4QuantKernel
+        threads_per_row = kernel._compute_threads_per_row(H_per_cta)
+        num_threads = kernel._compute_num_threads(H_per_cta)
+
+        # The optimal launch config depends on both H and M.
+        if H_per_cta >= 8192:
+            return 256, 256
+        if H_per_cta < 2048 or H_per_cta * M < (1 << 22):
+            return threads_per_row, num_threads
+
+        # Four FP16/BF16 tiles fit in a 96 KiB shared-memory budget.
+        max_rows = max(1, (3 << 12) // H_per_cta)
+        rows_per_block = last_positive_power_of_2(max_rows)
+        if rows_per_block > 1:
+            return 256 // rows_per_block, 256
+
+        return threads_per_row, num_threads
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1024)
+    def _compute_launch_config(
+        H: int,
+        M: int,
+        dtype: cutlass.Numeric,
+        sm_version: int,
+    ) -> tuple[int, int, int]:
+        """Compute a launch config while preserving the original fallback."""
+        kernel = AddRMSNormFP4QuantKernel
+        cluster_n = kernel._compute_cluster_n(H, dtype, sm_version)
+        H_per_cta = H // cluster_n
+
+        if sm_version in (100, 103):
+            config = kernel._compute_sm100_sm103_launch_config(H_per_cta, M)
+            return cluster_n, *config
+
+        threads_per_row = kernel._compute_threads_per_row(H_per_cta)
+        num_threads = kernel._compute_num_threads(H_per_cta)
+        return cluster_n, threads_per_row, num_threads
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
@@ -650,9 +731,19 @@ class AddRMSNormFP4QuantKernel:
 
                     if cutlass.const_expr(block_size == 16):
                         if cutlass.const_expr(cluster_n == 1):
-                            # Shared memory path - use helper functions
-                            h_f32 = load_f32_16_from_smem(sH, row_in_block, block_start)
-                            w_f32 = load_f32_16_from_smem(sW, row_in_block, block_start)
+                            h_h2, w_h2 = _load_8_half2_from_smem(
+                                sH,
+                                sW,
+                                row_in_block,
+                                block_start,
+                                self.cols_per_tile,
+                            )
+                            if cutlass.const_expr(is_fp16):
+                                h_f32 = half2_to_float16(h_h2, Float32(1.0))
+                                w_f32 = half2_to_float16(w_h2, Float32(1.0))
+                            else:
+                                h_f32 = bfloat2_to_float16(h_h2, Float32(1.0))
+                                w_f32 = bfloat2_to_float16(w_h2, Float32(1.0))
                             y_f32, max_abs = compute_y_and_max_abs_f32(
                                 h_f32, w_f32, rstd
                             )
@@ -1044,6 +1135,7 @@ def _get_compiled_kernel(
     sm_version: int,
     scale_format: str,
     is_sf_swizzled_layout: bool,
+    launch_config: tuple[int, int, int],
     output_both_sf_layouts: bool = False,
     enable_pdl: bool = False,
     output_norm: bool = False,
@@ -1059,6 +1151,7 @@ def _get_compiled_kernel(
         dtype=cutlass_dtype,
         H=hidden_size,
         block_size=block_size,
+        launch_config=launch_config,
         output_swizzled=is_sf_swizzled_layout,
         is_fp16=is_fp16,
         sm_version=sm_version,
@@ -1320,6 +1413,7 @@ def add_rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    _require_cute_dsl_arch_for(input.device)
     is_3d = input.dim() == 3
     if is_3d:
         B, S, H = input.shape
@@ -1447,6 +1541,13 @@ def add_rmsnorm_fp4quant(
         # output_norm=False (the store is compiled out).
         y_norm_arg = weight_contig
 
+    # Cache the M-selected config instead of M to avoid compiling for every batch size.
+    launch_config = AddRMSNormFP4QuantKernel._compute_launch_config(
+        hidden_size,
+        batch_size,
+        cutlass.Float16 if is_fp16 else cutlass.BFloat16,
+        sm_version,
+    )
     tensor_api = _get_compiled_kernel(
         hidden_size,
         block_size,
@@ -1454,6 +1555,7 @@ def add_rmsnorm_fp4quant(
         sm_version,
         actual_scale_format,
         is_sf_swizzled_layout,
+        launch_config,
         output_both_sf_layouts,
         enable_pdl,
         output_norm,

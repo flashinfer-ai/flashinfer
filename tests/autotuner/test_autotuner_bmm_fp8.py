@@ -10,6 +10,7 @@ from flashinfer.gemm.gemm_base import (
     get_gemm_module,
     DEFAULT_WORKSPACE_SIZE,
 )
+from flashinfer.gemm import gemm_base
 from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
@@ -208,3 +209,42 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     else:
         assert tactic >= 0
     assert stored_profile is not None
+
+
+def test_bmm_fp8_heuristic_gates_cudnn_on_sm12x_without_override_shape(monkeypatch):
+    """On SM12x, cuDNN must be excluded from the ``auto`` candidate list when
+    ``override_shape`` is unavailable (cuDNN backend < 9.23.1): the cuDNN FP8
+    path pays an unbounded per-shape ``policy=ALL`` host-side graph build at
+    serving time and surfaces an async CUDA fault past the tactic-level
+    fallback (#3707 only catches synchronous exceptions). When
+    ``override_shape`` is available, M is bucketed and the build is amortized,
+    so cuDNN stays a candidate. See RFC #3920 (runner-contract rule 6).
+
+    The SM version and cuDNN availability are monkeypatched so this runs on
+    any host without SM12x hardware or a cuDNN install.
+    """
+    # _match_sm_version(device, versions) -> True only for the SM12x list,
+    # so is_sm_supported (SM10x) is False and is_sm120_supported is True.
+    monkeypatch.setattr(gemm_base, "_match_sm_version", lambda dev, vers: "120" in vers)
+
+    a = torch.empty(1, 16, 32, dtype=torch.bfloat16)
+    b = torch.empty(1, 64, 32, dtype=torch.bfloat16)
+
+    def call(override_shape_available):
+        monkeypatch.setattr(
+            gemm_base, "CUDNN_AVAILABLE", True
+        )  # exercise the cudnn branch
+        monkeypatch.setattr(
+            gemm_base,
+            "_is_cudnn_override_shape_available",
+            lambda: override_shape_available,
+        )
+        return gemm_base._heuristic_func_bmm_fp8(
+            ["cudnn", "cublas", "cutlass"], a, b, a, b, torch.bfloat16, None, "auto"
+        )
+
+    # override_shape unavailable -> cuDNN excluded on SM12x.
+    assert "cudnn" not in call(override_shape_available=False)
+
+    # override_shape available -> cuDNN retained.
+    assert "cudnn" in call(override_shape_available=True)

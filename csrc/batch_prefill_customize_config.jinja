@@ -6,6 +6,7 @@
 #include <flashinfer/pos_enc.cuh>
 #include <flashinfer/fastdiv.cuh>
 #include <flashinfer/attention/variant_helper.cuh>
+#include <type_traits>
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
@@ -23,6 +24,13 @@ using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
+{% if require_fp4_kv_cache %}
+#ifndef FLASHINFER_ENABLE_FP4_E2M1
+#error "NVFP4 KV paged prefill compiled without FLASHINFER_ENABLE_FP4_E2M1"
+#endif
+static_assert(std::is_same_v<DTypeKV, __nv_fp4x2_e2m1>,
+              "NVFP4 KV paged prefill must build with the packed FP4 KV container type");
+{% endif %}
 constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
 constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};

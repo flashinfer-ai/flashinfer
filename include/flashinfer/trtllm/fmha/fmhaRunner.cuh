@@ -34,7 +34,8 @@ class TllmGenFmhaRunner {
         mDtypeK(dtypeK),
         mDtypeV(dtypeV),
         mDtypeOut(dtypeOut) {
-    FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
+    FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103 || mSM == kSM_107,
+                     "Unsupported architecture");
     FLASHINFER_CHECK(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 ||
                          mDtypeQ == DATA_TYPE_BF16 || mDtypeQ == DATA_TYPE_INT8,
                      "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));

@@ -37,10 +37,12 @@ from .ptx_helpers import (
     read_clock64,
     red_add_relaxed_sys_u64_raw,
     red_add_release_sys_s32_raw,
+    red_add_release_sys_u64_raw,
     stg_b32_raw,
     stg_b64_raw,
     tma_load_1d_raw,
     tma_store_1d,
+    _fence_rel_sys,
 )
 from .flag_batch import GpuReleaseFlagBatchTracker
 from .sf_swizzle import sf_atom_int32_offset
@@ -392,6 +394,7 @@ class TokenInPullTokenBackPush:
         token_back_standalone: bool = False,
         flag_batch: int = 1,
         is_swap_ab: bool = False,
+        sf_atom_swizzled: bool = True,
         token_back_schedule_mode: Literal["static", "atomic_counter"] = "static",
     ) -> None:
         self.world_size = world_size
@@ -404,6 +407,7 @@ class TokenInPullTokenBackPush:
         self.sf_uint32_per_token = sf_uint32_per_token
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
+        self.sf_atom_swizzled = sf_atom_swizzled
         self.cluster_tile_tokens = cluster_tile_tokens
         self.cluster_shape_mn = cluster_shape_mn
         if flag_batch < 1 or flag_batch > 32:
@@ -540,6 +544,27 @@ class TokenInPullTokenBackPush:
 
     def fc1_ready_counter_ptr(self, token_comm_args):
         return token_comm_args.fc1_ready_counter.iterator
+
+    @cute.jit
+    def _cta_linear_id(self):
+        """Grid-wide CTA id: ``bidz * cluster_size + %cluster_ctarank``.
+
+        The grid is (cluster_n, cluster_m, clusters) when swap-AB and
+        (cluster_m, cluster_n, clusters) otherwise (see get_grid_shape), so
+        bidy's multiplier must be bidx's extent.  Matching the hardware
+        x-fastest cluster-rank enumeration makes this a bijection onto
+        [0, sm_count) -- required by the dispatch work partition and the
+        tail bulk-zero striding.
+        """
+        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx_extent = (
+            self.cluster_shape_mn[1] if self.is_swap_ab else self.cluster_shape_mn[0]
+        )
+        return (
+            Int32(bidx)
+            + Int32(bidx_extent) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) * Int32(bidz)
+        )
 
     @cute.jit
     def sched_warp_pre_init_wait(self, token_comm_args):
@@ -956,7 +981,11 @@ class TokenInPullTokenBackPush:
                     Int64(0), current_rank_in_expert_idx, Int64(0)
                 )
                 inp_tok_local_base = input_token_buffer.iterator.toint()
-                inp_sf_local_base = input_sf_buffer.iterator.toint()
+                # SF-free callers pass input_sf_buffer=None (their SF loops are
+                # compiled out by sf_uint32_per_token=0, so this base address
+                # is never consumed).
+                if cutlass.const_expr(input_sf_buffer is not None):
+                    inp_sf_local_base = input_sf_buffer.iterator.toint()
                 inp_w_local_base = input_topk_weights_buffer.iterator.toint()
 
                 with cute.arch.elect_one():
@@ -1026,11 +1055,17 @@ class TokenInPullTokenBackPush:
                 for i in cutlass.range_constexpr(0, sf_passes, 1):
                     j = Int32(i * self.warp_threads) + lane_idx
                     if j < Int32(self.sf_uint32_per_token):
-                        sf_int32_pos = sf_atom_int32_offset(
-                            sf_token_in_pool_axis,
-                            j,
-                            num_k_atoms=self.sf_uint32_per_token,
-                        )
+                        if cutlass.const_expr(self.sf_atom_swizzled):
+                            sf_int32_pos = sf_atom_int32_offset(
+                                sf_token_in_pool_axis,
+                                j,
+                                num_k_atoms=self.sf_uint32_per_token,
+                            )
+                        else:
+                            sf_int32_pos = (
+                                sf_token_in_pool_axis * Int32(self.sf_uint32_per_token)
+                                + j
+                            )
                         fc1_input_sf_buffer[sf_int32_pos] = sf_vals[i]
                 cute.arch.sync_warp()
 
@@ -1534,12 +1569,7 @@ class TokenInPullTokenBackPush:
         lane_idx,
         tidx,
     ):
-        bidx, bidy, bidz = cute.arch.block_idx()
-        cta_linear_id = (
-            Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
-            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0]) * Int32(bidz)
-        )
+        cta_linear_id = self._cta_linear_id()
         local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
 
         iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
@@ -1652,12 +1682,7 @@ class TokenInPullTokenBackPush:
         lane_idx,
         tidx,
     ):
-        bidx, bidy, bidz = cute.arch.block_idx()
-        cta_linear_id = (
-            Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
-            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0]) * Int32(bidz)
-        )
+        cta_linear_id = self._cta_linear_id()
         local_warp_idx = Int32(warp_idx) - Int32(self.token_back_warp_start)
 
         # Handshake: dispatch_barrier done => expert_recv_count_sum populated.
@@ -1774,13 +1799,7 @@ class TokenInPullTokenBackPush:
         if (warp_idx >= self.dispatch_warp_start) and (
             warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
         ):
-            bidx, bidy, bidz = cute.arch.block_idx()
-            cta_linear_id = (
-                Int32(bidx)
-                + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
-                + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
-                * Int32(bidz)
-            )
+            cta_linear_id = self._cta_linear_id()
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
             # Per-launch nvlink barrier count must be a multiple of 4 so the
             # sense-reversing signal self-cancels back to its start state. The

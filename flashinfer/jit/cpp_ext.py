@@ -208,7 +208,9 @@ def build_cuda_cflags(
         ]
 
     cpp_ext_initial_compilation_context = CompilationContext()
-    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list()
+    global_flags = cpp_ext_initial_compilation_context.get_nvcc_flags_list(
+        map_sm107_to_100f=True
+    )
     if extra_cuda_cflags is not None:
         # Check if module provides architecture flags
         module_has_gencode = any(

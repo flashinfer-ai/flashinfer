@@ -45,9 +45,7 @@ struct SM120BlockScalingGemmKernel {
   static constexpr int MinBlocksPerMultiprocessor = 1;
 
   static constexpr sm120_common::GemmType kGemmType = KT::kGemmType;
-  using Scheduler =
-      std::conditional_t<KT::kSwapAB, sm120_common::Scheduler<kGemmType, KT::kTileN, KT::kTileM>,
-                         sm120_common::Scheduler<kGemmType, KT::kTileM, KT::kTileN>>;
+  using Scheduler = sm120_common::SelectedScheduler<kGemmType, KT::kSwapAB, KT::kTileM, KT::kTileN>;
   using ProblemShape = typename KT::ProblemShape;
 
   struct Params {
@@ -127,10 +125,8 @@ struct SM120BlockScalingGemmKernel {
     }
   }
 
-  using TensorStorage =
-      std::conditional_t<KT::kUseTmaStore, typename KT::TensorStorageSplit,
-                         std::conditional_t<KT::kUseStagedR2G, typename KT::TensorStorageStagedR2G,
-                                            typename KT::TensorStorageUnion>>;
+  using TensorStorage = std::conditional_t<KT::kUseTmaStore, typename KT::TensorStorageSplit,
+                                           typename KT::TensorStorageUnion>;
   using BarrierStorage = typename KT::BarrierStorage;
 
   struct SharedStorage {
@@ -177,24 +173,24 @@ struct SM120BlockScalingGemmKernel {
     auto block_tma_sfa = params.tma_load_sfa.get_slice(0);
     auto tAsSFA = block_tma_sfa.partition_D(sSFA);
 
-    Tensor mSFB = make_tensor(
+    cute::Tensor mSFB = make_tensor(
         make_gmem_ptr(params.ptr_SFB),
         KT::SFConfig::deduce_sfb_layout(params.M, params.N, params.K, params.num_experts));
-    Tensor cSFB = make_identity_tensor(mSFB.shape());
+    cute::Tensor cSFB = make_identity_tensor(mSFB.shape());
     auto scales_n = get<0>(mSFB.shape());
-    Tensor gSFB = local_tile(mSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
-                             make_coord(n_block_idx, _, expert_idx));
-    Tensor coordSFB = local_tile(cSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
-                                 make_coord(n_block_idx, _, expert_idx));
+    cute::Tensor gSFB = local_tile(mSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
+                                   make_coord(n_block_idx, _, expert_idx));
+    cute::Tensor coordSFB = local_tile(cSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
+                                       make_coord(n_block_idx, _, expert_idx));
 
     TiledCopy scale_copy_b = make_tiled_copy(
         typename KT::SFConfig::SmemCopyAtomSFB{},
         Layout<Shape<Int<KT::SFConfig::kNumScaleCopyThreads>>>{}, Layout<Shape<_1>>{});
     auto thr_scale_copy_b = scale_copy_b.get_slice(lane_idx);
-    Tensor tBgSFB = thr_scale_copy_b.partition_S(gSFB);
-    Tensor tBcSFB = thr_scale_copy_b.partition_S(coordSFB);
-    Tensor tBsSFB = thr_scale_copy_b.partition_D(sSFB);
-    Tensor tBpSFB = cute::lazy::transform(tBcSFB(_, _, 0), [&](auto const& coord) {
+    cute::Tensor tBgSFB = thr_scale_copy_b.partition_S(gSFB);
+    cute::Tensor tBcSFB = thr_scale_copy_b.partition_S(coordSFB);
+    cute::Tensor tBsSFB = thr_scale_copy_b.partition_D(sSFB);
+    cute::Tensor tBpSFB = cute::lazy::transform(tBcSFB(_, _, 0), [&](auto const& coord) {
       return lane_idx < KT::SFConfig::kTileScaleN && get<0>(coord) < scales_n;
     });
 
@@ -231,9 +227,8 @@ struct SM120BlockScalingGemmKernel {
 
   template <typename BlkCoord>
   CUTE_DEVICE static void load_sf(Params const& params, SharedStorage& shared_storage,
-                                  BlkCoord const& blk_coord, int32_t m_offset, int32_t m_boundary,
-                                  int32_t k_tile_count, int& sf_stage, uint32_t& sf_phase,
-                                  uint32_t& store_phase) {
+                                  BlkCoord const& blk_coord, int32_t m_offset, int32_t k_tile_count,
+                                  int& sf_stage, uint32_t& sf_phase, uint32_t& store_phase) {
     auto [m_block_idx, n_block_idx, expert_idx] = blk_coord;
     constexpr bool kPerBatchAB = KT::kPerBatchAB;
     constexpr bool kSwapAB = KT::kSwapAB;
@@ -255,26 +250,19 @@ struct SM120BlockScalingGemmKernel {
       static_assert(KT::kGranN == 1);
       sfb_real_N = KT::SFConfig::get_tma_aligned_size(sfb_src_N);
     }
-    if constexpr (kSwapAB &&
-                  KT::kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding) {
-      static_assert(KT::kGranN == 1);
-      sfb_real_N = sm120_common::math::compute_padded_offset(sfb_src_N, params.num_experts);
-      sf_m_offset = sm120_common::math::compute_padded_offset(m_offset, expert_idx);
-    }
-
     auto sSFA = make_tensor(make_smem_ptr(shared_storage.tensors.load.smem_SFA.begin()),
                             typename KT::SFConfig::SmemLayoutSFA{});
     auto sSFB = make_tensor(make_smem_ptr(shared_storage.tensors.load.smem_SFB.begin()),
                             typename KT::SFConfig::SmemLayoutSFB{});
 
-    Tensor mSFA_full =
+    cute::Tensor mSFA_full =
         make_tensor(make_gmem_ptr(params.ptr_SFA),
                     KT::SFConfig::deduce_sfa_layout(sfa_real_M, sfb_real_N, params.K, sfa_src_L));
-    Tensor mSFB_full =
+    cute::Tensor mSFB_full =
         make_tensor(make_gmem_ptr(params.ptr_SFB),
                     KT::SFConfig::deduce_sfb_layout(sfa_real_M, sfb_real_N, params.K, sfb_src_L));
-    Tensor cSFA_full = make_identity_tensor(mSFA_full.shape());
-    Tensor cSFB_full = make_identity_tensor(mSFB_full.shape());
+    cute::Tensor cSFA_full = make_identity_tensor(mSFA_full.shape());
+    cute::Tensor cSFB_full = make_identity_tensor(mSFB_full.shape());
 
     auto mSFA = [&] {
       if constexpr (!kSwapAB && !KT::kFlat) {
@@ -307,20 +295,15 @@ struct SM120BlockScalingGemmKernel {
 
     int64_t scales_m = sm120_common::math::ceil_div(sfa_src_M, int(KT::kGranM));
     int64_t scales_n = sm120_common::math::ceil_div(sfb_src_N, int(KT::kGranN));
-    if constexpr (kSwapAB &&
-                  KT::kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding) {
-      scales_n = sf_m_offset / KT::kGranN +
-                 sm120_common::math::ceil_div(m_boundary - m_offset, int(KT::kGranN));
-    }
 
-    Tensor gSFA = local_tile(mSFA, make_tile(Int<KT::SFConfig::kTileScaleM>{}),
-                             make_coord(sfa_tile_idx, _, sfa_batch_idx));
-    Tensor coordSFA = local_tile(cSFA, make_tile(Int<KT::SFConfig::kTileScaleM>{}),
-                                 make_coord(sfa_tile_idx, _, sfa_batch_idx));
-    Tensor gSFB = local_tile(mSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
-                             make_coord(sfb_tile_idx, _, sfb_batch_idx));
-    Tensor coordSFB = local_tile(cSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
-                                 make_coord(sfb_tile_idx, _, sfb_batch_idx));
+    cute::Tensor gSFA = local_tile(mSFA, make_tile(Int<KT::SFConfig::kTileScaleM>{}),
+                                   make_coord(sfa_tile_idx, _, sfa_batch_idx));
+    cute::Tensor coordSFA = local_tile(cSFA, make_tile(Int<KT::SFConfig::kTileScaleM>{}),
+                                       make_coord(sfa_tile_idx, _, sfa_batch_idx));
+    cute::Tensor gSFB = local_tile(mSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
+                                   make_coord(sfb_tile_idx, _, sfb_batch_idx));
+    cute::Tensor coordSFB = local_tile(cSFB, make_tile(Int<KT::SFConfig::kTileScaleN>{}),
+                                       make_coord(sfb_tile_idx, _, sfb_batch_idx));
 
     TiledCopy scale_copy_a = make_tiled_copy(
         typename KT::SFConfig::SmemCopyAtomSFA{},
@@ -332,18 +315,18 @@ struct SM120BlockScalingGemmKernel {
     auto thr_scale_copy_a = scale_copy_a.get_slice(lane_idx);
     auto thr_scale_copy_b = scale_copy_b.get_slice(lane_idx);
 
-    Tensor tAgSFA = thr_scale_copy_a.partition_S(gSFA);
-    Tensor tAcSFA = thr_scale_copy_a.partition_S(coordSFA);
-    Tensor tAsSFA = thr_scale_copy_a.partition_D(sSFA);
+    cute::Tensor tAgSFA = thr_scale_copy_a.partition_S(gSFA);
+    cute::Tensor tAcSFA = thr_scale_copy_a.partition_S(coordSFA);
+    cute::Tensor tAsSFA = thr_scale_copy_a.partition_D(sSFA);
 
-    Tensor tBgSFB = thr_scale_copy_b.partition_S(gSFB);
-    Tensor tBcSFB = thr_scale_copy_b.partition_S(coordSFB);
-    Tensor tBsSFB = thr_scale_copy_b.partition_D(sSFB);
+    cute::Tensor tBgSFB = thr_scale_copy_b.partition_S(gSFB);
+    cute::Tensor tBcSFB = thr_scale_copy_b.partition_S(coordSFB);
+    cute::Tensor tBsSFB = thr_scale_copy_b.partition_D(sSFB);
 
-    Tensor tApSFA = cute::lazy::transform(tAcSFA(_, _, 0), [&](auto const& coord) {
+    cute::Tensor tApSFA = cute::lazy::transform(tAcSFA(_, _, 0), [&](auto const& coord) {
       return lane_idx < KT::SFConfig::kTileScaleM && get<0>(coord) < scales_m;
     });
-    Tensor tBpSFB = cute::lazy::transform(tBcSFB(_, _, 0), [&](auto const& coord) {
+    cute::Tensor tBpSFB = cute::lazy::transform(tBcSFB(_, _, 0), [&](auto const& coord) {
       return lane_idx < KT::SFConfig::kTileScaleN && get<0>(coord) < scales_n;
     });
 
@@ -591,10 +574,6 @@ struct SM120BlockScalingGemmKernel {
     if constexpr (KT::kUseTmaStore) {
       sm120_common::utils::epi_r2s<KT>(params, shared_storage, accum, thread_idx, epi_stage,
                                        se_phase, store_full_mbar, store_empty_mbar);
-    } else if constexpr (KT::kUseStagedR2G) {
-      sm120_common::utils::epi_staged_r2s<KT>(params, shared_storage, accum, thread_idx, m_offset,
-                                              m_boundary, m_block_idx, epi_stage, se_phase[0],
-                                              store_full_mbar, store_empty_mbar);
     } else if constexpr (KT::kFlat || (!KT::kFlat && KT::kSwapAB)) {
       sm120_common::utils::epi_pred_stg<KT>(params, accum, thread_idx, m_offset, m_boundary,
                                             m_block_idx, n_block_idx, store_empty_mbar);
@@ -623,6 +602,8 @@ struct SM120BlockScalingGemmKernel {
 
   CUTE_DEVICE
   void operator()(Params const& params, char* smem_buf) {
+    static_assert(kGemmType != sm120_common::GemmType::MGroupedContiguousWithZeroPadding,
+                  "MGroupedContiguousWithZeroPadding launches SM120BlockScalingMoeGemmKernel");
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     int warp_idx = cutlass::canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
@@ -651,12 +632,6 @@ struct SM120BlockScalingGemmKernel {
         for (uint32_t i = 0; i < KT::TmaStoreConfig::StagesD; ++i) {
           store_full_mbar[i].init(KT::MMAConfig::kNumMathThreads);
           store_empty_mbar[i].init(1);
-        }
-      } else if constexpr (KT::kUseStagedR2G) {
-#pragma unroll
-        for (uint32_t i = 0; i < KT::StagedR2GStoreConfig::StagesD; ++i) {
-          store_full_mbar[i].init(KT::MMAConfig::kNumMathThreads);
-          store_empty_mbar[i].init(KT::StagedR2GStoreConfig::kNumStoreThreads);
         }
       } else if constexpr (KT::kUnionSmem) {
         store_empty_mbar[0].init(KT::MMAConfig::kNumMathThreads);
@@ -702,8 +677,8 @@ struct SM120BlockScalingGemmKernel {
             load_sf_tma(params, shared_storage, blk_coord, scheduler.get_m_offset(), k_tile_count,
                         sf_stage, sf_phase, store_phase);
           } else {
-            load_sf(params, shared_storage, blk_coord, scheduler.get_m_offset(),
-                    scheduler.get_m_boundary(), k_tile_count, sf_stage, sf_phase, store_phase);
+            load_sf(params, shared_storage, blk_coord, scheduler.get_m_offset(), k_tile_count,
+                    sf_stage, sf_phase, store_phase);
           }
         }
         __syncwarp();
@@ -720,23 +695,6 @@ struct SM120BlockScalingGemmKernel {
                     m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
                 store(params, shared_storage, blk_coord, sf_phase, epi_stage);
               }
-            }
-            __syncwarp();
-          }
-        } else if constexpr (KT::kUseStagedR2G) {
-          if (warp_idx == tma_store_warp_idx) {
-            uint32_t full_phase = 0;
-            int store_stage = 0;
-            int store_thread_idx = cutlass::canonical_lane_idx();
-            Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
-            int32_t m_block_idx, n_block_idx;
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-              auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
-                  m_block_idx, n_block_idx, scheduler.get_expert_idx(m_block_idx));
-              sm120_common::utils::staged_r2g_store<KT>(
-                  params, shared_storage, scheduler.get_m_offset(), scheduler.get_m_boundary(),
-                  cute::get<0>(blk_coord), cute::get<1>(blk_coord), store_thread_idx, full_phase,
-                  store_stage, store_full_mbar, store_empty_mbar);
             }
             __syncwarp();
           }

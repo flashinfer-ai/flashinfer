@@ -9,6 +9,7 @@ from flashinfer.grouped_mm.core import (
     _check_grouped_mm_fp8,
     _check_grouped_mm_mxfp8,
 )
+from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
 from flashinfer.utils import get_compute_capability
 
 try:
@@ -25,15 +26,22 @@ except (ImportError, OSError):
     CUDNN_BACKEND_VERSION = 0
     CUDNN_HAS_MOE_API = False
 
-requires_cudnn_moe = pytest.mark.skipif(
-    not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91800 or not CUDNN_HAS_MOE_API,
-    reason="cuDNN MOE requires backend >= 9.18.0 and a frontend exposing moe_grouped_matmul_mode",
-)
 
-requires_cudnn_moe_block_scale = pytest.mark.skipif(
-    not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 92100 or not CUDNN_HAS_MOE_API,
-    reason="cuDNN MOE block-scale requires backend >= 9.21.0 and a frontend exposing moe_grouped_matmul_mode",
-)
+def _requires_cudnn_moe(feature: str):
+    min_ver = _CUDNN_MOE_MIN_VERSION
+    ver = CUDNN_BACKEND_VERSION
+    return pytest.mark.skipif(
+        not CUDNN_AVAILABLE or ver < min_ver or not CUDNN_HAS_MOE_API,
+        reason=(
+            f"cuDNN MOE {feature} requires backend >= {min_ver // 10000}."
+            f"{min_ver // 100 % 100}.{min_ver % 100} and a frontend exposing "
+            "moe_grouped_matmul_mode"
+        ),
+    )
+
+
+requires_cudnn_moe = _requires_cudnn_moe("grouped matmul")
+requires_cudnn_moe_block_scale = _requires_cudnn_moe("block-scale")
 
 
 def _requires_supported_cc(check_fn):

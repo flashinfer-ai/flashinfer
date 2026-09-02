@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -37,8 +37,10 @@ from ..jit import (
     sm120a_nvcc_flags,
     sm120f_nvcc_flags,
     sm110a_nvcc_flags,
+    sm107a_nvcc_flags,
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     sm90a_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
@@ -172,6 +174,13 @@ def gen_fp4_quantization_sm103_module() -> JitSpec:
     return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
 
 
+def gen_fp4_quantization_sm107_module() -> JitSpec:
+    from flashinfer.compilation_context import cutlass_supports_sm107
+
+    nvcc_flags = sm107a_nvcc_flags if cutlass_supports_sm107() else sm100f_nvcc_flags
+    return gen_fp4_quantization_module(nvcc_flags, "107")
+
+
 def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
 
@@ -225,11 +234,12 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 
 @functools.cache
 def get_fp4_quantization_module(backend: str = "100"):
-    backend_modules = {
+    backend_modules: Dict[str, Callable[..., JitSpec]] = {
         "121": gen_fp4_quantization_sm121_module,
         "120f": gen_fp4_quantization_sm120f_module,
         "120": gen_fp4_quantization_sm120_module,
         "110": gen_fp4_quantization_sm110_module,
+        "107": gen_fp4_quantization_sm107_module,
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
@@ -1337,8 +1347,9 @@ def nvfp4_quantize(
     ----------
     a : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/float8_e4m3fn.
-    a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+    a_global_sf : float or torch.Tensor
+        Global scale factor. The CuTe-DSL backend accepts a host-side float
+        or, for backward compatibility, a single-element tensor.
     sfLayout : SfLayout
         Scale-factor layout.  Defaults to ``SfLayout.layout_128x4``.
     do_shuffle : bool
@@ -1507,7 +1518,7 @@ def nvfp4_quantize(
             sf_layout_int = _sf_layout_map[sfLayout]
 
         a_fp4, a_sf = nvfp4_quantize_cute_dsl(
-            a.cuda(), a_global_sf.cuda(), sf_layout=sf_layout_int, enable_pdl=enable_pdl
+            a.cuda(), a_global_sf, sf_layout=sf_layout_int, enable_pdl=enable_pdl
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
@@ -2039,7 +2050,7 @@ def get_fp4_kv_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
 
@@ -2086,7 +2097,7 @@ def nvfp4_kv_dequantize(
     return output
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
     return True
 
@@ -2195,7 +2206,7 @@ def nvfp4_kv_dequantize_paged(
     )
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 

@@ -51,14 +51,16 @@ void moe_permute_fp16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
                       int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                       int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                       int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                      int32_t tile_size, bool enable_pdl) {
+                      int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<half, uint8_t>(
       reinterpret_cast<half const*>(input_ptr), reinterpret_cast<half*>(permuted_output_ptr),
       reinterpret_cast<uint8_t const*>(input_sf_ptr), reinterpret_cast<uint8_t*>(permuted_sf_ptr),
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, get_current_stream());
+      hidden_size, top_k, tile_size, enable_pdl, stream);
 }
 
 #ifdef ENABLE_BF16
@@ -66,7 +68,9 @@ void moe_permute_bf16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
                       int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                       int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                       int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                      int32_t tile_size, bool enable_pdl) {
+                      int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_bfloat16, uint8_t>(
       reinterpret_cast<__nv_bfloat16 const*>(input_ptr),
       reinterpret_cast<__nv_bfloat16*>(permuted_output_ptr),
@@ -74,7 +78,7 @@ void moe_permute_bf16(int64_t input_ptr, int64_t permuted_output_ptr, int64_t in
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, get_current_stream());
+      hidden_size, top_k, tile_size, enable_pdl, stream);
 }
 #endif
 
@@ -83,7 +87,9 @@ void moe_permute_fp8(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
                      int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                      int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                      int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                     int32_t tile_size, bool enable_pdl) {
+                     int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_fp8_e4m3, uint8_t>(
       reinterpret_cast<__nv_fp8_e4m3 const*>(input_ptr),
       reinterpret_cast<__nv_fp8_e4m3*>(permuted_output_ptr),
@@ -91,7 +97,7 @@ void moe_permute_fp8(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, get_current_stream());
+      hidden_size, top_k, tile_size, enable_pdl, stream);
 }
 #endif
 
@@ -100,7 +106,9 @@ void moe_permute_fp4(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
                      int64_t permuted_sf_ptr, int64_t tile_idx_to_mn_limit_ptr,
                      int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                      int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
-                     int32_t tile_size, bool enable_pdl) {
+                     int32_t tile_size, bool enable_pdl, int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moePermute<__nv_fp4_e2m1, uint8_t>(
       reinterpret_cast<__nv_fp4_e2m1 const*>(input_ptr),
       reinterpret_cast<__nv_fp4_e2m1*>(permuted_output_ptr),
@@ -108,7 +116,7 @@ void moe_permute_fp4(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),
       reinterpret_cast<int32_t const*>(num_non_exiting_tiles_ptr), max_num_permuted_tokens,
-      hidden_size, top_k, tile_size, enable_pdl, get_current_stream());
+      hidden_size, top_k, tile_size, enable_pdl, stream);
 }
 #endif
 
@@ -335,6 +343,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_bf16, moe_activation_bf1
 // - total_num_padded_tokens: [1], total number of padded tokens
 // - num_non_exiting_tiles: [1], number of non-exiting tiles
 
+// Batch size from which the cooperative routing kernel switches to contiguous
+// per-CTA route windows (see DataBase::mUseContiguousRouteWindows). The gather
+// locality it buys only pays off once a grouped-GEMM tile's slice of the
+// activation tensor outgrows the uTLB: measured on B200 it is neutral at or
+// below 32K tokens, roughly break-even at 64K, and worth 1.15-1.17x end to end
+// on the fused MoE pipeline at 128K.
+static constexpr int32_t kContiguousRouteWindowMinTokens = 65536;
+
 void moe_sort(
     // Inputs
     int64_t token_selected_experts_ptr,  // [num_tokens, top_k], int32
@@ -357,6 +373,7 @@ void moe_sort(
   // Configure dtypes
   routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   routingData.mUsePdl = use_pdl;
+  routingData.mUseContiguousRouteWindows = num_tokens >= kContiguousRouteWindowMinTokens;
 
   // Input tensors (pre-computed expert selections)
   routingData.mPtrTopKIds = reinterpret_cast<int32_t*>(token_selected_experts_ptr);
@@ -405,6 +422,7 @@ void moe_sort(
   routingData.mNumExpertGroups = 1;
   routingData.mNumLimitedGroups = 1;
   routingData.mRouteScale = 1.0f;
+  routingData.mSumEpsilon = 1e-20f;
   routingData.mUseRoutingSoftmax = false;
 
   // Run the routing kernel

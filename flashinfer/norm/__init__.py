@@ -75,6 +75,33 @@ if not _USE_CUDA_NORM:
 
 
 @functools.cache
+def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can target this compute capability."""
+    try:
+        from ..cute_dsl.availability import is_cute_dsl_arch_supported
+
+        return is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the capability probe itself break norm dispatch.
+        return True
+
+
+def _use_cuda_norm(device: torch.device) -> bool:
+    """Return ``True`` when the CUDA JIT norm kernels should be used instead
+    of the CuTe DSL ones.
+
+    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers
+    devices whose architecture the installed CuTe DSL cannot target (e.g.
+    Rubin/sm_107 against a DSL without ``sm_107a``, unless
+    ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
+    The CUDA JIT kernels are functionally equivalent, so norm falls back
+    instead of raising like the DSL-only kernels do."""
+    if _USE_CUDA_NORM:
+        return True
+    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
+
+
+@functools.cache
 def get_norm_module():
     """Get or compile the CUDA JIT norm module.
 
@@ -158,7 +185,7 @@ def _rmsnorm_impl(
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
         if input.dim() == 3:
@@ -199,7 +226,8 @@ def rmsnorm_quant(
     Parameters
     ----------
     out: torch.Tensor
-        The output tensor, will quantize the output to the dtype of this tensor.
+        The output tensor, will quantize the output to the dtype of this tensor,
+        which must be float8_e4m3fn or float8_e5m2.
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size).
     weight: torch.Tensor
@@ -216,7 +244,7 @@ def rmsnorm_quant(
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
     else:
         rmsnorm_quant_cute(
@@ -269,7 +297,7 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
         fused_add_rmsnorm_cute(
@@ -312,7 +340,8 @@ def fused_add_rmsnorm_quant(
     Parameters
     ----------
     out: torch.Tensor
-        The output tensor, will quantize the output to the dtype of this tensor.
+        The output tensor, will quantize the output to the dtype of this tensor,
+        which must be float8_e4m3fn or float8_e5m2.
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor
@@ -330,7 +359,7 @@ def fused_add_rmsnorm_quant(
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm_quant(
             out, input, residual, weight, scale, eps, enable_pdl
         )
@@ -354,6 +383,76 @@ def _fused_add_rmsnorm_quant_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    pass
+
+
+@flashinfer_api
+@register_custom_op(
+    "flashinfer::fused_add_rmsnorm_fp8_block_quant",
+    mutates_args=("out", "block_scale", "normed_out", "residual"),
+)
+def fused_add_rmsnorm_fp8_block_quant(
+    out: torch.Tensor,
+    block_scale: torch.Tensor,
+    normed_out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Fused add-residual + RMSNorm + 1x128 fp8 block quantization, in one pass.
+
+    Replaces the two-kernel producer (:func:`fused_add_rmsnorm` then a per-token-group 1x128 fp8
+    quant) used before fp8 block-scaled GEMMs. Unlike :func:`fused_add_rmsnorm_quant` (scalar
+    per-tensor scale) this emits a **dynamic per-1x128-block** fp32 scale in the column-major
+    TMA-aligned layout that :mod:`flashinfer.deep_gemm` consumes.
+
+    Step 1: ``residual = input + residual`` (pre-norm, written in place).
+    Step 2: ``normed = RMSNorm(residual) * weight`` (bf16, written to ``normed_out``).
+    Step 3: ``out, block_scale = quant_1x128_fp8(normed)`` (fp8 from the bf16-rounded normed, so
+    ``out`` matches re-quantizing ``normed_out``).
+
+    Parameters
+    ----------
+    out : torch.Tensor
+        fp8 output, shape ``(batch_size, hidden_size)``, dtype float8_e4m3fn (the activation
+        dtype the fp8 block-scaled GEMMs consume).
+    block_scale : torch.Tensor
+        fp32 block scales, shape ``(hidden_size // 128, round_up(batch_size, 4))``, contiguous.
+        This is the column-major (MN-major, TMA-aligned) buffer deep_gemm expects: the logical
+        ``(batch_size, hidden_size // 128)`` scale is ``block_scale.transpose(0, 1)[:batch_size]``.
+    normed_out : torch.Tensor
+        bf16/fp16 normed output, shape ``(batch_size, hidden_size)`` (for consumers that need the
+        pre-quant activation, e.g. an MoE router).
+    input, residual : torch.Tensor
+        Shape ``(batch_size, hidden_size)``. ``residual`` is updated in place with ``input+residual``.
+    weight : torch.Tensor
+        RMSNorm weight, shape ``(hidden_size,)``. ``hidden_size`` must be a multiple of 128
+        (and of 256 for hidden_size<=8192, 512 for 8192<hidden_size<=16384).
+    eps : float
+        Epsilon for numerical stability.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch.
+    """
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    get_norm_module().fused_add_rmsnorm_fp8_block_quant(
+        out, block_scale, normed_out, input, residual, weight, eps, enable_pdl
+    )
+
+
+@register_fake_op("flashinfer::fused_add_rmsnorm_fp8_block_quant")
+def _fused_add_rmsnorm_fp8_block_quant_fake(
+    out: torch.Tensor,
+    block_scale: torch.Tensor,
+    normed_out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -407,7 +506,7 @@ def _gemma_rmsnorm_impl(
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
     else:
         if input.dim() == 3:
@@ -466,7 +565,7 @@ def gemma_fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
@@ -513,7 +612,7 @@ def layernorm(
         Layer Normalized tensor, shape (batch_size, hidden_size). Same dtype as input.
     """
     out = torch.empty_like(input)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().layernorm(out, input, gemma, beta, eps)
     else:
         layernorm_cute(out, input, gemma, beta, eps)
@@ -1490,7 +1589,7 @@ def _get_fused_qk_rmsnorm_rope_module():
     return gen_norm_module().build_and_load()
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_fused_qk_rmsnorm_rope(
     qkv,
     q_weight,

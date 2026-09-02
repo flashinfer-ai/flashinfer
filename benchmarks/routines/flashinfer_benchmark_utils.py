@@ -30,6 +30,12 @@ output_column_dict = {
         "is_var_seq",
         "cute_dsl_impl",
     ],
+    "dsv4_sparse_mla": [
+        "swa_topk",
+        "compressed_topk",
+        "compressed_kv_len",
+        "compressed_page_size",
+    ],
     "gemm": [
         "n",
         "group_size",
@@ -57,7 +63,12 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "quant_variant",
+        "autotune",
+        "tactic",
+        "refcheck_passed",
         "fp4_mode",
+        "cold_l2_cache",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
@@ -116,6 +127,11 @@ output_column_dict = {
         "max_len",
         "num_rows",
     ],
+    # top_k_varlen selects top-K KV positions per request; its row width is a
+    # max sequence length, not a vocab size (see routines/topk_varlen.py).
+    "topk_varlen": [
+        "max_seq_len",
+    ],
     "rope": [
         "seq_len",
         "head_dim",
@@ -146,6 +162,17 @@ output_column_dict = {
         "pool_mode",
         "update_state",
         "use_qk_l2norm",
+    ],
+    "kda": [
+        # Which variant the policy chose, and whether this device's thresholds
+        # were measured or inherited from another SM count. A time taken under
+        # fallback thresholds is not a time taken under tuned ones, and no
+        # other column distinguishes them.
+        "kda_variant",
+        "kda_variant_policy",
+        "sm_count",
+        "packed",
+        "has_initial_state",
     ],
     "msa": [
         "topk",
@@ -180,6 +207,7 @@ output_column_dict = {
 full_output_columns = (
     output_column_dict["perf"]
     + output_column_dict["attention"]
+    + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
@@ -188,9 +216,11 @@ full_output_columns = (
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
+    + output_column_dict["topk_varlen"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
+    + output_column_dict["kda"]
     + output_column_dict["msa"]
     + output_column_dict["general"]
 )
@@ -201,6 +231,7 @@ benchmark_apis = {
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",
         "BatchMLAPagedAttentionWrapper",
+        "trtllm_batch_decode_sparse_mla_dsv4",
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
@@ -221,9 +252,15 @@ benchmark_apis = {
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
+        "cute_dsl_bf16_moe",
         "b12x_fused_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
+    ],
+    # Uses each unified backend config's supported(arch) check followed by a
+    # real runner construction/probe, like mm_fp4's runtime backend filtering.
+    "unified_moe": [
+        "unified_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
@@ -271,6 +308,11 @@ benchmark_apis = {
         "top_k_page_table_transform",
         "top_k_ragged_transform",
     ],
+    # top_k_varlen is a sparse-attention KV-selection primitive (not vocab
+    # sampling), so it has its own category + routine module (routines/topk_varlen.py).
+    "topk_varlen": [
+        "top_k_varlen",
+    ],
     "rope": [
         "apply_rope",
         "apply_rope_pos_ids",
@@ -288,6 +330,9 @@ benchmark_apis = {
         "gated_delta_rule_decode",
         "gated_delta_rule_mtp",
         "chunk_gated_delta_rule",
+    ],
+    "kda": [
+        "recurrent_kda_prefill",
     ],
     "sparse_attention": [
         "MSAProxyScore",
@@ -368,8 +413,25 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "fa2_tc", "auto", "cudnn"],
         "8.9": ["fa2", "fa2_tc", "auto", "cudnn"],
         "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
-        "10.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
-        "10.3": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
+        "10.0": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
+        "10.3": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
+        "10.7": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
         "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
     },
@@ -382,9 +444,33 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
         "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
-        "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "10.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
+        "10.3": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+        ],
+        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "12.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
@@ -403,6 +489,7 @@ routine_cc_to_supported_backends = {
             "cutlass",
             "cute-dsl",
             "trtllm-native",
+            "prims-ts",
         ],
         "10.3": [
             "fa2",
@@ -411,8 +498,15 @@ routine_cc_to_supported_backends = {
             "cutlass",
             "cute-dsl",
             "trtllm-native",
+            "prims-ts",
         ],
-        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.0": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
@@ -425,10 +519,23 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
-        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
+        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
+        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
+        "10.7": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
+    },
+    "trtllm_batch_decode_sparse_mla_dsv4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["trtllm-gen"],
+        "10.3": ["trtllm-gen"],
+        "10.7": [],
+        "12.0": [],
+        "12.1": [],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {
@@ -439,6 +546,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": [],
         "12.1": [],
     },
@@ -450,6 +558,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": [],
         "12.1": [],
     },
@@ -488,7 +597,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -498,6 +607,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -509,6 +619,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -520,6 +631,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -531,6 +643,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
@@ -542,6 +655,17 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "cute_dsl_bf16_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["cute-dsl"],
+        "10.0": [],
+        "10.3": [],
         "12.0": [],
         "12.1": [],
     },
@@ -876,6 +1000,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # Note: top_k_varlen uses its @backend_requirement support checks
+    # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
     # ROPE
     "apply_rope": {
         "7.5": ["cuda"],
@@ -1013,6 +1139,28 @@ routine_cc_to_supported_backends = {
         "10.3": ["flashinfer", "fla"],
         "11.0": [],
         "12.0": [],
+        "12.1": [],
+    },
+    # KDA prefill on SM120a only. The SM100-family Cake prefill backend is a
+    # different kernel with a different contract and is not benchmarked here;
+    # listing it under 10.0/10.3 would put two unrelated implementations in one
+    # column.
+    "recurrent_kda_prefill": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": [],
+        "10.3": [],
+        "11.0": [],
+        "12.0": [
+            "flashinfer",
+            "flashinfer-decomp",
+            "flashinfer-fused",
+            "cutekda",
+            "flash-kda",
+        ],
         "12.1": [],
     },
 }

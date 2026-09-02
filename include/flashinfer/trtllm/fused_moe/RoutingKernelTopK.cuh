@@ -320,6 +320,70 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
   }
 };
 
+/// Capability envelope for the high-expert lane-owned routing specialization.
+/// This predicate is shared by compile-time tier selection and runtime dispatch;
+/// dispatch tables still decide which concrete tiers are instantiated.
+static constexpr int HighExpertLaneOwnedTopKMinExperts = 512;
+static constexpr int HighExpertLaneOwnedTopKMaxExperts = 1024;
+static constexpr int HighExpertLaneOwnedTopKMinTopExperts = 9;
+static constexpr int HighExpertLaneOwnedTopKMaxTopExperts = 16;
+
+__host__ __device__ constexpr bool isInHighExpertLaneOwnedTopKRange(int numExperts,
+                                                                    int numTopExperts) {
+  return numExperts >= HighExpertLaneOwnedTopKMinExperts &&
+         numExperts <= HighExpertLaneOwnedTopKMaxExperts &&
+         numTopExperts >= HighExpertLaneOwnedTopKMinTopExperts &&
+         numTopExperts <= HighExpertLaneOwnedTopKMaxTopExperts;
+}
+
+// Exact-K variant that returns only the result owned by this lane. The generic
+// reduceTopK interface materializes K scores and K indices per thread even though
+// routing kernels ultimately consume only element laneIdx. For high-K tiers that
+// dynamic lane-indexed array is placed in local memory and can spill the sorted
+// candidates as well. Keeping a single packed result per lane lets nvcc scalarize
+// the output while preserving the same comparison and tie-breaking order.
+template <int K, typename Type, int N>
+__forceinline__ __device__ void reduceTopKForLane(cg::thread_block_tile<WarpSize> const& warp,
+                                                  Type& out, int32_t& outIdx, Type (&value)[N],
+                                                  int32_t (&idx)[N], Type const minValue,
+                                                  int32_t laneIdx) {
+  static_assert(K > 0, "Top K must have K > 0");
+  static_assert(K <= WarpSize, "Top K must have K <= WarpSize");
+  static_assert(N > 0, "Top K must have N > 0");
+  static_assert(N <= 64, "Only support candidates number less than or equal to 64*32=2048");
+  using RedType = TopKRedType<Type>;
+  RedType topK[N];
+#pragma unroll
+  for (int nn = 0; nn < N; ++nn) {
+    topK[nn] = RedType{value[nn], idx[nn]};
+  }
+
+  Sort<N, RedType>::run(topK);
+
+  typename RedType::TypeCmp packedMax{};
+  typename RedType::TypeCmp lanePacked{};
+#pragma unroll
+  for (int kk = 0; kk < K; ++kk) {
+    bool update = kk > 0 && packedMax == topK[0].compVal;
+#pragma unroll
+    for (int nn = 0; nn < N; ++nn) {
+      topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]}
+                 : update              ? topK[nn + 1]
+                                       : topK[nn];
+    }
+    packedMax = topK[0].reduce(warp);
+    if (laneIdx == kk) {
+      lanePacked = packedMax;
+    }
+  }
+
+  if (laneIdx < K) {
+    RedType::unpack(out, outIdx, lanePacked);
+  } else {
+    out = minValue;
+    outIdx = -1;
+  }
+}
 #undef TOPK_SWAP
 }  // namespace topk
 }  // namespace moe::dev::routing

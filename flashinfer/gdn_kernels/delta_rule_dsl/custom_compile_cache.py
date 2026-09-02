@@ -1,3 +1,4 @@
+import functools
 import os
 import tempfile
 import warnings
@@ -94,11 +95,15 @@ class KeyedCompileMixin:
         return compile_key
 
 
+@functools.cache
+def _compile_options_tuple_key(options):
+    return tuple((type(option), option.value) for option in options)
+
+
 def _compile_options_key(options):
     if options is None:
         return None
-    options = _as_options_tuple(options)
-    return tuple((type(option), option.value) for option in options)
+    return _compile_options_tuple_key(_as_options_tuple(options))
 
 
 def _option_value(options, option_type):
@@ -176,3 +181,8 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
         _in_mem_compile_cache[cache_key] = compiled_fn
 
     return compiled_fn
+
+
+def get_cached_compile(func, compile_options=None):
+    cache_key = (func._get_compile_key(), _compile_options_key(compile_options))
+    return _in_mem_compile_cache.get(cache_key)

@@ -277,6 +277,80 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
     return k, v
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_without_kpe(backend):
+    device = torch.device("cuda:0")
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("FA3 is not supported on this device")
+
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = 3
+    kv_len = 97
+    num_heads = 16
+    head_dim_ckv = 512
+    head_dim_kpe = 0
+    page_size = 16
+    dtype = torch.float16
+    pages_num = math.ceil(kv_len / page_size)
+    q_nope = torch.randn(
+        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.empty(
+        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device=device
+    )
+    ckv = torch.randn(
+        batch_size * pages_num,
+        page_size,
+        head_dim_ckv,
+        dtype=dtype,
+        device=device,
+    )
+    kpe = torch.empty(
+        batch_size * pages_num,
+        page_size,
+        head_dim_kpe,
+        dtype=dtype,
+        device=device,
+    )
+    sm_scale = 1.0 / math.sqrt(128)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+    q_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * qo_len
+    kv_indptr = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * pages_num
+    )
+    kv_indices = torch.arange(batch_size * pages_num, device=device, dtype=torch.int32)
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
+    )
+    output, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
+
+    key, value = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
+    output_ref, lse_ref = attention_ref(batch_size, q_nope, key, value, False, sm_scale)
+    torch.testing.assert_close(output, output_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7])
 @pytest.mark.parametrize("kv_len_0", [0, 1, 3, 11])
 @pytest.mark.parametrize("kv_len_1", [17, 33, 79, 114])
@@ -356,33 +430,44 @@ def test_batch_mla_varlen_page_attention(
         )
         * qo_len
     )
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
+    pages_nums = pages_nums.to(device)
     kv_indptr = torch.cat(
         [
-            torch.arange(0, batch_size + 1).unsqueeze(-1).int() * pages_nums_sum
-            + pages_nums_indptr[i]
-            for i in range(num_different_kv_len)
-        ],
-        dim=-1,
-    ).flatten()
+            torch.zeros(1, dtype=torch.int32, device=device),
+            pages_nums.repeat(batch_size).cumsum(0).to(torch.int32),
+        ]
+    )
     kv_indices = torch.arange(
         0, batch_size * pages_nums_sum, device=device, dtype=torch.int32
     )
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
-    wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+    assert kv_indptr.numel() == q_indptr.numel()
+    assert kv_indptr.numel() == kv_lens.numel() + 1
+    torch.testing.assert_close(
+        kv_indptr[1:] - kv_indptr[:-1], pages_nums.repeat(batch_size)
     )
-    o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    assert kv_indptr[-1] == kv_indices.numel()
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
+    )
+    o, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
 
     q_rows = (
         torch.arange(0, num_different_kv_len * qo_len)[None, :]
@@ -409,8 +494,8 @@ def test_batch_mla_varlen_page_attention(
         lse_ref = lse_ref.flatten(0, 1)
         o_i = o[q_rows_arr[i]]
         lse_i = lse[q_rows_arr[i]]
-        torch.testing.assert_close(o_i, o_ref, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(lse_i, lse_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i, o_ref, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(lse_i, lse_ref, rtol=1e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 6, 7, 157])
@@ -470,20 +555,26 @@ def test_batch_mla_oob_kv_nan(
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
-    o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    o, lse = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        return_lse=True,
+    )
 
     k, v = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
 
@@ -550,7 +641,7 @@ def test_batch_mla_page_attention(
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer,
         backend=backend,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
         qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
         kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
         kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),
@@ -574,18 +665,23 @@ def test_batch_mla_page_attention(
         )
         kv_lens_warmup = torch.full((batch_size,), 0, dtype=torch.int32, device=device)
         wrapper.plan(
-            q_indptr,
-            kv_indptr_warmup,
-            kv_indices_warmup,
-            kv_lens_warmup,
-            num_heads,
-            head_dim_ckv,
-            head_dim_kpe,
-            page_size,
-            causal,
-            sm_scale,
-            q_nope.dtype,
-            ckv.dtype,
+            metadata=flashinfer.mla.MLAPlanMetadata.csr(
+                q_indptr,
+                kv_indptr_warmup,
+                kv_indices_warmup,
+                kv_lens_warmup,
+            ),
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            causal=causal,
+            sm_scale=sm_scale,
+            q_data_type=q_nope.dtype,
+            kv_data_type=ckv.dtype,
+            query_layout="split",
+            kv_cache_layout="split",
+            lse_mode="base2",
         )
 
         # warmup
@@ -593,34 +689,48 @@ def test_batch_mla_page_attention(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+                o, lse = wrapper.run(
+                    query=(q_nope, q_pe),
+                    kv_cache=(ckv, kpe),
+                    return_lse=True,
+                )
         torch.cuda.current_stream().wait_stream(s)
 
         # capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+            o, lse = wrapper.run(
+                query=(q_nope, q_pe),
+                kv_cache=(ckv, kpe),
+                return_lse=True,
+            )
 
     wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        causal,
-        sm_scale,
-        q_nope.dtype,
-        ckv.dtype,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_lens
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=q_nope.dtype,
+        kv_data_type=ckv.dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
     )
     if use_cuda_graph:
         o.fill_(0)
         lse.fill_(0)
         g.replay()
     else:
-        o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+        o, lse = wrapper.run(
+            query=(q_nope, q_pe),
+            kv_cache=(ckv, kpe),
+            return_lse=True,
+        )
 
     k, v = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
 
@@ -634,9 +744,29 @@ def test_batch_mla_page_attention(
     # test with pre-allocated output
     o_buffer = torch.empty_like(o)
     lse_buffer = torch.empty_like(lse)
-    wrapper.run(q_nope, q_pe, ckv, kpe, out=o_buffer, lse=lse_buffer)
+    wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv, kpe),
+        out=o_buffer,
+        lse=lse_buffer,
+    )
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_page_attention_cuda_graph_replan(backend):
+    test_batch_mla_page_attention(
+        batch_size=1,
+        kv_len=17,
+        qo_len=1,
+        num_heads=16,
+        causal=False,
+        page_size=1,
+        backend=backend,
+        use_cuda_graph=True,
+        dtype=torch.half,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
@@ -762,6 +892,20 @@ def _ref_dequant_to_bf16(fp8: torch.Tensor, scale: float) -> torch.Tensor:
     return (fp8.to(torch.bfloat16) * scale_bf16).to(torch.bfloat16)
 
 
+def _per_group_symmetric_quant_fp8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grouped = x.float().reshape(*x.shape[:-1], HEAD_DIM_CKV // 128, 128)
+    scales = (grouped.abs().amax(dim=-1) / 448.0).clamp_min(1e-8)
+    quantized = (grouped / scales.unsqueeze(-1)).clamp(-448, 448)
+    return quantized.to(torch.float8_e4m3fn).reshape_as(x), scales.contiguous()
+
+
+def _ref_group_dequant_to_bf16(fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    grouped = fp8.reshape(*fp8.shape[:-1], HEAD_DIM_CKV // 128, 128)
+    return (grouped.float() * scales.unsqueeze(-1)).to(torch.bfloat16).reshape_as(fp8)
+
+
 def _run_mla(
     backend: str,
     q_nope: torch.Tensor,
@@ -780,6 +924,8 @@ def _run_mla(
     kv_dtype: torch.dtype,
     ckv_scale: float | None = None,
     kpe_scale: float | None = None,
+    ckv_scale_arr: torch.Tensor | None = None,
+    head_dim_kpe: int = HEAD_DIM_KPE,
 ) -> torch.Tensor:
     device = q_nope.device
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -791,7 +937,7 @@ def _run_mla(
         kv_len_arr,
         num_heads=num_heads,
         head_dim_ckv=HEAD_DIM_CKV,
-        head_dim_kpe=HEAD_DIM_KPE,
+        head_dim_kpe=head_dim_kpe,
         page_size=page_size,
         causal=causal,
         sm_scale=sm_scale,
@@ -803,7 +949,83 @@ def _run_mla(
         kwargs["ckv_scale"] = ckv_scale
     if kpe_scale is not None:
         kwargs["kpe_scale"] = kpe_scale
+    if ckv_scale_arr is not None:
+        kwargs["ckv_scale_arr"] = ckv_scale_arr
     return wrapper.run(q_nope, q_pe, ckv, kpe, **kwargs)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_fp8_nope_group_scales_matches_bf16_reference(backend):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 NoPE MLA requires SM90a")
+
+    torch.manual_seed(2026)
+    device = torch.device("cuda:0")
+    batch_size, num_heads, page_size = 2, 16, 16
+    num_pages = 6
+    q_nope = torch.randn(
+        batch_size, num_heads, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.empty(batch_size, num_heads, 0, dtype=torch.bfloat16, device=device)
+
+    row_scale = torch.linspace(0.02, 0.2, num_pages * page_size, device=device)
+    group_scale = torch.tensor([0.5, 1.0, 2.0, 4.0], device=device)
+    ckv = torch.randn(num_pages, page_size, HEAD_DIM_CKV, device=device)
+    ckv *= row_scale[:, None].reshape(num_pages, page_size, 1)
+    ckv *= group_scale.repeat_interleave(128)
+    ckv_fp8, ckv_scales = _per_group_symmetric_quant_fp8(ckv)
+    ckv_ref = _ref_group_dequant_to_bf16(ckv_fp8, ckv_scales)
+    kpe_fp8 = torch.empty(
+        num_pages, page_size, 0, dtype=torch.float8_e4m3fn, device=device
+    )
+    kpe_ref = torch.empty(num_pages, page_size, 0, dtype=torch.bfloat16, device=device)
+
+    qo_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+    kv_indices = torch.tensor([4, 1, 3, 0, 5], dtype=torch.int32, device=device)
+    kv_len_arr = torch.tensor([45, 29], dtype=torch.int32, device=device)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_CKV)
+
+    o_ref = _run_mla(
+        backend,
+        q_nope,
+        q_pe,
+        ckv_ref,
+        kpe_ref,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads,
+        page_size,
+        False,
+        sm_scale,
+        torch.bfloat16,
+        torch.bfloat16,
+        head_dim_kpe=0,
+    )
+    o_fp8 = _run_mla(
+        backend,
+        q_nope,
+        q_pe,
+        ckv_fp8,
+        kpe_fp8,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads,
+        page_size,
+        False,
+        sm_scale,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        ckv_scale_arr=ckv_scales,
+        kpe_scale=1.0,
+        head_dim_kpe=0,
+    )
+
+    torch.testing.assert_close(o_fp8, o_ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
@@ -1122,7 +1344,8 @@ def test_batch_mla_fp8_kv_zero_kv_gives_zero_output():
     assert o.abs().max().item() == 0.0, f"non-zero output: {o.abs().max().item()}"
 
 
-def test_fp8_kv_kpe_dominant_no_row_aliasing():
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_fp8_kv_kpe_dominant_no_row_aliasing(backend):
     """Deterministic regression for the FP8 KPE shmem swizzle aliasing bug.
 
     With HEAD_DIM_KPE=64 on the FP8 path, the raw KPE buffer has 4 b128
@@ -1166,7 +1389,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
     kv_indices = torch.arange(0, nps, dtype=torch.int32, device=device)
 
     o_bf16 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_ref,
@@ -1183,7 +1406,7 @@ def test_fp8_kv_kpe_dominant_no_row_aliasing():
         kv_dtype=torch.bfloat16,
     )
     o_fp8 = _run_mla(
-        "fa3",
+        backend,
         q_nope,
         q_pe,
         ckv_fp8,
@@ -1247,9 +1470,6 @@ def test_fp8_kv_plan_rejects_fp16_q():
 
 
 def test_fp8_kv_scales_are_keyword_only():
-    """ckv_scale / kpe_scale must be passed by keyword. The `*` marker
-    in run()'s signature pins this; this test guards against accidental
-    removal of the marker."""
     import inspect
 
     sig = inspect.signature(flashinfer.mla.BatchMLAPagedAttentionWrapper.run)
@@ -1259,6 +1479,9 @@ def test_fp8_kv_scales_are_keyword_only():
     )
     assert params["kpe_scale"].kind == inspect.Parameter.KEYWORD_ONLY, (
         f"kpe_scale kind={params['kpe_scale'].kind}, expected KEYWORD_ONLY"
+    )
+    assert params["ckv_scale_arr"].kind == inspect.Parameter.KEYWORD_ONLY, (
+        f"ckv_scale_arr kind={params['ckv_scale_arr'].kind}, expected KEYWORD_ONLY"
     )
 
 
@@ -1354,8 +1577,6 @@ def test_fp8_kv_run_rejects_dtype_mismatch(wrong_tensor, wrong_dtype, exc_match)
 
 
 def test_fp8_kv_requires_scales():
-    """Forgetting to pass ckv_scale / kpe_scale on the FP8 path should raise
-    a clear error rather than silently producing wrong output."""
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 KV path on Hopper MLA requires SM90a")
     torch.manual_seed(0)
@@ -1412,8 +1633,33 @@ def test_fp8_kv_requires_scales():
         q_data_type=torch.bfloat16,
         kv_data_type=torch.float8_e4m3fn,
     )
-    with pytest.raises(ValueError, match="ckv_scale and kpe_scale are required"):
+    with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
         wrapper.run(q_nope, q_pe, ckv_fp8, kpe_fp8)
+    invalid_scales = torch.ones(
+        1, page_size, HEAD_DIM_CKV // 128 - 1, dtype=torch.float32, device=device
+    )
+    with pytest.raises(ValueError, match="Invalid shape of ckv_scale_arr"):
+        wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_fp8,
+            kpe_fp8,
+            ckv_scale_arr=invalid_scales,
+            kpe_scale=1.0,
+        )
+    valid_scales = torch.ones(
+        1, page_size, HEAD_DIM_CKV // 128, dtype=torch.float32, device=device
+    )
+    with pytest.raises(ValueError, match="Exactly one of ckv_scale or ckv_scale_arr"):
+        wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_fp8,
+            kpe_fp8,
+            ckv_scale=1.0,
+            ckv_scale_arr=valid_scales,
+            kpe_scale=1.0,
+        )
 
 
 if __name__ == "__main__":

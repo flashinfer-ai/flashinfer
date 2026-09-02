@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import jinja2
 import torch
@@ -23,6 +23,7 @@ import torch
 from .. import env as jit_env
 from ..core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
@@ -33,6 +34,7 @@ from ..utils import (
     dtype_map,
     dtype_map_kv,
     filename_safe_dtype_map,
+    filename_safe_dtype_map_kv,
     mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
@@ -40,6 +42,66 @@ from ..utils import (
 from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+
+
+class _BatchMLAModuleProxy:
+    """Stages Batch MLA planner metadata through PyTorch-owned pinned memory."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    @staticmethod
+    def _validate_workspace(
+        int_workspace: torch.Tensor, page_locked_workspace: torch.Tensor
+    ) -> None:
+        if (
+            page_locked_workspace.device.type != "cpu"
+            or not page_locked_workspace.is_pinned()
+            or not page_locked_workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "page_locked_workspace must be a pinned, contiguous CPU tensor."
+            )
+        if int_workspace.device.type != "cuda" or not int_workspace.is_contiguous():
+            raise ValueError("int_workspace must be a contiguous CUDA tensor.")
+
+    def plan_with_staged_workspace_bytes(self, *args: object) -> tuple[object, int]:
+        if (
+            len(args) < 3
+            or not isinstance(args[1], torch.Tensor)
+            or not isinstance(args[2], torch.Tensor)
+        ):
+            raise ValueError("Batch MLA plan requires integer and pinned workspaces.")
+        int_workspace = args[1]
+        page_locked_workspace = args[2]
+        self._validate_workspace(int_workspace, page_locked_workspace)
+        plan_info, staged_int_workspace_bytes = self._module.plan(*args)
+        staged_int_workspace_bytes = int(staged_int_workspace_bytes)
+        scratch_bytes = page_locked_workspace.view(torch.uint8)
+        device_bytes = int_workspace.view(torch.uint8)
+        if (
+            staged_int_workspace_bytes < 0
+            or staged_int_workspace_bytes > scratch_bytes.numel()
+            or staged_int_workspace_bytes > device_bytes.numel()
+        ):
+            raise ValueError(
+                "Batch MLA planner returned invalid "
+                f"staged_int_workspace_bytes={staged_int_workspace_bytes} for "
+                f"scratch={scratch_bytes.numel()} and device={device_bytes.numel()}."
+            )
+        staging = torch.empty(
+            staged_int_workspace_bytes, dtype=torch.uint8, pin_memory=True
+        )
+        staging.copy_(scratch_bytes[:staged_int_workspace_bytes])
+        with torch.cuda.device(int_workspace.device):
+            device_bytes[:staged_int_workspace_bytes].copy_(staging, non_blocking=True)
+        return plan_info, staged_int_workspace_bytes
+
+    def plan(self, *args: object) -> object:
+        return self.plan_with_staged_workspace_bytes(*args)[0]
 
 
 def get_single_decode_uri(
@@ -54,7 +116,7 @@ def get_single_decode_uri(
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -77,7 +139,7 @@ def get_batch_decode_uri(
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -100,12 +162,12 @@ def get_batch_mla_uri(
 ) -> str:
     return (
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
         f"head_dim_kpe_{head_dim_kpe}_"
-        f"profiler_{use_profiler}"
+        f"profiler_{use_profiler}_planabi2"
     ) + ("_sm90" if backend == "fa3" else "")
 
 
@@ -202,6 +264,7 @@ def gen_batch_mla_module(
         uri,
         source_paths,
         extra_cuda_cflags=extra_cuda_cflags,
+        post_load_adapter=_BatchMLAModuleProxy,
     )
 
 
@@ -217,7 +280,7 @@ def get_batch_decode_mla_uri(
 ) -> str:
     return (
         f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv{head_dim_ckv}_"
@@ -329,7 +392,7 @@ def get_single_prefill_uri(
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -356,7 +419,7 @@ def get_pod_uri(
 ) -> str:
     return (
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
         f"posenc_p_{pos_encoding_mode_p}_"
@@ -385,7 +448,7 @@ def get_batch_prefill_uri(
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -410,7 +473,7 @@ def get_batch_prefill_attention_sink_uri(
 ) -> str:
     return (
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -432,7 +495,7 @@ def get_batch_attention_uri(
 ) -> str:
     return (
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -1617,6 +1680,20 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if require_fp4_kv_cache:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1624,6 +1701,7 @@ def gen_customize_batch_prefill_module(
         "dtype_kv": dtype_map_kv[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
+        "require_fp4_kv_cache": require_fp4_kv_cache,
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
@@ -1708,12 +1786,17 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
+        extra_cuda_cflags = _fa2_prefill_head_dim_nvcc_flags(
+            head_dim_qk, head_dim_vo, dtype_kv
+        )
+        if kwargs["require_fp4_kv_cache"]:
+            # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
+            # when the head_dim helper returns no arch-specific flags.
+            extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
-                head_dim_qk, head_dim_vo, dtype_kv
-            ),
+            extra_cuda_cflags=extra_cuda_cflags,
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1810,7 +1893,7 @@ def get_fmha_cutlass_sm100a_uri(
     return "fmha_cutlass_sm100a"
     # return (
     #     f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-    #     f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+    #     f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
     #     f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
     #     f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
     #     f"head_dim_qk_{head_dim_qk}_"
@@ -1851,7 +1934,7 @@ def gen_fmha_cutlass_sm100a_module(
     ]
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         uri,
@@ -2030,7 +2113,10 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
     kernels = [
         "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
     ]
 

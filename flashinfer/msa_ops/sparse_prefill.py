@@ -21,12 +21,18 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
+from ._blackwell_sm100 import (
+    MSASparseAttentionWorkspace,
+    blackwell_msa_sparse_attention,
+    is_blackwell_msa_device,
+)
 from ._common import (
     _BLK_KV,
     _compile_cache,
     _cutlass_dtype,
     _fake,
     _q_offset_tensor,
+    _resolve_packed_kv,
 )
 
 
@@ -50,8 +56,9 @@ def msa_sparse_attention(
     q_offset=None,
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
+    workspace: Optional[MSASparseAttentionWorkspace] = None,
 ):
-    """Minimax Sparse Attention forward (prefill) for SM120/SM121.
+    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -63,6 +70,8 @@ def msa_sparse_attention(
     Packed NVFP4 stores two values per byte, so its K/V last dimension is
     ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
     ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
+    Packed NVFP4 is SM120/SM121-only; compute capability 10.0/10.3 supports
+    bf16/fp16 K/V and E4M3 K/V with bf16 Q, and requires ``topk == 16``.
 
     Parameters
     ----------
@@ -92,7 +101,11 @@ def msa_sparse_attention(
     page_table : Optional[torch.Tensor], default=None
         Enables the paged-KV path. ``page_table`` has shape
         ``(batch_size, max_pages)`` and maps batch-local KV block indices to
-        pages. Requires ``seqused_k``.
+        pages. Requires ``seqused_k``. ``k``/``v`` may also be views split
+        from a cache that packs K and V in one ``2 * head_dim`` content dim
+        per token on SM120/SM121 (see ``supports_packed_kv``). Compute
+        capability 10.0/10.3 requires separate contiguous K and V tensors and
+        never copies packed views implicitly.
     seqused_k : Optional[torch.Tensor], default=None
         Int32 tensor of shape ``(batch_size,)`` giving the valid KV length per
         sequence in the paged path.
@@ -105,14 +118,18 @@ def msa_sparse_attention(
         :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
         swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
         multiple of 128). Scale rows follow ``(token, head)`` order for flat K
-        and ``(page, head, token)`` order for paged K.
+        and ``(page, head, token)`` order for paged K. Packed NVFP4, and thus
+        this argument, is supported only on SM120/SM121.
     v_scale : Optional[torch.Tensor], default=None
         NVFP4 block scales for V, with the same dtype, layout, and row-order
         contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
-        Per-tensor NVFP4 global dequantization scale for K.
+        Global dequant scale for K; folds into the softmax scale (NVFP4 K
+        only). SM100/SM103 prefill does not support global K/V scales.
     v_global_scale : Optional[float], default=None
-        Per-tensor NVFP4 global dequantization scale for V.
+        Global dequant scale applied to the output on SM120/SM121, for any KV
+        dtype (e.g. an fp8 per-tensor V descale). SM100/SM103 prefill does not
+        support global K/V scales.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False
@@ -120,6 +137,11 @@ def msa_sparse_attention(
         value is ``(out, lse, lse_t)``.
     lse_temperature_scale : float, default=1.0
         Scale applied to the exponent when computing temperature LSE.
+    workspace : MSASparseAttentionWorkspace, optional
+        Caller-owned storage required for CUDA graph capture on compute
+        capability 10.0/10.3. Warm the workspace eagerly with the exact
+        tensors, options, and capture stream before capture. It is not used by
+        the SM120/SM121 backend.
 
     Returns
     -------
@@ -131,6 +153,33 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if is_blackwell_msa_device(q.device):
+        return blackwell_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            workspace=workspace,
+        )
+    if workspace is not None:
+        raise ValueError(
+            "MSASparseAttentionWorkspace is only used by the compute "
+            "capability 10.0/10.3 backend"
+        )
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
             "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
@@ -209,9 +258,9 @@ def msa_sparse_attention(
     for name, t in (("k", k), ("v", v), ("q2k_indices", q2k_indices)):
         if t.device != q.device:
             raise ValueError(f"{name} must be on the same device as q ({q.device})")
-    for name, t in (("q", q), ("k", k), ("v", v)):
-        if not t.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
+    if not q.is_contiguous():
+        raise ValueError("q must be contiguous")
+    packed_kv = _resolve_packed_kv(k, v, head_dim, paged=paged, kv_nvfp4=kv_nvfp4)
 
     dev = q.device
     cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
@@ -239,6 +288,7 @@ def msa_sparse_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         v_global_scale=v_global_scale,
+        packed_kv=packed_kv,
     )
 
 
@@ -394,6 +444,7 @@ def _msa_sparse_prefill(
     k_scale=None,
     v_scale=None,
     v_global_scale=None,
+    packed_kv=None,
 ):
     """Union-tile prefill path. See
     :class:`...cute_dsl.sparse_prefill_sm12x.SparsePrefillSm12x`."""
@@ -418,7 +469,9 @@ def _msa_sparse_prefill(
         ksf_dev = k_scale.reshape(-1).contiguous()
         vsf_dev = v_scale.reshape(-1).contiguous()
     else:
-        k_pass, v_pass = k, v
+        # Packed K/V views: the kernel gets the whole packed 5-D cache as
+        # both arguments and picks the K/V plane itself.
+        k_pass, v_pass = (k, v) if packed_kv is None else (packed_kv[0], packed_kv[0])
         ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
         vsf_dev = ksf_dev
     # V's global scale is applied to the output here, since prefill has no combine
@@ -446,6 +499,7 @@ def _msa_sparse_prefill(
     lse2 = _lse_buf(need_lse)
     lse2_t = _lse_buf(return_temperature_lse)
 
+    kv_stride_order = None if packed_kv is None else packed_kv[1]
     key = (
         "sparse_prefill",
         str(q.dtype),
@@ -459,6 +513,7 @@ def _msa_sparse_prefill(
         kv_nvfp4,
         need_lse,
         return_temperature_lse,
+        kv_stride_order,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -469,7 +524,12 @@ def _msa_sparse_prefill(
         f32 = _cutlass_dtype(torch.float32)
         s = [cute.sym_int() for _ in range(19)]
         kv_last = k_pass.shape[-1]  # head_dim (bf16/fp8) or 16 int32 words (NVFP4)
-        kv_shape = (s[9], s[10], _BLK_KV, kv_last) if paged else (s[2], s[3], kv_last)
+        if kv_stride_order is not None:
+            kv_shape = (s[9], s[10], _BLK_KV, 2, kv_last)
+        elif paged:
+            kv_shape = (s[9], s[10], _BLK_KV, kv_last)
+        else:
+            kv_shape = (s[2], s[3], kv_last)
         kernel_obj = SparsePrefillSm12x(
             head_dim=head_dim,
             m_block_size=m_block,
@@ -482,12 +542,13 @@ def _msa_sparse_prefill(
             paged=paged,
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
+            kv_packed=kv_stride_order is not None,
         )
         compiled = cute.compile(
             kernel_obj,
             _fake(cdt, (s[0], s[1], head_dim)),
-            _fake(kdt, kv_shape),
-            _fake(kdt, kv_shape),
+            _fake(kdt, kv_shape, stride_order=kv_stride_order),
+            _fake(kdt, kv_shape, stride_order=kv_stride_order),
             _fake(u8, (s[13],), align=4),
             _fake(u8, (s[14],), align=4),
             _fake(cdt, (s[0], s[1], head_dim)),

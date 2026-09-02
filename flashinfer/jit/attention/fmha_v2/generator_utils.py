@@ -680,6 +680,7 @@ flash_attention_kernel_template = """\
 #endif // disable_fadd_trick
 
 #include <cuda.h>
+#include <stdexcept>
 
 #if CUDA_VERSION >= {min_cuda_version}
 
@@ -846,6 +847,8 @@ void {launcher_name}_nl(
                                            smem_size));
     }}
     {causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Causal attention mask is not compiled for this FMHAv2 kernel");
 #endif // causal mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
 #if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
@@ -855,6 +858,9 @@ void {launcher_name}_nl(
                                         smem_size));
     }}
     {sliding_or_chunked_causal_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error(
+        "Sliding/chunked causal attention mask is not compiled for this FMHAv2 kernel");
 #endif // sliding_or_chunked_causal_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::PADDING ) {{
 #if {padding_mask} // padding_mask
@@ -864,6 +870,8 @@ void {launcher_name}_nl(
                                            smem_size));
     }}
     {kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Padding attention mask is not compiled for this FMHAv2 kernel");
 #endif // padding_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::CUSTOM_MASK ) {{
 #if {custom_mask} // custom_mask
@@ -873,7 +881,11 @@ void {launcher_name}_nl(
                                            smem_size));
     }}
     {custom_mask_kernel_name}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Custom attention mask is not compiled for this FMHAv2 kernel");
 #endif // custom mask
+  }} else {{
+    throw std::runtime_error("Unsupported FMHAv2 attention mask type");
   }}
 }}
 
@@ -999,6 +1011,8 @@ void {launcher_name}_nl_tiled(
                                            smem_size));
     }}
     {causal_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Causal attention mask is not compiled for this FMHAv2 kernel");
 #endif // causal mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL ) {{
 #if {sliding_or_chunked_causal_mask} // sliding_or_chunked_causal_mask
@@ -1008,6 +1022,9 @@ void {launcher_name}_nl_tiled(
                                         smem_size));
     }}
     {sliding_or_chunked_causal_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error(
+        "Sliding/chunked causal attention mask is not compiled for this FMHAv2 kernel");
 #endif // sliding_or_chunked_causal_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::PADDING ) {{
 #if {padding_mask} // padding_mask
@@ -1017,6 +1034,8 @@ void {launcher_name}_nl_tiled(
                                            smem_size));
     }}
     {kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Padding attention mask is not compiled for this FMHAv2 kernel");
 #endif // padding_mask
   }} else if( launch_params.attention_mask_type == Attention_mask_type::CUSTOM_MASK ) {{
 #if {custom_mask} // custom_mask
@@ -1026,7 +1045,11 @@ void {launcher_name}_nl_tiled(
                                            smem_size));
     }}
     {custom_mask_kernel_name}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>({params_str});
+#else
+    throw std::runtime_error("Custom attention mask is not compiled for this FMHAv2 kernel");
 #endif // custom mask
+  }} else {{
+    throw std::runtime_error("Unsupported FMHAv2 attention mask type");
   }}
 }}
 
@@ -5535,6 +5558,9 @@ def enumerate_qmma_flash_kernels(
         (160, (64, 32), 0),
         (192, (64, 32), 0),
         (256, (64, 32), 0),
+        # Standard self-attention with separate Q/K/V tensors.
+        ((64, 64), (64, 64), 1),
+        ((128, 128), (64, 64), 1),
         # MLA kernels.
         ((192, 128), (64, 64), 1),
         ((576, 512), (64, 64), 1),
@@ -5558,8 +5584,13 @@ def enumerate_qmma_flash_kernels(
         # skip if head_size is not in head_sizes
         if head_sizes is not None and head_size not in head_sizes:
             continue
-        # skip if head_size_v is not 128 for separate-q-k-v
-        if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v != 128:
+        # Separate Q/K/V supports standard 64/64 and 128/128 attention plus
+        # the existing MLA specializations with V dimension 128 or 512.
+        if input_layout == InputLayout.SEPARATE_Q_K_V and head_size_v not in (
+            64,
+            128,
+            512,
+        ):
             continue
         specs.append(
             kernel_spec(
