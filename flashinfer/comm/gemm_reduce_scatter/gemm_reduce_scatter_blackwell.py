@@ -704,7 +704,6 @@ def run_blackwell_gemm_rs_with_kernel(
     *,
     kernel_cls,
     workspace: BlackwellGemmRSWorkspace,
-    stream: cuda.CUstream | None = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """Run one Blackwell CUTLASS GEMM+RS call using a supplied kernel class.
@@ -721,12 +720,13 @@ def run_blackwell_gemm_rs_with_kernel(
         raise NotImplementedError("Blackwell GEMM+RS requires SM >= 100.")
 
     M, K_local, N, world_size = _validate_run_inputs(X_local, W_local, group, workspace)
+    stream = _current_cu_stream()
     config = workspace.config
     effective_b_layout = _resolve_b_layout(W_local, config)
     workspace.last_b_layout = effective_b_layout
     if effective_b_layout == "staged":
         workspace.get_w_staging()
-    profile = os.environ.get("FLASHINFER_GRS_PROFILE") == "1"
+    debug_timing = _env_flag("FLASHINFER_GRS_DEBUG")
     workspace.reset()
 
     profile_copy_ms = None
@@ -734,7 +734,7 @@ def run_blackwell_gemm_rs_with_kernel(
     profile_compile_ms = None
     key = _compile_key(X_local, W_local, workspace, kernel_cls, effective_b_layout)
     cache_hit = workspace._compiled_key == key and workspace._compiled_gemm is not None
-    if profile:
+    if debug_timing:
         copy_start = torch.cuda.Event(enable_timing=True)
         copy_end = torch.cuda.Event(enable_timing=True)
         copy_start.record()
@@ -751,12 +751,10 @@ def run_blackwell_gemm_rs_with_kernel(
             )
         else:
             b_tensor = make_b_tensor_nocopy(W_local)
-    if profile:
+    if debug_timing:
         copy_end.record()
         torch.cuda.synchronize()
         profile_copy_ms = copy_start.elapsed_time(copy_end)
-    if stream is None:
-        stream = _current_cu_stream()
 
     if not cache_hit:
         gemm = _make_kernel(kernel_cls, config)
@@ -790,7 +788,7 @@ def run_blackwell_gemm_rs_with_kernel(
     compiled_gemm = workspace._compiled_gemm
     if compiled_gemm is None:
         raise RuntimeError("Blackwell GEMM+RS compilation did not produce a kernel.")
-    if profile:
+    if debug_timing:
         kernel_start = torch.cuda.Event(enable_timing=True)
         kernel_end = torch.cuda.Event(enable_timing=True)
         kernel_start.record()
@@ -804,12 +802,12 @@ def run_blackwell_gemm_rs_with_kernel(
         barrier_flag=workspace.barrier_flag,
         barrier_flag_mc=workspace.barrier_flag_mc,
     )
-    if profile:
+    if debug_timing:
         kernel_end.record()
         torch.cuda.synchronize()
         profile_kernel_ms = kernel_start.elapsed_time(kernel_end)
         print(
-            "[run_blackwell_gemm_rs_with_kernel profile] "
+            "[flashinfer_grs_debug:timing] "
             f"rank={dist.get_rank(group)} copy_ms={profile_copy_ms:.6f} "
             f"kernel_ms={profile_kernel_ms:.6f} "
             f"compiled={profile_compile_ms is not None} "

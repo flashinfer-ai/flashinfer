@@ -204,6 +204,22 @@ correctness calls to exercise barrier-flag reuse. `--stress-pointer-pool > 1`
 rotates distinct `X/W` tensor allocations to exercise compiled-cache
 invalidation when activation or weight pointers change.
 
+## Debugging and Profiling
+
+`FLASHINFER_GRS_DEBUG=1` enables GEMM+RS diagnostics:
+
+- NVSHMEM world/node/shared team metadata during workspace construction;
+- per-rank staged-copy, kernel, and first-use compilation timing.
+
+The timing path records CUDA events and synchronizes the device around each
+measurement. It changes execution timing and must remain disabled for benchmark
+or production performance measurements.
+
+This flag does not enable Nsight Systems or Nsight Compute capture. FlashInfer
+benchmarks conventionally expose a `--profile-cuda` mode that brackets selected
+launches with `cudaProfilerStart/Stop`; adding that capture mode to the
+distributed GEMM+RS benchmark is separate from library debug timing.
+
 ## Production Readiness Completed
 
 - No-copy is the default B layout. Native `[K,N]` stride, dtype, pointer, and

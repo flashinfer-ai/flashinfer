@@ -24,6 +24,7 @@ import multiprocessing as mp
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -62,7 +63,13 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def multi_process_parallel(world_size: int, target, target_args: tuple = ()) -> None:
+def multi_process_parallel(
+    world_size: int,
+    target,
+    target_args: tuple = (),
+    *,
+    timeout_s: float = 300.0,
+) -> None:
     """Launch world_size processes, each calling target(world_size, rank, port, *target_args)."""
     mp.set_start_method("spawn", force=True)
     # Ensure the repo root is on PYTHONPATH so spawn'd processes can import
@@ -84,11 +91,51 @@ def multi_process_parallel(world_size: int, target, target_args: tuple = ()) -> 
         )
         proc.start()
         procs.append(proc)
-    for rank, proc in enumerate(procs):
-        proc.join()
-        assert proc.exitcode == 0, (
-            f"Process {rank} failed with exit code {proc.exitcode}"
+
+    deadline = time.monotonic() + timeout_s
+    failure = None
+    while True:
+        failed = [
+            (rank, proc.exitcode)
+            for rank, proc in enumerate(procs)
+            if proc.exitcode not in (None, 0)
+        ]
+        if failed:
+            failure = f"Worker process failure(s): {failed}"
+            break
+        if all(proc.exitcode == 0 for proc in procs):
+            break
+        if time.monotonic() >= deadline:
+            alive_ranks = [rank for rank, proc in enumerate(procs) if proc.is_alive()]
+            failure = (
+                f"Worker processes exceeded {timeout_s:.1f}s timeout; "
+                f"still alive ranks: {alive_ranks}"
+            )
+            break
+        time.sleep(0.1)
+
+    if failure is not None:
+        original_status = [
+            (rank, proc.exitcode, proc.is_alive()) for rank, proc in enumerate(procs)
+        ]
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        cleanup_deadline = time.monotonic() + 10.0
+        for proc in procs:
+            proc.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        for proc in procs:
+            if proc.is_alive():
+                proc.kill()
+        for proc in procs:
+            proc.join(timeout=1.0)
+        pytest.fail(
+            f"{failure}; worker status before cleanup: {original_status}",
+            pytrace=False,
         )
+
+    for proc in procs:
+        proc.join(timeout=0)
 
 
 # ---------------------------------------------------------------------------
