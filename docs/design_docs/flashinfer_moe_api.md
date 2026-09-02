@@ -697,6 +697,30 @@ Key mechanisms (and where they live):
   capabilities; unsupported pairs are filtered before build and direct-runner
   calls raise a specific `NotImplementedError`.
 - **Runners delegate** to canonical inner runners (`CuteDslFusedMoERunner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+- **Direct-runner packed-call lifetime.** Preserve the exact object returned by
+  `runner.pack_inputs(...)` until `runner.forward(...)`; TRTLLM runners attach
+  immutable per-call launch state and a matching tuning config to that list
+  subclass. Direct forward recovers the metadata from the packed object:
+
+  ```python
+  inputs = runner.pack_inputs(act, weights)
+  out = runner.forward(inputs, tactic=-1)
+  ```
+
+  Do not replace `inputs` with `list(inputs)` or a slice. Callers that invoke
+  the autotuner directly must carry the metadata explicitly because profiling
+  synthesizes ordinary tensor lists:
+
+  ```python
+  _, tactic = tuner.choose_one(
+      custom_op=f"moe_{runner.backend_key}",
+      runners=[runner],
+      tuning_config=runner.tuning_config_for(inputs),
+      inputs=inputs,
+      **runner.launch_kwargs_for(inputs),
+  )
+  out = runner.forward(inputs, tactic=tactic)
+  ```
 
 ### Typed activation values and backend parity
 
