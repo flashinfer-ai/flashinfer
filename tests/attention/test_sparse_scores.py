@@ -158,9 +158,11 @@ def test_scores_match_a_torch_reference(dtype, head_dim, num_heads):
 
 @requires_cuda_sm80
 @pytest.mark.parametrize("rows", [1, 96])
-def test_scores_match_a_torch_reference_across_launch_shapes(rows):
-    """One row does not fill the device and takes the deeper staging shape;
-    many rows take the wider one."""
+def test_scores_match_a_torch_reference_across_row_counts(rows):
+    """One row leaves most of the grid empty and 96 do not. Both take the
+    single-tile launch on any device this runs on -- which of the two shapes a
+    launch picks is pinned by the test below, against the reference this one
+    establishes."""
     q, k_cache, table, t2r, pos, lens = _scores_case(rows=rows, pages=8)
     divisor = q.shape[2] ** 0.5
     columns = table.shape[1] * k_cache.shape[1]
@@ -176,23 +178,23 @@ def test_scores_match_a_torch_reference_across_launch_shapes(rows):
 
 @requires_cuda_sm80
 def test_scores_agree_between_a_block_per_tile_and_a_block_per_eight():
-    """Several waves of blocks switch the launch from one column tile per block
-    to eight, which stages a feature slice at a time and runs the copies for the
-    next tile while the current one multiplies. A single row is one wave at
-    most, so scoring the rows one at a time takes the other shape; the two have
-    to agree column for column.
+    """Enough blocks switches the launch from one column tile per block to
+    eight, which stages a feature slice at a time and runs the copies for the
+    next tile while the current one multiplies. Scoring the rows one at a time
+    is eight blocks a launch and takes the other shape; the two have to agree
+    column for column.
 
-    The row count is taken from the device so the two sides really do land on
-    opposite sides of the switch: the kernel turns over at four waves, and a
-    block never holds more than 32 warps, so eight rows per SM is past it on any
-    part.
+    The row count comes from the device so the two sides really do land on
+    opposite sides of the switch, which is at 24 blocks per SM. This case is 512
+    columns, so eight blocks a row: four rows per SM is 32 blocks per SM, past
+    it on any part, and one row is eight blocks in total, under it on any part.
 
     The reference the single-tile shape is checked against is the torch one
     above; this pins the pipelined shape to it without paying for a python loop
     over every column of every row.
     """
     pages = 64
-    rows = 8 * torch.cuda.get_device_properties(DEV).multi_processor_count
+    rows = 4 * torch.cuda.get_device_properties(DEV).multi_processor_count
     q, k_cache, table, t2r, pos, lens = _scores_case(rows=rows, pages=pages)
     divisor = q.shape[2] ** 0.5
     columns = table.shape[1] * k_cache.shape[1]
