@@ -981,6 +981,10 @@ struct MkeyGeometry {
   uint64_t pitch = 0;
 };
 
+// A mode fixes more than the output shape: it also fixes which end of the
+// transfer is interleaved, and so which MKeys exist. Every function branching
+// on one owes all three answers, so the two that can fail closed do rather
+// than let an unhandled mode take a branch meant for another.
 inline MkeyGeometry GetMkeyGeometry(int mode, int64_t batch, int64_t seq, int64_t heads,
                                     int64_t dim, int64_t element_size, int world_size) {
   int64_t rows = 0;
@@ -990,16 +994,34 @@ inline MkeyGeometry GetMkeyGeometry(int mode, int64_t batch, int64_t seq, int64_
     rows = batch * seq;
     width = (heads / world_size) * dim * element_size;
     pitch = heads * dim * element_size;
-  } else {
+  } else if (mode == 1) {
     rows = batch * (seq / world_size);
     width = heads * dim * element_size;
     pitch = heads * world_size * dim * element_size;
+  } else {
+    TVM_FFI_ICHECK_EQ(mode, 2) << "unhandled PCIe Ulysses mode " << mode;
+    // Equal-length contiguous chunks: peer r owns [r * chunk, (r + 1) * chunk).
+    // No MKey is configured from this -- exchange only cross-checks it against
+    // the per-peer payload -- which is what frees a chunk from the 16-bit
+    // bytes_count above. ValidateGeometry pins the operand to
+    // [1, 1, world_size, chunk], so one "head" is one peer's chunk.
+    rows = 1;
+    width = dim * element_size;
+    pitch = width;
   }
   TVM_FFI_ICHECK_LE(rows, UINT32_MAX) << "mlx5 MKey row count exceeds UINT32_MAX";
   TVM_FFI_ICHECK_LE(width, UINT32_MAX) << "mlx5 MKey width exceeds UINT32_MAX";
   TVM_FFI_ICHECK_LE(width, pitch) << "mlx5 MKey width exceeds pitch";
-  TVM_FFI_ICHECK_LE(pitch, kMaxInterleavedStride)
-      << "mlx5 MKey pitch exceeds the 65535-byte interleaved-stride limit";
+  // bytes_count and bytes_skip share a 16-bit pair in the UMR repeat entry, and
+  // pitch bounds both at once (width <= pitch, skip = pitch - width), so one
+  // check does for both. A single row needs no skip but still needs its width
+  // to fit, which is why the bound holds whatever the row count is: measured
+  // here, 65535 bytes per peer crosses and 65536 returns a local protection
+  // error.
+  if (rows > 1) {
+    TVM_FFI_ICHECK_LE(pitch, kMaxInterleavedStride)
+        << "mlx5 MKey pitch exceeds the 65535-byte interleaved-stride limit";
+  }
   const int64_t skip = pitch - width;
   TVM_FFI_ICHECK_LE(skip, UINT32_MAX) << "mlx5 MKey skip exceeds UINT32_MAX";
   return {static_cast<uint32_t>(rows), static_cast<uint32_t>(width), static_cast<uint32_t>(skip),
@@ -1201,6 +1223,10 @@ inline void BindGeometry(Transport* transport, Buffer* buffer, int64_t mode, int
   buffer->element_size = element_size;
   buffer->output_bytes = output_bytes;
   if (!transport->use_rdma) return;
+  // Chunk exchange has no interleaved side at all -- both the local read and
+  // the remote write are contiguous per peer -- so it registered no MKeys and
+  // has nothing to rebind.
+  if (buffer->mode == 2) return;
   // Runs only inside exchange()'s hybrid failure envelope: the outer catch
   // must publish the group abort before quiescing partially posted UMR work,
   // so do not wrap this in RetireOnFailure.
