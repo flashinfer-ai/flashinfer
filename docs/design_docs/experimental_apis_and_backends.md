@@ -132,6 +132,18 @@ Every experimental feature must include:
 
 Experimental tests run in a separate CI lane and must pass for PRs that modify the feature.
 
+The PR declares which targets that lane runs, in a fenced `experimental-tests` block in the PR body (see `.github/pull_request_template.md`):
+
+```
+​```experimental-tests
+tests/experimental/test_my_backend.py
+​```
+```
+
+The declaration is required, and targets must live under `tests/experimental/`. Running the whole tree is permitted but gets slower and less relevant to any one change as the track grows, so authors should declare the narrowest scope that covers the change. `scripts/pr_checks/experimental_test_scope.py` parses and validates the block and emits a `TEST_PATH` (`--test-path`), the value both CI systems already accept — GitHub via the `run-ci` label or `@flashinfer-bot run`, GitLab via `/bot run TEST_PATH` — so neither lane reimplements the parsing, and a reviewer triggering a run by hand can paste the same value. Narrowing the scope reduces what runs within each GPU/toolkit matrix cell; it does not change the matrix itself.
+
+The two trigger paths are asymmetric, and that is why the declaration lives in the PR body. GitLab's `/bot run TEST_PATH` carries the target inline, so a reviewer can already scope a run by hand. GitHub's triggers — the `run-ci` label and `@flashinfer-bot run` — carry no argument, so a GitHub run has no other channel for learning what to test. Reading the declared block is what lets the same targeted run happen on both.
+
 Changes under `flashinfer.experimental` receive narrower review focused on eligibility, correctness, containment, licensing, and obvious safety or maintainability risks.
 
 Changes to core follow the normal core review process. Reviewers should verify that integration is explicit, stable behavior is unchanged by default, and backend-specific logic has not leaked into core.

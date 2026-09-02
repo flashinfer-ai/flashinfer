@@ -35,6 +35,15 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
   - [ ] Core changes are limited to a thin entry point (signature, shared validation, feature-gate check, backend selection, handoff).
   - [ ] Tests live in `tests/experimental/` and were validated on the intended hardware; a runnable example is included.
   - [ ] Nothing is registered in `flashinfer/aot.py`, and all experimental behavior is gated behind `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`.
+  - [ ] **Test scope declared below.** The experimental CI lane runs exactly these targets, so keep them as narrow as the change allows.
+
+<!-- Required for experimental PRs. One pytest target per line: a directory, a file, or file::test.
+     Paths must be under tests/experimental/. Do not delete the fence or change its `experimental-tests`
+     tag — CI reads this block verbatim. Declaring the whole tree is allowed but defeats the purpose. -->
+
+```experimental-tests
+tests/experimental/
+```
 
 ## Reviewer Notes
 
