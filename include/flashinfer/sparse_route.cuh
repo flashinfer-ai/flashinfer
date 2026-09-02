@@ -47,14 +47,24 @@ constexpr uint32_t kNarrowThreads = 256;
 // this GPU, so ask the driver rather than carry a number measured on one
 // architecture. Half a wave of blocks is where the narrow shape's extra blocks
 // stop buying anything.
+//
+// Neither the multiprocessor count nor the occupancy of a given kernel changes
+// between calls on one device, and a route launch is short enough that asking
+// the driver three times for them is a measurable part of it. They are kept per
+// device, and the template gives each kernel its own copy.
 template <typename KernelFn>
 inline cudaError_t choose_wide(KernelFn wide_kernel, uint32_t threads, uint32_t wide_blocks,
                                bool* wide) {
-  int dev_id = 0, num_sms = 0, blocks_per_sm = 0;
+  int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, wide_kernel,
-                                                                     static_cast<int>(threads), 0));
+  static thread_local int cached_dev = -1;
+  static thread_local int num_sms = 0, blocks_per_sm = 0;
+  if (cached_dev != dev_id) {
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, wide_kernel, static_cast<int>(threads), 0));
+    cached_dev = dev_id;
+  }
   *wide = num_sms == 0 || blocks_per_sm == 0 ||
           wide_blocks >= static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(blocks_per_sm) / 2;
   return cudaSuccess;
