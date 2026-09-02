@@ -67,7 +67,13 @@ def _load_flashinfer_transformer(
     )
     transformer = transformer.to(dtype=dtype).eval()
     if prepare_weights:
-        transformer.prepare_weights()
+        # Use a reusable workspace buffer to avoid per-call allocations in FP4 GEMM.
+        if torch.cuda.is_available():
+            ws_size = 1 << 20  # 1 MB workspace, adjust based on needs
+            workspace = torch.empty(ws_size, dtype=torch.uint8, device='cuda')
+        else:
+            workspace = None
+        transformer.prepare_weights(workspace=workspace)
     return transformer
 
 
