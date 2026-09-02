@@ -58,6 +58,9 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
   TVM_FFI_ICHECK_GT(compress_ratio, 0) << "compress_ratio must be positive";
   TVM_FFI_ICHECK_GT(divisor, 0.0) << "divisor must be positive";
   TVM_FFI_ICHECK_EQ(k_cache.size(2), head_dim) << "cache and query head_dim must match";
+  // A page holds at least one entry: the kernel divides a column by this to
+  // reach its page, and a cache with no pages at all is still a page size.
+  TVM_FFI_ICHECK_GT(k_cache.size(1), 0) << "a page holds at least one entry";
   TVM_FFI_ICHECK_EQ(logits.size(0), rows);
   TVM_FFI_ICHECK_EQ(token_to_req.size(0), rows);
   TVM_FFI_ICHECK_EQ(query_positions.size(0), rows);
