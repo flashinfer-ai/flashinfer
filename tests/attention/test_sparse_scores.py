@@ -360,3 +360,41 @@ def test_scores_leave_the_columns_past_a_row_alone():
         torch.testing.assert_close(
             got[row, :seen], want[row, :seen], rtol=2e-2, atol=2e-2
         )
+
+
+# Values that do not fit an int32. The index tensors may be int64 and the kernel
+# narrows, so a wrapped one must not become a valid request, position or page:
+# 2^32 exactly wraps to zero, which would read request zero or page zero.
+_PAST_INT32 = [2147483648, 4294967296, 9223372036854775807, -2147483649]
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("bad", _PAST_INT32)
+@pytest.mark.parametrize("field", ["token_to_req", "positions", "page_table"])
+def test_scores_do_not_wrap_an_index_that_is_not_an_int32(field, bad):
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    table, t2r, pos, lens = (t.long() for t in (table, t2r, pos, lens))
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    if field == "token_to_req":
+        t2r = t2r.clone()
+        t2r[0] = bad
+    elif field == "positions":
+        pos = pos.clone()
+        pos[0] = bad
+    else:
+        table = table.clone()
+        table[0, 0] = bad
+
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, num_columns=columns
+    )
+    torch.cuda.synchronize()
+    if field == "page_table":
+        # The entry maps nothing, so its page's columns are unselectable.
+        page_size = k_cache.shape[1]
+        assert torch.isinf(got[:, :page_size]).all()
+    else:
+        # The row carries no request it can resolve, so it sees nothing and is
+        # left as the caller passed it.
+        assert int(got_visible[0]) == 0
