@@ -505,14 +505,52 @@ def _resolve_cpb(
     )
     cpb = _cpb_hot_cache.get(hot_key)
     if cpb is None:
-        cpb = _cpb.select_cpb(
-            num_tokens,
-            num_heads,
-            topk,
-            extra_topk,
-            c,
-            chunk_width=_cpb._CHUNK_WIDTH[cpb_family],
-        )
+        cpb = _cpb.get_cpb_override(device, cpb_family, num_heads, topk, num_tokens)
+        if (
+            cpb is None
+            and tuning
+            and not skipped
+            # Refinement measures single-cache shapes only; dual-cache picks
+            # stay on the model (their measured pick error is within ~6%).
+            and extra_topk == 0
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from ._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+            try:
+                cpb = _cpb.refine_cpb(
+                    _get_sparse_mla_sm120_decode_module,
+                    cpb_family,
+                    device,
+                    c,
+                    num_tokens,
+                    num_heads,
+                    topk,
+                )
+            except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                logger.warning(
+                    "SM120 sparse-MLA %s cpb refinement failed at T=%d H=%d "
+                    "topk=%d (%s); using the model pick.",
+                    cpb_family,
+                    num_tokens,
+                    num_heads,
+                    topk,
+                    e,
+                )
+                cpb = None
+            else:
+                _cpb.save_cpb_override(
+                    device, cpb_family, num_heads, topk, num_tokens, cpb
+                )
+        if cpb is None:
+            cpb = _cpb.select_cpb(
+                num_tokens,
+                num_heads,
+                topk,
+                extra_topk,
+                c,
+                chunk_width=_cpb._CHUNK_WIDTH[cpb_family],
+            )
         _cpb_hot_cache[hot_key] = cpb
     return cpb
 

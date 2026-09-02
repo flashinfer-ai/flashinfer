@@ -54,6 +54,12 @@ version 1; only current-schema files load — files at any other version count
 as absent, so their families recalibrate on the next tuning-mode pass). The
 runtime decode/prefill routing in :mod:`._sparse_mla_sm120` consults it;
 absent entries keep the historical decode-first policy.
+
+Finally, tuning-mode decode-form calls refine the model's cpb pick for the
+exact shape being warmed (:func:`refine_cpb`): the pick +/- a small candidate
+window is timed and the measured best persists as a per-shape override. The
+model remains the proposal and the fallback for every shape never warmed
+(off-grid ``num_heads``, dual-cache calls, non-tuning processes).
 """
 
 from __future__ import annotations
@@ -90,9 +96,15 @@ _CHUNK_WIDTH = {"dsv4": 64, "dsv3_2": 64, "glm53_nope": 64, "dots3_swa": 32}
 
 # Device-level key in the JSON payload holding the crossover table.
 _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
+# Device-level key holding measured per-shape cpb picks (refine_cpb).
+_CPB_OVERRIDES_KEY = "cpb_overrides"
 # Probe grid and decode-wins margin for crossover calibration.
 _CROSSOVER_PROBED_T = (4, 8, 16, 24, 32, 48, 64)
 _CROSSOVER_MARGIN = 0.95
+# refine_cpb times the model pick +- this many cpb candidates and keeps the
+# measured best; the window covers every model-vs-oracle gap observed in the
+# kernel-bench sweep matrix (max distance 6 at mid-T wave-quantization rows).
+_REFINE_WINDOW = 6
 
 # (num_tokens, num_heads, topk, chunks_per_block); see calibrate().
 _MEASUREMENTS = (
@@ -141,7 +153,13 @@ _MEASUREMENTS_DOTS3_SWA = (
 _POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is HBM-faithful
 _POOL_BYTES_MIN = 512 << 20
 _WARMUP_ITERS = 3
-_TIMED_ITERS = 10
+# Batched timing (_time_call_fresh_indices): batches per measurement, and the
+# per-batch call-count floor/cap around the L2 reuse-distance sizing. The cap
+# must stay above L2/min-footprint (T=4, topk=128 ~ 0.3 MiB -> ~400 calls)
+# or small-footprint probes would go L2-warm across batches.
+_TIMED_BATCHES = 5
+_MIN_BATCH_CALLS = 8
+_MAX_BATCH_CALLS = 1024
 
 
 class CalibrationError(RuntimeError):
@@ -326,58 +344,61 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
     return kv_cache, kv_cache.shape[0] * 64
 
 
-def _time_call(call: Callable[[], None]) -> float:
-    """Min CUDA-event wall time (seconds) over warmup + timed iterations."""
-    for _ in range(_WARMUP_ITERS):
-        call()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    best = float("inf")
-    for _ in range(_TIMED_ITERS):
-        start.record()
-        call()
-        end.record()
-        torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(end) / 1e3)
-    return best
-
-
 def _time_call_fresh_indices(
     call: Callable[[torch.Tensor], None],
     num_tokens: int,
     topk: int,
     num_slots: int,
     device: torch.device,
+    bytes_per_token: int,
 ) -> float:
-    """Like :func:`_time_call`, but every rep (warmup included) gets a freshly
-    drawn full-pool uniform index set.
+    """Steady-state time (seconds) of one call: min over ``_TIMED_BATCHES``
+    batches of the per-call mean, each batch enqueuing its calls back-to-back
+    under a single sync.
 
-    ``num_tokens * topk * bytes_per_token`` fits in L2 at these sizes, so
-    reusing one index set across reps makes the KV working set L2-resident
-    after warmup and understates the HBM-bound steady state — this tainted
-    earlier calibration rounds (decode looked artificially fast). The redraw
-    runs outside the timed region.
+    The queued batch keeps the GPU busy across call boundaries, so per-call
+    launch latency overlaps execution — the regime production runs in (a
+    graph-replayed decode step pays no per-kernel launch gap). A per-rep
+    sync instead exposes one launch gap per call, which distorted small-T
+    measurements by a fixed ~7us.
+
+    L2 fidelity: every call in a batch gathers under a different pre-drawn
+    full-pool uniform index set. Consecutive sets overlap by
+    ~footprint/pool, and the batch length is sized so a set's reuse distance
+    ((K-1) calls x per-call gather footprint) exceeds L2 — reusing one index
+    set across reps makes the working set L2-resident after warmup and
+    understates the HBM-bound steady state (this tainted earlier calibration
+    rounds: decode looked artificially fast). The draws run before timing.
     """
-
-    def fresh() -> torch.Tensor:
-        return torch.randint(
+    # A set recurs after K-1 intervening calls; require the reuse distance to
+    # cover L2 so no gathered page survives between visits. Without a known
+    # L2 size, the minimum batch still hides launch latency.
+    l2 = int(getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0) or 0)
+    footprint = max(1, num_tokens * topk * bytes_per_token)
+    k = (
+        _MIN_BATCH_CALLS
+        if not l2
+        else min(_MAX_BATCH_CALLS, max(_MIN_BATCH_CALLS, l2 // footprint + 2))
+    )
+    sets = [
+        torch.randint(
             0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
         )
-
-    for _ in range(_WARMUP_ITERS):
-        call(fresh())
+        for _ in range(k)
+    ]
+    for i in range(_WARMUP_ITERS):
+        call(sets[i % k])
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     best = float("inf")
-    for _ in range(_TIMED_ITERS):
-        indices = fresh()
+    for _ in range(_TIMED_BATCHES):
         start.record()
-        call(indices)
+        for indices in sets:
+            call(indices)
         end.record()
         torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(end) / 1e3)
+        best = min(best, start.elapsed_time(end) / 1e3 / k)
     return best
 
 
@@ -483,9 +504,11 @@ def calibrate(
     """Calibrate the cpb model constants for ``family`` on ``device``.
 
     Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
-    to 512 MiB) with fresh full-pool uniform indices per rep so the measured
-    working set stays HBM-resident, then fits the three constants to six
-    fixed shapes by Levenberg-Marquardt on relative residuals.
+    to 512 MiB), timing queued batches over rotating fresh full-pool uniform
+    index sets (:func:`_time_call_fresh_indices`) so the measured working
+    set stays HBM-resident and launch latency stays off the clock, then fits
+    the three constants to six fixed shapes by Levenberg-Marquardt on
+    relative residuals.
     ``module_getter`` returns the loaded TVM-FFI kernel module.
     """
     if family not in _BYTES_PER_TOKEN:
@@ -525,10 +548,9 @@ def calibrate(
 
     def measure(num_tokens: int, num_heads: int, topk: int, cpb: int) -> float:
         call = build_call(num_tokens, num_heads, topk, model_type, cpb)
-        # Fresh full-pool uniform indices per rep: one fixed index set goes
-        # L2-resident after warmup and understates the HBM-bound steady state
-        # (the crossover calibration's protocol).
-        return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
+        return _time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, _BYTES_PER_TOKEN[family]
+        )
 
     t = [measure(*m) for m in measurements]
 
@@ -725,7 +747,9 @@ def calibrate_crossover(
     ) -> float:
         cpb = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
         call = build_call(num_tokens, num_heads, topk, model_type, cpb)
-        return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
+        return _time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, _BYTES_PER_TOKEN[family]
+        )
 
     def time_prefill(
         num_tokens: int, num_heads: int, topk: int, model_type: int
@@ -780,7 +804,9 @@ def calibrate_crossover(
             torch.cuda.synchronize()
         except RuntimeError:
             return float("inf")
-        return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
+        return _time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, _BYTES_PER_TOKEN[family]
+        )
 
     table: dict[str, int] = {}
     for prefix, pairs, model_type in spaces:
@@ -793,6 +819,58 @@ def calibrate_crossover(
                     best = num_tokens
             table[f"{prefix}|{num_heads}|{topk}"] = best
     return table
+
+
+def refine_cpb(
+    module_getter: Callable[[], Any],
+    family: str,
+    device: torch.device,
+    c: CpbConstants,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+) -> int:
+    """Measured best cpb around the model pick for one single-cache shape.
+
+    Times ``select_cpb``'s pick +/- ``_REFINE_WINDOW`` candidates (clamped to
+    1..N) with the calibration timing protocol and returns the measured
+    argmin. The analytical model proposes; this closes its residual pick
+    error — largest at mid-T wave-quantization shapes (up to 1.3x kernel
+    time in kernel-bench sweeps) — for exactly the shapes the caller warms
+    up. Dual-cache (extra_topk > 0) shapes stay on the model: their measured
+    pick error stays within ~6%.
+    """
+    from ._sparse_mla_sm120_plan import (
+        _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_GLM53_NOPE,
+    )
+
+    if family not in _BYTES_PER_TOKEN:
+        raise ValueError(f"unknown sparse-MLA family {family!r}")
+    if torch.cuda.is_current_stream_capturing():
+        # Same contract as calibrate(): synchronizes and allocates GiB pools.
+        raise CalibrationError(
+            "sparse-MLA SM120 cpb refinement must not run under CUDA graph capture"
+        )
+    bi = _CHUNK_WIDTH[family]
+    n = _ceil_div(topk, bi)
+    center = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
+    kv_cache, num_slots = _allocate_kv_pool(family, device)
+    build_call = _make_decode_call_builder(module_getter(), family, device, kv_cache)
+    model_type = (
+        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
+    )
+    best_cpb, best_t = center, float("inf")
+    lo = max(1, center - _REFINE_WINDOW)
+    hi = min(n, center + _REFINE_WINDOW)
+    for cpb in range(lo, hi + 1):
+        call = build_call(num_tokens, num_heads, topk, model_type, cpb)
+        t = _time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, _BYTES_PER_TOKEN[family]
+        )
+        if t < best_t:
+            best_cpb, best_t = cpb, t
+    return best_cpb
 
 
 def default_cache_path() -> pathlib.Path:
@@ -816,6 +894,9 @@ _failed: set[tuple[str, str]] = set()
 # dev_key -> flat {"<family>|<num_heads>|<topk>": decode_max_tokens} table.
 _crossover: dict[str, dict[str, int]] = {}
 _crossover_failed: set[tuple[str, str]] = set()
+# dev_key -> flat {"<family>|<num_heads>|<topk>|<num_tokens>": cpb} table of
+# per-shape measured picks written by refine_cpb at tuning time.
+_cpb_overrides: dict[str, dict[str, int]] = {}
 # Bumped whenever new constants enter the process (disk load or save), so
 # select_cpb memoization keyed on it never serves stale picks.
 _constants_version: int = 0
@@ -837,7 +918,7 @@ def _device_key(device: torch.device) -> str:
     return key
 
 
-def _parse_payload_devices(devices: dict) -> tuple[dict, dict]:
+def _parse_payload_devices(devices: dict) -> tuple[dict, dict, dict]:
     """Parse a cache document's ``devices`` mapping into process-cache entries.
 
     Raises on malformed entries; callers must publish the returned dicts
@@ -845,6 +926,7 @@ def _parse_payload_devices(devices: dict) -> tuple[dict, dict]:
     """
     new_constants: dict = {}
     new_crossover: dict = {}
+    new_overrides: dict = {}
     for dev_key, families in devices.items():
         if not isinstance(families, dict):
             continue
@@ -853,8 +935,12 @@ def _parse_payload_devices(devices: dict) -> tuple[dict, dict]:
                 if isinstance(raw, dict):
                     new_crossover[dev_key] = {str(k): int(v) for k, v in raw.items()}
                 continue
+            if family == _CPB_OVERRIDES_KEY:
+                if isinstance(raw, dict):
+                    new_overrides[dev_key] = {str(k): int(v) for k, v in raw.items()}
+                continue
             new_constants[(dev_key, family)] = CpbConstants(**raw)
-    return new_constants, new_crossover
+    return new_constants, new_crossover, new_overrides
 
 
 def _maybe_load_disk() -> None:
@@ -879,12 +965,13 @@ def _maybe_load_disk() -> None:
             return
         # Parse fully into locals first: a mid-document failure must not
         # publish a prefix of the entries while leaving mtime/version stale.
-        new_constants, new_crossover = _parse_payload_devices(devices)
+        new_constants, new_crossover, new_overrides = _parse_payload_devices(devices)
     except (OSError, ValueError, TypeError, KeyError):
         # Keep mtime unchanged so the next cold call retries.
         return
     _constants.update(new_constants)
     _crossover.update(new_crossover)
+    _cpb_overrides.update(new_overrides)
     _cache_mtime = mtime
     _constants_version += 1
 
@@ -914,49 +1001,73 @@ def _read_payload_for_merge(path: pathlib.Path) -> dict:
     return {"schema_version": _SCHEMA_VERSION, "devices": {}}
 
 
-def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
-    """Merge ``c`` into the disk cache (read-modify-write, atomic replace) and
-    the process cache. A failed disk write only loses cross-process sharing;
-    the in-process constants still take effect."""
-    global _cache_mtime, _constants_version
-    key = (_device_key(device), family)
+def _merge_into_cache(dev_key: str, section: str, entries: dict) -> dict:
+    """Read-modify-write ``entries`` into ``section`` of ``dev_key``'s device
+    record and return the merged document ({"devices": {}} when the write
+    fails — callers still publish to the process cache, losing only
+    cross-process sharing).
+
+    The read-modify-write is FileLock-serialized across processes (multi-GPU
+    tuning saves sibling device keys into the same file); reads stay
+    lock-free because the write is an atomic replace.
+    """
+    global _cache_mtime
     path = default_cache_path()
-    # Serialize the read-modify-write across processes (multi-GPU tuning saves
-    # sibling device keys into the same file); reads stay lock-free because
-    # the write is an atomic replace.
     try:
         with FileLock(str(path.with_name(path.name + ".lock"))):
             payload = _read_payload_for_merge(path)
             if not isinstance(payload.get("devices"), dict):
                 payload["devices"] = {}
-            if not isinstance(payload["devices"].get(key[0]), dict):
-                payload["devices"][key[0]] = {}
-            payload["devices"][key[0]][family] = asdict(c)
+            dev = payload["devices"].setdefault(dev_key, {})
+            if not isinstance(dev, dict):
+                dev = payload["devices"][dev_key] = {}
+            sec = dev.setdefault(section, {})
+            if not isinstance(sec, dict):
+                sec = dev[section] = {}
+            sec.update(entries)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(json.dumps(payload, indent=2) + "\n")
             os.replace(tmp, path)
     except OSError as e:
         logger.warning(
-            "SM120 sparse-MLA cpb constants not persisted to %s (%s); "
-            "using them in-process only.",
+            "SM120 sparse-MLA cpb cache not persisted to %s (%s); "
+            "using entries in-process only.",
             path,
             e,
         )
         payload = {"devices": {}}
-    # Publish the whole merged document, not only the family just saved: the
-    # merge may have carried on-disk sibling entries written by other
-    # processes, and _cache_mtime now asserts we hold the file's content.
-    try:
-        new_constants, new_crossover = _parse_payload_devices(payload["devices"])
-    except (ValueError, TypeError, KeyError):
-        new_constants, new_crossover = {}, {}
-    _constants.update(new_constants)
-    _crossover.update(new_crossover)
-    _constants[key] = c
-    _constants_version += 1
     with contextlib.suppress(OSError):
         _cache_mtime = path.stat().st_mtime
+    return payload
+
+
+def _publish_payload(payload: dict) -> None:
+    """Re-parse a merged document into the process caches and bump the
+    constants version. Publishes the whole document, not only the section
+    just saved: the merge may have carried on-disk sibling entries written by
+    other processes, and _cache_mtime now asserts we hold the file's content.
+    """
+    global _constants_version
+    try:
+        new_constants, new_crossover, new_overrides = _parse_payload_devices(
+            payload["devices"]
+        )
+    except (ValueError, TypeError, KeyError):
+        new_constants, new_crossover, new_overrides = {}, {}, {}
+    _constants.update(new_constants)
+    _crossover.update(new_crossover)
+    _cpb_overrides.update(new_overrides)
+    _constants_version += 1
+
+
+def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
+    """Merge ``c`` into the disk cache (read-modify-write, atomic replace) and
+    the process cache. A failed disk write only loses cross-process sharing;
+    the in-process constants still take effect."""
+    key = (_device_key(device), family)
+    _publish_payload(_merge_into_cache(key[0], family, asdict(c)))
+    _constants[key] = c
 
 
 def mark_calibration_failed(device: torch.device, family: str) -> None:
@@ -973,45 +1084,9 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
     """Merge a crossover table into the disk cache (read-modify-write, atomic
     replace) and the process cache. Same failure semantics as
     :func:`save_constants`."""
-    global _cache_mtime, _constants_version
     dev_key = _device_key(device)
-    path = default_cache_path()
-    # Same cross-process serialization as save_constants.
-    try:
-        with FileLock(str(path.with_name(path.name + ".lock"))):
-            payload = _read_payload_for_merge(path)
-            if not isinstance(payload.get("devices"), dict):
-                payload["devices"] = {}
-            dev = payload["devices"].setdefault(dev_key, {})
-            if not isinstance(dev, dict):
-                dev = payload["devices"][dev_key] = {}
-            xo = dev.setdefault(_DECODE_MAX_TOKENS_KEY, {})
-            if not isinstance(xo, dict):
-                xo = dev[_DECODE_MAX_TOKENS_KEY] = {}
-            xo.update(table)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps(payload, indent=2) + "\n")
-            os.replace(tmp, path)
-    except OSError as e:
-        logger.warning(
-            "SM120 sparse-MLA crossover table not persisted to %s (%s); "
-            "using it in-process only.",
-            path,
-            e,
-        )
-        payload = {"devices": {}}
-    # Same sibling-entry reasoning as save_constants.
-    try:
-        new_constants, new_crossover = _parse_payload_devices(payload["devices"])
-    except (ValueError, TypeError, KeyError):
-        new_constants, new_crossover = {}, {}
-    _constants.update(new_constants)
-    _crossover.update(new_crossover)
+    _publish_payload(_merge_into_cache(dev_key, _DECODE_MAX_TOKENS_KEY, table))
     _crossover.setdefault(dev_key, {}).update(table)
-    _constants_version += 1
-    with contextlib.suppress(OSError):
-        _cache_mtime = path.stat().st_mtime
 
 
 def get_decode_max_tokens(
@@ -1089,6 +1164,38 @@ def mark_crossover_failed(device: torch.device, family: str) -> None:
 def is_crossover_failed(device: torch.device, family: str) -> bool:
     """True iff crossover calibration already failed for (device, family)."""
     return (_device_key(device), family) in _crossover_failed
+
+
+def get_cpb_override(
+    device: torch.device, family: str, num_heads: int, topk: int, num_tokens: int
+) -> Optional[int]:
+    """Measured per-shape cpb from :func:`refine_cpb`; None when absent (the
+    analytical model's pick governs)."""
+    dev_key = _device_key(device)
+    table = _cpb_overrides.get(dev_key)
+    if table is None:
+        _maybe_load_disk()
+        table = _cpb_overrides.get(dev_key)
+    if table is None:
+        return None
+    return table.get(f"{family}|{num_heads}|{topk}|{num_tokens}")
+
+
+def save_cpb_override(
+    device: torch.device,
+    family: str,
+    num_heads: int,
+    topk: int,
+    num_tokens: int,
+    cpb: int,
+) -> None:
+    """Merge one refined pick into the disk cache (read-modify-write, atomic
+    replace) and the process cache. Same failure semantics as
+    :func:`save_constants`."""
+    dev_key = _device_key(device)
+    entry = {f"{family}|{num_heads}|{topk}|{num_tokens}": int(cpb)}
+    _publish_payload(_merge_into_cache(dev_key, _CPB_OVERRIDES_KEY, entry))
+    _cpb_overrides.setdefault(dev_key, {}).update(entry)
 
 
 # ── Public calibration entry point ─────────────────────────────────────────

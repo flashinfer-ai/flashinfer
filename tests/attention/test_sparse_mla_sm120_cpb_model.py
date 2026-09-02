@@ -139,11 +139,13 @@ def clean_cpb_state(monkeypatch, tmp_path):
     cpb_mod._failed.clear()
     cpb_mod._crossover.clear()
     cpb_mod._crossover_failed.clear()
+    cpb_mod._cpb_overrides.clear()
     yield tmp_path
     cpb_mod._constants.clear()
     cpb_mod._failed.clear()
     cpb_mod._crossover.clear()
     cpb_mod._crossover_failed.clear()
+    cpb_mod._cpb_overrides.clear()
 
 
 def test_crossover_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
@@ -170,6 +172,31 @@ def test_dsv3_2_crossover_requires_glm_nsa_entries(
     assert not cpb_mod.has_crossover(device, "dsv3_2")
     cpb_mod.save_crossover(device, {"glm_nsa|64|2048": 8})
     assert cpb_mod.has_crossover(device, "dsv3_2")
+
+
+def test_cpb_override_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
+    """Refined per-shape picks merge into the JSON document alongside the
+    constants and crossover entries, and survive a process-state reload."""
+    device = torch.device("cpu")
+    cpb_mod.save_cpb_override(device, "dsv4", 128, 1024, 64, 12)
+    cpb_mod.save_cpb_override(device, "dsv4", 128, 1024, 8, 3)
+    cpb_mod.save_cpb_override(device, "dsv3_2", 64, 2048, 32, 9)
+    cpb_mod._cpb_overrides.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+    assert cpb_mod.get_cpb_override(device, "dsv4", 128, 1024, 64) == 12
+    assert cpb_mod.get_cpb_override(device, "dsv4", 128, 1024, 8) == 3
+    assert cpb_mod.get_cpb_override(device, "dsv3_2", 64, 2048, 32) == 9
+    assert cpb_mod.get_cpb_override(device, "dsv4", 128, 1024, 16) is None
+    # Coexists with constants and crossover entries in the same document.
+    cpb_mod.save_constants(device, "dsv4", _C)
+    cpb_mod.save_crossover(device, {"dsv4|128|1024": 16})
+    cpb_mod._cpb_overrides.clear()
+    cpb_mod._constants.clear()
+    cpb_mod._crossover.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+    assert cpb_mod.get_cpb_override(device, "dsv4", 128, 1024, 64) == 12
+    assert cpb_mod.get_constants(device, "dsv4") == _C
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 128, 1024) == 16
 
 
 def test_crossover_grid_complete_gates_full_sweep(clean_cpb_state) -> None:
@@ -316,63 +343,29 @@ def test_calibration_smoke(family_constants: tuple[str, CpbConstants]) -> None:
 def test_model_cpb_accuracy_guard(
     dsv4_constants: CpbConstants, num_tokens, topk
 ) -> None:
-    """Model-picked cpb is within 1.25x of the best swept cpb."""
+    """Model-picked cpb is within 1.25x of the best swept cpb, measured with
+    the calibration timing protocol (queued batches, L2-cold indices) so the
+    guard certifies the regime production calibration runs in."""
     from flashinfer.mla._sparse_mla_sm120 import (
         _get_sparse_mla_sm120_decode_module,
     )
 
     _skip_if_low_vram(3)  # 2 GiB pool plus headroom
     device = torch.device("cuda")
-    module = _get_sparse_mla_sm120_decode_module()
     c = dsv4_constants
-    d_qk, d_v = 512, 512
     num_heads = 128
-
     num_splits = -(-topk // 64)
-    w = c.bytes_per_chunk
-    num_blocks = (2 << 30) // w
-    kv_cache = torch.empty(num_blocks, w, dtype=torch.uint8, device=device)
-    num_slots = num_blocks * 64
-
-    q = (torch.randn(num_tokens, num_heads, d_qk, device=device) / 10.0).to(
-        torch.bfloat16
+    kv_cache, num_slots = cpb_mod._allocate_kv_pool("dsv4", device)
+    build = cpb_mod._make_decode_call_builder(
+        _get_sparse_mla_sm120_decode_module(), "dsv4", device, kv_cache
     )
-    indices = torch.randint(
-        0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
-    )
-    mid_out = torch.empty(
-        num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
-    )
-    mid_lse = torch.empty(
-        num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
-    )
-    output = torch.empty(
-        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
-    )
-    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-    sm_scale = d_qk**-0.5
 
     def run(cpb_override: int) -> float:
-        def call() -> None:
-            module.sparse_mla_sm120_decode_dsv4(
-                q,
-                kv_cache,
-                indices,
-                mid_out,
-                mid_lse,
-                output,
-                out_lse,
-                num_splits,
-                sm_scale,
-                None,
-                None,
-                None,
-                None,
-                None,
-                cpb_override,
-            )
-
-        return cpb_mod._time_call(call)
+        # model_type is unused by the dsv4 FFI branch of the call builder.
+        call = build(num_tokens, num_heads, topk, 0, cpb_override)
+        return cpb_mod._time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, c.bytes_per_chunk // 64
+        )
 
     swept = {cpb: run(cpb) for cpb in range(1, num_splits + 1)}
     heuristic_t = run(-1)
@@ -429,9 +422,6 @@ def test_model_cpb_accuracy_guard_dual_cache(
     q = (torch.randn(num_tokens, num_heads, d_qk, device=device) / 10.0).to(
         torch.bfloat16
     )
-    indices = torch.randint(
-        0, kv_cache.shape[0] * 64, (num_tokens, topk), dtype=torch.int32, device=device
-    )
     extra_indices = torch.randint(
         0,
         extra_kv_cache.shape[0] * pbs_extra,
@@ -452,7 +442,9 @@ def test_model_cpb_accuracy_guard_dual_cache(
     sm_scale = d_qk**-0.5
 
     def run(cpb_override: int) -> float:
-        def call() -> None:
+        # The timing helper rotates fresh main-cache indices per call; the
+        # extra-cache set stays fixed (within-row uniform across candidates).
+        def call(indices: torch.Tensor) -> None:
             module.sparse_mla_sm120_decode_dsv4(
                 q,
                 kv_cache,
@@ -471,7 +463,9 @@ def test_model_cpb_accuracy_guard_dual_cache(
                 cpb_override,
             )
 
-        return cpb_mod._time_call(call)
+        return cpb_mod._time_call_fresh_indices(
+            call, num_tokens, topk, kv_cache.shape[0] * 64, device, bpt
+        )
 
     swept = {cpb: run(cpb) for cpb in range(1, num_splits + 1)}
     heuristic_t = run(-1)
@@ -490,6 +484,73 @@ def test_model_cpb_accuracy_guard_dual_cache(
     # Release the pools before the next parametrized case.
     kv_cache = extra_kv_cache = None
     torch.cuda.empty_cache()
+
+
+@requires_sm12x
+def test_refine_cpb_beats_or_matches_model(
+    monkeypatch, tmp_path, dsv4_constants: CpbConstants
+) -> None:
+    """refine_cpb's measured pick never loses to the model pick under the same
+    timing protocol, persists to disk, and _resolve_cpb serves the override
+    ahead of the model (tuning mode off)."""
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _get_sparse_mla_sm120_decode_module,
+        _resolve_cpb,
+    )
+
+    _skip_if_low_vram(3)  # 2 GiB pool plus headroom
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_DIR", str(tmp_path))
+    device = torch.device("cuda")
+    c = dsv4_constants
+    num_tokens, num_heads, topk = 64, 128, 1024
+
+    refined = cpb_mod.refine_cpb(
+        _get_sparse_mla_sm120_decode_module,
+        "dsv4",
+        device,
+        c,
+        num_tokens,
+        num_heads,
+        topk,
+    )
+    model_cpb = select_cpb(num_tokens, num_heads, topk, 0, c)
+
+    module = _get_sparse_mla_sm120_decode_module()
+    kv_cache, num_slots = cpb_mod._allocate_kv_pool("dsv4", device)
+    build = cpb_mod._make_decode_call_builder(module, "dsv4", device, kv_cache)
+
+    def timed(cpb: int) -> float:
+        # model_type is unused by the dsv4 FFI branch of the call builder.
+        call = build(num_tokens, num_heads, topk, 0, cpb)
+        return cpb_mod._time_call_fresh_indices(
+            call, num_tokens, topk, num_slots, device, c.bytes_per_chunk // 64
+        )
+
+    t_refined, t_model = timed(refined), timed(model_cpb)
+    print(
+        f"\nrefine: model cpb={model_cpb} {t_model * 1e6:.1f} us | "
+        f"refined cpb={refined} {t_refined * 1e6:.1f} us"
+    )
+    assert t_refined <= t_model * 1.05
+
+    cpb_mod.save_constants(device, "dsv4", c)
+    cpb_mod.save_cpb_override(device, "dsv4", num_heads, topk, num_tokens, refined)
+    cpb_mod._cpb_overrides.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+    assert (
+        cpb_mod.get_cpb_override(device, "dsv4", num_heads, topk, num_tokens) == refined
+    )
+    assert _resolve_cpb(device, "dsv4", num_tokens, num_heads, topk, 0) == refined
+    # An unrefined shape still falls through to the model pick.
+    assert _resolve_cpb(
+        device, "dsv4", num_tokens + 1, num_heads, topk, 0
+    ) == select_cpb(num_tokens + 1, num_heads, topk, 0, c)
+
+    # Do not leak process state into later tests.
+    kv_cache = None
+    torch.cuda.empty_cache()
+    cpb_mod._constants.clear()
+    cpb_mod._cpb_overrides.clear()
 
 
 @requires_sm12x
@@ -654,11 +715,20 @@ def test_glm_nsa_decode_uses_dsv3_2_cpb_family(clean_cpb_state, monkeypatch) -> 
         seen["calibrate_crossover"] = family
         return {"dsv3_2|64|2048": 32, "glm_nsa|64|2048": 32}
 
+    def fake_refine(module_getter, family, dev, c, t, h, k):
+        seen["refine_cpb"] = family
+        return select_cpb(t, h, k, 0, c)
+
     monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
     monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
+    monkeypatch.setattr(cpb_mod, "refine_cpb", fake_refine)
     monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
     call()
-    assert seen == {"calibrate": "dsv3_2", "calibrate_crossover": "dsv3_2"}
+    assert seen == {
+        "calibrate": "dsv3_2",
+        "calibrate_crossover": "dsv3_2",
+        "refine_cpb": "dsv3_2",
+    }
     assert recorded["cpb_override"] == expected_cpb
 
 
@@ -845,8 +915,13 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
         seen["calibrate_crossover"] = family
         return {}
 
+    def fake_refine(module_getter, family, dev, c, t, h, k):
+        seen["refine_cpb"] = family
+        return 1
+
     monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
     monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
+    monkeypatch.setattr(cpb_mod, "refine_cpb", fake_refine)
 
     def call() -> None:
         sm.sparse_mla_sm120_decode_dsv4(
@@ -859,4 +934,8 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
 
     with autotune(True):
         call()
-    assert seen == {"calibrate": "dsv4", "calibrate_crossover": "dsv4"}
+    assert seen == {
+        "calibrate": "dsv4",
+        "calibrate_crossover": "dsv4",
+        "refine_cpb": "dsv4",
+    }
