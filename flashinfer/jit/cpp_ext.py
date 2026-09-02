@@ -46,6 +46,16 @@ def _get_glibcxx_abi_build_flags() -> List[str]:
 
 @functools.cache
 def get_cuda_path() -> str:
+    """Return the canonical path of the CUDA toolkit to build against.
+
+    Resolution order: ``CUDA_HOME``, ``CUDA_PATH``, the parent of ``which
+    nvcc``, then ``/usr/local/cuda``. The result is passed through
+    :func:`os.path.realpath` because it is embedded verbatim as ``cuda_home``
+    in the generated ``build.ninja``: without canonicalization, two processes
+    that reach the same toolkit through different paths (``/usr/local/cuda``
+    vs its ``/usr/local/cuda-X.Y`` symlink target, or a different ``PATH``
+    order) write different ninja files and ninja rebuilds every object.
+    """
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home is None:
         # get output of "which nvcc"
@@ -60,8 +70,6 @@ def get_cuda_path() -> str:
                 raise RuntimeError(
                     f"Could not find nvcc and default {cuda_home=} doesn't exist"
                 )
-    # realpath so /usr/local/cuda vs /usr/local/cuda-X.Y (symlink) and
-    # PATH-order differences converge to one string in build.ninja (#4884).
     return os.path.realpath(cuda_home)
 
 
