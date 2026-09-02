@@ -723,6 +723,7 @@ def ref_attention_varlen(
 
 
 def assert_close_ratio(ref, out, atol, rtol, required_ratio=0.98):
+    """Require at least required_ratio of elements within atol or rtol."""
     diff_abs = torch.abs(ref - out)
     diff_rel = diff_abs / (torch.abs(ref) + 1e-8)
     pass_ratio = ((diff_abs <= atol) | (diff_rel <= rtol)).float().mean().item()
@@ -769,7 +770,9 @@ def make_paged_kv(
 )
 @pytest.mark.parametrize("use_attention_sinks", [False, True])
 @pytest.mark.parametrize("use_sliding_window", [False, True])
-@pytest.mark.parametrize("max_kv_len", [None, 256])
+# None: page-table capacity (2x the longest sequence); 4096: exact bound;
+# 256: too small, which may only change the split, never the result.
+@pytest.mark.parametrize("max_kv_len", [None, 4096, 256])
 def test_xqa_multi_block_mixed_seq_lens(
     fp8_kv_cache, use_fp8_output, use_attention_sinks, use_sliding_window, max_kv_len
 ):

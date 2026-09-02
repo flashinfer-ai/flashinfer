@@ -304,9 +304,9 @@ def xqa(
         cumulative offsets.
     max_kv_len : Optional[int], default=None
         Upper bound on the KV lengths in ``seq_lens``. It only steers how many
-        CTAs each sequence is split across, so a tight bound gives the best
-        split. Defaults to the page-table capacity
-        ``page_table.shape[-1] * page_size``.
+        CTAs each sequence is split across: a tight bound gives the best split
+        and a too-small value only costs performance. Defaults to the
+        page-table capacity ``page_table.shape[-1] * page_size``.
 
     Note
     ----
