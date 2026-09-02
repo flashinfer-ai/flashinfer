@@ -759,8 +759,11 @@ def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
         torch.float8_e5m2,
     ):
         comm = UlyssesCommunicator(
-            gloo_pg, max_bytes=(1 << 10) * dtype.itemsize, dtype=dtype,
-            backend="pcie", device=device
+            gloo_pg,
+            max_bytes=(1 << 10) * dtype.itemsize,
+            dtype=dtype,
+            backend="pcie",
+            device=device,
         )
         x = torch.zeros((1, 2, 4, 2), dtype=dtype, device=device)
         assert comm.scatter_heads(x) is x
