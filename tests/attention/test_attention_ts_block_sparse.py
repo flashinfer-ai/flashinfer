@@ -3292,7 +3292,7 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
 
 
 @pytest.mark.parametrize("use_proxy_routes", (False, True))
-def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
+def test_proxy_routes_share_exact_route_scheduler_selection(
     monkeypatch: pytest.MonkeyPatch,
     use_proxy_routes: bool,
 ) -> None:
@@ -3340,11 +3340,12 @@ def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
         block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
 
     policy = dict(spec.policy)
-    expected_persistent = not use_proxy_routes
-    assert len(selector_calls) == int(expected_persistent)
-    assert spec.compile_key.use_persistent_scheduler is expected_persistent
-    assert policy["scheduler"] == ("persistent" if expected_persistent else "static")
-    assert policy["use_persistent_scheduler"] is expected_persistent
+    # Proxy and exact routes consult the same launch-mode selector, so the
+    # persistent answer it returns applies to both.
+    assert len(selector_calls) == 1
+    assert spec.compile_key.use_persistent_scheduler is True
+    assert policy["scheduler"] == "persistent"
+    assert policy["use_persistent_scheduler"] is True
     assert "scheduler_policy" not in policy
 
 

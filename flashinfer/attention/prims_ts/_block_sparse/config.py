@@ -205,11 +205,10 @@ def _select_block_sparse_scheduler(
         heads_q_per_kv=heads_q_per_kv,
         kv_block_size=kv_block_size,
     )
-    # Reusable planning sees route capacity, not the live exact-route work.
-    # Keep proxy execution on the direct grid as a conservative workload-level
-    # default until runtime work can participate in scheduling.
-    if use_proxy_routes:
-        return q_tile_size, False
+    # Proxy routes add one summary route per row on top of the exact routes,
+    # so they see the same per-tile fixed cost the persistent scheduler
+    # amortizes; both route kinds share one scheduler selection.
+    _ = use_proxy_routes
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
