@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import importlib
+import warnings
 
 # Unified MoE API
 from .api import (  # noqa: F401
@@ -44,6 +45,8 @@ from .api import (  # noqa: F401
     CutlassNvfp4Config,
     CutlassW4A16Config,
     CutlassW4A8Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -77,7 +80,9 @@ from .runners import (  # noqa: F401
     CutlassNvfp4Runner,
     CutlassW4A16Runner,
     CutlassW4A8Runner,
-    CuteDslNvfp4Runner,
+    CuTileBf16Runner,
+    CuTileNvfp4Runner,
+    CuteDslRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -97,15 +102,6 @@ _PRIMS_TS_LAZY_EXPORTS = {
     "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
     "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
 }
-
-
-def __getattr__(name: str):
-    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(importlib.import_module(module_name, __name__), name)
-    globals()[name] = value
-    return value
 
 
 def __dir__() -> list[str]:
@@ -130,6 +126,8 @@ from .core import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
+    trtllm_fp8_per_channel_scale_moe,
+    trtllm_fp8_per_channel_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
     trtllm_moe_allocate_routing_metadata,
@@ -167,11 +165,13 @@ from .trtllm_gen_routing import (  # noqa: F401
 )
 
 from .bgmv_moe import (  # noqa: F401
+    BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
     fill_w_ptr as fill_w_ptr,
     has_bgmv_moe as has_bgmv_moe,
+    prepare_bgmv_moe as prepare_bgmv_moe,
 )
 from .moe_lora_delta import (  # noqa: F401
     bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
@@ -188,8 +188,9 @@ from .monomoe import (  # noqa: F401
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
     from .cute_dsl import (
-        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe,
         CuteDslMoEWrapper,
+        cute_dsl_fused_moe_nvfp4,
         cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
@@ -199,6 +200,23 @@ try:
     _cute_dsl_available = True
 except ImportError:
     _cute_dsl_available = False
+
+
+def __getattr__(name: str):
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        value = getattr(importlib.import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
+    if name == "CuteDslNvfp4Runner":
+        warnings.warn(
+            "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CuteDslRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Typed activation values
@@ -238,8 +256,13 @@ __all__ = [
     "CutlassW4A16Runner",
     "CutlassW4A8Config",
     "CutlassW4A8Runner",
+    "CuTileBf16Config",
+    "CuTileBf16Runner",
+    "CuTileNvfp4Config",
+    "CuTileNvfp4Runner",
     "ExecutionConfig",
     "ExpertConfig",
+    "CuteDslRunner",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
@@ -297,6 +320,8 @@ __all__ = [
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
+    "trtllm_fp8_per_channel_scale_moe",
+    "trtllm_fp8_per_channel_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_fp8_per_tensor_scale_routed_moe",
     "trtllm_mxint4_block_scale_moe",
@@ -306,12 +331,14 @@ __all__ = [
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
     "bgmv_moe",
+    "BGMVMoEBlackwellPlan",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
     "bgmv_moe_gemm1_lora_delta",
     "bgmv_moe_gemm2_lora_delta",
     "fill_w_ptr",
     "has_bgmv_moe",
+    "prepare_bgmv_moe",
     "mono_moe",
     "has_monomoe",
     "alloc_scratchpad",
@@ -322,9 +349,10 @@ __all__ = [
 # Add CuteDSL exports if available
 if _cute_dsl_available:
     __all__ += [
+        "cute_dsl_fused_moe",
         "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMoEWrapper",
         "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMoEWrapper",
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",

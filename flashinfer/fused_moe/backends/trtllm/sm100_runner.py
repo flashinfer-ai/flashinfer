@@ -224,12 +224,16 @@ class MoERunner(TunableRunner):
         topk_weights = expert_weights
         hidden_states = moe_inputs.hidden_states
         # Plain E4m3 returns false from trtllm_gen_dtype_has_scale, but DeepSeek
-        # block-FP8 still requires the real per-1x128-block activation scales.
+        # block-FP8 and per-channel FP8 still require activation scales.
         hidden_states_scale = (
             moe_inputs.hidden_states_scale
             if (
                 trtllm_gen_dtype_has_scale(self.dtype_act)
-                or self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                or self.fp8_quantization_type
+                in (
+                    Fp8QuantizationType.DeepSeekFp8,
+                    Fp8QuantizationType.PerChannelFp8,
+                )
             )
             else None
         )
@@ -363,6 +367,38 @@ class MoERunner(TunableRunner):
                     list(da_body_workspace),
                     prepare_da_body,
                 )
+            elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
+                result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
+                    routing_logits,
+                    topk_ids,
+                    topk_weights,
+                    kwargs["routing_bias"],
+                    hidden_states,
+                    hidden_states_scale,
+                    kwargs["gemm1_weights"],
+                    kwargs["gemm1_per_channel_weight_scale"],
+                    kwargs["output1_scale_scalar"],
+                    kwargs["output1_scale_gate_scalar"],
+                    kwargs["gemm2_weights"],
+                    kwargs["gemm2_per_channel_weight_scale"],
+                    kwargs["output2_scale_scalar"],
+                    output,
+                    kwargs["num_experts"],
+                    self.top_k,
+                    kwargs["n_group"],
+                    kwargs["topk_group"],
+                    self.intermediate_size,
+                    kwargs["local_expert_offset"],
+                    self.num_local_experts,
+                    kwargs["routed_scaling_factor"],
+                    kwargs["use_routing_scales_on_input"],
+                    kwargs["routing_method_type"],
+                    kwargs["do_finalize"],
+                    kwargs["enable_pdl"],
+                    [-1, -1] if tactic == -1 else tactic,
+                    self.activation_type,
+                    kwargs.get("norm_topk_prob", True),
+                )
             else:
                 common_args = (
                     kwargs["routing_bias"],
@@ -475,7 +511,7 @@ class MoERunner(TunableRunner):
                 kwargs["output1_scale_scalar"],
                 kwargs["output1_scale_gate_scalar"],
                 kwargs["output2_scale_scalar"],
-                kwargs["per_token_scale"],
+                moe_inputs.per_token_scale,
                 kwargs["num_experts"],
                 self.top_k,
                 kwargs.get("num_fused_shared_experts", self.num_fused_shared_experts),
