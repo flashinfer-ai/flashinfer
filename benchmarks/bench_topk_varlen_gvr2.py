@@ -82,7 +82,7 @@ def parse_args():
     p.add_argument(
         "--backends",
         type=str,
-        default="fi_gvr2,fi_gvr,fi_gvr_nolb,fi_radix,fi_radix_cutlass",
+        default="fi_gvr2,fi_gvr,fi_gvr_nolb,fi_radix,fi_radix_cutlass,fi_radix_filter",
         help="comma list; add trtllm_gvr2 for the upstream port-parity twin",
     )
     p.add_argument("--trtllm-path", type=str, default=_DEFAULT_TRTLLM_TOPK)
@@ -226,6 +226,22 @@ def make_backend_fns(backend, logits, seq_lens, pre_idx, K, nn, cr, trt_host):
                 compress_ratio=cr,
                 out_indices=out_i,
                 backend="radix_cutlass",
+            )
+
+        return fn, out_i
+    if backend == "fi_radix_filter":
+        if cr != 1:
+            return None, None  # the vendored DKG kernel has no compress_ratio
+
+        def fn():
+            flashinfer.top_k_varlen(
+                logits,
+                seq_lens,
+                K,
+                next_n=nn,
+                compress_ratio=cr,
+                out_indices=out_i,
+                backend="radix_filter",
             )
 
         return fn, out_i
