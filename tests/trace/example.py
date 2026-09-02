@@ -137,6 +137,7 @@ moe_layer_cudnn_frost_bf16.json
 moe_layer_cudnn_frost_mxfp8.json
 moe_layer_cudnn_frost_nvfp4.json
 moe_layer_cudnn_frost_mxfp8_mxfp4.json
+ulysses_exchange_chunks_ws1_c128.json
 ulysses_gather_heads_ws1_d128.json
 ulysses_scatter_heads_ws1_d128.json
 
@@ -2983,6 +2984,16 @@ try:
         ) as _ulysses_comm:
             _ulysses_comm.scatter_heads(_ulysses_x)
             _ulysses_comm.gather_heads(_ulysses_x)
+        # Chunk exchange takes [1, 1, world_size, chunk], so it needs its own
+        # operand rather than a view of the head-major one above.
+        _ulysses_chunks = torch.randn(1, 1, 1, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_chunks.nbytes,
+            dtype=_ulysses_chunks.dtype,
+            backend="nccl",
+            device=_ulysses_chunks.device,
+        ) as _ulysses_chunk_comm:
+            _ulysses_chunk_comm.exchange_chunks(_ulysses_chunks)
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()
