@@ -50,6 +50,17 @@ from flashinfer.tllm_enums import (
 from flashinfer.utils import get_compute_capability
 
 
+def assert_trtllm_packed_call_contract(runner, inputs) -> None:
+    """Check the metadata contract shared by TRTLLM unified runner packers."""
+    from flashinfer.fused_moe.runners import _TrtllmPackedInputs
+
+    assert isinstance(inputs, _TrtllmPackedInputs)
+    assert runner.tuning_config_for(inputs) is inputs.tuning_config
+    assert runner.launch_kwargs_for(inputs) == {"launch_state": inputs.launch_state}
+    with pytest.raises(RuntimeError, match="pack_inputs must return"):
+        runner.tuning_config_for(list(inputs))
+
+
 class QuantMode(IntEnum):
     """Supported quantization modes for MoE testing."""
 

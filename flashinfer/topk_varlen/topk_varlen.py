@@ -24,12 +24,19 @@ Backend choices
 ---------------
 ``"radix"``          — CuTe DSL single-pass multi-CTA radix top-K; native
                        varlen support (no logit masking). Requires Blackwell
-                       (sm_100+) and nvidia-cutlass-dsl. No ``pre_idx`` needed.
+                       (sm_100+, incl. Rubin sm_107) and nvidia-cutlass-dsl.
+                       No ``pre_idx`` needed.
 ``"gvr"``            — GVR (Guess-Verify-Refine) load-balance kernel.
-                       Requires Blackwell (sm_100+), nvidia-cutlass-dsl, and a
+                       Requires a datacentre Blackwell-class GPU (sm_100/103,
+                       or Rubin sm_107), nvidia-cutlass-dsl, and a
                        ``pre_idx`` hint from the previous decode step.
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
+``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
+                       refine); hint-free like ``"radix"``, large-N specialist.
+                       Datacentre Blackwell-class (sm_100/103/107) only;
+                       requires nvidia-cutlass-dsl >= 4.8 (see below);
+                       opt-in — never chosen by ``"auto"``.
 ``"auto"``           — GVR (if pre_idx provided) > radix (Blackwell) >
                        radix_cutlass (default).
 """
@@ -61,22 +68,75 @@ from ..utils import (
 # ---------------------------------------------------------------------------
 
 # All SM tiers FlashInfer ships kernels for.
-_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
+_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 
 # CuTe DSL radix backend: all Blackwell-plus tiers.
-_BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
+#
+# Rubin (SM107) runs the Blackwell CuTe-DSL kernels as-is: they use only
+# family-portable ops (block/warp scans, ``cute.arch.barrier``,
+# ``shuffle_sync_up``, ``warp_redux_sync``, griddepcontrol) with no
+# arch-specific ``tcgen05``/block-scaled MMA, so the DSL compiles them for
+# ``sm_107a`` natively. ``_cute_dsl_supports_arch`` below keeps a DSL that
+# predates the device from being selected.
+_BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
 
-# GVR is B200-class only (SM100/103). The non-LB (cluster_size=1) GVR CuTe-DSL
-# kernel fails to build on sm_120a: libNVVM rejects the generated device IR
-# (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't use GVR
-# even without load balancing. The LB path additionally needs cluster_size=4
-# programmatic multicast, which SM120/121's 1×1×1 cluster shape lacks. radix
+# GVR is B200-class only (SM100/103/107). The non-LB (cluster_size=1) GVR
+# CuTe-DSL kernel fails to build on sm_120a: libNVVM rejects the generated
+# device IR (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't
+# use GVR even without load balancing. The LB path additionally needs
+# cluster_size=4 programmatic multicast, which SM120/121's 1×1×1 cluster shape
+# lacks. Rubin keeps both (datacentre cluster shape, same PTX surface). radix
 # serves SM110+.
-_GVR_CCS = [100, 103]
+_GVR_CCS = [100, 103, 107]
+
+# DKG filtered-radix backend (vendored CuTe-DSL kernel, see
+# kernels/filtered_topk_util.py). Upstream's own arch table
+# ``_LARGE_OCCUPANCY_MIN_BLOCKS_PER_MP`` covers sm_100/103/107/109. 109 is left
+# out here because the shipped CuTe DSL has no ``sm_109`` entry in
+# ``SMEM_CAPACITY_MAP``, so sizing raises before the kernel ever compiles.
+_RADIX_FILTER_CCS = [100, 103, 107]
 
 # ---------------------------------------------------------------------------
 # Backend requirement checkers
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can target this compute capability.
+
+    The compute-capability lists above say which tiers FlashInfer *has* kernels
+    for; this says whether the *installed* DSL can emit code for the device. The
+    two differ on new silicon: a DSL release predating Rubin resolves ``sm_107a``
+    to a ``KeyError`` deep inside ``cute.compile``. Consulting this here makes
+    ``backend="auto"`` fall back to ``radix_cutlass`` instead of crashing, and
+    an explicit ``backend=`` request fail at dispatch with a clear error.
+
+    Note the introspection helper ``top_k_varlen.is_backend_supported`` does
+    NOT consult this (or any) runtime probe: it answers the *static* question
+    -- is the backend registered and does FlashInfer ship a kernel for this
+    compute capability -- from the registration dict and the CC lists alone.
+    Environment gates (installed-DSL arch support, the ``cutlass.memory``
+    requirement of ``radix_filter``) apply only at call time, through the
+    per-backend checkers. A True from ``is_backend_supported`` therefore does
+    not guarantee a call will be accepted in this environment. Mirrors
+    ``flashinfer.norm._cute_dsl_supports_arch``.
+    """
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+        return is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the capability probe itself break top-k dispatch.
+        return True
+
+
+def _cute_dsl_ready(device: torch.device) -> bool:
+    """``True`` when the CuTe-DSL backends are usable on ``device``."""
+    if not _CUTE_DSL_AVAILABLE:
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return _cute_dsl_supports_arch(major, minor)
 
 
 @supported_compute_capability(_ALL_CCS)
@@ -118,7 +178,7 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+    if not (_cute_dsl_ready(logits.device) and pre_idx is not None):
         return False
     # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
     # raise inside the kernel's __init__ during compilation.
@@ -160,6 +220,15 @@ def _top_k_varlen_heuristic(
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
     """
+    # "radix_filter" is deliberately absent: its checker accepts a strict
+    # subset of radix's configurations and its CC list is a subset of
+    # radix's, so listed after radix it could never be chosen (a dead
+    # entry), and listed before radix it would regress the small-row and
+    # small-batch regions where radix wins. Making it auto-selectable needs
+    # a shape/architecture-aware crossover rule (it wins at large N --
+    # roughly N >= 64K with enough rows on SM100, wider on SM107); until
+    # that rule exists it is explicit-only, as documented in the module
+    # docstring.
     return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
 
 
@@ -865,8 +934,8 @@ def _radix_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):
-    """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE
+    """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required."""
+    return _cute_dsl_ready(logits.device)
 
 
 def _run_radix(
@@ -952,6 +1021,150 @@ def _run_radix(
 
 
 # ---------------------------------------------------------------------------
+# Internal: DKG filtered-radix (`radix_filter`) backend implementation
+# ---------------------------------------------------------------------------
+
+_RADIX_FILTER_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+@functools.cache
+def _radix_filter_kernel_dsl_ok() -> bool:
+    """Whether the installed CuTe DSL has the APIs the vendored kernel uses.
+
+    The vendored kernels require **nvidia-cutlass-dsl >= 4.8**. They use the
+    ``cutlass.memory`` namespace (``SmemAllocator``,
+    ``get_smem_capacity_in_bytes``); 4.7.x exposes those APIs under
+    ``cutlass.utils`` instead, lacks the sm_107 architecture/capacity
+    metadata the Rubin sizing needs, and predates the ``cutlass.block``
+    namespace the TMA path uses -- so a 4.7 "compatibility alias" would not
+    actually run these kernels, and this repo's minimum DSL pin is older
+    still. On such environments the kernel would raise ``AttributeError``
+    from inside ``cute.compile``. Unlike the arch probe above,
+    this one fails CLOSED: without the module the kernel definitely cannot run,
+    so reporting unsupported (clean fallback / clean dispatch error) is strictly
+    better than the deferred crash.
+    """
+    try:
+        import cutlass.memory  # noqa: F401, PLC0415
+
+        return hasattr(cutlass.memory, "SmemAllocator") and hasattr(
+            cutlass.memory, "get_smem_capacity_in_bytes"
+        )
+    except Exception:
+        return False
+
+
+@supported_compute_capability(_RADIX_FILTER_CCS)
+def _radix_filter_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+):
+    """Return True only when the vendored DKG kernel covers this configuration.
+
+    Upstream's decode wrapper has no ``compress_ratio`` and no ``pre_idx``
+    parameter at all, so those are hard exclusions rather than tuning knobs --
+    returning False here makes an explicit ``backend="radix_filter"`` call fail
+    at backend validation instead of silently ignoring the argument or failing
+    deep inside the kernel constructor.
+    """
+    if not _cute_dsl_ready(logits.device):
+        return False
+    if not _radix_filter_kernel_dsl_ok():
+        return False
+    if pre_idx is not None:
+        return False
+    # Vendored kernel bound: FilteredTopKKernelVarlen rejects top_k outside
+    # [1, 16384]; enforce it here so the failure is a backend-validation error.
+    if not 1 <= top_k <= 16384:
+        return False
+    if compress_ratio != 1:
+        return False
+    if logits.dtype not in _RADIX_FILTER_DTYPES:
+        return False
+    return True
+
+
+def _run_radix_filter(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """DKG filtered-radix (coarse histogram -> filter -> refine) decode top-k.
+
+    The upstream wrapper's contract already matches this API: it takes the
+    ``(batch * next_n, N)`` logits and the ``(batch,)`` int32 ``seq_lens``, and
+    returns row-relative indices padded with ``-1``.
+
+    Integration boundary (vs. the fused sparse-attention interface): this
+    backend produces ROW-RELATIVE TOP-K INDICES ONLY. It does not fuse the
+    page-table translation, does not take ``row_starts`` /
+    ``page_table_row_starts`` / ``row_to_batch``, offers no deterministic
+    tie-breaking, and has no ``dsa_graph_safe`` mode -- all of which
+    :func:`flashinfer.top_k_page_table_transform` provides in one fused
+    launch. A consumer of that interface can substitute this backend for
+    ordinary decode only by adding a separate index-transform launch, and
+    cannot substitute it at all where ``row_starts``-based ragged/extend
+    semantics or deterministic ties are required. It allocates its own
+    outputs, so ``out_indices``/``out_values`` are filled by copy when the
+    caller supplied them.
+    """
+    from .kernels.filtered_topk_decode import (  # noqa: PLC0415
+        cute_dsl_radix_filter_topk_wrapper,
+    )
+
+    # The kernel ABI declares a symbolic leading stride (padded row views are
+    # zero-copy) but requires a unit inner stride and a 32-byte-aligned base
+    # for its vectorized loads; anything else previously failed late with an
+    # opaque FFI alignment error. Materialize only the genuinely unsupported
+    # layouts (rare: transposed/gathered views, or a base sliced off
+    # alignment -- torch allocations themselves are 256-byte aligned).
+    if logits.stride(-1) != 1 or (logits.data_ptr() % 32) != 0:
+        logits = logits.contiguous()
+        if (logits.data_ptr() % 32) != 0:
+            logits = logits.clone()
+
+    # Compile and launch under the input tensor's device: the persistent JIT
+    # cache tags artifacts by the CURRENT device's architecture, and the
+    # kernel launches on the current stream, so both must agree with where
+    # the data lives on a multi-GPU host.
+    with torch.cuda.device(logits.device):
+        # Caller-supplied buffers are threaded through to the kernel launch, so
+        # the kernel writes them directly: no per-call output allocation, no
+        # num_rows x top_k device copy, and CUDA-graph users keep stable
+        # destinations across replays.
+        idx, val = cute_dsl_radix_filter_topk_wrapper(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            return_val=return_output_values,
+            out_indices=out_indices,
+            out_values=out_values if return_output_values else None,
+        )
+
+    if out_indices is not None:
+        idx = out_indices  # same storage; preserve the caller's shape/object
+    if return_output_values and out_values is not None:
+        val = out_values
+    return idx, (val if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
 # Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
@@ -961,6 +1174,7 @@ def _run_radix(
         "radix": _radix_top_k_varlen_check,
         "gvr": _gvr_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
+        "radix_filter": _radix_filter_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -975,7 +1189,7 @@ def top_k_varlen(
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
-    backend: Literal["radix", "gvr", "radix_cutlass", "auto"] = "auto",
+    backend: Literal["radix", "gvr", "radix_cutlass", "radix_filter", "auto"] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1034,7 +1248,8 @@ def top_k_varlen(
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
-                              (Blackwell sm_100+; native varlen, no ``pre_idx``,
+                              (Blackwell sm_100+ incl. Rubin sm_107; native
+                              varlen, no ``pre_idx``,
                               no logit masking).
         ``"gvr"``           — GVR kernel (Blackwell sm_100+ only; requires
                               ``pre_idx``). ``load_balance`` selects the LB vs
@@ -1122,6 +1337,23 @@ def top_k_varlen(
     """
     assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    # Grouped-row ABI, shared by every backend: row r belongs to sequence
+    # r // next_n, so seq_lens must hold exactly one entry per group. Validated
+    # here (not in the per-backend checkers) because a violation is a silent
+    # device-side OOB read of seq_lens or a wrong grouping in every backend,
+    # and the API body still runs under skip_check=True. Real exceptions, not
+    # asserts: this must hold under `python -O` too.
+    if next_n < 1:
+        raise ValueError(f"next_n must be >= 1, got {next_n}")
+    if logits.shape[0] != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            f"logits has {logits.shape[0]} rows but seq_lens has "
+            f"{seq_lens.shape[0]} entries with next_n={next_n}: expected "
+            f"seq_lens.shape[0] * next_n == logits.shape[0] "
+            f"(= {seq_lens.shape[0] * next_n}). Rows are grouped as "
+            f"row // next_n -> sequence; for per-row lengths pass next_n=1 "
+            f"with one seq_lens entry per row."
+        )
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
@@ -1186,10 +1418,21 @@ def top_k_varlen(
             out_indices,
             out_values,
         )
+    elif backend == "radix_filter":
+        out_i, out_v = _run_radix_filter(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+        )
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', or 'radix_cutlass'."
+            f"Expected 'radix', 'gvr', 'radix_cutlass', or 'radix_filter'."
         )
 
     return out_i, out_v

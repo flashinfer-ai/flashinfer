@@ -4,6 +4,7 @@ from ..trace.templates.gemm import (
     mm_M1_16_K7168_N256_trace,
     tinygemm_bf16_trace,
 )
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.jit import (
     gen_dsv3_router_gemm_module,
     gen_tinygemm2_module,
@@ -490,20 +491,21 @@ def get_tinygemm2_sm100_module():
     return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
 
 
-# The generated kernels are validated on SM100 (B200) and SM103 (B300/GB300)
-# exactly; other 10.x devices (e.g. SM107) pass is_sm100a_supported's
+# The generated kernels are validated on SM100 (B200), SM103 (B300/GB300) and
+# SM107 (Rubin) exactly; other 10.x devices pass is_sm100a_supported's
 # major==10 predicate but must keep using the reference kernel.
-_TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+_TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
-    return get_compute_capability(
-        device
-    ) in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES and version_at_least(
-        torch.version.cuda, "12.8"
-    )
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
+        return False
+    if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
+        return False
+    return version_at_least(torch.version.cuda, "12.8")
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)

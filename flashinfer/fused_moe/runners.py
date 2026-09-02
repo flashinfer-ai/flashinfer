@@ -26,7 +26,8 @@ from __future__ import annotations
 import functools
 import warnings
 from dataclasses import dataclass
-from typing import Any, ClassVar, List, Optional
+from types import MappingProxyType
+from typing import Any, ClassVar, List, Mapping, Optional
 
 import torch
 
@@ -412,6 +413,14 @@ class MoERunner(TunableRunner):
     Concrete runners implement ``_check_support()`` and ``_build()``. Keeping
     the public methods here ensures a failed support check cannot authorize a
     build and execution cannot silently initialize backend resources.
+
+    Preserve the exact object returned by ``pack_inputs()`` until ``forward()``:
+    a runner may attach per-call tuning and launch metadata to a ``list``
+    subclass. Direct ``forward(packed_inputs)`` recovers that metadata from the
+    object. Callers invoking ``AutoTuner.choose_one()`` directly must pass
+    ``tuning_config_for(packed_inputs)`` and
+    ``**launch_kwargs_for(packed_inputs)`` because profiling synthesizes plain
+    tensor lists without the attached Python attributes.
     """
 
     backend_key: ClassVar[str] = ""
@@ -433,6 +442,28 @@ class MoERunner(TunableRunner):
     def __init__(self) -> None:
         self._support_checked = False
         self._built = False
+
+    def tuning_config_for(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        """Return the tuning config paired with ``inputs`` when one is present."""
+        packed_config = getattr(inputs, "tuning_config", None)
+        if packed_config is not None:
+            return packed_config
+        runner_config = getattr(self, "tuning_config", None)
+        if runner_config is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: pack_inputs must return a per-call "
+                "tuning config or the runner must initialize tuning_config."
+            )
+        return runner_config
+
+    def launch_state_for(self, inputs: List[torch.Tensor]) -> Any:
+        """Return immutable per-call launch metadata paired with ``inputs``."""
+        return getattr(inputs, "launch_state", None)
+
+    def launch_kwargs_for(self, inputs: List[torch.Tensor]) -> dict[str, Any]:
+        """Return only the launch kwargs required by this packed call."""
+        launch_state = self.launch_state_for(inputs)
+        return {"launch_state": launch_state} if launch_state is not None else {}
 
     def check_support(self) -> None:
         self._support_checked = False
@@ -3023,6 +3054,66 @@ class CuteDslRunner(MoERunner):
 
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+        self._assert_rubin_cute_dsl_available()
+
+    def _assert_rubin_cute_dsl_available(self) -> None:
+        """Reject SM107 when the installed CuTe DSL cannot provide its kernels.
+
+        The SM107 gather/activation-fusion and finalize-fusion kernels are built
+        on ``cutlass.utils.rubin_helpers``, which only exists from CuTe DSL 4.8.
+        Without it the kernel factories raise ``NotImplementedError`` when they
+        are first called -- that is, in the middle of ``forward()``, long after
+        this backend has been accepted as a candidate.
+
+        Declining here instead lets ``MoELayer`` drop the backend at build time,
+        so ``auto`` routes elsewhere and callers that enumerate backends see it
+        absent rather than failing mid-call.
+
+        The probe is arch-conditional on purpose: only the SM107 kernels need
+        ``rubin_helpers``, so an older DSL is perfectly usable on SM100/SM103.
+        """
+        from ..utils import get_compute_capability
+
+        # #4787 put this on CuteDslNvfp4Runner; #4793 unified that into
+        # CuteDslRunner. Keep the original blast radius -- only the NVFP4 path
+        # reaches the SM107 rubin kernels. MXFP4/W4A8 is already declined on
+        # SM107 above, and W4A16 gates itself via require_cute_dsl_arch().
+        if self.config.quant.variant is not QuantVariant.NVFP4:
+            return
+
+        # check_support() is also exercised on runners built with __new__ and only
+        # a config attached (see TestMoERunnerSupport), so there may be no bound
+        # device. Nothing arch-specific can be decided in that case; the real
+        # dispatch path always sets device in __init__ before check_support().
+        device = getattr(self, "device", None)
+        if device is None:
+            return
+        if get_compute_capability(device) != (10, 7):
+            return
+
+        # ``cute_dsl.utils`` imports cutlass at module scope, so on a stack with no
+        # CuTe DSL installed the probe cannot be reached at all. Failing to import
+        # it is itself proof the SM107 kernels are unavailable, so decline rather
+        # than propagating an ImportError out of a support check.
+        #
+        # #4753 adds a cutlass-free ``cute_dsl.availability`` module and reroutes
+        # the package off ``utils``; once that lands this collapses to a plain
+        # ``from ..cute_dsl.availability import is_rubin_cute_dsl_available``,
+        # matching what release-v0.6.18 already does. The try/except is kept so
+        # this commit is correct whichever of the two merges first.
+        try:
+            from ..cute_dsl.utils import is_rubin_cute_dsl_available
+
+            rubin_dsl_available = is_rubin_cute_dsl_available()
+        except ImportError:
+            rubin_dsl_available = False
+
+        if not rubin_dsl_available:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires CuTe DSL >= 4.8 on SM107 "
+                "(Rubin), which provides cutlass.utils.rubin_helpers; the "
+                "installed CuTe DSL does not have it."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -3235,12 +3326,55 @@ class CuteDslRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, eq=False)
+class _TrtllmLaunchState:
+    """Immutable kwargs for one TRTLLM ``pack_inputs``/``forward`` pair."""
+
+    static_kwargs: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "static_kwargs", MappingProxyType(dict(self.static_kwargs))
+        )
+
+    def with_overrides(self, **kwargs: Any) -> "_TrtllmLaunchState":
+        updated = dict(self.static_kwargs)
+        updated.update(kwargs)
+        return _TrtllmLaunchState(updated)
+
+
+class _TrtllmPackedInputs(list[torch.Tensor]):
+    """Tensor-list ABI plus launch metadata local to one TRTLLM call.
+
+    The list remains mutable because the autotuner synthesizes token-bucket
+    tensors. The associated tuning config and launch kwargs are immutable and
+    never stored on the shared runner.
+    """
+
+    def __init__(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tuning_config: TuningConfig,
+        launch_state: _TrtllmLaunchState,
+    ) -> None:
+        super().__init__(inputs)
+        self.tuning_config = tuning_config
+        self.launch_state = launch_state
+
+    def with_launch_overrides(self, **kwargs: Any) -> "_TrtllmPackedInputs":
+        return _TrtllmPackedInputs(
+            list(self),
+            tuning_config=self.tuning_config,
+            launch_state=self.launch_state.with_overrides(**kwargs),
+        )
+
+
 class _TrtllmRunnerBase(MoERunner):
     """Load the shared TRTLLM-gen module after support validation."""
 
     _module: Any
     _inner: Any
-    _static_kwargs: dict[str, Any]
 
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
@@ -3252,12 +3386,19 @@ class _TrtllmRunnerBase(MoERunner):
         inputs: List[torch.Tensor],
         tactic: Any,
         do_preparation: bool,
+        launch_state: _TrtllmLaunchState | None = None,
     ) -> torch.Tensor | List[torch.Tensor]:
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState):
+            raise RuntimeError(
+                "TRTLLM forward requires the launch state returned by pack_inputs."
+            )
         result = self._inner.forward(
             inputs,
             tactic=tactic,
             do_preparation=do_preparation,
-            **self._static_kwargs,
+            **launch_state.static_kwargs,
         )
         if self.config.finalize.do_finalize:
             return inputs[0]
@@ -3268,9 +3409,10 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
-    plus the static weight/config kwargs that ``core.MoERunner.forward``
-    consumes, then delegates tactic enumeration, tuning-config construction, and
-    the tactic'd forward to that inner runner.  This mirrors
+    plus the immutable per-call weight/config kwargs that
+    ``core.MoERunner.forward`` consumes, then delegates tactic enumeration,
+    tuning-config construction, and the tactic'd forward to that inner runner.
+    This mirrors
     ``CuteDslRunner`` (which wraps ``CuteDslFusedMoERunner``) and keeps
     the fragile raw-op positional launch in exactly one place —
     ``core.MoERunner.forward``.
@@ -3403,8 +3545,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
         # Built lazily on first pack_inputs once hidden_size is known.
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -3433,7 +3573,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     ) -> List[Any]:
         self._require_built()
         # The inner runner reads num_tokens from inputs + its own instance key;
-        # no static kwargs are needed for tactic enumeration.
+        # no launch kwargs are needed for tactic enumeration.
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -3444,10 +3584,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        # MoELayer's autotuner call passes no kwargs, so the static weight/config
-        # kwargs are injected here. Finalized calls write into inputs[0];
-        # unfinalized calls return the flat API's three-tensor result.
-        return self._forward_inner(inputs, tactic, do_preparation)
+        # Finalized calls write into inputs[0]; unfinalized calls return the flat
+        # API's three-tensor result. Launch kwargs come from the same packed call
+        # even when another pack_inputs invocation interleaves before forward.
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_fp4_tensors(
         self,
@@ -3601,7 +3743,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         on the config this runner was built with.  ``topk_ids`` carries
         GLOBAL expert ids and is packed as-is; the kernel performs the
         global→local mapping itself by subtracting ``local_expert_offset``
-        (passed via the static kwargs) and dropping ids outside
+        (passed via the paired launch state) and dropping ids outside
         ``[offset, offset + local_num_experts)``.
         """
         self._require_built()
@@ -3736,9 +3878,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
 
         # Static (num_tokens-invariant) launch arguments for the fp4 branch of
-        # MoERunner.forward.  None-valued entries are the optional gemm bias /
-        # swiglu beta-clamp / per-token-scale paths not used by the MVP.
-        self._static_kwargs = dict(
+        # MoERunner.forward. None-valued entries are optional GEMM bias and
+        # activation-scalar paths. per_token_scale intentionally stays in
+        # MoeRunnerInputs because it is num_tokens-dynamic and the autotuner
+        # resizes it with the synthesized token bucket.
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
@@ -3753,7 +3897,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             output1_scale_scalar=v.get("output1_scale_scalar"),
             output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
             output2_scale_scalar=v.get("output2_scale_scalar"),
-            per_token_scale=act.per_token_scale,
             num_experts=routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
@@ -3768,7 +3911,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._ensure_inner(hidden_size)
         # Reuse the inner runner's tuning-config builder so the num_tokens
         # buckets honor ExecutionConfig.tune_max_num_tokens (CR5).
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
@@ -3778,7 +3921,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3866,8 +4013,6 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -3905,7 +4050,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_fp8_tensors(
         self,
@@ -4072,7 +4219,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
@@ -4103,13 +4250,17 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4195,8 +4346,6 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4235,7 +4384,9 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_tensors(
         self, act: MoEActivationPack, view: dict, hidden_size: int
@@ -4365,7 +4516,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
@@ -4387,14 +4538,18 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4468,8 +4623,6 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4506,7 +4659,9 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -4589,7 +4744,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 
         from ..tllm_enums import WeightLayout
 
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
@@ -4613,14 +4768,18 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4680,8 +4839,6 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4718,7 +4875,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -4856,7 +5015,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             per_token_scale=None,
         )
 
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
@@ -4877,14 +5036,18 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
