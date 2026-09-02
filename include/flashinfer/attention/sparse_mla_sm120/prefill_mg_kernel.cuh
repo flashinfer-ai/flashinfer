@@ -451,7 +451,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
           acc_o[ti_acc][3] += xv[3] * sc1;
         }
       }
-      bar_arrive_alt<8, 9, Cfg::MATH_THREADS>(buf);  // w_free
+      bar_arrive_alt<8, 9, Cfg::MATH_THREADS>(buf);   // w_free
       bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(buf);  // KV release to IO
     }
 
