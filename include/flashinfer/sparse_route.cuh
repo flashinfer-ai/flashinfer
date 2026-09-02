@@ -101,11 +101,13 @@ __global__ void __launch_bounds__(THREADS)
 
   // Every column of this row shares them, so they are read once per block.
   // The index tensors may be int64 and everything below is int32, so each value
-  // is bounded in its own width before it is narrowed. The request is already
-  // compared against its count in IdType, which rejects anything an int32 could
-  // not hold; the position and the length are not bounded from above by
-  // anything else, and a value of exactly 2^32 narrows to zero. The bound is
-  // written out for all three so the next one cannot regress quietly.
+  // is bounded in its own width before it is narrowed -- a value of exactly
+  // 2^32 would narrow to zero, which is a real request and a real position.
+  //
+  // The request is also compared against num_requests, but that is a tensor
+  // extent with no int32 cap of its own, so the comparison alone does not stand
+  // in for the bound. The position and the length have nothing above them at
+  // all.
   constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
   const IdType position_raw = query_positions[row];
   const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
@@ -215,11 +217,13 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
   if (row >= rows || tile_base >= output_width) return;
 
   // The index tensors may be int64 and everything below is int32, so each value
-  // is bounded in its own width before it is narrowed. The request is already
-  // compared against its count in IdType, which rejects anything an int32 could
-  // not hold; the position and the length are not bounded from above by
-  // anything else, and a value of exactly 2^32 narrows to zero. The bound is
-  // written out for all three so the next one cannot regress quietly.
+  // is bounded in its own width before it is narrowed -- a value of exactly
+  // 2^32 would narrow to zero, which is a real request and a real position.
+  //
+  // The request is also compared against num_requests, but that is a tensor
+  // extent with no int32 cap of its own, so the comparison alone does not stand
+  // in for the bound. The position and the length have nothing above them at
+  // all.
   constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
   const IdType position_raw = query_positions[row];
   const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
@@ -306,11 +310,15 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
         // What bounds the page is the slot space, not an int32. A route of
         // int64 can hold a slot of 2^31 and the caller is allowed to ask for
         // one, so capping the page at INT32_MAX would mask a page it is
-        // entitled to. The cap is the largest page whose first slot is still
-        // inside num_slots, which is also what keeps the product below 64 bits.
-        const uint64_t max_page = (static_cast<uint64_t>(num_slots) - 1) / page_size;
+        // entitled to.
+        //
+        // page < num_slots is necessary rather than sufficient -- the slot is
+        // at least the page whenever a page holds anything -- so it turns no
+        // valid page away, and it is what keeps the product inside 64 bits:
+        // both factors are under 2^32 by then. The exact bound is still the
+        // candidate below.
         const IdType page = row_table[logical_page];
-        if (page >= IdType(0) && static_cast<uint64_t>(page) <= max_page) {
+        if (page >= IdType(0) && static_cast<uint64_t>(page) < static_cast<uint64_t>(num_slots)) {
           const uint64_t candidate =
               static_cast<uint64_t>(page) * page_size + static_cast<uint32_t>(token) % page_size;
           if (candidate < static_cast<uint64_t>(num_slots)) {
@@ -402,10 +410,8 @@ __global__ void __launch_bounds__(THREADS)
         if (logical_page < table_width) {
           // Bounded by the slot space rather than by an int32, for the same
           // reason as the fused kernel above.
-          const uint64_t max_page =
-              (static_cast<uint64_t>(num_slots) - 1) / static_cast<uint32_t>(page_size);
           const IdType page = row_table[logical_page];
-          if (page >= IdType(0) && static_cast<uint64_t>(page) <= max_page) {
+          if (page >= IdType(0) && static_cast<uint64_t>(page) < static_cast<uint64_t>(num_slots)) {
             const uint64_t candidate =
                 static_cast<uint64_t>(page) * static_cast<uint32_t>(page_size) + entry;
             if (candidate < static_cast<uint64_t>(num_slots)) {

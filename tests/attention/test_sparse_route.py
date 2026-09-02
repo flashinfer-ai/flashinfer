@@ -433,15 +433,20 @@ def test_qsa_route_from_logical_does_not_let_a_slot_wrap_into_range():
     while their product does not, and a product computed in 32 bits wraps to a
     small number that passes the num_slots bound -- page 65536 of a 65536-entry
     page is exactly 2^32, which would arrive as slot 0.
+
+    The page itself is inside the slot space here, so the bound that precedes
+    the multiply lets it through and the width of the multiply is what decides
+    the case. That needs the largest slot space a route can be given, which is
+    an int64 one.
     """
-    page_size, num_slots, width = 65536, 1024, 8
+    page_size, num_slots, width = 65536, 4294967295, 8
     rows = 1
-    logical = torch.arange(width, dtype=torch.int32, device=DEV).reshape(rows, width)
-    token_to_req = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    logical = torch.arange(width, dtype=torch.int64, device=DEV).reshape(rows, width)
+    token_to_req = torch.zeros(rows, dtype=torch.int64, device=DEV)
     # One page, mapped to a page id whose product with the page size is 2^32.
-    table = torch.tensor([[65536]], dtype=torch.int32, device=DEV)
+    table = torch.tensor([[65536]], dtype=torch.int64, device=DEV)
     nbytes = -(-width // 8)
-    route = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+    route = torch.empty(rows, width, dtype=torch.int64, device=DEV)
     mask = torch.empty(rows * nbytes, dtype=torch.uint8, device=DEV)
 
     flashinfer.qsa_route_from_logical(
@@ -505,9 +510,11 @@ def test_qsa_route_from_blocks_bounds_the_ratio_before_it_derives_a_width():
 @pytest.mark.parametrize("bad", _PAST_INT32)
 @pytest.mark.parametrize("field", ["token_to_req", "logical", "page_table"])
 def test_qsa_route_from_logical_does_not_wrap_an_index_that_is_not_an_int32(field, bad):
-    """The slot kernel narrows the request, the logical token and the page id
-    just as the expansion does, so the same values must not come back as
-    request, token or page zero."""
+    """The slot kernel narrows the request and the logical token just as the
+    expansion does, so neither may come back as request or token zero. The page
+    id is not narrowed at all -- it is bounded against the slot space in IdType
+    and then widened -- so what this asks of it is that a value it cannot
+    address is refused rather than folded into one it can."""
     width, page_size, num_slots = 8, 16, 4096
     logical = torch.arange(width, dtype=torch.int64, device=DEV).reshape(1, width)
     token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
