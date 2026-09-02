@@ -47,21 +47,22 @@ def _get_glibcxx_abi_build_flags() -> List[str]:
 @functools.cache
 def get_cuda_path() -> str:
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is not None:
-        return cuda_home
-    # get output of "which nvcc"
-    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
-    if nvcc_path.returncode == 0:
-        cuda_home = os.path.dirname(
-            os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
-        )
-    else:
-        cuda_home = "/usr/local/cuda"  # This default value is from: https://github.com/pytorch/pytorch/blob/ceb11a584d6b3fdc600358577d9bf2644f88def9/torch/utils/cpp_extension.py#L115
-        if not os.path.exists(cuda_home):
-            raise RuntimeError(
-                f"Could not find nvcc and default {cuda_home=} doesn't exist"
+    if cuda_home is None:
+        # get output of "which nvcc"
+        nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
+        if nvcc_path.returncode == 0:
+            cuda_home = os.path.dirname(
+                os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
             )
-    return cuda_home
+        else:
+            cuda_home = "/usr/local/cuda"  # This default value is from: https://github.com/pytorch/pytorch/blob/ceb11a584d6b3fdc600358577d9bf2644f88def9/torch/utils/cpp_extension.py#L115
+            if not os.path.exists(cuda_home):
+                raise RuntimeError(
+                    f"Could not find nvcc and default {cuda_home=} doesn't exist"
+                )
+    # realpath so /usr/local/cuda vs /usr/local/cuda-X.Y (symlink) and
+    # PATH-order differences converge to one string in build.ninja (#4884).
+    return os.path.realpath(cuda_home)
 
 
 @functools.cache
