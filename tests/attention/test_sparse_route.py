@@ -56,9 +56,10 @@ def _expand_reference(
         seq = raw_seq if in_range(raw_seq) else 0
         position = positions[row] if in_range(positions[row]) else -1
         past = min((position + 1) // compress_ratio, seq // compress_ratio)
-        complete = min(past, block_topk)
         route = []
-        for rank in range(complete):
+        # Every rank gets its columns; whether the block it names is usable is
+        # decided per block, not by truncating the rank range.
+        for rank in range(block_topk):
             block = blocks[row][rank]
             # The whole block or none of it: the block the query sits in is
             # partly ahead of it, and the tail below appends its seen half, so
@@ -710,3 +711,64 @@ def test_qsa_route_keeps_a_page_an_int64_route_can_hold(path):
     torch.cuda.synchronize()
     assert int(mask[0]) & 1, "a page inside the slot space was masked out"
     assert int(route[0, 0]) == big_page, route[0, 0].item()
+
+
+@pytest.mark.parametrize("path", ["logical", "blocks"])
+def test_expand_block_route_reads_every_rank_the_selector_filled(path):
+    """The selector's ranks are its own business. A valid block sitting at a
+    rank the query happens to be short of is still a valid block: with a ratio
+    of four and a query at position 7, two blocks are behind the query, and a
+    selection of [-1, -1, 0, 1] has both of them at ranks 2 and 3. Sizing the
+    expanded region by the query rather than by the rank count dropped them and
+    reinterpreted their columns as tail columns."""
+    ratio = 4
+    blocks = torch.tensor([[-1, -1, 0, 1]], dtype=torch.int32, device=DEV)
+    positions = torch.tensor([7], dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([16], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    if path == "logical":
+        out = flashinfer.expand_block_route(
+            blocks, positions, lengths, token_to_req, ratio
+        )
+    else:
+        page_size, width = 4, 4 * ratio + ratio - 1
+        table = torch.arange(4, dtype=torch.int32, device=DEV).reshape(1, 4)
+        out = torch.empty(1, width, dtype=torch.int32, device=DEV)
+        route = torch.empty(1, width, dtype=torch.int32, device=DEV)
+        mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            out,
+            route,
+            mask,
+            ratio,
+            page_size,
+            16,
+        )
+    torch.cuda.synchronize()
+    routed = sorted(t for t in out[0].tolist() if t >= 0)
+    assert routed == [0, 1, 2, 3, 4, 5, 6, 7], routed
+    expected = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_expand_block_route_covers_more_rows_than_one_grid_can_hold():
+    """Rows go on the grid's y dimension, which stops at 65535 on every compute
+    capability, and a row is a query token. A long-context step goes past that,
+    so the rows a grid cannot cover are walked by a stride rather than dropped
+    or refused."""
+    rows, ratio, topk = 70000, 4, 2
+    assert rows > 65535
+    blocks = torch.zeros(rows, topk, dtype=torch.int32, device=DEV)
+    positions = torch.full((rows,), 31, dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([64], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
+    torch.cuda.synchronize()
+    # Every row is the same query, so every row is the same route.
+    assert bool((out == out[0]).all()), out[-1].tolist()
+    assert int((out[-1] >= 0).sum()) > 0, out[-1].tolist()
