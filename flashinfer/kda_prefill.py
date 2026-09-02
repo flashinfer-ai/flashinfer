@@ -145,7 +145,10 @@ class _CakeKDAAffineRoute:
     """Exact target and token partition for the sealed affine composite."""
 
     target: Literal["sm100a", "sm103a"]
+    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"]
     token_offsets: tuple[int, ...]
+    gate_lower_bound: float
+    external_state_dtype: torch.dtype
 
     @property
     def num_parts(self) -> int:
@@ -196,6 +199,7 @@ class _CakeKDAAffineModuleBundle:
 @dataclass(frozen=True)
 class _CakeKDAAffineResourcesKey:
     target: Literal["sm100a", "sm103a"]
+    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"]
     token_offsets: tuple[int, ...]
     num_heads: int
 
@@ -1033,6 +1037,8 @@ def _select_cake_kda_affine_route(
 ) -> Optional[_CakeKDAAffineRoute]:
     """Select only the exact contract covered by the sealed affine export."""
 
+    bounded_fp32 = lower_bound == -5.0 and initial_state_dtype == torch.float32
+    unbounded_bf16 = lower_bound is None and initial_state_dtype == torch.bfloat16
     if (
         not export_available
         or compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
@@ -1048,14 +1054,18 @@ def _select_cake_kda_affine_route(
         or not beta_contiguous
         or beta_dtype != torch.bfloat16
         or not indexed_state
-        or initial_state_dtype != torch.bfloat16
+        or not (bounded_fp32 or unbounded_bf16)
         or has_checkpoints
-        or lower_bound is not None
         or sm_count <= 0
     ):
         return None
 
     chunks = total_tokens // _FLASH_KDA_M128_CHUNK
+    min_chunks = 256
+    if bounded_fp32:
+        min_chunks = max(min_chunks, num_heads * 32)
+    if 2 * num_heads > sm_count or chunks < min_chunks:
+        return None
     candidate_parts = min(
         sm_count,
         max(2, sm_count // num_heads),
@@ -1078,9 +1088,14 @@ def _select_cake_kda_affine_route(
     )
     return _CakeKDAAffineRoute(
         target=target,
+        family=(
+            "bounded_fp32_affine_prefix" if bounded_fp32 else "unbounded_affine_prefix"
+        ),
         token_offsets=tuple(
             chunk_offset * _FLASH_KDA_M128_CHUNK for chunk_offset in chunk_offsets
         ),
+        gate_lower_bound=-5.0 if bounded_fp32 else 0.0,
+        external_state_dtype=(torch.float32 if bounded_fp32 else torch.bfloat16),
     )
 
 
@@ -1121,24 +1136,21 @@ def _cake_kda_affine_workspace_buffer(
 @functools.cache
 def _get_cake_kda_affine_module_bundle(
     target: Literal["sm100a", "sm103a"],
+    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"],
 ) -> _CakeKDAAffineModuleBundle:
-    """Load the four sealed role modules for one exact Blackwell target."""
+    """Load one sealed affine family and its shared scan module."""
 
     from .jit.cake_kda import get_cake_kda_module
 
     return _CakeKDAAffineModuleBundle(
-        main=get_cake_kda_module(
-            target, "unbounded_affine_prefix", "affine_split_main", "main"
-        ),
-        map=get_cake_kda_module(
-            target, "unbounded_affine_prefix", "affine_split_map", "map"
-        ),
+        main=get_cake_kda_module(target, family, "affine_split_main", "main"),
+        map=get_cake_kda_module(target, family, "affine_split_map", "map"),
         scan=get_cake_kda_module(
             target, "unbounded_affine_prefix", "affine_prefix_scan", "scan"
         ),
         correction=get_cake_kda_module(
             target,
-            "unbounded_affine_prefix",
+            family,
             "affine_split_correction",
             "correction",
         ),
@@ -1157,6 +1169,7 @@ def _cake_kda_affine_resources(
 
     key = _CakeKDAAffineResourcesKey(
         target=affine_route.target,
+        family=affine_route.family,
         token_offsets=affine_route.token_offsets,
         num_heads=num_heads,
     )
@@ -1225,7 +1238,11 @@ def _cake_kda_affine_resources(
     )
     final_shape = (1, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
     final_compact = buffer("affine_final_compact_f32", final_shape, torch.float32)
-    final_external = buffer("affine_final_external_bf16", final_shape, torch.bfloat16)
+    final_external = (
+        final_compact
+        if affine_route.external_state_dtype == torch.float32
+        else buffer("affine_final_external_bf16", final_shape, torch.bfloat16)
+    )
     tail_value_shape = (1, tail_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     zero_v = buffer(
         "affine_zero_v_bf16",
@@ -1258,7 +1275,10 @@ def _cake_kda_affine_resources(
             "Cake KDA affine tail offsets are not warmed for CUDA graph capture"
         ),
     )
-    modules = _get_cake_kda_affine_module_bundle(affine_route.target)
+    modules = _get_cake_kda_affine_module_bundle(
+        affine_route.target,
+        affine_route.family,
+    )
     resolved = _CakeKDAAffineResources(
         key=key,
         num_parts=num_parts,
@@ -1356,7 +1376,12 @@ def _run_cake_kda_direct_export(
         int(store_final_state),
         scale,
         lower_bound,
-        state_indices.data_ptr() if use_state_indices else empty_i32.data_ptr(),
+        # The affine-main schedule may use this address for its indexed
+        # initial-state load even when final-state stores are compact.  Keep
+        # pointer selection independent from the kernel's generic
+        # use_state_indices flag; callers pass empty_i32 when no address is
+        # semantically required.
+        state_indices.data_ptr(),
         (state_checkpoints.data_ptr() if use_checkpoints else empty_bf16.data_ptr()),
         (checkpoint_cu_starts.data_ptr() if use_checkpoints else empty_i64.data_ptr()),
         beta.stride(-2),
@@ -1435,6 +1460,7 @@ def _run_cake_kda_affine_route(
     beta_tail = beta_flat[resources.tail_start :].view(1, tail_tokens, num_heads)
     main_beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
     compact_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    external_state_is_fp32 = affine_route.external_state_dtype == torch.float32
 
     _run_cake_kda_direct_export(
         module=resources.modules.main,
@@ -1442,7 +1468,7 @@ def _run_cake_kda_affine_route(
         k=k,
         v=v,
         g=g,
-        beta=main_beta_source,
+        beta=beta,
         beta_tma=main_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1452,10 +1478,10 @@ def _run_cake_kda_affine_route(
         state_checkpoints=empty_bf16,
         checkpoint_cu_starts=resources.empty_i64,
         checkpoint_every_n_tokens=0,
-        initial_state_bf16=initial_state,
+        initial_state_bf16=empty_bf16 if external_state_is_fp32 else initial_state,
         out=out,
         final_state_bf16=empty_bf16,
-        initial_state_f32=empty_f32,
+        initial_state_f32=initial_state if external_state_is_fp32 else empty_f32,
         final_state_f32=resources.main_final,
         empty_bf16=resources.empty_bf16,
         empty_f32=resources.empty_f32,
@@ -1464,12 +1490,15 @@ def _run_cake_kda_affine_route(
         empty_u32=resources.empty_u32,
         num_heads=num_heads,
         num_sequences=resources.num_parts,
-        use_state_indices=True,
+        # affine_main_indexed_initial reads the external slot through the
+        # state_indices address above.  Its main_final workspace is compact by
+        # split part, so generic indexed final-state stores must stay disabled.
+        use_state_indices=False,
         use_initial_state=True,
         store_final_state=True,
         state_slot_stride=initial_state.stride(0),
         scale=scale,
-        lower_bound=0.0,
+        lower_bound=affine_route.gate_lower_bound,
         grid_x=resources.num_parts * num_heads,
     )
     # The main and tail carriers can share workspace. Queue the tail refresh
@@ -1481,7 +1510,7 @@ def _run_cake_kda_affine_route(
         k=k_tail,
         v=resources.zero_v,
         g=g_tail,
-        beta=tail_beta_source,
+        beta=beta_tail,
         beta_tma=tail_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1508,7 +1537,7 @@ def _run_cake_kda_affine_route(
         store_final_state=True,
         state_slot_stride=compact_stride,
         scale=scale,
-        lower_bound=0.0,
+        lower_bound=affine_route.gate_lower_bound,
         grid_x=(resources.num_parts - 1) * num_heads,
     )
     resources.modules.scan.run(
@@ -1527,7 +1556,7 @@ def _run_cake_kda_affine_route(
         k=k_tail,
         v=resources.zero_v,
         g=g_tail,
-        beta=tail_beta_source,
+        beta=beta_tail,
         beta_tma=tail_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1554,7 +1583,7 @@ def _run_cake_kda_affine_route(
         store_final_state=True,
         state_slot_stride=compact_stride,
         scale=scale,
-        lower_bound=0.0,
+        lower_bound=affine_route.gate_lower_bound,
         grid_x=(resources.num_parts - 1) * num_heads,
     )
     out_flat[resources.tail_start :].add_(
@@ -1565,7 +1594,8 @@ def _run_cake_kda_affine_route(
         resources.correction_final[-1:],
         out=resources.final_compact,
     )
-    resources.final_external.copy_(resources.final_compact)
+    if not external_state_is_fp32:
+        resources.final_external.copy_(resources.final_compact)
     resources.state_indices_i64.copy_(state_indices)
     final_state.index_copy_(0, resources.state_indices_i64, resources.final_external)
 
@@ -1593,8 +1623,7 @@ def _should_use_independent_dvsplit(
         compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
         and fixed_layout
         and num_sequences == 1
-        and max_sequence_length
-        >= _FLASH_KDA_INDEPENDENT_DVSPLIT_MIN_SEQUENCE_LENGTH
+        and max_sequence_length >= _FLASH_KDA_INDEPENDENT_DVSPLIT_MIN_SEQUENCE_LENGTH
         and _FLASH_KDA_INDEPENDENT_DVSPLIT_CTAS * num_heads <= sm_count
     )
 

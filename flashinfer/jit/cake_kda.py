@@ -20,6 +20,7 @@ CakeKDATarget = Literal["sm100a", "sm103a"]
 CakeKDAFamily = Literal[
     "bounded_bf16_evolution",
     "bounded_fp32_serving",
+    "bounded_fp32_affine_prefix",
     "unbounded_bf16_serving",
     "unbounded_affine_prefix",
 ]
@@ -106,6 +107,19 @@ def _expected_module_keys() -> set[tuple[str, str, str, str]]:
         expected.update(
             (
                 arch,
+                "bounded_fp32_affine_prefix",
+                policy,
+                _ROLE_BY_POLICY.get(policy, "main"),
+            )
+            for policy in (
+                "affine_split_main",
+                "affine_split_map",
+                "affine_split_correction",
+            )
+        )
+        expected.update(
+            (
+                arch,
                 "unbounded_affine_prefix",
                 policy,
                 _ROLE_BY_POLICY.get(policy, "main"),
@@ -168,7 +182,7 @@ def _resolve_source(csrc_dir: Path, raw_path: object, label: str) -> Path:
 
 @functools.cache
 def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
-    """Load and verify the complete 89-shape, 54-module source closure."""
+    """Load and verify the complete 89-shape, 60-module source closure."""
 
     csrc_dir = get_kda_csrc_dir()
     payload: Any = json.loads((csrc_dir / _MANIFEST).read_text())
@@ -229,7 +243,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     )
 
     files = payload.get("files")
-    _require(isinstance(files, list) and len(files) == 58, "file inventory mismatch")
+    _require(isinstance(files, list) and len(files) == 64, "file inventory mismatch")
     file_sha256: dict[str, str] = {}
     for index, item in enumerate(files):
         _require(isinstance(item, dict), f"files[{index}] must be an object")
@@ -249,7 +263,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
 
     modules = payload.get("modules")
     _require(
-        isinstance(modules, list) and len(modules) == 54, "module inventory mismatch"
+        isinstance(modules, list) and len(modules) == 60, "module inventory mismatch"
     )
     target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
     expected = _expected_module_keys()
@@ -300,7 +314,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         compile_flags = item.get("compile_flags")
         launch = item.get("launch")
         _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
-        _require(item.get("tma_abi") == "pointer", f"{label}.tma_abi")
+        _require(item.get("tma_abi") == "grid_constant", f"{label}.tma_abi")
         _require(isinstance(item.get("name"), str), f"{label}.name")
         _require(isinstance(module_ident, str), f"{label}.module_ident")
         _require(
@@ -335,7 +349,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
 
 
 def cake_kda_is_available() -> bool:
-    return len(get_cake_kda_module_specs()) == 54
+    return len(get_cake_kda_module_specs()) == 60
 
 
 def get_cake_kda_module_spec(

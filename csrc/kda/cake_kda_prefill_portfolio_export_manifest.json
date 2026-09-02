@@ -229,360 +229,396 @@
   },
   "files": [
     {
-      "bytes": 245308,
+      "bytes": 250520,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
+      "sha256": "f4660884ff7b2c660ab3c2cac4775ab8b120183bbf0b6b1da24f5e750960a889"
+    },
+    {
+      "bytes": 37127,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction_binding.cu",
+      "sha256": "db27325e81e7feef791ab96f5274352bcd2204ee077a30f78dc32ba0533caec3"
+    },
+    {
+      "bytes": 250918,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
+      "sha256": "c6bb3f695cff5421b5ba1186a3f0f132bba0529912fa2655bf66d111ad0a793b"
+    },
+    {
+      "bytes": 36863,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_main_binding.cu",
+      "sha256": "b225146f4308c280f511618a98eb5ca64dd36040ef04f1e7e314f4def9d2055b"
+    },
+    {
+      "bytes": 257129,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
+      "sha256": "f0013f197523341501592fc6414a55444461272c38999451735d8fadb8348a39"
+    },
+    {
+      "bytes": 37085,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_map_binding.cu",
+      "sha256": "dbbeec39e2b0db2e3dc2b1ff1763e2a4b3472a5c679824bdc86a8bee6c6b49b3"
+    },
+    {
+      "bytes": 244710,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
-      "sha256": "50d4f7383df85b39a30afebb9587a4f733a9475fa8edd5c19bbdf3ebe9334940"
+      "sha256": "74694d4b585669728f7fe7e79714b735c0673925822d2a7ffe56b6c600e1e392"
     },
     {
-      "bytes": 39950,
+      "bytes": 37163,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
-      "sha256": "ba378e0e7c619bebb9f5e42885f4a73a8e351c37c68e60a4dad0b3ddf5121828"
+      "sha256": "06b488125b2f7fd38d03dca48d0a2d73aab774380a8d119ffe7442492c8fc4e1"
     },
     {
-      "bytes": 250535,
+      "bytes": 249937,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main.cu",
-      "sha256": "cf929922490c2646465ec621845aee367118b1659307c97696c18e6818bc6600"
+      "sha256": "9c57e76fd2eca52670e64660ea252f8f634b0cf759f53266af7d26aca21a3855"
     },
     {
-      "bytes": 39555,
+      "bytes": 36899,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
-      "sha256": "98bb6298a24bec448052a3090165b7dc17f6350f756b011fc35998640c0bc16c"
+      "sha256": "733e1c5bf7e4ebf67ddb9f7bbe43172b2852007fe992927af241a023b0f49bc2"
     },
     {
-      "bytes": 251917,
+      "bytes": 251319,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map.cu",
-      "sha256": "146e5a5d604bdc839da27133d111f457a324fd50f0d990b88076effd3ea00006"
+      "sha256": "70c7344c145cff2e37ad04c02782fccae8aaeb89e1169e866357de3bb1aa6296"
     },
     {
-      "bytes": 39908,
+      "bytes": 37121,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
-      "sha256": "2d2ca0a77a06a79fc256d9e08e19dc4bcf5c7ce8f4fee718a996565672a832f6"
+      "sha256": "0ad8095ac036e95dbb7c15aaad3b24e615f55632ec37ea7796dabacaa022b1ef"
     },
     {
-      "bytes": 11657,
+      "bytes": 11810,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu",
-      "sha256": "5df3aba531af2c975a2446bbd95b9004c2c10612b5874d78132d3a3d69310140"
+      "sha256": "f5834e09c6b6191a529af3caad61965b379541c37fafd4d67b8e194c202affa3"
     },
     {
-      "bytes": 8564,
+      "bytes": 8824,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
-      "sha256": "d9c66b1e7b862a46502df9baf828d8a5e32a97368023439014d383c5ead9f6e2"
+      "sha256": "e7efc46d9e3d682112640830498a75bde0bde05ef2afb9553c5ca01ac02f64c1"
     },
     {
-      "bytes": 211867,
+      "bytes": 211379,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
-      "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+      "sha256": "a7d513704a5254fcadc61ef327d30c6754b3fd40ccaaeaeaefad4fd621d7503f"
     },
     {
-      "bytes": 31580,
+      "bytes": 27845,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
-      "sha256": "cfac16f42dc1b90b1698bd633b6a918f1451af63f2b5ae7e2678e5bffcf58513"
+      "sha256": "aae2a7892a8c3628d34d535e7c63951a07aa859211844b610c4e935623a3a1ef"
     },
     {
-      "bytes": 215140,
+      "bytes": 214652,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
-      "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+      "sha256": "16591311e6a954b8ed906fd67176f939442363cc3fab5b143a876fe9f1a01f20"
     },
     {
-      "bytes": 31622,
+      "bytes": 27887,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
-      "sha256": "4973203fb14dd6189fa31bcfe7eec3a2455434f346f9b8d5c7d2c47c8189eae8"
+      "sha256": "cccd4771340f50ab81dbb2241193f972129e88b3b88e2d8b93f4e16e18f84574"
     },
     {
-      "bytes": 211901,
+      "bytes": 211413,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
-      "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+      "sha256": "7cdf1513aa65268176d5dbdbc59709a009860424bc42f6384bba6166f330f0c4"
     },
     {
-      "bytes": 31556,
+      "bytes": 27821,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
-      "sha256": "31d8f9b44b4a79c07d32f883c4ddaccaacdd3d822b74ce1530d6d4aafbbc18de"
+      "sha256": "6a61db2dcd0b4f3c72c22c27d27755639ecd9d2f9bf5fd024df89d4e9c643084"
     },
     {
-      "bytes": 182050,
+      "bytes": 181562,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
-      "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+      "sha256": "57f3b56554e7404a2a08fa57ece8b6dda60096b827649d7f3b3a82b3d2beadc7"
     },
     {
-      "bytes": 30280,
+      "bytes": 26415,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
-      "sha256": "4d0dbb17cca09b15b442ec81db68b7d142a48882fbf8fbbcb36a5fa937e6ea90"
+      "sha256": "3e537fb7d292c23819bea307922ab155d529adbfb1f3e9bc5a16dde8dfaf068a"
     },
     {
-      "bytes": 250564,
+      "bytes": 249966,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128.cu",
-      "sha256": "ff3a132c2b03315930976815590300eb9849c0b4b2328f30af623bbd0ed733fd"
+      "sha256": "af2dbb452402f89d26a82f38da2b15ddc90ffbd9642d19ef217fa75aa4e4f423"
     },
     {
-      "bytes": 39561,
+      "bytes": 36905,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128_binding.cu",
-      "sha256": "97029559c63332c7b7071fc5bd53efef542d113ed2faef14622b13937b257acf"
+      "sha256": "ae92dcbb597fb8a7768ab20e336cc246e8b65a7da0dd8a7d3068b2cbbef88657"
     },
     {
-      "bytes": 216773,
+      "bytes": 216282,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
-      "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+      "sha256": "e8bfb37b703d7c6aaef36bbf1886492f0e3c114904415098e25a11cffcc8e569"
     },
     {
-      "bytes": 31516,
+      "bytes": 27717,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
-      "sha256": "a85d0f55e42deefa4284445623a3dac42a2304ac5d9654ed0e6d0d97bb056ce6"
+      "sha256": "40e57672da297970219043a2693744bd95e53d38458b22913043566b62dbeb27"
     },
     {
-      "bytes": 216778,
+      "bytes": 216287,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
-      "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+      "sha256": "fbcc25cbcab21ad311d296d02923b2c7f00d20d2f62daea46dd14b938e1e2330"
     },
     {
-      "bytes": 31492,
+      "bytes": 27693,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
-      "sha256": "34f44a41c8ece3c4f7b03bb36b2bb718ccdcc3076320ba226e3c2fc102c5762c"
+      "sha256": "55d3bac21fb2a5f838bafe8e0bde6d28ef5960547497aa585838d9d429319c17"
     },
     {
-      "bytes": 219054,
+      "bytes": 218563,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
-      "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+      "sha256": "31e77f1a656c5d0fa6ec3e274256f46971f0020309d6d5d725227b942e3ea001"
     },
     {
-      "bytes": 31558,
+      "bytes": 27759,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
-      "sha256": "5918246faeff15bbdef7afed3e25e36d8a545a034bc7f33eba8585f43a9470f4"
+      "sha256": "fbacf551803338e460472a832b23caa97e5dd4cc4e5a427a3e77eb9fa2088df1"
     },
     {
-      "bytes": 219330,
+      "bytes": 218839,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
-      "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+      "sha256": "d10a9e5ef13a621dad8ac981fb62a55a4e61134160bdb8173dce25738b9fdfe9"
     },
     {
-      "bytes": 31582,
+      "bytes": 27783,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
-      "sha256": "ca68ebedd337f557cabafbf9935fcb54deb9380910a6f133138ba32abe16a226"
+      "sha256": "e23c8825f1cf43ab9950855ec307a0e8727ae04ecbd680d66fa126fe13c1928c"
     },
     {
-      "bytes": 86750,
+      "bytes": 86146,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32.cu",
-      "sha256": "c547d60e99cf380049f831edef5c11026c4c861baf8368ab4c633331d5e365fc"
+      "sha256": "8812f4904f43383038db89b7e1b2d44e901586447b10239cce80ad289398de31"
     },
     {
-      "bytes": 33881,
+      "bytes": 29934,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32_binding.cu",
-      "sha256": "1a8f34cac0ced6074c78f932954dae17b3415cabe761dd3b18545e36264df4f0"
+      "sha256": "6bc118b7c71ce0f8e7bc7c413469a4d3d0a5bc38244129c3e3f339cdd0a2dfd5"
     },
     {
-      "bytes": 87727,
+      "bytes": 87123,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32.cu",
-      "sha256": "96f2b354fa7dc522a3da69b53b0b542fd8cbe6abf037595850ec39dedf6a89f2"
+      "sha256": "ffbfef1853958b86f82ada1f15591e6725f278780a8a7463036ed772f754bf4a"
     },
     {
-      "bytes": 33881,
+      "bytes": 29934,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32_binding.cu",
-      "sha256": "abcec7824ceac0e11faeaea8fb02a83e10aa76b22e465267e23b4fd4e26eba15"
+      "sha256": "f68c3844be2d4c445d7aefabe6f1845ea17f311ffa8137d76fe46bb07a4a46ac"
     },
     {
-      "bytes": 82666,
+      "bytes": 82217,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_bt16_prepare.cu",
-      "sha256": "64b52b2f6ef67a4d39a69b5f02e4f110dabe790f1fe5c73e44cdab469522e9e2"
+      "sha256": "eec2ec0842e5263bdce60007ef5169f8c23faf65a8f8f3c96ea665172edc59da"
     },
     {
-      "bytes": 31038,
+      "bytes": 26951,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_bt16_prepare_binding.cu",
-      "sha256": "907effd36d40ee92b5b1805a75433a8fdc8109665c6698b4d6b19759ea563e29"
+      "sha256": "ad8c3d45f4adb32dbde7c8d1cbe3e95bd5082d4eed9d82a25326bb1f9f156984"
     },
     {
-      "bytes": 236171,
+      "bytes": 235573,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse.cu",
-      "sha256": "4b2de1aafcad7458388ebc8cf979128544484642e37833d1a4895c14a829507d"
+      "sha256": "e995088c468d3c1ed023cc60e1a3901b36d1c1dd37a871660b03a6bca3059a12"
     },
     {
-      "bytes": 39567,
+      "bytes": 36911,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse_binding.cu",
-      "sha256": "0b11475c01338a7dce898f771fe03e2dc79dd33d2964cd72a1dee290b7bab256"
+      "sha256": "dfef3e9a56bf3381f710d07f493063271d3644fb6ff205272eec19136450b53f"
     },
     {
-      "bytes": 249872,
+      "bytes": 249274,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse.cu",
-      "sha256": "1ac131e6be6ffa626a6d1cd2719aaf431455c36a8dc32afbd6db591ac4144bee"
+      "sha256": "8d33e0a89072594db8c48addcf386c2b01b4bf3fdef9fdcc22c2942ad2a6fb48"
     },
     {
-      "bytes": 39579,
+      "bytes": 36923,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse_binding.cu",
-      "sha256": "75d4ec66466e52a8533531c94cb5acf508e2ed82d35f1f368efba3ec6c8f10a0"
+      "sha256": "40230ac501b65aebfeef2986184d0928b28154fec47342599ea1f8b52fcc2e59"
     },
     {
-      "bytes": 248912,
+      "bytes": 248314,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32.cu",
-      "sha256": "2c7b9c55a7bf52990374d8c7caf2d00f0f82065720abf4f8341d5a52cdf0e76a"
+      "sha256": "d0f5d7be435fab5fe963265a3f7224a7c774c4821dbd12e165bd9761350cdbc6"
     },
     {
-      "bytes": 39532,
+      "bytes": 36876,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32_binding.cu",
-      "sha256": "7542e2653382cfb48282c85d55efd973506e9f473ce38262cd3144540e38abda"
+      "sha256": "e86e3321884b6f6c712a7f7a2832c32ed91250823a3f941ea47dd28175e4b7f9"
     },
     {
-      "bytes": 185609,
+      "bytes": 185011,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32.cu",
-      "sha256": "99a330548b13d1cb183875e4b71b40e771759e009ba4e2a88fe340da36e4ed69"
+      "sha256": "96e1ec0204c23173a6a06bd91180e0e98421b73524b476c5ee42d529d66d3796"
     },
     {
-      "bytes": 39762,
+      "bytes": 37106,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32_binding.cu",
-      "sha256": "b23119e3be53e8c7448dbc2786bfb560bd071c20e1973abef3cefa62715f80e1"
+      "sha256": "442f70fbece7ad283286bf088bbd9f8675aeb6ed5dc7364728d0882e740de306"
     },
     {
-      "bytes": 253335,
+      "bytes": 252734,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32.cu",
-      "sha256": "52d0e423cc32487f1bae4bf7017d984d17b9e8977872b04fa20958a6c9f481f7"
+      "sha256": "3eabc3c0b94598b246ec1c57986c683675e76bd71f5a6f0dfd572c79b3fbc3e7"
     },
     {
-      "bytes": 39536,
+      "bytes": 36880,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32_binding.cu",
-      "sha256": "3535cd5331ddb0fed8adce64dab2abf6b14324414cfbc384d3764c1cb3d3a150"
+      "sha256": "b6f79808e4cca7c011c6342a56578ef7dc6f7d6b2cb955959648442f433d50ad"
     },
     {
-      "bytes": 252459,
+      "bytes": 251861,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m128_tensor_decay_fp32.cu",
-      "sha256": "ac1f720ad9d425cf6d35a373d3b5e17c3016250612f1b08888711e975424a40d"
+      "sha256": "cb3439c285d364a5b8891ed9d17ef2148acf9803f1f20bd6d4972c9f5b83f580"
     },
     {
-      "bytes": 39555,
+      "bytes": 36899,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m128_tensor_decay_fp32_binding.cu",
-      "sha256": "9fd6e58ab9a5cffdc0d1eddb44469a5309730fbf1d0e2a1bcea6282e87860b2f"
+      "sha256": "07da208f034c4143df0e54306b4dafb5efce160acfc08e02cbb411620f148b82"
     },
     {
-      "bytes": 181396,
+      "bytes": 180908,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_m64_fp32.cu",
-      "sha256": "cd6b5d6a7bf3daea7c13126b36eea00f7a38e5c78e11491138587445a84c0277"
+      "sha256": "fd1affaa9dbdc8db16496599d86a8b670a01aed227a4fd687cc3a690c732774d"
     },
     {
-      "bytes": 30202,
+      "bytes": 26337,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_m64_fp32_binding.cu",
-      "sha256": "649ff91410dc274fc6d6ac92d30aaa92197e14bfce45aebc6eec49f1b8f11a2d"
+      "sha256": "3ce9a30900e34d830e0016956dc7ee7cb42c205499afafea78a499c03683b442"
     },
     {
-      "bytes": 200558,
+      "bytes": 200070,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_persistent_m128_fp32.cu",
-      "sha256": "13b53ffa4fb5921d60911696faaabf49abadc60198c4432e7d5d34d74b26aeac"
+      "sha256": "cf939c656e69dbf53de0d6fc7291bad5158ce269f7d3668c4e3b14d51228627e"
     },
     {
-      "bytes": 33217,
+      "bytes": 29832,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_persistent_m128_fp32_binding.cu",
-      "sha256": "c45404e9d3cb8e45a37f17e22ec8ce93182291cc6ef5b158fb9180194f69404e"
+      "sha256": "b42ec273c5a1b54738be804ab4bcd1e0a7eae58d8432b3a6160ce785ae517556"
     },
     {
-      "bytes": 211509,
+      "bytes": 211021,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32.cu",
-      "sha256": "faabcabd926a1dd1123ff861600d32b4181f0dcb9ee2dc671dd045ab85dbd1f2"
+      "sha256": "8e742730d1f38a0a6b4dc1921d94ca924f98f62eda5ce483174c40df07f67629"
     },
     {
-      "bytes": 33253,
+      "bytes": 29868,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32_binding.cu",
-      "sha256": "cbfae03c1a29c9ae0677f793a3b744e30009d0187afb7caef995135196f0eecc"
+      "sha256": "87f7991b7991233b8b39b2e1da52eae69a5ea1f26462b2abb2e42d5d9a390c88"
     },
     {
-      "bytes": 200238,
+      "bytes": 199750,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32.cu",
-      "sha256": "63208da18e3b9065c22889041b3a2b766e070e61b5de24c479a08931e2794e71"
+      "sha256": "cf6ba0c552cfdd2541bb045eca4aa943b5cf271a3422aa7d730369941645564e"
     },
     {
-      "bytes": 31664,
+      "bytes": 27929,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32_binding.cu",
-      "sha256": "be36f6194287d344cef528e3dc8bfaa46a64e34785df3629b356cb0ff887675f"
+      "sha256": "8ab17f37960730b04d9e64be2b6a0a961790cf657a3caa51ef9e55851840b009"
     },
     {
-      "bytes": 184104,
+      "bytes": 183510,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32.cu",
-      "sha256": "8c2e18a2de8f18553d8ea5efc4295ce7420578ff54b5cb8b5aa6393f7a110e8a"
+      "sha256": "b508fdb2bd882829bfa52a7b18535493d2f74329d98b397d3cd3efa77c7ebe9d"
     },
     {
-      "bytes": 34822,
+      "bytes": 31280,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32_binding.cu",
-      "sha256": "1a881f3bdbace42764ef59830a4e3aaafffc439f341f2e8ccd3661e32b5a89b5"
+      "sha256": "1226616f44c7fcb73635fb86a1c19ac875bad3cdea84aea11b293b04836e7933"
     },
     {
-      "bytes": 210329,
+      "bytes": 209838,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_vtile_m128_fp32.cu",
-      "sha256": "f5f7f9e59cfc46dafd79f2af163379025ae24da5fe00386aa09605cbe395b446"
+      "sha256": "28b5378e61a0535c174e517d59af29b501c48a153ccb29630a760d976d6a8143"
     },
     {
-      "bytes": 31528,
+      "bytes": 27729,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_vtile_m128_fp32_binding.cu",
-      "sha256": "0b4ad4d0686c0d981a07e2c0dbc2cb0d9647e68927ff3c4fcc9c967cea325110"
+      "sha256": "b019247a1c9dd32bf6e8b1f44362bf50fc6c75b763a5da1db278932526bba5c0"
     },
     {
-      "bytes": 215084,
+      "bytes": 214593,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32.cu",
-      "sha256": "e263c1738b798ea4184c268ac0d3c934dd924dd5b9a315d1905e3dc49754ffc5"
+      "sha256": "9396f6b29932aa9de91daf782b5bc809370a521d58f290ca03ff3dbd9a50e61e"
     },
     {
-      "bytes": 31618,
+      "bytes": 27819,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32_binding.cu",
-      "sha256": "8fc8ca44936b622eb65a06d77692644bc1ddaac012e62d5cc513cc35ac04dbbb"
+      "sha256": "348d60565b00ab743af84d16c74c3db03613113f52be4f372b1306c736382ddf"
     }
   ],
   "generation_inputs": {
-    "observed_checkout_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
-    "observed_tracked_tree_clean": true,
-    "producer_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
-    "recipe_sha256": "5a387043e031ac09b326e04e54463528580bad410888e228262926275f4e90ad",
-    "schema": "cake.library_export.generation_inputs.v1"
+    "observed_checkout_revision": null,
+    "observed_tracked_tree_clean": false,
+    "producer_revision": "54cf75589d8575a0a07154e67f5351004dfa9483",
+    "recipe_sha256": "63ecc68af5973876ac81c35f520007b8b14c036c6e3c1d419e8b3e218251aeed",
+    "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
   "modules": [
@@ -811,17 +847,887 @@
       },
       "closure": [
         {
-          "bytes": 245308,
-          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
-          "sha256": "50d4f7383df85b39a30afebb9587a4f733a9475fa8edd5c19bbdf3ebe9334940"
+          "bytes": 250520,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
+          "sha256": "f4660884ff7b2c660ab3c2cac4775ab8b120183bbf0b6b1da24f5e750960a889"
         },
         {
-          "bytes": 39950,
-          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
-          "sha256": "ba378e0e7c619bebb9f5e42885f4a73a8e351c37c68e60a4dad0b3ddf5121828"
+          "bytes": 37127,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction_binding.cu",
+          "sha256": "db27325e81e7feef791ab96f5274352bcd2204ee077a30f78dc32ba0533caec3"
         }
       ],
-      "closure_sha256": "c8296ecf836771d5b83a944b35d7068a7a0095e2cb29af069b535444b6efe233",
+      "closure_sha256": "56adf0131255d35a465540a073c0c0f0f2247ebea4f2f58400e12fead57e3376",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_correction",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_correction_ffi",
+      "name": "cake_kda_affine_bounded_fp32_correction",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "correction",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_correction"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_correction_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 250918,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
+          "sha256": "c6bb3f695cff5421b5ba1186a3f0f132bba0529912fa2655bf66d111ad0a793b"
+        },
+        {
+          "bytes": 36863,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_main_binding.cu",
+          "sha256": "b225146f4308c280f511618a98eb5ca64dd36040ef04f1e7e314f4def9d2055b"
+        }
+      ],
+      "closure_sha256": "714b9f4eedb083ec4db308f20554de2d68c315db560fde8721b273b3361c5ad0",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_main",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_main_ffi",
+      "name": "cake_kda_affine_bounded_fp32_main",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_main"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_main_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 257129,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
+          "sha256": "f0013f197523341501592fc6414a55444461272c38999451735d8fadb8348a39"
+        },
+        {
+          "bytes": 37085,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_map_binding.cu",
+          "sha256": "dbbeec39e2b0db2e3dc2b1ff1763e2a4b3472a5c679824bdc86a8bee6c6b49b3"
+        }
+      ],
+      "closure_sha256": "9f6376d1d48d90cfac0ec156de771784d15ae4caf9e827b75d3e2abb2f9fc3ed",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_map",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_map_ffi",
+      "name": "cake_kda_affine_bounded_fp32_map",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "map",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_map"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_map_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 244710,
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
+          "sha256": "74694d4b585669728f7fe7e79714b735c0673925822d2a7ffe56b6c600e1e392"
+        },
+        {
+          "bytes": 37163,
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
+          "sha256": "06b488125b2f7fd38d03dca48d0a2d73aab774380a8d119ffe7442492c8fc4e1"
+        }
+      ],
+      "closure_sha256": "1c28aaeddee71f1e155d4b460e0e338a31b2a7845f63193f0462ac1c52d1fa4b",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -855,7 +1761,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_correction"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
         "compile_separately": true,
@@ -1087,17 +2007,17 @@
       },
       "closure": [
         {
-          "bytes": 250535,
+          "bytes": 249937,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main.cu",
-          "sha256": "cf929922490c2646465ec621845aee367118b1659307c97696c18e6818bc6600"
+          "sha256": "9c57e76fd2eca52670e64660ea252f8f634b0cf759f53266af7d26aca21a3855"
         },
         {
-          "bytes": 39555,
+          "bytes": 36899,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
-          "sha256": "98bb6298a24bec448052a3090165b7dc17f6350f756b011fc35998640c0bc16c"
+          "sha256": "733e1c5bf7e4ebf67ddb9f7bbe43172b2852007fe992927af241a023b0f49bc2"
         }
       ],
-      "closure_sha256": "f2a588f5a5e89f053ea228a33a55a0a84a59111530040f2a886e7d7e388ffbf3",
+      "closure_sha256": "aedf22ebcc7b2c14b9bf3f57f8a618e26bbff2063774ed66ff55093a561ad4cd",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1131,7 +2051,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_main"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
         "compile_separately": true,
@@ -1363,17 +2297,17 @@
       },
       "closure": [
         {
-          "bytes": 251917,
+          "bytes": 251319,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map.cu",
-          "sha256": "146e5a5d604bdc839da27133d111f457a324fd50f0d990b88076effd3ea00006"
+          "sha256": "70c7344c145cff2e37ad04c02782fccae8aaeb89e1169e866357de3bb1aa6296"
         },
         {
-          "bytes": 39908,
+          "bytes": 37121,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
-          "sha256": "2d2ca0a77a06a79fc256d9e08e19dc4bcf5c7ce8f4fee718a996565672a832f6"
+          "sha256": "0ad8095ac036e95dbb7c15aaad3b24e615f55632ec37ea7796dabacaa022b1ef"
         }
       ],
-      "closure_sha256": "5060777b6ec4cbaf12e30322b62cc44a3840b5a803a92c3f79f415211aadb23c",
+      "closure_sha256": "ab40366e4ab26472f8249fd83547a77fce1b997562891b1f4cff8f8d9fea7222",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1407,7 +2341,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_map"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
         "compile_separately": true,
@@ -1459,17 +2407,17 @@
       },
       "closure": [
         {
-          "bytes": 11657,
+          "bytes": 11810,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu",
-          "sha256": "5df3aba531af2c975a2446bbd95b9004c2c10612b5874d78132d3a3d69310140"
+          "sha256": "f5834e09c6b6191a529af3caad61965b379541c37fafd4d67b8e194c202affa3"
         },
         {
-          "bytes": 8564,
+          "bytes": 8824,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
-          "sha256": "d9c66b1e7b862a46502df9baf828d8a5e32a97368023439014d383c5ead9f6e2"
+          "sha256": "e7efc46d9e3d682112640830498a75bde0bde05ef2afb9553c5ca01ac02f64c1"
         }
       ],
-      "closure_sha256": "b4d1a673f684381e7f295454c394b975a9fa18339ef01ced56332fb88992bae9",
+      "closure_sha256": "0de5df9896eca0d474c9d47c404d4c091fbc48b53f42ab1f73a2202e8222684c",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1498,7 +2446,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_prefix_scan"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
         "compile_separately": true,
@@ -1654,17 +2616,17 @@
       },
       "closure": [
         {
-          "bytes": 211867,
+          "bytes": 211379,
           "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
-          "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+          "sha256": "a7d513704a5254fcadc61ef327d30c6754b3fd40ccaaeaeaefad4fd621d7503f"
         },
         {
-          "bytes": 31580,
+          "bytes": 27845,
           "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
-          "sha256": "cfac16f42dc1b90b1698bd633b6a918f1451af63f2b5ae7e2678e5bffcf58513"
+          "sha256": "aae2a7892a8c3628d34d535e7c63951a07aa859211844b610c4e935623a3a1ef"
         }
       ],
-      "closure_sha256": "fbed1842053b8e2c898c5d186f3a24d9ef56676c180d2f841fa66fd27322084d",
+      "closure_sha256": "a5d62b7765f15c416855c3fec424263b92fd10175e7a04d7e43c3e582a6d0c7b",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1698,7 +2660,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m128_generic"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
         "compile_separately": true,
@@ -1854,17 +2830,17 @@
       },
       "closure": [
         {
-          "bytes": 215140,
+          "bytes": 214652,
           "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
-          "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+          "sha256": "16591311e6a954b8ed906fd67176f939442363cc3fab5b143a876fe9f1a01f20"
         },
         {
-          "bytes": 31622,
+          "bytes": 27887,
           "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
-          "sha256": "4973203fb14dd6189fa31bcfe7eec3a2455434f346f9b8d5c7d2c47c8189eae8"
+          "sha256": "cccd4771340f50ab81dbb2241193f972129e88b3b88e2d8b93f4e16e18f84574"
         }
       ],
-      "closure_sha256": "b5f3c9f26e7dd876040f6f3055bd704526e8e98d38ff7497c3818a152f5e3325",
+      "closure_sha256": "92b1f059f334f0b2f7d7329afe06452e8bbbe9aecfa3af89f06d77a316b259e8",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1898,7 +2874,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_m128_h64_lpt"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
         "compile_separately": true,
@@ -2054,17 +3044,17 @@
       },
       "closure": [
         {
-          "bytes": 211901,
+          "bytes": 211413,
           "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
-          "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+          "sha256": "7cdf1513aa65268176d5dbdbc59709a009860424bc42f6384bba6166f330f0c4"
         },
         {
-          "bytes": 31556,
+          "bytes": 27821,
           "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
-          "sha256": "31d8f9b44b4a79c07d32f883c4ddaccaacdd3d822b74ce1530d6d4aafbbc18de"
+          "sha256": "6a61db2dcd0b4f3c72c22c27d27755639ecd9d2f9bf5fd024df89d4e9c643084"
         }
       ],
-      "closure_sha256": "8dca0095b66ac5e310b7ea8b6f3e2b1b0b035eed10456a603eee8959d1bb5f19",
+      "closure_sha256": "71170ea3a3282858278d32eae2cbda6d459d5e0b7aa460fd0b1141c3d0d53997",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -2098,7 +3088,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m128_h96_commit_order"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
         "compile_separately": true,
@@ -2242,17 +3246,17 @@
       },
       "closure": [
         {
-          "bytes": 182050,
+          "bytes": 181562,
           "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
-          "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+          "sha256": "57f3b56554e7404a2a08fa57ece8b6dda60096b827649d7f3b3a82b3d2beadc7"
         },
         {
-          "bytes": 30280,
+          "bytes": 26415,
           "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
-          "sha256": "4d0dbb17cca09b15b442ec81db68b7d142a48882fbf8fbbcb36a5fa937e6ea90"
+          "sha256": "3e537fb7d292c23819bea307922ab155d529adbfb1f3e9bc5a16dde8dfaf068a"
         }
       ],
-      "closure_sha256": "ae2954b99819631dd92f2cfbf474a07b39bf58b85defd2d5231db09d96e2d4c6",
+      "closure_sha256": "c882947c9fff30c22f7925e3108a203130d6e7c9997c4a07979adeafd010dd79",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -2286,7 +3290,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m64_independent_value_split"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
         "compile_separately": true,
@@ -2518,17 +3536,17 @@
       },
       "closure": [
         {
-          "bytes": 250564,
+          "bytes": 249966,
           "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128.cu",
-          "sha256": "ff3a132c2b03315930976815590300eb9849c0b4b2328f30af623bbd0ed733fd"
+          "sha256": "af2dbb452402f89d26a82f38da2b15ddc90ffbd9642d19ef217fa75aa4e4f423"
         },
         {
-          "bytes": 39561,
+          "bytes": 36905,
           "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128_binding.cu",
-          "sha256": "97029559c63332c7b7071fc5bd53efef542d113ed2faef14622b13937b257acf"
+          "sha256": "ae92dcbb597fb8a7768ab20e336cc246e8b65a7da0dd8a7d3068b2cbbef88657"
         }
       ],
-      "closure_sha256": "6a0ba4ee21f95ac4643bacc85d3a237e92a344040a3ddc196f22dc4c6135062b",
+      "closure_sha256": "35408407cc607e09602f4a02da0a413934411714defbad8e4939df6e90b8ef99",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -2562,7 +3580,21 @@
         "family": "unbounded_bf16_serving",
         "policy": "direct_m128_unbounded_softplus"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128_binding.cu",
         "compile_separately": true,
@@ -2718,17 +3750,17 @@
       },
       "closure": [
         {
-          "bytes": 216773,
+          "bytes": 216282,
           "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
-          "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+          "sha256": "e8bfb37b703d7c6aaef36bbf1886492f0e3c114904415098e25a11cffcc8e569"
         },
         {
-          "bytes": 31516,
+          "bytes": 27717,
           "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
-          "sha256": "a85d0f55e42deefa4284445623a3dac42a2304ac5d9654ed0e6d0d97bb056ce6"
+          "sha256": "40e57672da297970219043a2693744bd95e53d38458b22913043566b62dbeb27"
         }
       ],
-      "closure_sha256": "d9d348cc20363bbd65eb9338f431641b65b694dcd0f5b4fc35e8adf314ef48c4",
+      "closure_sha256": "f4ee86ea36d3cdfdcbb62d5142f6d758e5fd750705b62c9df13b3ce6f7dce47a",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -2762,7 +3794,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_vtile_m128_generic"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
         "compile_separately": true,
@@ -2918,17 +3964,17 @@
       },
       "closure": [
         {
-          "bytes": 216778,
+          "bytes": 216287,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
-          "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+          "sha256": "fbcc25cbcab21ad311d296d02923b2c7f00d20d2f62daea46dd14b938e1e2330"
         },
         {
-          "bytes": 31492,
+          "bytes": 27693,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
-          "sha256": "34f44a41c8ece3c4f7b03bb36b2bb718ccdcc3076320ba226e3c2fc102c5762c"
+          "sha256": "55d3bac21fb2a5f838bafe8e0bde6d28ef5960547497aa585838d9d429319c17"
         }
       ],
-      "closure_sha256": "fe034c2739dc290572791b087b13aea504c66a7b32fc94d9e8770bcdbf5fcbec",
+      "closure_sha256": "7b3008373015a1321fb4fa6400694524206242ff8e1414fd9927240df1b4bacf",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -2962,7 +4008,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_vtile_m128_h64_gate_order"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
         "compile_separately": true,
@@ -3118,17 +4178,17 @@
       },
       "closure": [
         {
-          "bytes": 219054,
+          "bytes": 218563,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
-          "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+          "sha256": "31e77f1a656c5d0fa6ec3e274256f46971f0020309d6d5d725227b942e3ea001"
         },
         {
-          "bytes": 31558,
+          "bytes": 27759,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
-          "sha256": "5918246faeff15bbdef7afed3e25e36d8a545a034bc7f33eba8585f43a9470f4"
+          "sha256": "fbacf551803338e460472a832b23caa97e5dd4cc4e5a427a3e77eb9fa2088df1"
         }
       ],
-      "closure_sha256": "d68ec7a1ed37227ace0df372b09a8d8cc645807391464fae32ca192f41a484fb",
+      "closure_sha256": "140e329cef6e1f0f07d9ae1b11aff44c1ce6f11f9a9bfbcdeb16d50af3ae0331",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -3162,7 +4222,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_vtile_m128_h64"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
         "compile_separately": true,
@@ -3318,17 +4392,17 @@
       },
       "closure": [
         {
-          "bytes": 219330,
+          "bytes": 218839,
           "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
-          "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+          "sha256": "d10a9e5ef13a621dad8ac981fb62a55a4e61134160bdb8173dce25738b9fdfe9"
         },
         {
-          "bytes": 31582,
+          "bytes": 27783,
           "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
-          "sha256": "ca68ebedd337f557cabafbf9935fcb54deb9380910a6f133138ba32abe16a226"
+          "sha256": "e23c8825f1cf43ab9950855ec307a0e8727ae04ecbd680d66fa126fe13c1928c"
         }
       ],
-      "closure_sha256": "5d28dec47f5f78b20eb6656331cd2e1961eed065b2f62ba2efc12e4a54610c56",
+      "closure_sha256": "f423c596afd037538a48fa8f2ce4e6cc282b620b0dad79139498f527c8035e52",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -3362,7 +4436,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_vtile_m128_h96_six_task"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
         "compile_separately": true,
@@ -3506,17 +4594,17 @@
       },
       "closure": [
         {
-          "bytes": 86750,
+          "bytes": 86146,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32.cu",
-          "sha256": "c547d60e99cf380049f831edef5c11026c4c861baf8368ab4c633331d5e365fc"
+          "sha256": "8812f4904f43383038db89b7e1b2d44e901586447b10239cce80ad289398de31"
         },
         {
-          "bytes": 33881,
+          "bytes": 29934,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32_binding.cu",
-          "sha256": "1a8f34cac0ced6074c78f932954dae17b3415cabe761dd3b18545e36264df4f0"
+          "sha256": "6bc118b7c71ce0f8e7bc7c413469a4d3d0a5bc38244129c3e3f339cdd0a2dfd5"
         }
       ],
-      "closure_sha256": "1f4d011d669fc88941febbfd23b25909194f439dd356b0d10cf5faa6870c39c6",
+      "closure_sha256": "e255a859d442e797c19e6df95e6f962dc5b55d815b9313a81f81d461ea8a95b0",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -3550,7 +4638,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_chain_m64_s8"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32_binding.cu",
         "compile_separately": true,
@@ -3694,17 +4796,17 @@
       },
       "closure": [
         {
-          "bytes": 87727,
+          "bytes": 87123,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32.cu",
-          "sha256": "96f2b354fa7dc522a3da69b53b0b542fd8cbe6abf037595850ec39dedf6a89f2"
+          "sha256": "ffbfef1853958b86f82ada1f15591e6725f278780a8a7463036ed772f754bf4a"
         },
         {
-          "bytes": 33881,
+          "bytes": 29934,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32_binding.cu",
-          "sha256": "abcec7824ceac0e11faeaea8fb02a83e10aa76b22e465267e23b4fd4e26eba15"
+          "sha256": "f68c3844be2d4c445d7aefabe6f1845ea17f311ffa8137d76fe46bb07a4a46ac"
         }
       ],
-      "closure_sha256": "beef4f9001b9f908de913ed5207b3dad89e6234de2b41c01a8df740a1df00724",
+      "closure_sha256": "5e88ab0e23f8fa78758252447708c05877d2f5bc95f7f3f19e3dbff3528dcc27",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -3738,7 +4840,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_chain_m64_s9"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32_binding.cu",
         "compile_separately": true,
@@ -3866,17 +4982,17 @@
       },
       "closure": [
         {
-          "bytes": 82666,
+          "bytes": 82217,
           "path": "csrc/kda/cake_kda_serving_bt16_prepare.cu",
-          "sha256": "64b52b2f6ef67a4d39a69b5f02e4f110dabe790f1fe5c73e44cdab469522e9e2"
+          "sha256": "eec2ec0842e5263bdce60007ef5169f8c23faf65a8f8f3c96ea665172edc59da"
         },
         {
-          "bytes": 31038,
+          "bytes": 26951,
           "path": "csrc/kda/cake_kda_serving_bt16_prepare_binding.cu",
-          "sha256": "907effd36d40ee92b5b1805a75433a8fdc8109665c6698b4d6b19759ea563e29"
+          "sha256": "ad8c3d45f4adb32dbde7c8d1cbe3e95bd5082d4eed9d82a25326bb1f9f156984"
         }
       ],
-      "closure_sha256": "ba6c25ad83f9a8e52efb5f8f51e34ad6a33011e041cd19b4ff1499bb916e6fa2",
+      "closure_sha256": "48e0feffacf7d8b5037776d94d34dd21754e4ad7124300859ab9c5f8d3b1ed47",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -3905,7 +5021,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_prepare"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_prepare_binding.cu",
         "compile_separately": true,
@@ -4137,17 +5267,17 @@
       },
       "closure": [
         {
-          "bytes": 236171,
+          "bytes": 235573,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse.cu",
-          "sha256": "4b2de1aafcad7458388ebc8cf979128544484642e37833d1a4895c14a829507d"
+          "sha256": "e995088c468d3c1ed023cc60e1a3901b36d1c1dd37a871660b03a6bca3059a12"
         },
         {
-          "bytes": 39567,
+          "bytes": 36911,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse_binding.cu",
-          "sha256": "0b11475c01338a7dce898f771fe03e2dc79dd33d2964cd72a1dee290b7bab256"
+          "sha256": "dfef3e9a56bf3381f710d07f493063271d3644fb6ff205272eec19136450b53f"
         }
       ],
-      "closure_sha256": "e61e30769147ce99ff5a82f19b059e5c0e174c3cbad6a77aca522c0825b1eecf",
+      "closure_sha256": "bf7b47006b13dd6ec76718fd247006e024ca7fcf9fe1743eea67e19977f982f1",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -4181,7 +5311,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_legacy_inverse"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse_binding.cu",
         "compile_separately": true,
@@ -4413,17 +5557,17 @@
       },
       "closure": [
         {
-          "bytes": 249872,
+          "bytes": 249274,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse.cu",
-          "sha256": "1ac131e6be6ffa626a6d1cd2719aaf431455c36a8dc32afbd6db591ac4144bee"
+          "sha256": "8d33e0a89072594db8c48addcf386c2b01b4bf3fdef9fdcc22c2942ad2a6fb48"
         },
         {
-          "bytes": 39579,
+          "bytes": 36923,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse_binding.cu",
-          "sha256": "75d4ec66466e52a8533531c94cb5acf508e2ed82d35f1f368efba3ec6c8f10a0"
+          "sha256": "40230ac501b65aebfeef2986184d0928b28154fec47342599ea1f8b52fcc2e59"
         }
       ],
-      "closure_sha256": "f0d48f28f08b60c03f4da8e3244ebd2f0fd158c4db838ddf5c91c895929147f6",
+      "closure_sha256": "e414c25c2e00e26ac05f331c59cf4b67aa9a86a066d331dabedc53b92fd56ed3",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -4457,7 +5601,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_register_inverse"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse_binding.cu",
         "compile_separately": true,
@@ -4689,17 +5847,17 @@
       },
       "closure": [
         {
-          "bytes": 248912,
+          "bytes": 248314,
           "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32.cu",
-          "sha256": "2c7b9c55a7bf52990374d8c7caf2d00f0f82065720abf4f8341d5a52cdf0e76a"
+          "sha256": "d0f5d7be435fab5fe963265a3f7224a7c774c4821dbd12e165bd9761350cdbc6"
         },
         {
-          "bytes": 39532,
+          "bytes": 36876,
           "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32_binding.cu",
-          "sha256": "7542e2653382cfb48282c85d55efd973506e9f473ce38262cd3144540e38abda"
+          "sha256": "e86e3321884b6f6c712a7f7a2832c32ed91250823a3f941ea47dd28175e4b7f9"
         }
       ],
-      "closure_sha256": "09e3ddee8df13996a292d9ac4b9b2dc7e4fb2a2fa755910824b0b55b5fe93a1b",
+      "closure_sha256": "43daa17162f71b65e0166b8170bd15da37a3eee391cf42f553140c7894a6fbec",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -4733,7 +5891,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_h12_pair_packed_beta"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_long_fp32_binding.cu",
         "compile_separately": true,
@@ -4965,17 +6137,17 @@
       },
       "closure": [
         {
-          "bytes": 185609,
+          "bytes": 185011,
           "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32.cu",
-          "sha256": "99a330548b13d1cb183875e4b71b40e771759e009ba4e2a88fe340da36e4ed69"
+          "sha256": "96e1ec0204c23173a6a06bd91180e0e98421b73524b476c5ee42d529d66d3796"
         },
         {
-          "bytes": 39762,
+          "bytes": 37106,
           "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32_binding.cu",
-          "sha256": "b23119e3be53e8c7448dbc2786bfb560bd071c20e1973abef3cefa62715f80e1"
+          "sha256": "442f70fbece7ad283286bf088bbd9f8675aeb6ed5dc7364728d0882e740de306"
         }
       ],
-      "closure_sha256": "0a739a6a60abea35d1217688503a457f66d791c4e83b1fb5bc436e700065c569",
+      "closure_sha256": "62024a5ba117114200aaba85d9d1e4d34be187f0f63fc3447dcd41cdfe37b304",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -5009,7 +6181,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_n16_h12_scalar"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32_binding.cu",
         "compile_separately": true,
@@ -5241,17 +6427,17 @@
       },
       "closure": [
         {
-          "bytes": 253335,
+          "bytes": 252734,
           "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32.cu",
-          "sha256": "52d0e423cc32487f1bae4bf7017d984d17b9e8977872b04fa20958a6c9f481f7"
+          "sha256": "3eabc3c0b94598b246ec1c57986c683675e76bd71f5a6f0dfd572c79b3fbc3e7"
         },
         {
-          "bytes": 39536,
+          "bytes": 36880,
           "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32_binding.cu",
-          "sha256": "3535cd5331ddb0fed8adce64dab2abf6b14324414cfbc384d3764c1cb3d3a150"
+          "sha256": "b6f79808e4cca7c011c6342a56578ef7dc6f7d6b2cb955959648442f433d50ad"
         }
       ],
-      "closure_sha256": "f1c3d77da0550dbb20c7c1387942d31bee59842915049010a99601248008335a",
+      "closure_sha256": "ad07680b846db0bab04d303f8f52e418967809f30bb58f377007f320d56c2b5b",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -5285,7 +6471,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_h12_scalar_early_pack"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_short_fp32_binding.cu",
         "compile_separately": true,
@@ -5429,17 +6629,17 @@
       },
       "closure": [
         {
-          "bytes": 181396,
+          "bytes": 180908,
           "path": "csrc/kda/cake_kda_serving_m64_fp32.cu",
-          "sha256": "cd6b5d6a7bf3daea7c13126b36eea00f7a38e5c78e11491138587445a84c0277"
+          "sha256": "fd1affaa9dbdc8db16496599d86a8b670a01aed227a4fd687cc3a690c732774d"
         },
         {
-          "bytes": 30202,
+          "bytes": 26337,
           "path": "csrc/kda/cake_kda_serving_m64_fp32_binding.cu",
-          "sha256": "649ff91410dc274fc6d6ac92d30aaa92197e14bfce45aebc6eec49f1b8f11a2d"
+          "sha256": "3ce9a30900e34d830e0016956dc7ee7cb42c205499afafea78a499c03683b442"
         }
       ],
-      "closure_sha256": "99615cc8b9c47d52d2a37f2a5cb9004a020a7c1a497c51c04ba533c5e92df5f4",
+      "closure_sha256": "f7fff9bf24582b377ae2cf69f45817aacddc35ad1dd0e34da7b00dd7eecdc5d3",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -5473,7 +6673,21 @@
         "family": "bounded_fp32_serving",
         "policy": "independent_dvsplit_m64"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m64_fp32_binding.cu",
         "compile_separately": true,
@@ -5649,17 +6863,17 @@
       },
       "closure": [
         {
-          "bytes": 200558,
+          "bytes": 200070,
           "path": "csrc/kda/cake_kda_serving_persistent_m128_fp32.cu",
-          "sha256": "13b53ffa4fb5921d60911696faaabf49abadc60198c4432e7d5d34d74b26aeac"
+          "sha256": "cf939c656e69dbf53de0d6fc7291bad5158ce269f7d3668c4e3b14d51228627e"
         },
         {
-          "bytes": 33217,
+          "bytes": 29832,
           "path": "csrc/kda/cake_kda_serving_persistent_m128_fp32_binding.cu",
-          "sha256": "c45404e9d3cb8e45a37f17e22ec8ce93182291cc6ef5b158fb9180194f69404e"
+          "sha256": "b42ec273c5a1b54738be804ab4bcd1e0a7eae58d8432b3a6160ce785ae517556"
         }
       ],
-      "closure_sha256": "fd20d38829fe078cf94f312c6216b9f33a0c493a99c5200136132c34b024888e",
+      "closure_sha256": "e793d65970e88f3a77f62f5bfe23f2b92fa0bdbe2fad22de71874bf497a20559",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -5693,7 +6907,21 @@
         "family": "bounded_fp32_serving",
         "policy": "persistent_m128_whole_chain"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_persistent_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -5869,17 +7097,17 @@
       },
       "closure": [
         {
-          "bytes": 211509,
+          "bytes": 211021,
           "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32.cu",
-          "sha256": "faabcabd926a1dd1123ff861600d32b4181f0dcb9ee2dc671dd045ab85dbd1f2"
+          "sha256": "8e742730d1f38a0a6b4dc1921d94ca924f98f62eda5ce483174c40df07f67629"
         },
         {
-          "bytes": 33253,
+          "bytes": 29868,
           "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32_binding.cu",
-          "sha256": "cbfae03c1a29c9ae0677f793a3b744e30009d0187afb7caef995135196f0eecc"
+          "sha256": "87f7991b7991233b8b39b2e1da52eae69a5ea1f26462b2abb2e42d5d9a390c88"
         }
       ],
-      "closure_sha256": "12a7a4ac5cc0ee1cbb1df338ad9ff25da22373807f9dbaa44a3c7ab34167b6f7",
+      "closure_sha256": "ae5e296bc19f85d0fc4c3cd961a5afcf27b96cee9b607c63bfbc6b6fd1f1a926",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -5913,7 +7141,21 @@
         "family": "bounded_fp32_serving",
         "policy": "persistent_m128_recurrence_pieces"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -6069,17 +7311,17 @@
       },
       "closure": [
         {
-          "bytes": 200238,
+          "bytes": 199750,
           "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32.cu",
-          "sha256": "63208da18e3b9065c22889041b3a2b766e070e61b5de24c479a08931e2794e71"
+          "sha256": "cf6ba0c552cfdd2541bb045eca4aa943b5cf271a3422aa7d730369941645564e"
         },
         {
-          "bytes": 31664,
+          "bytes": 27929,
           "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32_binding.cu",
-          "sha256": "be36f6194287d344cef528e3dc8bfaa46a64e34785df3629b356cb0ff887675f"
+          "sha256": "8ab17f37960730b04d9e64be2b6a0a961790cf657a3caa51ef9e55851840b009"
         }
       ],
-      "closure_sha256": "5f2f5dcd6554273d0f5c537972f784a03423f32c0b9d8f0aba5186d0f8e6e26f",
+      "closure_sha256": "1591e7df45dcc956d52645b976d581098ef44a7cc904a3709eb050ab08fd7171",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -6113,7 +7355,21 @@
         "family": "bounded_fp32_serving",
         "policy": "scalar_chunk_lpt_m128_h96"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -6289,17 +7545,17 @@
       },
       "closure": [
         {
-          "bytes": 184104,
+          "bytes": 183510,
           "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32.cu",
-          "sha256": "8c2e18a2de8f18553d8ea5efc4295ce7420578ff54b5cb8b5aa6393f7a110e8a"
+          "sha256": "b508fdb2bd882829bfa52a7b18535493d2f74329d98b397d3cd3efa77c7ebe9d"
         },
         {
-          "bytes": 34822,
+          "bytes": 31280,
           "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32_binding.cu",
-          "sha256": "1a881f3bdbace42764ef59830a4e3aaafffc439f341f2e8ccd3661e32b5a89b5"
+          "sha256": "1226616f44c7fcb73635fb86a1c19ac875bad3cdea84aea11b293b04836e7933"
         }
       ],
-      "closure_sha256": "7a2b7c6cbad344aa89013ee498983c95ab4c6a6a9792fd22e77e49bba653255d",
+      "closure_sha256": "3780a9931ff9b31d01280dee7a2daa71a22e5f362791dc6b2c9be471e441f5bc",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -6333,7 +7589,21 @@
         "family": "bounded_fp32_serving",
         "policy": "small_bh_owner_helper_m128"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_small_bh_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -6565,17 +7835,887 @@
       },
       "closure": [
         {
-          "bytes": 245308,
-          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
-          "sha256": "50d4f7383df85b39a30afebb9587a4f733a9475fa8edd5c19bbdf3ebe9334940"
+          "bytes": 250520,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
+          "sha256": "f4660884ff7b2c660ab3c2cac4775ab8b120183bbf0b6b1da24f5e750960a889"
         },
         {
-          "bytes": 39950,
-          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
-          "sha256": "ba378e0e7c619bebb9f5e42885f4a73a8e351c37c68e60a4dad0b3ddf5121828"
+          "bytes": 37127,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction_binding.cu",
+          "sha256": "db27325e81e7feef791ab96f5274352bcd2204ee077a30f78dc32ba0533caec3"
         }
       ],
-      "closure_sha256": "b0ec9ee3020a26d5d100fe31ca75b7a9891b0671e39a64a169f0822e68f62a33",
+      "closure_sha256": "2a170adfe53448b852b3e4a888431a3ee83ca311c8bedecf74ae37677ddbe973",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_correction",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_correction_ffi",
+      "name": "cake_kda_affine_bounded_fp32_correction",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "correction",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_correction"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_correction_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 250918,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
+          "sha256": "c6bb3f695cff5421b5ba1186a3f0f132bba0529912fa2655bf66d111ad0a793b"
+        },
+        {
+          "bytes": 36863,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_main_binding.cu",
+          "sha256": "b225146f4308c280f511618a98eb5ca64dd36040ef04f1e7e314f4def9d2055b"
+        }
+      ],
+      "closure_sha256": "e4ea7eb39c6e4caf3d4125d2ddc4f129051831c94709ad4c572a4698d2c2a6f6",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_main",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_main_ffi",
+      "name": "cake_kda_affine_bounded_fp32_main",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_main"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_main_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 257129,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
+          "sha256": "f0013f197523341501592fc6414a55444461272c38999451735d8fadb8348a39"
+        },
+        {
+          "bytes": 37085,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_map_binding.cu",
+          "sha256": "dbbeec39e2b0db2e3dc2b1ff1763e2a4b3472a5c679824bdc86a8bee6c6b49b3"
+        }
+      ],
+      "closure_sha256": "77082a102ba72eb19eabd63dcf7a8ae8746c089201d34f4e8b7dce00c8b07516",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_map",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_map_ffi",
+      "name": "cake_kda_affine_bounded_fp32_map",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "map",
+      "route": {
+        "family": "bounded_fp32_affine_prefix",
+        "policy": "affine_split_map"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_map_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 244710,
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
+          "sha256": "74694d4b585669728f7fe7e79714b735c0673925822d2a7ffe56b6c600e1e392"
+        },
+        {
+          "bytes": 37163,
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
+          "sha256": "06b488125b2f7fd38d03dca48d0a2d73aab774380a8d119ffe7442492c8fc4e1"
+        }
+      ],
+      "closure_sha256": "f23bc0a05dd9edacb9fc805e891cbf75a3a6a2ccf9f9b460a18799e65bffd602",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -6609,7 +8749,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_correction"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
         "compile_separately": true,
@@ -6841,17 +8995,17 @@
       },
       "closure": [
         {
-          "bytes": 250535,
+          "bytes": 249937,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main.cu",
-          "sha256": "cf929922490c2646465ec621845aee367118b1659307c97696c18e6818bc6600"
+          "sha256": "9c57e76fd2eca52670e64660ea252f8f634b0cf759f53266af7d26aca21a3855"
         },
         {
-          "bytes": 39555,
+          "bytes": 36899,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
-          "sha256": "98bb6298a24bec448052a3090165b7dc17f6350f756b011fc35998640c0bc16c"
+          "sha256": "733e1c5bf7e4ebf67ddb9f7bbe43172b2852007fe992927af241a023b0f49bc2"
         }
       ],
-      "closure_sha256": "b5e67f76cbf19c9bda5c360cef59d9e17fc675e769aae7042a17b6b27e73829b",
+      "closure_sha256": "70b8d318085c50e55bc1cd084c636c0d61af5ef48b45ef1d9deabb76b617b42f",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -6885,7 +9039,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_main"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
         "compile_separately": true,
@@ -7117,17 +9285,17 @@
       },
       "closure": [
         {
-          "bytes": 251917,
+          "bytes": 251319,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map.cu",
-          "sha256": "146e5a5d604bdc839da27133d111f457a324fd50f0d990b88076effd3ea00006"
+          "sha256": "70c7344c145cff2e37ad04c02782fccae8aaeb89e1169e866357de3bb1aa6296"
         },
         {
-          "bytes": 39908,
+          "bytes": 37121,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
-          "sha256": "2d2ca0a77a06a79fc256d9e08e19dc4bcf5c7ce8f4fee718a996565672a832f6"
+          "sha256": "0ad8095ac036e95dbb7c15aaad3b24e615f55632ec37ea7796dabacaa022b1ef"
         }
       ],
-      "closure_sha256": "2980dc71167c8a6f43c558688566d98d2dbfb51a3384f62d0aacd310503e0029",
+      "closure_sha256": "6197874879196bb720254191b8a5ac6b771a5a989e5b9d7a66662df0f7bcae17",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -7161,7 +9329,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_split_map"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
         "compile_separately": true,
@@ -7213,17 +9395,17 @@
       },
       "closure": [
         {
-          "bytes": 11657,
+          "bytes": 11810,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu",
-          "sha256": "5df3aba531af2c975a2446bbd95b9004c2c10612b5874d78132d3a3d69310140"
+          "sha256": "f5834e09c6b6191a529af3caad61965b379541c37fafd4d67b8e194c202affa3"
         },
         {
-          "bytes": 8564,
+          "bytes": 8824,
           "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
-          "sha256": "d9c66b1e7b862a46502df9baf828d8a5e32a97368023439014d383c5ead9f6e2"
+          "sha256": "e7efc46d9e3d682112640830498a75bde0bde05ef2afb9553c5ca01ac02f64c1"
         }
       ],
-      "closure_sha256": "cbafbf5fc1440a707732062cb523950e336769733d582b86b5b7625c771e0ff9",
+      "closure_sha256": "c58900009fc3155b683424fe1709e506eee62df34c5b30e3dadf64c481028119",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -7252,7 +9434,21 @@
         "family": "unbounded_affine_prefix",
         "policy": "affine_prefix_scan"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
         "compile_separately": true,
@@ -7408,17 +9604,17 @@
       },
       "closure": [
         {
-          "bytes": 211867,
+          "bytes": 211379,
           "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
-          "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+          "sha256": "a7d513704a5254fcadc61ef327d30c6754b3fd40ccaaeaeaefad4fd621d7503f"
         },
         {
-          "bytes": 31580,
+          "bytes": 27845,
           "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
-          "sha256": "cfac16f42dc1b90b1698bd633b6a918f1451af63f2b5ae7e2678e5bffcf58513"
+          "sha256": "aae2a7892a8c3628d34d535e7c63951a07aa859211844b610c4e935623a3a1ef"
         }
       ],
-      "closure_sha256": "e5328fa6d6ec301f83f21598d43b5c1e39e6977daff6323c289e941c1f3ae3f8",
+      "closure_sha256": "603efbbae253f2e6e4f02a6957b614df53837b6bbf3af629e1092d83007aa7b3",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -7452,7 +9648,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m128_generic"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
         "compile_separately": true,
@@ -7608,17 +9818,17 @@
       },
       "closure": [
         {
-          "bytes": 215140,
+          "bytes": 214652,
           "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
-          "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+          "sha256": "16591311e6a954b8ed906fd67176f939442363cc3fab5b143a876fe9f1a01f20"
         },
         {
-          "bytes": 31622,
+          "bytes": 27887,
           "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
-          "sha256": "4973203fb14dd6189fa31bcfe7eec3a2455434f346f9b8d5c7d2c47c8189eae8"
+          "sha256": "cccd4771340f50ab81dbb2241193f972129e88b3b88e2d8b93f4e16e18f84574"
         }
       ],
-      "closure_sha256": "1cde23a535581c671498774a372d7f41bf46053f894d29b634f09d7ed9d3e362",
+      "closure_sha256": "9472ac1fd42765a0fa3ea81603755a6dcc65643e4ccf2390c322480d44df5de1",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -7652,7 +9862,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_m128_h64_lpt"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
         "compile_separately": true,
@@ -7808,17 +10032,17 @@
       },
       "closure": [
         {
-          "bytes": 211901,
+          "bytes": 211413,
           "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
-          "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+          "sha256": "7cdf1513aa65268176d5dbdbc59709a009860424bc42f6384bba6166f330f0c4"
         },
         {
-          "bytes": 31556,
+          "bytes": 27821,
           "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
-          "sha256": "31d8f9b44b4a79c07d32f883c4ddaccaacdd3d822b74ce1530d6d4aafbbc18de"
+          "sha256": "6a61db2dcd0b4f3c72c22c27d27755639ecd9d2f9bf5fd024df89d4e9c643084"
         }
       ],
-      "closure_sha256": "58a1d9bbf9028be34d56cfdf83e4af394238c880e97b811f1f1936ae291f5afc",
+      "closure_sha256": "2b9d7229cb6f3bf9c693887101bb98e5a6b3d53cf1bcdf2a4fe99d180f6c37fb",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -7852,7 +10076,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m128_h96_commit_order"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
         "compile_separately": true,
@@ -7996,17 +10234,17 @@
       },
       "closure": [
         {
-          "bytes": 182050,
+          "bytes": 181562,
           "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
-          "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+          "sha256": "57f3b56554e7404a2a08fa57ece8b6dda60096b827649d7f3b3a82b3d2beadc7"
         },
         {
-          "bytes": 30280,
+          "bytes": 26415,
           "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
-          "sha256": "4d0dbb17cca09b15b442ec81db68b7d142a48882fbf8fbbcb36a5fa937e6ea90"
+          "sha256": "3e537fb7d292c23819bea307922ab155d529adbfb1f3e9bc5a16dde8dfaf068a"
         }
       ],
-      "closure_sha256": "9ef18c60c33099f75dd65c059312633b2489a6cfe7b5e582b10f4423c57c0b80",
+      "closure_sha256": "fe290713824c018c99ab79eed3397ece308932d8743324793d87941c40388d0e",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -8040,7 +10278,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_m64_independent_value_split"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
         "compile_separately": true,
@@ -8272,17 +10524,17 @@
       },
       "closure": [
         {
-          "bytes": 250564,
+          "bytes": 249966,
           "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128.cu",
-          "sha256": "ff3a132c2b03315930976815590300eb9849c0b4b2328f30af623bbd0ed733fd"
+          "sha256": "af2dbb452402f89d26a82f38da2b15ddc90ffbd9642d19ef217fa75aa4e4f423"
         },
         {
-          "bytes": 39561,
+          "bytes": 36905,
           "path": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128_binding.cu",
-          "sha256": "97029559c63332c7b7071fc5bd53efef542d113ed2faef14622b13937b257acf"
+          "sha256": "ae92dcbb597fb8a7768ab20e336cc246e8b65a7da0dd8a7d3068b2cbbef88657"
         }
       ],
-      "closure_sha256": "ebacddbdc26f5cd69243332637d4bb4b269bf243755ddd79e9e5bd702b8fafd0",
+      "closure_sha256": "8f716f5a4423ad387459bbf46bbf85e98ce421139b501d79a85c1d7a36e265db",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -8316,7 +10568,21 @@
         "family": "unbounded_bf16_serving",
         "policy": "direct_m128_unbounded_softplus"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_unbounded_softplus_m128_binding.cu",
         "compile_separately": true,
@@ -8472,17 +10738,17 @@
       },
       "closure": [
         {
-          "bytes": 216773,
+          "bytes": 216282,
           "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
-          "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+          "sha256": "e8bfb37b703d7c6aaef36bbf1886492f0e3c114904415098e25a11cffcc8e569"
         },
         {
-          "bytes": 31516,
+          "bytes": 27717,
           "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
-          "sha256": "a85d0f55e42deefa4284445623a3dac42a2304ac5d9654ed0e6d0d97bb056ce6"
+          "sha256": "40e57672da297970219043a2693744bd95e53d38458b22913043566b62dbeb27"
         }
       ],
-      "closure_sha256": "3386e04bc52cdab3b9c6c4f2d8bbbdae6dea271dfdd1b8e8c95ac2b5c7176a5a",
+      "closure_sha256": "9df743570ba822708b0f8d4f4319ee7fcc17b4dd5a93cc3bf6dc73bffc6853a6",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -8516,7 +10782,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_vtile_m128_generic"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
         "compile_separately": true,
@@ -8672,17 +10952,17 @@
       },
       "closure": [
         {
-          "bytes": 216778,
+          "bytes": 216287,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
-          "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+          "sha256": "fbcc25cbcab21ad311d296d02923b2c7f00d20d2f62daea46dd14b938e1e2330"
         },
         {
-          "bytes": 31492,
+          "bytes": 27693,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
-          "sha256": "34f44a41c8ece3c4f7b03bb36b2bb718ccdcc3076320ba226e3c2fc102c5762c"
+          "sha256": "55d3bac21fb2a5f838bafe8e0bde6d28ef5960547497aa585838d9d429319c17"
         }
       ],
-      "closure_sha256": "4792a77fa63ab819ad76e703bf0c082259a92bb65240614db6282e1f14e1ae5b",
+      "closure_sha256": "f862d5d5bf2446bff78ae93b7e9361885063396840f39f48bad85fcbccff18b5",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -8716,7 +10996,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "direct_vtile_m128_h64_gate_order"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
         "compile_separately": true,
@@ -8872,17 +11166,17 @@
       },
       "closure": [
         {
-          "bytes": 219054,
+          "bytes": 218563,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
-          "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+          "sha256": "31e77f1a656c5d0fa6ec3e274256f46971f0020309d6d5d725227b942e3ea001"
         },
         {
-          "bytes": 31558,
+          "bytes": 27759,
           "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
-          "sha256": "5918246faeff15bbdef7afed3e25e36d8a545a034bc7f33eba8585f43a9470f4"
+          "sha256": "fbacf551803338e460472a832b23caa97e5dd4cc4e5a427a3e77eb9fa2088df1"
         }
       ],
-      "closure_sha256": "48eca3893c9e2744c011b3cd81215f3be05ab88c9d351901496a18904b832936",
+      "closure_sha256": "4aebe70fce71685d1ae82925572e8eaeca42511d9d85f30b9eaf34d23d5b9fe4",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -8916,7 +11210,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_vtile_m128_h64"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
         "compile_separately": true,
@@ -9072,17 +11380,17 @@
       },
       "closure": [
         {
-          "bytes": 219330,
+          "bytes": 218839,
           "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
-          "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+          "sha256": "d10a9e5ef13a621dad8ac981fb62a55a4e61134160bdb8173dce25738b9fdfe9"
         },
         {
-          "bytes": 31582,
+          "bytes": 27783,
           "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
-          "sha256": "ca68ebedd337f557cabafbf9935fcb54deb9380910a6f133138ba32abe16a226"
+          "sha256": "e23c8825f1cf43ab9950855ec307a0e8727ae04ecbd680d66fa126fe13c1928c"
         }
       ],
-      "closure_sha256": "58f13011d5467a0bd54fbd1afd74b308a8018585fcbd3443710a9fa638b453a6",
+      "closure_sha256": "a07052deec4944ba91b21fa944b1734706d5ce473a1ed993cf36efde92511dea",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9116,7 +11424,21 @@
         "family": "bounded_bf16_evolution",
         "policy": "persistent_vtile_m128_h96_six_task"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
         "compile_separately": true,
@@ -9260,17 +11582,17 @@
       },
       "closure": [
         {
-          "bytes": 86750,
+          "bytes": 86146,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32.cu",
-          "sha256": "c547d60e99cf380049f831edef5c11026c4c861baf8368ab4c633331d5e365fc"
+          "sha256": "8812f4904f43383038db89b7e1b2d44e901586447b10239cce80ad289398de31"
         },
         {
-          "bytes": 33881,
+          "bytes": 29934,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32_binding.cu",
-          "sha256": "1a8f34cac0ced6074c78f932954dae17b3415cabe761dd3b18545e36264df4f0"
+          "sha256": "6bc118b7c71ce0f8e7bc7c413469a4d3d0a5bc38244129c3e3f339cdd0a2dfd5"
         }
       ],
-      "closure_sha256": "7b922d0837c7bbcff831fa95bb82524e0fc93ac623f2d55e7b192c57cc4a2d00",
+      "closure_sha256": "da50b16354df753c70a2ae81e01ed3248e8721e50e6af2ad3ae4e41cb6e7864a",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9304,7 +11626,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_chain_m64_s8"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_chain_s8_fp32_binding.cu",
         "compile_separately": true,
@@ -9448,17 +11784,17 @@
       },
       "closure": [
         {
-          "bytes": 87727,
+          "bytes": 87123,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32.cu",
-          "sha256": "96f2b354fa7dc522a3da69b53b0b542fd8cbe6abf037595850ec39dedf6a89f2"
+          "sha256": "ffbfef1853958b86f82ada1f15591e6725f278780a8a7463036ed772f754bf4a"
         },
         {
-          "bytes": 33881,
+          "bytes": 29934,
           "path": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32_binding.cu",
-          "sha256": "abcec7824ceac0e11faeaea8fb02a83e10aa76b22e465267e23b4fd4e26eba15"
+          "sha256": "f68c3844be2d4c445d7aefabe6f1845ea17f311ffa8137d76fe46bb07a4a46ac"
         }
       ],
-      "closure_sha256": "a61e70a5d8c1eea63f4279c0bff36b30de218844a9ed7c014837b732c42aea9c",
+      "closure_sha256": "1fa63555f8566e893e88f4255cf79ab82a781aee98e65080d728b6ba608e23cd",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9492,7 +11828,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_chain_m64_s9"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_chain_s9_fp32_binding.cu",
         "compile_separately": true,
@@ -9620,17 +11970,17 @@
       },
       "closure": [
         {
-          "bytes": 82666,
+          "bytes": 82217,
           "path": "csrc/kda/cake_kda_serving_bt16_prepare.cu",
-          "sha256": "64b52b2f6ef67a4d39a69b5f02e4f110dabe790f1fe5c73e44cdab469522e9e2"
+          "sha256": "eec2ec0842e5263bdce60007ef5169f8c23faf65a8f8f3c96ea665172edc59da"
         },
         {
-          "bytes": 31038,
+          "bytes": 26951,
           "path": "csrc/kda/cake_kda_serving_bt16_prepare_binding.cu",
-          "sha256": "907effd36d40ee92b5b1805a75433a8fdc8109665c6698b4d6b19759ea563e29"
+          "sha256": "ad8c3d45f4adb32dbde7c8d1cbe3e95bd5082d4eed9d82a25326bb1f9f156984"
         }
       ],
-      "closure_sha256": "a042b5d473000ab2c5c84e27834448382fd948de2e97536f381d6610aeb32b3c",
+      "closure_sha256": "566c4ca3fa8e7724eefde1397a9075280e18c288e5da7f2442be496814ad8496",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9659,7 +12009,21 @@
         "family": "bounded_fp32_serving",
         "policy": "bt16_prepare"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_bt16_prepare_binding.cu",
         "compile_separately": true,
@@ -9891,17 +12255,17 @@
       },
       "closure": [
         {
-          "bytes": 236171,
+          "bytes": 235573,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse.cu",
-          "sha256": "4b2de1aafcad7458388ebc8cf979128544484642e37833d1a4895c14a829507d"
+          "sha256": "e995088c468d3c1ed023cc60e1a3901b36d1c1dd37a871660b03a6bca3059a12"
         },
         {
-          "bytes": 39567,
+          "bytes": 36911,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse_binding.cu",
-          "sha256": "0b11475c01338a7dce898f771fe03e2dc79dd33d2964cd72a1dee290b7bab256"
+          "sha256": "dfef3e9a56bf3381f710d07f493063271d3644fb6ff205272eec19136450b53f"
         }
       ],
-      "closure_sha256": "b60385900eb7f71fd7b57f0d66e80d23a94dc711c6b61e155fa954c5bb04f508",
+      "closure_sha256": "840e0547cc90a1aeb19a3a11ffa3513b7df48debed3d594e36c022ea667d8fe0",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9935,7 +12299,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_legacy_inverse"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_fp32_legacy_inverse_binding.cu",
         "compile_separately": true,
@@ -10167,17 +12545,17 @@
       },
       "closure": [
         {
-          "bytes": 249872,
+          "bytes": 249274,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse.cu",
-          "sha256": "1ac131e6be6ffa626a6d1cd2719aaf431455c36a8dc32afbd6db591ac4144bee"
+          "sha256": "8d33e0a89072594db8c48addcf386c2b01b4bf3fdef9fdcc22c2942ad2a6fb48"
         },
         {
-          "bytes": 39579,
+          "bytes": 36923,
           "path": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse_binding.cu",
-          "sha256": "75d4ec66466e52a8533531c94cb5acf508e2ed82d35f1f368efba3ec6c8f10a0"
+          "sha256": "40230ac501b65aebfeef2986184d0928b28154fec47342599ea1f8b52fcc2e59"
         }
       ],
-      "closure_sha256": "2736f6258486e5ac8278fb4e95626bdb1979a815a196a89f99674774ea6ddde3",
+      "closure_sha256": "e2ffe0fca7773430a82133b108aaad2ab40841bb4aeae1887366f0b06268c67c",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -10211,7 +12589,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_register_inverse"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_fp32_register_inverse_binding.cu",
         "compile_separately": true,
@@ -10443,17 +12835,17 @@
       },
       "closure": [
         {
-          "bytes": 248912,
+          "bytes": 248314,
           "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32.cu",
-          "sha256": "2c7b9c55a7bf52990374d8c7caf2d00f0f82065720abf4f8341d5a52cdf0e76a"
+          "sha256": "d0f5d7be435fab5fe963265a3f7224a7c774c4821dbd12e165bd9761350cdbc6"
         },
         {
-          "bytes": 39532,
+          "bytes": 36876,
           "path": "csrc/kda/cake_kda_serving_m128_h12_long_fp32_binding.cu",
-          "sha256": "7542e2653382cfb48282c85d55efd973506e9f473ce38262cd3144540e38abda"
+          "sha256": "e86e3321884b6f6c712a7f7a2832c32ed91250823a3f941ea47dd28175e4b7f9"
         }
       ],
-      "closure_sha256": "c9b55e2463fd6a3d3e5e4bd9f55b028762b9e5e90d32af6317a12d34c4fd3c18",
+      "closure_sha256": "92d838a8453391e15cbefbfdd1f44f5dd3b7f1a79ffa9411343607ce098b3385",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -10487,7 +12879,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_h12_pair_packed_beta"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_long_fp32_binding.cu",
         "compile_separately": true,
@@ -10719,17 +13125,17 @@
       },
       "closure": [
         {
-          "bytes": 185609,
+          "bytes": 185011,
           "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32.cu",
-          "sha256": "99a330548b13d1cb183875e4b71b40e771759e009ba4e2a88fe340da36e4ed69"
+          "sha256": "96e1ec0204c23173a6a06bd91180e0e98421b73524b476c5ee42d529d66d3796"
         },
         {
-          "bytes": 39762,
+          "bytes": 37106,
           "path": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32_binding.cu",
-          "sha256": "b23119e3be53e8c7448dbc2786bfb560bd071c20e1973abef3cefa62715f80e1"
+          "sha256": "442f70fbece7ad283286bf088bbd9f8675aeb6ed5dc7364728d0882e740de306"
         }
       ],
-      "closure_sha256": "13550f7d5bad11de9ef0ac9b554e7353f11d036a8959c8c6b61ef28981026abd",
+      "closure_sha256": "eb7e3f4584b15884a44de283baac7a04067b161f5ec399fc199fb2d617c76ef5",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -10763,7 +13169,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_n16_h12_scalar"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_n16_fp32_binding.cu",
         "compile_separately": true,
@@ -10995,17 +13415,17 @@
       },
       "closure": [
         {
-          "bytes": 253335,
+          "bytes": 252734,
           "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32.cu",
-          "sha256": "52d0e423cc32487f1bae4bf7017d984d17b9e8977872b04fa20958a6c9f481f7"
+          "sha256": "3eabc3c0b94598b246ec1c57986c683675e76bd71f5a6f0dfd572c79b3fbc3e7"
         },
         {
-          "bytes": 39536,
+          "bytes": 36880,
           "path": "csrc/kda/cake_kda_serving_m128_h12_short_fp32_binding.cu",
-          "sha256": "3535cd5331ddb0fed8adce64dab2abf6b14324414cfbc384d3764c1cb3d3a150"
+          "sha256": "b6f79808e4cca7c011c6342a56578ef7dc6f7d6b2cb955959648442f433d50ad"
         }
       ],
-      "closure_sha256": "39c67fb28951d77034cb1a94f60122b60eed21705f968c665eeecee6d7b2bb7e",
+      "closure_sha256": "2bd3c5890bbd0fc4a116aafb96d598e6af3efa6fd0128c817e10c3962f0ff696",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -11039,7 +13459,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_h12_scalar_early_pack"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_h12_short_fp32_binding.cu",
         "compile_separately": true,
@@ -11271,17 +13705,17 @@
       },
       "closure": [
         {
-          "bytes": 252459,
+          "bytes": 251861,
           "path": "csrc/kda/cake_kda_serving_m128_tensor_decay_fp32.cu",
-          "sha256": "ac1f720ad9d425cf6d35a373d3b5e17c3016250612f1b08888711e975424a40d"
+          "sha256": "cb3439c285d364a5b8891ed9d17ef2148acf9803f1f20bd6d4972c9f5b83f580"
         },
         {
-          "bytes": 39555,
+          "bytes": 36899,
           "path": "csrc/kda/cake_kda_serving_m128_tensor_decay_fp32_binding.cu",
-          "sha256": "9fd6e58ab9a5cffdc0d1eddb44469a5309730fbf1d0e2a1bcea6282e87860b2f"
+          "sha256": "07da208f034c4143df0e54306b4dafb5efce160acfc08e02cbb411620f148b82"
         }
       ],
-      "closure_sha256": "ed86539fca93b5c589f232515861ef1cd1dc2912d7b305c484b281faaec67329",
+      "closure_sha256": "3d6268f4ab12c05a99bcd26daf1bca2c92a1c5bcf112357fe04a17625325d545",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -11315,7 +13749,21 @@
         "family": "bounded_fp32_serving",
         "policy": "direct_m128_prediction_first_tensor_decay"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m128_tensor_decay_fp32_binding.cu",
         "compile_separately": true,
@@ -11459,17 +13907,17 @@
       },
       "closure": [
         {
-          "bytes": 181396,
+          "bytes": 180908,
           "path": "csrc/kda/cake_kda_serving_m64_fp32.cu",
-          "sha256": "cd6b5d6a7bf3daea7c13126b36eea00f7a38e5c78e11491138587445a84c0277"
+          "sha256": "fd1affaa9dbdc8db16496599d86a8b670a01aed227a4fd687cc3a690c732774d"
         },
         {
-          "bytes": 30202,
+          "bytes": 26337,
           "path": "csrc/kda/cake_kda_serving_m64_fp32_binding.cu",
-          "sha256": "649ff91410dc274fc6d6ac92d30aaa92197e14bfce45aebc6eec49f1b8f11a2d"
+          "sha256": "3ce9a30900e34d830e0016956dc7ee7cb42c205499afafea78a499c03683b442"
         }
       ],
-      "closure_sha256": "49fe30040673fdf7816d206b75f0f3f97bd4a547e4937742a831d8237e2b6d82",
+      "closure_sha256": "6e8965412a68d73eab4d14a5abd39b5a3904791c2bea4da1e56dc6e9101c4fad",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -11503,7 +13951,21 @@
         "family": "bounded_fp32_serving",
         "policy": "independent_dvsplit_m64"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_m64_fp32_binding.cu",
         "compile_separately": true,
@@ -11679,17 +14141,17 @@
       },
       "closure": [
         {
-          "bytes": 211509,
+          "bytes": 211021,
           "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32.cu",
-          "sha256": "faabcabd926a1dd1123ff861600d32b4181f0dcb9ee2dc671dd045ab85dbd1f2"
+          "sha256": "8e742730d1f38a0a6b4dc1921d94ca924f98f62eda5ce483174c40df07f67629"
         },
         {
-          "bytes": 33253,
+          "bytes": 29868,
           "path": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32_binding.cu",
-          "sha256": "cbfae03c1a29c9ae0677f793a3b744e30009d0187afb7caef995135196f0eecc"
+          "sha256": "87f7991b7991233b8b39b2e1da52eae69a5ea1f26462b2abb2e42d5d9a390c88"
         }
       ],
-      "closure_sha256": "3b69f7f23ea83b89943cbc3c465354b1eaea81a002f0a8b112eb1dfeb9f3e931",
+      "closure_sha256": "c916d9a9b785d597bf270e412611d06a5f693516c4131ec44ef80746355d2d5e",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -11723,7 +14185,21 @@
         "family": "bounded_fp32_serving",
         "policy": "persistent_m128_recurrence_pieces"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_piece_persistent_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -11879,17 +14355,17 @@
       },
       "closure": [
         {
-          "bytes": 200238,
+          "bytes": 199750,
           "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32.cu",
-          "sha256": "63208da18e3b9065c22889041b3a2b766e070e61b5de24c479a08931e2794e71"
+          "sha256": "cf6ba0c552cfdd2541bb045eca4aa943b5cf271a3422aa7d730369941645564e"
         },
         {
-          "bytes": 31664,
+          "bytes": 27929,
           "path": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32_binding.cu",
-          "sha256": "be36f6194287d344cef528e3dc8bfaa46a64e34785df3629b356cb0ff887675f"
+          "sha256": "8ab17f37960730b04d9e64be2b6a0a961790cf657a3caa51ef9e55851840b009"
         }
       ],
-      "closure_sha256": "de958d65be86ec51cbff1941c0938ab5c533eb72cceb0d30767acffb4003af2f",
+      "closure_sha256": "d518a33f0471d9047fa835a6c0789f82bef1d9f54a64d596f89514d56af8c2ce",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -11923,7 +14399,21 @@
         "family": "bounded_fp32_serving",
         "policy": "scalar_chunk_lpt_m128_h96"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_scalar_chunk_lpt_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -12099,17 +14589,17 @@
       },
       "closure": [
         {
-          "bytes": 184104,
+          "bytes": 183510,
           "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32.cu",
-          "sha256": "8c2e18a2de8f18553d8ea5efc4295ce7420578ff54b5cb8b5aa6393f7a110e8a"
+          "sha256": "b508fdb2bd882829bfa52a7b18535493d2f74329d98b397d3cd3efa77c7ebe9d"
         },
         {
-          "bytes": 34822,
+          "bytes": 31280,
           "path": "csrc/kda/cake_kda_serving_small_bh_m128_fp32_binding.cu",
-          "sha256": "1a881f3bdbace42764ef59830a4e3aaafffc439f341f2e8ccd3661e32b5a89b5"
+          "sha256": "1226616f44c7fcb73635fb86a1c19ac875bad3cdea84aea11b293b04836e7933"
         }
       ],
-      "closure_sha256": "19efe9da5d91200d6ad307919888638fc933a0927d8edbeeffa33002c3704026",
+      "closure_sha256": "2df8597395f4fd9a10b8c0141a786cf180a856303cf646c7c5c234d33b8fda8d",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -12143,7 +14633,21 @@
         "family": "bounded_fp32_serving",
         "policy": "small_bh_owner_helper_m128"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_small_bh_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -12299,17 +14803,17 @@
       },
       "closure": [
         {
-          "bytes": 210329,
+          "bytes": 209838,
           "path": "csrc/kda/cake_kda_serving_vtile_m128_fp32.cu",
-          "sha256": "f5f7f9e59cfc46dafd79f2af163379025ae24da5fe00386aa09605cbe395b446"
+          "sha256": "28b5378e61a0535c174e517d59af29b501c48a153ccb29630a760d976d6a8143"
         },
         {
-          "bytes": 31528,
+          "bytes": 27729,
           "path": "csrc/kda/cake_kda_serving_vtile_m128_fp32_binding.cu",
-          "sha256": "0b4ad4d0686c0d981a07e2c0dbc2cb0d9647e68927ff3c4fcc9c967cea325110"
+          "sha256": "b019247a1c9dd32bf6e8b1f44362bf50fc6c75b763a5da1db278932526bba5c0"
         }
       ],
-      "closure_sha256": "81b6c6f02be041cb0f4e553d82eef3a1e5f0c1dad9885c5716adc2e9e927ebbb",
+      "closure_sha256": "65a4a05a611027373e963d32781907d0f2aaca1222e1c926c7a819f692968a1f",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -12343,7 +14847,21 @@
         "family": "bounded_fp32_serving",
         "policy": "source_vtile_m128_direct"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_vtile_m128_fp32_binding.cu",
         "compile_separately": true,
@@ -12499,17 +15017,17 @@
       },
       "closure": [
         {
-          "bytes": 215084,
+          "bytes": 214593,
           "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32.cu",
-          "sha256": "e263c1738b798ea4184c268ac0d3c934dd924dd5b9a315d1905e3dc49754ffc5"
+          "sha256": "9396f6b29932aa9de91daf782b5bc809370a521d58f290ca03ff3dbd9a50e61e"
         },
         {
-          "bytes": 31618,
+          "bytes": 27819,
           "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32_binding.cu",
-          "sha256": "8fc8ca44936b622eb65a06d77692644bc1ddaac012e62d5cc513cc35ac04dbbb"
+          "sha256": "348d60565b00ab743af84d16c74c3db03613113f52be4f372b1306c736382ddf"
         }
       ],
-      "closure_sha256": "9ebdb7f967760a85688fc618963ef7c965a6dec48c483c899ed01a0b5759a14b",
+      "closure_sha256": "2b61257f7978a23150719cacc863ed1abf09720e1e3e24f322136841fbe61ba3",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -12543,7 +15061,21 @@
         "family": "bounded_fp32_serving",
         "policy": "source_vtile_m128_persistent_six_task"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
       "translation_units": {
         "binding": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32_binding.cu",
         "compile_separately": true,
@@ -12553,6 +15085,6 @@
   ],
   "name": "cake_kda_prefill_portfolio",
   "producer": "cake",
-  "producer_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
+  "producer_revision": "54cf75589d8575a0a07154e67f5351004dfa9483",
   "schema": "cake.library_export.v1"
 }

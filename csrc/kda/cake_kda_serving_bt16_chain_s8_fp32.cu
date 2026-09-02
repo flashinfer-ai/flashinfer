@@ -11,11 +11,15 @@ static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
 
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byte aligned");
 #include <cuda_bf16.h>
 
 #define CAKE_INF CUDART_INF_F
@@ -467,7 +471,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_kda_serving_bt16_chain_s8_fp32(__nv_bfloat16* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, __nv_bfloat16* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, __nv_bfloat16* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, __nv_bfloat16* __restrict__ ws_qk, CakeTensorMap const* ws_qk_tma, float* __restrict__ ws_diag, CakeTensorMap const* ws_diag_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32)
+kernel_cake_kda_serving_bt16_chain_s8_fp32(__nv_bfloat16* __restrict__ ws_qd, const __grid_constant__ CUtensorMap ws_qd_tma, __nv_bfloat16* __restrict__ ws_kd, const __grid_constant__ CUtensorMap ws_kd_tma, __nv_bfloat16* __restrict__ ws_w, const __grid_constant__ CUtensorMap ws_w_tma, __nv_bfloat16* __restrict__ ws_qk, const __grid_constant__ CUtensorMap ws_qk_tma, float* __restrict__ ws_diag, const __grid_constant__ CUtensorMap ws_diag_tma, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -491,17 +495,6 @@ kernel_cake_kda_serving_bt16_chain_s8_fp32(__nv_bfloat16* __restrict__ ws_qd, Ca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(ws_qd_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(ws_kd_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(ws_w_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(ws_qk_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(ws_diag_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(v_tma)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(out_tma)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -686,7 +679,7 @@ kernel_cake_kda_serving_bt16_chain_s8_fp32(__nv_bfloat16* __restrict__ ws_qd, Ca
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
-                            tma_store_4d(out_tma, 0, (int)(bos + (long long)(chunk_idx * 16)), head_idx, value_split_idx, smem_out_addr + output_stage * 2048);
+                            tma_store_4d((&out_tma), 0, (int)(bos + (long long)(chunk_idx * 16)), head_idx, value_split_idx, smem_out_addr + output_stage * 2048);
                         }
                         asm volatile("cp.async.bulk.commit_group;");
                     }
@@ -1347,12 +1340,12 @@ kernel_cake_kda_serving_bt16_chain_s8_fp32(__nv_bfloat16* __restrict__ ws_qd, Ca
                 int ws_row = ws_chunk * 16;
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(qk_full_addr + (factor_tma_stage) * 8, 15360);
-                    tma_4d_gmem2smem(smem_qd_addr + factor_stage * 15360, ws_qd_tma, 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
-                    tma_4d_gmem2smem(smem_kd_addr + factor_stage * 15360, ws_kd_tma, 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
-                    tma_4d_gmem2smem(smem_kr_trans_addr + factor_stage * 15360, ws_w_tma, 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
-                    tma_5d_gmem2smem(smem_mqk_trans_addr + factor_stage * 15360, ws_qk_tma, 0, 0, ws_chunk, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
-                    tma_4d_gmem2smem(smem_gt_all_addr + factor_stage * 15360, ws_diag_tma, 0, ws_chunk, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
-                    tma_3d_gmem2smem(smem_v_addr + factor_stage * 15360, v_tma, value_row_offset_3, head_idx_3, (int)(bos_5 + (long long)(chunk_idx_2 * 16)), qk_full_addr + (factor_tma_stage) * 8);
+                    tma_4d_gmem2smem(smem_qd_addr + factor_stage * 15360, (&ws_qd_tma), 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
+                    tma_4d_gmem2smem(smem_kd_addr + factor_stage * 15360, (&ws_kd_tma), 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
+                    tma_4d_gmem2smem(smem_kr_trans_addr + factor_stage * 15360, (&ws_w_tma), 0, ws_row, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
+                    tma_5d_gmem2smem(smem_mqk_trans_addr + factor_stage * 15360, (&ws_qk_tma), 0, 0, ws_chunk, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
+                    tma_4d_gmem2smem(smem_gt_all_addr + factor_stage * 15360, (&ws_diag_tma), 0, ws_chunk, head_idx_3, 0, qk_full_addr + (factor_tma_stage) * 8);
+                    tma_3d_gmem2smem(smem_v_addr + factor_stage * 15360, (&v_tma), value_row_offset_3, head_idx_3, (int)(bos_5 + (long long)(chunk_idx_2 * 16)), qk_full_addr + (factor_tma_stage) * 8);
                 }
                 factor_stage += 1;
                 if (factor_stage == 8) { factor_stage = 0; _phase_smem_free ^= 1; }
