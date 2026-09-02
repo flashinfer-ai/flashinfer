@@ -130,12 +130,21 @@ __device__ __forceinline__ void lane_axes(int lane, int mrope_h, int mrope_w,
  * factors -- so halving the reads on it is worth a table of its own.
  */
 template <int D, bool MROPE, typename DType>
-__device__ __forceinline__ void load_cos_sin(const DType* __restrict__ cos_sin, int lane,
-                                             int64_t pos_t, int64_t pos_h, int64_t pos_w,
+__device__ __forceinline__ void load_cos_sin(const DType* __restrict__ cos_sin, int64_t rows,
+                                             int lane, int64_t pos_t, int64_t pos_h, int64_t pos_w,
                                              const int (&axis)[kPairs<D>], float (&c)[kPairs<D>],
                                              float (&s)[kPairs<D>]) {
   constexpr int kHalf = D / 2;
   constexpr int kP = kPairs<D>;
+
+  // The coordinates are the caller's, and a table row is what they index. One
+  // outside the table would read off the end of it, so it is held at the edge
+  // instead: the rotation that comes out is not the caller's, but the read is
+  // its own. Supplying a table that covers every position is the contract.
+  const int64_t last = rows > 0 ? rows - 1 : 0;
+  pos_t = min(max(pos_t, int64_t(0)), last);
+  pos_h = min(max(pos_h, int64_t(0)), last);
+  pos_w = min(max(pos_w, int64_t(0)), last);
 
   if constexpr (!MROPE) {
     const CosSin<DType>* row = reinterpret_cast<const CosSin<DType>*>(cos_sin + pos_t * kHalf);
@@ -254,6 +263,8 @@ struct QSAPreIndexerParams {
   int64_t pos_stride_axis;
   int64_t pos_stride_token;
   const DType* cos_sin;
+  // Rows the rotary table holds, so a coordinate cannot index past it.
+  int64_t cos_sin_rows;
   const DType* q_norm_weight;
   const DType* k_norm_weight;
   float eps;
@@ -338,7 +349,8 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
         pos_h = a.positions[a.pos_stride_axis + safe * a.pos_stride_token];
         pos_w = a.positions[2 * a.pos_stride_axis + safe * a.pos_stride_token];
       }
-      load_cos_sin<D, MROPE_Q, DType>(a.cos_sin, lane, pos_t, pos_h, pos_w, q_axis, c[t], sn[t]);
+      load_cos_sin<D, MROPE_Q, DType>(a.cos_sin, a.cos_sin_rows, lane, pos_t, pos_h, pos_w, q_axis,
+                                      c[t], sn[t]);
     }
 
     constexpr int kHeadGroup = 4;
@@ -489,7 +501,8 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
     int k_axis[kPairs<D>];
     lane_axes<D, MROPE_K>(lane, a.mrope_h, a.mrope_w, k_axis);
     float kc[kPairs<D>], ks[kPairs<D>];
-    load_cos_sin<D, MROPE_K, DType>(a.cos_sin, lane, pos_t, pos_h, pos_w, k_axis, kc, ks);
+    load_cos_sin<D, MROPE_K, DType>(a.cos_sin, a.cos_sin_rows, lane, pos_t, pos_h, pos_w, k_axis,
+                                    kc, ks);
     norm_rope<D, DType>(acc, kw, kc, ks, a.eps);
     if (valid) {
       const int64_t comp_block =
