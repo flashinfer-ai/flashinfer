@@ -133,6 +133,7 @@ def _block_fp8_reference(
     gemm1_beta=None,
     gemm1_clamp_limit=None,
     activation=None,
+    narrow_routing_weights=True,
 ):
     """Dequantized block-FP8 MoE reference.
 
@@ -140,7 +141,9 @@ def _block_fp8_reference(
     per-expert SwiGLU OA controls; leaving all three unset reproduces plain SwiGLU.
     """
     activation = activation or SwiGLU()
-    weights = weights.to(torch.bfloat16).float()
+    if narrow_routing_weights:
+        weights = weights.to(torch.bfloat16)
+    weights = weights.float()
     has_oa = (
         gemm1_alpha is not None
         or gemm1_beta is not None
@@ -303,6 +306,50 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     direct = runner.forward(inputs, tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
+
+
+@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
+    variant, weights_dtype
+):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    packed, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        variant, expert_offset=8, local_experts=8
+    )
+    ids = packed.topk_ids
+    route_weights = packed.topk_weights.to(weights_dtype)
+    unpacked = MoEActivationPack(
+        hidden_states_q=packed.hidden_states_q,
+        hidden_states_scale=packed.hidden_states_scale,
+        topk_ids=ids,
+        topk_weights=route_weights,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    reference = _block_fp8_reference(
+        x,
+        w1,
+        w2,
+        ids,
+        route_weights,
+        variant,
+        expert_offset=8,
+        narrow_routing_weights=False,
+    )
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    inputs = runner.pack_inputs(unpacked, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _assert_fp8_close(runner.forward(inputs, tactic=-1), reference)
+    _assert_fp8_close(layer(unpacked, weights), reference)
 
 
 @pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))

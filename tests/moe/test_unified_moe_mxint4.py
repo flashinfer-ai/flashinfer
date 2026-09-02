@@ -73,7 +73,7 @@ def _mxint4_reference(
     expert_offset=0,
 ):
     out = torch.zeros_like(x.float())
-    final_scales = final_scales.to(torch.bfloat16).float()
+    final_scales = final_scales.float()
     for local_e in range(w1.shape[0]):
         token, slot = torch.where(selected_experts == local_e + expert_offset)
         if token.numel() == 0:
@@ -97,6 +97,7 @@ def _make_case(
     local_expert_offset=0,
     routing_input_mode=RoutingInputMode.PackedPrecomputed,
     routing_method=None,
+    routing_weights_dtype=torch.float32,
 ):
     routing_method = routing_method or RoutingMethodType.Default
     device = torch.device("cuda")
@@ -185,12 +186,17 @@ def _make_case(
     w2_dequant = _dequant_mxint4(
         q2, s2.reshape(local_num_experts, hidden_size, intermediate_size // 32)
     )
+    reference_scales = (
+        scales.to(routing_weights_dtype)
+        if routing_input_mode is RoutingInputMode.UnpackedPrecomputed
+        else scales.to(torch.bfloat16)
+    )
     reference = _mxint4_reference(
         x,
         w1_dequant,
         w2_dequant,
         selected,
-        scales,
+        reference_scales,
         intermediate_size,
         expert_offset=local_expert_offset,
     )
@@ -225,7 +231,8 @@ def _make_case(
             hidden_states_q=x,
             hidden_states_scale=None,
             topk_ids=selected,
-            topk_weights=scales,
+            topk_weights=scales.to(routing_weights_dtype),
+            routing_input_mode=routing_input_mode,
         )
     weights = MoEWeightPack()
     weights.prepare_for("trtllm_mxint4_routed", view)
@@ -416,6 +423,60 @@ def test_mxint4_layer_and_direct_runner_match_reference(routing_input_mode):
 
 
 @mxint4_required
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_mxint4_unpacked_routing_forwards_inputs_and_matches_reference(weights_dtype):
+    act, weights, config, reference, _ = _make_case(
+        num_experts=8,
+        local_num_experts=4,
+        local_expert_offset=4,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        routing_weights_dtype=weights_dtype,
+    )
+    ids = act.topk_ids
+    route_weights = act.topk_weights
+    runner = _build_mxint4_runner(config)
+    inputs = runner.pack_inputs(act, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _assert_mxint4_close(runner.forward(inputs), reference)
+    _assert_mxint4_close(MoELayer(config)(act, weights), reference)
+
+
+@mxint4_required
+def test_mxint4_native_unpacked_routing_validation():
+    """Exercise native checks that pack_inputs rejects before the launcher."""
+    act, weights, config, _, _ = _make_case(
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    runner = _build_mxint4_runner(config)
+    inputs = runner.pack_inputs(act, weights)
+
+    native_kwargs = dict(inputs.launch_state.static_kwargs)
+    native_kwargs["routing_input_mode"] = 99
+    with pytest.raises(RuntimeError, match="unsupported routing_input_mode"):
+        runner._inner.forward(inputs, **native_kwargs)
+
+    ids = inputs[MoeRunnerInputs.idx("topk_ids")]
+    noncontiguous_ids = torch.empty(
+        ids.shape[::-1], dtype=ids.dtype, device=ids.device
+    ).T
+    noncontiguous_ids.copy_(ids)
+    assert not noncontiguous_ids.is_contiguous()
+    inputs[MoeRunnerInputs.idx("topk_ids")] = noncontiguous_ids
+    with pytest.raises(
+        RuntimeError,
+        match="expert_indices must be contiguous for unpacked precomputed routing",
+    ):
+        runner.forward(inputs)
+
+
+@mxint4_required
 def test_mxint4_from_logits_deepseek_routing_bias():
     act, weights, config, reference, _ = _make_case(
         routing_input_mode=RoutingInputMode.FromLogits,
@@ -572,8 +633,12 @@ def test_mxint4_runner_validates_optional_gemm1_params(mutation, error_type, mat
 @mxint4_required
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.PackedPrecomputed, RoutingInputMode.FromLogits],
-    ids=["packed", "from-logits"],
+    [
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    ],
+    ids=["packed", "unpacked", "from-logits"],
 )
 def test_mxint4_cuda_graph_replay(routing_input_mode):
     act, weights, config, reference, _ = _make_case(
