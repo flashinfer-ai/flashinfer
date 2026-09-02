@@ -60,14 +60,13 @@ struct KVIOTraits {
 // Bulk gather token nope data (and inline scales for DSV3_2) from global to smem.
 // DSV3_2: flat addressing (idx * 656). DSV4: block-structured (footer layout).
 //
-// TILE_BI / TILE_IO_THREADS default to the namespace-scope 64/128, so every
-// existing `io_bulk_gather_tile<MT, PBS, HINT>` spelling keeps its old geometry.
-// A kernel running a different tile (DOTS3_SWA prefill: BI=32, 4 IO warps) must
-// pass them, or the mbarrier transaction count and the gather stride disagree
-// with the smem buffer it is filling.
+// `idx` is this IO thread's candidate index, staged in a register by the caller
+// one tile ahead of use so the LDG latency does not sit on the TMA issue chain.
+// TILE_BI <= TILE_IO_THREADS gives each IO thread at most one candidate, so the
+// thread's slot in the smem tile is io_tid.
 template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false, int TILE_BI = BI,
           int TILE_IO_THREADS = IO_THREADS>
-__device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t* indices,
+__device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
                                                     const uint8_t* __restrict__ kv_ptr,
                                                     uint64_t* mbar, int io_tid,
                                                     size_t stride_kv_block,
@@ -76,32 +75,33 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   using IO = KVIOTraits<MT>;
   constexpr int COPY_BYTES = KV::KV_SMEM_COPY_BYTES;
   constexpr int SMEM_STRIDE = KV::KV_SMEM_STRIDE;
+  static_assert(TILE_BI <= TILE_IO_THREADS,
+                "per-thread index staging assumes at most one candidate per IO thread");
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, TILE_BI * COPY_BYTES);
+  if (io_tid >= TILE_BI) return;
 
-#pragma unroll 1
-  for (int bi = io_tid; bi < TILE_BI; bi += TILE_IO_THREADS) {
-    int idx = indices[bi];
-    idx = (idx >= 0) ? idx : 0;
+  idx = (idx >= 0) ? idx : 0;
 
-    const uint8_t* src;
-    if constexpr (KV::SCALE_IN_KV_SMEM) {
-      src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
-    } else {
-      constexpr int pbs = PAGE_BLOCK_SIZE;
-      int block_idx = idx / pbs;
-      int local_idx = idx % pbs;
-      src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
-    }
-    if constexpr (USE_L2_HINT)
-      cp_async_bulk_g2s_l2hint(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
-    else
-      cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
+  const uint8_t* src;
+  if constexpr (KV::SCALE_IN_KV_SMEM) {
+    src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
+  } else {
+    constexpr int pbs = PAGE_BLOCK_SIZE;
+    int block_idx = idx / pbs;
+    int local_idx = idx % pbs;
+    src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
   }
+  if constexpr (USE_L2_HINT)
+    cp_async_bulk_g2s_l2hint(dst + io_tid * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
+  else
+    cp_async_bulk_g2s(dst + io_tid * SMEM_STRIDE, src, COPY_BYTES, mbar);
 }
 
+// `idx` is the same per-thread staged value passed to io_bulk_gather_tile, so
+// the footer-scale model reads each index from gmem once per tile, not twice.
 template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI = BI, int TILE_IO_THREADS = IO_THREADS>
-__device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32_t* indices,
+__device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
                                                  const uint8_t* __restrict__ kv_ptr, int io_tid,
                                                  size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
@@ -115,16 +115,16 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32
   static_assert(KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t),
                 "the footer gather moves one uint64 per token; a different footer width needs a "
                 "different load");
+  static_assert(TILE_BI <= TILE_IO_THREADS,
+                "per-thread index staging assumes at most one candidate per IO thread");
+  if (io_tid >= TILE_BI) return;
 
-  for (int bi = io_tid; bi < TILE_BI; bi += TILE_IO_THREADS) {
-    int idx = indices[bi];
-    idx = (idx >= 0) ? idx : 0;
+  idx = (idx >= 0) ? idx : 0;
 
-    int block_idx = idx / pbs;
-    int local_idx = idx % pbs;
-    const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block +
-                         (size_t)pbs * IO::IO_STRIDE + (size_t)local_idx * SCALE_BYTES;
-    *reinterpret_cast<uint64_t*>(scale_dst + bi * SCALE_BYTES) =
-        __ldg(reinterpret_cast<const uint64_t*>(src));
-  }
+  int block_idx = idx / pbs;
+  int local_idx = idx % pbs;
+  const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)pbs * IO::IO_STRIDE +
+                       (size_t)local_idx * SCALE_BYTES;
+  *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
+      __ldg(reinterpret_cast<const uint64_t*>(src));
 }

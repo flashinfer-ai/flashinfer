@@ -111,29 +111,38 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     const int32_t* idx_base = indices + (size_t)s_i * topk;
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-    // Prologue: gather tile 0. Scales first (plain stores, no mbar signal),
-    // then bulk gather (cp.async.bulk signals mbar_kv on completion). Math
-    // warps wake on mbar_kv, so reversing the order would race scales vs
-    // math reads. threadfence_block ensures scale stores are visible to all
-    // threads before the bulk completion event.
-    if (actual_ni > 0) {
+    // This thread's candidate index for tile t, staged a tile ahead of use so
+    // the index LDG latency is hidden behind the previous tile's gather.
+    auto load_idx = [&](int t) -> int {
+      return (t < actual_ni && io_tid < Cfg::BI) ? __ldg(idx_base + t * Cfg::BI + io_tid) : -1;
+    };
+    // Scales first (plain stores, no mbar signal), then bulk gather
+    // (cp.async.bulk signals mbar_kv on completion). Math warps wake on
+    // mbar_kv, so reversing the order would race scales vs math reads.
+    // threadfence_block ensures scale stores are visible to all threads before
+    // the bulk completion event.
+    auto issue_tile = [&](int t, int staged) {
+      const int buf = t & 1;
       io_gather_scales<MT, PAGE_BLOCK_SIZE, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid, stride_kv_block);
+          sm.kv_scale_bufs[buf], staged, KV_cache, io_tid, stride_kv_block);
       __threadfence_block();
       io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid, stride_kv_block, kv_l2_policy);
+          sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid, stride_kv_block,
+          kv_l2_policy);
+    };
+
+    int staged = load_idx(0);
+    if (actual_ni > 0) {
+      issue_tile(0, staged);
+      staged = load_idx(1);
     }
 
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       if (ti + 1 < actual_ni) {
-        io_gather_scales<MT, PAGE_BLOCK_SIZE, Cfg::BI, Cfg::IO_THREADS>(
-            sm.kv_scale_bufs[(ti + 1) & 1], idx_base + (ti + 1) * Cfg::BI, KV_cache, io_tid,
-            stride_kv_block);
-        __threadfence_block();
-        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-            sm.kv_bufs[(ti + 1) & 1], idx_base + (ti + 1) * Cfg::BI, KV_cache,
-            sm.mbar_kv + ((ti + 1) & 1), io_tid, stride_kv_block, kv_l2_policy);
+        const int next = load_idx(ti + 2);
+        issue_tile(ti + 1, staged);
+        staged = next;
       }
       bar_sync_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
     }
@@ -803,88 +812,65 @@ __device__ __forceinline__ void prefill_mg_impl(
     }
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-    if constexpr (ASSUME_FULL_TILES) {
-      io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(0), idx_base, KV_cache, io_tid,
-                                            stride_kv_block);
-      __threadfence_block();
-      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-          sm.kv_buf(0), idx_base, KV_cache, sm.mbar_kv(0), io_tid, stride_kv_block, kv_l2_policy);
-#pragma unroll 1
-      for (int ti = 0; ti < loop_bound; ti++) {
-        if (ti + 1 < loop_bound) {
-          if constexpr (DUAL_CACHE) {
-            const bool next_main = (ti + 1) < NI;
-            const int32_t* next_idx =
-                next_main ? (idx_base + (ti + 1) * BI) : (idx_base_extra + (ti + 1 - NI) * BI);
-            if (next_main) {
-              io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
-                                                    KV_cache, io_tid, stride_kv_block);
-              __threadfence_block();
-              io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
-                                                             KV_cache, sm.mbar_kv((ti + 1) & 1),
-                                                             io_tid, stride_kv_block, kv_l2_policy);
-            } else {
-              io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
-                                                          KV_cache_extra, io_tid,
-                                                          stride_kv_block_extra);
-              __threadfence_block();
-              io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                  sm.kv_buf((ti + 1) & 1), next_idx, KV_cache_extra, sm.mbar_kv((ti + 1) & 1),
-                  io_tid, stride_kv_block_extra, kv_l2_policy);
-            }
-          } else {
-            const int32_t* next_idx = idx_base + (ti + 1) * BI;
-            io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx, KV_cache,
-                                                  io_tid, stride_kv_block);
-            __threadfence_block();
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
-                                                           KV_cache, sm.mbar_kv((ti + 1) & 1),
-                                                           io_tid, stride_kv_block, kv_l2_policy);
-          }
-        }
-        bar_sync_alt<1, 5, BLOCK_THREADS>(ti & 1);
+    // This thread's candidate index for logical tile t, staged a tile ahead of
+    // use so the index LDG latency is hidden behind the previous tile's
+    // gather. main_ni equals NI under ASSUME_FULL_TILES, so the main/extra
+    // split needs no branch on the tile-length mode.
+    auto load_idx = [&](int t) -> int {
+      if (t >= loop_bound || io_tid >= BI) return -1;
+      if constexpr (DUAL_CACHE) {
+        const bool is_main = t < main_ni;
+        const int32_t* p =
+            is_main ? (idx_base + t * BI) : (idx_base_extra + (t - main_ni) * BI);
+        return __ldg(p + io_tid);
+      } else {
+        return __ldg(idx_base + t * BI + io_tid);
       }
-    } else {
-      auto issue_tile = [&](int logical_ti, int buf) {
-        if constexpr (DUAL_CACHE) {
-          const bool is_main_tile = logical_ti < main_ni;
-          const int32_t* tile_idx = is_main_tile ? (idx_base + logical_ti * BI)
-                                                 : (idx_base_extra + (logical_ti - main_ni) * BI);
-          if (is_main_tile) {
-            io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), tile_idx, KV_cache, io_tid,
-                                                  stride_kv_block);
-            __threadfence_block();
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), tile_idx, KV_cache,
-                                                           sm.mbar_kv(buf), io_tid, stride_kv_block,
-                                                           kv_l2_policy);
-          } else {
-            io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                sm.kv_scale_buf(buf), tile_idx, KV_cache_extra, io_tid, stride_kv_block_extra);
-            __threadfence_block();
-            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                sm.kv_buf(buf), tile_idx, KV_cache_extra, sm.mbar_kv(buf), io_tid,
-                stride_kv_block_extra, kv_l2_policy);
-          }
-        } else {
-          const int32_t* tile_idx = idx_base + logical_ti * BI;
-          io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), tile_idx, KV_cache, io_tid,
+    };
+    // Scales first (plain stores, no mbar signal), then bulk gather
+    // (cp.async.bulk signals mbar_kv on completion); threadfence_block makes
+    // the scale stores visible before the bulk completion event wakes math.
+    auto issue_tile = [&](int logical_ti, int buf, int staged) {
+      if constexpr (DUAL_CACHE) {
+        if (logical_ti < main_ni) {
+          io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), staged, KV_cache, io_tid,
                                                 stride_kv_block);
           __threadfence_block();
-          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), tile_idx, KV_cache,
+          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), staged, KV_cache,
                                                          sm.mbar_kv(buf), io_tid, stride_kv_block,
                                                          kv_l2_policy);
+        } else {
+          io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_buf(buf), staged, KV_cache_extra,
+                                                      io_tid, stride_kv_block_extra);
+          __threadfence_block();
+          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+              sm.kv_buf(buf), staged, KV_cache_extra, sm.mbar_kv(buf), io_tid,
+              stride_kv_block_extra, kv_l2_policy);
         }
-      };
+      } else {
+        io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), staged, KV_cache, io_tid,
+                                              stride_kv_block);
+        __threadfence_block();
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), staged, KV_cache,
+                                                       sm.mbar_kv(buf), io_tid, stride_kv_block,
+                                                       kv_l2_policy);
+      }
+    };
 
-      if (loop_bound > 0) issue_tile(0, 0);
+    int staged = load_idx(0);
+    if (loop_bound > 0) {
+      issue_tile(0, 0, staged);
+      staged = load_idx(1);
+    }
 
 #pragma unroll 1
-      for (int ti = 0; ti < loop_bound; ti++) {
-        if (ti + 1 < loop_bound) {
-          issue_tile(ti + 1, (ti + 1) & 1);
-        }
-        bar_sync_alt<1, 5, BLOCK_THREADS>(ti & 1);
+    for (int ti = 0; ti < loop_bound; ti++) {
+      if (ti + 1 < loop_bound) {
+        const int next = load_idx(ti + 2);
+        issue_tile(ti + 1, (ti + 1) & 1, staged);
+        staged = next;
       }
+      bar_sync_alt<1, 5, BLOCK_THREADS>(ti & 1);
     }
 
     // ── Math warps ──────────────────────────────────────────────────

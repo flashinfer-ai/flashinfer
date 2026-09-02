@@ -50,21 +50,21 @@
 
 // Unlike io_bulk_gather_tile this copies the whole gmem row, rope included, so
 // the inline-scale ABI needs no rope buffer and the smem stride matches gmem.
+// `idx` is this IO thread's candidate index, staged in a register by the caller
+// one tile ahead of use; with BI <= IO_THREADS the thread's slot is io_tid.
 template <ModelType MT>
-__device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, const int32_t* indices,
+__device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
                                                            uint64_t* mbar, int io_tid,
                                                            uint64_t cache_policy) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
+  static_assert(BI <= IO_THREADS, "per-thread index staging assumes one candidate per IO thread");
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * STRIDE);
+  if (io_tid >= BI) return;
 
-#pragma unroll 1
-  for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
-    const int idx = indices[bi];
-    const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * STRIDE;
-    cp_async_bulk_g2s_l2hint(dst + bi * STRIDE, src, STRIDE, mbar, cache_policy);
-  }
+  const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * STRIDE;
+  cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
 template <ModelType MT, int NUM_HEADS>
@@ -115,13 +115,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const int io_tid = threadIdx.x - MATH_THREADS;
     const uint64_t kv_l2_policy = create_l2_evict_last_policy();
 
+    // Stage this thread's candidate index a tile ahead: the LDG for tile ti+1
+    // is issued before the mbar_wr wait so its latency hides behind the wait.
+    int staged = (actual_ni > 0 && io_tid < BI) ? __ldg(idx_base + io_tid) : -1;
     int wr_phase = 1;
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
+      const int next =
+          (ti + 1 < actual_ni && io_tid < BI) ? __ldg(idx_base + (ti + 1) * BI + io_tid) : -1;
       mbarrier_wait_parity(sm.mbar_wr + buf, wr_phase);
-      io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], idx_base + ti * BI, KV_cache,
-                                     sm.mbar_kv + buf, io_tid, kv_l2_policy);
+      io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
+                                     kv_l2_policy);
+      staged = next;
       if (buf == 1) wr_phase ^= 1;
     }
 
