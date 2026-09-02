@@ -667,12 +667,11 @@ class TllmGenFmhaKernel {
           int const targetMaxNumCtasPerSeqKv =
               std::min(maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
           if (targetMaxNumCtasPerSeqKv > 1 && targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
-            int const leftReachKv =
-                params.mLeftSlidingWindow >= 0 ? params.mLeftSlidingWindow + 1 : maxAttentionWindow;
             int const targetTileSizePerCtaKv =
                 isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType) &&
                         params.mLeftSlidingWindow >= 0
-                    ? flashinfer::ceil_div(leftReachKv, targetMaxNumCtasPerSeqKv - 1)
+                    ? flashinfer::ceil_div(params.mLeftSlidingWindow + 1,
+                                           targetMaxNumCtasPerSeqKv - 1)
                     : flashinfer::ceil_div(maxAttentionWindow, targetMaxNumCtasPerSeqKv);
             if (targetTileSizePerCtaKv <= 1024) {
               tunedMaxNumCtasPerSeqKv = targetMaxNumCtasPerSeqKv;
@@ -1194,8 +1193,9 @@ class TllmGenFmhaKernel {
       selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
       if (!isSparseMla(params.mSparseMlaType)) {
         FLASHINFER_CHECK(
-            params.mLeftSlidingWindow == -1 && params.mRightSlidingWindow == -1 &&
-                params.mChunkedAttentionSize == 0,
+            (params.mLeftSlidingWindow == -1 ||
+             params.mMaxSeqLenKv <= params.mLeftSlidingWindow + 1) &&
+                params.mRightSlidingWindow <= 0 && params.mChunkedAttentionSize == 0,
             "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
       }
     } else if (isGenerationKernel(params.mKernelType)) {

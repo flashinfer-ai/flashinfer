@@ -255,12 +255,6 @@ def get_trtllm_gen_prefill_module():
         lse: Optional[torch.Tensor] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not is_causal and window_left >= 0:
-            raise NotImplementedError(
-                "trtllm-gen wrapper does not support non-causal sliding-window "
-                "attention; use trtllm_batch_context_with_kv_cache with explicit "
-                "window_left and window_right bounds"
-            )
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
@@ -2021,14 +2015,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
-        # Reject this before module construction so an unsupported request cannot reach the
-        # lower-level trtllm-gen run closure even if plan-time setup changes later.
-        if self._backend == "trtllm-gen" and not causal and window_left >= 0:
-            raise NotImplementedError(
-                "Sliding-window non-causal attention is not supported for trtllm-gen "
-                "paged KV cache. Use window_left=-1 for dense bidirectional attention."
-            )
-
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
@@ -2307,6 +2293,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
+        # Reject this during planning so an unsupported request cannot reach the
+        # lower-level trtllm-gen launcher if wrapper setup changes later.
         if self._backend == "trtllm-gen" and not causal and window_left >= 0:
             raise NotImplementedError(
                 "Sliding-window non-causal attention is not supported for trtllm-gen "
@@ -4863,7 +4851,9 @@ def trtllm_ragged_attention_deepseek(
     batch_size : int
         batch size
     window_left : int
-        window left
+        The left (inclusive) attention window. ``-1`` selects the full sequence.
+        The ``trtllm-gen`` backend does not support a finite window for
+        non-causal attention; older versions silently ignored that combination.
     cum_seq_lens_q : torch.Tensor
         cumulative sequence lengths for query
     cum_seq_lens_kv : torch.Tensor
@@ -4932,6 +4922,11 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
+    if backend == "trtllm-gen" and not is_causal and window_left >= 0:
+        raise NotImplementedError(
+            "trtllm-gen ragged attention does not support non-causal sliding-window "
+            "attention; previously the window was silently ignored"
+        )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
