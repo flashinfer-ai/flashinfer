@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 x FP4 (W4A16) dense GEMM public API.
 
-Backend implementation details live in respective submodules
-gemm_bf16_fp4_cudnn and gemm_bf16_fp4_cute_dsl.
+Backend implementation details live in respective submodules for cuDNN,
+CuTe DSL, and the source-built Blackwell kernels.
 """
 
 from typing import Literal, Optional, Tuple
@@ -30,6 +30,12 @@ if CUDNN_AVAILABLE:
 
 # Earliest cuDNN backend version supporting bf16 x fp4 GEMM
 _CUDNN_BF16_FP4_MIN_BACKEND_VERSION = 92301
+_Bf16Fp4Backend = Literal[
+    "cudnn",
+    "cute-dsl",
+    "blackwell-native",
+    "blackwell-tiled",
+]
 
 
 def _check_mm_bf16_fp4_problem_size(
@@ -38,7 +44,7 @@ def _check_mm_bf16_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -68,7 +74,7 @@ def _cudnn_bf16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -102,7 +108,7 @@ def _cute_dsl_bf16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -121,6 +127,123 @@ def _cute_dsl_bf16_fp4_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
+def _blackwell_native_bf16_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: _Bf16Fp4Backend,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    enable_pdl: bool = True,
+):
+    del alpha, backend, enable_pdl
+    if int(a.shape[1]) % block_size != 0:
+        raise ValueError(
+            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
+        )
+    if b.dim() != 2 or b.dtype != torch.uint8:
+        raise ValueError(
+            "blackwell-native expects the uint8 [N, K/2] weight returned by "
+            "prepare_bf16_fp4_weights(..., backend='blackwell-native')"
+        )
+    n = int(b.shape[0])
+    k = int(b.shape[1]) * 2
+    if int(a.shape[1]) != k:
+        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
+    if b_descale.dtype != torch.float8_e4m3fn or tuple(b_descale.shape) != (
+        n,
+        k // block_size,
+    ):
+        raise ValueError(
+            "blackwell-native expects linear float8_e4m3fn scales with shape "
+            f"{(n, k // block_size)}; got dtype={b_descale.dtype}, "
+            f"shape={tuple(b_descale.shape)}"
+        )
+    requested_dtype = out_dtype or a.dtype
+    if requested_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "blackwell-native supports bfloat16 or float16 output; "
+            f"got {requested_dtype}"
+        )
+    if not b.is_contiguous() or not b_descale.is_contiguous():
+        raise ValueError("blackwell-native requires contiguous b and b_descale")
+    if b.device != a.device or b_descale.device != a.device:
+        raise ValueError("a, b, and b_descale must be on the same device")
+    if out is not None and (
+        tuple(out.shape) != (int(a.shape[0]), n)
+        or out.dtype != requested_dtype
+        or out.device != a.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous, on the same device, and have shape/dtype "
+            f"{(int(a.shape[0]), n)}/{requested_dtype}"
+        )
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _blackwell_tiled_bf16_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: _Bf16Fp4Backend,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    enable_pdl: bool = True,
+):
+    del alpha, backend, enable_pdl
+    if int(a.shape[1]) % block_size != 0:
+        raise ValueError(
+            f"K={int(a.shape[1])} must be a multiple of block_size={block_size}"
+        )
+    if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
+        raise ValueError(
+            "blackwell-tiled expects the int32 [K/16, N*2] weight returned by "
+            "prepare_bf16_fp4_weights(..., backend='blackwell-tiled')"
+        )
+    k_tiles = int(b.shape[0])
+    n = int(b.shape[1]) // 2
+    k = k_tiles * block_size
+    if int(a.shape[1]) != k:
+        raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
+    if n % 64 != 0:
+        raise ValueError(f"blackwell-tiled requires N to be a multiple of 64; got N={n}")
+    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
+        raise ValueError(
+            "blackwell-tiled expects S0E5M3 uint8 scales with shape "
+            f"{(k_tiles, n)}; got dtype={b_descale.dtype}, "
+            f"shape={tuple(b_descale.shape)}"
+        )
+    requested_dtype = out_dtype or a.dtype
+    if requested_dtype != torch.bfloat16:
+        raise ValueError(
+            f"blackwell-tiled requires bfloat16 output; got {requested_dtype}"
+        )
+    if not b.is_contiguous() or not b_descale.is_contiguous():
+        raise ValueError("blackwell-tiled requires contiguous b and b_descale")
+    if b.device != a.device or b_descale.device != a.device:
+        raise ValueError("a, b, and b_descale must be on the same device")
+    if out is not None and (
+        tuple(out.shape) != (int(a.shape[0]), n)
+        or out.dtype != requested_dtype
+        or out.device != a.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous, on the same device, and have shape/dtype "
+            f"{(int(a.shape[0]), n)}/{requested_dtype}"
+        )
+    return True
+
+
 # =============================================================================
 # Public dispatchers
 # =============================================================================
@@ -132,7 +255,7 @@ def prepare_bf16_fp4_weights(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare FP4 weights for the bf16 x fp4 GEMM, for a specific backend.
@@ -158,8 +281,9 @@ def prepare_bf16_fp4_weights(
         alpha: Optional ``(1,) float32`` global scalar.  Pass ``None``
             (default) for implicit ``alpha=1.0``.  Returned unchanged;
             forward the returned tuple to :func:`flashinfer.mm_bf16_fp4`.
-        backend: Identifier of a supported backend (``"cudnn"`` or
-            ``"cute-dsl"``).
+        backend: Identifier of a supported backend: ``"cudnn"``,
+            ``"cute-dsl"``, ``"blackwell-native"``, or
+            ``"blackwell-tiled"``.
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
@@ -201,13 +325,28 @@ def prepare_bf16_fp4_weights(
         from .gemm_bf16_fp4_cute_dsl import _prepare_cute_dsl
 
         return _prepare_cute_dsl(b, b_descale, alpha, block_size)
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
+    if backend in ("blackwell-native", "blackwell-tiled"):
+        from .gemm_bf16_fp4_blackwell import _prepare_blackwell_bf16_fp4
+
+        return _prepare_blackwell_bf16_fp4(
+            b,
+            b_descale,
+            alpha,
+            block_size,
+            backend,
+        )
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
+        "'blackwell-native', 'blackwell-tiled'."
+    )
 
 
 @backend_requirement(
     {
         "cudnn": _cudnn_bf16_fp4_requirement,
         "cute-dsl": _cute_dsl_bf16_fp4_requirement,
+        "blackwell-native": _blackwell_native_bf16_fp4_requirement,
+        "blackwell-tiled": _blackwell_tiled_bf16_fp4_requirement,
     },
     common_check=_check_mm_bf16_fp4_problem_size,
 )
@@ -218,7 +357,7 @@ def mm_bf16_fp4(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["cudnn", "cute-dsl"],
+    backend: _Bf16Fp4Backend,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -271,15 +410,32 @@ def mm_bf16_fp4(
         return _compute_cute_dsl(
             a, b, b_descale, alpha, out_dtype, out, block_size, enable_pdl=enable_pdl
         )
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
+    if backend in ("blackwell-native", "blackwell-tiled"):
+        from .gemm_bf16_fp4_blackwell import _compute_blackwell_bf16_fp4
+
+        return _compute_blackwell_bf16_fp4(
+            a,
+            b,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            enable_pdl,
+            backend,
+        )
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl', "
+        "'blackwell-native', 'blackwell-tiled'."
+    )
 
 
 # =============================================================================
 # Shared SF utility
 # =============================================================================
 #
-# Used by both backends' prepare paths (cuDNN and cute-dsl) to turn the
-# canonical 128x4-swizzled SF into a linear ``(N, K_sf)`` layout.
+# Used by backend preparation paths to turn the canonical 128x4-swizzled SF
+# into a linear ``(N, K_sf)`` layout.
 
 
 def _unswizzle_sf_128x4(sf_swizzled: torch.Tensor, n: int, k_sf: int) -> torch.Tensor:
