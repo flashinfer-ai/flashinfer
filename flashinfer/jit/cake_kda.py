@@ -19,6 +19,8 @@ from .core import JitSpec, logger
 CakeKDATarget = Literal["sm100a", "sm103a"]
 CakeKDAFamily = Literal[
     "bounded_bf16_evolution",
+    "bounded_bf16_affine_prefix",
+    "bounded_bf16_affine_h12_prefix",
     "bounded_fp32_serving",
     "bounded_fp32_affine_prefix",
     "bounded_fp32_affine_h12_prefix",

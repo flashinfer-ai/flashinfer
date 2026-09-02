@@ -79,12 +79,17 @@ _FLASH_KDA_INDEPENDENT_DVSPLIT_MIN_SEQUENCE_LENGTH = 512
 _FLASH_KDA_H12_DIRECT_N32_MIN_SEQUENCE_LENGTH = 64
 _FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH = 256
 _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH = 128
+_FLASH_KDA_N32_REGISTER_INVERSE_MIN_SEQUENCE_LENGTH = 256
+_FLASH_KDA_N32_PREDICTION_FIRST_MIN_HEADS = 24
+_FLASH_KDA_N32_PREDICTION_FIRST_MIXED_MIN_SEQUENCE_LENGTH = 512
 _FLASH_KDA_ROUTE_DIRECT_M128 = "direct_m128"
 _FLASH_KDA_ROUTE_DIRECT_M128_N16 = "direct_m128_n16"
 _FLASH_KDA_ROUTE_PERSISTENT_M128 = "persistent_m128"
 _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128 = "piece_persistent_m128"
 _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
+_FLASH_KDA_ROUTE_SOURCE_VTILE_M128 = "source599_vtile_m128"
+_FLASH_KDA_ROUTE_SCALAR_CHUNK_LPT_M128 = "scalar_chunk_lpt_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 _CAKE_KDA_ROUTE_AFFINE_M128 = "cake_affine_split_m128"
 _CAKE_KDA_SHARED_SUPPORTED_HEADS = frozenset((1, 4, 6, 8, 12, 16, 32, 64, 96))
@@ -146,6 +151,8 @@ class _CakeKDAAffineRoute:
 
     target: Literal["sm100a", "sm103a"]
     family: Literal[
+        "bounded_bf16_affine_prefix",
+        "bounded_bf16_affine_h12_prefix",
         "bounded_fp32_affine_prefix",
         "bounded_fp32_affine_h12_prefix",
         "unbounded_affine_prefix",
@@ -197,6 +204,8 @@ class _CakeKDAAffineModule(Protocol):
 class _CakeKDAAffineResourcesKey:
     target: Literal["sm100a", "sm103a"]
     family: Literal[
+        "bounded_bf16_affine_prefix",
+        "bounded_bf16_affine_h12_prefix",
         "bounded_fp32_affine_prefix",
         "bounded_fp32_affine_h12_prefix",
         "unbounded_affine_prefix",
@@ -783,6 +792,72 @@ def _build_cake_kda_shared_scalar_schedule(
     return tuple(schedule), counts, stride
 
 
+def _cake_kda_bounded_direct_policy(
+    *,
+    source_route: str,
+    target: "CakeKDATarget",
+    num_heads: int,
+    num_sequences: int,
+    uniform_sequences: bool,
+    max_sequence_length: int,
+    full_chunks: bool,
+    has_state_indices: bool,
+) -> Optional[str]:
+    """Resolve the complete direct-kernel build identity selected by Cake."""
+
+    if source_route == _FLASH_KDA_ROUTE_SMALL_BH_M128:
+        return (
+            "small_bh_owner_helper_m128_indexed_bf16"
+            if has_state_indices
+            else "small_bh_owner_helper_m128"
+        )
+    if source_route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
+        if has_state_indices:
+            return (
+                "direct_m128_n16_h12_scalar"
+                if num_heads == 12
+                else "direct_m128_n16_indexed_bf16"
+            )
+        return "direct_m128_n16"
+    if source_route != _FLASH_KDA_ROUTE_DIRECT_M128:
+        return None
+    abi = "indexed_bf16" if has_state_indices else "compact_bf16"
+    if num_heads == 12:
+        return (
+            f"direct_m128_h12_scalar_early_pack_{abi}"
+            if max_sequence_length
+            <= _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH
+            else f"direct_m128_h12_pair_packed_beta_{abi}"
+        )
+    if max_sequence_length < _FLASH_KDA_N32_REGISTER_INVERSE_MIN_SEQUENCE_LENGTH:
+        return (
+            "direct_m128_legacy_inverse_indexed_bf16"
+            if has_state_indices
+            else "direct_m128_legacy_inverse"
+        )
+    prediction_first = (
+        target == "sm103a"
+        and num_heads >= _FLASH_KDA_N32_PREDICTION_FIRST_MIN_HEADS
+        and (
+            uniform_sequences
+            or max_sequence_length
+            >= _FLASH_KDA_N32_PREDICTION_FIRST_MIXED_MIN_SEQUENCE_LENGTH
+        )
+    )
+    tensor_state_decay = (
+        prediction_first
+        and uniform_sequences
+        and num_heads >= 64
+        and num_sequences * num_heads >= 96
+        and full_chunks
+    )
+    if tensor_state_decay:
+        return f"direct_m128_prediction_first_tensor_decay_{abi}"
+    if prediction_first:
+        return f"direct_m128_prediction_first_{abi}"
+    return f"direct_m128_register_inverse_{abi}"
+
+
 def _select_cake_kda_bounded_evolution_route(
     *,
     requested: bool,
@@ -878,6 +953,24 @@ def _select_cake_kda_bounded_evolution_route(
             sequence_order=sequence_order,
             grid_x=2 * num_sequences * num_heads,
         )
+    direct_policy = _cake_kda_bounded_direct_policy(
+        source_route=source_route,
+        target=target,
+        num_heads=num_heads,
+        num_sequences=num_sequences,
+        uniform_sequences=uniform_sequences,
+        max_sequence_length=max(sequence_lengths),
+        full_chunks=full_chunks,
+        has_state_indices=has_state_indices,
+    )
+    if direct_policy is not None:
+        return _CakeKDABoundedEvolutionRoute(
+            target=target,
+            policy=direct_policy,
+            sequence_order=sequence_order,
+            grid_x=num_sequences * num_heads,
+            sequence_lengths=sequence_lengths,
+        )
     if source_route == _FLASH_KDA_ROUTE_BT16_M64:
         prepare_variant, chain_variant, _dense_wavefront = (
             _select_bt16_physical_variants(
@@ -901,30 +994,6 @@ def _select_cake_kda_bounded_evolution_route(
             grid_x=_FLASH_KDA_BT16_VALUE_SPLITS * num_sequences * num_heads,
             sequence_lengths=sequence_lengths,
         )
-    if source_route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
-        return _CakeKDABoundedEvolutionRoute(
-            target=target,
-            policy=(
-                "direct_m128_n16_h12_scalar"
-                if has_state_indices and num_heads == 12
-                else "direct_m128_n16"
-            ),
-            sequence_order=sequence_order,
-            grid_x=num_sequences * num_heads,
-            sequence_lengths=sequence_lengths,
-        )
-    if (
-        source_route == _FLASH_KDA_ROUTE_DIRECT_M128
-        and max(sequence_lengths) < 256
-    ):
-        return _CakeKDABoundedEvolutionRoute(
-            target=target,
-            policy="direct_m128_legacy_inverse",
-            sequence_order=sequence_order,
-            grid_x=num_sequences * num_heads,
-            sequence_lengths=sequence_lengths,
-        )
-
     if fixed_layout or uniform_sequences:
         persistent_tasks = 1
         persistent_stride = num_sequences * num_heads
@@ -1046,8 +1115,9 @@ def _select_cake_kda_fp32_serving_route(
         target == "sm103a"
         and not fixed_layout
         and uniform_sequences
-        and num_heads == 96
-        and total_tasks == 6 * _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
+        and num_heads in (64, 96)
+        and total_tasks % _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS == 0
+        and total_tasks // _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS in (4, 6)
         and max_sequence_length >= 512
     ):
         return _CakeKDAFP32ServingRoute(
@@ -1061,7 +1131,7 @@ def _select_cake_kda_fp32_serving_route(
 
     if (
         not uniform_sequences
-        and num_heads == 96
+        and num_heads in (64, 96)
         and 2 * sm_count <= total_tasks < 1024
         and (max_sequence_length + _FLASH_KDA_M128_CHUNK - 1) // _FLASH_KDA_M128_CHUNK
         < 256
@@ -1073,7 +1143,7 @@ def _select_cake_kda_fp32_serving_route(
         )
         return _CakeKDAFP32ServingRoute(
             target=target,
-            policy="scalar_chunk_lpt_m128_h96",
+            policy=f"scalar_chunk_lpt_m128_h{num_heads}",
             grid_x=sm_count,
             tile_schedule=schedule,
             tile_schedule_counts=counts,
@@ -1105,6 +1175,7 @@ def _select_cake_kda_affine_route(
     """Select only the exact contract covered by the sealed affine export."""
 
     bounded_fp32 = lower_bound == -5.0 and initial_state_dtype == torch.float32
+    bounded_bf16 = lower_bound == -5.0 and initial_state_dtype == torch.bfloat16
     unbounded_bf16 = lower_bound is None and initial_state_dtype == torch.bfloat16
     if (
         not export_available
@@ -1121,7 +1192,7 @@ def _select_cake_kda_affine_route(
         or not beta_contiguous
         or beta_dtype != torch.bfloat16
         or not indexed_state
-        or not (bounded_fp32 or unbounded_bf16)
+        or not (bounded_fp32 or bounded_bf16 or unbounded_bf16)
         or has_checkpoints
         or sm_count <= 0
     ):
@@ -1160,12 +1231,16 @@ def _select_cake_kda_affine_route(
             if bounded_fp32 and num_heads == 12
             else "bounded_fp32_affine_prefix"
             if bounded_fp32
+            else "bounded_bf16_affine_h12_prefix"
+            if bounded_bf16 and num_heads == 12
+            else "bounded_bf16_affine_prefix"
+            if bounded_bf16
             else "unbounded_affine_prefix"
         ),
         token_offsets=tuple(
             chunk_offset * _FLASH_KDA_M128_CHUNK for chunk_offset in chunk_offsets
         ),
-        gate_lower_bound=-5.0 if bounded_fp32 else 0.0,
+        gate_lower_bound=-5.0 if bounded_fp32 or bounded_bf16 else 0.0,
         external_state_dtype=(torch.float32 if bounded_fp32 else torch.bfloat16),
     )
 
@@ -1208,6 +1283,8 @@ def _cake_kda_workspace_buffer(
 def _get_cake_kda_affine_sequence(
     target: Literal["sm100a", "sm103a"],
     family: Literal[
+        "bounded_bf16_affine_prefix",
+        "bounded_bf16_affine_h12_prefix",
         "bounded_fp32_affine_prefix",
         "bounded_fp32_affine_h12_prefix",
         "unbounded_affine_prefix",
@@ -1582,9 +1659,10 @@ def _run_cake_kda_affine_route(
     k_tail = k_flat[resources.tail_start :].view_as(q_tail)
     g_tail = g_flat[resources.tail_start :].view_as(q_tail)
     beta_tail = beta_flat[resources.tail_start :].view(1, tail_tokens, num_heads)
-    scalar_beta = (
-        affine_route.family == "bounded_fp32_affine_h12_prefix"
-    )
+    scalar_beta = affine_route.family in {
+        "bounded_bf16_affine_h12_prefix",
+        "bounded_fp32_affine_h12_prefix",
+    }
     main_beta_source = _cake_kda_beta_source(
         beta,
         workspace,
@@ -1934,6 +2012,26 @@ def _select_flash_kda_bf16_route(
         max_sequence_length=max_sequence_length,
     ):
         return _FLASH_KDA_ROUTE_M64
+    if (
+        compute_capability == (10, 3)
+        and fixed_layout
+        and uniform_sequences
+        and num_heads == 96
+        and num_sequences * num_heads <= sm_count
+        and max_sequence_length >= 4096
+    ):
+        return _FLASH_KDA_ROUTE_SOURCE_VTILE_M128
+    total_tasks = num_sequences * num_heads
+    if (
+        compute_capability == (10, 3)
+        and not fixed_layout
+        and uniform_sequences
+        and num_heads in (64, 96)
+        and total_tasks % _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS == 0
+        and total_tasks // _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS in (4, 6)
+        and max_sequence_length >= 512
+    ):
+        return _FLASH_KDA_ROUTE_SOURCE_VTILE_M128
     if _should_use_bt16_dense_wavefront(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -2009,6 +2107,16 @@ def _select_flash_kda_bf16_route(
         max_sequence_length=max_sequence_length,
     ):
         return _FLASH_KDA_ROUTE_M64
+    if (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and not uniform_sequences
+        and num_heads in (64, 96)
+        and 2 * sm_count <= total_tasks < 1024
+        and (max_sequence_length + _FLASH_KDA_M128_CHUNK - 1)
+        // _FLASH_KDA_M128_CHUNK
+        < 256
+    ):
+        return _FLASH_KDA_ROUTE_SCALAR_CHUNK_LPT_M128
     if _should_use_uniform_piece_persistent(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -3696,6 +3804,7 @@ def _cake_kda_serving_policy(
     variant: str,
     target: "CakeKDATarget",
     max_sequence_length: int,
+    num_heads: int,
 ) -> Optional[str]:
     """Map a material host route to one exported FP32-state policy."""
 
@@ -3704,7 +3813,6 @@ def _cake_kda_serving_policy(
         "m128_tensor_state_decay": "direct_m128_prediction_first_tensor_decay",
         "m128_h12_short": "direct_m128_h12_scalar_early_pack",
         "m128_h12_long": "direct_m128_h12_pair_packed_beta",
-        "m128_n16": "direct_m128_n16_h12_scalar",
         "persistent_m128": "persistent_m128_whole_chain",
         "piece_persistent_m128": "persistent_m128_recurrence_pieces",
         "small_bh_m128": "small_bh_owner_helper_m128",
@@ -3714,6 +3822,12 @@ def _cake_kda_serving_policy(
             "direct_m128_register_inverse"
             if max_sequence_length >= 256
             else "direct_m128_legacy_inverse"
+        )
+    if variant == "m128_n16":
+        return (
+            "direct_m128_n16_h12_scalar"
+            if num_heads == 12
+            else "direct_m128_n16"
         )
     policy = fixed.get(variant)
     if policy == "persistent_m128_whole_chain" and target == "sm103a":
@@ -3791,7 +3905,7 @@ def _run_cake_kda_fp32_source_route(
         1,
         1,
     )
-    if route.policy == "scalar_chunk_lpt_m128_h96":
+    if route.policy.startswith("scalar_chunk_lpt_m128_h"):
         tile_schedule = _cached_int32_metadata(
             device=q.device,
             kind="cake_fp32_scalar_tile_schedule",
@@ -3871,6 +3985,7 @@ def _run_cake_kda_fp32_serving_export(
         variant=variant,
         target=target,
         max_sequence_length=max_sequence_length,
+        num_heads=num_heads,
     )
     if policy is None:
         return False
@@ -4072,10 +4187,92 @@ def _run_cake_kda_bounded_evolution(
             lower_bound=lower_bound,
         )
         return
+    if route.policy.startswith("small_bh_owner_helper_m128"):
+        module = _get_cake_kda_export_module(
+            route.target,
+            "bounded_bf16_evolution",
+            route.policy,
+        )
+        total_tasks = len(route.sequence_lengths) * q.shape[2]
+        packet_workspace, packet_ready, packet_consumed, helper_done = (
+            _small_bh_workspace(
+                workspace=workspace,
+                device=q.device,
+                total_tasks=total_tasks,
+            )
+        )
+        sequence_order = _cached_int32_metadata(
+            device=q.device,
+            kind=f"cake_shared_{route.policy}_sequence_order",
+            values=route.sequence_order,
+        )
+        beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
+        empty_bf16 = _dummy_bf16(q.device)
+        empty_f32 = _dummy_f32(q.device)
+        empty_i32 = _dummy_i32(q.device)
+        empty_i64 = _dummy_i64(q.device)
+        module.run(
+            q,
+            q,
+            k,
+            k,
+            v,
+            v,
+            g,
+            g,
+            beta_source,
+            beta_source,
+            A_log,
+            dt_bias,
+            cu_seqlens,
+            sequence_order,
+            initial_state,
+            out,
+            out,
+            initial_state,
+            q.shape[2],
+            1,
+            1,
+            scale,
+            lower_bound,
+            (
+                state_indices.data_ptr()
+                if state_indices is not None
+                else empty_i32.data_ptr()
+            ),
+            empty_bf16.data_ptr(),
+            empty_i64.data_ptr(),
+            beta.stride(-2),
+            initial_state.stride(0),
+            int(state_indices is not None),
+            0,
+            packet_workspace,
+            packet_ready,
+            packet_consumed,
+            helper_done,
+            empty_f32,
+            empty_f32,
+            8 * total_tasks,
+            1,
+            1,
+        )
+        return
     if route.policy in {
         "direct_m128_legacy_inverse",
+        "direct_m128_legacy_inverse_indexed_bf16",
         "direct_m128_n16",
+        "direct_m128_n16_indexed_bf16",
         "direct_m128_n16_h12_scalar",
+        "direct_m128_register_inverse_compact_bf16",
+        "direct_m128_register_inverse_indexed_bf16",
+        "direct_m128_prediction_first_compact_bf16",
+        "direct_m128_prediction_first_indexed_bf16",
+        "direct_m128_prediction_first_tensor_decay_compact_bf16",
+        "direct_m128_prediction_first_tensor_decay_indexed_bf16",
+        "direct_m128_h12_scalar_early_pack_compact_bf16",
+        "direct_m128_h12_scalar_early_pack_indexed_bf16",
+        "direct_m128_h12_pair_packed_beta_compact_bf16",
+        "direct_m128_h12_pair_packed_beta_indexed_bf16",
     }:
         _run_cake_kda_bf16_direct_export(
             route=route,
@@ -4423,15 +4620,29 @@ def _run_cake_kda_bf16_direct_export(
     empty_i64 = _dummy_i64(q.device)
     empty_u32 = _dummy_u32(q.device)
     chunk_tokens = 16 if route.policy.startswith("direct_m128_n16") else 32
-    beta_tma = _cake_kda_beta_source(
-        beta,
-        workspace,
-        chunk_tokens=chunk_tokens,
-        refresh=(
-            route.policy != "direct_m128_n16_h12_scalar"
-            and any(length >= chunk_tokens for length in route.sequence_lengths)
-        ),
-    )
+    if "pair_packed_beta" in route.policy:
+        beta_tma = _pair_packed_beta_tma_source(beta)
+        if beta_tma is None:
+            raise ValueError(
+                "the selected Cake H12 pair-packed export requires an aligned "
+                "dense beta tensor with an even token count"
+            )
+    else:
+        scalar_beta = (
+            route.policy == "direct_m128_n16_h12_scalar"
+            or "h12_scalar_early_pack" in route.policy
+        )
+        beta_tma = _cake_kda_beta_source(
+            beta,
+            workspace,
+            chunk_tokens=chunk_tokens,
+            refresh=(
+                not scalar_beta
+                and any(
+                    length >= chunk_tokens for length in route.sequence_lengths
+                )
+            ),
+        )
     _run_cake_kda_direct_export(
         module=module,
         q=q,
@@ -4615,38 +4826,66 @@ def _run_flash_kda_prefill(
         cake_export_available = _cake_kda_export_is_available()
         if compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
             shared_target = _select_cake_kda_prefill_target(q.device)
-    evolution_route = _select_cake_kda_bounded_evolution_route(
-        requested=use_cake_export,
-        export_available=cake_export_available,
-        target=shared_target,
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        sequence_lengths=sequence_lengths,
-        num_heads=num_heads,
-        head_dim=q.shape[-1],
-        qkv_shapes_equal=q.shape == k.shape == v.shape == g.shape,
-        qkv_dtype=q.dtype,
-        beta_contiguous=beta.is_contiguous(),
-        beta_dtype=beta.dtype,
-        initial_state_shape=(
-            tuple(initial_state.shape) if initial_state is not None else None
-        ),
-        initial_state_dtype=(
-            initial_state.dtype if initial_state is not None else None
-        ),
-        initial_state_contiguous=(
-            initial_state is not None and initial_state.is_contiguous()
-        ),
-        has_explicit_seq_order=seq_order is not None,
-        has_state_indices=state_indices is not None,
-        has_checkpoints=(
-            checkpoint_every_n_tokens != 0
-            or state_checkpoints is not None
-            or checkpoint_cu_starts is not None
-        ),
-        scale=scale_value,
-        lower_bound=lower_bound,
-    )
+    affine_route = None
+    if seq_order is None:
+        affine_route = _select_cake_kda_affine_route(
+            export_available=cake_export_available,
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            batch_size=batch_size,
+            total_tokens=batch_size * seq_len,
+            num_heads=num_heads,
+            head_dim=q.shape[-1],
+            qkv_shapes_equal=k.shape == q.shape == v.shape,
+            qkv_dtype=q.dtype,
+            beta_contiguous=beta.is_contiguous(),
+            beta_dtype=beta.dtype,
+            indexed_state=state_indices is not None,
+            initial_state_dtype=(
+                initial_state.dtype if initial_state is not None else None
+            ),
+            has_checkpoints=(
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            ),
+            lower_bound=lower_bound,
+        )
+    evolution_route = None
+    if affine_route is None:
+        evolution_route = _select_cake_kda_bounded_evolution_route(
+            requested=use_cake_export,
+            export_available=cake_export_available,
+            target=shared_target,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            sequence_lengths=sequence_lengths,
+            num_heads=num_heads,
+            head_dim=q.shape[-1],
+            qkv_shapes_equal=q.shape == k.shape == v.shape == g.shape,
+            qkv_dtype=q.dtype,
+            beta_contiguous=beta.is_contiguous(),
+            beta_dtype=beta.dtype,
+            initial_state_shape=(
+                tuple(initial_state.shape) if initial_state is not None else None
+            ),
+            initial_state_dtype=(
+                initial_state.dtype if initial_state is not None else None
+            ),
+            initial_state_contiguous=(
+                initial_state is not None and initial_state.is_contiguous()
+            ),
+            has_explicit_seq_order=seq_order is not None,
+            has_state_indices=state_indices is not None,
+            has_checkpoints=(
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            ),
+            scale=scale_value,
+            lower_bound=lower_bound,
+        )
     if evolution_route is not None:
         if output is None:
             if capturing:
@@ -4716,32 +4955,6 @@ def _run_flash_kda_prefill(
             or checkpoint_cu_starts is not None
         ),
     )
-    affine_route = None
-    if seq_order is None:
-        affine_route = _select_cake_kda_affine_route(
-            export_available=cake_export_available,
-            compute_capability=compute_capability,
-            sm_count=sm_count,
-            fixed_layout=fixed_layout,
-            batch_size=batch_size,
-            total_tokens=batch_size * seq_len,
-            num_heads=num_heads,
-            head_dim=q.shape[-1],
-            qkv_shapes_equal=k.shape == q.shape == v.shape,
-            qkv_dtype=q.dtype,
-            beta_contiguous=beta.is_contiguous(),
-            beta_dtype=beta.dtype,
-            indexed_state=state_indices is not None,
-            initial_state_dtype=(
-                initial_state.dtype if initial_state is not None else None
-            ),
-            has_checkpoints=(
-                checkpoint_every_n_tokens != 0
-                or state_checkpoints is not None
-                or checkpoint_cu_starts is not None
-            ),
-            lower_bound=lower_bound,
-        )
     use_exact_n16 = (
         checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
     ) or _requires_exact_n16_recurrence(
