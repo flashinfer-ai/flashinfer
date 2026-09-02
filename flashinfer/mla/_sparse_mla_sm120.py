@@ -962,8 +962,9 @@ class _SparseMLAPagedAttentionRunner:
             return mid_out, mid_lse
 
         num_tokens, num_heads, d_qk = q.shape
-        if num_tokens == 0:
-            # The op no-ops on empty requests before planning.
+        if num_tokens == 0 or num_tokens > _DECODE_MAX_TOKENS:
+            # The op no-ops on empty requests before planning, and prefill-form
+            # calls never route to decode — skip the plan() lookup on both.
             return None, None
         model_type = _resolve_model_type(d_qk, self._kv_scale_format)
         topk = indices.shape[-1]
