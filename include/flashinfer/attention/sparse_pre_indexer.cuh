@@ -308,14 +308,15 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
   const int warp = threadIdx.x / kWarp;
   const int block = static_cast<int>(blockIdx.x);
 
-  // A lane's slice of the norm weight is the same for every row it will ever
-  // see, so it is read once.
-  float weight[kPer<D>];
-  load_weight<D, DType>(weight, a.q_norm_weight, lane);
-  int q_axis[kPairs<D>];
-  lane_axes<D, MROPE_Q>(lane, a.mrope_h, a.mrope_w, q_axis);
-
   if (block >= a.k_blocks) {
+    // A lane's slice of the norm weight is the same for every row it will ever
+    // see, so it is read once. Inside the branch: the compression blocks below
+    // read the key weight instead and would otherwise pay for this one.
+    float weight[kPer<D>];
+    load_weight<D, DType>(weight, a.q_norm_weight, lane);
+    int q_axis[kPairs<D>];
+    lane_axes<D, MROPE_Q>(lane, a.mrope_h, a.mrope_w, q_axis);
+
     // Two tokens per warp. Their eight rows are all in flight before any is
     // normalised, which is what keeps a warp with something to issue while a
     // row is still arriving; one row at a time leaves the warp waiting.
