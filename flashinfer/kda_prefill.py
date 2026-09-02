@@ -28,14 +28,14 @@ import heapq
 import math
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
 import torch
 
 from .utils import get_compute_capability
 
 if TYPE_CHECKING:
-    from .jit.cake_kda import CakeKDATarget
+    from .jit.cake_kda import CakeKDAFamily, CakeKDARole, CakeKDATarget
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
@@ -767,10 +767,10 @@ def _build_cake_kda_shared_scalar_schedule(
         if max(split_loads) >= heavy_load:
             break
         split_tasks: list[list[tuple[int, int]]] = [[], [], []]
-        for task_index, task in enumerate(selected_tasks):
+        for task_index, task_record in enumerate(selected_tasks):
             encoded_group = (assignment >> (2 * task_index)) & 3
             group = 0 if encoded_group == 1 else 1 if encoded_group == 2 else 2
-            split_tasks[group].append(task)
+            split_tasks[group].append(task_record)
         for index, load, tasks in zip(
             selected_indices, split_loads, split_tasks, strict=True
         ):
@@ -1124,15 +1124,12 @@ def _select_cake_kda_fp32_serving_route(
             target=target,
             policy=(
                 "source_vtile_m128_persistent_six_task"
-                if total_tasks
-                == 6 * _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
+                if total_tasks == 6 * _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
                 else "source_vtile_m128_persistent_four_task"
             ),
             grid_x=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
             uniform_sequence_length=max_sequence_length,
-            persistent_tasks=(
-                total_tasks // _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
-            ),
+            persistent_tasks=(total_tasks // _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS),
             persistent_stride=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
         )
 
@@ -1264,9 +1261,7 @@ def _cake_kda_workspace_buffer(
     """Return a stable, grow-only caller-owned Cake workspace view."""
 
     if not name or not shape or any(dimension <= 0 for dimension in shape):
-        raise ValueError(
-            "Cake KDA workspace names and dimensions must be positive"
-        )
+        raise ValueError("Cake KDA workspace names and dimensions must be positive")
     numel = math.prod(shape)
     buffer = workspace._cake_kda_workspace_buffers.get(name)
     if (
@@ -1440,7 +1435,7 @@ def _cake_kda_affine_resources(
     else:
         from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
-        stage_routes = (
+        stage_routes: tuple[tuple["CakeKDAFamily", str, "CakeKDARole"], ...] = (
             (affine_route.family, "affine_split_main", "main"),
             (affine_route.family, "affine_split_map", "map"),
             ("unbounded_affine_prefix", "affine_prefix_scan", "scan"),
@@ -1614,7 +1609,7 @@ def _cake_kda_direct_export_args(
 def _run_cake_kda_direct_export(
     *,
     module: _CakeKDAAffineModule,
-    **launch_args: object,
+    **launch_args: Any,
 ) -> None:
     """Submit one exported kernel using its mechanically shared argument ABI."""
 
@@ -2119,8 +2114,7 @@ def _select_flash_kda_bf16_route(
         and not uniform_sequences
         and num_heads in (64, 96)
         and 2 * sm_count <= total_tasks < 1024
-        and (max_sequence_length + _FLASH_KDA_M128_CHUNK - 1)
-        // _FLASH_KDA_M128_CHUNK
+        and (max_sequence_length + _FLASH_KDA_M128_CHUNK - 1) // _FLASH_KDA_M128_CHUNK
         < 256
     ):
         return _FLASH_KDA_ROUTE_SCALAR_CHUNK_LPT_M128
@@ -3831,11 +3825,7 @@ def _cake_kda_serving_policy(
             else "direct_m128_legacy_inverse"
         )
     if variant in {"m128_n16", "m128_n16_short"}:
-        return (
-            "direct_m128_n16_h12_scalar"
-            if num_heads == 12
-            else "direct_m128_n16"
-        )
+        return "direct_m128_n16_h12_scalar" if num_heads == 12 else "direct_m128_n16"
     policy = fixed.get(variant)
     if policy == "persistent_m128_whole_chain" and target == "sm103a":
         return None
@@ -4630,9 +4620,7 @@ def _run_cake_kda_bf16_direct_export(
 
     from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
-    module = get_cake_kda_module(
-        route.target, "bounded_bf16_evolution", route.policy
-    )
+    module = get_cake_kda_module(route.target, "bounded_bf16_evolution", route.policy)
     spec = get_cake_kda_module_spec(
         route.target, "bounded_bf16_evolution", route.policy
     )
@@ -4676,9 +4664,7 @@ def _run_cake_kda_bf16_direct_export(
             chunk_tokens=chunk_tokens,
             refresh=(
                 not scalar_beta
-                and any(
-                    length >= chunk_tokens for length in route.sequence_lengths
-                )
+                and any(length >= chunk_tokens for length in route.sequence_lengths)
             ),
         )
     _run_cake_kda_direct_export(
@@ -4947,10 +4933,10 @@ def _run_flash_kda_prefill(
         assert lower_bound is not None
         stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
         explicit_workspace = prefill_workspace is not None
-        workspace = metadata_workspace
-        with workspace._lock:
+        evolution_workspace = metadata_workspace
+        with evolution_workspace._lock:
             _bind_workspace(
-                workspace,
+                evolution_workspace,
                 device=q.device,
                 stream_ptr=stream_ptr,
                 capturing=capturing,
@@ -4958,7 +4944,7 @@ def _run_flash_kda_prefill(
             )
             _run_cake_kda_bounded_evolution(
                 route=evolution_route,
-                workspace=workspace,
+                workspace=evolution_workspace,
                 q=q,
                 k=k,
                 v=v,
@@ -4974,7 +4960,7 @@ def _run_flash_kda_prefill(
                 lower_bound=float(lower_bound),
             )
             if capturing and explicit_workspace:
-                workspace._captured = True
+                evolution_workspace._captured = True
         return (out_buf, initial_state if output_final_state else None)
     fp32_serving_route = _select_cake_kda_fp32_serving_route(
         requested=use_cake_export and lower_bound is not None,
@@ -5561,8 +5547,7 @@ def _run_flash_kda_prefill(
                     )
                 cake_beta_tma = (
                     beta_tma
-                    if variant
-                    in {"m128_h12_short", "m128_h12_long", "m128_n16"}
+                    if variant in {"m128_h12_short", "m128_h12_long", "m128_n16"}
                     else _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
                 )
                 launched = _run_cake_kda_fp32_serving_export(

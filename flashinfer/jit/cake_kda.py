@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 from ._kda_jit_common import (
     gen_kda_jit_spec,
@@ -27,9 +27,7 @@ CakeKDAFamily = Literal[
     "unbounded_bf16_serving",
     "unbounded_affine_prefix",
 ]
-CakeKDASequenceFamily = Literal[
-    "unbounded_affine_prefix",
-]
+CakeKDASequenceFamily = Literal["unbounded_affine_prefix",]
 CakeKDARole = Literal["main", "prepare", "chain", "map", "scan", "correction"]
 CakeKDATMAABI = Literal["grid_constant", "pointer"]
 
@@ -129,15 +127,15 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     _require(isinstance(contract, dict), "contract missing")
     _require(contract.get("architectures") == ["sm_100a", "sm_103a"], "architectures")
     suites = contract.get("shape_suites")
-    _require(isinstance(suites, dict) and suites, "shape suites missing")
+    _require(isinstance(suites, dict) and bool(suites), "shape suites missing")
     suite_rows = 0
     for suite, labels in suites.items():
         _require(
             isinstance(suite, str)
-            and suite
+            and bool(suite)
             and isinstance(labels, list)
-            and labels
-            and all(isinstance(label, str) and label for label in labels)
+            and bool(labels)
+            and all(isinstance(label, str) and bool(label) for label in labels)
             and len(set(labels)) == len(labels),
             f"{suite!r} must contain unique nonempty labels",
         )
@@ -145,8 +143,8 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     denominator = contract.get("shape_denominator")
     _require(
         isinstance(denominator, list)
-        and denominator
-        and all(isinstance(label, str) and label for label in denominator)
+        and bool(denominator)
+        and all(isinstance(label, str) and bool(label) for label in denominator)
         and len(set(denominator)) == len(denominator)
         and contract.get("shape_count") == len(denominator),
         "shape denominator must contain shape_count unique nonempty rows",
@@ -175,15 +173,14 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         )
         _require(
             isinstance(core_state_arms, list)
-            and core_state_arms
-            and all(isinstance(arm, str) and arm for arm in core_state_arms)
+            and bool(core_state_arms)
+            and all(isinstance(arm, str) and bool(arm) for arm in core_state_arms)
             and len(set(core_state_arms)) == len(core_state_arms),
             "core_state_arms must be unique nonempty labels",
         )
         _require(
             isinstance(suites.get("core177"), list)
-            and len(suites["core177"])
-            == core_base_shape_count * len(core_state_arms),
+            and len(suites["core177"]) == core_base_shape_count * len(core_state_arms),
             "core suite size must equal base shapes times state arms",
         )
     timing_requirement = contract.get("timing_requirement")
@@ -194,7 +191,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     )
 
     files = payload.get("files")
-    _require(isinstance(files, list) and files, "file inventory missing")
+    _require(isinstance(files, list) and bool(files), "file inventory missing")
     file_sha256: dict[str, str] = {}
     for index, item in enumerate(files):
         _require(isinstance(item, dict), f"files[{index}] must be an object")
@@ -214,7 +211,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
 
     modules = payload.get("modules")
     target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
-    _require(isinstance(modules, list) and modules, "module inventory missing")
+    _require(isinstance(modules, list) and bool(modules), "module inventory missing")
     observed: set[tuple[str, str, str, str]] = set()
     specs: list[CakeKDAModuleSpec] = []
     for index, item in enumerate(modules):
@@ -229,10 +226,12 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         policy = route.get("policy")
         _require(family in _SUPPORTED_FAMILIES, f"{label}.family unsupported")
         _require(
-            isinstance(policy, str) and policy,
+            isinstance(policy, str) and bool(policy),
             f"{label}.policy must be nonempty",
         )
         _require(role in _SUPPORTED_ROLES, f"{label}.role unsupported")
+        typed_family = cast(CakeKDAFamily, family)
+        typed_role = cast(CakeKDARole, role)
         key = (arch, family, policy, role)
         _require(key not in observed, f"duplicate module {key}")
         observed.add(key)
@@ -316,10 +315,10 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         _require(isinstance(launch, dict), f"{label}.launch")
         specs.append(
             CakeKDAModuleSpec(
-                target=target_by_arch[arch],
-                family=family,
+                target=cast(CakeKDATarget, target_by_arch[arch]),
+                family=typed_family,
                 policy=policy,
-                role=role,
+                role=typed_role,
                 name=item["name"],
                 module_ident=module_ident,
                 closure_sha256=closure_sha256,
@@ -332,11 +331,11 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
             )
         )
 
-    observed_arch_families = {(arch, family) for arch, family, _policy, _role in observed}
+    observed_arch_families = {
+        (arch, family) for arch, family, _policy, _role in observed
+    }
     expected_arch_families = {
-        (arch, family)
-        for arch in target_by_arch
-        for family in _SUPPORTED_FAMILIES
+        (arch, family) for arch in target_by_arch for family in _SUPPORTED_FAMILIES
     }
     _require(
         observed_arch_families == expected_arch_families,
@@ -370,12 +369,14 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
         isinstance(raw_sequences, list) and len(raw_sequences) == 2,
         "prepared sequence inventory mismatch",
     )
-    expected = {
+    expected: set[tuple[CakeKDATarget, CakeKDASequenceFamily]] = {
         (target, family)
-        for target in _TARGET_ARCH
-        for family in ("unbounded_affine_prefix",)
+        for target in cast(tuple[CakeKDATarget, ...], tuple(_TARGET_ARCH))
+        for family in cast(
+            tuple[CakeKDASequenceFamily, ...], ("unbounded_affine_prefix",)
+        )
     }
-    observed: set[tuple[str, str]] = set()
+    observed: set[tuple[CakeKDATarget, CakeKDASequenceFamily]] = set()
     specs: list[CakeKDASequenceSpec] = []
     target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
     for index, item in enumerate(raw_sequences):
@@ -385,8 +386,8 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
         route = item.get("route")
         _require(arch in target_by_arch, f"{label}.arch unsupported")
         _require(isinstance(route, dict), f"{label}.route missing")
-        family = route.get("family")
-        target = target_by_arch[arch]
+        family = cast(CakeKDASequenceFamily, route.get("family"))
+        target = cast(CakeKDATarget, target_by_arch[arch])
         key = (target, family)
         _require(key in expected, f"{label} unsupported route {key}")
         _require(key not in observed, f"duplicate sequence {key}")
@@ -435,7 +436,11 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
             _require(stage.get("name") == stage_name, f"{stage_label}.name")
             module_ref = stage.get("module")
             _require(isinstance(module_ref, dict), f"{stage_label}.module")
-            identity = (target, module_ref.get("name"), module_ref.get("role"))
+            identity = (
+                target,
+                module_ref.get("name"),
+                cast(CakeKDARole, module_ref.get("role")),
+            )
             _require(
                 module_by_identity.get(identity) == expected_spec,
                 f"{stage_label}.module identity",
@@ -513,10 +518,7 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
 
 
 def cake_kda_is_available() -> bool:
-    return (
-        bool(get_cake_kda_module_specs())
-        and len(get_cake_kda_sequence_specs()) == 2
-    )
+    return bool(get_cake_kda_module_specs()) and len(get_cake_kda_sequence_specs()) == 2
 
 
 def get_cake_kda_module_spec(
