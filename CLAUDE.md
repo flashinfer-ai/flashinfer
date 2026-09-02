@@ -172,10 +172,13 @@ python benchmarks/flashinfer_benchmark.py \
 ```python
 from flashinfer.testing import bench_gpu_time
 
-# CUPTI preferred, auto-fallback to CUDA events
-median_time, std_time = bench_gpu_time(
-    my_kernel, args=(x, y), enable_cupti=True, num_iters=30
+# CUPTI preferred, auto-fallback to CUDA events.
+# Returns per-iteration times in milliseconds (a list).
+times = bench_gpu_time(
+    my_kernel, input_args=(x, y), enable_cupti=True,
+    dry_run_iters=10, repeat_iters=30,
 )
+median_time_ms = statistics.median(times)
 ```
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
