@@ -66,8 +66,8 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
-  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4 receives separate
-    int32 ids + BF16 or FP32 weights without packed-id construction.
+  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): capable TRTLLM runners receive
+    separate int32 ids + BF16 or FP32 weights without packed-id construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
@@ -78,8 +78,7 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
 
 Coverage today: NVFP4, BF16, block/per-tensor FP8, MXFP4/W4A16, and MxInt4.
 CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
-dispatch to capable TRTLLM runners. MxInt4 covers packed and BF16-FromLogits
-routing.
+dispatch to capable TRTLLM runners.
 
 ENABLED BY DEFAULT: this suite runs like any other test. Unsupported configurations skip at the
 no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver.
@@ -1667,12 +1666,12 @@ def _gen(seed):
 
     activation = "swiglu"
     if variant == "bf16":
-        # FromLogits and EP require TRTLLM, whose BF16 cubins expose SwiGLU
-        # and ReLU2. CUTLASS-only activations are valid only for non-EP
-        # pre-routed cases.
+        # FromLogits, unpacked routing, and EP require TRTLLM, whose BF16 cubins
+        # expose SwiGLU and ReLU2. CUTLASS-only activations are valid only for
+        # non-EP packed pre-routed cases.
         activation = rng.choice(
             ("swiglu", "relu2")
-            if fromlogits or offset != 0 or local != ne
+            if fromlogits or unpacked or offset != 0 or local != ne
             else ("swiglu", "relu2", "geglutanh", "swiglustep", "situ")
         )
     return Cfg(
@@ -2198,7 +2197,7 @@ def test_random_seed_stream_is_unchanged():
     payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
     assert (
         hashlib.sha256(payload).hexdigest()
-        == "cff06d91b524c74c66863e4078e24303b431eeffbedc94b3237390bccd837e70"
+        == "504c8a83ccb3622911238b95b340b5d7901413a48f31dd2c47e8e575a209a629"
     )
 
 
@@ -2727,9 +2726,8 @@ def test_unified_moe_fuzz(cfg):
         # so it cannot serve a logits-only pack and would compare apples to oranges).
         wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
     elif cfg.is_unpacked:
-        # Exact TRTLLM Mode 3 is currently wired only through the FP4 runner.
-        # Backends that accept separate tensors through their own ABI are not
-        # implementations of RoutingInputMode.UnpackedPrecomputed.
+        # Keep only runners that implement exact TRTLLM Mode 3 with separate
+        # caller-owned IDs and weights.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not cfg.do_finalize:
         # Only TRTLLM returns unfinalized intermediates; like the EP filter
