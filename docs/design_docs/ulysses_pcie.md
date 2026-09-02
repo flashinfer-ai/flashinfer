@@ -10,8 +10,9 @@ Why copy engines rather than SM stores: the fused-transpose kernel behind `backe
 |---|---|
 | Hosts / ranks | One host; world size 1, 2, 4, or 8 |
 | Routes | ws 1: identity (no JIT, no transport); ws 2: all-pairs CUDA P2P; ws 4/8: all-RDMA preferred, all-P2P fallback; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces p2p or rdma at ws 2/4/8, or the 4+4 NUMA hybrid at ws 8; full-group CUDA P2P required on every route |
-| RDMA route requirements | One mlx5 device per rank with DEVX, RC QP, UMR, an active IPv4 RoCE v2 GID, GPUDirect RDMA; batch size 1 and head-row pitch `H * D * element_size <= 65,535` bytes; hybrid additionally needs the 4+4 NUMA split |
+| RDMA route requirements | One mlx5 device per rank with DEVX, RC QP, UMR, an active IPv4 RoCE v2 GID, GPUDirect RDMA; batch size 1, and head-row pitch `H * D * element_size <= 65,535` bytes for the two head-axis transforms (`exchange_chunks` registers no MKey, so no stride bounds it); hybrid additionally needs the 4+4 NUMA split |
 | Build requirements | rdma-core >= 36 (libibverbs and libmlx5 headers/libraries) and the CUDA driver library, on every route including all-P2P |
+| Transforms | `scatter_heads` / `gather_heads` interleave the head axis; `exchange_chunks` takes `[1, 1, world_size, chunk]` to the same shape (`all_to_all_single` over an already-packed payload) and interleaves nothing |
 | Input | Contiguous 4-D CUDA tensor with a 1-, 2- or 4-byte element type (FP16/BF16/FP32, FP8, INT8/UINT8); any batch size on the all-P2P route |
 | Execution | P2P enqueues asynchronously on the caller stream; the RDMA routes block the host until every rank reaches the barrier (unbounded) and until RDMA completes (fixed 10 s deadline); one in-flight operation per communicator, bound to the stream of the first call |
 | CUDA Graphs | All-P2P: capturable when every output comes from `allocate_output`; hybrid/all-RDMA: refused |
