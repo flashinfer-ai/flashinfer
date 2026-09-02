@@ -108,10 +108,12 @@ __global__ void __launch_bounds__(THREADS)
       request_valid ? static_cast<int32_t>(sequence_lengths[safe_request]) : 0;
 
   // Blocks entirely in the past, capped by what the selector produced.
-  const int32_t complete_blocks =
-      min(min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
-              sequence_length / static_cast<int32_t>(COMPRESS_RATIO)),
-          static_cast<int32_t>(block_topk));
+  // One past the last block the query has entirely behind it. A selection is
+  // only expandable while it names one of these: the block the query sits in
+  // is partly ahead of it, and the tail below is what supplies its seen half.
+  const int32_t past_blocks = min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
+                                  sequence_length / static_cast<int32_t>(COMPRESS_RATIO));
+  const int32_t complete_blocks = min(past_blocks, static_cast<int32_t>(block_topk));
   const int32_t expanded_count = complete_blocks * static_cast<int32_t>(COMPRESS_RATIO);
   const int32_t tail_start =
       ((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO)) * COMPRESS_RATIO;
@@ -135,7 +137,9 @@ __global__ void __launch_bounds__(THREADS)
       const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
       const int32_t block = static_cast<int32_t>(row_blocks[rank * blocks_stride]);
       token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
-      valid = true;
+      // The whole block, not the token: keeping only the seen half of a block
+      // the query sits in would repeat exactly what the tail appends.
+      valid = block >= 0 && block < past_blocks;
     } else {
       const int32_t tail_offset = column - expanded_count;
       token = tail_start + tail_offset;
@@ -194,10 +198,12 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
   const int32_t sequence_length =
       request_valid ? static_cast<int32_t>(sequence_lengths[safe_request]) : 0;
 
-  const int32_t complete_blocks =
-      min(min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
-              sequence_length / static_cast<int32_t>(COMPRESS_RATIO)),
-          static_cast<int32_t>(block_topk));
+  // One past the last block the query has entirely behind it. A selection is
+  // only expandable while it names one of these: the block the query sits in
+  // is partly ahead of it, and the tail below is what supplies its seen half.
+  const int32_t past_blocks = min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
+                                  sequence_length / static_cast<int32_t>(COMPRESS_RATIO));
+  const int32_t complete_blocks = min(past_blocks, static_cast<int32_t>(block_topk));
   const int32_t expanded_count = complete_blocks * static_cast<int32_t>(COMPRESS_RATIO);
   const int32_t tail_start =
       ((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO)) * COMPRESS_RATIO;
@@ -228,7 +234,8 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
         const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
         const int32_t block = static_cast<int32_t>(row_blocks[rank * blocks_stride]);
         token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
-        valid = true;
+        // Same whole-block rule as the standalone expansion above.
+        valid = block >= 0 && block < past_blocks;
       } else {
         const int32_t tail_offset = column - expanded_count;
         token = tail_start + tail_offset;
