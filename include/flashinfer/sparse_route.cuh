@@ -52,9 +52,14 @@ constexpr uint32_t kNarrowThreads = 256;
 // between calls on one device, and a route launch is short enough that asking
 // the driver three times for them is a measurable part of it. They are kept per
 // device, and the template gives each kernel its own copy.
-template <typename KernelFn>
-inline cudaError_t choose_wide(KernelFn wide_kernel, uint32_t threads, uint32_t wide_blocks,
-                               bool* wide) {
+//
+// The kernel and its thread count are template parameters rather than
+// arguments, because the cache below lives in the instantiation: taking either
+// as a value would give one shared entry to every kernel of the same signature
+// and every thread count, and a second caller would read back an occupancy
+// measured for something else.
+template <auto WideKernel, uint32_t Threads>
+inline cudaError_t choose_wide(uint32_t wide_blocks, bool* wide) {
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   static thread_local int cached_dev = -1;
@@ -62,7 +67,7 @@ inline cudaError_t choose_wide(KernelFn wide_kernel, uint32_t threads, uint32_t 
   if (cached_dev != dev_id) {
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, wide_kernel, static_cast<int>(threads), 0));
+        &blocks_per_sm, WideKernel, static_cast<int>(Threads), 0));
     cached_dev = dev_id;
   }
   *wide = num_sms == 0 || blocks_per_sm == 0 ||
@@ -459,9 +464,15 @@ cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_re
   if (rows == 0 || width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(width, sparse_route::kWideTile);
   bool wide = true;
-  FLASHINFER_CUDA_CALL(sparse_route::choose_wide(
-      QSARouteFromLogicalKernel<sparse_route::kWideTile, sparse_route::kWideThreads, IdType>,
-      sparse_route::kWideThreads, wide_blocks, &wide));
+  // Hoisted into a name: the kernel's own template arguments written inline
+  // inside choose_wide's argument list is more than the frontend will parse.
+  constexpr auto kWideKernel =
+      QSARouteFromLogicalKernel<sparse_route::kWideTile, sparse_route::kWideThreads, IdType>;
+  // Through a name: the comma between the template arguments would otherwise
+  // split FLASHINFER_CUDA_CALL's own argument list.
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
   const dim3 grid(ceil_div(width, tile), rows);
   const uint_fastdiv page_div(page_size);
@@ -492,9 +503,11 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
   if (rows == 0 || output_width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   bool wide = true;
-  FLASHINFER_CUDA_CALL(sparse_route::choose_wide(
-      ExpandBlockRouteKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads, IdType>,
-      sparse_route::kWideThreads, wide_blocks, &wide));
+  constexpr auto kWideKernel =
+      ExpandBlockRouteKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads, IdType>;
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
   const dim3 grid(ceil_div(output_width, tile), rows);
   // Both strides are 1 for every caller that hands over a plain route; folding them
@@ -556,10 +569,11 @@ cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_
   if (rows == 0 || output_width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   bool wide = true;
-  FLASHINFER_CUDA_CALL(
-      sparse_route::choose_wide(QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile,
-                                                         sparse_route::kWideThreads, IdType>,
-                                sparse_route::kWideThreads, wide_blocks, &wide));
+  constexpr auto kWideKernel = QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile,
+                                                        sparse_route::kWideThreads, IdType>;
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
   const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
   const dim3 grid(ceil_div(output_width, tile), rows);
   const bool contiguous = stride_blocks_col == 1;
