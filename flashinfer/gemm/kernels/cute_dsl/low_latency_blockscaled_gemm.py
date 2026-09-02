@@ -394,7 +394,7 @@ class LowLatencyBlockscaledGemmKernel:
         # Accumulator shape for TMEM allocation size calculation
         acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = cutlass.utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
     @cute.jit
     def __call__(
@@ -473,13 +473,9 @@ class LowLatencyBlockscaledGemmKernel:
         self.smem_alloc_b_dtype = (
             cutlass.Int8 if self.mxf8f6f4 and self.b_dtype.width < 8 else self.b_dtype
         )
-        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
-            a
-        ).mma_major_mode()
-        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
-            b
-        ).mma_major_mode()
-        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = cutlass.utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.c_layout = cutlass.utils.LayoutEnum.from_tensor(c)
         sfa = cute.make_tensor(
             sfa_ptr, blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
         )
@@ -823,7 +819,7 @@ class LowLatencyBlockscaledGemmKernel:
             dsmem_mailbox_barrier: cutlass.Int64
             dsmem_mailbox: cute.struct.MemRange[cutlass.Float32, MailboxElems]
 
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Defer synchronization until every pipeline and standalone barrier is ready
