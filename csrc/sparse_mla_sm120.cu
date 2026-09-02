@@ -106,7 +106,9 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
   }
   if (kv.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-        << name << " 3D form must be [num_pages, page_block_size, " << bpt << "]";
+        << name << " 3D form must be [num_pages, page_block_size, " << bpt
+        << "]; prefill requires tightly packed rows — padded-row KV caches are "
+           "decode-only (the decode-v32 kernel honors stride_kv_row)";
     return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
   }
   TVM_FFI_ICHECK_EQ(kv.ndim(), 4) << name << " must be 2D [num_pages, page_bytes], 3D "
@@ -114,7 +116,9 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
                                   << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
                                   << "[num_pages, page_block_size, 1, bytes_per_token]";
   TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-      << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1);
+      << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1)
+      << "; prefill requires tightly packed rows — padded-row KV caches are "
+         "decode-only (the decode-v32 kernel honors stride_kv_row)";
   if (kv.size(1) == 1) {
     return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
   }

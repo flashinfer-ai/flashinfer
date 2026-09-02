@@ -2826,38 +2826,51 @@ def test_sparse_mla_sm120_prefill_impl_mg_matches_swapab(num_heads: int) -> None
     torch.testing.assert_close(lse_mg, case[6], atol=5e-2, rtol=5e-2)
 
 
-@pytest.mark.parametrize("pad", ["block_stride", "row_width"])
-def test_sparse_mla_sm120_inline_scale_rejects_padded_cache(pad: str) -> None:
-    """Inline-scale caches must be densely packed through this entry.
+def test_sparse_mla_sm120_inline_scale_rejects_padded_block_stride() -> None:
+    """Non-contiguous inline-scale caches fail at the entry.
 
-    The prefill kernels address inline-scale caches as a flat token array and
-    crossover can route any decode-form call to them, so padded layouts must
-    fail at the entry, not at the first prefill-routed call.
+    The prefill kernels address inline-scale caches as a flat token array, so
+    a padded block stride would be silently misread — and crossover can route
+    any decode-form call there, so the rejection cannot wait for a
+    prefill-routed call.
     """
     q, kv_packed, indices, sm_scale, d_v, _, _ = _make_dsv3_2_prefill_case(
         64, num_tokens=128
     )
-    if pad == "block_stride":
-        base = torch.zeros(
-            kv_packed.shape[0] * 2,
-            *kv_packed.shape[1:],
-            dtype=kv_packed.dtype,
-            device=kv_packed.device,
-        )
-        kv = base[::2]
-        kv.copy_(kv_packed)
-    else:
-        kv = torch.zeros(
-            *kv_packed.shape[:-1],
-            kv_packed.shape[-1] + 16,
-            dtype=kv_packed.dtype,
-            device=kv_packed.device,
-        )
-        kv[..., : kv_packed.shape[-1]] = kv_packed
+    base = torch.zeros(
+        kv_packed.shape[0] * 2,
+        *kv_packed.shape[1:],
+        dtype=kv_packed.dtype,
+        device=kv_packed.device,
+    )
+    kv = base[::2]
+    kv.copy_(kv_packed)
 
     output = torch.zeros(128, 64, d_v, dtype=torch.bfloat16, device=q.device)
     out_lse = torch.zeros(128, 64, dtype=torch.float32, device=q.device)
-    with pytest.raises(ValueError, match="densely packed"):
+    with pytest.raises(ValueError, match="must be contiguous"):
+        sparse_mla_sm120_paged_attention(
+            q, kv, indices, output, out_lse, sm_scale, d_v=d_v
+        )
+
+
+def test_sparse_mla_sm120_inline_scale_prefill_rejects_padded_rows() -> None:
+    """Padded-row inline-scale caches are decode-only: decode-v32 honors the
+    row stride, and a prefill-routed call fails loudly at the binding."""
+    q, kv_packed, indices, sm_scale, d_v, _, _ = _make_dsv3_2_prefill_case(
+        64, num_tokens=128
+    )
+    kv = torch.zeros(
+        *kv_packed.shape[:-1],
+        kv_packed.shape[-1] + 16,
+        dtype=kv_packed.dtype,
+        device=kv_packed.device,
+    )
+    kv[..., : kv_packed.shape[-1]] = kv_packed
+
+    output = torch.zeros(128, 64, d_v, dtype=torch.bfloat16, device=q.device)
+    out_lse = torch.zeros(128, 64, dtype=torch.float32, device=q.device)
+    with pytest.raises(RuntimeError, match="tightly packed rows"):
         sparse_mla_sm120_paged_attention(
             q, kv, indices, output, out_lse, sm_scale, d_v=d_v
         )
