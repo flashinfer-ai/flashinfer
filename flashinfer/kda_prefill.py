@@ -3815,6 +3815,7 @@ def _run_cake_kda_fp32_source_route(
 def _run_cake_kda_fp32_serving_export(
     *,
     target: "CakeKDATarget",
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
     variant: str,
     max_sequence_length: int,
     q: torch.Tensor,
@@ -3866,6 +3867,20 @@ def _run_cake_kda_fp32_serving_export(
     if policy is None:
         return False
     module = _get_cake_kda_export_module(target, "bounded_fp32_serving", policy)
+    from .jit.cake_kda import get_cake_kda_module_spec
+
+    spec = get_cake_kda_module_spec(target, "bounded_fp32_serving", policy)
+    tma_workspace = (
+        _cake_kda_workspace_buffer(
+            workspace=workspace,
+            name=f"tma_descriptor_{spec.target}_{spec.family}_{spec.policy}",
+            device=q.device,
+            shape=(spec.tma_workspace_bytes,),
+            dtype=torch.uint8,
+        )
+        if spec.tma_workspace_bytes
+        else None
+    )
     total_tasks = num_sequences * num_heads
     initial_f32 = initial_state if use_initial_state else empty_f32
     final_f32 = final_state if store_final_state else empty_f32
@@ -3912,6 +3927,7 @@ def _run_cake_kda_fp32_serving_export(
             scale=scale,
             lower_bound=lower_bound,
             grid_x=total_tasks,
+            tma_descriptor_workspace=tma_workspace,
         )
         return True
 
@@ -5290,6 +5306,7 @@ def _run_flash_kda_prefill(
                 )
                 launched = _run_cake_kda_fp32_serving_export(
                     target=shared_target,
+                    workspace=workspace,
                     variant=variant,
                     max_sequence_length=max_sequence_length,
                     q=q,
