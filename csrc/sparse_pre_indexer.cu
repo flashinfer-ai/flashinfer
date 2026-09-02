@@ -90,6 +90,11 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   // there, so a second KV head would land on top of the first.
   TVM_FFI_ICHECK_EQ(state_cache.size(2), 1) << "the ring holds one KV head";
   TVM_FFI_ICHECK_EQ(compressed_cache.size(2), 1) << "the compressed cache holds one KV head";
+  // Rank first: everything below indexes the last axis, and size(ndim() - 1) on
+  // a rank-zero tensor reads off the front of its own shape.
+  TVM_FFI_ICHECK_GE(cos_sin_cache.ndim(), 1) << "the rotary table has at least one axis";
+  TVM_FFI_ICHECK(positions.ndim() == 1 || positions.ndim() == 2)
+      << "positions is one axis or three";
   // The rotary table is addressed as a flat run of rows of half the head
   // dimension; a row of any other width silently shifts every position.
   TVM_FFI_ICHECK_EQ(cos_sin_cache.size(cos_sin_cache.ndim() - 1), head_dim / 2)
@@ -142,7 +147,6 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   TVM_FFI_ICHECK_EQ(work_metadata.dtype(), dl_int32) << "work_metadata must be int32";
 
   const bool pos_2d = positions.ndim() == 2;
-  TVM_FFI_ICHECK(pos_2d || positions.ndim() == 1) << "positions is one axis or three";
   if (pos_2d) {
     TVM_FFI_ICHECK_EQ(positions.size(0), 3) << "a three-axis position tensor has three rows";
   }
@@ -159,6 +163,9 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
     p.pos_stride_axis = pos_2d ? positions.stride(0) : 0;
     p.pos_stride_token = pos_2d ? positions.stride(1) : positions.stride(0);
     p.cos_sin = static_cast<const c_type*>(cos_sin_cache.data_ptr());
+    // Rows the table holds: the kernel keeps a coordinate inside them rather
+    // than reading off the end.
+    p.cos_sin_rows = cos_sin_cache.numel() / (head_dim / 2);
     p.q_norm_weight = static_cast<const c_type*>(q_norm_weight.data_ptr());
     p.k_norm_weight = static_cast<const c_type*>(k_norm_weight.data_ptr());
     p.eps = static_cast<float>(eps);

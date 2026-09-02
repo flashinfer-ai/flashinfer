@@ -108,7 +108,10 @@ def _reference(
     for pid in range(work_metadata.shape[0]):
         request = int(work_metadata[pid, 0])
         work_in_request = int(work_metadata[pid, 1])
-        if request < 0:
+        # The work list is the caller's and the request it names indexes both
+        # ends of a prefix-sum entry, so one past the last request reads off
+        # the table. Same bound the kernel applies.
+        if request < 0 or request >= state_block_table.shape[0]:
             continue
         start = int(query_start_loc[request])
         end = int(query_start_loc[request + 1])
@@ -741,9 +744,10 @@ def test_a_work_item_naming_a_request_that_does_not_exist_is_skipped():
     case = _case(num_tokens=16, num_requests=1)
     case["work_metadata"] = case["work_metadata"].clone()
     case["work_metadata"][0, 0] = 1  # only request 0 exists
-    q_out, _, _ = _run(case)
-    torch.cuda.synchronize()
-    assert torch.isfinite(q_out.float()).all()
+    # Against the reference, not just for finiteness: the query path does not
+    # read the work list at all, so a finite q_out says nothing about whether
+    # the request index was bounded. The ring and the compressed rows do.
+    _assert_matches(case)
 
 
 def test_rejects_an_empty_ring():
@@ -778,3 +782,34 @@ def test_a_group_reaching_into_an_unaligned_ring(state_size, compress_ratio):
             cache_pos=True,
         )
     )
+
+
+@pytest.mark.parametrize("axis", ["t", "h", "w"])
+def test_a_rotary_coordinate_past_the_table_is_held_at_its_edge(axis):
+    """The coordinates are the caller's and a table row is what they index, so
+    one past the table would read off the end of it. The kernel holds it at the
+    last row instead: the rotation is not the caller's, but the read is inside
+    the table."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8, mrope=True)
+    rows = case["table"].shape[0]
+    pos = case["positions"].clone()
+    row = {"t": 0, "h": 1, "w": 2}[axis]
+    pos[row, 0] = rows + 1000
+    case["positions"] = pos.contiguous()
+    q_out, _, _ = _run(case)
+    torch.cuda.synchronize()
+    assert torch.isfinite(q_out.float()).all()
+
+
+@pytest.mark.parametrize("which", ["positions", "cos_sin_cache"])
+def test_rejects_a_tensor_with_no_axes(which):
+    """size(ndim() - 1) on a rank-zero tensor reads off the front of its own
+    shape, so the rank has to be checked before anything indexes the last
+    axis."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8)
+    key = "table" if which == "cos_sin_cache" else "positions"
+    case[key] = case[key].flatten()[0].clone()  # rank zero
+    match = "at least one axis" if which == "cos_sin_cache" else "one axis or three"
+    _expect_rejected(case, match)
