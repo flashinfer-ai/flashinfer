@@ -4016,11 +4016,14 @@ def _run_flash_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
-    use_cake_export: bool = False,
+    backend: Literal["default", "cake"] = "default",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
 ):
+    if backend not in {"default", "cake"}:
+        raise ValueError(f"unsupported recurrent_kda prefill backend: {backend!r}")
+    use_cake_export = backend == "cake"
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(

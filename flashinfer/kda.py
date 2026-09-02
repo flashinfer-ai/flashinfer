@@ -436,6 +436,29 @@ def recurrent_kda(
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None
+        if backend == "cake":
+            return _kda_prefill._run_flash_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                seq_order=seq_order,
+                prefill_workspace=prefill_workspace,
+                state_indices=ssm_state_indices,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                backend="cake",
+            )
         return _kda_prefill._run_flash_kda_prefill(
             q=q,
             k=k,
@@ -456,7 +479,7 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            use_cake_export=backend == "cake",
+            backend="default",
         )
 
     if backend == "cake" and is_plain_prefill:
