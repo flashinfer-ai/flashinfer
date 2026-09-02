@@ -5,6 +5,7 @@
 #   bash tests/moe_ep/run_tests.sh
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh sm90_push_nvfp4 # Hopper push NVFP4
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
@@ -136,6 +137,26 @@ run_unit() {
   # notes; observed since 2026-07-22).
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
+}
+
+run_sm90_fp8_nvfp4_bf16_push_cuda() {
+  local rc=0
+
+  "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_w4a8_gemm.py \
+    tests/moe_ep/test_sm90_w4a8_payload_v4_contract.py \
+    tests/moe_ep/test_sm90_w4a8_tma_cache.py \
+    tests/moe_ep/test_sm90_nvfp4_folded_fp8.py \
+    tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_backend_cpu.py \
+    tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_backend.py \
+    tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_hot_folded.py -v || rc=1
+
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_backend.py -v || rc=1
+
+  return "${rc}"
 }
 
 run_multirank() {
@@ -391,6 +412,10 @@ case "${1:-all}" in
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   oracle_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
+  sm90_fp8_nvfp4_bf16_push_cuda|sm90_push_nvfp4)
+    run_section "SM90 FP8-NVFP4-BF16 push CUDA" run_sm90_fp8_nvfp4_bf16_push_cuda
+    print_summary
+    ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
@@ -401,7 +426,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|sm90_fp8_nvfp4_bf16_push_cuda|sm90_push_nvfp4|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

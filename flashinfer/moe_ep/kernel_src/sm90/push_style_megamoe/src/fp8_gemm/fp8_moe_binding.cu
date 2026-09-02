@@ -80,7 +80,16 @@ class Fp8MoeGemmRunner : public tvm::ffi::ModuleObj {
                                         int64_t shape_k, int64_t num_problems, bool a_is_fp8,
                                         bool b_is_fp8) -> int64_t {
         return get_workspace_size(expected_m, max_rows, shape_n, shape_k, num_problems, a_is_fp8,
-                                  b_is_fp8);
+                                  b_is_fp8, num_problems);
+      });
+    }
+    if (name == "get_moe_workspace_size_with_scale_problems") {
+      return Function::FromTyped([this](int64_t expected_m, int64_t max_rows, int64_t shape_n,
+                                        int64_t shape_k, int64_t num_problems,
+                                        int64_t scale_problems, bool a_is_fp8,
+                                        bool b_is_fp8) -> int64_t {
+        return get_workspace_size(expected_m, max_rows, shape_n, shape_k, num_problems, a_is_fp8,
+                                  b_is_fp8, scale_problems);
       });
     }
     if (name == "configure_workspace") {
@@ -139,14 +148,19 @@ class Fp8MoeGemmRunner : public tvm::ffi::ModuleObj {
 
  private:
   int64_t get_workspace_size(int64_t expected_m, int64_t max_rows, int64_t shape_n, int64_t shape_k,
-                             int64_t num_problems, bool a_is_fp8, bool b_is_fp8) {
+                             int64_t num_problems, bool a_is_fp8, bool b_is_fp8,
+                             int64_t scale_problems) {
     TVM_FFI_ICHECK(expected_m > 0 && max_rows > 0 && shape_n > 0 && shape_k > 0 && num_problems > 0)
         << "get_moe_workspace_size: expected_m, max_rows, N, K, and num_problems must be positive";
+    TVM_FFI_ICHECK(scale_problems >= num_problems)
+        << "get_moe_workspace_size: scale_problems must cover every GEMM problem";
+    TVM_FFI_ICHECK_LE(scale_problems, std::numeric_limits<int>::max() / int64_t{31})
+        << "get_moe_workspace_size: scale_problems exceeds int32 padding range";
     TVM_FFI_ICHECK(a_is_fp8 && b_is_fp8)
         << "get_moe_workspace_size: the private SM90 push runner accepts FP8 A and FP8 B";
     TVM_FFI_ICHECK_LE(num_problems, std::numeric_limits<int>::max())
         << "get_moe_workspace_size: num_problems exceeds int32";
-    int64_t const scale_padding = num_problems * int64_t{31};
+    int64_t const scale_padding = scale_problems * int64_t{31};
     TVM_FFI_ICHECK_LE(expected_m, std::numeric_limits<int>::max())
         << "get_moe_workspace_size: expected_m exceeds int32";
     TVM_FFI_ICHECK_LE(max_rows, std::numeric_limits<int>::max() - scale_padding)
@@ -160,7 +174,7 @@ class Fp8MoeGemmRunner : public tvm::ffi::ModuleObj {
 
     expected_m_ = expected_m;
     max_rows_ = ceil_div(max_rows, int64_t{4}) * 4;
-    padded_rows_ = deep_gemm::compute_padded_offset(max_rows, num_problems);
+    padded_rows_ = deep_gemm::compute_padded_offset(max_rows, scale_problems);
     max_shape_n_ = shape_n;
     max_shape_k_ = shape_k;
     num_problems_ = num_problems;
