@@ -23,7 +23,7 @@ from flashinfer.profiler import export_to_perfetto_trace
 
 
 def profile_deepseek_mla_decode(
-    batch_size, seq_len, num_heads, profiler_buffer_size, backend
+    batch_size, seq_len, num_heads, profiler_buffer_size, backend, topk=None
 ):
     head_dim_ckv = 512
     head_dim_kpe = 64
@@ -43,7 +43,7 @@ def profile_deepseek_mla_decode(
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace_buffer, backend=backend
+        workspace_buffer, backend=backend, topk=topk
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * seq_len
@@ -63,6 +63,7 @@ def profile_deepseek_mla_decode(
         q_nope.dtype,
         ckv.dtype,
         use_profiler=True,
+        topk=topk,
     )
     profiler_buffer = torch.zeros(
         (profiler_buffer_size,), dtype=torch.uint64, device="cuda"
