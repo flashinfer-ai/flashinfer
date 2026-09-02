@@ -2067,7 +2067,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             block_tables,
             max_item_len_ptr,
             max_token_per_sequence,
-            prefix_len_ptr,
             rope_scale,
             rope_theta,
             seq_lens_q,
