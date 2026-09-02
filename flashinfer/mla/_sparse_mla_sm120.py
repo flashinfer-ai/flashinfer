@@ -551,6 +551,28 @@ def get_sparse_mla_sm120_module():
         kv_pbs = _packed_kv_page_block_size(
             kv_cache, model_type=model_type, name="kv_cache"
         )
+        if model_type in (
+            _MODEL_TYPE_DSV3_2,
+            _MODEL_TYPE_GLM_NSA,
+            _MODEL_TYPE_GLM53_NOPE,
+        ) and not (
+            kv_cache.is_contiguous()
+            and (
+                kv_cache.ndim == 2
+                or kv_cache.shape[-1] == _bytes_per_token_for_model_type(model_type)
+            )
+        ):
+            # Inline-scale prefill kernels address the cache as a flat token
+            # array; crossover can route any decode-form call there, so the
+            # restriction cannot wait for a prefill-routed call to fire.
+            raise ValueError(
+                "inline-scale (DSv3.2/GLM) KV caches must be densely packed "
+                "(contiguous, exact row width): prefill-routed calls address "
+                "the cache as a flat token array, and the calibrated "
+                "crossover can route decode-form calls to prefill. Padded "
+                "rows/strides are supported only by the standalone decode "
+                "entry (sparse_mla_sm120_decode_dsv3_2)"
+            )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         planned = plan(
             num_tokens,
@@ -686,7 +708,11 @@ def _sparse_mla_sm120_paged_attention(
         ``[num_blocks, 1, page_block_size, bytes]``, or NHD
         ``[num_blocks, page_block_size, 1, bytes]``. The SM120 binding derives
         page size and block stride from the tensor metadata without
-        materializing a layout conversion.
+        materializing a layout conversion. Padded block strides are honored
+        only for footer-scale models (DSv4 / DOTS3_SWA); inline-scale
+        (DSv3.2 / GLM) caches must be densely packed (contiguous, exact row
+        width), since crossover can route any decode-form call to the
+        flat-addressing prefill kernels.
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
