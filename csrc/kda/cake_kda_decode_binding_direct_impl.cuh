@@ -34,6 +34,9 @@
 #ifndef CAKE_KDA_DECODE_WARPS_PER_CTA
 #error "CAKE_KDA_DECODE_WARPS_PER_CTA must be defined by the binding translation unit"
 #endif
+#ifndef CAKE_KDA_DECODE_KERNEL_SYMBOL
+#error "CAKE_KDA_DECODE_KERNEL_SYMBOL must name the frozen Cake kernel"
+#endif
 
 namespace flashinfer {
 namespace cake_kda_decode {
@@ -64,11 +67,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
                   ctx.num_sequences, 1);
   const dim3 block(CAKE_KDA_DECODE_LAUNCH_THREADS, 1, 1);
 #if CAKE_KDA_DECODE_GATE_KIND == 2
-#if CAKE_KDA_DECODE_WARPS_PER_CTA == 2
-  kernel_flashinfer_recurrent_kda_t1_unbounded_softplus_warp2<<<grid, block, 0, ctx.stream>>>(
-#else
-  kernel_flashinfer_recurrent_kda_t1_unbounded_softplus<<<grid, block, 0, ctx.stream>>>(
-#endif
+  CAKE_KDA_DECODE_KERNEL_SYMBOL<<<grid, block, 0, ctx.stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),

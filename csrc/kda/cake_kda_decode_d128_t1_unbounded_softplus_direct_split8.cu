@@ -16,21 +16,33 @@
 
 // clang-format off
 // Frozen Cake recurrent-KDA export; do not edit by hand.
-// Raw generated body SHA256: 0cd542dd0e6327d89d00a2fd835cbdf657bf2c2d67caf9d58df5bcc8f194c6e8
-// Normalized generated SHA256: 5212fdda593d60f3ef2897f44ac3a81fd15d87fd3fa39c5463635a4bb4378718
+// Raw generated body SHA256: 6d41f02d7e47854cac11b3700da91648a5cce2ccb838eb7b315464736c14cdba
+// Normalized generated SHA256: 6d41f02d7e47854cac11b3700da91648a5cce2ccb838eb7b315464736c14cdba
 // BEGIN FROZEN GENERATED BODY
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
 typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeKDATensorMap { uint64_t opaque[16]; };
 template <int N>
 struct __align__(128) CakeKDATensorMapPack { CakeKDATensorMap maps[N]; };
 
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
 
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byte aligned");
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
@@ -49,7 +61,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
+kernel_cake_kda_t1_contract_e724f2cceb5341e2df2e(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta, float* __restrict__ A_log, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens, int* __restrict__ ssm_state_indices, int* __restrict__ num_accepted_tokens, float scale, int q_stride_token, int k_stride_token, int v_stride_token, int g_stride_token, int beta_stride_token, int state_stride_slot, long long q_stride_token_wide, long long k_stride_token_wide, long long v_stride_token_wide, long long g_stride_token_wide, long long beta_stride_token_wide, long long state_stride_slot_wide, int beta_is_logit, int state_base_mod8, int H, int HV, int head_ratio)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -107,7 +119,8 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
     {
         if (has_token) {
             {
-                uint2 _vld_0 = *reinterpret_cast<const uint2*>(q + q_base_narrow);
+                uint2 _vld_0;
+                _vld_0 = *reinterpret_cast<const uint2*>(q + q_base_narrow);
                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -121,7 +134,8 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
                 }
             }
             {
-                uint2 _vld_1 = *reinterpret_cast<const uint2*>(k + k_base_narrow);
+                uint2 _vld_1;
+                _vld_1 = *reinterpret_cast<const uint2*>(k + k_base_narrow);
                 uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -135,7 +149,8 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
                 }
             }
             {
-                uint2 _vld_2 = *reinterpret_cast<const uint2*>(g + gate_base_narrow);
+                uint2 _vld_2;
+                _vld_2 = *reinterpret_cast<const uint2*>(g + gate_base_narrow);
                 uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -238,8 +253,7 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
                         asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_vld_3[_blk].x), "=r"(_vld_3[_blk].y), "=r"(_vld_3[_blk].z), "=r"(_vld_3[_blk].w)
-                            : "l"(_vptr_3 + _blk) : "memory");
+                            : "=r"(_vld_3[_blk].x), "=r"(_vld_3[_blk].y), "=r"(_vld_3[_blk].z), "=r"(_vld_3[_blk].w) : "l"((const void*)(_vptr_3 + _blk)) : "memory");
                         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
@@ -318,6 +332,5 @@ kernel_flashinfer_recurrent_kda_t1_unbounded_softplus(__nv_bfloat16* __restrict_
 }
 
 } // extern "C"
-
 // END FROZEN GENERATED BODY
 // clang-format on
