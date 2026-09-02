@@ -675,6 +675,79 @@ def test_pcie_hybrid_mkey_pitch_validation_precedes_native(monkeypatch):
     )
 
 
+def test_chunk_exchange_geometry_is_identity_at_mode_two():
+    comm = _make_mock_pcie_comm()
+    x = torch.empty((1, 1, 2, 1024), dtype=torch.float16)
+    assert comm._output_geometry(x, "exchange_chunks") == ((1, 1, 2, 1024), 2)
+
+    # One chunk per peer, and nothing to iterate over on the leading axes --
+    # those two premises are what let the descriptor collapse to a single row.
+    for bad, match in (
+        (
+            torch.empty((2, 1, 2, 8), dtype=torch.float16),
+            r"\[1, 1, world_size, chunk\]",
+        ),
+        (
+            torch.empty((1, 3, 2, 8), dtype=torch.float16),
+            r"\[1, 1, world_size, chunk\]",
+        ),
+        (torch.empty((1, 1, 4, 8), dtype=torch.float16), r"one chunk per peer"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            comm._output_geometry(bad, "exchange_chunks")
+
+
+def test_chunk_exchange_is_exempt_from_the_mkey_pitch_limit():
+    """The 65535 limit bounds a stride; a single-row descriptor has none.
+
+    The exemption must not leak to the interleaved transforms, which is the
+    half of this that would fail silently -- an over-long row would reach the
+    provider and be rejected there instead of here.
+    """
+    comm = _make_mock_pcie_comm()
+    over = torch.empty((1, 1, 2, 65536), dtype=torch.uint8)
+    comm._validate(over, "exchange_chunks", torch.uint8)
+    with pytest.raises(ValueError, match=r"element_size <= 65535"):
+        comm._validate(over, "scatter_heads", torch.uint8)
+
+
+def test_chunk_exchange_world_size_one_is_identity():
+    comm = _make_mock_pcie_comm()
+    comm.world_size = 1
+    x = torch.arange(8, dtype=torch.float16).reshape(1, 1, 1, 8)
+    assert comm.exchange_chunks(x) is x
+    out = torch.empty_like(x)
+    assert comm.exchange_chunks(x, out) is out
+    assert torch.equal(out, x)
+
+
+def test_chunk_exchange_is_a_registered_output_op(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    x = torch.empty((1, 1, 2, 64), dtype=torch.float16)
+    storage = torch.empty(1 << 20, dtype=torch.float16)
+    seen = {}
+    module = SimpleNamespace(
+        allocate_output=lambda _h, _t, mode, _c: (
+            seen.setdefault("mode", mode),
+            (storage, [1, 2, 3]),
+        )[1],
+        connect_output=lambda *_args: None,
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+
+    out = comm.allocate_output(x, "exchange_chunks")
+    assert seen["mode"] == 2
+    assert tuple(out.shape) == (1, 1, 2, 64)
+    assert comm._pcie_outputs[storage.data_ptr()] == 2
+
+    with pytest.raises(ValueError, match="exchange_chunks"):
+        comm.allocate_output(x, "scatter_chunks")
+
+
 def test_pcie_allocate_output_rejects_capture_before_allocation(monkeypatch):
     ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     comm = _make_mock_pcie_comm()
@@ -2516,6 +2589,70 @@ def _pcie_input_landing_body(rank, world_size, group, _arg):
         torch.cuda.synchronize(device)
         assert torch.equal(out, staged_x)
     return ("ok", world_size)
+
+
+def _pcie_exchange_chunks_body(rank, world_size, group, route):
+    """Chunk exchange on the wire, against all_to_all_single at zero tolerance.
+
+    The chunk is deliberately far past the 65535-byte interleaved-stride limit
+    that bounds the head-axis transforms. That limit is on mlx5's bytes_skip,
+    and this op registers no MKey at all -- each peer's bytes are contiguous on
+    both ends, so the NIC reads them through the plain memory region at a
+    linear offset. Reaching the same result as NCCL is what shows the linear
+    addressing lands where the interleaved one would have.
+    """
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = route
+    torch.manual_seed(6000 + rank)
+    chunk = 1 << 18  # 256 KiB per peer
+    packed = torch.randint(
+        0, 256, (1, 1, world_size, chunk), dtype=torch.uint8, device=device
+    )
+    with UlyssesCommunicator(
+        max_bytes=packed.nbytes, dtype=torch.uint8, backend="pcie", device=device
+    ) as comm:
+        if route == "rdma" and comm.transport not in ("hybrid", "rdma"):
+            raise UlyssesBackendError(
+                f"forced rdma fell back to {comm.transport}; this case is about "
+                "the RDMA descriptor"
+            )
+        out = comm.allocate_output(packed, "exchange_chunks", dtype=torch.uint8)
+        comm.exchange_chunks(packed, out=out, dtype=torch.uint8)
+        torch.cuda.synchronize(device)
+
+        reference = torch.empty_like(packed)
+        dist.all_to_all_single(reference.view(-1), packed.reshape(-1), group=group)
+        torch.cuda.synchronize(device)
+        assert torch.equal(out, reference)
+
+        # A second call on the same registration: the geometry rebind that the
+        # head-axis transforms do must stay skipped rather than half-applied.
+        again = torch.randint(
+            0, 256, (1, 1, world_size, chunk), dtype=torch.uint8, device=device
+        )
+        comm.exchange_chunks(again, out=out, dtype=torch.uint8)
+        dist.all_to_all_single(reference.view(-1), again.reshape(-1), group=group)
+        torch.cuda.synchronize(device)
+        assert torch.equal(out, reference)
+    return ("ok", world_size)
+
+
+@pytest.mark.parametrize("route", ["rdma", "p2p"])
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_correctness_forced_pcie_exchange_chunks(world_size, route):
+    """A packed payload past the stride limit crosses both routes unchanged."""
+    _run_multi_rank(
+        "_pcie_exchange_chunks_body",
+        world_size,
+        route,
+        timeout=600,
+        allow_skip=True,
+    )
 
 
 @pytest.mark.parametrize("world_size", [2, 8])
