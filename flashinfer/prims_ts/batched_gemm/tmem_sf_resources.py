@@ -483,16 +483,88 @@ class TmemSfRouteResource(MemoryResource):
                         + Int32(sttm_idx * col_stride)
                     )
                     tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                    if cutlass.const_expr(source_slices == 1):
+                    if cutlass.const_expr(source_slices == 6):
+                        # tcgen05.st only accepts power-of-two vector lengths.
+                        # A 192-row R8c4 tile has six 32-row source slices, so
+                        # publish it as the hardware-supported 4+2 sequence.
+                        prims.tcgen05_st(
+                            "32x32b",
+                            tmem_ptr,
+                            cutlass.Vector.from_elements(
+                                tuple(src_vals[:4]), dtype=cutlass.Int32
+                            ),
+                        )
+                        tail_tmem_ptr = prims.make_tmem_ptr(
+                            tmem_addr + Int32(4), cutlass.Int32
+                        )
+                        prims.tcgen05_st(
+                            "32x32b",
+                            tail_tmem_ptr,
+                            cutlass.Vector.from_elements(
+                                tuple(src_vals[4:]), dtype=cutlass.Int32
+                            ),
+                        )
+                    elif cutlass.const_expr(source_slices == 1):
                         src = src_vals[0]
+                        prims.tcgen05_st(
+                            "32x32b",
+                            tmem_ptr,
+                            src,
+                        )
                     else:
                         src = cutlass.Vector.from_elements(
                             tuple(src_vals), dtype=cutlass.Int32
                         )
+                        prims.tcgen05_st(
+                            "32x32b",
+                            tmem_ptr,
+                            src,
+                        )
+            elif cutlass.const_expr(smem_layout == int(SfLayout.R128c4)):
+                # Routed N=192 SFB is staged in two physical R128 blocks but
+                # MMA expects six contiguous 32-row TMEM columns. Load the six
+                # logical slices from their shuffled R128 positions and emit
+                # the same legal x4+x2 STTM sequence used by compact R8c4.
+                num_sttm_iters = sf_k // TMEM_SF_PACK_SIZE_BYTES
+                for sttm_idx in cutlass.range_constexpr(num_sttm_iters):
+                    src_vals = []
+                    for source_slice in cutlass.range_constexpr(source_slices):
+                        block_idx = source_slice // 4
+                        quadrant = source_slice % 4
+                        smem_word_offset = (
+                            (block_idx * num_sttm_iters + sttm_idx) * 512
+                            + lane_id * Int32(16)
+                            + Int32(quadrant * 4)
+                        )
+                        smem_word = cutlass.Array(
+                            stage_base.data_ptr() + smem_word_offset,
+                            dtype=cutlass.Int32,
+                            shape=(1,),
+                            addrspace=3,
+                        )
+                        src_vals.append(smem_word.load())
+                    tmem_addr = (
+                        self.sf_tmem_addr_base
+                        + sf_stage_col_offset
+                        + Int32(sttm_idx * col_stride)
+                    )
+                    tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
                     prims.tcgen05_st(
                         "32x32b",
                         tmem_ptr,
-                        src,
+                        cutlass.Vector.from_elements(
+                            tuple(src_vals[:4]), dtype=cutlass.Int32
+                        ),
+                    )
+                    tail_tmem_ptr = prims.make_tmem_ptr(
+                        tmem_addr + Int32(4), cutlass.Int32
+                    )
+                    prims.tcgen05_st(
+                        "32x32b",
+                        tail_tmem_ptr,
+                        cutlass.Vector.from_elements(
+                            tuple(src_vals[4:]), dtype=cutlass.Int32
+                        ),
                     )
             elif cutlass.const_expr(smem_layout == int(SfLayout.LINEAR)):
                 num_vec4 = sf_k // TMEM_SF_PACK_SIZE_BYTES
@@ -553,7 +625,8 @@ class TmemSfRouteResource(MemoryResource):
                 raise AssertionError(
                     f"Unsupported LDS+STTM SMEM SF layout: {smem_layout}"
                 )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            # Lowers to tcgen05.wait::st.sync.aligned, ordering the STTM
+            # writes above before the TS full-barrier commit consumed by MMA.
             cute.arch.fence_view_async_tmem_store()
         else:
             s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
@@ -578,22 +651,6 @@ class TmemSfRouteResource(MemoryResource):
                         )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
                 cute.arch.fence_view_async_tmem_store()
-
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def sync_sttm_copy(self, stage_info: StageInfo) -> None:
-        """Sync all LDS+STTM CopySf warps before releasing reused SMEM."""
-        is_b = cutlass.const_expr(self._operand == "b")
-        copy_mode = (
-            self.cfg.sfb_smem_to_tmem_copy if is_b else self.cfg.sfa_smem_to_tmem_copy
-        )
-        use_sttm = cutlass.const_expr(copy_mode == int(SfSmemToTmemCopy.LDS_STTM))
-        if cutlass.const_expr(use_sttm):
-            barrier_id = 4 if is_b else 5
-            thread_count = (
-                self.cfg.num_copy_sfb_warps if is_b else self.cfg.num_copy_sfa_warps
-            ) * 32
-            prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=thread_count)
 
     @cute.jit
     def _consumer_work_impl(self, stage_info: StageInfo):

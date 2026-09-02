@@ -169,8 +169,11 @@ class TestScheduleValidation:
             for resource in task.src_resources + task.dst_resources
         ]
 
-        assert task_manager._assume_pdl_wait_completed is True
-        assert not any(
+        # qgai's Gen-matched non-gather FC2 schedule loads the launch bound in
+        # the prologue but keeps the PDL wait on the FC1-output consumer.  Only
+        # gather schedules may mark the wait complete before task execution.
+        assert task_manager._assume_pdl_wait_completed is False
+        assert any(
             isinstance(resource, PdlWaitBarrier) for resource in all_task_resources
         )
         assert any(

@@ -54,6 +54,83 @@ BACKENDS = ("trtllm", "prims_ts")
 
 
 @dataclass(frozen=True)
+class MoeModelPreset:
+    quant_mode: str
+    num_tokens: tuple[int, ...]
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    routed_scaling_factor: float
+    swiglu_limit: float
+
+
+# These presets benchmark the routed-expert fused kernel only.  V4's router and
+# shared expert are intentionally excluded so both backends receive identical
+# precomputed routing decisions and execute the same FC1/SwiGLU/FC2 workload.
+MODEL_PRESETS = {
+    "deepseek-v4-flash": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+    ),
+    "deepseek-v4-pro": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=384,
+        hidden_size=7168,
+        intermediate_size=3072,
+        top_k=6,
+        routed_scaling_factor=2.5,
+        swiglu_limit=10.0,
+    ),
+}
+
+
+def _apply_model_preset(args: argparse.Namespace) -> None:
+    if args.model == "custom":
+        return
+
+    if args.model == "kimi-k3":
+        args.quant_mode = "MxFP4xMxFP8"
+        if args.num_tokens is None:
+            args.num_tokens = [1024]
+        args.num_experts = 896
+        args.local_num_experts = 56
+        args.local_expert_offset = 0
+        args.hidden_size = 3584
+        args.intermediate_size = 3072
+        args.top_k = 16
+        args.activation_type = ActivationType.Situ
+        args.gemm1_alpha = 4.0
+        args.gemm1_beta = 25.0
+        args.use_bias = False
+        args.routed = True
+        args.routed_scaling_factor = None
+        args.swiglu_limit = None
+        return
+
+    preset = MODEL_PRESETS[args.model]
+    args.quant_mode = preset.quant_mode
+    if args.num_tokens is None:
+        args.num_tokens = list(preset.num_tokens)
+    args.num_experts = preset.num_experts
+    args.hidden_size = preset.hidden_size
+    args.intermediate_size = preset.intermediate_size
+    args.top_k = preset.top_k
+    args.use_bias = False
+    args.routed = True
+    args.activation_type = ActivationType.Swiglu
+    args.routed_scaling_factor = preset.routed_scaling_factor
+    args.swiglu_limit = preset.swiglu_limit
+
+
+@dataclass(frozen=True)
 class BenchmarkSetup:
     batch_size: int
     backend: str
@@ -70,11 +147,18 @@ class BenchmarkResult:
 
 
 def _pack_topk(
-    num_tokens: int, top_k: int, num_experts: int, device: torch.device
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    device: torch.device,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
     raw_w = torch.rand(num_tokens, top_k, device=device)
-    weights = (raw_w / raw_w.sum(-1, keepdim=True)).to(torch.bfloat16)
+    weights = raw_w / raw_w.sum(-1, keepdim=True)
+    if routed_scaling_factor is not None:
+        weights *= routed_scaling_factor
+    weights = weights.to(torch.bfloat16)
     return (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
 
 
@@ -157,38 +241,51 @@ def _run_benchmark(
     iterations: int,
     config_str: str,
     tuning_buckets: Optional[list[int]] = None,
+    cuda_graph_profile_replays: int = 1,
 ):
     AutoTuner.get().clear_cache()
 
     measure = partial(_measure, warmups=warmups, iterations=iterations)
 
-    # measure untuned
-    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
-
-    # Tune each backend once.  The tuning config controls whether this covers
+    # Tune before starting CUPTI activity tracing. Repeated CUPTI
+    # initialize/finalize cycles can destabilize later CuTe CUDA-graph tactic
+    # profiling in the same process. The timing order does not affect either
+    # reported value: autotuning and JIT stay outside every measured sample.
+    # The tuning config controls whether this covers
     # all buckets up to tune_max or only the explicit user-requested buckets.
     tuned_backends = set()
     tuning_buckets_tuple = None if tuning_buckets is None else tuple(tuning_buckets)
     for setup in setups:
         if setup.backend in tuned_backends:
             continue
-        with autotune(True, tuning_buckets=tuning_buckets_tuple):
+        with autotune(
+            True,
+            tuning_buckets=tuning_buckets_tuple,
+            cuda_graph_profile_replays=cuda_graph_profile_replays,
+        ):
             setup.fn(**setup.input_kwargs)
         tuned_backends.add(setup.backend)
 
     # The same override must remain active for lookup as for profiling.  Without
     # it, explicit buckets are cached under one profile mapping and measured
     # under the API's default mapping, which can silently fall back to tactic -1.
-    with autotune(False, tuning_buckets=tuning_buckets_tuple):
-        results = [
-            BenchmarkResult(
-                setup.batch_size,
-                setup.backend,
-                ms,
-                measure(setup.fn, setup.input_kwargs),
-            )
-            for setup, ms in zip(setups, ms_no_autotune, strict=True)
-        ]
+    with autotune(
+        False,
+        tuning_buckets=tuning_buckets_tuple,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
+    ):
+        ms_tuned = [measure(setup.fn, setup.input_kwargs) for setup in setups]
+
+    # Clear only selected tactics, then collect the heuristic controls. Kernel
+    # modules and generated input tensors remain unchanged.
+    AutoTuner.get().clear_cache()
+    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
+    results = [
+        BenchmarkResult(setup.batch_size, setup.backend, ms, tuned_ms)
+        for setup, ms, tuned_ms in zip(
+            setups, ms_no_autotune, ms_tuned, strict=True
+        )
+    ]
 
     _print_table(results, config_str)
     return results
@@ -609,6 +706,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     backends: list[str],
     tuning_buckets: Optional[list[int]] = None,
     routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -792,6 +890,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
         tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -808,10 +907,17 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     warmups: int,
     iterations: int,
     activation_type: int,
+    gemm1_alpha: Optional[float],
+    gemm1_beta: Optional[float],
+    gemm1_clamp_limit: Optional[float],
     backends: list[str],
     tuning_buckets: Optional[list[int]] = None,
     use_bias: bool = True,
     routed: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
+    model: str = "custom",
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -909,6 +1015,16 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         [hidden_states_global_scale * w2_global_scale] * local_num_experts,
         device=device,
     )
+    gemm1_clamp_limit = (
+        torch.full(
+            (local_num_experts,),
+            swiglu_limit,
+            dtype=torch.float32,
+            device=device,
+        )
+        if swiglu_limit is not None
+        else None
+    )
 
     shuffled = _shuffle_fp4_major_k(
         w13,
@@ -925,9 +1041,21 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
 
     fp4_kwargs = dict(
         routing_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
+        gemm1_alpha=(
+            None
+            if gemm1_alpha is None
+            else torch.full(
+                (local_num_experts,), gemm1_alpha, dtype=torch.float32, device=device
+            )
+        ),
+        gemm1_beta=(
+            None
+            if gemm1_beta is None
+            else torch.full(
+                (local_num_experts,), gemm1_beta, dtype=torch.float32, device=device
+            )
+        ),
+        gemm1_clamp_limit=gemm1_clamp_limit,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
@@ -938,7 +1066,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         intermediate_size=intermediate_size,
         local_expert_offset=local_expert_offset,
         local_num_experts=local_num_experts,
-        routed_scaling_factor=None,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
         enable_pdl=enable_pdl,
@@ -974,7 +1102,13 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
 
         if routed:
             common_fn_kwargs = dict(
-                topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
+                topk_ids=_pack_topk(
+                    batch_size,
+                    top_k,
+                    num_experts,
+                    device,
+                    routed_scaling_factor,
+                ),
                 **fp4_kwargs,
             )
         else:
@@ -1010,11 +1144,16 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         setups,
         warmups,
         iterations,
-        f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
+        f"model={model}  quant_mode={quant_mode}  routing={mode_str}"
+        f"  experts={num_experts}"
         f"  local_experts={local_num_experts}  local_offset={local_expert_offset}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
-        f"  bias={use_bias}",
+        f"  bias={use_bias}  routed_scale={routed_scaling_factor}"
+        f"  swiglu_limit={swiglu_limit}"
+        f"  activation={ActivationType(activation_type).name}"
+        f"  gemm1_alpha={gemm1_alpha}  gemm1_beta={gemm1_beta}",
         tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -1029,6 +1168,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
     warmups: int,
     iterations: int,
     activation_type: int,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -1097,11 +1237,25 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         iterations,
         f"quant_mode={quant_mode}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="custom",
+        choices=["custom", *MODEL_PRESETS, "kimi-k3"],
+        help=(
+            "MoE model preset. DeepSeek-V4 and Kimi-K3 presets select the "
+            "checkpoint's "
+            "MXFP4-weight/MXFP8-activation routed-expert shape, Top-K, routing "
+            "scale/activation, and no-bias path. --num-tokens and TP remain "
+            "configurable."
+        ),
+    )
     parser.add_argument(
         "--quant-mode",
         type=str,
@@ -1190,12 +1344,39 @@ if __name__ == "__main__":
         "--iterations", type=int, default=100, help="Number of benchmark iterations"
     )
     parser.add_argument(
+        "--cuda-graph-profile-replays",
+        type=int,
+        default=1,
+        help=(
+            "Back-to-back CUDA graph warmup and timed replays used to profile "
+            "every autotuned config."
+        ),
+    )
+    parser.add_argument(
         "--activation-type",
         type=enum_type(ActivationType),
         metavar=str([e.name for e in ActivationType]),
         required=False,
         default=ActivationType.Swiglu,
         help=f"Type of activation function: {[e.name for e in ActivationType]}",
+    )
+    parser.add_argument(
+        "--gemm1-alpha",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation alpha (Kimi K3 SiTU gate beta: 4.0).",
+    )
+    parser.add_argument(
+        "--gemm1-beta",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation beta (Kimi K3 SiTU linear beta: 25.0).",
+    )
+    parser.add_argument(
+        "--gemm1-clamp-limit",
+        type=float,
+        default=None,
+        help="Optional per-local-expert gated activation clamp limit.",
     )
     parser.add_argument(
         "--routed",
@@ -1213,8 +1394,21 @@ if __name__ == "__main__":
         default=None,
         help="Write configuration, environment, and raw median results as JSON.",
     )
+    parser.add_argument(
+        "--routed-scaling-factor",
+        type=float,
+        default=None,
+        help="Optional routing-weight scale applied by the fused MoE operation.",
+    )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help="Optional per-expert SwiGLU clamp limit for FP4 MoE.",
+    )
     args = parser.parse_args()
 
+    _apply_model_preset(args)
     torch.manual_seed(args.seed)
 
     if args.num_tokens is None:
@@ -1274,6 +1468,7 @@ if __name__ == "__main__":
             backends,
             tuning_buckets=args.tuning_buckets,
             routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     elif is_mxint4:
         results = bench_trtllm_gen_fused_moe_autotuner_mxint4(
@@ -1287,6 +1482,7 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     else:
         results = bench_trtllm_gen_fused_moe_autotuner_fp4(
@@ -1302,10 +1498,17 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            args.gemm1_alpha,
+            args.gemm1_beta,
+            args.gemm1_clamp_limit,
             backends,
             tuning_buckets=args.tuning_buckets,
             use_bias=args.use_bias,
             routed=args.routed,
+            routed_scaling_factor=args.routed_scaling_factor,
+            swiglu_limit=args.swiglu_limit,
+            model=args.model,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
 
     if args.output_json is not None:

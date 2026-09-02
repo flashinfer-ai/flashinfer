@@ -53,11 +53,14 @@ def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
         expert_ids = make_random_topk_ids(
             num_experts=num_experts,
             num_tokens=math.prod(shapes[:-1]),
             top_k=shapes[-1],
             device=device,
+            generator=generator,
         ).view(shapes)
         if not packed:
             return expert_ids
@@ -69,13 +72,57 @@ def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
     return _init
 
 
+def make_repeating_tensor_initializer(
+    source: torch.Tensor,
+    *,
+    num_experts: int | None = None,
+    packed: bool = True,
+) -> Callable:
+    """Initialize tuning routes from runtime data without amplifying imbalance.
+
+    Preserve the caller's exact route rows when the profile is no larger than
+    the runtime source. If a dynamic profile is larger, literal repetition can
+    turn a one-token route into a pathological all-tokens-to-four-experts
+    workload. When ``num_experts`` is provided, expanded profiles instead use
+    the deterministic realistic sampler shared by all backends.
+    """
+    if source.ndim < 1 or source.numel() == 0:
+        raise ValueError("source must be a non-empty tensor")
+
+    source = source.detach()
+    source_width = source.shape[-1]
+    source_rows = source.reshape(-1, source_width)
+
+    def _initializer(shapes, dtype, device):
+        if len(shapes) < 1 or shapes[-1] != source_width:
+            raise ValueError(
+                f"Cannot initialize shape {tuple(shapes)} from source shape "
+                f"{tuple(source.shape)}"
+            )
+        target_rows = math.prod(shapes[:-1])
+        if target_rows == 0:
+            return torch.empty(shapes, dtype=dtype, device=device)
+        if num_experts is not None and target_rows > source_rows.shape[0]:
+            return moe_topk_ids_init(num_experts, packed=packed)(
+                shapes, dtype, device
+            )
+        repeats = (target_rows + source_rows.shape[0] - 1) // source_rows.shape[0]
+        return (
+            source_rows.to(device=device, dtype=dtype)
+            .repeat(repeats, 1)[:target_rows]
+            .reshape(shapes)
+        )
+
+    return _initializer
+
+
 def make_moe_tuning_config(
     moe_inputs: MoeRunnerInputs,
     *,
     num_experts: int,
     hidden_size: int,
     fp8_quantization_type: Fp8QuantizationType,
-    init_packed_topk_ids: Callable,
+    init_packed_topk_ids: Callable | None,
     tune_max_num_tokens: int = 8192,
     **kwargs: Any,
 ) -> TuningConfig:
@@ -88,7 +135,9 @@ def make_moe_tuning_config(
     if moe_inputs.routing_logits is not None:
         spec["routing_logits"] = autotuner_initializer_rand
     if moe_inputs.topk_ids is not None:
-        spec["topk_ids"] = init_packed_topk_ids
+        # Empty routed placeholders remain dynamic inputs so their historical
+        # bucketed cache-key shape is preserved. They carry no route payload.
+        spec["topk_ids"] = init_packed_topk_ids or autotuner_initializer_empty
     if moe_inputs.expert_weights is not None:
         spec["expert_weights"] = autotuner_initializer_ones
     if moe_inputs.hidden_states_scale is not None:

@@ -31,7 +31,7 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_NVFP4_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
-SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
+SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_MXFP4_BF16_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_DSFP8_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_MXFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
@@ -42,6 +42,7 @@ _ACTIVATION_TO_ACT_KIND = {
     int(ActivationType.Geglu): 2,
     int(ActivationType.Relu2): 3,
     int(ActivationType.Silu): 4,
+    int(ActivationType.Situ): 5,
 }
 
 
@@ -67,6 +68,7 @@ class _ActKind(IntEnum):
     GEGLU = 2
     RELU2 = 3
     SILU = 4
+    SITU = 5
 
 
 class _DType(IntEnum):
@@ -132,6 +134,7 @@ class _JsonBatchedGemmConfig:
     comment: str
     combo_index: int
     options: dict[str, object]
+    is_scheduler_union_variant: bool = False
 
 
 _SUPPORTED_JSON_OPTION_KEYS = frozenset(
@@ -149,6 +152,8 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "epi_tile_n",
         "epilogue_regs",
         "fused_act",
+        "fuse_operand_sf_loads",
+        "fuse_sf_copy_to_mma",
         "gather_regs",
         "load_a_regs",
         "load_b_regs",
@@ -202,6 +207,7 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "use_tma_oob_opt",
         "use_tma_store",
         "use_two_tma_load_warps",
+        "use_unroll_loop_2x_for_mma",
         "use_work_throttle",
         "weight_layout",
         "workid_regs",
@@ -235,12 +241,18 @@ def _selected_tile_ns(
     )
     center_idx = supported_tiles.index(center_tile)
     selected_tiles = {center_tile}
-    if center_idx + 1 < len(supported_tiles):
-        selected_tiles.add(supported_tiles[center_idx + 1])
-        if center_idx + 2 < len(supported_tiles):
-            selected_tiles.add(supported_tiles[center_idx + 2])
+    for offset in (1, 2, 3):
+        if center_idx + offset < len(supported_tiles):
+            selected_tiles.add(supported_tiles[center_idx + offset])
     if center_idx > 0:
-        selected_tiles.add(supported_tiles[center_idx - 1])
+        lower_tile = supported_tiles[center_idx - 1]
+        selected_tiles.add(lower_tile)
+        # Keep the original power-of-two lower neighbor when an intermediate
+        # expert-token tile (for example 192) is added below the center. This
+        # lets the autotuner consider N=192 for large routes without dropping
+        # the N=128 tactics that are important for smaller EP workloads.
+        if center_idx > 1 and lower_tile & (lower_tile - 1):
+            selected_tiles.add(supported_tiles[center_idx - 2])
     return tuple(sorted(selected_tiles))
 
 
@@ -454,11 +466,15 @@ def _activation_json_fused_act(activation_type: int) -> bool:
         int(ActivationType.Swiglu),
         int(ActivationType.Geglu),
         int(ActivationType.Silu),
+        int(ActivationType.Situ),
     )
 
 
 def _activation_json_act(activation_type: int) -> str:
-    if int(activation_type) == int(ActivationType.Swiglu):
+    if int(activation_type) in (
+        int(ActivationType.Swiglu),
+        int(ActivationType.Situ),
+    ):
         return "swiglu"
     if int(activation_type) == int(ActivationType.Geglu):
         return "geglu"
@@ -566,6 +582,39 @@ def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
             )
             _validate_json_options(cfg, options)
             expanded.append(cfg)
+
+    # Keep every existing config and append the persistent fast-drain plus
+    # work-throttled counterpart when that exact scheduler variant is absent.
+    # Appending after the original expansion preserves every original global
+    # config index while making the scheduler-policy configurations available
+    # to fresh autotuning.
+    seen_options = {
+        json.dumps(cfg.options, sort_keys=True, separators=(",", ":"))
+        for cfg in expanded
+    }
+    original_configs = tuple(expanded)
+    for cfg in original_configs:
+        if str(cfg.options.get("tile_scheduler", "static")).lower() != "persistent":
+            continue
+        options = {
+            **cfg.options,
+            "use_clc_fast_drain": True,
+            "use_work_throttle": True,
+        }
+        options_key = json.dumps(options, sort_keys=True, separators=(",", ":"))
+        if options_key in seen_options:
+            continue
+        seen_options.add(options_key)
+        variant = _JsonBatchedGemmConfig(
+            global_index=len(expanded),
+            raw_index=cfg.raw_index,
+            comment=f"{cfg.comment} [fast-drain+work-throttle]",
+            combo_index=cfg.combo_index,
+            options=options,
+            is_scheduler_union_variant=True,
+        )
+        _validate_json_options(variant, options)
+        expanded.append(variant)
     return tuple(expanded)
 
 
@@ -642,7 +691,13 @@ def _json_config_matches_moe(
         if act_kind != int(_ActKind.NONE):
             return False
     elif fc == "fc1":
-        if act_kind != _activation_act_kind(activation_type):
+        expected_act_kind = _activation_act_kind(activation_type)
+        # SiTU uses the same gated GEMM geometry as SwiGLU. Existing JSON
+        # tactic rows describe geometry rather than the activation formula,
+        # so reuse SwiGLU rows and replace the generated ActKind below.
+        if expected_act_kind == int(_ActKind.SITU):
+            expected_act_kind = int(_ActKind.SWIGLU)
+        if act_kind != expected_act_kind:
             return False
     elif act_kind != int(_ActKind.NONE):
         return False
@@ -799,6 +854,16 @@ def _resolve_moe_json_config_pair(
                 ),
             )
         )
+    else:
+        # Appended union variants must not reinterpret any persisted baseline
+        # pair index. Keep the complete original FC1 x FC2 product first and
+        # place every pair involving a new scheduler variant afterward.
+        config_pairs.sort(
+            key=lambda pair: int(
+                _json_config_by_global_index(pair[0]).is_scheduler_union_variant
+                or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+            )
+        )
     total = len(config_pairs)
     if moe_config_index >= total:
         raise ValueError(
@@ -819,6 +884,7 @@ def _json_config_kwargs(
     cfg: _JsonBatchedGemmConfig,
     *,
     fc: str,
+    activation_type: int,
     has_bias: bool,
     default_dtype_a: int,
     default_dtype_b: int,
@@ -877,7 +943,11 @@ def _json_config_kwargs(
         "route_act": _json_route_value(options.get("route_act", False)),
         "route_sfs_act": _json_route_value(options.get("route_sfs_act", False)),
         "tile_scheduler": _json_scheduler_value(options["tile_scheduler"]),
-        "act_kind": _json_act_kind(options),
+        "act_kind": (
+            _activation_act_kind(activation_type)
+            if fc == "fc1" and not _bool_value(options.get("use_deepseek_fp8", False))
+            else _json_act_kind(options)
+        ),
         **_bias_kwargs(has_bias),
         "sf_layout_a": _json_sf_layout_value(options.get("sf_layout_a")),
         "sf_layout_b": _json_sf_layout_value(options.get("sf_layout_b")),
@@ -897,7 +967,9 @@ def _json_config_kwargs(
         "num_stages_tmem_sfa": int(options["num_stages_tmem_sfa"]),
         "num_stages_tmem_sfb": int(options["num_stages_tmem_sfb"]),
         "num_stages_tmem_acc": tmem_acc_stages,
-        "use_unroll_loop_2x_for_mma": 0,
+        "use_unroll_loop_2x_for_mma": int(
+            _bool_value(options.get("use_unroll_loop_2x_for_mma", False))
+        ),
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
@@ -913,6 +985,12 @@ def _json_config_kwargs(
         "use_global_scales": int(use_global_scales),
         "use_work_throttle": int(_bool_value(options.get("use_work_throttle", False))),
         "use_max_tmem_overlap": use_max_tmem_overlap,
+        "fuse_sf_copy_to_mma": int(
+            _bool_value(options.get("fuse_sf_copy_to_mma", False))
+        ),
+        "fuse_operand_sf_loads": int(
+            _bool_value(options.get("fuse_operand_sf_loads", False))
+        ),
         "epilogue_regs": epilogue_regs,
         "mma_regs": mma_regs,
         "load_regs": load_regs,
@@ -1064,6 +1142,7 @@ def _make_json_moe_config_pair(
                     **_json_config_kwargs(
                         fc1_json,
                         fc="fc1",
+                        activation_type=activation_type,
                         has_bias=fc1_has_bias,
                         default_dtype_a=dtype_a,
                         default_dtype_b=dtype_b,
@@ -1084,6 +1163,7 @@ def _make_json_moe_config_pair(
                     **_json_config_kwargs(
                         fc2_json,
                         fc="fc2",
+                        activation_type=activation_type,
                         has_bias=fc2_has_bias,
                         default_dtype_a=dtype_a,
                         default_dtype_b=dtype_b,

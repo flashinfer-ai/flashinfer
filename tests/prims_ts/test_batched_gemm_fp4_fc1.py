@@ -100,6 +100,8 @@ def _run_fp4_fc1(
     unroll=0,
     bias_type=0,
     gemm1_clamp_limit_value=2.0,
+    gemm1_alpha_value=None,
+    gemm1_beta_value=None,
     scale_c_value=1.0,
     scale_gate_value=1.0,
 ):
@@ -147,9 +149,13 @@ def _run_fp4_fc1(
         sf_layout_b=sf_layout_b,
         use_unroll_loop_2x_for_mma=unroll,
         bias_type=bias_type,
+        has_gemm1_alpha=int(gemm1_alpha_value is not None),
+        has_gemm1_beta=int(gemm1_beta_value is not None),
         has_gemm1_clamp_limit=int(act_kind == int(ActKind.SWIGLU)),
         scale_c_value=scale_c_value,
         scale_gate_value=scale_gate_value,
+        gemm1_alpha_value=gemm1_alpha_value,
+        gemm1_beta_value=gemm1_beta_value,
         gemm1_clamp_limit_value=gemm1_clamp_limit_value,
         **base,
     )
@@ -236,6 +242,45 @@ class TestFp4Fc1GPU:
             swap_ab=False,
             act_kind=1,
             gemm1_clamp_limit_value=0.5,
+        )
+
+    def test_tile8_kimi_k3_situ_swap(self):
+        _run_fp4_fc1(
+            tile_n=8,
+            swap_ab=True,
+            act_kind=int(ActKind.SITU),
+            pipeline_stages=9,
+            gemm1_alpha_value=4.0,
+            gemm1_beta_value=25.0,
+        )
+
+    def test_tile192_kimi_k3_situ_routed_sf_compaction(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+        from flashinfer.prims_ts.moe.config_mapper import (
+            map_trtllm_mxfp4_mxfp8_moe_tactic,
+        )
+        from flashinfer.tllm_enums import ActivationType
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+            [192, 0],
+            activation_type=int(ActivationType.Situ),
+            num_tokens=8192,
+            top_k=16,
+            num_local_experts=56,
+            has_gemm1_alpha=True,
+            has_gemm1_beta=True,
+        )
+        assert reference_check(
+            num_experts=2,
+            num_tokens=192,
+            top_k=2,
+            problem_n=512,
+            problem_k=512,
+            repeat_launches=3,
+            gemm1_alpha_value=4.0,
+            gemm1_beta_value=25.0,
+            **pair.fc1.cfg.kwargs,
         )
 
     def test_tile8_swiglu_global_scale_gate(self):
@@ -731,9 +776,9 @@ class TestFp4Fc1SfbTmaRouteCluster2:
     quantization regime, without which the SwiGLU clamp amplifies accumulator
     cancellation into sparse ref-check failures on the larger (256-token) shape.
 
-    num_experts is reduced from the benchmark's 64 to keep the test light; the
-    routed-SFB feature and the cancellation scenario depend on token count and
-    cluster shape, not expert count.
+    The large regression uses 64 experts instead of the benchmark's 256 to keep
+    the test light while retaining enough persistent work tiles to expose TMA
+    scratch reuse races.
     """
 
     @staticmethod
@@ -768,6 +813,7 @@ class TestFp4Fc1SfbTmaRouteCluster2:
             use_clc_fast_drain=0,
             use_early_exit=1,
             use_max_tmem_overlap=0,
+            use_tma_store=1,
             use_tma_oob_opt=1,
             epilogue_regs=160,
             mma_regs=48,
@@ -795,11 +841,13 @@ class TestFp4Fc1SfbTmaRouteCluster2:
         """Case 2: tile_n=64, num_tokens=256 (large shape; cancellation-prone)."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
 
+        base = {**self._base(), "num_experts": 64}
         result = reference_check(
             num_tokens=256,
             tile_n=64,
             mma_n=64,
+            repeat_launches=30,
             **uniform_pipeline_stage_overrides(4, tmem_acc_stages=2),
-            **self._base(),
+            **base,
         )
         assert result, "routed-SFB tma cluster2 tile_n=64 (256 tokens) failed"

@@ -25,6 +25,7 @@ from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.moe.tensor_adapter import _get_expert_scale_ones
 from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
+    PrimsTsMxfp4Mxfp8MoERunner,
     _moe_topk_ids_init_for_routing,
     _routed_token_capacity,
     _torch_views_of_ffi_tensors,
@@ -111,6 +112,42 @@ def test_topk_initializer_matches_routing_representation():
     assert _moe_topk_ids_init_for_routing(
         num_experts, RoutingInputMode.UnpackedPrecomputed
     ) is moe_topk_ids_init(num_experts, packed=False)
+
+
+def test_mxfp4_mxfp8_runtime_routing_cache_preserves_runner_hash():
+    moe_op = object()
+
+    def make_runner():
+        return PrimsTsMxfp4Mxfp8MoERunner(
+            moe_op,
+            top_k=4,
+            num_local_experts=8,
+            hidden_size=128,
+            intermediate_size=128,
+        )
+
+    def make_inputs():
+        return MoeRunnerInputs(
+            output=torch.empty(4, 128),
+            routing_logits=None,
+            topk_ids=torch.zeros(4, 4, dtype=torch.int32),
+            expert_weights=torch.empty(4, 4),
+            hidden_states=torch.empty(4, 128),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+    first, second = make_runner(), make_runner()
+    first_inputs, second_inputs = make_inputs(), make_inputs()
+    assert hash(first) == hash(second)
+
+    first._make_tuning_config(first_inputs, tune_max_num_tokens=4)
+    second._make_tuning_config(second_inputs, tune_max_num_tokens=4)
+
+    assert first._topk_initializer_cache[0] is first_inputs.topk_ids
+    assert second._topk_initializer_cache[0] is second_inputs.topk_ids
+    assert hash(first) == hash(second)
 
 
 def test_gemm_launches_use_local_expert_count():

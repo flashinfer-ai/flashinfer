@@ -19,6 +19,51 @@ import sys
 import pytest
 
 
+def _fused_operand_sf_config(**overrides):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        RouteImpl,
+        SfLayout,
+        TileScheduler,
+        compute_warp_layout,
+        make_config,
+    )
+
+    values = dict(
+        batch_mode=int(BatchMode.BATCH_N),
+        cluster_m=2,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        epi_tile_n=32,
+        act_kind=int(ActKind.SWIGLU),
+        fuse_operand_sf_loads=1,
+        fuse_sf_copy_to_mma=1,
+        mma_k=64,
+        mma_m=256,
+        mma_n=128,
+        num_load_sfb_warps=4,
+        num_stages_a=3,
+        num_stages_b=3,
+        num_stages_smem_sfa=3,
+        num_stages_smem_sfb=3,
+        route_act=int(RouteImpl.LDGSTS),
+        route_sfs_act=int(RouteImpl.LDGSTS),
+        sf_layout_b=int(SfLayout.LINEAR),
+        tile_k=512,
+        tile_n=128,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        transpose_mma_output=1,
+        use_early_exit=1,
+    )
+    values.update(overrides)
+    cfg = make_config(**values)
+    compute_warp_layout(cfg)
+    return cfg
+
+
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
@@ -102,7 +147,7 @@ def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     )
 
 
-def test_validation_rejects_unimplemented_mma_unroll():
+def test_validation_accepts_mma_unroll():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         make_config,
@@ -118,7 +163,91 @@ def test_validation_rejects_unimplemented_mma_unroll():
         tile_n=16,
         use_unroll_loop_2x_for_mma=1,
     )
-    with pytest.raises(ValueError, match="use_unroll_loop_2x_for_mma"):
+    validate_config(cfg)
+
+
+def test_validation_accepts_safe_fused_operand_sf_pipeline():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    validate_config(_fused_operand_sf_config())
+
+
+@pytest.mark.parametrize("operand", ("sfa", "sfb"))
+def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        SfLayout,
+        make_config,
+        validate_config,
+    )
+
+    overrides = {
+        "sf_layout_a": int(SfLayout.R128c4),
+        "sf_layout_b": int(SfLayout.R128c4),
+    }
+    overrides[f"sf_layout_{operand[-1]}"] = int(SfLayout.LINEAR)
+    cfg = make_config(
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.BF16),
+        fuse_sf_copy_to_mma=1,
+        mma_k=64,
+        mma_n=128,
+        tile_k=512,
+        tile_n=128,
+        **overrides,
+    )
+
+    with pytest.raises(ValueError, match=f"R128c4 SMEM layout for {operand.upper()}"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        (
+            {"num_load_sfa_warps": 2},
+            "num_load_sfa_warps == num_load_a_warps",
+        ),
+        (
+            {"num_load_sfb_warps": 2},
+            "num_load_sfb_warps == num_gather_warps",
+        ),
+        (
+            {
+                "num_stages_a": 1,
+                "num_stages_b": 1,
+                "num_stages_smem_sfb": 4,
+            },
+            "delayed SFB commit depth",
+        ),
+    ),
+)
+def test_validation_rejects_unsafe_fused_operand_sf_pipeline(overrides, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_fused_operand_sf_config(**overrides))
+
+
+def test_validation_rejects_pdl_early_exit_without_count_wait():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_k=16,
+        tile_k=64,
+        use_early_exit=1,
+        use_pdl=1,
+    )
+
+    with pytest.raises(ValueError, match="PDL early exit requires"):
         validate_config(cfg)
 
 
@@ -415,7 +544,7 @@ def test_validation_rejects_invalid_epi_tile_n(epi_tile_n, expected):
     ("overrides", "expected"),
     (
         ({"mma_m": 96}, "mma_m must be 64/128/256"),
-        ({"mma_n": 12}, "mma_n must be 8/16/32/64/128/256"),
+        ({"mma_n": 12}, "mma_n must be 8/16/32/64/128/192/256"),
     ),
 )
 def test_validation_rejects_invalid_mma_shape(overrides, expected):
@@ -660,6 +789,45 @@ def test_validation_accepts_silu_activation():
     validate_config(cfg)
 
 
+def test_clustered_swap_ab_ldgsts_splits_b_smem_across_ctas():
+    """Each CTA stages its routed B rows and uses the matching K-group stride."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        RouteImpl,
+        make_config,
+    )
+
+    cfg = make_config(
+        cluster_m=2,
+        route_act=int(RouteImpl.LDGSTS),
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        tile_n=128,
+        mma_n=128,
+        epi_tile_n=32,
+        tile_k=512,
+        mma_k=64,
+    )
+
+    assert cfg.is_swap_ab
+    assert cfg.has_gather
+    assert cfg.split_b_across_ctas
+    assert cfg.num_bytes_b_per_stage == 32_768
+    assert cfg.num_bytes_b_smem_per_stage == 16_384
+
+
+def test_r128c4_sfb_s2t_descriptors_advance_in_k_group_order():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+    from flashinfer.prims_ts.batched_gemm.tmem_c_resources import (
+        _sfb_s2t_desc_increment,
+    )
+
+    assert [
+        _sfb_s2t_desc_increment(int(SfLayout.R128c4), copy_idx) for copy_idx in range(8)
+    ] == [0, 32, 64, 96, 128, 160, 192, 224]
+
+
 def test_ldgsts_routed_sf_does_not_use_routed_tma_descriptors():
     """LDGSTS-routed scale factors must not build compact TMA TensorMaps."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -851,8 +1019,7 @@ def test_deepseek_fp8_tma_route_uses_generated_load_b_warp_count(
     assert by_name["PaddingTask"].warp_idx == padding_warp_idx
     assert cfg.threads_per_cta == 512
 
-
-def test_validation_accepts_persistent_clc_fast_drain():
+def test_validation_accepts_clc_fast_drain_for_persistent_early_exit():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         TileScheduler,
@@ -1168,6 +1335,20 @@ def test_nvfp4_per_token_sfb_schedule_validates():
         use_per_token_sf_b=1,
         per_token_sf_dtype=int(DType.FP32),
     )
+
+
+def test_benchmark_preserves_supported_fast_drain_and_mma_unroll_knobs():
+    from flashinfer.prims_ts.batched_gemm.tools.bench import _ts_kwargs
+
+    kwargs = {
+        "use_clc_fast_drain": 1,
+        "use_unroll_loop_2x_for_mma": 1,
+    }
+
+    result = _ts_kwargs(kwargs)
+
+    assert result == kwargs
+    assert result is not kwargs
 
 
 def test_fp4_json_variant_forwards_per_token_sfb_without_skip():

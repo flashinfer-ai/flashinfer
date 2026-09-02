@@ -119,6 +119,7 @@ def _is_gated_act_kind(act_kind: int) -> bool:
         int(ActKind.SWIGLU),
         int(ActKind.GEGLU),
         int(ActKind.SILU),
+        int(ActKind.SITU),
     )
 
 
@@ -262,20 +263,15 @@ def _launch_metadata_lists(
     return tile_idx, mn_limit, route_map
 
 
-def _normalize_runtime_scheduler(
+def _normalize_early_exit_launch_extent(
     cfg,
     token_layout: TokenLayout,
-    out_hidden: int,
     early_exit_max_token_ctas: int,
-):
-    """Normalize runtime-only options for the concrete token layout."""
-    if (
-        cfg.use_early_exit
-        and cfg.is_persistent
-        and token_layout.num_token_tiles >= early_exit_max_token_ctas
-    ):
-        cfg = replace(cfg, use_early_exit=0)
-    return cfg
+) -> int:
+    """Return an early-exit extent that cannot underlaunch active token tiles."""
+    if cfg.use_early_exit:
+        return max(int(token_layout.num_token_tiles), int(early_exit_max_token_ctas))
+    return int(early_exit_max_token_ctas)
 
 
 def _runtime_config(cfg, in_hidden: int):
@@ -291,7 +287,16 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
                 f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
             )
-    runtime_cfg = replace(cfg)
+    num_k_tiles = (in_hidden + cfg.tile_k - 1) // cfg.tile_k
+    use_unroll_loop_2x_for_mma = cfg.use_unroll_loop_2x_for_mma
+    if use_unroll_loop_2x_for_mma and (num_k_tiles < 2 or num_k_tiles % 2 != 0):
+        # Keep the generated loop structure identical to Gen's 2x-unrolled
+        # steady state. Fall back when concrete K would require a scalar tail.
+        use_unroll_loop_2x_for_mma = 0
+    runtime_cfg = replace(
+        cfg,
+        use_unroll_loop_2x_for_mma=use_unroll_loop_2x_for_mma,
+    )
     derive_problem_shape_constants(runtime_cfg, problem_mnk=(0, 0, in_hidden))
     return runtime_cfg
 
@@ -1430,6 +1435,7 @@ def _parse_overrides(args):
                 "geglu": ActKind.GEGLU,
                 "relu2": ActKind.RELU2,
                 "silu": ActKind.SILU,
+                "situ": ActKind.SITU,
             }[args.act_kind]
         ),
         "sf_layout_a": int(
@@ -1566,6 +1572,7 @@ def reference_check(
     gemm1_beta_value=None,
     gemm1_clamp_limit_value=2.0,
     return_output=False,
+    repeat_launches=1,
     output_guard_elements=0,
     early_exit_max_token_ctas=0,
     **cfg_overrides,
@@ -1580,8 +1587,11 @@ def reference_check(
 
     When problem_n / problem_k are None, they default to tile_n / tile_k
     (single-tile test). Set them to realistic values (e.g. 4096) for
-    multi-tile benchmarks.
+    multi-tile benchmarks. ``repeat_launches`` reuses the compiled kernel and
+    requires bitwise-stable output and output scale buffers across launches.
     """
+    if repeat_launches < 1:
+        raise ValueError(f"repeat_launches must be positive, got {repeat_launches}")
     launch_early_exit_max_token_ctas = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -1619,10 +1629,9 @@ def reference_check(
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    cfg = _normalize_runtime_scheduler(
+    launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden,
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
@@ -2072,7 +2081,7 @@ def reference_check(
     )
     gemm1_beta_torch = _make_per_expert_f32_tensor(
         gemm1_beta_value,
-        default=0.0,
+        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
         num_experts=L,
         device=device,
     )
@@ -2295,8 +2304,27 @@ def reference_check(
     print("Compiling kernel...")
     compiled_fn = _compile_for_launch(ref_io, stream)
     print("Launching kernel...")
-    compiled_fn(*_launch_arg_tuple(ref_io, stream))
-    torch.cuda.synchronize()
+    first_output = None
+    first_scale = None
+    outputs_deterministic = True
+    scales_deterministic = True
+    for _ in range(repeat_launches):
+        compiled_fn(*_launch_arg_tuple(ref_io, stream))
+        torch.cuda.synchronize()
+        if repeat_launches > 1:
+            output_tensor = (
+                c_storage
+                if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
+                else c_torch
+            )
+            if first_output is None:
+                first_output = output_tensor.detach().clone()
+                if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
+                    first_scale = sf_c_torch.detach().clone()
+            else:
+                outputs_deterministic &= torch.equal(first_output, output_tensor)
+                if first_scale is not None:
+                    scales_deterministic &= torch.equal(first_scale, sf_c_torch)
     # Unload the per-check CUDA library at a deterministic point after the
     # launch is synchronized. Letting Python GC do this later can overlap
     # library unload with the next clustered persistent compile/launch.
@@ -2354,18 +2382,46 @@ def reference_check(
                 return False, c_logical.detach().clone()
             return False
 
+    # Routed MoE kernels are only required to write rows/columns that map to
+    # real tokens. Expert padding remains outside the observable output, so do
+    # not treat unspecified padding values as correctness failures.
+    active_route_mask = torch.tensor(
+        [expert_idx >= 0 for expert_idx in token_layout.expanded_to_expert],
+        dtype=torch.bool,
+        device=device,
+    )
+
+    def _active_routes(output):
+        token_dim = 1 if cfg.is_swap_ab else 0
+        if output.shape[token_dim] != active_route_mask.numel():
+            raise AssertionError(
+                "output token extent does not match routed metadata: "
+                f"{output.shape[token_dim]} != {active_route_mask.numel()}"
+            )
+        if cfg.is_swap_ab:
+            return output[:, active_route_mask]
+        return output[active_route_mask, :]
+
     # --- PyTorch reference ---
-    has_nan = torch.isnan(c_logical).any().item()
-    has_inf = torch.isinf(c_logical).any().item()
+    c_active = _active_routes(c_logical)
+    has_nan = torch.isnan(c_active).any().item()
+    has_inf = torch.isinf(c_active).any().item()
 
     def _return(result):
         if return_output:
             return result, c_logical.detach().clone()
         return result
 
+    if not outputs_deterministic or not scales_deterministic:
+        print(
+            "FAIL: repeated launches are nondeterministic "
+            f"(output={outputs_deterministic}, scale={scales_deterministic})"
+        )
+        return _return(False)
+
     if has_nan or has_inf:
         print(f"FAIL: output has NaN={has_nan}, Inf={has_inf}")
-        bad_mask = torch.isnan(c_logical) | torch.isinf(c_logical)
+        bad_mask = torch.isnan(c_active) | torch.isinf(c_active)
         bad_count = bad_mask.sum().item()
         bad_indices = bad_mask.nonzero(as_tuple=False)[:8].detach().cpu().tolist()
         print(f"Bad value count: {bad_count}, first indices: {bad_indices}")
@@ -2556,6 +2612,7 @@ def reference_check(
         return value
 
     is_geglu = cfg.act_kind == int(ActKind.GEGLU)
+    is_situ = cfg.act_kind == int(ActKind.SITU)
     is_gated = _is_gated_act_kind(cfg.act_kind)
     is_relu2 = cfg.act_kind == int(ActKind.RELU2)
 
@@ -2574,7 +2631,38 @@ def reference_check(
             up = ref_gemm[:, half:].float()
 
         scale_gate = _expert_scale_like(gate.shape, scale_gate_torch)
-        if cfg.has_swiglu_oai_params:
+        if is_situ:
+            if cfg.has_gemm1_clamp_limit:
+                clamp_limit = _expert_param_like(
+                    gate.shape,
+                    gemm1_clamp_limit_torch,
+                    active=True,
+                    default=0.0,
+                )
+                gate = torch.minimum(torch.maximum(gate, -clamp_limit), clamp_limit)
+                up = torch.minimum(up, clamp_limit)
+            x0 = gate * scale_gate
+            x1 = up * scale_gate
+            alpha = _expert_param_like(
+                gate.shape,
+                gemm1_alpha_torch,
+                active=bool(cfg.has_gemm1_alpha),
+                default=1.0,
+            )
+            beta = _expert_param_like(
+                gate.shape,
+                gemm1_beta_torch,
+                active=bool(cfg.has_gemm1_beta),
+                default=1.0,
+            )
+            activated = (
+                beta
+                * torch.tanh(x0 / beta)
+                * alpha
+                * torch.tanh(x1 / alpha)
+                * torch.sigmoid(x1)
+            )
+        elif cfg.has_swiglu_oai_params:
             if cfg.has_gemm1_clamp_limit:
                 clamp_limit = _expert_param_like(
                     gate.shape,
@@ -2643,11 +2731,13 @@ def reference_check(
             )
             return _return(False)
 
-    diff = (c_compare.float() - ref_torch.float()).abs()
+    c_compare_active = _active_routes(c_compare)
+    ref_active = _active_routes(ref_torch)
+    diff = (c_compare_active.float() - ref_active.float()).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
-    ref_max = ref_torch.float().abs().max().item()
-    out_max = c_compare.float().abs().max().item()
+    ref_max = ref_active.float().abs().max().item()
+    out_max = c_compare_active.float().abs().max().item()
     print(
         f"Reference comparison: max_abs={max_abs:.6f}, "
         f"mean_abs={mean_abs:.6f}, ref_max={ref_max:.6f}"
@@ -2667,8 +2757,12 @@ def reference_check(
             dst_in_block = indices[src_in_block]
             unshuffle_idx[block_idx * block_size + dst_in_block] = mi
         inv_ref = ref_torch[unshuffle_idx, :]
-        shuffled_diff = (c_compare.float() - shuffled_ref.float()).abs()
-        inv_diff = (c_compare.float() - inv_ref.float()).abs()
+        shuffled_diff = (
+            c_compare_active.float() - _active_routes(shuffled_ref).float()
+        ).abs()
+        inv_diff = (
+            c_compare_active.float() - _active_routes(inv_ref).float()
+        ).abs()
         print(
             "CastA row-diagnostic: "
             f"shuffled_max={shuffled_diff.max().item():.6f}, "
@@ -2759,10 +2853,9 @@ def _build_launch_io(
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    cfg = _normalize_runtime_scheduler(
+    launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden,
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
@@ -3094,7 +3187,7 @@ def _build_launch_io(
     )
     gemm1_beta_torch = _make_per_expert_f32_tensor(
         gemm1_beta_value,
-        default=0.0,
+        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
         num_experts=L,
         device=device,
     )
@@ -3725,7 +3818,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--act-kind",
-        choices=["none", "swiglu", "geglu", "relu2", "silu"],
+        choices=["none", "swiglu", "geglu", "relu2", "silu", "situ"],
         default="none",
     )
     parser.add_argument(

@@ -16,6 +16,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_partial_route_map_padding_keeps_trt_absolute_limits():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -80,111 +82,60 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     assert extra_routes
     assert set(extra_routes) == {0}
 
-
-def test_clustered_persistent_normalization_keeps_invalid_static_grid():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-        TileScheduler,
-        make_config,
-    )
+@pytest.mark.parametrize(
+    ("num_tokens", "requested_extent", "expected_extent"),
+    (
+        (1, 8, 8),
+        (512, 1, 4),
+    ),
+)
+def test_early_exit_launch_extent_covers_active_token_tiles(
+    num_tokens, requested_extent, expected_extent
+):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _make_token_layout,
-        _normalize_runtime_scheduler,
+        _normalize_early_exit_launch_extent,
     )
 
-    cfg = make_config(
-        tile_scheduler=int(TileScheduler.PERSISTENT),
-        cluster_m=2,
-        tile_m=128,
-        tile_n=64,
-        use_early_exit=0,
-    )
+    cfg = SimpleNamespace(use_early_exit=1)
     token_layout = _make_token_layout(
-        num_tokens=256,
+        num_tokens=num_tokens,
         num_experts=2,
         top_k=1,
-        tile_size=cfg.tile_n,
+        tile_size=128,
         cluster_dim_in_token=1,
     )
 
-    normalized = _normalize_runtime_scheduler(
+    extent = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden=128,
-        early_exit_max_token_ctas=0,
+        early_exit_max_token_ctas=requested_extent,
     )
 
-    assert normalized.is_persistent
+    assert extent == expected_extent
 
-
-def test_clustered_persistent_normalization_keeps_max_tmem_overlap():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-        TileScheduler,
-        make_config,
-    )
+def test_disabled_early_exit_keeps_requested_launch_extent():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _make_token_layout,
-        _normalize_runtime_scheduler,
+        _normalize_early_exit_launch_extent,
     )
 
-    cfg = make_config(
-        tile_scheduler=int(TileScheduler.PERSISTENT),
-        cluster_m=2,
-        tile_m=128,
-        tile_n=256,
-        use_early_exit=0,
-        use_max_tmem_overlap=1,
-    )
+    cfg = SimpleNamespace(use_early_exit=0)
     token_layout = _make_token_layout(
         num_tokens=512,
         num_experts=2,
         top_k=1,
-        tile_size=cfg.tile_n,
+        tile_size=128,
         cluster_dim_in_token=1,
     )
 
-    normalized = _normalize_runtime_scheduler(
+    extent = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden=8192,
-        early_exit_max_token_ctas=0,
+        early_exit_max_token_ctas=3,
     )
 
-    assert normalized.is_persistent
-
-
-def test_clustered_persistent_normalization_keeps_persistent_grid():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-        TileScheduler,
-        make_config,
-    )
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
-        _make_token_layout,
-        _normalize_runtime_scheduler,
-    )
-
-    cfg = make_config(
-        tile_scheduler=int(TileScheduler.PERSISTENT),
-        cluster_m=2,
-        tile_m=128,
-        tile_n=128,
-        use_early_exit=0,
-    )
-    token_layout = _make_token_layout(
-        num_tokens=1,
-        num_experts=1,
-        top_k=1,
-        tile_size=cfg.tile_n,
-        cluster_dim_in_token=1,
-    )
-
-    normalized = _normalize_runtime_scheduler(
-        cfg,
-        token_layout,
-        out_hidden=8192,
-        early_exit_max_token_ctas=0,
-    )
-
-    assert normalized.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert extent == 3
 
 
 def test_persistent_multistage_workid_disables_c_scratch_ab_alias():

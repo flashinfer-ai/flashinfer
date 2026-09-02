@@ -845,6 +845,52 @@ def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     )
 
 
+def test_mxfp4_mxfp8_kimi_k3_situ_reference(moe_gemm_backend, cache_permute_indices):
+    """Kimi K3 SiTU matches the dequantized reference on both backends."""
+    num_tokens = 32
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 8
+    top_k = 2
+    device = torch.device("cuda")
+
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Situ],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [
+                MoeGemmBackend.TRTLLM,
+                MoeGemmBackend.PRIMS_TS,
+            ],
+        },
+        activation_type=ActivationType.Situ,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_alpha=torch.full((num_experts,), 4.0, device=device, dtype=torch.float32),
+        gemm1_beta=torch.full((num_experts,), 25.0, device=device, dtype=torch.float32),
+        moe_gemm_backend=moe_gemm_backend,
+    )
+
+
 def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
     """Packed and unpacked Prims-TS routed inputs match the logits path."""
     from flashinfer.autotuner import autotune

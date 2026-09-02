@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import (
     make_moe_tuning_config,
+    make_repeating_tensor_initializer,
     moe_topk_ids_init,
 )
 from flashinfer.jit.core import logger
@@ -160,7 +161,14 @@ def _select_expert_weights(
     moe_inputs: MoeRunnerInputs,
     routed_expert_weights: torch.Tensor | None,
 ) -> torch.Tensor:
-    if moe_inputs.expert_weights is not None and moe_inputs.expert_weights.numel() > 0:
+    has_precomputed_routing = (
+        moe_inputs.routing_logits is None or moe_inputs.routing_logits.numel() == 0
+    )
+    if (
+        has_precomputed_routing
+        and moe_inputs.expert_weights is not None
+        and moe_inputs.expert_weights.numel() > 0
+    ):
         return moe_inputs.expert_weights
     if routed_expert_weights is None:
         raise RuntimeError("routing did not return expert weights")
@@ -433,7 +441,7 @@ class _PrimsTsMoERunnerMixin:
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         return (
-            ("prims_ts_moe_config_version", 1),
+            ("prims_ts_moe_config_version", 4),
             ("dtype_act", int(self.dtype_act)),
             ("dtype_weights", int(self.dtype_weights)),
             ("fp8_quantization_type", int(self.fp8_quantization_type)),
@@ -526,6 +534,8 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+        self._topk_initializer_source = None
+        self._topk_initializer = None
 
     def _make_tuning_config(
         self,
@@ -914,16 +924,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-        routing_logits_for_routing = moe_inputs.routing_logits
-        if (
-            routing_logits_for_routing is not None
-            and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
-        ):
-            routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
-
         routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
-            routing_logits_for_routing,
+            moe_inputs.routing_logits,
             kwargs["routing_bias"],
             moe_inputs.topk_ids,
             moe_inputs.expert_weights,
@@ -987,7 +989,6 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         )
         fc1_cfg = pair.fc1.cfg.build()
         fc2_cfg = pair.fc2.cfg.build()
-
         if uses_per_token_scaling and not fc1_cfg.has_epilogue_quant:
             gemm1_output = torch.empty(
                 (int(gemm1_output.shape[0]), self.intermediate_size),
@@ -1025,7 +1026,11 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             hidden_size=self.hidden_size,
             per_token_sf_b=moe_inputs.per_token_scale,
         )
-        fc1_io = build_nvfp4_launch_io(fc="fc1", cfg=fc1_cfg, **common_io_kwargs)
+        fc1_io = build_nvfp4_launch_io(
+            fc="fc1",
+            cfg=fc1_cfg,
+            **common_io_kwargs,
+        )
         fc1_hash = stable_config_hash(fc1_io["cfg"])
         fc1_fn = get_compiled_gemm(fc1_hash, "nvfp4_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))
@@ -1113,6 +1118,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+        # Excluded from TunableRunner.__hash__: the tensor and closure carry
+        # per-call identity but do not change which tactics are valid.
+        self._topk_initializer_cache = None
 
     def _make_tuning_config(
         self,
@@ -1121,14 +1129,34 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
+        if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0:
+            if (
+                self._topk_initializer_cache is None
+                or self._topk_initializer_cache[0] is not moe_inputs.topk_ids
+            ):
+                self._topk_initializer_cache = (
+                    moe_inputs.topk_ids,
+                    make_repeating_tensor_initializer(
+                        moe_inputs.topk_ids,
+                        num_experts=self.num_experts,
+                        packed=(
+                            routing_input_mode
+                            != RoutingInputMode.UnpackedPrecomputed
+                        ),
+                    ),
+                )
+            init_packed_topk_ids = self._topk_initializer_cache[1]
+        else:
+            init_packed_topk_ids = _moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            )
+
         return make_moe_tuning_config(
             moe_inputs,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
-                self.num_experts, routing_input_mode
-            ),
+            init_packed_topk_ids=init_packed_topk_ids,
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )

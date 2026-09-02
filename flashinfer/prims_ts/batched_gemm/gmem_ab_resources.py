@@ -53,6 +53,23 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
 )
 
+
+def nonnegative_div(value, divisor: int):
+    """Divide an index by a positive constant without signed correction code."""
+
+    if divisor > 0 and divisor & (divisor - 1) == 0:
+        return value >> Int32(divisor.bit_length() - 1)
+    return value // Int32(divisor)
+
+
+def nonnegative_mod(value, divisor: int):
+    """Modulo an index by a positive constant without signed correction code."""
+
+    if divisor > 0 and divisor & (divisor - 1) == 0:
+        return value & Int32(divisor - 1)
+    return value % Int32(divisor)
+
+
 Constexpr = cutlass.Constexpr
 
 
@@ -267,6 +284,21 @@ class GmemBResource(MemoryResource):
     ) -> tuple[Int32, Int32, Int32, Int32]:
         self._load_tile_metadata(stage_info)
         return self._b_coords(stage_info)
+
+    @consumer_work(returns=(coord_b_k, coord_b_mn, coord_b_l, mn_limit))
+    @cute.jit
+    def compute_b_coords_prefetch(
+        self,
+        stage_info: StageInfo,
+        *,
+        prefetch_idx: cutlass.Constexpr[int],
+    ) -> tuple[Int32, Int32, Int32, Int32]:
+        """Build a prologue coordinate without relying on a loop offset."""
+        _, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        coord_k = Int32(prefetch_idx * self.cfg.tile_k)
+        coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
+        coord_l = Int32(0) if self.cfg.is_swap_ab else self.tile_expert_idx
+        return coord_k, coord_mn, coord_l, self.tile_mn_limit
 
     @consumer_work(returns=(coord_b_k, coord_b_mn, coord_b_l, mn_limit))
     @cute.jit

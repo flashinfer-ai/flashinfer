@@ -100,8 +100,6 @@ epilogue need changes.
 
 Kernel-level performance/configuration gaps inherited by the MoE backend:
 
-- `use_clc_fast_drain` is not implemented.
-- `use_unroll_loop_2x_for_mma` is not implemented.
 - `RouteImpl.LDG_PLUS_STS` for activation or scale-factor gathering is not
   implemented.
 - DeepSeek FP8 PrimsTS configs are restricted to tile-K 128, `cluster_m == 1`,
@@ -258,6 +256,9 @@ mode; otherwise `PaddingTask` does. They are mutually exclusive by scheduling mo
 - **Persistent scheduling with early exit and fast drain.** The kernel launches for
   the maximum number of CTAs and exits the unneeded ones at runtime based on device
   information, which makes it usable for MoE under CUDA Graphs.
+- **Generated-style MMA and operand pipelines.** Supported tactics can use 2x
+  compiler unrolling for the MMA loop and fuse activation/scale-factor producers
+  when their pipeline stages and producer warps match.
 - **Other fused / hardware optimizations.** Fused gated activation, fused
   quantization, TMA out-of-bounds predication, and 2-CTA TMA with tensor cores.
 
