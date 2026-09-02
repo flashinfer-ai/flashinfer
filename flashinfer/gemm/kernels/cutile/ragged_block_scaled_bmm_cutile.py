@@ -288,7 +288,9 @@ def ragged_block_scaled_bmm(
     # not stripped when Python runs with `-O`, which would let bad layouts /
     # shapes reach the cuda.tile kernel and silently miscompile.
     if transpose_a or not transpose_b:
-        raise ValueError("Only NT layout is supported (transpose_a=False, transpose_b=True)")
+        raise ValueError(
+            "Only NT layout is supported (transpose_a=False, transpose_b=True)"
+        )
     if not a.is_contiguous():
         raise ValueError("A matrix must be contiguous")
     if not b.is_contiguous():
@@ -307,7 +309,9 @@ def ragged_block_scaled_bmm(
     if K_A != K_B:
         raise ValueError(f"K dimensions must match: {K_A} != {K_B}")
     if m_indptr.shape[0] != Q + 1:
-        raise ValueError(f"m_indptr must have Q+1 ({Q + 1}) elements; got {m_indptr.shape[0]}")
+        raise ValueError(
+            f"m_indptr must have Q+1 ({Q + 1}) elements; got {m_indptr.shape[0]}"
+        )
 
     # Validate scale dimensions
     Q_SB, rnb, rkb = b_scale.shape
@@ -316,7 +320,9 @@ def ragged_block_scaled_bmm(
     if a_scale is not None:
         total_ma, rka = a_scale.shape
         if total_ma != total_m:
-            raise ValueError(f"a_scale total_m dimension mismatch: {total_ma} != {total_m}")
+            raise ValueError(
+                f"a_scale total_m dimension mismatch: {total_ma} != {total_m}"
+            )
 
     if Q_SB != Q:
         raise ValueError(f"b_scale Q dimension mismatch: {Q_SB} != {Q}")

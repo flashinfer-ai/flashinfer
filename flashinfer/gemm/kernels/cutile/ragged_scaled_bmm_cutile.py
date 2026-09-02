@@ -351,7 +351,9 @@ def _ragged_scaled_bmm_launch(
     def grid_fn(cfg):
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
-        num_pid_m = ct.cdiv(a.shape[0], BM)  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
+        num_pid_m = ct.cdiv(
+            a.shape[0], BM
+        )  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
         num_pid_n = ct.cdiv(N, BN)
         tiles_per_batch = num_pid_m * num_pid_n
         total_tiles = tiles_per_batch * Q
@@ -433,7 +435,9 @@ def _ragged_scaled_bmm_default_launch(
     SCALE_REP_K = BK // VEC_SIZE // 4
 
     NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
-    num_pid_m = ct.cdiv(a.shape[0], BM)  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
+    num_pid_m = ct.cdiv(
+        a.shape[0], BM
+    )  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
     num_pid_n = ct.cdiv(N, BN)
     total_tiles = num_pid_m * num_pid_n * Q
     num_programs = min(NUM_SMS // num_ctas, total_tiles) * occupancy

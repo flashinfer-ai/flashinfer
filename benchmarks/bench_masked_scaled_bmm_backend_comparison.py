@@ -404,7 +404,8 @@ def main():
         try:
             ok, cos = verify_cutile(bst, out_dtype)
             print(
-                f"  cutile: {'OK' if ok else 'FAIL'}" + (f" cos={cos:.4f}" if cos else "")
+                f"  cutile: {'OK' if ok else 'FAIL'}"
+                + (f" cos={cos:.4f}" if cos else "")
             )
         except Exception as e:
             # A cuTile failure on the tiny check must not abort the whole sweep;
