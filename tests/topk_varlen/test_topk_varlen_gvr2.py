@@ -67,7 +67,8 @@ def _gvr2_hw_supported() -> bool:
 _IS_GVR2_CAPABLE = _gvr2_hw_supported()
 requires_gvr2 = pytest.mark.skipif(
     not _IS_GVR2_CAPABLE,
-    reason="gvr_2 requires datacenter Blackwell (sm_100/103) + nvidia-cutlass-dsl",
+    reason="gvr_2 requires datacenter Blackwell (sm_100/103, Rubin sm_107) "
+    "+ nvidia-cutlass-dsl",
 )
 
 _DEV = "cuda"
@@ -413,6 +414,85 @@ def test_gvr2_noncontiguous_arena_view():
 
 
 @requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl",
+    [
+        (16, 131008),  # streaming main, R=9 split
+        (256, 8128),  # streaming main, R=1
+        (16, 8128),  # register-resident
+        (16, 65472),  # clustered register-resident
+        (64, 131008),  # cluster split
+    ],
+)
+def test_gvr2_arena_view_oversized_seq_lens(rows, msl):
+    """A kv length beyond the logical row width must clamp to the WIDTH, not
+    to the arena row stride: on a 256-rounded arena view the columns in
+    [width, stride) belong to other data and must never be classified (radix
+    parity — ``seq_lens`` is clamped to ``logits.shape[1]``). The arena tail
+    is poisoned with +3e38 so a stride-clamped family fails the multiset."""
+    top_k = 1024
+    stride = (msl + 255) // 256 * 256
+    assert stride > msl
+    gen = torch.Generator(device=_DEV).manual_seed(11)
+    arena = torch.randn(rows, stride, generator=gen, device=_DEV) - 2.0
+    arena[:, msl:] = 3e38  # arena tail: outside every row's logical width
+    logits = arena[:, :msl]
+    assert not logits.is_contiguous()
+    kv = [stride + 777 if r % 2 == 0 else msl - 64 * (r % 5) for r in range(rows)]
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    n_r = _row_valid_lens(kv, rows, 1, 1, msl)  # clamps to the width
+    for r in range(rows):
+        logits[r, n_r[r] :] = 3e38
+    pre_idx = torch.randint(
+        0, top_k, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+    )
+    indices, _ = _run_gvr2(logits, seq_lens, top_k, pre_idx)
+    _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@pytest.mark.skipif(
+    not (
+        _FLASHINFER_AVAILABLE
+        and torch.cuda.is_available()
+        and torch.cuda.device_count() >= 2
+    ),
+    reason="needs two CUDA devices",
+)
+def test_gvr2_logits_on_non_current_device():
+    """Launch with logits on a device that is NOT torch.cuda.current_device():
+    the launcher cache key, the DSL compile target and the launch itself must
+    all follow the tensor's device — a heterogeneous multi-GPU process must
+    never reuse or run an engine compiled for another architecture."""
+    if not _cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl not installed")
+    cur = torch.cuda.current_device()
+    capable = []
+    for i in range(torch.cuda.device_count()):
+        if i == cur:
+            continue
+        major, minor = get_compute_capability(torch.device(f"cuda:{i}"))
+        if flashinfer.top_k_varlen.is_backend_supported("gvr_2", major * 10 + minor):
+            capable.append(i)
+    if not capable:
+        pytest.skip("no gvr_2-capable device other than the current one")
+    dev = torch.device(f"cuda:{capable[0]}")
+    rows, n_valid, top_k = 4, 16384, 1024
+    gen = torch.Generator(device=dev).manual_seed(3)
+    logits = torch.randn(rows, n_valid, generator=gen, device=dev) - 2.0
+    seq_lens = torch.full((rows,), n_valid, dtype=torch.int32, device=dev)
+    pre_idx = torch.randint(
+        0, n_valid, (rows, top_k), generator=gen, device=dev, dtype=torch.int32
+    )
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
+    )
+    torch.cuda.synchronize(dev)
+    assert indices.device == logits.device
+    assert torch.cuda.current_device() == cur, "entry must restore the current device"
+    _check_exact(logits, indices, n_valid, torch.topk(logits, top_k, dim=1).values)
+
+
+@requires_gvr2
 def test_gvr2_workspace_override():
     """Caller-provided workspace (multi-stream escape hatch) must agree with
     the default per-device slab."""
@@ -562,7 +642,7 @@ def test_next_n_row_relationship_validated_up_front():
     length (or out of bounds) rather than failing loudly."""
     logits = torch.randn(4, 4096, dtype=torch.float32, device=_DEV)
     seq_lens = torch.full((4,), 4096, dtype=torch.int32, device=_DEV)  # != 4/2
-    with pytest.raises(ValueError, match="seq_lens.shape"):
+    with pytest.raises(ValueError, match=r"seq_lens\.shape"):
         flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=2)
     with pytest.raises(ValueError, match="next_n"):
         flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=0)
@@ -589,7 +669,7 @@ def test_gvr2_rejects_non_fp32():
     logits = torch.randn(4, 8192, dtype=torch.bfloat16, device=_DEV)
     seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=_DEV)
     pre_idx = torch.zeros(4, 512, dtype=torch.int32, device=_DEV)
-    with pytest.raises(Exception, match="not supported|Problem size"):
+    with pytest.raises(Exception, match=r"not supported|Problem size"):
         flashinfer.top_k_varlen(logits, seq_lens, 512, pre_idx=pre_idx, backend="gvr_2")
 
 
@@ -598,7 +678,7 @@ def test_gvr2_rejects_bad_top_k():
     logits = torch.randn(4, 8192, dtype=torch.float32, device=_DEV)
     seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=_DEV)
     pre_idx = torch.zeros(4, 768, dtype=torch.int32, device=_DEV)
-    with pytest.raises(Exception, match="not supported|Problem size"):
+    with pytest.raises(Exception, match=r"not supported|Problem size"):
         flashinfer.top_k_varlen(logits, seq_lens, 768, pre_idx=pre_idx, backend="gvr_2")
 
 

@@ -77,6 +77,28 @@ def _compile_arch_token() -> str:
         return "unknown"
 
 
+def _base_compile_opts() -> str:
+    """Base ``cute.compile`` options for every gvr2 family: the TVM-FFI ABI
+    (the persistent cache reloads artifacts through it) plus an explicit
+    ``--gpu-arch`` for the CURRENT device. Without the latter the DSL resolves
+    its target once per process from device 0 (``detect_gpu_arch``), so in a
+    heterogeneous process a kernel compiled while device 1 is current is built
+    for device 0's architecture and fails to load
+    (cudaErrorNoKernelImageForDevice). ``CUTE_DSL_ARCH`` still wins when set."""
+    import os
+
+    opts = "--enable-tvm-ffi"
+    if os.environ.get("CUTE_DSL_ARCH"):
+        return opts
+    try:
+        import torch  # lazy: module stays torch-free at import
+
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:  # noqa: BLE001 — no GPU context: let the DSL detect
+        return opts
+    return f"{opts} --gpu-arch sm_{major}{minor}{'a' if major >= 9 else ''}"
+
+
 def _persist(kernel_name: str, compile_fn):
     """Route a ``cute.compile`` closure through FlashInfer's persistent
     CuTe-DSL kernel cache (one ``gvr2_topk`` module directory shared by all
@@ -1539,7 +1561,8 @@ class GvrMainKernel:
         # kv_len = kv_lens[r // next_n], n = (kv_len - next_n + r % next_n + 1)
         # >> cr_shift.  The sampling-ladder scalars are then re-derived from
         # this row's n by the EXACT route_dynamic() host formulas (the scalar
-        # launch args are dead in this mode).  n <= k rows have no runtime
+        # launch args are dead in this mode, except `n`, which carries the
+        # envelope the per-row length is clamped to).  n <= k rows have no runtime
         # `return` in CuTe DSL: they run the body as a zero-work pass
         # (n = 0, TGT = INT_MAX so no rung ever accepts) and the identity/pad
         # emission happens in the epilogue at the end of the kernel.  Every
@@ -1558,8 +1581,13 @@ class GvrMainKernel:
             )
             if nv < cutlass.Int32(0):
                 nv = cutlass.Int32(0)
-            if nv > npad:
-                nv = npad
+            # Clamp to the logical envelope carried in the (otherwise dead)
+            # `n` launch slot, NOT to the row stride `npad`: on a wider-stride
+            # arena view the columns in [n, npad) belong to the arena, never
+            # to this row, so an oversized kv_len must not classify them
+            # (same clamp the reg / reg_clus / clus varlen prologues apply).
+            if nv > n:
+                nv = n
             n_row = nv
             if nv <= k:
                 short = cutlass.Int32(1)
@@ -3068,7 +3096,7 @@ def get_compiled(tpl, options_extra: str = ""):
             kv_fake,
             *([cutlass.Int32(0)] * 5),
             stream=fake_stream,
-            options=("--enable-tvm-ffi " + options_extra).strip(),
+            options=(_base_compile_opts() + " " + options_extra).strip(),
         )
 
     name = "main_" + "_".join(str(x) for x in tuple(tpl))
@@ -4301,7 +4329,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             cutlass.Int32, (v0_,), stride_order=(0,), assumed_align=4
         )
         fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
-        opts = "--enable-tvm-ffi"
+        opts = _base_compile_opts()
         if dump_dir:
             opts += f" --keep-ptx --keep-cubin --dump-dir {dump_dir}"
 
@@ -5673,7 +5701,7 @@ def get_compiled__clus(
             out_fake,
             *([cutlass.Int32(0)] * 10),
             stream=fake_stream,
-            options=("--enable-tvm-ffi " + options_extra).strip(),
+            options=(_base_compile_opts() + " " + options_extra).strip(),
         )
 
     name = (
@@ -6574,7 +6602,7 @@ def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1,
             cutlass.Int32, (v0_,), stride_order=(0,), assumed_align=4
         )
         fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
-        opts = "--enable-tvm-ffi"
+        opts = _base_compile_opts()
         if dump_dir:
             opts += f" --keep-ptx --keep-cubin --dump-dir {dump_dir}"
 

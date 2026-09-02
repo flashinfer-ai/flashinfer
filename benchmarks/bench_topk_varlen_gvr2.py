@@ -101,20 +101,27 @@ def make_inputs(scenario, batch, N, K, nn, cr, hint_quality, oracle, seed, dtype
     )
     if scenario == "uniform":
         seq_lens = torch.full((batch,), N * cr, dtype=torch.int32, device="cuda")
-    elif scenario == "mixed":
-        seq_lens = torch.randint(
-            K * cr + nn, N * cr + 1, (batch,), generator=gen, device="cuda"
-        ).int()
-    elif scenario == "short":
-        seq_lens = torch.randint(
-            K * cr + nn,
-            max(N * cr // 8, K * cr + nn + 1),
-            (batch,),
-            generator=gen,
-            device="cuda",
-        ).int()
-        n_long = max(batch // 4, 1)
-        seq_lens[:n_long] = N * cr
+    elif scenario in ("mixed", "short"):
+        # Smallest uncompressed kv whose EVERY next_n row is a long row
+        # (n_r = (kv - nn + j + 1) // cr >= K + 1 for all j): keeps the
+        # documented domains ("mixed" = rows in [K+1, N]) so no row silently
+        # bypasses refcheck's n <= K skip.
+        lo = (K + 1) * cr + nn - 1
+        if scenario == "mixed":
+            hi = N * cr + 1
+        else:
+            hi = N * cr // 8
+            if hi <= lo:
+                print(
+                    f"[NOTE] short scenario is degenerate for N={N}, K={K}: "
+                    "N/8 <= K+1, so the 'short' rows are not short",
+                    flush=True,
+                )
+        hi = max(hi, lo + 1)
+        seq_lens = torch.randint(lo, hi, (batch,), generator=gen, device="cuda").int()
+        if scenario == "short":
+            n_long = max(batch // 4, 1)
+            seq_lens[:n_long] = N * cr
     else:
         raise ValueError(scenario)
 
@@ -142,6 +149,13 @@ def make_backend_fns(backend, logits, seq_lens, pre_idx, K, nn, cr, trt_host):
     or None if the backend cannot run this config."""
     rows = logits.shape[0]
     out_i = torch.empty(rows, K, dtype=torch.int32, device="cuda")
+
+    if backend in ("fi_gvr2", "fi_gvr", "fi_gvr_nolb", "trtllm_gvr2") and K not in (
+        512,
+        1024,
+        2048,
+    ):
+        return None, None  # outside the GVR-family top_k domain: n/a, not an error
 
     if backend == "fi_gvr2":
 
@@ -369,16 +383,17 @@ def main():
                     if msg and msg != "n/a":
                         print(f"    [{b}] {msg}", flush=True)
 
-    # ---- summary ----------------------------------------------------------
-    if "fi_gvr2" not in backends:
+    # ---- summary (relative to gvr_2 when present, else the first backend) ---
+    if not backends:
         return
-    print("\n================ SUMMARY (ratios are other/gvr_2; >1 = gvr_2 faster)")
+    base = "fi_gvr2" if "fi_gvr2" in backends else backends[0]
+    print(f"\n================ SUMMARY (ratios are other/{base}; >1 = {base} faster)")
     for other in backends:
-        if other == "fi_gvr2":
+        if other == base:
             continue
         ratios, wins, total = [], 0, 0
         for _, _, _, row in results:
-            g2, g2_ok, _ = row["fi_gvr2"]
+            g2, g2_ok, _ = row[base]
             ot, ot_ok, _ = row.get(other, (float("nan"), False, ""))
             if math.isnan(g2) or math.isnan(ot) or not (g2_ok and ot_ok):
                 continue
@@ -388,7 +403,7 @@ def main():
         if total:
             print(
                 f"  vs {other:<17} geomean {geomean(ratios):5.2f}x   "
-                f"gvr_2 wins {wins}/{total}"
+                f"{base} wins {wins}/{total}"
             )
     print("\nper-config winner:")
     for scenario, B, N, row in results:

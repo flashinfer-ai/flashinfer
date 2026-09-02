@@ -79,7 +79,9 @@ def _arch_token() -> str:
     """Compile-target token for the launcher caches (mirrors the device
     module's _compile_arch_token without forcing its cutlass import): a
     heterogeneous multi-GPU process must not reuse a launcher whose compiled
-    engine targets another architecture."""
+    engine targets another architecture. Reads the CURRENT device, exactly
+    like the DSL compile target and the launch stream do — the public entries
+    pin the current device to ``logits.device`` first (_on_other_device)."""
     import os
 
     env = os.environ.get("CUTE_DSL_ARCH")
@@ -90,6 +92,18 @@ def _arch_token() -> str:
         return f"sm{major}{minor}"
     except Exception:  # noqa: BLE001 — no GPU context: single-arch fallback
         return "unknown"
+
+
+def _on_other_device(logits: torch.Tensor) -> bool:
+    """True when ``logits`` lives on a CUDA device other than the current one.
+
+    The launcher cache keys (_arch_token), the DSL compile target
+    (_compile_arch_token) and the launch stream all follow the CURRENT
+    device, so ``run`` / ``run_ws`` / ``run_varlen`` re-enter themselves under
+    ``torch.cuda.device(logits.device)`` in that case: a heterogeneous
+    multi-GPU process must never cache, compile for, or launch on the wrong
+    architecture. One device-index compare on the common (same-device) path."""
+    return logits.is_cuda and logits.get_device() != torch.cuda.current_device()
 
 
 # ===========================================================================
@@ -803,7 +817,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # staged floor (a distribution-dependent tail regression); the kernel
     # gates TSH per row at runtime anyway.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
-    pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+    # slot 0 (`n`) carries the envelope: the varlen prologue clamps each row's
+    # kv-derived length to it, never to the row stride npad (arena tails)
+    pre = (n_env, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
     lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
@@ -1238,6 +1254,9 @@ def run(
     tensor therefore dies with 'device index out of range').
     Hot path inlines the device check + atomic load + cache hit; the slow
     path allocates under the workspace lock."""
+    if _on_other_device(logits):
+        with torch.cuda.device(logits.get_device()):
+            return run(logits, pre_idx, n_valid, indices, values)
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:  # checked on EVERY call
         raise RuntimeError(f"device index out of range: {d}")
@@ -1258,6 +1277,9 @@ def run_ws(
     """TESTING/BENCH ONLY — production callers must use ``run_varlen(workspace=...)``.
 
     Explicit-workspace form for multi-stream callers."""
+    if _on_other_device(logits):
+        with torch.cuda.device(logits.get_device()):
+            return run_ws(logits, pre_idx, n_valid, indices, workspace, values)
     validate_run_ws(workspace, logits)
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
@@ -1309,6 +1331,20 @@ def run_varlen(
     selection (streaming main / clustered register-resident) is a pure
     function of the capture-stable launcher key.
     """
+    if _on_other_device(logits):
+        with torch.cuda.device(logits.get_device()):
+            return run_varlen(
+                logits,
+                pre_idx,
+                kv_lens,
+                indices,
+                next_n=next_n,
+                compress_ratio=compress_ratio,
+                values=values,
+                max_seq_len=max_seq_len,
+                engine=engine,
+                workspace=workspace,
+            )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
             f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "

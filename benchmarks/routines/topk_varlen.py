@@ -146,15 +146,19 @@ def testTopKVarlen(args):
                 f"[WARNING] {backend} for routine {args.routine} is not supported "
                 f"on compute capability {major}.{minor}. Skipping."
             )
-    # gvr_2's CC check passes on sm_100/103, but the backend is fp32-only with
-    # a fixed top_k domain — drop it up front instead of failing the call.
+    # gvr_2's CC check passes on sm_100/103/107, but the backend is fp32-only,
+    # has a fixed top_k domain and needs a 4-aligned row stride (float4 loads;
+    # for these contiguous logits the stride is max_seq_len) — drop it up
+    # front instead of failing the call.
     if "gvr_2" in backends and (
-        args.input_dtype != "float32" or top_k not in (512, 1024, 2048)
+        args.input_dtype != "float32"
+        or top_k not in (512, 1024, 2048)
+        or max_seq_len % 4 != 0
     ):
         backends.remove("gvr_2")
         print(
-            "[WARNING] gvr_2 requires float32 logits and top_k in {512, 1024, "
-            "2048}. Skipping."
+            "[WARNING] gvr_2 requires float32 logits, top_k in {512, 1024, "
+            "2048} and max_seq_len % 4 == 0. Skipping."
         )
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
