@@ -88,24 +88,26 @@ struct PrefillColdParams {
 //               lane holds 4 of the 128 outputs either way. MATH_WARPS is the
 //               only lever on accumulator registers.
 //
-// Tying the two together is what hurts DOTS3_SWA: BI=32 forces 4 warps, and at
-// 4 warps D_V=1024 puts 128 floats of accumulator in every thread. Splitting
-// them lets 4 warps do QK while 8 share the XV MMA and the epilogue, halving
-// `acc_o` to 64 and halving XV wall time. The split is nearly free because the
-// XV MMA sub-loop already reads only smem (`w_fp8`, `w_head_sc_all`, `kv_smem`)
-// and is already separated from the register-dependent W-quantize by a barrier.
+// Tying the two together is what hurts DOTS3_SWA: BI=32 forces QK_WARPS=4,
+// and D_V=1024 accumulators bound MATH_WARPS from below. On a split tile the
+// kernel therefore runs a producer/consumer pipeline (see
+// sparse_mla_prefill_math_pc): the QK_WARPS warps produce w_fp8 + scales +
+// alpha per tile while the remaining MATH_WARPS - QK_WARPS warps run the XV
+// MMA a tile behind out of the other parity buffer, so the XV warps no longer
+// idle through QK+softmax+W-quant. Handoff buffers are double-buffered in
+// smem (SmemLayout::SPLIT_PC).
 //
 // Going to 12 warps also re-enables setmaxnreg: at 384 threads nvcc's baseline
 // is capped near 65536/384 = 170, so the math warps have something real to
 // claim from the IO warps. At 256 threads it could already allocate 255 on its
 // own and a `.inc` to 232 would have been an invalid decrease.
 //
-// Measured on RTX PRO 6000 (sm120), DOTS3_SWA prefill, coupled 4/4 -> split
-// 4 QK / 8 XV: spill 240 B -> 152 B, smem unchanged at 93584 B, and 2-6% faster
-// across (num_heads, num_tokens) in {16,64} x {256,1024}. The gain is well
-// under the 2x the XV split alone implies, because the kernel is bound on the
-// KV gather (each token pulls window * 1152 B, and NUM_HEADS > 16 re-reads it
-// once per 16-head CTA) rather than on the XV MMA.
+// Measured on RTX PRO 6000 (sm120), DOTS3_SWA prefill at H=64, 1024 tokens:
+// the pipeline is ~5% faster than the serial split loop. With the overlap in
+// place the kernel is bound by the per-tile latency skeleton (KV gather
+// refill, the gmem rope prefetch, and the handshake round trips), not by MMA
+// throughput — ablating the QK or XV MMAs individually does not move the
+// wall clock further.
 //
 // MG is deliberately not parameterized. Its per-group Q and KV buffers put a
 // D_NOPE=1024 model over the cap at any BI that still satisfies the k=32 floor,

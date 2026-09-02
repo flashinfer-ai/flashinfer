@@ -73,9 +73,18 @@ struct SmemLayout {
 
   // XV phase — w_fp8 for all V chunks (batch W quant, single barrier).
   // XV is always FP8; CM only flips the QK side.
-  static constexpr size_t SMEM_W_SC_ALL = CT::N_V_CHUNKS * HPB * sizeof(float);
+  //
+  // On a SPLIT_QK_XV tile (TILE_MATH_WARPS * 8 != TILE_BI, e.g. DOTS3_SWA) the
+  // math warps run a QK-producer / XV-consumer pipeline, so the handoff
+  // buffers (w_fp8, w_head_sc_all) are double-buffered by tile parity and a
+  // small alpha array carries the softmax rescale factor between the groups.
+  static constexpr bool SPLIT_PC = (TILE_MATH_WARPS * 8 != TILE_BI);
+  static constexpr size_t SMEM_W_SC_ONE = CT::N_V_CHUNKS * HPB * sizeof(float);
+  static constexpr size_t SMEM_W_SC_ALL = SMEM_W_SC_ONE * (SPLIT_PC ? 2 : 1);
   static constexpr size_t SMEM_W_FP8_ONE = HPB * (TILE_BI + 16);
-  static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
+  static constexpr size_t SMEM_W_FP8_ONE_PARITY = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
+  static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE_PARITY * (SPLIT_PC ? 2 : 1);
+  static constexpr size_t SMEM_ALPHA = SPLIT_PC ? 2 * HPB * sizeof(float) : 0;
 
   // Mbarrier (double-buffered)
   static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
@@ -94,7 +103,8 @@ struct SmemLayout {
   static constexpr size_t OFF_L = OFF_M + SMEM_M;
   static constexpr size_t OFF_W_SC_ALL = OFF_L + SMEM_L;
   static constexpr size_t OFF_W_FP8 = OFF_W_SC_ALL + SMEM_W_SC_ALL;
-  static constexpr size_t OFF_MBAR_KV = (OFF_W_FP8 + SMEM_W_FP8 + 7) / 8 * 8;
+  static constexpr size_t OFF_ALPHA = OFF_W_FP8 + SMEM_W_FP8;
+  static constexpr size_t OFF_MBAR_KV = (OFF_ALPHA + SMEM_ALPHA + 7) / 8 * 8;
   static constexpr size_t TOTAL = OFF_MBAR_KV + SMEM_MBAR_KV;
 
   static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
@@ -314,7 +324,8 @@ struct SmemPtrs {
   float* m_smem;
   float* l_smem;
   float* w_head_sc_all;
-  uint8_t* w_fp8;  // base, index by vc * SMEM_W_FP8_ONE
+  uint8_t* w_fp8;    // base, index by vc * SMEM_W_FP8_ONE
+  float* alpha_buf;  // 2*HPB on SPLIT_PC tiles, empty otherwise
   uint64_t* mbar_kv;
 
   __device__ static SmemPtrs init(char* base) {
@@ -338,6 +349,7 @@ struct SmemPtrs {
     s.l_smem = (float*)(base + L::OFF_L);
     s.w_head_sc_all = (float*)(base + L::OFF_W_SC_ALL);
     s.w_fp8 = (uint8_t*)(base + L::OFF_W_FP8);
+    s.alpha_buf = (float*)(base + L::OFF_ALPHA);
     s.mbar_kv = (uint64_t*)(base + L::OFF_MBAR_KV);
     return s;
   }
