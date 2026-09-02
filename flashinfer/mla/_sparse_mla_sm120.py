@@ -755,11 +755,14 @@ def _sparse_mla_sm120_paged_attention(
         Pre-allocated split-K partial-output scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits, >=d_v]``, dtype bf16. Only
         consumed by the decode path; required when the call dispatches to a
-        decode kernel.
+        decode kernel. The head dimension must match the kernel's scratch
+        stride: exactly 8 for ``num_heads == 8``, otherwise padded up to the
+        nearest multiple of 16 (see ``_decode_scratch_heads``).
     mid_lse : Optional[torch.Tensor]
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
-        ``mid_out`` when the call dispatches to a decode kernel.
+        ``mid_out`` when the call dispatches to a decode kernel; the head
+        dimension follows the same rule as ``mid_out``.
     prefill_impl : Optional[str]
         Prefill-kernel override for calls that dispatch to prefill. ``None``
         or ``"auto"`` keeps the default order (swapAB preferred where
