@@ -259,8 +259,8 @@ class FmhaConfig:
     tma_copy_kv_elements: int = 0
     tma_copy_kv_granu_elems: int = 0
     tma_copy_kv_bytes: int = 0
-    # V-specific TMA copy granularity. V may use a narrower dtype than K,
-    # e.g. QK-BF16/PV-FP8.
+    # V-specific TMA copy granularity. V may use a different dtype than K,
+    # e.g. QK-BF16/PV-FP8, but these fields are otherwise ignored.
     tma_copy_v_iters: int = 1
     tma_copy_v_granu_inner: int = 128
     tma_copy_v_stage_iters: int = 0
