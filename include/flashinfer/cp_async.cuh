@@ -202,8 +202,8 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
  * \param smem_ptr Pointer to shared memory
  * \param gmem_ptr Pointer to global memory
  */
-template <size_t num_bits, PrefetchMode prefetch_mode,
-          CacheMode cache_mode = CacheMode::kBypassL1, typename T>
+template <size_t num_bits, PrefetchMode prefetch_mode, CacheMode cache_mode = CacheMode::kBypassL1,
+          typename T>
 __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
   static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
   if constexpr (num_bits == 128) {
@@ -235,8 +235,8 @@ __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool p
     pred_load_128b<prefetch_mode, fill_mode, cache_mode>(smem_ptr, gmem_ptr, predicate);
   } else {
     pred_load_128b<prefetch_mode, fill_mode, cache_mode>(smem_ptr, gmem_ptr, predicate);
-    pred_load_128b<prefetch_mode, fill_mode, cache_mode>(
-        smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T), predicate);
+    pred_load_128b<prefetch_mode, fill_mode, cache_mode>(smem_ptr + 16 / sizeof(T),
+                                                         gmem_ptr + 16 / sizeof(T), predicate);
   }
 }
 
