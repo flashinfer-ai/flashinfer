@@ -1431,12 +1431,17 @@ def single_prefill_with_kv_cache(
             head_dim_vo=out_head_dim,
         )
 
-    if window_right >= 0 and backend not in ("fa2", "cute-dsl"):
-        raise NotImplementedError(
-            f"window_right is not supported on backend {backend!r} (kernel cannot "
-            "express a right window); supported backends are 'fa2' and 'cute-dsl'. "
-            "Pass window_right=-1 on other backends."
-        )
+    if window_right >= 0:
+        if window_left < 0:
+            raise ValueError(
+                "window_right requires window_left to also be set (>= 0). "
+                "For bidirectional local attention, set both."
+            )
+        if backend not in ("fa2", "cute-dsl"):
+            raise NotImplementedError(
+                f"window_right is not supported on backend {backend!r}; "
+                "supported backends are 'fa2' and 'cute-dsl'."
+            )
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -2135,12 +2140,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
-            if window_right >= 0 and backend not in ("fa2", "cute-dsl"):
-                raise NotImplementedError(
-                    f"window_right is not supported on backend {backend!r} (kernel "
-                    "cannot express a right window); supported backends are 'fa2' "
-                    "and 'cute-dsl'. Pass window_right=-1 on other backends."
-                )
+            if window_right >= 0:
+                if window_left < 0:
+                    raise ValueError(
+                        "window_right requires window_left to also be set (>= 0). "
+                        "For bidirectional local attention, set both."
+                    )
+                if backend not in ("fa2", "cute-dsl"):
+                    raise NotImplementedError(
+                        f"window_right is not supported on backend {backend!r}; "
+                        "supported backends are 'fa2' and 'cute-dsl'."
+                    )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -2625,16 +2635,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        if window_right >= 0 and self._backend not in (
-            "fa2",
-            "cute-dsl",
-        ):
-            raise NotImplementedError(
-                f"window_right is not supported on backend "
-                f"{self._backend!r} (kernel cannot express a "
-                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
-                f"Pass window_right=-1 on other backends."
-            )
+        if window_right >= 0:
+            if window_left < 0:
+                raise ValueError(
+                    "window_right requires window_left to also be set (>= 0). "
+                    "For bidirectional local attention, set both."
+                )
+            if self._backend not in ("fa2", "cute-dsl"):
+                raise NotImplementedError(
+                    f"window_right is not supported on backend {self._backend!r}; "
+                    "supported backends are 'fa2' and 'cute-dsl'."
+                )
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -4051,16 +4062,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        if window_right >= 0 and self._backend not in (
-            "fa2",
-            "cute-dsl",
-        ):
-            raise NotImplementedError(
-                f"window_right is not supported on backend "
-                f"{self._backend!r} (kernel cannot express a "
-                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
-                f"Pass window_right=-1 on other backends."
-            )
+        if window_right >= 0:
+            if window_left < 0:
+                raise ValueError(
+                    "window_right requires window_left to also be set (>= 0). "
+                    "For bidirectional local attention, set both."
+                )
+            if self._backend not in ("fa2", "cute-dsl"):
+                raise NotImplementedError(
+                    f"window_right is not supported on backend {self._backend!r}; "
+                    "supported backends are 'fa2' and 'cute-dsl'."
+                )
 
         if self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
