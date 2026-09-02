@@ -38,6 +38,7 @@ struct MaterializeParams {
   const int32_t* dst_slots;
   const int32_t* ring_start;
   const int32_t* flush_count;
+  const int32_t* active_request_indices;
   const int64_t* rand_seed;
   int batch, layers, heads, ring_buffer_len;
 };
@@ -57,6 +58,16 @@ __device__ __forceinline__ void advance_persistent_coordinates(
     ++request;
   }
   request += request_delta;
+}
+
+// Keep Philox counters address-based within a layer while deriving a distinct
+// high-entropy key for every layer from the one caller-provided seed.
+__device__ __forceinline__ int64_t layer_philox_seed(int64_t base_seed, int layer) {
+  uint64_t z = static_cast<uint64_t>(base_seed) ^
+               (0x9E3779B97F4A7C15ULL * (uint64_t(layer) + 1));
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return static_cast<int64_t>(z ^ (z >> 31));
 }
 
 // Normal-state path: preserves the current SSU replay representation and
@@ -88,18 +99,19 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
   int64_t const request_layer_delta = work_stride / p.heads;
   int const layer_delta = request_layer_delta % p.layers;
   int const request_delta = request_layer_delta / p.layers;
-  int cached_request = -1, count = -1;
+  // Keep the client-provided indirection in registers for all of this virtual
+  // request's layer/head work; repeatedly loading it from global memory costs
+  // measurable time when only a few requests flush.
+  int cached_virtual_request = -1, cached_physical_request = -1, count = -1;
   while (work < work_items) {
-    if (request != cached_request) {
-      count = p.flush_count[request];
-      cached_request = request;
+    if (request != cached_virtual_request) {
+      cached_physical_request = p.active_request_indices[request];
+      if (cached_physical_request < 0) break;
+      count = p.flush_count[cached_physical_request];
+      cached_virtual_request = request;
     }
-    if (count < 0) {
-      advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
-                                     layer_delta, head_delta, p.layers, p.heads);
-      continue;
-    }
-    int64_t const table = int64_t(layer) * p.batch + request;
+    int const actual_request = cached_physical_request;
+    int64_t const table = int64_t(layer) * p.batch + actual_request;
     int const src_slot = p.src_slots[table], dst_slot = p.dst_slots[table];
     if (src_slot < 0 || dst_slot < 0 || count > MAX_WINDOW) {
       advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
@@ -133,7 +145,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     auto const* x = reinterpret_cast<input_t const*>(p.x_ptrs[layer]);
     auto const* b = reinterpret_cast<input_t const*>(p.b_ptrs[layer]);
     auto const* dt = reinterpret_cast<float const*>(p.dt_ptrs[layer]);
-    int const start = p.ring_start[request];
+    int const start = p.ring_start[actual_request];
     CheckpointingSsuParams view{};
     view.dt_cache = const_cast<float*>(dt);
     view.dt_cache_stride_seq = p.dt_slot_strides[layer];
@@ -158,7 +170,8 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     __pipeline_commit();
     __pipeline_wait_prior(0);
     __syncthreads();
-    int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *p.rand_seed : 0;
+    int64_t const rand_seed =
+        (PHILOX_ROUNDS > 0) ? layer_philox_seed(*p.rand_seed, layer) : 0;
     if constexpr (sizeof(T) == 1) {
       // The existing int8/fp8 replay uses a two-pass encode.  Reuse both
       // passes, with the source scale read independently from the destination
@@ -216,7 +229,8 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
                            TensorView dt_ptrs, TensorView dt_slot_strides, TensorView a_ptrs,
                            TensorView scale_ptrs, TensorView scale_slot_strides,
                            TensorView src_slots, TensorView dst_slots, TensorView ring_start,
-                           TensorView flush_count, int64_t num_layers, int64_t num_heads,
+                           TensorView flush_count, TensorView active_request_indices,
+                           int64_t num_layers, int64_t num_heads,
                            int64_t ring_buffer_len, tvm::ffi::Optional<TensorView> rand_seed) {
   CHECK_CUDA(state_ptrs);
   CHECK_CUDA(state_slot_strides);
@@ -233,6 +247,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   CHECK_CUDA(dst_slots);
   CHECK_CUDA(ring_start);
   CHECK_CUDA(flush_count);
+  CHECK_CUDA(active_request_indices);
   auto check_same_device = [&state_ptrs](TensorView const& table, char const* name) {
     FLASHINFER_CHECK(table.device().device_id == state_ptrs.device().device_id, name,
                      " must be on the same CUDA device as state_ptrs");
@@ -251,6 +266,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   check_same_device(dst_slots, "dst_slots");
   check_same_device(ring_start, "ring_start");
   check_same_device(flush_count, "flush_count");
+  check_same_device(active_request_indices, "active_request_indices");
   CHECK_DIM(1, state_ptrs);
   CHECK_DIM(1, state_slot_strides);
   CHECK_DIM(1, x_ptrs);
@@ -266,6 +282,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   CHECK_DIM(2, dst_slots);
   CHECK_DIM(1, ring_start);
   CHECK_DIM(1, flush_count);
+  CHECK_DIM(1, active_request_indices);
   CHECK_CONTIGUOUS(state_ptrs);
   CHECK_CONTIGUOUS(state_slot_strides);
   CHECK_CONTIGUOUS(x_ptrs);
@@ -281,6 +298,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   CHECK_CONTIGUOUS(dst_slots);
   CHECK_CONTIGUOUS(ring_start);
   CHECK_CONTIGUOUS(flush_count);
+  CHECK_CONTIGUOUS(active_request_indices);
   auto check_int_table = [](TensorView const& table, char const* name) {
     FLASHINFER_CHECK(table.dtype().code == kDLInt && table.dtype().bits == 64, name,
                      " must be int64");
@@ -304,6 +322,8 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
                    "ring_start must be int32");
   FLASHINFER_CHECK(flush_count.dtype().code == kDLInt && flush_count.dtype().bits == 32,
                    "flush_count must be int32");
+  FLASHINFER_CHECK(active_request_indices.dtype().code == kDLInt && active_request_indices.dtype().bits == 32,
+                   "active_request_indices must be int32");
   FLASHINFER_CHECK(num_layers > 0, "num_layers must be positive");
   FLASHINFER_CHECK(num_heads > 0, "num_heads must be positive");
   constexpr int64_t kIntMax = std::numeric_limits<int>::max();
@@ -330,6 +350,8 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   FLASHINFER_CHECK(dst_slots.size(0) == num_layers && dst_slots.size(1) == flush_count.size(0),
                    "dst_slots must be [num_layers, batch]");
   FLASHINFER_CHECK(ring_start.size(0) == flush_count.size(0), "ring_start must have shape [batch]");
+  FLASHINFER_CHECK(active_request_indices.size(0) == flush_count.size(0),
+                   "active_request_indices must have shape [batch]");
   FLASHINFER_CHECK(ring_buffer_len > 0, "ring_buffer_len must be positive");
   if constexpr (PHILOX_ROUNDS > 0) {
     FLASHINFER_CHECK(rand_seed.has_value(), "rand_seed is required when PHILOX_ROUNDS > 0");
@@ -357,6 +379,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
       static_cast<const int32_t*>(dst_slots.data_ptr()),
       static_cast<const int32_t*>(ring_start.data_ptr()),
       static_cast<const int32_t*>(flush_count.data_ptr()),
+      static_cast<const int32_t*>(active_request_indices.data_ptr()),
       rand_seed.has_value() ? static_cast<const int64_t*>(rand_seed.value().data_ptr()) : nullptr,
       int(flush_count.size(0)),
       int(num_layers),

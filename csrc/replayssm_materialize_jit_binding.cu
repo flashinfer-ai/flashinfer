@@ -3,7 +3,7 @@
 namespace flashinfer::mamba {
 void replayssm_materialize(TensorView, TensorView, TensorView, TensorView, TensorView, TensorView,
                            TensorView, TensorView, TensorView, TensorView, TensorView, TensorView,
-                           TensorView, TensorView, TensorView, int64_t, int64_t, int64_t,
+                           TensorView, TensorView, TensorView, TensorView, int64_t, int64_t, int64_t,
                            tvm::ffi::Optional<TensorView>);
 }
 

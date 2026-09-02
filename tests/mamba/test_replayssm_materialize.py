@@ -5,6 +5,7 @@ import torch
 
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.mamba.replayssm_materialize import replayssm_materialize
+from flashinfer.utils import is_cvt_rs_supported
 
 
 def _ptr_table(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -19,6 +20,13 @@ def _stride_table(tensors: list[torch.Tensor]) -> torch.Tensor:
     )
 
 
+def _active_request_indices(flush_count: torch.Tensor) -> torch.Tensor:
+    indices = torch.full_like(flush_count, -1)
+    active = torch.nonzero(flush_count >= 0, as_tuple=False).flatten()
+    indices[: active.numel()] = active
+    return indices
+
+
 def _materialize(
     state: list[torch.Tensor],
     x_cache: list[torch.Tensor],
@@ -31,6 +39,10 @@ def _materialize(
     flush_count: torch.Tensor,
     ring_buffer_len: int,
     heads_per_group: int = 1,
+    active_request_indices: torch.Tensor | None = None,
+    state_dtype: torch.dtype = torch.bfloat16,
+    rand_seed: torch.Tensor | None = None,
+    philox_rounds: int = 0,
 ) -> None:
     layers = len(state)
     zero_table = torch.zeros(layers, dtype=torch.int64, device="cuda")
@@ -50,7 +62,10 @@ def _materialize(
         dst_slots,
         ring_start,
         flush_count,
-        state_dtype=torch.bfloat16,
+        active_request_indices
+        if active_request_indices is not None
+        else _active_request_indices(flush_count),
+        state_dtype=state_dtype,
         input_dtype=torch.bfloat16,
         matrixA_dtype=torch.float32,
         dim=64,
@@ -59,6 +74,8 @@ def _materialize(
         heads_per_group=heads_per_group,
         max_window=8,
         ring_buffer_len=ring_buffer_len,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
     )
 
 
@@ -88,6 +105,10 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
     flush_count = torch.tensor([3, 0], dtype=torch.int32, device="cuda")
 
     before = [tensor.clone() for tensor in state]
+    # Deliberately reverse the active requests: virtual request 0 is the
+    # physical zero-copy request, while virtual request 1 replays three rows.
+    # This verifies the client-provided indirection for every layer's slots,
+    # ring metadata, and state destination.
     _materialize(
         state,
         x_cache,
@@ -99,6 +120,7 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         ring_start,
         flush_count,
         ring_buffer_len,
+        active_request_indices=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
     )
     torch.cuda.synchronize()
 
@@ -165,6 +187,7 @@ def test_replayssm_materialize_negative_count_is_noop() -> None:
         dst_slots,
         ring_start,
         flush_count,
+        _active_request_indices(flush_count),
         ring_buffer_len,
     )
     torch.cuda.synchronize()
@@ -239,11 +262,20 @@ def test_replayssm_materialize_multilayer_multhead_grouped_b() -> None:
             )
 
 
-def test_replayssm_materialize_matches_checkpointing_ssu_replay() -> None:
+@pytest.mark.parametrize(
+    ("state_dtype", "philox_rounds"),
+    [(torch.bfloat16, 0), (torch.float16, 5)],
+    ids=["bf16_rn", "fp16_philox5"],
+)
+def test_replayssm_materialize_matches_checkpointing_ssu_replay(
+    state_dtype: torch.dtype, philox_rounds: int
+) -> None:
     """The shared replay helper produces bitwise-identical BF16 state."""
     torch.manual_seed(2)
     cache_size, ring_buffer_len, predicted = 2, 12, 4
-    state = torch.randn(cache_size, 1, 64, 64, dtype=torch.bfloat16, device="cuda")
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip("FP16 Philox stochastic rounding requires SM100a/SM103a")
+    state = torch.randn(cache_size, 1, 64, 64, dtype=state_dtype, device="cuda")
     x_cache = torch.randn(
         cache_size, 1, ring_buffer_len, 64, dtype=torch.bfloat16, device="cuda"
     )
@@ -265,6 +297,7 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay() -> None:
     out = torch.empty_like(x)
 
     expected = state.clone()
+    rand_seed = torch.tensor([12345], device="cuda", dtype=torch.int64) if philox_rounds else None
     checkpointing_ssu(
         expected,
         x_cache.clone(),
@@ -280,6 +313,8 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay() -> None:
         out,
         state_batch_indices=torch.tensor([0], dtype=torch.int32, device="cuda"),
         algorithm="monolith",
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
     )
 
     actual = state.clone()
@@ -294,9 +329,21 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay() -> None:
         ring_start[:1],
         accepted[:1],
         ring_buffer_len,
+        state_dtype=state_dtype,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
     )
     torch.cuda.synchronize()
-    assert torch.equal(actual[1], expected[0])
+    if philox_rounds:
+        expected_value = expected[0]
+        actual_value = actual[1]
+        assert torch.all(
+            (actual_value == expected_value)
+            | (actual_value == torch.nextafter(expected_value, torch.full_like(expected_value, float("inf"))))
+            | (actual_value == torch.nextafter(expected_value, torch.full_like(expected_value, float("-inf"))))
+        )
+    else:
+        assert torch.equal(actual[1], expected[0])
 
 
 @pytest.mark.parametrize(
@@ -395,6 +442,7 @@ def _materialize_int8(
         torch.tensor([[1]], dtype=torch.int32, device="cuda"),
         ring_start,
         flush_count,
+        _active_request_indices(flush_count),
         state_dtype=state.dtype,
         input_dtype=torch.bfloat16,
         matrixA_dtype=torch.float32,

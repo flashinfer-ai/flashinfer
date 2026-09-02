@@ -45,6 +45,7 @@ def replayssm_materialize(
     dst_slots: torch.Tensor,
     ring_start: torch.Tensor,
     flush_count: torch.Tensor,
+    active_request_indices: torch.Tensor,
     *,
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
@@ -63,7 +64,10 @@ def replayssm_materialize(
     Pointer and stride tables are CUDA int64 tensors indexed by layer. Slots are
     CUDA int32 tensors with shape ``[num_layers, batch]``; ring metadata is
     non-layer ``[batch]``. ``flush_count < 0`` is a no-op and zero is an exact
-    raw state/scale copy.
+    raw state/scale copy. ``active_request_indices`` is a CUDA int32 tensor
+    with shape ``[batch]`` containing every request with non-negative flush
+    count, followed by ``-1`` entries. Its active prefix maps the kernel's
+    ordered virtual requests to physical batch requests.
     """
     tables = (
         state_ptrs,
@@ -90,10 +94,12 @@ def replayssm_materialize(
     if (
         not ring_start.is_cuda
         or not flush_count.is_cuda
+        or not active_request_indices.is_cuda
         or ring_start.dtype != torch.int32
         or flush_count.dtype != torch.int32
+        or active_request_indices.dtype != torch.int32
     ):
-        raise ValueError("ring_start and flush_count must be CUDA int32")
+        raise ValueError("ring metadata and active_request_indices must be CUDA int32")
     if max_window < 1 or max_window > 16:
         raise ValueError("max_window must be in [1, 16]")
     if ring_buffer_len < 1:
@@ -111,6 +117,7 @@ def replayssm_materialize(
         dst_slots.shape != (layers, batch)
         or ring_start.numel() != batch
         or flush_count.numel() != batch
+        or active_request_indices.numel() != batch
     ):
         raise ValueError("slot and metadata shapes are inconsistent")
     _module(
@@ -128,6 +135,7 @@ def replayssm_materialize(
         dst_slots,
         ring_start,
         flush_count,
+        active_request_indices,
         layers,
         num_heads,
         ring_buffer_len,

@@ -3,10 +3,9 @@
 """Measure ReplaySSM prefix materialization with a persistent launch grid.
 
 The materializer uses a fixed CTA pool which grid-strides over the logical
-``(request, layer, head)`` grid. Serving uses CUDA graphs or avoids a host-side
-compaction of flushing requests, so the logical grid can cover the entire
-decode batch even when nearly every request has ``flush_count == -1``. This
-benchmark measures that case directly.
+``(request, layer, head)`` grid. The caller supplies a compact active-request
+map, so the kernel traverses only flushing requests while preserving their
+physical batch indices. This benchmark constructs that map directly.
 
 The default shape is the proposed Nemotron-v4 full-model shape:
 ``batch=256, layers=48, heads=256, dim=64, dstate=128``.  It is 3,145,728
@@ -161,6 +160,11 @@ def _build_call(
     counts = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
     if active_requests:
         counts[active_indices_tensor] = flush_count
+    active_request_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    if active_requests:
+        active_request_indices[:active_requests] = torch.tensor(
+            active_indices, device="cuda", dtype=torch.int32
+        )
 
     state_ptrs = _pointer_table(state, layers)
     state_slot_strides = _stride_table(state, layers)
@@ -193,6 +197,7 @@ def _build_call(
             dst_slots,
             ring_start,
             counts,
+            active_request_indices,
             state_dtype=torch.bfloat16,
             input_dtype=torch.bfloat16,
             matrixA_dtype=torch.float32,

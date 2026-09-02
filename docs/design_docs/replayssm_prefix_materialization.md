@@ -27,6 +27,12 @@ provides one logical ring position for every layer in the invocation:
 The caller owns boundary convention and validates selected counts. The op has
 no accepted-token, alignment, or ring-cursor update semantics.
 
+The caller also supplies `active_request_indices[B]` (int32): all physical
+request IDs whose `flush_count` is nonnegative, followed by `-1`. The active
+prefix may use any order, but every active physical request must appear once;
+the kernel stops at the first `-1` and uses this tensor to map its ordered
+virtual request coordinate to physical metadata and slot columns.
+
 ## Provisional data interface
 
 Each storage family is independently addressable by a GPU-resident per-layer
