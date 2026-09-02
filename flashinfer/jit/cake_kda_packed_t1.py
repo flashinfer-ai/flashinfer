@@ -84,7 +84,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
 ] = {
     "register_tile16": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_register_tile16.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_register_tile16",
+        symbol="kernel_cake_kda_packed_t1_register_tile16",
         value_tiles=8,
         threads=128,
         smem_bytes=0,
@@ -92,7 +92,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "register_tile8_interleaved": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_register_tile8_interleaved.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_register_tile8_interleaved",
+        symbol="kernel_cake_kda_packed_t1_register_tile8_interleaved",
         value_tiles=16,
         threads=32,
         smem_bytes=0,
@@ -109,7 +109,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile64_ilp4": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile64_ilp4.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_ilp4",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile64_ilp4",
         value_tiles=2,
         threads=128,
         smem_bytes=24576,
@@ -117,7 +117,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile64": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile64.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync",
+        symbol="kernel_cake_kda_packed_t1_cpasync",
         value_tiles=2,
         threads=128,
         smem_bytes=16384,
@@ -125,7 +125,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile128_ilp4": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_ilp4.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128_ilp4",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile128_ilp4",
         value_tiles=1,
         threads=128,
         smem_bytes=24576,
@@ -133,7 +133,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile64_register_pipeline": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile64_register_pipeline.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile64_register_pipeline",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile64_register_pipeline",
         value_tiles=2,
         threads=128,
         smem_bytes=16384,
@@ -142,8 +142,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     "cpasync_tile128_packed_state_v_private_prefetch": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_packed_state_v_private_prefetch.cu",
         symbol=(
-            "kernel_flashinfer_packed_kda_t1_cpasync_"
-            "tile128_packed_state_v_private_prefetch"
+            "kernel_cake_kda_packed_t1_cpasync_tile128_packed_state_v_private_prefetch"
         ),
         value_tiles=1,
         threads=128,
@@ -152,7 +151,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile128_v_private_prefetch": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_v_private_prefetch.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128_v_private_prefetch",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile128_v_private_prefetch",
         value_tiles=1,
         threads=128,
         smem_bytes=20736,
@@ -160,7 +159,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile128_paired_row_pipeline": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_paired_row_pipeline.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128_paired_row_pipeline",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile128_paired_row_pipeline",
         value_tiles=1,
         threads=128,
         smem_bytes=20736,
@@ -168,7 +167,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile128_register_pipeline": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_register_pipeline.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128_register_pipeline",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile128_register_pipeline",
         value_tiles=1,
         threads=128,
         smem_bytes=20480,
@@ -176,7 +175,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "cpasync_tile128_ilp2": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_ilp2.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128",
+        symbol="kernel_cake_kda_packed_t1_cpasync_tile128",
         value_tiles=1,
         threads=128,
         smem_bytes=20480,

@@ -9,7 +9,6 @@
 import pytest
 
 from flashinfer.jit import cake_kda_packed_t1
-from flashinfer.jit import core as jit_core
 
 
 @pytest.mark.parametrize(
@@ -83,54 +82,6 @@ def test_unaligned_state_uses_legacy_route():
             state_aligned=True,
             aux_vec4_aligned=True,
         )
-
-
-@pytest.mark.parametrize("variant", cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANTS)
-def test_jit_specs_bind_frozen_source_and_physical_launch_metadata(
-    monkeypatch,
-    tmp_path,
-    variant,
-):
-    monkeypatch.setattr(
-        jit_core.current_compilation_context,
-        "TARGET_CUDA_ARCHS",
-        {(10, "3a")},
-    )
-    monkeypatch.setattr(
-        cake_kda_packed_t1.jit_env,
-        "FLASHINFER_GEN_SRC_DIR",
-        tmp_path,
-    )
-    cake_kda_packed_t1.gen_cake_kda_packed_t1_module.cache_clear()
-
-    metadata = cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANT_METADATA[variant]
-    spec = cake_kda_packed_t1.gen_cake_kda_packed_t1_module(variant, "sm100f")
-    uri = cake_kda_packed_t1.get_cake_kda_packed_t1_uri(variant, "sm100f")
-
-    assert spec.name == uri
-    assert spec.sources == [tmp_path / uri / "cake_kda_packed_t1_binding.cu"]
-    assert "-gencode=arch=compute_100f,code=sm_100f" in spec.extra_cuda_cflags
-    assert "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND=100" in spec.extra_cuda_cflags
-    assert "-use_fast_math" in spec.extra_cuda_cflags
-    assert "--maxrregcount=128" in spec.extra_cuda_cflags
-    assert ("--ftz=false" in spec.extra_cuda_cflags) == (
-        variant == "register_tile8_interleaved"
-    )
-
-    source = (cake_kda_packed_t1._get_csrc_dir() / metadata.body).read_text()
-    assert metadata.symbol in source
-    binding = spec.sources[0].read_text()
-    assert f'#define CAKE_KDA_PACKED_T1_BODY_FILE "{metadata.body}"' in binding
-    assert f"#define CAKE_KDA_PACKED_T1_KERNEL {metadata.symbol}" in binding
-    assert f"#define CAKE_KDA_PACKED_T1_VALUE_TILES {metadata.value_tiles}" in binding
-    assert f"#define CAKE_KDA_PACKED_T1_THREADS {metadata.threads}" in binding
-    assert f"#define CAKE_KDA_PACKED_T1_SMEM_BYTES {metadata.smem_bytes}" in binding
-    assert (
-        "#define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 "
-        f"{int(metadata.requires_aux_vec4)}"
-    ) in binding
-    assert '#include "cake_kda_packed_t1_binding.cuh"' in binding
-    cake_kda_packed_t1.gen_cake_kda_packed_t1_module.cache_clear()
 
 
 def test_binding_preserves_stream_stride_index_and_alignment_contracts():

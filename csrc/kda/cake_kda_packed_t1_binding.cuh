@@ -47,11 +47,10 @@
 #include "tvm_ffi_utils.h"
 
 extern "C" __global__ void CAKE_KDA_PACKED_T1_KERNEL(
-    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, __nv_bfloat16* g,
-    __nv_bfloat16* beta, float* A_log, float* dt_bias, __nv_bfloat16* state,
-    __nv_bfloat16* out, int* state_indices, float scale, long long q_stride_token,
-    long long k_stride_token, long long v_stride_token, long long g_stride_token,
-    long long beta_stride_token, long long state_stride_slot);
+    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, __nv_bfloat16* g, __nv_bfloat16* beta,
+    float* A_log, float* dt_bias, __nv_bfloat16* state, __nv_bfloat16* out, int* state_indices,
+    float scale, long long q_stride_token, long long k_stride_token, long long v_stride_token,
+    long long g_stride_token, long long beta_stride_token, long long state_stride_slot);
 
 namespace flashinfer {
 namespace cake_kda_packed_t1 {
