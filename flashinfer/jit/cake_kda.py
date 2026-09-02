@@ -55,6 +55,8 @@ class CakeKDAModuleSpec:
     compile_flags: tuple[str, ...]
     device_path: Path
     binding_path: Path
+    device_headers: tuple[Path, ...]
+    binding_headers: tuple[Path, ...]
     use_pdl: bool
     tma_abi: CakeKDATMAABI
     tma_workspace_bytes: int
@@ -241,13 +243,47 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         _require(units.get("compile_separately") is True, f"{label}.compile_separately")
         device_raw = units.get("device")
         binding_raw = units.get("binding")
+        device_headers_raw = units.get("device_headers", [])
+        binding_headers_raw = units.get("binding_headers", [])
+        _require(
+            isinstance(device_headers_raw, list)
+            and all(isinstance(path, str) for path in device_headers_raw)
+            and len(device_headers_raw) == len(set(device_headers_raw)),
+            f"{label}.device_headers",
+        )
+        _require(
+            isinstance(binding_headers_raw, list)
+            and all(isinstance(path, str) for path in binding_headers_raw)
+            and len(binding_headers_raw) == len(set(binding_headers_raw)),
+            f"{label}.binding_headers",
+        )
         device_path = _resolve_source(csrc_dir, device_raw, f"{label}.device")
         binding_path = _resolve_source(csrc_dir, binding_raw, f"{label}.binding")
+        device_headers = tuple(
+            _resolve_source(
+                csrc_dir, raw_path, f"{label}.device_headers[{header_index}]"
+            )
+            for header_index, raw_path in enumerate(device_headers_raw)
+        )
+        binding_headers = tuple(
+            _resolve_source(
+                csrc_dir, raw_path, f"{label}.binding_headers[{header_index}]"
+            )
+            for header_index, raw_path in enumerate(binding_headers_raw)
+        )
         _require(
-            device_raw in file_sha256 and binding_raw in file_sha256, f"{label}.files"
+            device_raw in file_sha256
+            and binding_raw in file_sha256
+            and all(path in file_sha256 for path in device_headers_raw)
+            and all(path in file_sha256 for path in binding_headers_raw),
+            f"{label}.files",
         )
         closure = item.get("closure")
-        _require(isinstance(closure, list) and len(closure) == 2, f"{label}.closure")
+        _require(
+            isinstance(closure, list)
+            and len(closure) == 2 + len(device_headers_raw) + len(binding_headers_raw),
+            f"{label}.closure",
+        )
         closure_map = {
             entry.get("path"): entry.get("sha256")
             for entry in closure
@@ -258,6 +294,8 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
             == {
                 device_raw: file_sha256[device_raw],
                 binding_raw: file_sha256[binding_raw],
+                **{raw_path: file_sha256[raw_path] for raw_path in device_headers_raw},
+                **{raw_path: file_sha256[raw_path] for raw_path in binding_headers_raw},
             },
             f"{label}.closure mismatch",
         )
@@ -325,6 +363,8 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
                 compile_flags=tuple(compile_flags),
                 device_path=device_path,
                 binding_path=binding_path,
+                device_headers=device_headers,
+                binding_headers=binding_headers,
                 use_pdl=launch.get("use_pdl") is True,
                 tma_abi=tma_abi,
                 tma_workspace_bytes=tma_workspace_bytes,
