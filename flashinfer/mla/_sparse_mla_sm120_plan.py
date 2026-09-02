@@ -458,7 +458,7 @@ def _resolve_cpb(
         c is not None
         and AutoTuner.get().is_tuning_mode
         and not _cpb.is_crossover_failed(device, family)
-        and not _cpb.has_crossover(device, family)
+        and not _cpb.crossover_grid_complete(device, family)
     ):
         from ._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
 

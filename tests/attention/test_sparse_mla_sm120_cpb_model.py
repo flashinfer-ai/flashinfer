@@ -172,6 +172,37 @@ def test_dsv3_2_crossover_requires_glm_nsa_entries(
     assert cpb_mod.has_crossover(device, "dsv3_2")
 
 
+def test_crossover_grid_complete_gates_full_sweep(clean_cpb_state) -> None:
+    """A targeted off-grid crossover entry must not count as a completed full
+    sweep (it would silently suppress the tuning-mode grid calibration)."""
+    from flashinfer.mla._sparse_mla_sm120_plan import (
+        _DECODE_DSV3_2_CALIBRATION_GRID,
+        _DECODE_DSV4_CALIBRATION_GRID,
+    )
+
+    device = torch.device("cpu")
+    cpb_mod.save_crossover(device, {"dsv4|48|256": 8})  # targeted one-off
+    assert cpb_mod.has_crossover(device, "dsv4")
+    assert not cpb_mod.crossover_grid_complete(device, "dsv4")
+
+    cpb_mod.save_crossover(
+        device, {f"dsv4|{h}|{k}": 32 for h, k in _DECODE_DSV4_CALIBRATION_GRID}
+    )
+    assert cpb_mod.crossover_grid_complete(device, "dsv4")
+
+    # dsv3_2 completeness needs both key spaces on the shared grid.
+    cpb_mod.save_crossover(
+        device,
+        {f"dsv3_2|{h}|{k}": 16 for h, k in _DECODE_DSV3_2_CALIBRATION_GRID},
+    )
+    assert not cpb_mod.crossover_grid_complete(device, "dsv3_2")
+    cpb_mod.save_crossover(
+        device,
+        {f"glm_nsa|{h}|{k}": 16 for h, k in _DECODE_DSV3_2_CALIBRATION_GRID},
+    )
+    assert cpb_mod.crossover_grid_complete(device, "dsv3_2")
+
+
 def test_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
     device = torch.device("cpu")
     cpb_mod.save_constants(device, "dsv4", _C)

@@ -1011,7 +1011,8 @@ def get_decode_max_tokens(
 def has_crossover(device: torch.device, family: str) -> bool:
     """True iff the process/disk cache holds crossover entries for ``family``.
     The ``dsv3_2`` calibration covers both the ``dsv3_2`` and ``glm_nsa`` key
-    spaces, so both must be present."""
+    spaces, so both must be present. Loose any-key predicate;
+    :func:`crossover_grid_complete` is the full-sweep gate."""
     dev_key = _device_key(device)
     table = _crossover.get(dev_key)
     if table is None:
@@ -1021,6 +1022,42 @@ def has_crossover(device: torch.device, family: str) -> bool:
         return False
     prefixes = ("dsv3_2|", "glm_nsa|") if family == "dsv3_2" else (f"{family}|",)
     return all(any(k.startswith(p) for k in table) for p in prefixes)
+
+
+def crossover_grid_complete(device: torch.device, family: str) -> bool:
+    """True iff the cache holds a crossover entry for every (num_heads, topk)
+    pair on the family's full calibration grid (both key spaces for
+    ``dsv3_2``). Targeted off-grid calibrations do not count, so a one-off
+    ``calibrate_sparse_mla_sm120(heads=..., topks=...)`` cannot suppress the
+    full tuning-mode sweep."""
+    from ._sparse_mla_sm120_plan import (
+        _DECODE_DSV3_2_CALIBRATION_GRID,
+        _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_GLM53_NOPE_CALIBRATION_GRID,
+        _DECODE_DOTS3_SWA_CALIBRATION_GRID,
+    )
+
+    key_spaces = {
+        "dsv4": (("dsv4", _DECODE_DSV4_CALIBRATION_GRID),),
+        "dsv3_2": (
+            ("dsv3_2", _DECODE_DSV3_2_CALIBRATION_GRID),
+            ("glm_nsa", _DECODE_DSV3_2_CALIBRATION_GRID),
+        ),
+        "glm53_nope": (("glm53_nope", _DECODE_GLM53_NOPE_CALIBRATION_GRID),),
+        "dots3_swa": (("dots3_swa", _DECODE_DOTS3_SWA_CALIBRATION_GRID),),
+    }.get(family)
+    if key_spaces is None:
+        return False
+    dev_key = _device_key(device)
+    table = _crossover.get(dev_key)
+    if table is None:
+        _maybe_load_disk()
+        table = _crossover.get(dev_key)
+    if not table:
+        return False
+    return all(
+        f"{prefix}|{h}|{k}" in table for prefix, grid in key_spaces for h, k in grid
+    )
 
 
 def mark_crossover_failed(device: torch.device, family: str) -> None:
