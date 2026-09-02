@@ -1,4 +1,4 @@
-"""Tests for tinygemm2_sm100 — the generated SM100/SM103/SM107 tinygemm2 variants.
+"""Tests for tinygemm2_sm100 — the generated SM100/SM103 tinygemm2 variants.
 
 The four frozen variants in ``csrc/tinygemm2_sm100/tinygemm2_sm100.cu`` are
 generated Loom schedules exactly porting ``csrc/tinygemm2.cu``; the contract
@@ -10,32 +10,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.gemm.routergemm import (
-    _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES,
-)
-from flashinfer.jit.cpp_ext import is_cuda_version_at_least
-from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported
 
 
 def _skip_if_not_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("tinygemm2_sm100 tests require a CUDA device")
-    device = torch.device("cuda")
-    # is_sm100a_supported() only tests major == 10 (plus CUDA >= 12.8), but the
-    # kernel's own TVM_FFI_ICHECK accepts minor 0/3/7 only. Gate on the same
-    # tuple the dispatcher uses so any other 10.x device skips rather than
-    # tripping that check.
-    capability = get_compute_capability(device)
-    if not is_sm100a_supported(device) or (
-        capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES
-    ):
-        pytest.skip("tinygemm2_sm100 requires SM100/SM103/SM107")
-    # #4849 made the kernel's SM107 arm conditional on a CUDA 13.4+ toolkit
-    # (kSupportsSm107 in csrc/tinygemm2_sm100.cu) and only emits compute_107a
-    # under the same condition. Mirror that, or an SM107 device on an older
-    # toolkit would reach the TVM_FFI_ICHECK instead of skipping.
-    if capability == (10, 7) and not is_cuda_version_at_least("13.4"):
-        pytest.skip("tinygemm2_sm100 on SM107 requires a CUDA 13.4+ toolkit")
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("tinygemm2_sm100 requires SM100/SM103")
 
 
 def _make_case(batch_size, output_features, input_features, seed=0):
