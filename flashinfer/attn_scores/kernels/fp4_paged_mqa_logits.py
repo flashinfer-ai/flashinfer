@@ -17,7 +17,7 @@
 # Original copyright: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-CuTe DSL FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100).
+CuTe DSL FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100/SM103) and Rubin (SM107).
 
 Implement from DeepGEMM's `sm100_fp4_paged_mqa_logits.cuh` and reuse the FP8 DSL kernel's
 warp partition / barrier choreography with the following deltas (see plan

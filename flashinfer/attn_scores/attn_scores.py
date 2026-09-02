@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Paged MQA logits: FP8 and FP4 attention-score kernels for Blackwell (SM100).
+"""Paged MQA logits: FP8 and FP4 attention-score kernels for datacentre
+Blackwell (SM100/SM103) and Rubin (SM107).
 
 These kernels compute, for each batch element b, speculative slot t, and KV
 position pos:
@@ -31,7 +32,8 @@ Two variants, differing in how their scale factors enter:
                          folded into dequantizing Q and K, so there is no
                          trailing scale factor
 
-Both are SM100 (B200-class Blackwell) only.
+Both run on datacentre Blackwell (SM100/SM103) and Rubin (SM107); consumer
+Blackwell (SM120/121) is deliberately unsupported (see ``_PAGED_MQA_CCS``).
 """
 
 import contextlib
@@ -1057,7 +1059,11 @@ def compute_paged_mqa_logits_schedule(
     """Compute the CTA schedule tensor for paged MQA logits kernels.
 
     Returns [num_sms+1, 2] int32 on CUDA, ready to pass as ``schedule_meta``
-    to :func:`fp8_paged_mqa_logits` or :func:`fp4_paged_mqa_logits`.
+    to :func:`fp8_paged_mqa_logits` or :func:`fp4_paged_mqa_logits`.  One
+    exception: when fp4's atom split is active (always the case for next_n=4
+    on SM100/SM103), the kernel schedules batch_size*num_atoms rows, so a
+    schedule built from the native context_lens is rejected there -- omit
+    schedule_meta on split configurations instead.
 
     Args:
         context_lens:   [B] int32, on CPU or CUDA.
@@ -1218,7 +1224,7 @@ def fp8_paged_mqa_logits(
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> torch.Tensor:
-    """FP8 paged MQA logits for Blackwell (SM100).
+    """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
     Args:
         q:               [batch_size, next_n, num_heads, head_dim]  float8_e4m3fn
@@ -1525,7 +1531,7 @@ def fp4_paged_mqa_logits(
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> torch.Tensor:
-    """FP4 (MXFP4) paged MQA logits for Blackwell (SM100).
+    """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
     Args:
         q:               [batch_size, next_n, num_heads, head_dim/2]  uint8
@@ -1585,6 +1591,27 @@ def fp4_paged_mqa_logits(
                          pass in, so set it to match how that cache was
                          written; supplying the interleaved order can be
                          faster.
+        next_n_atom:     experimental execution-strategy override for how
+                         next_n decomposes into per-launch atoms.  The MMA/TMEM
+                         tile spans one atom, so the atom (not next_n) is what
+                         the per-arch TMEM cap gates: at most 3 on SM100/SM103,
+                         4 on Rubin (SM107+).  Legal values:
+                           None (default) -- run direct (one atom of next_n)
+                             whenever this device's cap holds it, splitting
+                             only when it cannot (next_n=4 on SM100/SM103 runs
+                             as two atoms of 2).  Never changes the execution
+                             of a configuration that fits directly.
+                           "auto" -- pick the atom by an analytical wave-count
+                             heuristic; may split even when direct fits (a
+                             split can win at small batch by filling idle SMs,
+                             at the cost of num_atoms x KV reads).
+                           "direct" -- force one atom of next_n; raises if the
+                             device cap cannot hold it.
+                           int -- force that atom size; must divide next_n and
+                             fit the device cap.
+                         Numerics are identical for every legal value; only
+                         performance and the schedule_meta contract (below)
+                         change.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on CUDA.  If None, computed from context_lens each call.
                          Reusable only while the entire
@@ -1596,6 +1623,15 @@ def fp4_paged_mqa_logits(
                          the same buffer before launching.  A stale schedule can
                          hang the kernel.
                          Use compute_paged_mqa_logits_schedule() to generate it.
+                         Must be omitted (None) whenever an atom split is
+                         active (always the case for next_n=4 on SM100/SM103):
+                         the scheduler then describes batch_size*num_atoms rows
+                         while a caller-built schedule describes batch_size, a
+                         mismatch that can hang the persistent kernel, so it is
+                         rejected with ValueError.  The internally computed
+                         schedule is CUDA-graph-capturable and replays
+                         correctly, so under capture simply omit this argument
+                         on split configurations.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len].  Use
                          padded_context_len() to size it.  Required for CUDA
@@ -1615,6 +1651,11 @@ def fp4_paged_mqa_logits(
         num_heads        must equal _FP4_REQUIRED_NUM_HEADS.
         head_dim         must equal _FP4_REQUIRED_HEAD_DIM.
         next_n           must be in 1.._FP4_MAX_NEXT_N.
+        next_n_atom      (when an int) must divide next_n, and the resolved
+                         atom must fit the device cap: 3 on SM100/SM103, 4 on
+                         Rubin (SM107+).
+        schedule_meta    must be None when the resolved decomposition has more
+                         than one atom (see next_n_atom above).
         sf_vec_size      must equal _FP4_SF_VEC_SIZE, and head_dim/sf_vec_size
                          must equal _SF_PER_INT32.
         block_size       must divide _COMPUTE_BLOCK_KV, with the quotient at
@@ -1662,7 +1703,18 @@ def fp4_paged_mqa_logits(
     elif next_n_atom == "direct":
         atom = next_n
     else:
-        atom = int(next_n_atom)
+        # Strict domain: bool is an int subclass, so next_n_atom=True (a
+        # plausible "enable" typo) would silently mean atom=1 -- a full split
+        # with num_atoms x KV traffic -- and an int() coercion would likewise
+        # accept floats and numeric strings. Reject anything but a real int so
+        # a malformed value fails loudly instead of silently changing the
+        # execution strategy.
+        if not isinstance(next_n_atom, int) or isinstance(next_n_atom, bool):
+            raise ValueError(
+                f"fp4_paged_mqa_logits: next_n_atom must be None, 'auto', "
+                f"'direct', or an int dividing next_n; got {next_n_atom!r}"
+            )
+        atom = next_n_atom
     if not (1 <= atom <= next_n and next_n % atom == 0):
         raise ValueError(
             f"fp4_paged_mqa_logits: next_n_atom={atom} must divide next_n="
