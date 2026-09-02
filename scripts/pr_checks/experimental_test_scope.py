@@ -74,31 +74,41 @@ def parse(body: str) -> list[str]:
     if len(blocks) > 1:
         raise ValueError(f"found {len(blocks)} experimental-tests blocks; expected 1")
 
-    targets, bad, unsafe = [], [], []
+    targets = []
     for raw in blocks[0].splitlines():
         line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        # A path may carry a ::test suffix; validate only the file part.
-        path = line.split("::", 1)[0]
-        if not TARGET_RE.match(line):
-            unsafe.append(line)
-        elif not path.startswith(ROOT) or ".." in path:
-            bad.append(line)
-        else:
+        if line:
             targets.append(line)
-    if unsafe:
-        raise ValueError(
-            "targets contain characters not allowed in a test path: "
-            + ", ".join(unsafe)
-        )
-    if bad:
-        raise ValueError(f"targets outside {ROOT}: {', '.join(bad)}")
+    validate(targets, ROOT)
     if not targets:
         raise ValueError(
             "the experimental-tests block is empty; declare at least one target "
             f"under {ROOT}"
         )
+    return targets
+
+
+def validate(targets: list[str], root: str = ROOT) -> list[str]:
+    """Charset- and root-check an already-split list of targets.
+
+    Shared by both entry points so there is one definition of a safe target: the
+    declared block (root ``tests/experimental/``) and an explicit list from a
+    ``@flashinfer-bot run`` comment (root ``tests/``, since a reviewer may
+    legitimately want to run anything).
+    """
+    unsafe = [x for x in targets if not TARGET_RE.match(x)]
+    if unsafe:
+        raise ValueError(
+            "targets contain characters not allowed in a test path: "
+            + ", ".join(unsafe)
+        )
+    bad = [
+        x
+        for x in targets
+        if not x.split("::", 1)[0].startswith(root) or ".." in x.split("::", 1)[0]
+    ]
+    if bad:
+        raise ValueError(f"targets outside {root}: {', '.join(bad)}")
     return targets
 
 
@@ -216,6 +226,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--body-file", help="file containing the PR body")
     ap.add_argument(
+        "--targets",
+        help="validate this whitespace-separated list instead of parsing a body "
+        "(for arguments supplied to `@flashinfer-bot run`)",
+    )
+    ap.add_argument(
+        "--root",
+        default=None,
+        help="required path prefix (default: tests/experimental/ for --body-file, "
+        "tests/ for --targets)",
+    )
+    ap.add_argument(
         "--test-path",
         action="store_true",
         help="print targets space-separated as a TEST_PATH value for the CI scripts",
@@ -235,13 +256,22 @@ def main() -> int:
 
     if args.selftest:
         return _selftest()
-    if not args.body_file:
-        ap.error("--body-file is required (or use --selftest)")
+    if not args.body_file and not args.targets:
+        ap.error("one of --body-file / --targets is required (or use --selftest)")
+    if args.body_file and args.targets:
+        ap.error("--body-file and --targets are mutually exclusive")
 
-    with open(args.body_file, encoding="utf-8") as fh:
-        body = fh.read()
     try:
-        targets = parse(body)
+        if args.targets is not None:
+            targets = args.targets.split()
+            if not targets:
+                raise ValueError("no targets given")
+            validate(targets, args.root or "tests/")
+        else:
+            with open(args.body_file, encoding="utf-8") as fh:
+                targets = parse(fh.read())
+            if args.root:
+                validate(targets, args.root)
         if not args.no_check_exists:
             check_exists(targets, args.repo_root)
     except ValueError as e:

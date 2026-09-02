@@ -45,6 +45,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  issues: read # PR conversation comments live on the issues API
   actions: read
 
 env:
@@ -153,6 +154,52 @@ jobs:
           fi
 
       # Built here rather than written inline in the test job because the
+      # A run-ci label carries no payload, so a parameterised `@flashinfer-bot run
+      # <paths>` has to be recovered from the comment that caused the label. Only a
+      # comment newer than the head commit counts: otherwise re-labelling a PR by hand
+      # months later would silently resurrect a stale scope.
+      - name: Resolve requested test scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          HEAD_DATE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}" \
+            --jq '.commit.committer.date')
+
+          # Newest `@flashinfer-bot run <args>` comment created after the head commit.
+          RAW=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                  --paginate --jq \
+            "[.[] | select(.created_at > \"${HEAD_DATE}\")
+                  | select(.body | test(\"@flashinfer-bot[ \t]+run[ \t]+[^ \t]\"; \"i\"))]
+             | last | .body // empty")
+
+          if [ -z "$RAW" ]; then
+            echo "No parameterised bot-run comment after ${HEAD_SHA}; running defaults"
+            echo "test_path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # sed works line by line, so `(.*)$` cannot span lines - and unlike
+          # [^\r\n], it behaves the same under BSD and GNU sed. CRs are stripped first
+          # so a CRLF comment body does not leave one on the last target.
+          ARGS=$(printf '%s' "$RAW" | tr -d '\r' \
+            | sed -nE 's/.*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+(.*)$/\1/p' \
+            | head -1)
+
+          # Validated with the same rules as a declared scope: strict charset, under
+          # tests/, must exist. A reviewer is authorised to trigger CI, which is not the
+          # same as this string being safe to hand to a shell.
+          if ! TEST_PATH=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$ARGS" --test-path 2>/tmp/scope_err); then
+            echo "::error::Requested test scope rejected: $(cat /tmp/scope_err)"
+            exit 1
+          fi
+          echo "Requested scope: ${TEST_PATH}"
+          echo "test_path=${TEST_PATH}" >> "$GITHUB_OUTPUT"
+
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
       # skipping inside the job would still claim a runner first.
@@ -162,11 +209,9 @@ jobs:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
           RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
-          # PR body is attacker-controlled: it is passed through env and read from a
-          # file, never interpolated into the script text. See the experimental lane
-          # below.
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
+          # already validated in the step above. Empty for an unparameterised run.
+          REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -184,7 +229,7 @@ jobs:
               done
             fi
 
-            if [ "$SKIP_GPU" != "true" ]; then
+            if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
@@ -214,35 +259,24 @@ jobs:
                 timeout: 480
               }'
 
-              # Experimental track: one extra H100 lane running only the targets the
-              # PR declares (see .github/pull_request_template.md). Additive - the
-              # lanes above are untouched, so a normal PR cannot be affected.
+              # A `@flashinfer-bot run <paths>` comment replaces the default GPU lanes
+              # with a single targeted lane. `@flashinfer-bot run` with no arguments is
+              # unchanged and still runs everything above.
               #
-              # The declared scope is validated by experimental_test_scope.py, which
-              # rejects paths outside tests/experimental/, path traversal and targets
-              # that do not exist in the checkout. A nonexistent path would otherwise
-              # collect nothing and pass, which looks like coverage.
-              #
-              # Trust: whether this PR's code (including its tests) may run on our
-              # runners is decided upstream, by the screening that gates the run-ci
-              # label. This step decides *scope*, not trust.
-              if jq -e 'index("experimental")' <<< "$PR_LABELS" > /dev/null 2>&1; then
-                printf '%s' "$PR_BODY" > /tmp/pr_body.md
-                if EXP_TEST_PATH=$(python3 scripts/pr_checks/experimental_test_scope.py \
-                      --body-file /tmp/pr_body.md --test-path 2>/tmp/exp_err); then
-                  jq -nc --arg test_path "$EXP_TEST_PATH" '{
-                    name: "Experimental Unittest (H100)",
-                    kind: "h100",
-                    runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
-                    cuda: "cu129",
-                    script: "task_run_unit_tests.sh",
-                    test_path: $test_path,
-                    timeout: 480
-                  }'
-                else
-                  echo "::error::experimental PR without a valid test scope: $(cat /tmp/exp_err)" >&2
-                  exit 1
-                fi
+              # This step does NOT parse the PR body. The declared experimental scope is
+              # read by whoever issues the trigger (a reviewer, or the screening watcher
+              # posting under their own identity), so there is exactly one place that
+              # turns a declaration into paths. CI runs what it is told.
+              if [ -n "${REQUESTED_TEST_PATH}" ]; then
+                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                  name: "Targeted Unittest (H100)",
+                  kind: "h100",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 480
+                }'
               fi
             fi
           } | jq -sc '{include: .}' > matrix.json
