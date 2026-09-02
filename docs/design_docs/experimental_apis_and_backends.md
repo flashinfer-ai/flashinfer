@@ -142,7 +142,9 @@ tests/experimental/test_my_backend.py
 
 The declaration is required, and targets must live under `tests/experimental/`. Running the whole tree is permitted but gets slower and less relevant to any one change as the track grows, so authors should declare the narrowest scope that covers the change. `scripts/pr_checks/experimental_test_scope.py` parses and validates the block and emits a `TEST_PATH` (`--test-path`), the value both CI systems already accept — GitHub via the `run-ci` label or `@flashinfer-bot run`, GitLab via `/bot run TEST_PATH` — so neither lane reimplements the parsing, and a reviewer triggering a run by hand can paste the same value. Narrowing the scope reduces what runs within each GPU/toolkit matrix cell; it does not change the matrix itself.
 
-Both CI systems take the scope as an argument: GitLab as `/bot run TEST_PATH`, GitHub as `@flashinfer-bot run <paths>`. A parameterised GitHub run replaces the default GPU lanes with a single targeted lane; `@flashinfer-bot run` with no arguments is unchanged.
+Both CI systems take the scope as an argument: GitLab as `/bot run TEST_PATH`, GitHub as `@flashinfer-bot run <paths>`. A parameterised GitHub run retargets the GPU lanes at those paths; `@flashinfer-bot run` with no arguments is unchanged.
+
+There is no arch selection, and none is needed: tests carry their own arch guards and skip themselves where unsupported, so a targeted run still spans the GPU matrix and the right subset executes on each runner. Narrowing the scope reduces what runs *within* each cell rather than which cells run — and no path-to-arch mapping has to be kept in sync with the tests.
 
 **CI runs what it is told, and does not read the declaration.** Turning a declared block into paths happens once, in whoever issues the trigger — a reviewer, or the screening watcher posting under its own identity with the declared scope. There is deliberately no second parser in the workflow: a reviewer who wants to run something else just says so, and the declaration stays the default rather than becoming a constraint.
 

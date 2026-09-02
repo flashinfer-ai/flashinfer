@@ -259,15 +259,40 @@ jobs:
                 timeout: 480
               }'
 
-              # A `@flashinfer-bot run <paths>` comment replaces the default GPU lanes
-              # with a single targeted lane. `@flashinfer-bot run` with no arguments is
-              # unchanged and still runs everything above.
+              # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
+              # paths. There is deliberately no arch selection: tests carry their own
+              # arch guards (is_sm90a_supported() and friends) and skip themselves where
+              # unsupported, so the targets can run across the whole GPU matrix and the
+              # right subset executes per runner. Narrowing the scope reduces what runs
+              # in each cell, not which cells run - and nobody has to keep a
+              # path-to-arch mapping in sync with the tests.
               #
-              # This step does NOT parse the PR body. The declared experimental scope is
-              # read by whoever issues the trigger (a reviewer, or the screening watcher
-              # posting under their own identity), so there is exactly one place that
-              # turns a declaration into paths. CI runs what it is told.
+              # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
+              # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
+              # the script that forwards "$@" into TEST_PATH -- on every GPU runner.
+              #
+              # This step does NOT parse the PR body. Turning a declared scope into paths
+              # happens once, in whoever issues the trigger (a reviewer, or the screening
+              # watcher posting under its own identity). CI runs what it is told.
               if [ -n "${REQUESTED_TEST_PATH}" ]; then
+                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                  name: "Targeted Unittest (A10G)",
+                  kind: "gpu",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 360
+                }'
+                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                  name: "Targeted Unittest (T4)",
+                  kind: "gpu",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 360
+                }'
                 jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
                   name: "Targeted Unittest (H100)",
                   kind: "h100",
