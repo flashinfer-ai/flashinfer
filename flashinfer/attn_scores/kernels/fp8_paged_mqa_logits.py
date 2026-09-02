@@ -83,7 +83,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -210,8 +210,22 @@ def add_f16x2(
     )
 
 
-def _target_is_rubin() -> bool:
-    """Whether the JIT target is a Rubin arch (sm_107 / sm_109).
+def _arch_major_minor(arch: str) -> "tuple[int, int]":
+    """Parse a codegen arch string (``"sm_107a"``, ``"sm_100f"``, ``"sm_100"``)
+    into its compute-capability ``(major, minor)`` pair, e.g. ``(10, 7)``."""
+    digits = arch.removeprefix("sm_").rstrip("af")
+    return int(digits[:-1]), int(digits[-1])
+
+
+def _is_rubin_arch(arch: str) -> bool:
+    """Whether ``arch`` is a Rubin part (sm_107 / sm_109).
+
+    Takes the compile-target arch as an explicit string (the same value the
+    caller passes to ``cute.compile`` as ``--gpu-arch``) instead of querying
+    the DSL: this is consulted at kernel *construction* time, before
+    ``cute.compile`` installs the target, when a DSL arch query would return
+    the ambient arch (``CUTE_DSL_ARCH`` or a device-ordinal-0 probe) -- the
+    wrong device on a heterogeneous node.
 
     NOTE: there is no canonical "is Rubin" Arch API -- Arch.BlackwellArchs()
     lumps sm_107/sm_109 in with Blackwell, and Arch.is_family_of() only compares
@@ -220,8 +234,8 @@ def _target_is_rubin() -> bool:
     (Blackwell, minor 0/3) and sm_107/109 (Rubin, minor 7/9), so `minor >= 7` is
     the robust discriminator (sm_110/sm_101 are major 11, excluded).
     """
-    arch = BaseDSL._get_dsl().get_arch_enum()
-    return arch.major == 10 and arch.minor >= 7
+    major, minor = _arch_major_minor(arch)
+    return major == 10 and minor >= 7
 
 
 class FP8MQALogitsKernel:
@@ -252,7 +266,13 @@ class FP8MQALogitsKernel:
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
         use_paired_pipeline_polls=None,
+        *,
+        arch: str,
     ):
+        # arch is the cute.compile --gpu-arch target (e.g. "sm_100a"), passed
+        # explicitly and required: __init__ runs before compilation installs
+        # the target, so a DSL arch query here would silently read the ambient
+        # (device-0 / CUTE_DSL_ARCH) arch instead -- see _is_rubin_arch.
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -277,7 +297,7 @@ class FP8MQALogitsKernel:
         #   baseline loop is the best achievable there. Auto: on except
         #   Rubin nn=4 (both fall back together so nn=4 compiles to the
         #   baseline task-loop form).
-        is_rubin = _target_is_rubin()
+        is_rubin = _is_rubin_arch(arch)
         if use_flat_logits_view is None:
             use_flat_logits_view = not is_rubin
         if use_two_level_task_loop is None:
@@ -318,8 +338,8 @@ class FP8MQALogitsKernel:
 
         self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
 
-        # TMEM columns available on the JIT target: each group needs N columns
-        # per UMMA stage, so max_umma_stages = TMEM_COLS // (2 * N).
+        # TMEM columns available on the compile target: each group needs N
+        # columns per UMMA stage, so max_umma_stages = TMEM_COLS // (2 * N).
         #
         # Queried per-arch rather than hardcoded to SM100's 512 because Rubin
         # (sm_107) exposes 576. Note this currently changes nothing in practice:
@@ -327,8 +347,8 @@ class FP8MQALogitsKernel:
         # is always a multiple of 32, so no reachable configuration lands in
         # that band. It is written this way so the constant stops being wrong on
         # a 576-column part, not because it buys a stage today.
-        arch = BaseDSL._get_dsl().get_arch_enum()
-        TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{arch.major}{arch.minor}")
+        _major, _minor = _arch_major_minor(arch)
+        TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{_major}{_minor}")
         if max_umma_pipeline:
             self.num_umma_stages = min(2, TMEM_COLS // (2 * self.N))
         else:

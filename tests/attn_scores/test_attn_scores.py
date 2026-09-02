@@ -2071,6 +2071,61 @@ def test_arch_backstop_rejects_target_it_cannot_run(monkeypatch):
     assert "torch.cuda.device" in msg, "the error should say how to fix it"
 
 
+def test_kernel_arch_gates_follow_passed_arch():
+    """Construction-time arch gates must follow the arch argument, never the
+    DSL's ambient (device-0 / CUTE_DSL_ARCH) probe.
+
+    The compile target is already threaded from the input tensor's device
+    (``_arch_for_launch`` -> ``--gpu-arch``), but the kernels also make
+    decisions at construction time -- the FP4 atom cap and the per-arch perf
+    levers -- and ``__init__`` runs before ``cute.compile`` installs the
+    target, where a DSL arch query silently reads the ambient arch. On a
+    heterogeneous node (e.g. cuda:0 Blackwell + cuda:1 Rubin) that crashed
+    valid next_n=4 calls with a bare AssertionError and baked the wrong
+    arch's levers into artifacts cached under the target's tag. Construction
+    is pure host code, so both targets are checked from whatever single GPU
+    runs this test.
+    """
+    pytest.importorskip("cutlass")
+
+    from flashinfer.attn_scores.kernels import FP4MQALogitsKernel, FP8MQALogitsKernel
+
+    # FP4 atom cap: a Blackwell target rejects atom=4 and gates its levers per
+    # Blackwell policy, regardless of which GPU (if any) is ambient. No DSL
+    # arch table is consulted, so this works on any installed DSL release.
+    with pytest.raises(AssertionError, match="requires Rubin"):
+        FP4MQALogitsKernel(next_n=4, num_next_n_atoms=1, arch="sm_100a")
+    k4s = FP4MQALogitsKernel(next_n=4, num_next_n_atoms=2, arch="sm_100a")
+    assert k4s.next_n_atom == 2
+    assert k4s.use_flat_logits_view is True  # Blackwell auto-gate: lever on
+    assert k4s.use_two_level_task_loop is True
+    # atom=3: both levers off everywhere (B200 register-pressure gate).
+    k43 = FP4MQALogitsKernel(next_n=3, num_next_n_atoms=1, arch="sm_100a")
+    assert k43.use_flat_logits_view is False
+    assert k43.use_two_level_task_loop is False
+
+    # Rubin target: atom=4 constructs directly and the levers flip to the
+    # Rubin policy. FP4 construction consults no DSL arch table; FP8 does
+    # (get_max_tmem_alloc_cols), so its Rubin half is gated on the installed
+    # DSL knowing the part.
+    k4 = FP4MQALogitsKernel(next_n=4, num_next_n_atoms=1, arch="sm_107a")
+    assert k4.next_n_atom == 4 and k4.N == 256
+    assert k4.use_flat_logits_view is False  # Rubin auto-gate: lever off
+
+    k8b = FP8MQALogitsKernel(next_n=4, arch="sm_100a")
+    assert k8b.use_flat_logits_view is True
+    assert k8b.use_two_level_task_loop is True
+    assert k8b.use_paired_pipeline_polls is True
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+    if is_cute_dsl_arch_supported(10, 7, native_only=True):
+        k8r = FP8MQALogitsKernel(next_n=4, arch="sm_107a")
+        assert k8r.use_flat_logits_view is False
+        assert k8r.use_two_level_task_loop is False
+        assert k8r.use_paired_pipeline_polls is False
+
+
 def test_on_device_enters_target_and_is_free_when_already_current():
     """The launch paths must make the target device current before launching.
 

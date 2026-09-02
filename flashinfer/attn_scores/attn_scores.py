@@ -567,7 +567,11 @@ def _fp4_max_atom_for_device(device: torch.device) -> int:
     report the limit without entering the DSL.
     """
     major, minor = torch.cuda.get_device_capability(device)
-    return 4 if (major, minor) >= (10, 7) else 3
+    # Same predicate as the kernel-side check, deliberately NOT a tuple
+    # compare: (major, minor) >= (10, 7) would also claim 4 for major >= 11,
+    # where the TMEM budget is unknown. Unreachable today (the CC allow-list
+    # stops at 107), but the two capacity oracles must stay identical.
+    return 4 if (major == 10 and minor >= 7) else 3
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -835,6 +839,9 @@ def _cached_compile_fp8_kernel(
         epi_dtype=epi_dtype,
         acc_dtype=acc_dtype,
         output_dtype=output_dtype,
+        # Construction-time arch gates (is_rubin levers, TMEM columns) must
+        # follow the compile target, not the DSL's ambient device-0 probe.
+        arch=arch,
     )
 
     def _compile_fn():
@@ -959,6 +966,9 @@ def _cached_compile_fp4_kernel(
         output_dtype=output_dtype,
         # kernel kwarg name is fixed (verbatim TRT-LLM port)
         remove_online_sf_transpose=is_kv_sf_interleaved,
+        # Construction-time arch gates (atom cap, is_rubin levers) must follow
+        # the compile target, not the DSL's ambient device-0 probe.
+        arch=arch,
     )
 
     def _compile_fn():
