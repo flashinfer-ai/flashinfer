@@ -257,6 +257,9 @@ from .rope import apply_rope_with_cos_sin_cache as apply_rope_with_cos_sin_cache
 from .rope import (
     apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace,
 )
+from .rope import (
+    qk_rmsnorm_rope_append_paged_kv_cache_hy3 as qk_rmsnorm_rope_append_paged_kv_cache_hy3,
+)
 from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
 from .sampling import sampling_from_logits as sampling_from_logits

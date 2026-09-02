@@ -148,6 +148,7 @@ from .jit.rmsnorm_silu import (
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
+from .jit.rope_hy3 import gen_qk_norm_rope_hy3_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
@@ -784,6 +785,7 @@ def gen_all_modules(
             gen_page_module(),
             gen_quantization_module(),
             gen_rope_module(),
+            gen_qk_norm_rope_hy3_module(),
             gen_sampling_module(),
             gen_topk_module(),
         ]

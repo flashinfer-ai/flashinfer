@@ -85,6 +85,7 @@ prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 quantize_nvfp4_smooth_N3072.json
+qk_rmsnorm_rope_append_paged_kv_cache_hy3_fp8_decode_h64_kv8_d128_ps64.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -2198,3 +2199,10 @@ with contextlib.suppress(Exception):
             _fp4_in["block_table"],
             _fp4_in["max_context_len"],
         )
+
+# HY3 B200 64Q/8KV dynamic-FP8 uniform decode fusion.
+with contextlib.suppress(Exception):
+    _hy3_rope_inputs = flashinfer.qk_rmsnorm_rope_append_paged_kv_cache_hy3.fi_init(
+        batch_size=256, device=device
+    )
+    flashinfer.qk_rmsnorm_rope_append_paged_kv_cache_hy3(**_hy3_rope_inputs)
