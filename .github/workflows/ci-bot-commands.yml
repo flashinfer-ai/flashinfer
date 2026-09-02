@@ -157,10 +157,11 @@ jobs:
               --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140)
           fi
 
-          # Statuses cannot be deleted, so a scope that shrank must have its leftover
-          # chunks blanked; otherwise pr-test would reassemble stale trailing paths.
-          PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/statuses" \
-            --paginate --jq '[.[].context
+          # There is no DELETE for statuses, but re-posting a context supersedes it, so
+          # a scope that shrank has its leftover chunks updated to empty; otherwise
+          # pr-test would reassemble stale trailing paths.
+          PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+            --jq '[.statuses[].context
               | select(test("^ci/test-scope-[0-9]+$"))
               | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
 
