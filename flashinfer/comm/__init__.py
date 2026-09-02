@@ -62,6 +62,29 @@ from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
 from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
 from .ulysses import init_ulysses_a2a as init_ulysses_a2a
 from .ulysses import ulysses_a2a as ulysses_a2a
+
+# Low-precision (INT8/FP8) Ulysses A2A payload ops (V2-G global grid).
+# NOTE: never export a function named exactly 'ulysses_lowp' here — it would
+# shadow the flashinfer.comm.ulysses_lowp submodule (see ulysses.py's
+# ulysses_a2a merge note). Generic names (abi_version/capability) are exported
+# with the ulysses_lowp_ prefix, following the vllm_meta_size precedent.
+from .ulysses_lowp import abi_version as ulysses_lowp_abi_version
+from .ulysses_lowp import capability as ulysses_lowp_capability
+from .ulysses_lowp import gen_ulysses_lowp_module as gen_ulysses_lowp_module
+from .ulysses_lowp import get_ulysses_lowp_module as get_ulysses_lowp_module
+from .ulysses_lowp import k_grouped_amax as k_grouped_amax
+from .ulysses_lowp import k_sum_v_amax as k_sum_v_amax
+from .ulysses_lowp import payload_spec as payload_spec
+from .ulysses_lowp import q_grouped_amax as q_grouped_amax
+from .ulysses_lowp import quant_kv_into_payload as quant_kv_into_payload
+from .ulysses_lowp import quant_q_into_payload as quant_q_into_payload
+from .ulysses_lowp import quant_qkv_pack as quant_qkv_pack
+from .ulysses_lowp import quant_v_fp8_with_scale as quant_v_fp8_with_scale
+from .ulysses_lowp import unpack_for_sage as unpack_for_sage
+from .ulysses_lowp import (
+    verify_duplicate_scale_slots as verify_duplicate_scale_slots,
+)
+from .ulysses_lowp import zero_scale_and_padding as zero_scale_and_padding
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
