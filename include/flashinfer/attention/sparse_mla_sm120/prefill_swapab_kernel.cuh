@@ -67,6 +67,17 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
   cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
+// Warm L2 for a tile gathered one iteration later; addressing matches
+// io_bulk_gather_tile_swapab. Pure hint, padding indices skipped.
+template <ModelType MT>
+__device__ __forceinline__ void io_bulk_prefetch_l2_swapab(int idx,
+                                                           const uint8_t* __restrict__ kv_ptr,
+                                                           int io_tid, uint64_t cache_policy) {
+  constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
+  if (io_tid >= BI || idx < 0) return;
+  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * STRIDE, STRIDE, cache_policy);
+}
+
 template <ModelType MT, int NUM_HEADS>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_swapab_kernel(const bf16* __restrict__ Q,
@@ -115,19 +126,26 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const int io_tid = threadIdx.x - MATH_THREADS;
     const uint64_t kv_l2_policy = create_l2_evict_last_policy();
 
-    // Stage this thread's candidate index a tile ahead: the LDG for tile ti+1
+    // Stage this thread's candidate index a tile ahead: the LDG for tile ti+2
     // is issued before the mbar_wr wait so its latency hides behind the wait.
-    int staged = (actual_ni > 0 && io_tid < BI) ? __ldg(idx_base + io_tid) : -1;
+    // `pf` (tile ti+1) warms L2 after the gather issue: this pipeline is one
+    // tile deep, so the prefetch must not delay the gather the math waits on.
+    auto ld_idx = [&](int t) -> int {
+      return (t < actual_ni && io_tid < BI) ? __ldg(idx_base + t * BI + io_tid) : -1;
+    };
+    int staged = ld_idx(0);
+    int pf = ld_idx(1);
     int wr_phase = 1;
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
-      const int next =
-          (ti + 1 < actual_ni && io_tid < BI) ? __ldg(idx_base + (ti + 1) * BI + io_tid) : -1;
+      const int next = ld_idx(ti + 2);
       mbarrier_wait_parity(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
                                      kv_l2_policy);
-      staged = next;
+      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, kv_l2_policy);
+      staged = pf;
+      pf = next;
       if (buf == 1) wr_phase ^= 1;
     }
 

@@ -597,13 +597,18 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       issue_tile(0, staged);
       staged = load_idx(1);
     }
+    int pf = load_idx(2);
 
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       if (ti + 1 < actual_ni) {
-        const int next = load_idx(ti + 2);
+        const int next = load_idx(ti + 3);
+        // Warm L2 for tile ti+2; its index LDG was issued an iteration ago.
+        io_bulk_prefetch_l2<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
+            pf, KV_cache, io_tid, stride_kv_block, kv_l2_policy);
         issue_tile(ti + 1, staged);
-        staged = next;
+        staged = pf;
+        pf = next;
       }
       bar_sync_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
     }

@@ -98,6 +98,37 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
     cp_async_bulk_g2s(dst + io_tid * SMEM_STRIDE, src, COPY_BYTES, mbar);
 }
 
+// Warm L2 for a candidate row ahead of its gather; issued by IO threads idle
+// on the release handshake. Pure hint: padding indices are skipped, not
+// clamped. Addressing mirrors io_bulk_gather_tile; footer models also warm the
+// scale line, whose synchronous LDG sits on the gather issue path.
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false, int TILE_BI = BI,
+          int TILE_IO_THREADS = IO_THREADS>
+__device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __restrict__ kv_ptr,
+                                                    int io_tid, size_t stride_kv_block,
+                                                    uint64_t cache_policy = 0) {
+  using KV = KVCacheTraits<MT>;
+  using IO = KVIOTraits<MT>;
+  static_assert(TILE_BI <= TILE_IO_THREADS);
+  if (io_tid >= TILE_BI || idx < 0) return;
+
+  const uint8_t* src;
+  if constexpr (KV::SCALE_IN_KV_SMEM) {
+    src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
+  } else {
+    constexpr int pbs = PAGE_BLOCK_SIZE;
+    src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block + (size_t)(idx % pbs) * IO::IO_STRIDE;
+    const uint8_t* footer = kv_ptr + (size_t)(idx / pbs) * stride_kv_block +
+                            (size_t)pbs * IO::IO_STRIDE +
+                            (size_t)(idx % pbs) * KV::SCALE_BYTES_PER_TOKEN;
+    prefetch_l2_line(footer);
+  }
+  if constexpr (USE_L2_HINT)
+    cp_async_bulk_prefetch_l2_hint(src, IO::IO_STRIDE, cache_policy);
+  else
+    cp_async_bulk_prefetch_l2(src, IO::IO_STRIDE);
+}
+
 // `idx` is the same per-thread staged value passed to io_bulk_gather_tile, so
 // the footer-scale model reads each index from gmem once per tile, not twice.
 template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI = BI, int TILE_IO_THREADS = IO_THREADS>

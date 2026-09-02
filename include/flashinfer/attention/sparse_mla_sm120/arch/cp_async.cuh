@@ -83,6 +83,23 @@ __device__ __forceinline__ void cp_async_bulk_g2s_l2hint(void* smem_dst, const v
       "l"(gmem_src), "r"(bytes), "r"(mbar_addr), "l"(cache_policy));
 }
 
+// cp.async.bulk.prefetch: warm L2 for a future bulk copy. Pure hint, no
+// completion tracking; the caller guarantees the address is valid.
+__device__ __forceinline__ void cp_async_bulk_prefetch_l2(const void* gmem_src, uint32_t bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(gmem_src), "r"(bytes));
+}
+
+__device__ __forceinline__ void cp_async_bulk_prefetch_l2_hint(const void* gmem_src, uint32_t bytes,
+                                                               uint64_t cache_policy) {
+  asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" ::"l"(gmem_src),
+               "r"(bytes), "l"(cache_policy));
+}
+
+// Single-line L2 prefetch; never faults.
+__device__ __forceinline__ void prefetch_l2_line(const void* addr) {
+  asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
+}
+
 // Create L2 evict-first cache policy (streaming data consumed once)
 __device__ __forceinline__ uint64_t create_l2_evict_first_policy() {
   uint64_t policy;
