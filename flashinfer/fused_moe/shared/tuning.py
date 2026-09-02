@@ -103,9 +103,7 @@ def make_repeating_tensor_initializer(
         if target_rows == 0:
             return torch.empty(shapes, dtype=dtype, device=device)
         if num_experts is not None and target_rows > source_rows.shape[0]:
-            return moe_topk_ids_init(num_experts, packed=packed)(
-                shapes, dtype, device
-            )
+            return moe_topk_ids_init(num_experts, packed=packed)(shapes, dtype, device)
         repeats = (target_rows + source_rows.shape[0] - 1) // source_rows.shape[0]
         return (
             source_rows.to(device=device, dtype=dtype)

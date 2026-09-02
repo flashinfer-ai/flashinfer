@@ -262,6 +262,7 @@ class TestFp4Fc1GPU:
             map_trtllm_mxfp4_mxfp8_moe_tactic,
         )
         from flashinfer.tllm_enums import ActivationType
+
         pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
             [192, 0],
             activation_type=int(ActivationType.Situ),
@@ -461,6 +462,50 @@ class TestFp4Fc1GPU:
             **base,
         )
         assert result, "FP4 FC1 tileN32/tileK512 second K-box regression failed"
+
+    def test_tile64_k512_swap_epilogue_quant_stores_scale_factors(self):
+        """The epi-N64 replacement store must write both SF-C halves."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        base = {
+            k: v
+            for k, v in FP4_FC1_LL.items()
+            if k
+            not in (
+                "act_kind",
+                "batch_mode",
+                "dtype_c",
+                "epilogue_regs",
+                "sf_layout_b",
+                "transpose_mma_output",
+            )
+        }
+        assert reference_check(
+            num_experts=2,
+            num_tokens=128,
+            top_k=1,
+            problem_n=256,
+            problem_k=512,
+            tile_n=64,
+            mma_n=64,
+            epi_tile_n=64,
+            tile_k=512,
+            **uniform_pipeline_stage_overrides(4),
+            tile_scheduler=0,
+            num_stages_tmem_acc=1,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
+            act_kind=int(ActKind.SWIGLU),
+            dtype_c=int(DType.E2M1),
+            epilogue_regs=160,
+            sf_layout_b=int(SfLayout.LINEAR),
+            sf_layout_c=int(SfLayout.R8c4),
+            use_global_scales=1,
+            seed=123,
+            **base,
+        )
 
     def test_tile8_4experts(self):
         _run_fp4_fc1(tile_n=8, num_experts=4, num_tokens=512)

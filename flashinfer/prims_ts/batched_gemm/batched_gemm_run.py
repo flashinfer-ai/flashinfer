@@ -2760,9 +2760,7 @@ def reference_check(
         shuffled_diff = (
             c_compare_active.float() - _active_routes(shuffled_ref).float()
         ).abs()
-        inv_diff = (
-            c_compare_active.float() - _active_routes(inv_ref).float()
-        ).abs()
+        inv_diff = (c_compare_active.float() - _active_routes(inv_ref).float()).abs()
         print(
             "CastA row-diagnostic: "
             f"shuffled_max={shuffled_diff.max().item():.6f}, "

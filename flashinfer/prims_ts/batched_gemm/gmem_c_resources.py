@@ -1474,9 +1474,7 @@ class GmemCResource(MemoryResource):
     def _absmax_scratch_idx(self, warpgroup_idx, warp_in_epi4, lane_id, scale_slot):
         lane_col = (lane_id & Int32(3)) << Int32(1)
         scratch_warp_stride = Int32(max(1, self.cfg.epi_tile_n // 8) * 8)
-        slot_col = (scale_slot >> Int32(1)) * Int32(8) + (
-            scale_slot & Int32(1)
-        )
+        slot_col = (scale_slot >> Int32(1)) * Int32(8) + (scale_slot & Int32(1))
         return (
             self._absmax_scratch_base(warpgroup_idx)
             + warp_in_epi4 * scratch_warp_stride
@@ -2236,9 +2234,7 @@ class GmemCResource(MemoryResource):
             output_in_bounds = (n_col < self.problem_n) & (m_row < output_m)
             if output_in_bounds:
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                    token_in_bounds = (
-                        n_subtile_offset + n_local_col
-                    ) < token_limit
+                    token_in_bounds = (n_subtile_offset + n_local_col) < token_limit
                     if token_in_bounds:
                         self.gSfCBytes.subview(sf_idx).store(sf_packed)
                 else:
@@ -2696,21 +2692,34 @@ class GmemCResource(MemoryResource):
                                 tmem_col_even,
                                 self.cfg.epi_tile_n not in (32, 64),
                             )
-                            if cutlass.const_expr(self.cfg.epi_tile_n == 32):
+                            if cutlass.const_expr(self.cfg.epi_tile_n in (32, 64)):
                                 fp4_sf_c_vals.append(sf_packed)
                 if cutlass.const_expr(
-                    not self.cfg.uses_mx_output_quant and self.cfg.epi_tile_n == 32
+                    not self.cfg.uses_mx_output_quant
+                    and self.cfg.epi_tile_n in (32, 64)
                 ):
-                    self._store_swap_ab_quant_sf_epi32(
-                        fp4_sf_c_vals,
-                        m_tile_base,
-                        n_tile_base,
-                        n_subtile_offset,
-                        token_limit,
-                        output_m,
-                        lane_id,
-                        warp_in_epi4,
-                    )
+                    if cutlass.const_expr(self.cfg.epi_tile_n == 32):
+                        self._store_swap_ab_quant_sf_epi32(
+                            fp4_sf_c_vals,
+                            m_tile_base,
+                            n_tile_base,
+                            n_subtile_offset,
+                            token_limit,
+                            output_m,
+                            lane_id,
+                            warp_in_epi4,
+                        )
+                    else:
+                        self._store_swap_ab_quant_sf_epi64(
+                            fp4_sf_c_vals,
+                            m_tile_base,
+                            n_tile_base,
+                            n_subtile_offset,
+                            token_limit,
+                            output_m,
+                            lane_id,
+                            warp_in_epi4,
+                        )
                 if cutlass.const_expr(self.cfg.uses_mx_output_quant):
                     # Phase 1: after all activation outputs are available,
                     # reduce/store adjacent MX scale slots as paired f32

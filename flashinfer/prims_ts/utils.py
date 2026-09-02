@@ -20,8 +20,6 @@ import importlib.util
 import os
 from pathlib import Path
 
-from .cutlass_dsl import ensure_cutlass_dsl_experimental
-
 
 def configure_cute_dsl_cache_dir() -> str:
     """Set a stable CuTe DSL file-cache directory if the user did not choose one."""
@@ -38,8 +36,6 @@ def configure_cute_dsl_cache_dir() -> str:
 
 
 def is_prims_ts_available() -> bool:
-    if not ensure_cutlass_dsl_experimental():
-        return False
     try:
         return (
             importlib.util.find_spec("cutlass") is not None

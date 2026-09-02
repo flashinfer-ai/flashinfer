@@ -18,18 +18,22 @@ import ast
 from pathlib import Path
 
 
-def test_autotune_lookup_preserves_profile_replay_override():
-    benchmark = (
-        Path(__file__).parents[2]
-        / "benchmarks"
-        / "bench_trtllm_gen_fused_moe_autotuner.py"
-    )
-    tree = ast.parse(benchmark.read_text())
-    run_benchmark = next(
+_BENCHMARK = (
+    Path(__file__).parents[2] / "benchmarks" / "bench_trtllm_gen_fused_moe_autotuner.py"
+)
+
+
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    return next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_run_benchmark"
+        if isinstance(node, ast.FunctionDef) and node.name == name
     )
+
+
+def test_autotune_lookup_preserves_profile_replay_override():
+    tree = ast.parse(_BENCHMARK.read_text())
+    run_benchmark = _function(tree, "_run_benchmark")
     lookup_contexts = [
         item.context_expr
         for node in ast.walk(run_benchmark)
@@ -46,3 +50,57 @@ def test_autotune_lookup_preserves_profile_replay_override():
     assert len(lookup_contexts) == 1
     overrides = {keyword.arg for keyword in lookup_contexts[0].keywords}
     assert overrides >= {"tuning_buckets", "cuda_graph_profile_replays"}
+
+
+def test_bf16_benchmark_forwards_profile_replays_and_uses_situ_gating():
+    tree = ast.parse(_BENCHMARK.read_text())
+    benchmark = _function(tree, "bench_trtllm_gen_fused_moe_autotuner_bf16")
+    run_call = next(
+        node
+        for node in ast.walk(benchmark)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_run_benchmark"
+    )
+    assert "cuda_graph_profile_replays" in {
+        keyword.arg for keyword in run_call.keywords
+    }
+
+    is_gated = next(
+        node
+        for node in ast.walk(benchmark)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "is_gated"
+            for target in node.targets
+        )
+    )
+    assert ast.unparse(is_gated.value) == "ActivationType(activation_type).is_gated"
+
+
+def test_fp4_benchmark_cli_clamp_takes_precedence_over_model_default():
+    tree = ast.parse(_BENCHMARK.read_text())
+    benchmark = _function(tree, "bench_trtllm_gen_fused_moe_autotuner_fp4")
+    effective_clamp = next(
+        node
+        for node in ast.walk(benchmark)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "effective_clamp_limit"
+            for target in node.targets
+        )
+    )
+    assert ast.unparse(effective_clamp.value) == (
+        "gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit"
+    )
+
+    clamp_keyword = next(
+        keyword
+        for node in ast.walk(benchmark)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "gemm1_clamp_limit"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "gemm1_clamp_limit_tensor"
+    )
+    assert clamp_keyword.value.id == "gemm1_clamp_limit_tensor"

@@ -40,9 +40,11 @@ pytestmark = [
     pytest.mark.xdist_group("isolated_cuda"),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required"),
     pytest.mark.skipif(
-        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))), reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+"
+        (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))),
+        reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+",
     ),
 ]
+
 
 def _finalize_tmem(cfg):
     """Exercise config construction while leaving TMEM columns derived."""
@@ -55,6 +57,7 @@ def _finalize_tmem(cfg):
     tmp = make_config(**cfg)
     compute_warp_layout(tmp)
     return cfg
+
 
 def _mx_fc1_base(*, dtype_a):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -102,6 +105,7 @@ def _mx_fc1_base(*, dtype_a):
         gather_regs=48,
     )
 
+
 def _mx_fc2_base(*, dtype_a, dtype_b):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         BatchMode,
@@ -137,6 +141,7 @@ def _mx_fc2_base(*, dtype_a, dtype_b):
         bias_type=int(BiasType.M),
         use_tma_oob_opt=1,
     )
+
 
 def _mxfp4_bf16_base(*, has_activation_epilogue):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -191,6 +196,7 @@ def _mxfp4_bf16_base(*, has_activation_epilogue):
         gather_regs=48,
     )
 
+
 def _run_mx_fc1(cfg, *, num_tokens=128, problem_n=128, problem_k=None):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -208,6 +214,7 @@ def _run_mx_fc1(cfg, *, num_tokens=128, problem_n=128, problem_k=None):
     )
     assert result
 
+
 def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -223,6 +230,7 @@ def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
         **cfg,
     )
     assert result
+
 
 def _run_mxfp4_bf16(cfg, *, num_tokens=128, problem_n=128, problem_k=256):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -240,6 +248,7 @@ def _run_mxfp4_bf16(cfg, *, num_tokens=128, problem_n=128, problem_k=256):
         **cfg,
     )
     assert result
+
 
 def _mx_generated_json_rows():
     """Return compact aliases for all rows in the MX JSON."""
@@ -416,6 +425,7 @@ def _mx_generated_json_rows():
         )
     return rows
 
+
 def _mxfp4_bf16_generated_json_rows():
     """Return compact aliases for rows in the MXFP4-weight BF16 JSON."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -431,7 +441,7 @@ def _mxfp4_bf16_generated_json_rows():
         (32, 32, 32, 256, 2, 0),
         (64, 64, 64, 128, 1, 0),
         (64, 64, 64, 256, 2, 0),
-        (128, 128, 128, 256, 2, 0)
+        (128, 128, 128, 256, 2, 0),
     ]
     fc1_shapes = [
         (8, 8, 8, 128, 1, 0),
@@ -441,7 +451,7 @@ def _mxfp4_bf16_generated_json_rows():
         (32, 32, 32, 256, 2, 0),
         (64, 64, 64, 128, 1, 0),
         (64, 64, 64, 256, 2, 0),
-        (128, 128, 128, 256, 2, 0)
+        (128, 128, 128, 256, 2, 0),
     ]
     for tile_n, mma_n, epi_n, mma_m, cluster_m, use_unroll in fc2_shapes:
         rows.append(
@@ -481,6 +491,7 @@ def _mxfp4_bf16_generated_json_rows():
         )
     return rows
 
+
 def _mxfp4_bf16_json_row_to_cfg(row):
     cfg = _mxfp4_bf16_base(has_activation_epilogue=row["has_activation_epilogue"])
     cfg.update(
@@ -501,6 +512,7 @@ def _mxfp4_bf16_json_row_to_cfg(row):
     if row["tile_n"] == 128:
         cfg["num_stages_tmem_acc"] = 1
     return cfg
+
 
 def _mx_json_row_to_cfg(comment, row):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -561,6 +573,7 @@ def _mx_json_row_to_cfg(comment, row):
             cfg[key] = row[key]
     return cfg
 
+
 def test_generated_mx_json_rows_construct_ts_configs():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         compute_warp_layout,
@@ -583,6 +596,7 @@ def test_generated_mx_json_rows_construct_ts_configs():
         compute_warp_layout(concrete)
         validate_config(concrete)
 
+
 def test_generated_mxfp4_bf16_json_rows_construct_ts_configs():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         compute_warp_layout,
@@ -600,6 +614,7 @@ def test_generated_mxfp4_bf16_json_rows_construct_ts_configs():
         concrete = make_config(**cfg)
         compute_warp_layout(concrete)
         validate_config(concrete)
+
 
 class TestMxFp4Bf16Fc2:
     def test_tile8_persistent_correctness(self):
@@ -640,6 +655,7 @@ class TestMxFp4Bf16Fc2:
             "num_stages_tmem_acc": 1,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
+
 
 class TestMxFp4Bf16Fc1:
     """MXFP4-weight / BF16-activation FC1 with fused SwiGLU (CastA + fusedAct).
@@ -686,6 +702,7 @@ class TestMxFp4Bf16Fc1:
             "cluster_m": 2,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
+
 
 class TestMxFc2LowLatency:
     def test_mxfp4_mxfp8_tile8_k512_persistent(self):
@@ -795,6 +812,7 @@ class TestMxFc2LowLatency:
         }
         _run_mx_fc2(cfg, num_tokens=256)
 
+
 class TestMxFc2HighThroughput:
     def test_mxfp4_mxfp8_tile64_k128_cluster_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -889,6 +907,7 @@ class TestMxFc2HighThroughput:
         }
         _run_mx_fc2(cfg, num_tokens=128, problem_n=128)
 
+
 class TestMxFc1LowLatency:
     def test_mxfp4_mxfp8_tile8_k512_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -958,6 +977,7 @@ class TestMxFc1LowLatency:
             "cluster_m": 2,
         }
         _run_mx_fc1(cfg, num_tokens=256)
+
 
 class TestMxFc1HighThroughput:
     @staticmethod
@@ -1114,6 +1134,7 @@ class TestMxFc1HighThroughput:
             num_tokens=1024,
             problem_n=6144,
         )
+
 
 class TestMxFc1QuantizedEpilogue:
     def test_mxfp4_mxfp8_to_mxfp8_tile8_tma_store(self):

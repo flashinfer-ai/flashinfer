@@ -113,9 +113,7 @@ def test_repeating_tensor_initializer_resamples_expanded_route_profiles():
         source, num_experts=128, packed=True
     )
 
-    assert torch.equal(
-        initializer((1, 4), torch.int32, torch.device("cpu")), source
-    )
+    assert torch.equal(initializer((1, 4), torch.int32, torch.device("cpu")), source)
     first = initializer((512, 4), torch.int32, torch.device("cpu"))
     second = initializer((512, 4), torch.int32, torch.device("cpu"))
     expanded_ids = first >> 16

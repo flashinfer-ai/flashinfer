@@ -80,8 +80,7 @@ def test_nvfp4_search_contains_bs1_ldgsts_persistent_pair():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.skipif(
-    torch.cuda.is_available()
-    and not is_sm100a_supported(torch.device("cuda")),
+    torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
 @pytest.mark.parametrize(
@@ -159,8 +158,7 @@ def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.skipif(
-    torch.cuda.is_available()
-    and not is_sm100a_supported(torch.device("cuda")),
+    torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
 @pytest.mark.parametrize(

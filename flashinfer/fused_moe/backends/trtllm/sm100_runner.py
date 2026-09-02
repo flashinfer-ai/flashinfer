@@ -90,7 +90,7 @@ class MoERunner(TunableRunner):
         # identity, so keep them in an attribute excluded by
         # TunableRunner.__hash__.  Otherwise logically identical runners built
         # by successive API calls cannot reuse an in-memory tuned tactic.
-        self._topk_initializer_cache = None
+        self._topk_initializer_cache: Optional[tuple[torch.Tensor, Any]] = None
 
     def _make_tuning_config(
         self,
@@ -110,8 +110,7 @@ class MoERunner(TunableRunner):
                         moe_inputs.topk_ids,
                         num_experts=self.num_experts,
                         packed=(
-                            routing_input_mode
-                            != RoutingInputMode.UnpackedPrecomputed
+                            routing_input_mode != RoutingInputMode.UnpackedPrecomputed
                         ),
                     ),
                 )

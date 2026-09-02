@@ -24,7 +24,6 @@ from .utils import (
 )
 
 configure_cute_dsl_cache_dir()
-ensure_cutlass_dsl_experimental()
 
 __all__ = [
     "configure_cute_dsl_cache_dir",

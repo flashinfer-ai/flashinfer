@@ -50,6 +50,7 @@ from flashinfer.tllm_enums import (
 )
 from flashinfer.utils import is_sm100a_supported
 
+
 def _runner(**overrides):
     values = dict(
         dtype_act=DtypeTrtllmGen.Bfloat16,
@@ -66,6 +67,7 @@ def _runner(**overrides):
     values.update(overrides)
     return SimpleNamespace(**values)
 
+
 def _inputs(**overrides):
     values = dict(
         hidden_states=torch.empty((4, 128), dtype=torch.bfloat16),
@@ -75,6 +77,7 @@ def _inputs(**overrides):
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
 
 def _first_buildable_pair(mapper, tile_n, **kwargs):
     for config_index in range(512):
@@ -87,8 +90,10 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
         return pair
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
 
+
 def test_config_mapper_loads_local_prims_ts_json():
     assert _expanded_trtllm_gen_json_configs()
+
 
 def test_config_mapper_json_uses_prims_ts_option_names():
     stale_keys = {
@@ -100,6 +105,7 @@ def test_config_mapper_json_uses_prims_ts_option_names():
     for cfg in _expanded_prims_ts_json_configs():
         assert not stale_keys.intersection(cfg.options)
         assert all(key == key.lower() for key in cfg.options)
+
 
 def test_config_mapper_uses_local_json_for_bf16_tactic():
     num_configs = len(_expanded_prims_ts_json_configs())
@@ -151,10 +157,12 @@ def test_config_mapper_maps_activation_types():
     )
     assert pair.fc1.cfg.kwargs["act_kind"] == 3
 
+
 def test_config_mapper_keeps_mxfp4_bf16_tile256_disabled():
     assert 256 not in SUPPORTED_MXFP4_BF16_TILE_N
     with pytest.raises(ValueError, match="Unsupported Prims-TS MXFP4xBF16 tile_N"):
         map_trtllm_mxfp4_bf16_moe_tactic([256, 0])
+
 
 def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType, RouteImpl
@@ -177,6 +185,7 @@ def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
     assert fc1.use_per_token_sf_b == 1
     assert fc1.per_token_sf_dtype == int(DType.FP32)
     assert fc2.use_per_token_sf_b == 0
+
 
 def test_nvfp4_tile32_packed_gather_uses_two_warps():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -218,6 +227,7 @@ def test_config_mapper_mxfp4_mxfp8_uses_local_json_config_pair():
     assert pair.fc1.cfg.build().tile_n == 64
     assert pair.fc2.cfg.build().tile_n == 64
 
+
 def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     pair = _first_buildable_pair(
         map_trtllm_mxfp4_mxfp8_moe_tactic,
@@ -231,6 +241,7 @@ def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     assert pair.tile_n == 8
     assert pair.fc1.cfg.kwargs["act_kind"] == 2
     assert pair.fc2.cfg.kwargs["act_kind"] == 0
+
 
 @pytest.mark.parametrize("num_tokens", [1024, 8192])
 def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
@@ -448,13 +459,9 @@ def test_kimi_k3_high_throughput_fast_drain_fc2_config_is_buildable():
 
 
 def test_kimi_k3_high_throughput_tma_oob_fc1_is_buildable():
-    configs_by_comment = {
-        cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()
-    }
+    configs_by_comment = {cfg.comment: cfg for cfg in _expanded_prims_ts_json_configs()}
     baseline = configs_by_comment["MxFp4xMxFp8_FC1_HighThroughputFusedLdgsts"]
-    winner = configs_by_comment[
-        "MxFp4xMxFp8_FC1_KimiK3HighThroughputTmaOob"
-    ]
+    winner = configs_by_comment["MxFp4xMxFp8_FC1_KimiK3HighThroughputTmaOob"]
     actual_changes = {
         key: (baseline.options.get(key), winner.options.get(key))
         for key in baseline.options.keys() | winner.options.keys()
@@ -596,8 +603,7 @@ def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 @pytest.mark.skipif(
-    torch.cuda.is_available()
-    and not is_sm100a_supported(torch.device("cuda")),
+    torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="MXFP4 PrimsTS kernels require Blackwell SM100A+",
 )
 def test_gpt_oss_high_throughput_fused_fc1_gpu_correctness():
@@ -632,6 +638,7 @@ def test_runner_filter_drops_unbuildable_json_tactics():
 
     assert filtered == [[8, valid_pair.moe_config_index]]
 
+
 def test_config_mapper_matches_default_tile_selection():
     pair = map_trtllm_bf16_moe_tactic(
         [-1, -1],
@@ -640,6 +647,7 @@ def test_config_mapper_matches_default_tile_selection():
         num_local_experts=128,
     )
     assert pair.tile_n == 8
+
 
 def test_deepseek_scheduler_variants_preserve_persisted_pair_indices():
     legacy_pairs = [
@@ -673,6 +681,7 @@ def test_config_mapper_rejects_unknown_tile():
     with pytest.raises(ValueError, match="Unsupported Prims-TS BF16 tile_N"):
         map_trtllm_bf16_moe_tactic([512, 0])
 
+
 def test_support_reports_missing_dependencies(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: False)
     ok, reason = support.is_prims_ts_bf16_supported(
@@ -680,6 +689,7 @@ def test_support_reports_missing_dependencies(monkeypatch):
     )
     assert not ok
     assert "dependencies" in reason
+
 
 def test_support_rejects_lora_after_dependency_and_device_checks(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -692,6 +702,7 @@ def test_support_rejects_lora_after_dependency_and_device_checks(monkeypatch):
     )
     assert not ok
     assert "gemm1_lora_delta" in reason
+
 
 def test_support_accepts_shuffled_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -708,6 +719,7 @@ def test_support_accepts_shuffled_major_k(monkeypatch):
     assert ok
     assert reason == ""
 
+
 def test_support_accepts_block_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -722,6 +734,7 @@ def test_support_accepts_block_major_k(monkeypatch):
 
     assert ok
     assert reason == ""
+
 
 def test_support_accepts_swiglu_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -830,6 +843,7 @@ def test_support_rejects_activations_without_local_config(
     assert not ok
     assert "No buildable local Prims-TS MoE config" in reason
 
+
 def test_support_accepts_nvfp4_per_token_scale_local_config(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -857,6 +871,7 @@ def test_support_accepts_nvfp4_per_token_scale_local_config(monkeypatch):
     )
 
     assert ok, reason
+
 
 def test_support_accepts_fp8_per_tensor_llama4_routing_scale_tactic_with_sfa(
     monkeypatch,
@@ -888,6 +903,7 @@ def test_support_accepts_fp8_per_tensor_llama4_routing_scale_tactic_with_sfa(
     )
 
     assert ok, reason
+
 
 def test_support_accepts_fp8_per_tensor_routing_scale_without_sfa(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -974,7 +990,11 @@ def test_support_rejects_fp8_per_tensor_mismatched_sfa_sfb_dtype(monkeypatch):
     )
 
     assert not ok
-    assert "fc1_per_channel_weight_scale and routing_logits must use the same dtype" in reason
+    assert (
+        "fc1_per_channel_weight_scale and routing_logits must use the same dtype"
+        in reason
+    )
+
 
 def test_support_rejects_fp8_per_tensor_sigmoid_routing(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -996,6 +1016,7 @@ def test_support_rejects_fp8_per_tensor_sigmoid_routing(monkeypatch):
     assert not ok
     assert "Sigmoid routing" in reason
 
+
 def test_support_rejects_fp8_per_tensor_deepseekv3_non_gated(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -1016,6 +1037,7 @@ def test_support_rejects_fp8_per_tensor_deepseekv3_non_gated(monkeypatch):
 
     assert not ok
     assert "DeepSeekV3 routing requires a gated activation" in reason
+
 
 def test_support_rejects_unshuffled_major_k(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)

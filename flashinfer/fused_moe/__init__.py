@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib
+
 # Unified MoE API
 from .api import (  # noqa: F401
     # Typed activation values
@@ -83,17 +85,34 @@ from .runners import (  # noqa: F401
     TrtllmMxInt4RoutedRunner,
 )
 
-# Legacy flat-argument APIs (unchanged, not deprecated)
-from .backends.prims_ts.bf16_op import prims_ts_bf16_moe, prims_ts_bf16_routed_moe
-from .backends.prims_ts.fp8_op import (
-    prims_ts_fp8_block_scale_moe,
-    prims_ts_fp8_block_scale_routed_moe,
-    prims_ts_fp8_per_tensor_scale_moe,
-)
-from .backends.prims_ts.fp4_op import (
-    prims_ts_fp4_block_scale_moe,
-    prims_ts_fp4_block_scale_routed_moe,
-)
+# Legacy flat-argument Prims-TS APIs are imported on first use. Keeping them
+# lazy prevents a plain ``import flashinfer`` from importing CUTLASS Task
+# Scheduling and applying its process-wide WorkTileInfo customization.
+_PRIMS_TS_LAZY_EXPORTS = {
+    "prims_ts_bf16_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_bf16_routed_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_fp8_block_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_block_scale_routed_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_per_tensor_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
+}
+
+
+def __getattr__(name: str):
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS.keys())
+
+
+# Other legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     RoutingInputMode,
     TrtllmMoERoutingMetadata,

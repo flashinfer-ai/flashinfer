@@ -462,6 +462,7 @@ class _DummyResource(MemoryResource):
     ):
         pass
 
+
 @dataclass(kw_only=True)
 class _DummyProxyResource(MemoryResource):
     """Proxy stub whose consumer publishes one pipeline-stage token."""
@@ -478,10 +479,12 @@ class _DummyProxyResource(MemoryResource):
     def consumer_work(self, stage_info):
         pass
 
+
 def _res(name: str, **kwargs) -> MemoryResource:
     if name == "Proxy":
         return _DummyProxyResource(name=name, **kwargs)
     return _DummyResource(name=name, **kwargs)
+
 
 def _work_queue() -> WorkQueue:
     scheduler_config = TileSchedulerConfig(
@@ -815,6 +818,7 @@ def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     assert load_a.skippable_head_slots == frozenset()
     assert load_a.skippable_tail_slots == frozenset()
 
+
 def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
     mma = create_mma_task(
         _cfg(use_unroll_loop_2x_for_mma=True),
@@ -829,6 +833,7 @@ def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
 
     assert mma.step == 1
     assert mma.unroll == 2
+
 
 def test_mma_task_rejects_partial_sf_pairs():
     with pytest.raises(ValueError, match="smem_sfa and smem_sfb together"):
@@ -982,6 +987,7 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert smem_sfb_cfg.producer_group.size == compact_cfg.num_load_sfb_warps * 32
     assert not smem_sfb_cfg.advance_on_acquire
 
+
 def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     cfg = make_config(
         batch_mode=int(BatchMode.BATCH_N),
@@ -1090,6 +1096,7 @@ def test_fused_sf_copy_reserves_tmem_after_accumulator():
         + cfg.tmem_sfb_cols
     )
     assert resource._alloc_c.num_columns == cfg.tmem_required_cols
+
 
 def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     source = inspect.getsource(ts_pipeline.TSPipelineAsyncUmma.producer_commit)
@@ -1355,6 +1362,7 @@ def test_runtime_config_preserves_plain_bf16_stages():
 
     assert normalized.num_stages_a == 5
     assert normalized.num_stages_b == 5
+
 
 @pytest.mark.parametrize(
     ("in_hidden", "expected_unroll"),

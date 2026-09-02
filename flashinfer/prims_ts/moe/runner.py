@@ -1140,8 +1140,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                         moe_inputs.topk_ids,
                         num_experts=self.num_experts,
                         packed=(
-                            routing_input_mode
-                            != RoutingInputMode.UnpackedPrecomputed
+                            routing_input_mode != RoutingInputMode.UnpackedPrecomputed
                         ),
                     ),
                 )

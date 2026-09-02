@@ -139,7 +139,7 @@ def _task_manager_verify_enabled() -> bool:
 
 
 def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
-    return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas and cfg.has_gather)
+    return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas)
 
 
 class _ProductionTaskManager(TaskManager):
@@ -1387,12 +1387,7 @@ def _batched_gemm_kernel_bf16_body(
         and cfg.do_pdl_wait_for_num_non_exiting_ctas
         and not _pdl_wait_completed_before_tasks(cfg)
     ):
-        # Non-gather FC2 is transitively ordered through FC1.  Match TRT-LLM
-        # Gen by loading the launch bound in the prologue and keeping the PDL
-        # waits on the tasks that consume FC1 output.
-        num_non_exiting_ctas_view = cutlass.make_array_view(
-            num_non_exiting_ctas_tensor
-        )
+        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
         num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
             idx=Int32(0), vector_size=1
         )[0]
@@ -2395,10 +2390,7 @@ def batched_gemm_kernel_bf16(
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     early_exit_max_token_ctas: cutlass.Int32,
 ) -> None:
-    if cutlass.const_expr(
-        cfg.do_pdl_wait_for_num_non_exiting_ctas
-        and (not cfg.is_persistent or cfg.has_gather)
-    ):
+    if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):

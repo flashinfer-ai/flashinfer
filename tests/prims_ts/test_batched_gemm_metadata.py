@@ -82,6 +82,7 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     assert extra_routes
     assert set(extra_routes) == {0}
 
+
 @pytest.mark.parametrize(
     ("num_tokens", "requested_extent", "expected_extent"),
     (
@@ -113,6 +114,7 @@ def test_early_exit_launch_extent_covers_active_token_tiles(
     )
 
     assert extent == expected_extent
+
 
 def test_disabled_early_exit_keeps_requested_launch_extent():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (

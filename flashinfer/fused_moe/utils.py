@@ -354,9 +354,9 @@ def make_random_topk_ids(
     weights = torch.ones((), device=device, dtype=torch.float32).expand(
         num_tokens, num_experts
     )
-    return torch.multinomial(
-        weights, top_k, replacement=False, generator=generator
-    ).to(torch.int32)
+    return torch.multinomial(weights, top_k, replacement=False, generator=generator).to(
+        torch.int32
+    )
 
 
 def get_b12x_activation_name(activation_type: ActivationType) -> str:

@@ -1244,8 +1244,8 @@ def load_from_file(file_key: str) -> tuple[bool, int, Any, None]:
 # override stack.  First element is the sorted tuple of tuning bucket values
 # (None means "inherit from enclosing context / use default"), second element
 # is the round_up flag that controls whether runtime shapes are rounded up to
-# the nearest bucket.
-Override: TypeAlias = tuple[tuple[int, ...] | None, bool]
+# the nearest bucket, and the third is the optional CUDA graph replay count.
+Override: TypeAlias = tuple[tuple[int, ...] | None, bool, int | None]
 
 # Per-thread stack of Override entries.  The top of the stack (index -1) is
 # the currently active override; inner autotune() contexts push, outer ones pop.
@@ -2251,9 +2251,7 @@ class AutoTuner:
                         graph.replay()
                     else:
                         _run_once(
-                            input_tensor_batches[
-                                sample_idx % len(input_tensor_batches)
-                            ]
+                            input_tensor_batches[sample_idx % len(input_tensor_batches)]
                         )
                     ends[sample_idx].record(stream)
 

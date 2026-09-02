@@ -282,9 +282,7 @@ def _run_benchmark(
     ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
     results = [
         BenchmarkResult(setup.batch_size, setup.backend, ms, tuned_ms)
-        for setup, ms, tuned_ms in zip(
-            setups, ms_no_autotune, ms_tuned, strict=True
-        )
+        for setup, ms, tuned_ms in zip(setups, ms_no_autotune, ms_tuned, strict=True)
     ]
 
     _print_table(results, config_str)
@@ -592,16 +590,14 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
     backends: list[str],
     tuning_buckets: Optional[list[int]] = None,
     routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
     tune_max = (
         max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
     )
-    is_gated = activation_type in (
-        ActivationType.Swiglu.value,
-        ActivationType.Geglu.value,
-    )
+    is_gated = ActivationType(activation_type).is_gated
     gemm1_rows = 2 * intermediate_size if is_gated else intermediate_size
     gemm1_weights = torch.randn(
         num_experts,
@@ -689,6 +685,7 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
         f"quant_mode=BF16  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
         tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -1015,14 +1012,17 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         [hidden_states_global_scale * w2_global_scale] * local_num_experts,
         device=device,
     )
-    gemm1_clamp_limit = (
+    effective_clamp_limit = (
+        gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+    )
+    gemm1_clamp_limit_tensor = (
         torch.full(
             (local_num_experts,),
-            swiglu_limit,
+            effective_clamp_limit,
             dtype=torch.float32,
             device=device,
         )
-        if swiglu_limit is not None
+        if effective_clamp_limit is not None
         else None
     )
 
@@ -1055,7 +1055,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
                 (local_num_experts,), gemm1_beta, dtype=torch.float32, device=device
             )
         ),
-        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm1_clamp_limit=gemm1_clamp_limit_tensor,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
@@ -1151,7 +1151,8 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         f"  bias={use_bias}  routed_scale={routed_scaling_factor}"
         f"  swiglu_limit={swiglu_limit}"
         f"  activation={ActivationType(activation_type).name}"
-        f"  gemm1_alpha={gemm1_alpha}  gemm1_beta={gemm1_beta}",
+        f"  gemm1_alpha={gemm1_alpha}  gemm1_beta={gemm1_beta}"
+        f"  gemm1_clamp_limit={gemm1_clamp_limit}",
         tuning_buckets=tuning_buckets,
         cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
@@ -1452,6 +1453,7 @@ if __name__ == "__main__":
             backends,
             tuning_buckets=args.tuning_buckets,
             routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     elif is_fp8:
         results = bench_trtllm_gen_fused_moe_autotuner_fp8(
