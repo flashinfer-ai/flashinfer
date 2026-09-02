@@ -2062,6 +2062,7 @@ def test_sparse_mla_sm120_prefill_dots3_swa(
         1, window + 1, (num_tokens,), device=device, dtype=torch.int32
     )
     topk_length[0] = window  # pin one token to the full window
+    topk_length[1] = 0  # pin one token to an empty window (zero tiles)
 
     attn_sink = (
         torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
@@ -2099,7 +2100,16 @@ def test_sparse_mla_sm120_prefill_dots3_swa(
     )
 
     torch.testing.assert_close(output, ref_out, atol=1e-2, rtol=5e-3)
-    torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
+    if attn_sink is None:
+        # The empty-window token's LSE is the kernel's -1e30 sentinel while
+        # the dense reference emits -inf; compare only non-empty rows here.
+        nonempty = topk_length.bool()
+        torch.testing.assert_close(
+            out_lse[nonempty], ref_lse[nonempty], atol=5e-3, rtol=5e-3
+        )
+        assert (out_lse[1] == -1e30).all()
+    else:
+        torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize("num_heads", [8, 64])
