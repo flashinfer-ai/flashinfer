@@ -848,30 +848,24 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("avg_ctx", [256, 4096])
-@pytest.mark.parametrize("next_n_atom", [None, "direct", 2, 1])
-def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx, next_n_atom):
+def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     """Numerical check of next_n=4 against the torch reference.
 
     next_n=4 raw TMEM footprint is 544 columns.  Rubin (SM107+, 576) runs it as
-    one atom; Blackwell (512) must decompose it.  Every decomposition of 4 that
-    the arch permits has to give the same logits as the reference, so this
-    sweeps them: ``None`` (direct where it fits, else the widest legal split),
-    ``"direct"`` (skipped where the arch cannot), and explicit 2- and 4-way
-    splits.  The staggered per-atom causal limits are the easy thing to get
-    wrong, so both a short context (one KV block) and a multi-block one are
-    covered.
+    one atom; Blackwell (512) decomposes it into two atoms of 2.  The
+    decomposition is a fixed internal rule keyed on the device, so running this
+    test on both architectures covers both executions: direct on Rubin, the
+    in-kernel split on Blackwell.  The staggered per-atom causal limits are the
+    easy thing to get wrong, so both a short context (one KV block) and a
+    multi-block one are covered.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
 
     from flashinfer import fp4_paged_mqa_logits
-    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
 
     device = "cuda"
     next_n = 4
-    max_atom = _fp4_max_atom_for_device(torch.device(device))
-    if next_n_atom == "direct" and max_atom < next_n:
-        pytest.skip(f"atom of {next_n} needs Rubin; this device caps at {max_atom}")
 
     torch.manual_seed(42)
     num_heads, head_dim, block_size = 64, 128, 64
@@ -921,7 +915,6 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx, next_n_atom):
         block_table,
         max_model_len,
         output_dtype=output_dtype,
-        next_n_atom=next_n_atom,
     )
 
     positions = (
@@ -986,21 +979,6 @@ def test_fp4_next_n_limits():
         else:
             with pytest.raises(ValueError, match=r"next_n in 1\.\.4"):
                 fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
-
-    # Malformed next_n_atom values must fail with a domain error naming the
-    # legal forms, not be int()-coerced: True is an int subclass and would
-    # silently mean atom=1 (a full split with num_atoms x KV traffic), 2.5
-    # would silently truncate to atom=2, and a junk string would surface a
-    # bare int() parse error instead of the accepted values.
-    next_n = 2
-    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
-    sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
-    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
-    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
-    args = (q, sf_q, kv, w, context_lens, block_table, ctx)
-    for bad in (True, 2.5, "bogus"):
-        with pytest.raises(ValueError, match=r"next_n_atom must be None"):
-            fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16, next_n_atom=bad)
 
 
 def test_fp4_next_n4_split_rejects_caller_schedule():
