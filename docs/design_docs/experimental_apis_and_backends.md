@@ -148,7 +148,9 @@ There is no arch selection, and none is needed: tests carry their own arch guard
 
 **CI runs what it is told, and does not read the declaration.** Turning a declared block into paths happens once, in whoever issues the trigger — a reviewer, or the screening watcher posting under its own identity with the declared scope. There is deliberately no second parser in the workflow: a reviewer who wants to run something else just says so, and the declaration stays the default rather than becoming a constraint.
 
-Because a `run-ci` label carries no payload, the workflow recovers the arguments from the comment that caused the label, accepting only a comment newer than the head commit — otherwise re-labelling a PR by hand months later would silently resurrect a stale scope.
+Because a `run-ci` label carries no payload, `ci-bot-commands.yml` — the one place that already parses this comment — publishes the requested paths as a `ci/test-scope` commit status on the head SHA, and `pr-test.yml` reads that value verbatim. Nothing downstream re-reads comments, and keying on the SHA makes staleness structural: a new push is a new SHA with no scope status, so an old scope cannot be resurrected by re-labelling.
+
+The convention is deliberately the same on both systems — `@flashinfer-bot run <paths>` and `/bot run TEST_PATH` — with the status being an implementation detail of the GitHub side. That symmetry also means automation gets no privileged channel: a watcher triggering a screened PR types exactly what a reviewer would, so there is one path to test and no way for the two to drift.
 
 Requested targets are validated with the same rules as a declared scope — strict charset, must exist — but against a wider root (`tests/` rather than `tests/experimental/`), since a reviewer may legitimately want to run anything. Being authorised to trigger CI is not the same as a string being safe to hand to a shell, so the value is passed via `env`, never interpolated into script text, and read into an array with globbing disabled.
 
