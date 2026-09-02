@@ -26,24 +26,64 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def get_device_capability_no_context(device: int = 0) -> tuple[int, int]:
-    """Return (major, minor) without creating a CUDA context.
+def _visible_nvml_handles(pynvml) -> list:
+    """NVML handles of the CUDA-visible devices, in CUDA ordinal order.
 
-    ``torch.cuda.get_device_capability`` calls ``_lazy_init`` and forces a
-    CUDA context. Import-time callers (JIT workspace naming, availability
-    probes) must not do that — it breaks frameworks that need to control
-    when/where the context is created (#4889). Fall back to NVML when the
-    context is not yet initialized.
+    NVML enumerates every GPU in the system and ignores
+    ``CUDA_VISIBLE_DEVICES``, so a CUDA ordinal is not an NVML index: with
+    ``CUDA_VISIBLE_DEVICES=1,0`` CUDA device 0 is NVML index 1. Entries are
+    either NVML indices or ``GPU-``/``MIG-`` UUIDs, and CUDA drops the first
+    entry it cannot resolve together with everything after it.
+
+    Without ``CUDA_VISIBLE_DEVICES`` the NVML order is used. That matches CUDA
+    for ``CUDA_DEVICE_ORDER=PCI_BUS_ID``; under the default ``FASTEST_FIRST``
+    the order can differ on heterogeneous hosts, but the set of devices — all
+    that :attr:`CompilationContext.TARGET_CUDA_ARCHS` needs — is the same.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return [
+            pynvml.nvmlDeviceGetHandleByIndex(i)
+            for i in range(pynvml.nvmlDeviceGetCount())
+        ]
+
+    handles = []
+    for entry in visible.split(","):
+        entry = entry.strip()
+        try:
+            if entry.startswith(("GPU-", "MIG-")):
+                handles.append(pynvml.nvmlDeviceGetHandleByUUID(entry))
+            else:
+                handles.append(pynvml.nvmlDeviceGetHandleByIndex(int(entry)))
+        except Exception:
+            break  # CUDA ignores this entry and all later ones
+    return handles
+
+
+def get_visible_device_capabilities() -> list[tuple[int, int]]:
+    """Return (major, minor) per CUDA-visible device without creating a context.
+
+    ``torch.cuda.get_device_capability`` calls ``_lazy_init`` and forces a CUDA
+    context. Import-time callers (JIT workspace naming, availability probes)
+    must not do that — it breaks frameworks that need to control when and where
+    the context is created (#4889). NVML answers the same question with no
+    context, so it is used until CUDA is initialized.
     """
     if torch.cuda.is_initialized():
-        return torch.cuda.get_device_capability(device)
+        return [
+            torch.cuda.get_device_capability(device)
+            for device in range(torch.cuda.device_count())
+        ]
+
     import pynvml
 
     pynvml.nvmlInit()
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
-        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-        return int(major), int(minor)
+        caps = []
+        for handle in _visible_nvml_handles(pynvml):
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            caps.append((int(major), int(minor)))
+        return caps
     finally:
         pynvml.nvmlShutdown()
 
@@ -124,8 +164,7 @@ class CompilationContext:
                     )
         else:
             try:
-                for device in range(torch.cuda.device_count()):
-                    major, minor = get_device_capability_no_context(device)
+                for major, minor in get_visible_device_capabilities():
                     self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")

@@ -97,8 +97,11 @@ from ..cutile import (
     is_cuda_tile_available as is_cuda_tile_available,
 )
 
-# Do not probe/import cuTile at import time — can create a CUDA context (#4889).
-_cuda_tile_kernels = ["is_cuda_tile_available", "make_bmm_bf16_tune_cache"]
+# Do not probe/import cuTile at import time — can create a CUDA context
+# (#4889); make_bmm_bf16_tune_cache is resolved lazily below. It stays out of
+# __all__ because __getattr__ raises AttributeError when cuTile is missing,
+# which would break ``from flashinfer.gemm import *``.
+_cuda_tile_kernels = ["is_cuda_tile_available"]
 
 
 def __getattr__(name: str):
