@@ -29,17 +29,19 @@
 // Sparse-MLA SM120 prefill. Single raw-pointer entry point that launches the
 // planner-selected PrefillVariant:
 //   - SWAPAB (warp specialized, 64 heads/CTA): the V32 family (DSV3_2 /
-//     GLM_NSA / GLM53_NOPE), num_heads 64 / 128, topk 2048 (GLM53_NOPE: 2176),
-//     single cache
-//   - SG (single-group, 16 heads/CTA): V32 family num_heads 8 / 16, topk 2048
-//     (GLM53_NOPE: 2176); DOTS3_SWA num_heads {8, 16, 32, 64} topk 576 — SG-only,
-//     its D_NOPE=1024 does not fit the MG layout
-//   - MG (multi-group, 32 heads/CTA): V32 family num_heads >= 32 topk
-//     2048 (GLM53_NOPE: 2176); DSV4 num_heads {8..128} topk {128..2048}
-//   - MG_DUAL: dual-cache MG variants (DSV4 only, topk 128)
+//     GLM_NSA / GLM53_NOPE), num_heads 64 / 128, single cache
+//   - SG (single-group, 16 heads/CTA): V32 family num_heads 8 / 16;
+//     DOTS3_SWA num_heads {8, 16, 32, 64} — SG-only, its D_NOPE=1024 does not
+//     fit the MG layout
+//   - MG (multi-group, 32 heads/CTA): V32 family num_heads >= 32; DSV4
+//     num_heads {8..128}
+//   - MG_DUAL: dual-cache MG variants (DSV4 only)
 //
-// All routing policy lives in the Python planner; each dispatch branch only
-// re-checks its own envelope. Raw-pointer interface; framework-agnostic.
+// topk (the indices row width) is a runtime kernel argument everywhere: the
+// binding requires topk % 64 == 0 (plus topk >= 513 for the DOTS3_SWA sliding
+// window), so one instantiation per (model, variant, num_heads) serves every
+// width. All routing policy lives in the Python planner; each dispatch branch
+// only re-checks its own envelope. Raw-pointer interface; framework-agnostic.
 
 #include <cuda_runtime.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
@@ -75,10 +77,10 @@ void configure_dynamic_smem_per_device(Kernel kernel, size_t smem_bytes,
   CUDA_CHECK(rc);
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
-                       int num_tokens, size_t stride_kv_block, size_t stride_out_lse,
+                       int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
                        const int* topk_length_ptr, cudaStream_t stream) {
   using Cfg = PrefillTileCfg<MT>;
   constexpr size_t smem_bytes = SmemLayout<MT, CM, Cfg::BI, Cfg::MATH_WARPS>::TOTAL;
@@ -87,7 +89,7 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(Cfg::BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+  auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
@@ -97,6 +99,7 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          stride_kv_block,
                          /*stride_kv_block_extra=*/(size_t)0,
                          stride_out_lse,
+                         topk,
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
@@ -108,10 +111,10 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
 }
 
 // Warp-specialized swapAB dispatcher (DSV3_2 family, 64 heads/CTA, single cache).
-template <ModelType MT, int NUM_HEADS, int TOPK>
+template <ModelType MT, int NUM_HEADS>
 void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                            const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
-                           int num_tokens, size_t stride_kv_block, size_t stride_out_lse,
+                           int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
                            const int* topk_length_ptr, cudaStream_t stream) {
   using CT = ComputeTraitsSwapAB<MT>;
   using L = SmemLayoutSwapAB<MT>;
@@ -122,7 +125,7 @@ void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS, TOPK>;
+  auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
@@ -131,6 +134,7 @@ void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t
                          stride_kv_block,
                          /*stride_kv_block_extra=*/(size_t)0,
                          stride_out_lse,
+                         topk,
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
@@ -143,11 +147,11 @@ void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t
 
 // Single-cache MG dispatcher. MG_N_HG_T: 1 lets NUM_HEADS=8/16 use a 16-head
 // CTA (NH=8 is internally padded); 2 is the default for NH >= 32.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
-                       int num_tokens, size_t stride_kv_block, size_t stride_out_lse,
+                       int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
                        const int* topk_length_ptr, cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
@@ -157,7 +161,7 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, MG_N_HG_T>;
+  auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
@@ -166,6 +170,7 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          stride_kv_block,
                          /*stride_kv_block_extra=*/(size_t)0,
                          stride_out_lse,
+                         topk,
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
@@ -176,14 +181,14 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// Dual-cache MG dispatcher. `topk_extra` is runtime; PAGE_BLOCK_SIZE_EXTRA
-// stays template because it changes the KV stride.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
+// Dual-cache MG dispatcher. `topk` and `topk_extra` are runtime;
+// PAGE_BLOCK_SIZE_EXTRA stays template because it changes the KV stride.
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                                      const uint8_t* KV_cache_extra, const int32_t* indices_extra,
                                      const float* attn_sink, bf16* output, float* out_lse,
-                                     float sm_scale, int num_tokens, int topk_extra,
+                                     float sm_scale, int num_tokens, int topk, int topk_extra,
                                      size_t stride_kv_block, size_t stride_kv_block_extra,
                                      size_t stride_out_lse, cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, ComputeMode::BF16>::TOTAL;
@@ -194,7 +199,7 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_mg_dual_fulltile_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE,
+  auto kernel = sparse_mla_prefill_mg_dual_fulltile_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE,
                                                            PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
@@ -204,6 +209,7 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
                          stride_kv_block,
                          stride_kv_block_extra,
                          stride_out_lse,
+                         topk,
                          topk_extra,
                          attn_sink,
                          /*topk_length=*/(const int*)nullptr,
@@ -221,12 +227,12 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                             const uint8_t* KV_cache_extra, const int32_t* indices_extra,
                             const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
-                            int num_tokens, int topk_extra, size_t stride_kv_block,
+                            int num_tokens, int topk, int topk_extra, size_t stride_kv_block,
                             size_t stride_kv_block_extra, size_t stride_out_lse,
                             const int* topk_length_ptr, const int* topk_length_extra_ptr,
                             cudaStream_t stream) {
@@ -238,14 +244,14 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_mg_dual_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE,
+  auto kernel = sparse_mla_prefill_mg_dual_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE,
                                                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   PrefillColdParams cold{
-      sm_scale,   num_tokens, stride_kv_block, stride_kv_block_extra, stride_out_lse,
-      topk_extra, attn_sink,  topk_length_ptr, topk_length_extra_ptr};
+      sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra, stride_out_lse,
+      topk,     topk_extra, attn_sink,       topk_length_ptr,       topk_length_extra_ptr};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,
                   (void*)&KV_cache,
@@ -259,8 +265,9 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// swapAB (warp specialized, 64 heads/CTA), DSV3_2 family. GLM53_NOPE is
-// instantiated at its model topk=2176 as well.
+// swapAB (warp specialized, 64 heads/CTA), DSV3_2 family. Any runtime topk
+// width is served (GLM53_NOPE's 2176 folds the 128-token indexer tail into
+// the 2048 sparse selection).
 // swapAB takes no PBS template parameter (the KV stride is runtime), but the
 // envelope is pbs=64 like every other instantiation.
 template <ModelType MT>
@@ -269,12 +276,10 @@ inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, co
                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                 size_t stride_kv_block, size_t stride_out_lse,
                                 const int* topk_length_ptr, cudaStream_t stream) {
-  constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
-  if (topk != TOPK || page_block_size != 64) return false;
-#define DISPATCH_DSV3_2_SWAPAB(NH)                                                          \
-  launch_prefill_swapab<MT, NH, TOPK>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
-                                      num_tokens, stride_kv_block, stride_out_lse,          \
-                                      topk_length_ptr, stream)
+  if (page_block_size != 64) return false;
+#define DISPATCH_DSV3_2_SWAPAB(NH)                                                                \
+  launch_prefill_swapab<MT, NH>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, \
+                                topk, stride_kv_block, stride_out_lse, topk_length_ptr, stream)
 
   switch (num_heads) {
     case 64:
@@ -292,26 +297,24 @@ inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, co
 // SG (single-group, 16 heads/CTA). PBS=64 matches the V32 decode
 // (`decode_dsv3_2_kernel.cuh`). NH=8 covers small-TP shards; the SG kernel
 // zero-pads invalid head slots up to HPB=16 internally and gates write-back
-// by VALID_HPB. GLM53_NOPE's topk folds the 128-token indexer tail into the
-// 2048 sparse selection.
+// by VALID_HPB.
 template <ModelType MT>
 inline bool dispatch_v32_sg(int num_heads, int topk, int page_block_size, const bf16* Q,
                             const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                             bf16* output, float* out_lse, float sm_scale, int num_tokens,
                             size_t stride_kv_block, size_t stride_out_lse,
                             const int* topk_length_ptr, cudaStream_t stream) {
-  constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
-  if (topk != TOPK || page_block_size != 64) return false;
+  if (page_block_size != 64) return false;
   if (num_heads == 8) {
-    launch_prefill_sg<MT, ComputeMode::FP8, 8, TOPK, 64>(Q, KV, indices, attn_sink, output, out_lse,
-                                                         sm_scale, num_tokens, stride_kv_block,
-                                                         stride_out_lse, topk_length_ptr, stream);
+    launch_prefill_sg<MT, ComputeMode::FP8, 8, 64>(Q, KV, indices, attn_sink, output, out_lse,
+                                                   sm_scale, num_tokens, topk, stride_kv_block,
+                                                   stride_out_lse, topk_length_ptr, stream);
     return true;
   }
   if (num_heads != 16) return false;
-  launch_prefill_sg<MT, ComputeMode::FP8, 16, TOPK, 64>(Q, KV, indices, attn_sink, output, out_lse,
-                                                        sm_scale, num_tokens, stride_kv_block,
-                                                        stride_out_lse, topk_length_ptr, stream);
+  launch_prefill_sg<MT, ComputeMode::FP8, 16, 64>(Q, KV, indices, attn_sink, output, out_lse,
+                                                  sm_scale, num_tokens, topk, stride_kv_block,
+                                                  stride_out_lse, topk_length_ptr, stream);
   return true;
 }
 
@@ -322,13 +325,12 @@ inline bool dispatch_v32_mg(int num_heads, int topk, int page_block_size, const 
                             bf16* output, float* out_lse, float sm_scale, int num_tokens,
                             size_t stride_kv_block, size_t stride_out_lse,
                             const int* topk_length_ptr, cudaStream_t stream) {
-  constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
-  if (topk != TOPK || page_block_size != 64) return false;
+  if (page_block_size != 64) return false;
 
-#define DISPATCH_DSV3_2_MG(NH)                                                           \
-  launch_prefill_mg<MT, ComputeMode::FP8, NH, TOPK, 64>(                                 \
-      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
-      stride_out_lse, topk_length_ptr, stream)
+#define DISPATCH_DSV3_2_MG(NH)                                                                 \
+  launch_prefill_mg<MT, ComputeMode::FP8, NH, 64>(Q, KV, indices, attn_sink, output, out_lse,  \
+                                                  sm_scale, num_tokens, topk, stride_kv_block, \
+                                                  stride_out_lse, topk_length_ptr, stream)
 
   switch (num_heads) {
     case 32:
@@ -351,19 +353,20 @@ inline bool dispatch_v32_mg(int num_heads, int topk, int page_block_size, const 
 // covers num_heads > HPB by replicating one CTA per 16-head tile
 // (`REPLICATE_H`), so TP1..TP8 shards of a 64-head layer are all reachable.
 //
-// TOPK is fixed at 576: the tightest multiple of the BI=32 tile that covers the
-// 513-wide sliding window. The window itself is baked into PrefillTilePrimary,
-// so a caller passing no topk_length still gets a correctly bounded scan.
+// Any runtime topk >= 513 (the binding's sliding-window floor) is served;
+// 576 is the tightest multiple of the BI=32 tile that covers the window. The
+// window itself is baked into PrefillTilePrimary, so a caller passing no
+// topk_length still gets a correctly bounded scan.
 inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, const bf16* Q,
                                   const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                   bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                   size_t stride_kv_block, size_t stride_out_lse,
                                   const int* topk_length_ptr, cudaStream_t stream) {
-  if (topk != 576 || page_block_size != 64) return false;
+  if (page_block_size != 64) return false;
 
-#define DISPATCH_DOTS3_SWA_SG(NH)                                                        \
-  launch_prefill_sg<ModelType::DOTS3_SWA, ComputeMode::FP8, NH, 576, 64>(                \
-      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
+#define DISPATCH_DOTS3_SWA_SG(NH)                                                              \
+  launch_prefill_sg<ModelType::DOTS3_SWA, ComputeMode::FP8, NH, 64>(                           \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block, \
       stride_out_lse, topk_length_ptr, stream)
 
   switch (num_heads) {
@@ -391,52 +394,42 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, c
                                  size_t stride_kv_block, size_t stride_out_lse,
                                  const int* topk_length_ptr, cudaStream_t stream) {
   if (page_block_size != 64) return false;
-#define DISPATCH_MG_CM(CM, NH, TK, NHG)                                                  \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, NHG>(                  \
-      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
+#define DISPATCH_MG_CM(CM, NH, NHG)                                                            \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, 64, NHG>(                            \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block, \
       stride_out_lse, topk_length_ptr, stream)
 
 // NH=8 and NH=16 share the MG_N_HG_T=1 kernel. NH=8 zero-pads the upper half
 // of the 16-head tile and gates all global Q/sink/output/LSE accesses.
-#define DISPATCH_BY_NH_CM(CM, TK)       \
-  do {                                  \
-    switch (num_heads) {                \
-      case 8:                           \
-        DISPATCH_MG_CM(CM, 8, TK, 1);   \
-        return true;                    \
-      case 16:                          \
-        DISPATCH_MG_CM(CM, 16, TK, 1);  \
-        return true;                    \
-      case 32:                          \
-        DISPATCH_MG_CM(CM, 32, TK, 2);  \
-        return true;                    \
-      case 64:                          \
-        DISPATCH_MG_CM(CM, 64, TK, 2);  \
-        return true;                    \
-      case 128:                         \
-        DISPATCH_MG_CM(CM, 128, TK, 2); \
-        return true;                    \
-      default:                          \
-        return false;                   \
-    }                                   \
+#define DISPATCH_BY_NH_CM(CM)       \
+  do {                              \
+    switch (num_heads) {            \
+      case 8:                       \
+        DISPATCH_MG_CM(CM, 8, 1);   \
+        return true;                \
+      case 16:                      \
+        DISPATCH_MG_CM(CM, 16, 1);  \
+        return true;                \
+      case 32:                      \
+        DISPATCH_MG_CM(CM, 32, 2);  \
+        return true;                \
+      case 64:                      \
+        DISPATCH_MG_CM(CM, 64, 2);  \
+        return true;                \
+      case 128:                     \
+        DISPATCH_MG_CM(CM, 128, 2); \
+        return true;                \
+      default:                      \
+        return false;               \
+    }                               \
   } while (0)
 
   // Small K-loop: BF16 QK skips the FP8 Q-quantize prologue. Larger K
   // amortises FP8's higher Tensor-Core throughput.
-  if (topk == 128)
-    DISPATCH_BY_NH_CM(BF16, 128);
-  else if (topk == 192)
-    DISPATCH_BY_NH_CM(BF16, 192);
-  else if (topk == 256)
-    DISPATCH_BY_NH_CM(BF16, 256);
-  else if (topk == 512)
-    DISPATCH_BY_NH_CM(FP8, 512);
-  else if (topk == 1024)
-    DISPATCH_BY_NH_CM(FP8, 1024);
-  else if (topk == 2048)
-    DISPATCH_BY_NH_CM(FP8, 2048);
+  if (topk <= 256)
+    DISPATCH_BY_NH_CM(BF16);
   else
-    return false;
+    DISPATCH_BY_NH_CM(FP8);
 
 #undef DISPATCH_BY_NH_CM
 #undef DISPATCH_MG_CM
@@ -452,34 +445,34 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
                                size_t stride_out_lse, const int* topk_length_ptr,
                                const int* topk_length_extra_ptr, cudaStream_t stream) {
   if (page_block_size != 64) return false;
-  if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
-      topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
-#define DISPATCH_DUAL_MG_FULLTILE(NH, TK, PBSX, NHG)                                         \
-  launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, TK, 64, PBSX, NHG>(                   \
-      Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
+  if (topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr && topk_extra % BI == 0 &&
+      (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+#define DISPATCH_DUAL_MG_FULLTILE(NH, PBSX, NHG)                                                   \
+  launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, 64, PBSX, NHG>(                             \
+      Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
       topk_extra, stride_kv_block, stride_kv_block_extra, stride_out_lse, stream)
 
-#define DISPATCH_FULLTILE_BY_NH_PBSX(PBSX)            \
-  do {                                                \
-    switch (num_heads) {                              \
-      case 8:                                         \
-        DISPATCH_DUAL_MG_FULLTILE(8, 128, PBSX, 1);   \
-        return true;                                  \
-      case 16:                                        \
-        DISPATCH_DUAL_MG_FULLTILE(16, 128, PBSX, 1);  \
-        return true;                                  \
-      case 32:                                        \
-        DISPATCH_DUAL_MG_FULLTILE(32, 128, PBSX, 2);  \
-        return true;                                  \
-      case 64:                                        \
-        DISPATCH_DUAL_MG_FULLTILE(64, 128, PBSX, 2);  \
-        return true;                                  \
-      case 128:                                       \
-        DISPATCH_DUAL_MG_FULLTILE(128, 128, PBSX, 2); \
-        return true;                                  \
-      default:                                        \
-        return false;                                 \
-    }                                                 \
+#define DISPATCH_FULLTILE_BY_NH_PBSX(PBSX)       \
+  do {                                           \
+    switch (num_heads) {                         \
+      case 8:                                    \
+        DISPATCH_DUAL_MG_FULLTILE(8, PBSX, 1);   \
+        return true;                             \
+      case 16:                                   \
+        DISPATCH_DUAL_MG_FULLTILE(16, PBSX, 1);  \
+        return true;                             \
+      case 32:                                   \
+        DISPATCH_DUAL_MG_FULLTILE(32, PBSX, 2);  \
+        return true;                             \
+      case 64:                                   \
+        DISPATCH_DUAL_MG_FULLTILE(64, PBSX, 2);  \
+        return true;                             \
+      case 128:                                  \
+        DISPATCH_DUAL_MG_FULLTILE(128, PBSX, 2); \
+        return true;                             \
+      default:                                   \
+        return false;                            \
+    }                                            \
   } while (0)
 
     if (extra_page_block_size == 64) {
@@ -491,38 +484,38 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
 #undef DISPATCH_DUAL_MG_FULLTILE
   }
 
-// topk_extra is runtime; extra_page_block_size stays template because it
-// changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded internally.
-#define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                           \
-  launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(           \
-      Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
-      topk_extra, stride_kv_block, stride_kv_block_extra, stride_out_lse, topk_length_ptr,   \
+// topk and topk_extra are runtime; extra_page_block_size stays template
+// because it changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded
+// internally.
+#define DISPATCH_DUAL_MG_CM(CM, NH, PBSX, NHG)                                                     \
+  launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, 64, PBSX, NHG>(                     \
+      Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
+      topk_extra, stride_kv_block, stride_kv_block_extra, stride_out_lse, topk_length_ptr,         \
       topk_length_extra_ptr, stream)
 
-#define DISPATCH_BY_NH_PBSX(PBSX)                     \
-  do {                                                \
-    switch (num_heads) {                              \
-      case 8:                                         \
-        DISPATCH_DUAL_MG_CM(BF16, 8, 128, PBSX, 1);   \
-        return true;                                  \
-      case 16:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 16, 128, PBSX, 1);  \
-        return true;                                  \
-      case 32:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 32, 128, PBSX, 2);  \
-        return true;                                  \
-      case 64:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 64, 128, PBSX, 2);  \
-        return true;                                  \
-      case 128:                                       \
-        DISPATCH_DUAL_MG_CM(BF16, 128, 128, PBSX, 2); \
-        return true;                                  \
-      default:                                        \
-        return false;                                 \
-    }                                                 \
+#define DISPATCH_BY_NH_PBSX(PBSX)                \
+  do {                                           \
+    switch (num_heads) {                         \
+      case 8:                                    \
+        DISPATCH_DUAL_MG_CM(BF16, 8, PBSX, 1);   \
+        return true;                             \
+      case 16:                                   \
+        DISPATCH_DUAL_MG_CM(BF16, 16, PBSX, 1);  \
+        return true;                             \
+      case 32:                                   \
+        DISPATCH_DUAL_MG_CM(BF16, 32, PBSX, 2);  \
+        return true;                             \
+      case 64:                                   \
+        DISPATCH_DUAL_MG_CM(BF16, 64, PBSX, 2);  \
+        return true;                             \
+      case 128:                                  \
+        DISPATCH_DUAL_MG_CM(BF16, 128, PBSX, 2); \
+        return true;                             \
+      default:                                   \
+        return false;                            \
+    }                                            \
   } while (0)
 
-  if (topk != 128) return false;
   if (extra_page_block_size == 64) {
     DISPATCH_BY_NH_PBSX(64);
   } else if (extra_page_block_size == 2) {
@@ -550,7 +543,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
                                  const int* topk_length, const int* extra_topk_length,
                                  cudaStream_t stream) {
   // V32-family variants (swapAB/SG/MG) dispatch over the three V32 model
-  // types. GLM53_NOPE is included at topk=2176; the other two serve topk=2048.
+  // types; topk is runtime, so each serves the whole family at any width.
 #define DISPATCH_V32(fn)                                                                         \
   do {                                                                                           \
     switch (mt) {                                                                                \

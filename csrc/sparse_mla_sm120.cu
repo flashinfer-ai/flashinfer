@@ -201,6 +201,18 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_GT(num_heads, 0);
   TVM_FFI_ICHECK_LE(num_heads, 128);
   TVM_FFI_ICHECK_GT(topk, 0);
+  // The prefill kernels issue whole BI=64-wide index tiles (the tail tile is
+  // not masked), so the indices row width must be a multiple of 64.
+  TVM_FFI_ICHECK_EQ(topk % 64, 0)
+      << "sparse-MLA SM120 prefill requires topk % 64 == 0 (BI=64: index tiles "
+         "are issued whole, the tail tile is not masked); got topk="
+      << topk;
+  // DOTS3_SWA's candidate list is the 513-wide sliding window; the buffer
+  // must fit it (the kernel clamps the scan to the window, not the row).
+  TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA || topk >= 513)
+      << "sparse-MLA SM120 DOTS3_SWA prefill requires topk >= 513 (the "
+         "513-wide sliding window must fit the indices buffer); got topk="
+      << topk;
   TVM_FFI_ICHECK_GT(page_block_size, 0);
   const int d_v = d_v_for(mt);
   TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, d_v]";

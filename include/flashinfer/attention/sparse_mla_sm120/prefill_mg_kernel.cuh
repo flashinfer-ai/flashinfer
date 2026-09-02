@@ -33,7 +33,7 @@
 // Sparse MLA Prefill Kernel — single-pass (no split-KV, no combine)
 //
 // Structurally identical to decode main loop (QK→softmax→XV), but:
-//   - Iterates over ALL NI = TOPK/BI tiles (no split)
+//   - Iterates over ALL NI = topk/BI tiles (no split)
 //   - Writes direct BF16 output (no partial_O + combine)
 //   - No PDL (no dependent kernel)
 //
@@ -42,12 +42,13 @@
 //   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
 //   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates;
 //                    NUM_HEADS > HPB replicates one CTA per 16-head tile)
-//   TOPK:            128, 192, 256, 512, 576, 1024, 2048, 2176 — a whole number
-//                    of PrefillTileCfg<MT>::BI candidate tiles
 //   PAGE_BLOCK_SIZE: 64 (every supported model uses the 64-token page layout)
+//
+// topk is runtime (cold.topk): the indices row width, a whole number of
+// PrefillTileCfg<MT>::BI candidate tiles.
 // ============================================================================
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
@@ -70,24 +71,21 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
   // Q load and BF16 output / LSE write-back are gated by VALID_HPB to avoid
   // reading/writing past the caller's [num_tokens, NUM_HEADS, ...] buffers.
   constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
-  static_assert(TOPK % Cfg::BI == 0, "TOPK must be a whole number of candidate tiles");
 
   const int s_i = blockIdx.x / REPLICATE_H;
   const int h_tile = blockIdx.x % REPLICATE_H;
   const int h_start = h_tile * HPB;
   if (s_i >= num_tokens) return;
 
-  int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  const int topk = cold.topk;
+  int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
   // A sliding-window model's candidate list *is* the window, so no token can
-  // carry more valid entries than that however wide TOPK or a caller-supplied
+  // carry more valid entries than that however wide topk or a caller-supplied
   // topk_length is. Capping here (rather than validating in the FFI) makes an
-  // over-large topk_length harmless and turns WINDOW <= TOPK into a
-  // compile-time guarantee. Mirrors DecodeTileCfg::WINDOW.
+  // over-large topk_length harmless; the binding requires topk >= WINDOW so
+  // the window always fits the row. Mirrors DecodeTileCfg::WINDOW.
   if constexpr (Cfg::HAS_WINDOW) {
-    static_assert(Cfg::WINDOW <= TOPK,
-                  "TOPK must cover the sliding window; a smaller TOPK would silently drop "
-                  "in-window candidates");
     topk_len = topk_len > Cfg::WINDOW ? Cfg::WINDOW : topk_len;
   }
   const int actual_ni = (topk_len + Cfg::BI - 1) / Cfg::BI;
@@ -110,7 +108,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     }
 
     const int io_tid = threadIdx.x - Cfg::MATH_THREADS;
-    const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+    const int32_t* idx_base = indices + (size_t)s_i * topk;
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
     // Prologue: gather tile 0. Scales first (plain stores, no mbar signal),
@@ -155,7 +153,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
     const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
-    const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+    const int32_t* idx_base = indices + (size_t)s_i * topk;
 
     if constexpr (CM == ComputeMode::BF16) {
       load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
@@ -300,7 +298,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
           // HAS_WINDOW makes topk_len a real bound even when the caller passes no
           // topk_length, so the mask has to run. For the unbounded models this
           // folds back to the original pointer test (and with topk_length null,
-          // topk_len == TOPK makes the comparisons dead anyway).
+          // topk_len == topk makes the comparisons dead anyway).
           if (Cfg::HAS_WINDOW || cold.topk_length != nullptr) {
             int a0 = ti * Cfg::BI + e0, a1 = ti * Cfg::BI + e1;
             if (a0 >= topk_len) {
@@ -672,8 +670,9 @@ static constexpr int MG_N_HG_DEFAULT = 2;
 static constexpr int MG_HEADS_PER_CTA_DEFAULT = MG_N_HG_DEFAULT * HPB;  // 32
 
 // Shared MG implementation for single-cache and dual-cache prefill.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
-          bool DUAL_CACHE, int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T, bool ASSUME_FULL_TILES = false>
+// topk (the main indices row width) is runtime via cold.topk.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE, bool DUAL_CACHE,
+          int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T, bool ASSUME_FULL_TILES = false>
 __device__ __forceinline__ void prefill_mg_impl(
     const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
@@ -696,7 +695,6 @@ __device__ __forceinline__ void prefill_mg_impl(
   using LMG = SmemLayoutMG<MT, CM>;
   using SMG = SmemPtrsMG<MT, CM>;
 
-  static constexpr int NI = TOPK / BI;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill MG_HEADS_PER_CTA, except a single padded head group");
   static constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA - 1) / MG_HEADS_PER_CTA;
@@ -709,10 +707,13 @@ __device__ __forceinline__ void prefill_mg_impl(
   const int h_start = h_tile * MG_HEADS_PER_CTA;
   if (s_i >= num_tokens) return;
 
+  // Whole-tile main-cache tile count (the binding guarantees topk % BI == 0).
+  const int NI = cold.topk / BI;
   [[maybe_unused]] int topk_len =
-      ASSUME_FULL_TILES ? TOPK : (cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK);
+      ASSUME_FULL_TILES ? cold.topk
+                        : (cold.topk_length ? __ldg(cold.topk_length + s_i) : cold.topk);
   if constexpr (!ASSUME_FULL_TILES) {
-    topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+    topk_len = topk_len < 0 ? 0 : (topk_len > cold.topk ? cold.topk : topk_len);
   }
   const int actual_ni = ASSUME_FULL_TILES ? NI : ((topk_len + BI - 1) / BI);
   const int main_ni = ASSUME_FULL_TILES ? NI : actual_ni;
@@ -756,7 +757,7 @@ __device__ __forceinline__ void prefill_mg_impl(
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(32));
 
     const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
-    const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+    const int32_t* idx_base = indices + (size_t)s_i * cold.topk;
     [[maybe_unused]] const int32_t* idx_base_extra = nullptr;
     if constexpr (DUAL_CACHE) {
       idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
@@ -855,7 +856,7 @@ __device__ __forceinline__ void prefill_mg_impl(
     const int mwarp = warp_rank;
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
-    const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+    const int32_t* idx_base = indices + (size_t)s_i * cold.topk;
     [[maybe_unused]] const int32_t* idx_base_extra = nullptr;
     if constexpr (DUAL_CACHE) {
       idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
@@ -1660,7 +1661,7 @@ __device__ __forceinline__ void prefill_mg_impl(
 }
 
 // Single-cache __global__ wrapper.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_mg_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -1668,15 +1669,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                  float* __restrict__ out_lse,
                                  const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                                  __grid_constant__ const PrefillColdParams cold) {
-  prefill_mg_impl<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/false,
+  prefill_mg_impl<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/false,
                   /*PAGE_BLOCK_SIZE_EXTRA=*/PAGE_BLOCK_SIZE, MG_N_HG_T>(
       Q, KV_cache, indices, /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, output, out_lse,
       attn_sink, cold);
 }
 
-// Dual-cache __global__ wrapper. topk_extra is runtime; PAGE_BLOCK_SIZE_EXTRA
-// stays template because it changes the KV stride.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+// Dual-cache __global__ wrapper. topk and topk_extra are runtime;
+// PAGE_BLOCK_SIZE_EXTRA stays template because it changes the KV stride.
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T = MG_N_HG_DEFAULT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_mg_dual_kernel(const bf16* __restrict__ Q,
@@ -1687,13 +1688,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                       bf16* __restrict__ output, float* __restrict__ out_lse,
                                       const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                                       __grid_constant__ const PrefillColdParams cold) {
-  prefill_mg_impl<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
-                  PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>(
-      Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse, attn_sink, cold);
+  prefill_mg_impl<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true, PAGE_BLOCK_SIZE_EXTRA,
+                  MG_N_HG_T>(Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse,
+                             attn_sink, cold);
 }
 
 // Dual-cache full-tile wrapper for fixed-length inputs.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_dual_fulltile_kernel(
     const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -1701,7 +1702,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_dual_f
     const int32_t* __restrict__ indices_extra, bf16* __restrict__ output,
     float* __restrict__ out_lse, const float* __restrict__ attn_sink,
     __grid_constant__ const PrefillColdParams cold) {
-  prefill_mg_impl<MT, ComputeMode::BF16, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
+  prefill_mg_impl<MT, ComputeMode::BF16, NUM_HEADS, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T, /*ASSUME_FULL_TILES=*/true>(
       Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse, attn_sink, cold);
 }

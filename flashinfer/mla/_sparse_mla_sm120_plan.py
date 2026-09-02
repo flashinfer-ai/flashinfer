@@ -207,18 +207,21 @@ def _decode_scratch_heads(num_heads: int) -> int:
 
 
 # Prefill instantiation envelope (single cache unless noted).
-# DSV3_2-family prefill topk (SG, MG, and swapAB); GLM53_NOPE serves 2176.
-_V32_TOPK = {
-    _MODEL_TYPE_DSV3_2: 2048,
-    _MODEL_TYPE_GLM_NSA: 2048,
-    _MODEL_TYPE_GLM53_NOPE: 2176,
-}
+# topk (the indices row width) is a runtime kernel argument for every prefill
+# variant: any topk >= 1 made of whole _BI=64 index tiles is served (the
+# kernels issue whole tiles and the binding rejects ragged widths), so one
+# instantiation per (model, variant, num_heads) covers every width — e.g. the
+# V32 family's 2048, GLM53_NOPE's 2176, DOTS3_SWA's 576, and DSV4's
+# 128..2048 all ride the same kernels.
 _SG_HEADS = frozenset({8, 16})  # SG: 16-head CTA, NH=8 zero-padded
 _MG_V32_HEADS = frozenset({32, 64, 128})  # MG: 32-head CTA
-_PREFILL_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024, 2048})
 _PREFILL_DSV4_HEADS = frozenset({8, 16, 32, 64, 128})
 _SWAPAB_HEADS = frozenset({64, 128})  # swapAB fills whole 64-head CTAs
-_DUAL_TOPK = 128  # dual-cache MG (DSV4 C4A / C128A layers)
+
+
+def _prefill_topk_ok(topk: int) -> bool:
+    """Prefill topk contract: whole 64-wide index tiles (binding-enforced)."""
+    return topk >= 1 and topk % _BI == 0
 
 
 class KernelVariant(enum.IntEnum):
@@ -271,19 +274,20 @@ def decode_splitk_eligible(
 def prefill_swapab_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
-    # Single-cache only; GLM53_NOPE is included at topk=2176.
+    # Single-cache only.
     return (
         model_type in _V32_MODEL_TYPES
         and not has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
-        and topk == _V32_TOPK[model_type]
+        and _prefill_topk_ok(topk)
         and num_heads in _SWAPAB_HEADS
     )
 
 
 # DOTS3_SWA prefill is SG-only (D_NOPE=1024 does not fit the MG smem layout);
-# num_heads > 16 is served by CTA replication.
-_DOTS3_SWA_TOPK = 576
+# num_heads > 16 is served by CTA replication. The indices buffer must cover
+# the 513-wide sliding window (the kernel clamps the scan to the window).
+_DOTS3_SWA_MIN_TOPK = 513
 _DOTS3_SWA_SG_HEADS = frozenset({8, 16, 32, 64})
 
 
@@ -294,14 +298,15 @@ def prefill_sg_eligible(
         return (
             not has_extra
             and page_block_size == _PAGE_BLOCK_SIZE
-            and topk == _DOTS3_SWA_TOPK
+            and topk >= _DOTS3_SWA_MIN_TOPK
+            and topk % _BI == 0
             and num_heads in _DOTS3_SWA_SG_HEADS
         )
     return (
         model_type in _V32_MODEL_TYPES
         and not has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
-        and topk == _V32_TOPK[model_type]
+        and _prefill_topk_ok(topk)
         and num_heads in _SG_HEADS
     )
 
@@ -309,12 +314,12 @@ def prefill_sg_eligible(
 def prefill_mg_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
-    if has_extra or page_block_size != _PAGE_BLOCK_SIZE:
+    if has_extra or page_block_size != _PAGE_BLOCK_SIZE or not _prefill_topk_ok(topk):
         return False
     if model_type in _V32_MODEL_TYPES:
-        return topk == _V32_TOPK[model_type] and num_heads in _MG_V32_HEADS
+        return num_heads in _MG_V32_HEADS
     if model_type == _MODEL_TYPE_DSV4:
-        return topk in _PREFILL_DSV4_TOPKS and num_heads in _PREFILL_DSV4_HEADS
+        return num_heads in _PREFILL_DSV4_HEADS
     return False
 
 
@@ -325,7 +330,7 @@ def prefill_mg_dual_eligible(
         model_type == _MODEL_TYPE_DSV4
         and has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
-        and topk == _DUAL_TOPK
+        and _prefill_topk_ok(topk)
         and num_heads in _PREFILL_DSV4_HEADS
     )
 
@@ -368,9 +373,10 @@ def _check_swapab_eligible(
             "prefill_impl='swapab' requires a V32-family model type "
             f"(dsv3_2, glm_nsa, or glm53_nope); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
         )
-    if topk != _V32_TOPK[model_type]:
+    if not _prefill_topk_ok(topk):
         raise ValueError(
-            f"prefill_impl='swapab' requires topk={_V32_TOPK[model_type]}; got topk={topk}"
+            f"prefill_impl='swapab' requires topk >= 1 with topk % 64 == 0 "
+            f"(whole index tiles); got topk={topk}"
         )
     if num_heads not in _SWAPAB_HEADS:
         raise ValueError(

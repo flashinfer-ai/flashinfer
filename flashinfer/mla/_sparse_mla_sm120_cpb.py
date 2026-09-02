@@ -650,9 +650,9 @@ def calibrate_crossover(
     ``"dsv3_2"`` covers both the ``dsv3_2`` and ``glm_nsa`` key spaces because
     the scale format changes prefill speed; the decode kernel is timed with
     the matching ``model_type`` too. ``"glm53_nope"`` covers its own key
-    space at the topk=2176 instantiations, ``"dots3_swa"`` its own at the
-    topk=576 instantiations. A config the prefill envelope does not
-    serve (e.g. DSV3_2-family topk != 2048) records
+    space at topk=2176, ``"dots3_swa"`` its own at topk=576. A config the
+    prefill envelope does not serve (e.g. an off-envelope ``num_heads``, or a
+    ``topk`` that is not a whole number of 64-wide index tiles) records
     ``decode_max_tokens=64``.
 
     Returns a flat ``{"<family>|<num_heads>|<topk>": decode_max_tokens}``
@@ -731,8 +731,8 @@ def calibrate_crossover(
         num_tokens: int, num_heads: int, topk: int, model_type: int
     ) -> float:
         # The prefill variant the auto policy would pick; None when the
-        # prefill envelope does not serve the shape (e.g. DSV3_2-family
-        # topk != 2048).
+        # prefill envelope does not serve the shape (e.g. an off-envelope
+        # num_heads, or a ragged topk).
         variant = prefill_variant(
             model_type, num_heads, topk, 64, False, _PREFILL_IMPL_AUTO
         )

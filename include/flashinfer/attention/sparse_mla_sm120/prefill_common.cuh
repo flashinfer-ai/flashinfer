@@ -56,11 +56,13 @@ struct PrefillColdParams {
   size_t stride_kv_block_extra;
   // out_lse row stride in elements; a column slice of a wider buffer is legal.
   size_t stride_out_lse;
+  int topk;                // indices row width. Runtime so one instantiation serves every
+                           // width; the binding requires topk % BI == 0 (whole index tiles).
   int topk_extra;          // dual-cache only. Runtime topk_extra so callers can
                            // pass any cdiv(max_model_len, compress_ratio) value
                            // without per-bound template instantiations.
   const float* attn_sink;  // [NUM_HEADS] float32, natural log domain. nullptr = disabled.
-  const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
+  const int* topk_length;  // [num_tokens] int32, nullptr = uniform topk.
   const int*
       topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform topk_extra.
 };

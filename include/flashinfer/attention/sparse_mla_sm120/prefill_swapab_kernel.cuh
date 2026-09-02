@@ -32,7 +32,7 @@
 // ============================================================================
 // Sparse MLA Prefill Kernel — swapAB, warp specialized (DSV3_2 family)
 //
-// Single pass over all TOPK/BI tiles, with the MMA operands swapped:
+// Single pass over all topk/BI tiles, with the MMA operands swapped:
 //   - Candidates on M, heads on N, so one warp owns HEADS_PER_WARP heads and
 //     softmax reduces inside the warp
 //   - Q is register resident, so the KV ring gets the whole smem budget
@@ -43,7 +43,9 @@
 // Template params (all constexpr):
 //   MT:        ModelType (DSV3_2 / GLM_NSA)
 //   NUM_HEADS: 64, 128
-//   TOPK:      2048
+//
+// topk is runtime (cold.topk): the indices row width, a whole number of BI
+// candidate tiles.
 // ============================================================================
 
 // Unlike io_bulk_gather_tile this copies the whole gmem row, rope included, so
@@ -65,7 +67,7 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, const i
   }
 }
 
-template <ModelType MT, int NUM_HEADS, int TOPK>
+template <ModelType MT, int NUM_HEADS>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_swapab_kernel(const bf16* __restrict__ Q,
                                      const uint8_t* __restrict__ KV_cache,
@@ -85,13 +87,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   const int h_start = (blockIdx.x % REPLICATE_H) * CT::HEADS_PER_CTA;
   if (s_i >= cold.num_tokens) return;
 
-  int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  const int topk = cold.topk;
+  int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
   const int actual_ni = (topk_len + BI - 1) / BI;
 
   const int warp_rank = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
-  const int32_t* idx_base = indices + (size_t)s_i * TOPK;
+  const int32_t* idx_base = indices + (size_t)s_i * topk;
 
   extern __shared__ char smem_raw[];
   auto sm = SmemPtrsSwapAB<MT>::init(smem_raw, warp_rank < N_MATH_WARPS ? warp_rank : 0);

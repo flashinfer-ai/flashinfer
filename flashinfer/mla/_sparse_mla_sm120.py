@@ -57,6 +57,12 @@ family's envelope so callers can validate a configuration at init time.
 Decode-eligible is not required: shapes outside the decode envelope are
 served by prefill.
 
+Prefill kernels likewise take ``topk`` (the indices row width) as a runtime
+argument: any ``topk >= 1`` with ``topk % 64 == 0`` is served (whole 64-wide
+index tiles; the tail tile is not masked), with ``topk >= 513`` for
+DOTS3_SWA so its sliding window fits the buffer. The binding rejects ragged
+widths loudly.
+
 The decode launch parameter ``chunks_per_block`` is picked per call by the
 calibrated analytical model in :mod:`._sparse_mla_sm120_cpb` when constants
 are available (calibrated once per device during ``autotune()`` tuning mode,
@@ -720,7 +726,10 @@ def _sparse_mla_sm120_paged_attention(
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
-        out-of-window slots (kernel skips).
+        out-of-window slots (kernel skips). Prefill-routed calls require
+        ``topk % 64 == 0`` (whole 64-wide index tiles; the tail tile is not
+        masked) and, for DOTS3_SWA, ``topk >= 513`` so the sliding window
+        fits the buffer.
     output : torch.Tensor
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor
@@ -772,10 +781,10 @@ def _sparse_mla_sm120_paged_attention(
         or ``"auto"`` keeps the default order (swapAB preferred where
         instantiated); ``"swapab"`` forces the warp-specialized swapAB kernel
         and raises ``ValueError`` unless the shape is swapAB-eligible (DSV3_2
-        family, single cache, ``topk=2048``, ``num_heads`` in {64, 128});
-        ``"mg"`` forces the non-swapAB SG/MG path. For the DSV4 family
-        ``"mg"`` and ``None`` are no-ops on dispatch, and ``"swapab"`` always
-        raises.
+        family, single cache, whole-tile ``topk``, ``num_heads`` in
+        {64, 128}); ``"mg"`` forces the non-swapAB SG/MG path. For the DSV4
+        family ``"mg"`` and ``None`` are no-ops on dispatch, and ``"swapab"``
+        always raises.
 
     Notes
     -----
@@ -998,7 +1007,7 @@ class _SparseMLAPagedAttentionRunner:
         ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
         the prefill-kernel selection for calls that dispatch to prefill;
         ``"swapab"`` raises ``ValueError`` on shapes outside its envelope
-        (DSV3_2 family, single cache, ``topk=2048``, ``num_heads`` in
+        (DSV3_2 family, single cache, whole-tile ``topk``, ``num_heads`` in
         {64, 128}) and is a no-op distinction for DSV4, where only the
         non-swapAB path exists.
         """
