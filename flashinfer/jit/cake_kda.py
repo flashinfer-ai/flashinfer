@@ -60,6 +60,8 @@ _REQUIRED_PROBLEM_SHAPES = {
     "affine_predecessor_7:h32_t16384_direct",
 }
 _EVOLUTION_POLICIES = {
+    "bt16_chain_m64_s8",
+    "bt16_chain_m64_s9",
     "direct_m128_generic",
     "direct_m128_h96_commit_order",
     "persistent_m128_h64_lpt",
@@ -104,7 +106,12 @@ def _expected_module_keys() -> set[tuple[str, str, str, str]]:
     expected: set[tuple[str, str, str, str]] = set()
     for arch in _TARGET_ARCH.values():
         expected.update(
-            (arch, "bounded_bf16_evolution", policy, "main")
+            (
+                arch,
+                "bounded_bf16_evolution",
+                policy,
+                _ROLE_BY_POLICY.get(policy, "main"),
+            )
             for policy in _EVOLUTION_POLICIES
         )
         expected.add(

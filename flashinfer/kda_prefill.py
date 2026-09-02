@@ -169,6 +169,7 @@ class _CakeKDABoundedEvolutionRoute:
     tile_schedule: tuple[int, ...] = ()
     tile_schedule_counts: tuple[int, ...] = ()
     schedule_stride: int = 1
+    sequence_lengths: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -849,6 +850,39 @@ def _select_cake_kda_bounded_evolution_route(
             policy="direct_m64_independent_value_split",
             sequence_order=sequence_order,
             grid_x=2 * num_heads,
+        )
+
+    source_route = _select_flash_kda_bf16_route(
+        compute_capability=(10, 0) if target == "sm100a" else (10, 3),
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+        max_sequence_length=max(sequence_lengths),
+    )
+    if source_route == _FLASH_KDA_ROUTE_BT16_M64:
+        prepare_variant, chain_variant, _dense_wavefront = (
+            _select_bt16_physical_variants(
+                compute_capability=(10, 0) if target == "sm100a" else (10, 3),
+                sm_count=sm_count,
+                fixed_layout=fixed_layout,
+                num_sequences=num_sequences,
+                num_heads=num_heads,
+                max_sequence_length=max(sequence_lengths),
+            )
+        )
+        if prepare_variant != "bt16_prepare" or chain_variant not in {
+            "bt16_chain_m64_s8",
+            "bt16_chain_m64_s9",
+        }:
+            return None
+        return _CakeKDABoundedEvolutionRoute(
+            target=target,
+            policy=f"bt16_prepare_chain_{chain_variant}",
+            sequence_order=sequence_order,
+            grid_x=_FLASH_KDA_BT16_VALUE_SPLITS * num_sequences * num_heads,
+            sequence_lengths=sequence_lengths,
         )
 
     if fixed_layout or uniform_sequences:
@@ -3893,6 +3927,25 @@ def _run_cake_kda_bounded_evolution(
 ) -> None:
     """Launch one manifest-verified shared policy through its exported ABI."""
 
+    if route.policy.startswith("bt16_prepare_chain_"):
+        _run_cake_kda_bf16_bt16_prepare_chain(
+            route=route,
+            workspace=workspace,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            out=out,
+            scale=scale,
+            lower_bound=lower_bound,
+        )
+        return
+
     from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
     total_tokens = q.shape[0] * q.shape[1]
@@ -4022,6 +4075,147 @@ def _run_cake_kda_bounded_evolution(
         *common_scalars,
         *((tma_workspace,) if tma_workspace is not None else ()),
         *common_grid,
+    )
+
+
+def _run_cake_kda_bf16_bt16_prepare_chain(
+    *,
+    route: _CakeKDABoundedEvolutionRoute,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    lower_bound: float,
+) -> None:
+    """Launch the exported BF16 BT16 prepare/chain physical route."""
+
+    from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
+
+    chain_policy = route.policy.removeprefix("bt16_prepare_chain_")
+    if chain_policy not in {"bt16_chain_m64_s8", "bt16_chain_m64_s9"}:
+        raise ValueError(f"unsupported exported BF16 BT16 chain {chain_policy!r}")
+    offsets_list = [0]
+    for length in route.sequence_lengths:
+        offsets_list.append(offsets_list[-1] + length)
+    offsets = tuple(offsets_list)
+    num_heads = q.shape[2]
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    (
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        kd,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        prepare_ctas,
+    ) = _bt16_workspace(
+        workspace=workspace,
+        device=q.device,
+        offsets=offsets,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        dense_wavefront=False,
+    )
+    seq_order = _cached_int32_metadata(
+        device=q.device,
+        kind=f"cake_shared_{route.policy}_sequence_order",
+        values=route.sequence_order,
+    )
+    prepare_module = get_cake_kda_module(
+        route.target, "bounded_fp32_serving", "bt16_prepare", "prepare"
+    )
+    chain_module = get_cake_kda_module(
+        route.target, "bounded_bf16_evolution", chain_policy, "chain"
+    )
+    chain_spec = get_cake_kda_module_spec(
+        route.target, "bounded_bf16_evolution", chain_policy, "chain"
+    )
+    tma_workspace = _cake_kda_workspace_buffer(
+        workspace=workspace,
+        name=(
+            "tma_descriptor_"
+            f"{chain_spec.target}_{chain_spec.family}_{chain_spec.policy}"
+        ),
+        device=q.device,
+        shape=(chain_spec.tma_workspace_bytes,),
+        dtype=torch.uint8,
+    )
+    beta_flat = _flatten_beta_source(beta)
+    beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=16)
+    prepare_module.run(
+        q,
+        q,
+        k,
+        k,
+        g,
+        g,
+        beta_flat,
+        beta_tma,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        qd,
+        kd,
+        kd,
+        w,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        num_heads,
+        lower_bound,
+        prepare_ctas,
+        1,
+        1,
+    )
+    dummy_i32 = _dummy_i32(q.device)
+    dummy_f32 = _dummy_f32(q.device)
+    chain_module.run(
+        qd,
+        qd,
+        kd,
+        kd,
+        w,
+        w,
+        qk,
+        qk,
+        diag,
+        diag,
+        v,
+        v,
+        cu_seqlens,
+        cu_chunks,
+        seq_order,
+        initial_state,
+        out,
+        out,
+        initial_state,
+        num_heads,
+        1,
+        1,
+        scale,
+        dummy_i32.data_ptr(),
+        initial_state.stride(0),
+        0,
+        dummy_f32,
+        dummy_f32,
+        tma_workspace,
+        route.grid_x,
+        1,
+        1,
     )
 
 

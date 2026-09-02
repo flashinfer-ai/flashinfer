@@ -337,6 +337,30 @@
       "sha256": "e58c36ef62a43b9d829a80578d00a8579801a21575f12bb1a1ac2098ac122a95"
     },
     {
+      "bytes": 85970,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16.cu",
+      "sha256": "306b3d44b791f86ac379e255e0be755f652eb873e06dd0d9f76c889d33cfe9ab"
+    },
+    {
+      "bytes": 34026,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16_binding.cu",
+      "sha256": "df63b4eecefc8ed97419c8ca07bbb37aadec2c99b305802909042a621450cd2e"
+    },
+    {
+      "bytes": 86947,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16.cu",
+      "sha256": "fa95dccd904a8734ba2f38ee8c6439078f5471552fabdfc4778edfad93bcf468"
+    },
+    {
+      "bytes": 34026,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16_binding.cu",
+      "sha256": "7e35b10720b5ba2f2db4f2fc725993b7c2c5d65966ba6afe3141098ed63bd509"
+    },
+    {
       "bytes": 211379,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
@@ -650,10 +674,10 @@
     }
   ],
   "generation_inputs": {
-    "observed_checkout_revision": null,
-    "observed_tracked_tree_clean": false,
+    "observed_checkout_revision": "ad85f3e1b621b36aad3dc2f95fe292715e8673d5",
+    "observed_tracked_tree_clean": true,
     "producer_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "recipe_sha256": "c2fd397618de83f5ae186ef933e7031efae672c4abefce07862c84c101fe0769",
+    "recipe_sha256": "dbf2f9db49c7813668810da15fb8f315f099dbf4cea7ef9a3ba9aa305975e8c6",
     "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
@@ -2508,6 +2532,420 @@
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
         "compile_separately": true,
         "device": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "ws_qd"
+        ],
+        [
+          "tma_buffer",
+          "ws_qd_tma"
+        ],
+        [
+          "buffer",
+          "ws_kd"
+        ],
+        [
+          "tma_buffer",
+          "ws_kd_tma"
+        ],
+        [
+          "buffer",
+          "ws_w"
+        ],
+        [
+          "tma_buffer",
+          "ws_w_tma"
+        ],
+        [
+          "buffer",
+          "ws_qk"
+        ],
+        [
+          "tma_buffer",
+          "ws_qk_tma"
+        ],
+        [
+          "buffer",
+          "ws_diag"
+        ],
+        [
+          "tma_buffer",
+          "ws_diag_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "cu_chunks"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bdd06f694122c156b362695c217534f3600c2d8fb4d88101800cfec8e89aa6f5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 85970,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16.cu",
+          "sha256": "306b3d44b791f86ac379e255e0be755f652eb873e06dd0d9f76c889d33cfe9ab"
+        },
+        {
+          "bytes": 34026,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16_binding.cu",
+          "sha256": "df63b4eecefc8ed97419c8ca07bbb37aadec2c99b305802909042a621450cd2e"
+        }
+      ],
+      "closure_sha256": "8b1388930f44eb9ae69e9f3292f971a6adc0b8a15c2ca6578955ed2a5d36b1dd",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_bt16_chain_s8_bf16",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 138240,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_bt16_chain_s8_bf16_ffi",
+      "name": "cake_kda_prefill_bt16_chain_s8_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "chain",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "bt16_chain_m64_s8"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "ws_qd"
+        ],
+        [
+          "tma_buffer",
+          "ws_qd_tma"
+        ],
+        [
+          "buffer",
+          "ws_kd"
+        ],
+        [
+          "tma_buffer",
+          "ws_kd_tma"
+        ],
+        [
+          "buffer",
+          "ws_w"
+        ],
+        [
+          "tma_buffer",
+          "ws_w_tma"
+        ],
+        [
+          "buffer",
+          "ws_qk"
+        ],
+        [
+          "tma_buffer",
+          "ws_qk_tma"
+        ],
+        [
+          "buffer",
+          "ws_diag"
+        ],
+        [
+          "tma_buffer",
+          "ws_diag_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "cu_chunks"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bdd06f694122c156b362695c217534f3600c2d8fb4d88101800cfec8e89aa6f5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 86947,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16.cu",
+          "sha256": "fa95dccd904a8734ba2f38ee8c6439078f5471552fabdfc4778edfad93bcf468"
+        },
+        {
+          "bytes": 34026,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16_binding.cu",
+          "sha256": "7e35b10720b5ba2f2db4f2fc725993b7c2c5d65966ba6afe3141098ed63bd509"
+        }
+      ],
+      "closure_sha256": "abf65cb496c7fec8f0e4d52749a453d7becc2423f0980e9967cb1868e8b8835a",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_bt16_chain_s9_bf16",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 153600,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_bt16_chain_s9_bf16_ffi",
+      "name": "cake_kda_prefill_bt16_chain_s9_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "chain",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "bt16_chain_m64_s9"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16.cu"
       }
     },
     {
@@ -9744,6 +10182,420 @@
         "binding": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
         "compile_separately": true,
         "device": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "ws_qd"
+        ],
+        [
+          "tma_buffer",
+          "ws_qd_tma"
+        ],
+        [
+          "buffer",
+          "ws_kd"
+        ],
+        [
+          "tma_buffer",
+          "ws_kd_tma"
+        ],
+        [
+          "buffer",
+          "ws_w"
+        ],
+        [
+          "tma_buffer",
+          "ws_w_tma"
+        ],
+        [
+          "buffer",
+          "ws_qk"
+        ],
+        [
+          "tma_buffer",
+          "ws_qk_tma"
+        ],
+        [
+          "buffer",
+          "ws_diag"
+        ],
+        [
+          "tma_buffer",
+          "ws_diag_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "cu_chunks"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bdd06f694122c156b362695c217534f3600c2d8fb4d88101800cfec8e89aa6f5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 85970,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16.cu",
+          "sha256": "306b3d44b791f86ac379e255e0be755f652eb873e06dd0d9f76c889d33cfe9ab"
+        },
+        {
+          "bytes": 34026,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16_binding.cu",
+          "sha256": "df63b4eecefc8ed97419c8ca07bbb37aadec2c99b305802909042a621450cd2e"
+        }
+      ],
+      "closure_sha256": "e805eaf20769d84405847b4c41d6a657fd3718aa2d1d567542acd93539ab4d9c",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_bt16_chain_s8_bf16",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 138240,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_bt16_chain_s8_bf16_ffi",
+      "name": "cake_kda_prefill_bt16_chain_s8_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "chain",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "bt16_chain_m64_s8"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_bt16_chain_s8_bf16.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "ws_qd"
+        ],
+        [
+          "tma_buffer",
+          "ws_qd_tma"
+        ],
+        [
+          "buffer",
+          "ws_kd"
+        ],
+        [
+          "tma_buffer",
+          "ws_kd_tma"
+        ],
+        [
+          "buffer",
+          "ws_w"
+        ],
+        [
+          "tma_buffer",
+          "ws_w_tma"
+        ],
+        [
+          "buffer",
+          "ws_qk"
+        ],
+        [
+          "tma_buffer",
+          "ws_qk_tma"
+        ],
+        [
+          "buffer",
+          "ws_diag"
+        ],
+        [
+          "tma_buffer",
+          "ws_diag_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "cu_chunks"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bdd06f694122c156b362695c217534f3600c2d8fb4d88101800cfec8e89aa6f5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 86947,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16.cu",
+          "sha256": "fa95dccd904a8734ba2f38ee8c6439078f5471552fabdfc4778edfad93bcf468"
+        },
+        {
+          "bytes": 34026,
+          "path": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16_binding.cu",
+          "sha256": "7e35b10720b5ba2f2db4f2fc725993b7c2c5d65966ba6afe3141098ed63bd509"
+        }
+      ],
+      "closure_sha256": "44d8322c7045b4fd65af5d840f50cac910e4d3cb5c00a21b1a95eee7ca57cbed",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_bt16_chain_s9_bf16",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 153600,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_bt16_chain_s9_bf16_ffi",
+      "name": "cake_kda_prefill_bt16_chain_s9_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "chain",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "bt16_chain_m64_s9"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_bt16_chain_s9_bf16.cu"
       }
     },
     {
