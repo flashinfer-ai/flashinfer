@@ -455,7 +455,14 @@ routine_cc_to_supported_backends = {
             "prims-ts",
         ],
         "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
@@ -485,7 +492,13 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
-        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.0": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {

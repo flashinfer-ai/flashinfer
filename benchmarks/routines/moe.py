@@ -2912,16 +2912,18 @@ def testUnifiedNvfp4Moe(args):
     tuner = AutoTuner.get()
     for runner in layer.runners:
         inputs = runner.pack_inputs(act_pack, weight_pack)
+        launch_kwargs = runner.launch_kwargs_for(inputs)
         with autotune(True):
             _, tactic = tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
-                tuning_config=runner.tuning_config,
+                tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
+                **launch_kwargs,
             )
 
-        def _call(r=runner, i=inputs, t=tactic):
-            return r.forward(i, tactic=t)
+        def _call(r=runner, i=inputs, t=tactic, kw=launch_kwargs):
+            return r.forward(i, tactic=t, **kw)
 
         times = bench_gpu_time(
             fn=_call,
@@ -2969,7 +2971,7 @@ def testUnifiedNvfp4Moe(args):
         # Shared-reference accuracy check for this candidate (CR10/CR11).
         refcheck_passed = None
         if ref_output is not None:
-            out = runner.forward(inputs, tactic=tactic)
+            out = runner.forward(inputs, tactic=tactic, **launch_kwargs)
             refcheck_passed, pct, atol = check_accuracy(out, ref_output)
             status = "PASS" if refcheck_passed else "FAIL"
             print(
