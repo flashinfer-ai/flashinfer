@@ -3425,7 +3425,11 @@ def _run_cake_kda_bt16_prepare_chain(
         target, "bounded_fp32_serving", chain_variant, "chain"
     )
     beta_flat = _flatten_beta_source(beta)
-    beta_tma = _cake_kda_beta_source(beta, workspace, chunk_tokens=16)
+    # This exported prepare policy consumes scalar beta_logits through the
+    # dense pointer.  Its generated ABI still carries a TMA descriptor slot,
+    # but the kernel never reads it, so mirror Cake by allocating a legal,
+    # stable carrier without refreshing padded contents on every launch.
+    beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=16)
     total_tasks = (len(offsets) - 1) * num_heads
     prepare_module.run(
         q,
