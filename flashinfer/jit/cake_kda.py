@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from ._kda_jit_common import (
     gen_kda_jit_spec,
@@ -37,115 +37,8 @@ _TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=0",
     "sm103a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=3",
 }
-_EVOLUTION_POLICIES = {
-    "bt16_chain_m64_s8",
-    "bt16_chain_m64_s9",
-    "direct_m128_generic",
-    "direct_m128_h96_commit_order",
-    "direct_m128_legacy_inverse",
-    "direct_m128_n16",
-    "persistent_m128_h64_lpt",
-    "persistent_m128_h96_lpt",
-    "direct_vtile_m128_generic",
-    "direct_vtile_m128_h64_gate_order",
-    "persistent_vtile_m128_h96_six_task",
-    "persistent_vtile_m128_h64",
-    "direct_m64_independent_value_split",
-}
-_SERVING_COMMON_POLICIES = {
-    "bt16_prepare",
-    "bt16_chain_m64_s8",
-    "bt16_chain_m64_s9",
-    "direct_m128_h12_pair_packed_beta",
-    "direct_m128_h12_scalar_early_pack",
-    "direct_m128_n16_h12_scalar",
-    "direct_m128_legacy_inverse",
-    "direct_m128_register_inverse",
-    "independent_dvsplit_m64",
-    "persistent_m128_recurrence_pieces",
-    "scalar_chunk_lpt_m128_h96",
-    "small_bh_owner_helper_m128",
-}
-_SERVING_SM100_POLICIES = _SERVING_COMMON_POLICIES | {"persistent_m128_whole_chain"}
-_SERVING_SM103_POLICIES = _SERVING_COMMON_POLICIES | {
-    "direct_m128_prediction_first_tensor_decay",
-    "source_vtile_m128_direct",
-    "source_vtile_m128_persistent_six_task",
-}
-_ROLE_BY_POLICY: dict[str, CakeKDARole] = {
-    "bt16_prepare": "prepare",
-    "bt16_chain_m64_s8": "chain",
-    "bt16_chain_m64_s9": "chain",
-    "affine_split_map": "map",
-    "affine_prefix_scan": "scan",
-    "affine_split_correction": "correction",
-}
-
-
-def _expected_module_keys() -> set[tuple[str, str, str, str]]:
-    expected: set[tuple[str, str, str, str]] = set()
-    for arch in _TARGET_ARCH.values():
-        expected.update(
-            (
-                arch,
-                "bounded_bf16_evolution",
-                policy,
-                _ROLE_BY_POLICY.get(policy, "main"),
-            )
-            for policy in _EVOLUTION_POLICIES
-        )
-        expected.add(
-            (arch, "unbounded_bf16_serving", "direct_m128_unbounded_softplus", "main")
-        )
-        expected.update(
-            (
-                arch,
-                "bounded_fp32_affine_prefix",
-                policy,
-                _ROLE_BY_POLICY.get(policy, "main"),
-            )
-            for policy in (
-                "affine_split_main",
-                "affine_split_map",
-                "affine_split_correction",
-            )
-        )
-        expected.update(
-            (
-                arch,
-                "bounded_fp32_affine_h12_prefix",
-                policy,
-                _ROLE_BY_POLICY.get(policy, "main"),
-            )
-            for policy in (
-                "affine_split_main",
-                "affine_split_map",
-                "affine_split_correction",
-            )
-        )
-        expected.update(
-            (
-                arch,
-                "unbounded_affine_prefix",
-                policy,
-                _ROLE_BY_POLICY.get(policy, "main"),
-            )
-            for policy in (
-                "affine_split_main",
-                "affine_split_map",
-                "affine_prefix_scan",
-                "affine_split_correction",
-            )
-        )
-    expected.update(
-        ("sm_100a", "bounded_fp32_serving", policy, _ROLE_BY_POLICY.get(policy, "main"))
-        for policy in _SERVING_SM100_POLICIES
-    )
-    expected.update(
-        ("sm_103a", "bounded_fp32_serving", policy, _ROLE_BY_POLICY.get(policy, "main"))
-        for policy in _SERVING_SM103_POLICIES
-    )
-    return expected
+_SUPPORTED_FAMILIES = frozenset(get_args(CakeKDAFamily))
+_SUPPORTED_ROLES = frozenset(get_args(CakeKDARole))
 
 
 @dataclass(frozen=True)
@@ -319,11 +212,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
 
     modules = payload.get("modules")
     target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
-    expected = _expected_module_keys()
-    _require(
-        isinstance(modules, list) and len(modules) == len(expected),
-        "module inventory does not match the expected route set",
-    )
+    _require(isinstance(modules, list) and modules, "module inventory missing")
     observed: set[tuple[str, str, str, str]] = set()
     specs: list[CakeKDAModuleSpec] = []
     for index, item in enumerate(modules):
@@ -336,8 +225,13 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         _require(isinstance(route, dict), f"{label}.route missing")
         family = route.get("family")
         policy = route.get("policy")
+        _require(family in _SUPPORTED_FAMILIES, f"{label}.family unsupported")
+        _require(
+            isinstance(policy, str) and policy,
+            f"{label}.policy must be nonempty",
+        )
+        _require(role in _SUPPORTED_ROLES, f"{label}.role unsupported")
         key = (arch, family, policy, role)
-        _require(key in expected, f"{label} unsupported route {key}")
         _require(key not in observed, f"duplicate module {key}")
         observed.add(key)
 
@@ -436,7 +330,16 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
             )
         )
 
-    _require(observed == expected, "target/route module set mismatch")
+    observed_arch_families = {(arch, family) for arch, family, _policy, _role in observed}
+    expected_arch_families = {
+        (arch, family)
+        for arch in target_by_arch
+        for family in _SUPPORTED_FAMILIES
+    }
+    _require(
+        observed_arch_families == expected_arch_families,
+        "every architecture must contain every portfolio family",
+    )
     specs.sort(key=lambda spec: (spec.target, spec.family, spec.policy, spec.role))
     return tuple(specs)
 
@@ -609,7 +512,7 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
 
 def cake_kda_is_available() -> bool:
     return (
-        len(get_cake_kda_module_specs()) == len(_expected_module_keys())
+        bool(get_cake_kda_module_specs())
         and len(get_cake_kda_sequence_specs()) == 2
     )
 
