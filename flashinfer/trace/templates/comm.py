@@ -470,6 +470,54 @@ _ulysses_gather_heads_template = _UlyssesSingleRankTraceTemplate(
 )
 
 
+_ulysses_exchange_chunks_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_exchange_chunks",
+    description=(
+        "Equal-length chunk all-to-all over an already-packed payload: chunk "
+        "``r`` goes to peer ``r`` and lands in slot ``rank`` there. Unlike the "
+        "two head-axis transforms this one interleaves nothing, so it is the "
+        "identity at world_size=1 by shape as well as by value. The reference "
+        "models world_size=1; multi-rank correctness is exercised by "
+        "tests/comm/."
+    ),
+    # Every axis the operand carries is read off its shape; only world_size
+    # comes off the communicator, so it is the one with a fixed value here.
+    axes={
+        "batch_size": Const(
+            abbrev="",
+            description="Pinned to 1: one row per operand is what lets the "
+            "transport address each peer's bytes contiguously.",
+        ),
+        "seq_len": Const(abbrev="", description="Pinned to 1, as above."),
+        "chunk_count": Const(
+            abbrev="",
+            description="Chunks in the operand, one per peer, so equal to "
+            "world_size by construction.",
+        ),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "chunk": Const(abbrev="c", description="Elements in one peer's chunk."),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "seq_len", "chunk_count", "chunk"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "chunk_count", "chunk"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=["world_size == 1", "chunk_count == world_size"],
+    tags=["status:experimental", "stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
 def _ulysses_single_rank_trace_dispatch(template, **kwargs):
     """Trace only the identity case; multi-rank collectives have no local reference."""
     communicator = kwargs.get("self")
@@ -486,9 +534,18 @@ def ulysses_gather_heads_trace(**kwargs):
     return _ulysses_single_rank_trace_dispatch(_ulysses_gather_heads_template, **kwargs)
 
 
+def ulysses_exchange_chunks_trace(**kwargs):
+    return _ulysses_single_rank_trace_dispatch(
+        _ulysses_exchange_chunks_template, **kwargs
+    )
+
+
 ulysses_scatter_heads_trace.templates = (  # type: ignore[attr-defined]
     _ulysses_scatter_heads_template,
 )
 ulysses_gather_heads_trace.templates = (  # type: ignore[attr-defined]
     _ulysses_gather_heads_template,
+)
+ulysses_exchange_chunks_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_exchange_chunks_template,
 )
