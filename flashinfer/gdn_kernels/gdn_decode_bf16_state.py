@@ -44,6 +44,8 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
+import functools
+
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -2699,13 +2701,21 @@ def _run_wide_vec_t1(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+# Defer CUDA queries until first use — module import must not create a
+# CUDA context (#4889). Cached after first call.
+@functools.cache
+def _num_sms() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
 
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
+
+@functools.cache
+def _use_packed_fma() -> bool:
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 10
+
+
+# Back-compat aliases for in-module readers; prefer the callables above.
+# _num_sms() stays a function attribute accessed via property-like usage below.
 
 
 def gated_delta_rule(
@@ -2869,7 +2879,7 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * _num_sms():
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
@@ -3067,7 +3077,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = _use_packed_fma()
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -3419,7 +3429,7 @@ def gated_delta_rule_t1_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = _use_packed_fma()
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -3783,7 +3793,7 @@ def gated_delta_rule_mtp(
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = _use_packed_fma()
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (

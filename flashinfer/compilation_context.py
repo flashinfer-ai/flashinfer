@@ -19,10 +19,33 @@ Global compilation context management for FlashInfer.
 
 import functools
 import os
-import torch
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
+
+
+def get_device_capability_no_context(device: int = 0) -> tuple[int, int]:
+    """Return (major, minor) without creating a CUDA context.
+
+    ``torch.cuda.get_device_capability`` calls ``_lazy_init`` and forces a
+    CUDA context. Import-time callers (JIT workspace naming, availability
+    probes) must not do that — it breaks frameworks that need to control
+    when/where the context is created (#4889). Fall back to NVML when the
+    context is not yet initialized.
+    """
+    if torch.cuda.is_initialized():
+        return torch.cuda.get_device_capability(device)
+    import pynvml
+
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        return int(major), int(minor)
+    finally:
+        pynvml.nvmlShutdown()
 
 
 @functools.cache
@@ -102,7 +125,7 @@ class CompilationContext:
         else:
             try:
                 for device in range(torch.cuda.device_count()):
-                    major, minor = torch.cuda.get_device_capability(device)
+                    major, minor = get_device_capability_no_context(device)
                     self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
