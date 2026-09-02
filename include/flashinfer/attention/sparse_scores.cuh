@@ -19,7 +19,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-
 #include <sstream>
 
 #include "../cp_async.cuh"
@@ -123,8 +122,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   // so that the copy needs no predicate; the bitmask beside it is what marks
   // the column unscorable.
   uintptr_t* bases_smem = reinterpret_cast<uintptr_t*>(k_smem + kStages * kBlockN * kSliceRow);
-  uint32_t* live_smem =
-      reinterpret_cast<uint32_t*>(bases_smem + TILES_PER_BLOCK * kBlockN);
+  uint32_t* live_smem = reinterpret_cast<uint32_t*>(bases_smem + TILES_PER_BLOCK * kBlockN);
 
   // Rows on x so that blocks scoring the same columns run together: rows of one
   // request read the same keys, and consecutive blocks are what shares a cache.
@@ -166,8 +164,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   // do not settle -- a view onto the middle of a tensor keeps whatever strides
   // it started with and carries a base that is not.
   const bool q_vectorizable = HEAD_DIM % kQVec == 0 && stride_q_head % kQVec == 0 &&
-                              stride_q_row % kQVec == 0 &&
-                              reinterpret_cast<uintptr_t>(q) % 16 == 0;
+                              stride_q_row % kQVec == 0 && reinterpret_cast<uintptr_t>(q) % 16 == 0;
   if (q_vectorizable) {
     constexpr uint32_t kQVecsPerHead = HEAD_DIM / kQVec;
     for (uint32_t i = threadIdx.x; i < TILE_N * kQVecsPerHead; i += kThreads) {
@@ -187,8 +184,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     for (uint32_t i = threadIdx.x; i < TILE_N * HEAD_DIM; i += kThreads) {
       const uint32_t h = i / HEAD_DIM;
       const uint32_t d = i - h * HEAD_DIM;
-      q_smem[h * kSmemRow + d] =
-          h < heads ? q[row * stride_q_row + h * stride_q_head + d] : zero;
+      q_smem[h * kSmemRow + d] = h < heads ? q[row * stride_q_row + h * stride_q_head + d] : zero;
     }
   }
 
@@ -208,12 +204,12 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
       }
     }
     bases_smem[i] =
-        page >= 0 ? reinterpret_cast<uintptr_t>(k_cache + static_cast<int64_t>(page) *
-                                                              stride_cache_page +
-                                                entry * stride_cache_entry)
-                  // Never read, since a block with no page stages nothing, but
-                  // it keeps the staging loop free of a predicate.
-                  : reinterpret_cast<uintptr_t>(k_cache);
+        page >= 0
+            ? reinterpret_cast<uintptr_t>(k_cache + static_cast<int64_t>(page) * stride_cache_page +
+                                          entry * stride_cache_entry)
+            // Never read, since a block with no page stages nothing, but
+            // it keeps the staging loop free of a predicate.
+            : reinterpret_cast<uintptr_t>(k_cache);
     // Consecutive threads take consecutive columns, so a warp holds exactly the
     // thirty-two bits of one mask word.
     const uint32_t live = __ballot_sync(0xffffffffu, page >= 0);
@@ -242,7 +238,6 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   // compile-time trip count and unrolls; leaving the bound as a runtime min()
   // costs that, which is most of the instruction issue in this kernel.
   constexpr bool kEvenSlices = HEAD_DIM % SLICE_K == 0;
-
 
   // One step stages one slice of one tile, so the pipeline runs unbroken across
   // tile boundaries.
@@ -275,8 +270,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
       for (uint32_t i = threadIdx.x; i < kBlockN * elems; i += kThreads) {
         const uint32_t c = i / elems;
         const uint32_t e = i - c * elems;
-        dst_base[c * kSliceRow + e] =
-            reinterpret_cast<const DType*>(tile_bases[c])[k0 + e];
+        dst_base[c * kSliceRow + e] = reinterpret_cast<const DType*>(tile_bases[c])[k0 + e];
       }
       cp_async::commit_group();
       return;
@@ -286,8 +280,8 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     // the launch divides evenly, which makes every address in the loop below a
     // constant away from one the thread already holds. The general form is kept
     // for the shapes that do not divide.
-    constexpr bool kUniformVec = kEvenSlices && kThreads % kSliceVecs == 0 &&
-                                 (kBlockN * kSliceVecs) % kThreads == 0;
+    constexpr bool kUniformVec =
+        kEvenSlices && kThreads % kSliceVecs == 0 && (kBlockN * kSliceVecs) % kThreads == 0;
     if constexpr (kUniformVec) {
       constexpr uint32_t kIters = kBlockN * kSliceVecs / kThreads;
       constexpr uint32_t kColStep = kThreads / kSliceVecs;
@@ -488,8 +482,8 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   static thread_local int num_sms = 0, max_smem_per_block_optin = 0;
   if (cached_dev != dev_id) {
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
-        &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
     cached_dev = dev_id;
   }
   const size_t largest = max(smem_for(8, kMultiTileSliceK), smem_for(1, HEAD_DIM));
@@ -564,10 +558,8 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   constexpr uint64_t kBlocksPerSMBeforeWide = 24;
   // Sixty-four bit: rows times column tiles is the caller's shape, and a launch
   // big enough to wrap 32 bits would pick the wrong shape rather than fail.
-  const uint64_t narrow_blocks =
-      static_cast<uint64_t>(rows) * ceil_div(num_columns, kBlockN);
-  const bool narrow =
-      narrow_blocks <= kBlocksPerSMBeforeWide * static_cast<uint64_t>(num_sms);
+  const uint64_t narrow_blocks = static_cast<uint64_t>(rows) * ceil_div(num_columns, kBlockN);
+  const bool narrow = narrow_blocks <= kBlocksPerSMBeforeWide * static_cast<uint64_t>(num_sms);
   if (tile_n == kNarrowTileN) {
     constexpr std::integral_constant<uint32_t, kNarrowTileN> n{};
     return narrow ? launch(std::integral_constant<uint32_t, 1>{}, n)
