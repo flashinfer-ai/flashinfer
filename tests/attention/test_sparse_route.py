@@ -43,21 +43,24 @@ def _expand_reference(
         request = requests[row]
         seq = lengths[request] if 0 <= request < num_requests else 0
         position = positions[row]
-        complete = min(
-            (position + 1) // compress_ratio, seq // compress_ratio, block_topk
-        )
+        past = min((position + 1) // compress_ratio, seq // compress_ratio)
+        complete = min(past, block_topk)
         route = []
         for rank in range(complete):
-            base = blocks[row][rank] * compress_ratio
-            route.extend(base + offset for offset in range(compress_ratio))
+            block = blocks[row][rank]
+            # The whole block or none of it: the block the query sits in is
+            # partly ahead of it, and the tail below appends its seen half, so
+            # expanding it here would route those tokens twice.
+            base = block * compress_ratio if 0 <= block < past else None
+            route.extend(
+                None if base is None else base + offset
+                for offset in range(compress_ratio)
+            )
         tail_start = ((position + 1) // compress_ratio) * compress_ratio
         tail = min((position + 1) - tail_start, compress_ratio - 1)
         route.extend(tail_start + offset for offset in range(tail))
         for column, token in enumerate(route[:width]):
-            # A block the query has not reached expands into tokens it cannot
-            # see. The block ids are the caller's, so the bound is applied here
-            # rather than assumed.
-            if 0 <= token <= position and token < seq:
+            if token is not None and 0 <= token <= position and token < seq:
                 out[row, column] = token
     return out
 
@@ -168,6 +171,28 @@ def test_expand_block_route_drops_a_block_the_query_has_not_reached():
     token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
     out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
     assert int(out.max()) <= 3, f"routed a token past the query: {out.tolist()}"
+    assert out[0, :ratio].tolist() == [-1] * ratio
+    expected = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_expand_block_route_does_not_repeat_the_block_the_query_sits_in():
+    """The block a query sits in is half behind it, and the tail is what
+    appends that half. Keeping the seen tokens of that block during expansion
+    instead of dropping the block whole would route them twice -- at a ratio of
+    four and a query at position 9, block 2 covers tokens 8 to 11 and the tail
+    already carries 8 and 9."""
+    ratio = 4
+    # One column, so the only expansion is the offending block.
+    blocks = torch.tensor([[2]], dtype=torch.int32, device=DEV)
+    positions = torch.tensor([9], dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([512], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
+    routed = [t for t in out[0].tolist() if t >= 0]
+    assert len(routed) == len(set(routed)), f"a token is routed twice: {routed}"
+    assert routed == [8, 9], routed
+    assert out[0, :ratio].tolist() == [-1] * ratio
     expected = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
