@@ -62,9 +62,9 @@
 //                        landed (the producer waited mbar_kv before QK).
 //   w_free   (ids 8/9):  consumer arrives, producer syncs before reusing the
 //                        parity buffer two tiles later.
-//   KV release (ids 1/5): consumer arrives, IO syncs before refilling the KV
-//                        buffer; in this mode IO no longer syncs with the
-//                        whole block, only with the consumer group.
+//   KV release (ids 1/5): both math groups arrive (the consumer for its XV
+//                        reads, the producer for its QK/vsc reads of the same
+//                        buffer), IO syncs before refilling the KV buffer.
 // Softmax state (m, row sums) stays in producer registers; the consumer
 // receives only the per-head alpha. The epilogue hands l_smem/m_smem across
 // once (id 4) so the consumer can normalize and store the output. Producer
@@ -346,6 +346,11 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
         wfp8[(gid + 8) * CT::W_FP8_STRIDE + e1i] = f11.__x;
       }
       bar_arrive_alt<6, 7, Cfg::MATH_THREADS>(buf);  // w_ready
+      // The producer also joins the KV release: its QK/vsc reads of this
+      // buffer are not otherwise ordered against IO's refill (the consumer's
+      // release only covers the consumer's own reads; racecheck flags the
+      // scale-buffer pair without this).
+      bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(buf);
 
       if (ti + 1 < actual_ni) {
         const int next_phase = ((ti + 1) >> 1) & 1;
@@ -447,8 +452,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
         }
       }
       bar_arrive_alt<8, 9, Cfg::MATH_THREADS>(buf);  // w_free
-      // Release the KV buffer to IO (128 consumer + 128 IO threads).
-      bar_arrive_alt<1, 5, Cfg::MATH_THREADS - QK_THREADS + Cfg::IO_THREADS>(buf);
+      bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(buf);  // KV release to IO
     }
 
     // ── Consumer epilogue: normalize + BF16 store ────────────────
@@ -604,12 +608,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         issue_tile(ti + 1, staged);
         staged = next;
       }
-      // On a SPLIT_QK_XV tile the KV buffer is released by the consumer (XV)
-      // warps alone, so the handshake covers IO + consumer, not the block.
-      constexpr int RELEASE_CNT = Cfg::SPLIT_QK_XV
-                                      ? Cfg::MATH_THREADS - Cfg::QK_THREADS + Cfg::IO_THREADS
-                                      : Cfg::BLOCK_THREADS;
-      bar_sync_alt<1, 5, RELEASE_CNT>(ti & 1);
+      bar_sync_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
     }
 
     // ── Math warps ──────────────────────────────────────────────────
