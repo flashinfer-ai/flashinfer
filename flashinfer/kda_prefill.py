@@ -28,7 +28,7 @@ import heapq
 import math
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, Union, cast
 
 import torch
 
@@ -615,7 +615,10 @@ def _select_flash_kda_prefill_variant(
     use_exact_n16: bool = False,
     unbounded_softplus: bool = False,
     use_bt64_unbounded_softplus: bool = False,
-) -> "FlashKDAVariant":
+) -> Union[
+    "FlashKDAVariant",
+    Literal["m128_unbounded_softplus", "m128_bt64_unbounded_softplus"],
+]:
     if unbounded_softplus:
         if use_bt64_unbounded_softplus:
             return "m128_bt64_unbounded_softplus"
@@ -5630,7 +5633,16 @@ def _run_flash_kda_prefill(
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
         assert flash_target is not None
-        module = _get_flash_kda_prefill_module(variant, flash_target)
+        if variant in {
+            "m128_unbounded_softplus",
+            "m128_bt64_unbounded_softplus",
+        }:
+            raise RuntimeError(
+                "unbounded Cake variants must return through the exported path"
+            )
+        module = _get_flash_kda_prefill_module(
+            cast("FlashKDAVariant", variant), flash_target
+        )
         try:
             if variant == "m64":
                 module.run(
