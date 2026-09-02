@@ -1,11 +1,13 @@
 {
   "name": "fp8_paged_mqa_logits_nn2_H64_D128_bs64",
-  "description": "FP8 paged MQA logits: weighted dot-product attention scores against a paged KV cache, with per-token FP32 KV scales. Blackwell (SM100/SM103) only.",
+  "description": "FP8 paged MQA logits: weighted dot-product attention scores against a paged KV cache, with per-token FP32 KV scales. Datacentre Blackwell (SM100/SM103) and Rubin (SM107).",
   "op_type": "paged_mqa_logits",
   "tags": [
     "fi_api:flashinfer.attn_scores.attn_scores.fp8_paged_mqa_logits",
     "status:verified",
-    "arch:sm100"
+    "arch:sm100",
+    "arch:sm103",
+    "arch:sm107"
   ],
   "axes": {
     "batch_size": {

@@ -1,11 +1,13 @@
 {
   "name": "fp4_paged_mqa_logits_nn2_H64_Dp64_bs64",
-  "description": "FP4 (MXFP4) paged MQA logits: weighted dot-product attention scores against a paged KV cache, with block-scaled FP4 Q/K and per-(token, K-group) UE8M0 scale factors. Blackwell (SM100/SM103) only.",
+  "description": "FP4 (MXFP4) paged MQA logits: weighted dot-product attention scores against a paged KV cache, with block-scaled FP4 Q/K and per-(token, K-group) UE8M0 scale factors. Datacentre Blackwell (SM100/SM103) and Rubin (SM107).",
   "op_type": "paged_mqa_logits",
   "tags": [
     "fi_api:flashinfer.attn_scores.attn_scores.fp4_paged_mqa_logits",
     "status:verified",
-    "arch:sm100"
+    "arch:sm100",
+    "arch:sm103",
+    "arch:sm107"
   ],
   "axes": {
     "batch_size": {
