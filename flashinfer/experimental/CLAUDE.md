@@ -66,6 +66,8 @@ if backend == "experimental_xyz":
 
 - Named owner + tracking issue (use case, reason, graduation plan/target;
   default intent: graduate within four weeks).
+- Declare the PR via the **Experimental Track** checkbox in the PR template,
+  linking the tracking issue (maintainers add the `experimental` label).
 - Correctness tests vs. a reference in `tests/experimental/`, validated on
   the intended hardware, plus a runnable example.
 

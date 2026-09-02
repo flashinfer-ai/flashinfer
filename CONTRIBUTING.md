@@ -76,6 +76,9 @@ stable backends.
 * a named owner and a tracking issue (use case, reason for the experimental
   path, graduation plan and target release — default intent is graduation
   within four weeks);
+* declaration in the PR: tick the **Experimental Track** checkbox in the PR
+  template and link the tracking issue there (maintainers add the
+  `experimental` label);
 * correctness tests against a reference in `tests/experimental/`, validated on
   the intended hardware, plus a runnable example;
 * no registration in `flashinfer/aot.py` (experimental features are JIT-only

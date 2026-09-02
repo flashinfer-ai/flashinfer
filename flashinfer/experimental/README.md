@@ -195,11 +195,13 @@ the normal core review process; reviewers verify that integration is
 explicit, stable behavior is unchanged by default, and backend-specific logic
 has not leaked into core.
 
-The tracking issue is reviewed together with the PR itself, especially when
-the PR introduces a new experimental feature (as opposed to small
-improvements to an existing experimental backend): reviewers assess the
-documented use case, the reason for taking the experimental path, and the
-graduation plan as part of admission.
+The PR declares itself experimental by ticking the **Experimental Track**
+checkbox in the PR template and linking the tracking issue there; maintainers
+add the `experimental` label. The tracking issue is reviewed together with the
+PR itself, especially when the PR introduces a new experimental feature (as
+opposed to small improvements to an existing experimental backend): reviewers
+assess the documented use case, the reason for taking the experimental path,
+and the graduation plan as part of admission.
 
 Broad portability, comprehensive performance coverage, and long-term
 maintainability are **not** required at admission.
