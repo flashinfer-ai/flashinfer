@@ -1069,9 +1069,65 @@ def test_trtllm_batch_prefill_wrapper_rejects_noncausal_sliding_window():
         )
 
 
-def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window():
-    _skip_if_not_blackwell()
-    query = torch.empty((1, 1, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
+def test_trtllm_gen_prefill_run_forwards_noncausal_window_as_invalid_pair(monkeypatch):
+    forwarded_args = None
+
+    class FakeOp:
+        def trtllm_paged_attention_context(self, *args):
+            nonlocal forwarded_args
+            forwarded_args = args
+
+    class FakeJitModule:
+        def build_and_load(self):
+            return FakeOp()
+
+        def get_library_path(self):
+            return "unused"
+
+    flashinfer.prefill.get_trtllm_gen_prefill_module.cache_clear()
+    monkeypatch.setattr(flashinfer.prefill, "gen_trtllm_gen_fmha_module", FakeJitModule)
+    monkeypatch.setattr(flashinfer.prefill, "setup_cubin_loader", lambda _: None)
+    monkeypatch.setattr(flashinfer.prefill, "get_device_sm_count", lambda _: 1)
+    monkeypatch.setattr(
+        flashinfer.prefill,
+        "_resolve_trtllm_gen_multi_ctas_kv_counter_buffer",
+        lambda *args: torch.empty(0, dtype=torch.uint8),
+    )
+
+    query = torch.empty((1, 1, 128), dtype=torch.bfloat16)
+    module = flashinfer.prefill.get_trtllm_gen_prefill_module()
+    try:
+        module.paged_run(
+            query=query,
+            k_cache=torch.empty_like(query),
+            v_cache=torch.empty_like(query),
+            workspace_buffer=torch.empty(1, dtype=torch.uint8),
+            block_tables=torch.empty((1, 1), dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            max_q_len=1,
+            max_kv_len=1,
+            bmm1_scale=1.0,
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 1], dtype=torch.int32),
+            enable_pdl=False,
+            workspace_size=1,
+            window_left=1,
+            out=torch.empty_like(query),
+            is_causal=False,
+        )
+    finally:
+        flashinfer.prefill.get_trtllm_gen_prefill_module.cache_clear()
+
+    assert forwarded_args is not None
+    assert forwarded_args[17] == 1  # window_left
+    assert forwarded_args[18] == -1  # window_right
+
+
+@pytest.mark.parametrize("backend", ["trtllm-gen", "auto"])
+def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window(backend):
+    query = torch.empty((1, 1, 128), dtype=torch.bfloat16)
     key = torch.empty_like(query)
     value = torch.empty_like(query)
     with pytest.raises(
@@ -1081,8 +1137,8 @@ def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window():
             query=query,
             key=key,
             value=value,
-            workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device=GPU_DEVICE),
-            seq_lens=torch.tensor([1], dtype=torch.int32, device=GPU_DEVICE),
+            workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
             max_q_len=1,
             max_kv_len=1,
             bmm1_scale=1.0,
@@ -1090,12 +1146,12 @@ def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window():
             o_sf_scale=1.0,
             batch_size=1,
             window_left=1,
-            cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32, device=GPU_DEVICE),
-            cum_seq_lens_kv=torch.tensor([0, 1], dtype=torch.int32, device=GPU_DEVICE),
+            cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 1], dtype=torch.int32),
             enable_pdl=False,
             is_causal=False,
             return_lse=False,
-            backend="trtllm-gen",
+            backend=backend,
         )
 
 

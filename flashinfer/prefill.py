@@ -298,7 +298,7 @@ def get_trtllm_gen_prefill_module():
             0,  # o_sf_start_index
             batch_size,
             window_left,
-            0 if window_left >= 0 else -1,
+            0 if (is_causal and window_left >= 0) else -1,
             cum_seq_lens_q,
             cum_seq_lens_kv,
             None,
@@ -2558,11 +2558,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if logits_soft_cap != 0.0:
                 raise ValueError(
                     "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
-                )
-            if not causal and window_left >= 0:
-                raise NotImplementedError(
-                    "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
-                    "Use window_left=-1 for dense bidirectional attention."
                 )
             if self._block_tables is None:
                 blocks_per_seq = [
@@ -4922,7 +4917,7 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
-    if backend == "trtllm-gen" and not is_causal and window_left >= 0:
+    if backend != "cute-dsl" and not is_causal and window_left >= 0:
         raise NotImplementedError(
             "trtllm-gen ragged attention does not support non-causal sliding-window "
             "attention; previously the window was silently ignored"

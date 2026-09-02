@@ -1196,7 +1196,11 @@ class TllmGenFmhaKernel {
             (params.mLeftSlidingWindow == -1 ||
              params.mMaxSeqLenKv <= params.mLeftSlidingWindow + 1) &&
                 params.mRightSlidingWindow <= 0 && params.mChunkedAttentionSize == 0,
-            "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
+            "TRTLLM-GEN MLA generation requires a window that covers the whole KV sequence "
+            "(maxSeqLenKv=%d, leftSlidingWindow=%d, rightSlidingWindow=%d, "
+            "chunkedAttentionSize=%d).",
+            params.mMaxSeqLenKv, params.mLeftSlidingWindow, params.mRightSlidingWindow,
+            params.mChunkedAttentionSize);
       }
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
