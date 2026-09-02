@@ -271,6 +271,14 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
         knobs.get("mma_tiler_mnk", (256, 256, 64)) == (256, 256, 64)
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
+        and knobs.get("force_static_sched", True)
+        and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
+        and knobs.get("token_back_mode", "epi_warps")
+        in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+        and not (
+            knobs.get("in_kernel_fc2_reduce", False)
+            and knobs.get("token_back_mode", "epi_warps") == "epi_warps"
+        )
         and is_valid(
             {
                 **knobs,
@@ -295,9 +303,33 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "reuse_dispatch_warps")
+        and not (
+            knobs.get("in_kernel_fc2_reduce", False)
+            and knobs.get("token_back_mode", "epi_warps") != "epi_warps"
+        )
         and knobs.get("clc_bundle_size") is None
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
     )
+
+
+def _effective_knobs(config: Any, knobs: Dict[str, Any]) -> Dict[str, Any]:
+    return {**dataclasses.asdict(config), **knobs}
+
+
+def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate BF16 knobs against a session's caller-owned IKR setting."""
+    effective = _effective_knobs(config, knobs)
+    return effective[
+        "in_kernel_fc2_reduce"
+    ] == config.in_kernel_fc2_reduce and is_valid_bf16(effective)
+
+
+def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate mixed BF16/MXFP8 knobs against a session's IKR setting."""
+    effective = _effective_knobs(config, knobs)
+    return effective[
+        "in_kernel_fc2_reduce"
+    ] == config.in_kernel_fc2_reduce and is_valid_bf16_mxfp8(effective)
 
 
 def iter_candidates(
@@ -354,7 +386,9 @@ __all__ = [
     "default_knobs",
     "is_valid",
     "is_valid_bf16",
+    "is_valid_bf16_for_config",
     "is_valid_bf16_mxfp8",
+    "is_valid_bf16_mxfp8_for_config",
     "iter_candidates",
     "with_knobs",
 ]
