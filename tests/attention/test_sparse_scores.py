@@ -398,3 +398,27 @@ def test_scores_do_not_wrap_an_index_that_is_not_an_int32(field, bad):
         # The row carries no request it can resolve, so it sees nothing and is
         # left as the caller passed it.
         assert int(got_visible[0]) == 0
+
+
+@requires_cuda_sm80
+def test_scores_take_a_position_at_the_top_of_the_int32_range():
+    """INT32_MAX is inside the range the kernel accepts, so what it exercises is
+    the arithmetic after the cast rather than the cast: the visible count comes
+    from position + 1, and adding one to INT32_MAX in int32 is signed
+    overflow."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    table, t2r, pos, lens = (t.long() for t in (table, t2r, pos, lens))
+    pos = pos.clone()
+    pos[0] = 2147483647
+    lens = lens.clone()
+    lens[0] = 2147483647
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, num_columns=columns
+    )
+    want, want_visible = _reference(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, columns
+    )
+    torch.testing.assert_close(got_visible, want_visible)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)

@@ -157,8 +157,11 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   // A query sees only the compressed entries whose tokens are all behind it.
   // Clamp before the unsigned divide: a row with no request carries a length of
   // zero, and a negative position would otherwise divide as a huge number.
+  // query_position + 1 in a wider type: INT32_MAX is inside the range accepted
+  // above, and adding one to it in int32 is signed overflow.
+  const int64_t query_end = static_cast<int64_t>(query_position) + 1;
   uint32_t q_blocks, k_blocks, ignored;
-  compress_ratio.divmod(static_cast<uint32_t>(max(query_position + 1, 0)), q_blocks, ignored);
+  compress_ratio.divmod(static_cast<uint32_t>(max(query_end, int64_t(0))), q_blocks, ignored);
   compress_ratio.divmod(static_cast<uint32_t>(max(sequence_length, 0)), k_blocks, ignored);
   const uint32_t visible = min(min(q_blocks, k_blocks), num_columns);
   if (blockIdx.y == 0 && threadIdx.x == 0) {
