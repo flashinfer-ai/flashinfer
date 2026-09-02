@@ -1122,10 +1122,17 @@ def _select_cake_kda_fp32_serving_route(
     ):
         return _CakeKDAFP32ServingRoute(
             target=target,
-            policy="source_vtile_m128_persistent_six_task",
+            policy=(
+                "source_vtile_m128_persistent_six_task"
+                if total_tasks
+                == 6 * _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
+                else "source_vtile_m128_persistent_four_task"
+            ),
             grid_x=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
             uniform_sequence_length=max_sequence_length,
-            persistent_tasks=6,
+            persistent_tasks=(
+                total_tasks // _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
+            ),
             persistent_stride=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
         )
 
@@ -3823,7 +3830,7 @@ def _cake_kda_serving_policy(
             if max_sequence_length >= 256
             else "direct_m128_legacy_inverse"
         )
-    if variant == "m128_n16":
+    if variant in {"m128_n16", "m128_n16_short"}:
         return (
             "direct_m128_n16_h12_scalar"
             if num_heads == 12
@@ -4000,6 +4007,7 @@ def _run_cake_kda_fp32_serving_export(
         "m128_h12_short",
         "m128_h12_long",
         "m128_n16",
+        "m128_n16_short",
     }:
         _run_cake_kda_direct_export(
             module=module,

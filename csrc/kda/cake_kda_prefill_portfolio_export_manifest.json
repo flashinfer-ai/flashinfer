@@ -1245,6 +1245,18 @@
       "sha256": "b019247a1c9dd32bf6e8b1f44362bf50fc6c75b763a5da1db278932526bba5c0"
     },
     {
+      "bytes": 214313,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32.cu",
+      "sha256": "7a48a941dd9d8cf86d5c1e31fc377431f76f64b43a061ac1805f25e2013b6c3a"
+    },
+    {
+      "bytes": 27825,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32_binding.cu",
+      "sha256": "84e9a40620a6c492960c531fab228c17ae116e8a131ab0e0a9deca75abc92de1"
+    },
+    {
       "bytes": 214593,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_six_fp32.cu",
@@ -1261,7 +1273,7 @@
     "observed_checkout_revision": null,
     "observed_tracked_tree_clean": false,
     "producer_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "recipe_sha256": "0533aba1b4c7bb60ce4461207cf7592a4ec7414ab355d8c78dd6324be67390aa",
+    "recipe_sha256": "9fb83473574b2e83c262b7fc0b55a1c73bcfdfc5023c7a3273d38463f6c49a31",
     "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
@@ -32955,6 +32967,221 @@
         "binding": "csrc/kda/cake_kda_serving_vtile_m128_fp32_binding.cu",
         "compile_separately": true,
         "device": "csrc/kda/cake_kda_serving_vtile_m128_fp32.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 214313,
+          "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32.cu",
+          "sha256": "7a48a941dd9d8cf86d5c1e31fc377431f76f64b43a061ac1805f25e2013b6c3a"
+        },
+        {
+          "bytes": 27825,
+          "path": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32_binding.cu",
+          "sha256": "84e9a40620a6c492960c531fab228c17ae116e8a131ab0e0a9deca75abc92de1"
+        }
+      ],
+      "closure_sha256": "1d78854ca1185c45673fd1bb61217c42fe172083c198be626cac806b251e58f6",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_serving_vtile_m128_persistent_four_fp32",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_serving_vtile_m128_persistent_four_fp32_ffi",
+      "name": "cake_kda_serving_vtile_m128_persistent_four_fp32",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_fp32_serving",
+        "policy": "source_vtile_m128_persistent_four_task"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_serving_vtile_m128_persistent_four_fp32.cu"
       }
     },
     {
