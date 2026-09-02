@@ -170,6 +170,19 @@ class MegaMoEHopperFp8Config:
     # are FULLY idle until kernel_tail, reserved for future work.
     # Output-invariant work partitioning.
     active_dispatch_warps: int = 1
+    # FC1 store offload to the empty warp (S2G + fc1_done publish leave the
+    # epilogue warps).  Self-gating: active only for non-swap non-ping-pong
+    # kernels with register headroom for the store server; elsewhere it
+    # silently keeps the in-epilogue store.  Output-invariant.
+    fc1_store_offload: bool = True
+    # Early fc1_done publication (right after the tile's store drains,
+    # ahead of consume_next / boundary barrier / tracker batching).
+    # Implemented for every layout (swap-AB non-pp pays a pre-consume
+    # drain; non-swap pp's retire already publishes early), but measured
+    # net-neutral-to-negative outside the offload's domain, so default
+    # OFF; the offload supersedes it where active and auto-enables it as
+    # its register-fit fallback.  Output-invariant tuner knob.
+    fc1_early_done_publish: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -729,6 +742,8 @@ class MegaMoEHopperFp8Frontend:
             grouped_token_back=c.grouped_token_back,
             combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
+            fc1_store_offload=c.fc1_store_offload,
+            fc1_early_done_publish=c.fc1_early_done_publish,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1272,6 +1287,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
+    fc1_store_offload: bool = True,
+    fc1_early_done_publish: bool = False,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1409,6 +1426,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
+        fc1_store_offload=fc1_store_offload,
+        fc1_early_done_publish=fc1_early_done_publish,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

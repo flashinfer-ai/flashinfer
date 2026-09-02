@@ -105,6 +105,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = False,
         token_back_by_dispatch: bool = False,
+        # Accepted for Mega-ctor parity with the non-swap base; the swap-AB
+        # epilogue has no FC1 store-offload / early-publish path (non-pp
+        # swap tiles span both WGs, and ping-pong already publishes in its
+        # retire section before consume_next).
+        fc1_store_offload: bool = False,
+        fc1_early_done_publish: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
     ) -> None:
@@ -187,6 +193,20 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.token_back_by_dispatch = token_back_by_dispatch
+        # Empty-warp FC1 store offload, swap-AB flavor: the epilogue only
+        # R2S-stages FC1 output into its per-WG sC slot; the empty warp
+        # issues the TMA store, waits full completion, and
+        # release-publishes fc1_done -- KEEPING the baseline's drain/consume
+        # overlap (server drains while the epilogue sits in consume_next)
+        # while hoisting the publication to store-landed time.  Non-pp only
+        # (pp's retire already publishes before consume_next).
+        self.fc1_store_offload = fc1_store_offload and not pingpong
+        # Early fc1_done publication: per WG-half after a pre-consume drain
+        # of that WG's FC1 bulk stores.  Non-pp only; superseded by the
+        # offload where that is active.
+        self.fc1_early_done_publish = fc1_early_done_publish and not pingpong
+        if self.fc1_store_offload:
+            self.fc1_early_done_publish = False
         self.epi_flag_batch = epi_flag_batch
         self.gate_up_clamp = (
             abs(gate_up_clamp) if gate_up_clamp is not None else None
@@ -262,14 +282,19 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.tma_a_warp_id = len(self.epilogue_warp_id)
         self.tma_b_warp_id = self.tma_a_warp_id + 1
         self.sched_warp_id = self.tma_b_warp_id + 1
-        self.empty_warp_id = self.sched_warp_id + 1
+        # Auxiliary (epi_aux) warp: the single warp that pads the producer
+        # role set to a whole warpgroup (setmaxnreg is warpgroup-granular).
+        # Idle by default; when fc1_store_offload is active it runs the FC1
+        # epilogue-store S2G server (issues the TMA store, waits completion,
+        # publishes fc1_done) -- see epilogue_fp8{,_swapab}.py.
+        self.epi_aux_warp_id = self.sched_warp_id + 1
         self.threads_per_cta = 32 * len(
             (
                 *self.epilogue_warp_id,
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
+                self.epi_aux_warp_id,
             )
         )
 
@@ -298,7 +323,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.tma_a_reg_cnt = 32
         self.tma_b_reg_cnt = 32
         self.sched_reg_cnt = 40
-        self.empty_reg_cnt = 24
+        self.epi_aux_reg_cnt = (
+            224 if getattr(self, "fc1_store_offload", False) else 24
+        )
         self.dispatch_reg_cnt = 48
         self.token_back_reg_cnt = 32
         self.task_reg_cnt = 32
@@ -344,7 +371,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
         if self.enable_token_comm:
-            dispatch_warp_start = self.empty_warp_id + 1
+            dispatch_warp_start = self.epi_aux_warp_id + 1
             self.dispatch_warp_id = tuple(
                 range(dispatch_warp_start, dispatch_warp_start + 4)
             )
@@ -362,7 +389,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     self.tma_a_warp_id,
                     self.tma_b_warp_id,
                     self.sched_warp_id,
-                    self.empty_warp_id,
+                    self.epi_aux_warp_id,
                     *self.dispatch_warp_id,
                     *token_back_warp_ids,
                 )
@@ -411,6 +438,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fc2_in_kernel_topk_reduce=self.fc2_in_kernel_topk_reduce,
             apply_topk_in_fc1=self.apply_topk_in_fc1,
             token_back_by_dispatch=self.token_back_by_dispatch,
+            fc1_early_done_publish=self.fc1_early_done_publish,
+            fc1_store_offload=self.fc1_store_offload,
             epi_flag_batch=self.epi_flag_batch,
             glu_clamp=self.gate_up_clamp,
             fp8_scale_mode=self.fp8_scale_mode,
@@ -1175,6 +1204,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             )
             // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
         ) * self.cluster_shape_mn[0]
+        if cutlass.const_expr(
+            (self.fc1_early_done_publish or self.fc1_store_offload)
+            and self.epilogue_warpgroup_count == 2
+        ):
+            # Early pub publishes once per WG-half (2 per task; the knob
+            # is gated to non-pp, where each task spans both WGs).
+            ext_fc2_spin_threshold = ext_fc2_spin_threshold * 2
 
         ext = SwapABSwigluFp4Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
@@ -1244,6 +1280,15 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
                     cutlass.Int64, self.num_ab_stage * 2
+                ]
+                fc1_offload_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_empty_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_mbox: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage * 5
                 ]
                 sched_storage: SchedStorage
 
@@ -1366,6 +1411,26 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 sched_warp_id=self.sched_warp_id,
             )
 
+        if cutlass.const_expr(self.fc1_store_offload):
+            if tidx == cutlass.Int32(0):
+                for _s in cutlass.range_constexpr(self.num_c_stage):
+                    cute.arch.mbarrier_init(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr() + _s,
+                        self.epilogue_warps_per_warpgroup * 32,
+                    )
+                    cute.arch.mbarrier_init(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr() + _s,
+                        1,
+                    )
+                cute.arch.mbarrier_init_fence()
+                # Pre-arm each empty mbar once so the epilogue's first
+                # (unconditional) Linear1 wait falls through; thereafter the
+                # server arrives once per drained store, keeping phase parity.
+                for _s in cutlass.range_constexpr(self.num_c_stage):
+                    cute.arch.mbarrier_arrive(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr() + _s
+                    )
+
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # ── SMEM tensors A / B (shared by fc1 / fc2) ──
@@ -1412,8 +1477,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 cute.arch.setmaxregister_decrease(self.tma_b_reg_cnt)
             elif warp_idx == self.sched_warp_id:
                 cute.arch.setmaxregister_decrease(self.sched_reg_cnt)
-            elif warp_idx == self.empty_warp_id:
-                cute.arch.setmaxregister_decrease(self.empty_reg_cnt)
+            elif warp_idx == self.epi_aux_warp_id:
+                if cutlass.const_expr(self.fc1_store_offload):
+                    # Store server: INCREASE from launch allocation (the
+                    # cute TMA-partition machinery spills below ~150).
+                    cute.arch.setmaxregister_increase(self.epi_aux_reg_cnt)
+                else:
+                    cute.arch.setmaxregister_decrease(self.epi_aux_reg_cnt)
             else:
                 if cutlass.const_expr(self.token_back_standalone):
                     if warp_idx < self.token_back_warp_id[0]:
@@ -1442,6 +1512,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             )
             // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
         ) * self.cluster_shape_mn[0]
+        if cutlass.const_expr(
+            (self.fc1_early_done_publish or self.fc1_store_offload)
+            and self.epilogue_warpgroup_count == 2
+        ):
+            fc2_spin_threshold = fc2_spin_threshold * 2
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (after the two TMA warps)
@@ -1843,6 +1918,19 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 math_wg_order_barrier=math_wg_order_barrier,
                 epi_wg_order_barrier=epi_wg_order_barrier,
             )
+            if cutlass.const_expr(self.fc1_store_offload):
+                _run_kwargs.update(
+                    fc1_offload_full_mbar_ptr=(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_empty_mbar_ptr=(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_mbox=cute.make_tensor(
+                        storage.fc1_offload_mbox.data_ptr(),
+                        cute.make_layout(self.num_c_stage * 5),
+                    ),
+                )
 
             # MegaMoE: pass token_comm_args only when it is a real bundle (not
             # None).  Passing Python None explicitly to @cute.jit methods
@@ -1859,6 +1947,27 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 cute.arch.fence_acq_rel_sys()
 
         # ════════════════════════════════════════════════════════════════════
+        # Empty-warp FC1 store server (swap-AB offload).
+        if cutlass.const_expr(self.fc1_store_offload):
+            if warp_idx == self.epi_aux_warp_id:
+                self.epilogue.fc1_store_offload_server_swapab(
+                    sC=sC,
+                    tma_atom_fc1_output=tma_atom_fc1_output,
+                    gmem_fc1_output=tma_tensor_fc1_output,
+                    fc1_offload_full_mbar_ptr=(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_empty_mbar_ptr=(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_mbox=cute.make_tensor(
+                        storage.fc1_offload_mbox.data_ptr(),
+                        cute.make_layout(self.num_c_stage * 5),
+                    ),
+                    num_slots=self.num_c_stage,
+                    num_wgs=self.epilogue_warpgroup_count,
+                )
+
         # Dispatch warps hook (four warps after the empty warp; MegaMoE-only)
         # ════════════════════════════════════════════════════════════════════
         #

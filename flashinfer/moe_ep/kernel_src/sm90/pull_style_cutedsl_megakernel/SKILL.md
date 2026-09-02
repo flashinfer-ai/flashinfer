@@ -40,6 +40,11 @@ not picked them up):
   rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
   (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
   rank-masked reduce -- keep NVFP4-compatible when re-syncing).
+- FC1 store offload + early fc1_done publish (2026-09-01):
+  `fc1_store_offload` (default True) / `fc1_early_done_publish` knobs in
+  `moe_hopper_fp8/kernel_fp8_glu_fc12.py` + `epilogue_fp8.py` (mailbox
+  FIFO + empty-warp store server + register fit; swap-AB base only takes
+  the ctor params for parity).  The drop tree has neither.
 - `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
   (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
   barrier / pull / reuse token-back all follow it; barrier and grid-sync

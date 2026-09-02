@@ -99,6 +99,10 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # physical warp layout stays at 4.  Output-invariant work partitioning
     # (rank-local -- no cross-rank agreement needed).
     active_dispatch_warps: int = 1
+    # Empty-warp FC1 store offload (self-gating to non-swap non-ping-pong
+    # with register headroom; falls back to early fc1_done publication).
+    fc1_store_offload: bool = True
+    fc1_early_done_publish: bool = False
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

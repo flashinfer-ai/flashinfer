@@ -19,6 +19,7 @@ from cutlass.cutlass_dsl import Int64
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.ptx_helpers import red_add_relaxed_sys_v2_bf16x2
+from src.ptx_helpers import red_add_release_gpu_s32
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from common.megamoe_constants import (
     Fp8E4M3RcpLimit,
@@ -79,6 +80,8 @@ class SwapABFp8GluEpilogue:
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = False,
         token_back_by_dispatch: bool = False,
+        fc1_early_done_publish: bool = False,
+        fc1_store_offload: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
     ) -> None:
@@ -187,6 +190,15 @@ class SwapABFp8GluEpilogue:
         self._fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self._apply_topk_in_fc1 = apply_topk_in_fc1
         self._token_back_by_dispatch = token_back_by_dispatch
+        # Early fc1_done publication (non-pp only, gated kernel-side):
+        # drain this WG's FC1 bulk stores and release the tile flag right
+        # after the tile's store issues, ahead of consume_next / the
+        # boundary barrier / the tracker's batch deferral.
+        self._early_fc1_pub = fc1_early_done_publish
+        # Set by the ctor param; when True the empty warp runs the store
+        # server and the epilogue only R2S-stages + hands off (keeps the
+        # drain/consume overlap while hoisting publication).
+        self._fc1_store_offload = fc1_store_offload
         if isinstance(epi_flag_batch, tuple):
             self._epi_fc1_batch = max(1, epi_flag_batch[0])
             self._epi_fc2_batch = max(1, epi_flag_batch[1])
@@ -836,6 +848,9 @@ class SwapABFp8GluEpilogue:
         n_half: cutlass.Constexpr,
         storage_group_idx,
         _iket_active,
+        gmem_fc1_done_counter=None,
+        fc1_offload_full_mbar_ptr=None,
+        fc1_offload_mbox=None,
     ) -> None:
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
             "c", gmem_fc1_output, work_tile_info,
@@ -858,6 +873,39 @@ class SwapABFp8GluEpilogue:
         fc1_store_bar.arrive_and_wait()
         if _iket_active:
             iket.range_pop()
+
+        if cutlass.const_expr(self._fc1_store_offload):
+            # Hand off to the empty-warp server: the WG barrier above
+            # ordered every thread's R2S; lane 0 publishes the destination
+            # scalars, then all 128 threads arrive the full mbar.  The
+            # server drains while the epilogue moves into consume_next
+            # (overlap preserved).
+            _slot = cutlass.Int32(storage_group_idx)
+            _base = _slot * cutlass.Int32(5)
+            if local_warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    fc1_offload_mbox[_base + 0] = Int64(
+                        work_tile_info.cumulative_data_physical_row
+                    )
+                    fc1_offload_mbox[_base + 1] = Int64(
+                        work_tile_info.tile_n_idx
+                    )
+                    fc1_offload_mbox[_base + 2] = Int64(output_n_tile)
+                    fc1_offload_mbox[_base + 3] = Int64(
+                        work_tile_info.valid_tokens_in_cta_tile
+                    )
+                    _slot_id = (
+                        cutlass.Int32(self._cluster_n)
+                        * work_tile_info.cumulative_token_block_count
+                        + work_tile_info.tile_n_idx
+                    )
+                    fc1_offload_mbox[_base + 4] = Int64(
+                        (
+                            gmem_fc1_done_counter.iterator + _slot_id
+                        ).toint()
+                    )
+            cute.arch.mbarrier_arrive(fc1_offload_full_mbar_ptr + _slot)
+            return
 
         if local_warp_idx == cutlass.Int32(0):
             stage_idx = cutlass.Int32(storage_group_idx)
@@ -1252,6 +1300,77 @@ class SwapABFp8GluEpilogue:
         return ab_consumer_state, math_wg_order_state, epi_wg_order_state
 
     @cute.jit
+    def fc1_store_offload_server_swapab(
+        self,
+        sC: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        gmem_fc1_output: cute.Tensor,
+        fc1_offload_full_mbar_ptr,
+        fc1_offload_empty_mbar_ptr,
+        fc1_offload_mbox,
+        *,
+        num_slots: cutlass.Constexpr,
+        num_wgs: cutlass.Constexpr,
+    ) -> None:
+        """Empty-warp FC1 store server (swap-AB).
+
+        One slot per epilogue WG (depth 1).  Blocks on each slot in
+        round-robin: rebuilds the destination from the mailbox, issues the
+        TMA store, waits FULL completion, release-publishes fc1_done, and
+        frees the slot.  Exits after one valid_tokens == -1 sentinel per
+        WG.  Because the epilogue only R2S-stages and hands off (never
+        waits the store), its consume_next overlaps this drain.
+        """
+        done_wgs = cutlass.Int32(0)
+        slot = cutlass.Int32(0)
+        phases = cutlass.Int32(0)
+        while done_wgs < cutlass.Int32(num_wgs):
+            cute.arch.mbarrier_wait(
+                fc1_offload_full_mbar_ptr + slot,
+                (phases >> slot) & cutlass.Int32(1),
+            )
+            base = slot * cutlass.Int32(5)
+            valid_tokens = cutlass.Int32(fc1_offload_mbox[base + 3])
+            if valid_tokens == cutlass.Int32(-1):
+                done_wgs = done_wgs + cutlass.Int32(1)
+            else:
+                token_off = cutlass.Int32(fc1_offload_mbox[base + 0])
+                tile_n_idx = cutlass.Int32(fc1_offload_mbox[base + 1])
+                output_n_tile = cutlass.Int32(fc1_offload_mbox[base + 2])
+                flag_addr = Int64(fc1_offload_mbox[base + 4])
+                real_fc1_output = cute.domain_offset(
+                    (token_off, 0, 0), gmem_fc1_output
+                )
+                g_view = cute.local_tile(
+                    real_fc1_output,
+                    (self._token_tile_n, Fc1EpilogueStoreTileN, 1),
+                    (tile_n_idx, output_n_tile, 0),
+                )
+                tma_store_fc1_output(
+                    sC,
+                    slot,
+                    tma_atom_fc1_output,
+                    g_view,
+                    valid_tokens,
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+                cute.arch.sync_warp()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    flag_ptr = cute.make_ptr(
+                        cutlass.Int32,
+                        flag_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    red_add_release_gpu_s32(flag_ptr, cutlass.Int32(1))
+            phases = phases ^ (cutlass.Int32(1) << slot)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(fc1_offload_empty_mbar_ptr + slot)
+            cute.arch.sync_warp()
+            slot = (slot + cutlass.Int32(1)) % cutlass.Int32(num_slots)
+
+    @cute.jit
     def run(
         self,
         sched_consumer,
@@ -1289,6 +1408,9 @@ class SwapABFp8GluEpilogue:
         warpgroup_idx,
         math_wg_order_barrier,
         epi_wg_order_barrier,
+        fc1_offload_full_mbar_ptr=None,
+        fc1_offload_empty_mbar_ptr=None,
+        fc1_offload_mbox=None,
         token_comm_args=None,
     ) -> None:
         """
@@ -1347,6 +1469,8 @@ class SwapABFp8GluEpilogue:
             math_wg_order_state = ab_consumer_state.clone()
             epi_wg_order_state = ab_consumer_state.clone()
 
+        # Offload: one empty-mbar phase bit per warp (its WG's slot).
+        fc1_off_phase = cutlass.Int32(0)
         while work_tile_info.is_valid_tile:
             # Outer task-tile range, emitted by local warp 0 of each epilogue
             # warpgroup. It starts
@@ -1386,6 +1510,14 @@ class SwapABFp8GluEpilogue:
                 )
 
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                if cutlass.const_expr(self._fc1_store_offload):
+                    # Acquire this WG's store slot from the server before
+                    # the R2S reuses it (pre-armed once at init).
+                    cute.arch.mbarrier_wait(
+                        fc1_offload_empty_mbar_ptr + warpgroup_idx,
+                        fc1_off_phase & cutlass.Int32(1),
+                    )
+                    fc1_off_phase = fc1_off_phase + cutlass.Int32(1)
                 if cutlass.const_expr(self._wgmma_fragment_count == 1):
                     (
                         ab_consumer_state,
@@ -1440,6 +1572,10 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 0
                         ),
                         _iket_active=_iket_active,
+                    
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
                     )
                 elif n_half == cutlass.Int32(0):
                     (
@@ -1495,6 +1631,10 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 0
                         ),
                         _iket_active=_iket_active,
+                    
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
                     )
                 else:
                     (
@@ -1550,6 +1690,10 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 1
                         ),
                         _iket_active=_iket_active,
+                    
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
                     )
             else:
                 if cutlass.const_expr(self._wgmma_fragment_count == 1):
@@ -1669,6 +1813,24 @@ class SwapABFp8GluEpilogue:
             )
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
+            if cutlass.const_expr(self._early_fc1_pub):
+                if cur_was_linear1:
+                    # Drain this WG's FC1 bulk stores and publish the tile
+                    # flag now -- the pre-consume hoist.  The per-WG +1 is
+                    # matched by the kernel's x2 fc2 spin threshold.
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.fence_acq_rel_gpu()
+                    if local_warp_idx == cutlass.Int32(0):
+                        if cute.arch.lane_idx() == cutlass.Int32(0):
+                            _early_ptr = (
+                                gmem_fc1_done_counter.iterator
+                                + cur_fc1_counter_slot
+                            )
+                            red_add_release_gpu_s32(
+                                _early_ptr, cutlass.Int32(1)
+                            )
+
             if cutlass.const_expr(self._pingpong_order):
                 # Match CUTLASS ping-pong ordering: retire the current FC1
                 # bulk-store group and hand epilogue ownership to the peer WG
@@ -1730,8 +1892,10 @@ class SwapABFp8GluEpilogue:
                 iket.range_pop()
 
             # Drain fc1 TMA/STG stores before publishing the fc1-done counter.
+            # Offload: the empty-warp server owns the drain + publish, so the
+            # epilogue neither drains nor accumulates here.
             if cur_was_linear1 and cutlass.const_expr(
-                not self._pingpong_order
+                not self._pingpong_order and not self._fc1_store_offload
             ):
                 if _iket_active:
                     iket.range_push("swapab_fc1_store_drain")
@@ -1753,11 +1917,17 @@ class SwapABFp8GluEpilogue:
             ):
                 if _iket_active:
                     iket.range_push("swapab_fc1_done_flag_accumulate")
-                flag_tracker = flag_tracker.accumulate(
-                    work_tile_info.phase,
-                    self._epi_fc1_batch,
-                    (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
-                )
+                if cutlass.const_expr(
+                    not self._early_fc1_pub and not self._fc1_store_offload
+                ):
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        self._epi_fc1_batch,
+                        (
+                            gmem_fc1_done_counter.iterator
+                            + cur_fc1_counter_slot
+                        ).toint(),
+                    )
                 if _iket_active:
                     iket.range_pop()
             elif cutlass.const_expr(not self._pingpong_order):
@@ -1782,6 +1952,22 @@ class SwapABFp8GluEpilogue:
                 )
                 if _iket_active:
                     iket.range_pop()
+
+        if cutlass.const_expr(self._fc1_store_offload):
+            # Retire this WG's slot and send a sentinel so the server counts
+            # one finished WG (valid_tokens = -1).
+            cute.arch.mbarrier_wait(
+                fc1_offload_empty_mbar_ptr + warpgroup_idx,
+                fc1_off_phase & cutlass.Int32(1),
+            )
+            if local_warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    fc1_offload_mbox[
+                        warpgroup_idx * cutlass.Int32(5) + 3
+                    ] = Int64(-1)
+            cute.arch.mbarrier_arrive(
+                fc1_offload_full_mbar_ptr + warpgroup_idx
+            )
 
         if _iket_active:
             iket.range_push("swapab_done_flag_fire_tail")

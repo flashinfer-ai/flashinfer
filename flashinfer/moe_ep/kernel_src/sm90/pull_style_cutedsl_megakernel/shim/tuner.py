@@ -61,6 +61,11 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     # How many of the 4 dispatch warps do token-comm work (the rest idle);
     # output-invariant partitioning (rank-local, no wire-format coupling).
     "active_dispatch_warps": (1, 2, 4),
+    # FC1 store offload / early fc1_done publication: output-invariant
+    # (publication timing only; both self-gate to the configs they
+    # support and fall back to the baseline store elsewhere).
+    "fc1_store_offload": (False, True),
+    "fc1_early_done_publish": (False, True),
     "mma_tiler_mnk": _NONSWAP_TILES + _SWAPAB_TILES,
     "cluster_shape_mnk": _CLUSTER_SHAPES,
     "fp8_accum_mode": ("1xacc", "2xacc"),

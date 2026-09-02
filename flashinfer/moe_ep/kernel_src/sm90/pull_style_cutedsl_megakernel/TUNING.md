@@ -6,7 +6,7 @@ behind those numbers, the knob surface as it exists today, and the open
 perf levers.  It is the companion to `SKILL.md` (drop-update workflow) and
 mirrors the structure of the SM100 tree's `TUNING.md`.
 
-Unless noted otherwise, all measurements were taken 2026-08-30 on a single
+Unless noted otherwise, all measurements were taken 2026-09-02 on a single
 H200 node (4x NVIDIA H200 141GB, SM clock locked at 1830 MHz, EP=4) at the
 kernel drop's DSV4-Pro P03
 geometry: **384 experts, top-6, hidden 7168, intermediate 3072
@@ -20,7 +20,7 @@ sources, plus the locally added per-bucket `token_back_mode` column from
 the 2026-08-23 epi-vs-reuse sweep — see the knob list below).
 Raw rows: `benchmark_data/20260830/20260830_224758_mega_sm90_heuristic_both.csv`.
 
-## Microbenchmark results (2026-08-30, heuristic launch configs, max-rank µs)
+## Microbenchmark results (2026-09-02, heuristic launch configs, max-rank µs)
 
 Two timed series per point — the difference is WHAT each call includes:
 
@@ -48,41 +48,41 @@ All other knobs are at their config defaults — notably
 `active_dispatch_warps=1` (see "The knob surface"), which lifts the
 large-token buckets by up to ~7% over the previous 4-warp fixed layout.
 
-**per_tensor** — peak 896 TFLOPS/rank:
+**per_tensor** — peak 936 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB ping-pong M128N16 CGA2x1   |    epi     |      826.8 |    7.7 |    980.9 |        6.5 |
-|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1249.4 |   10.2 |   1440.0 |        8.8 |
-|       32 | non-swap M64N256 CGA1x1            |    epi     |     1679.6 |   15.1 |   1840.8 |       13.8 |
-|       64 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     1986.1 |   25.6 |   2169.0 |       23.4 |
-|      128 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     1823.2 |   55.7 |   1980.7 |       51.2 |
-|      256 | swap-AB M256N32 CGA2x1             |    epi     |     1929.5 |  105.2 |   2011.9 |      100.9 |
-|      512 | swap-AB M256N64 CGA1x1             |    epi     |     2082.1 |  194.9 |   2249.4 |      180.4 |
-|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2131.8 |  380.8 |   2289.9 |      354.5 |
-|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     2976.8 |  545.4 |   3117.2 |      520.8 |
-|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     4954.2 |  655.4 |   5167.6 |      628.3 |
-|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8612.2 |  754.0 |   8721.2 |      744.6 |
-|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    14491.1 |  896.3 |  15349.3 |      846.2 |
-|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    29241.8 |  888.3 |  30919.4 |      840.1 |
+|        8 | swap-AB ping-pong M128N16 CGA2x1   |    epi     |      815.4 |    7.8 |    977.2 |        6.5 |
+|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1236.6 |   10.3 |   1403.3 |        9.0 |
+|       32 | non-swap M64N256 CGA1x1            |    epi     |     1517.4 |   16.7 |   1650.5 |       15.4 |
+|       64 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     1991.7 |   25.5 |   2175.7 |       23.3 |
+|      128 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     1847.0 |   54.9 |   2044.3 |       49.6 |
+|      256 | swap-AB M256N32 CGA2x1             |    epi     |     1666.7 |  121.8 |   1876.5 |      108.1 |
+|      512 | swap-AB M256N64 CGA1x1             |    epi     |     1818.0 |  223.2 |   2088.6 |      194.3 |
+|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2084.9 |  389.4 |   2258.6 |      359.4 |
+|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     2999.4 |  541.3 |   3149.2 |      515.5 |
+|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     4959.9 |  654.6 |   5172.8 |      627.7 |
+|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8132.9 |  798.5 |   8481.6 |      765.7 |
+|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    13875.1 |  936.1 |  14642.5 |      887.0 |
+|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    28056.1 |  925.9 |  29793.7 |      871.9 |
 
-**blockwise** — peak 589 TFLOPS/rank:
+**blockwise** — peak 594 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |      837.9 |    7.6 |   1078.7 |        5.9 |
-|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1240.4 |   10.2 |   1523.0 |        8.3 |
-|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1683.5 |   15.1 |   1922.8 |       13.2 |
-|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1807.0 |   28.1 |   2085.4 |       24.3 |
-|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1783.1 |   56.9 |   2109.8 |       48.1 |
-|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2113.4 |   96.0 |   2376.8 |       85.4 |
-|      512 | non-swap M64N128 CGA1x1            |    epi     |     2448.5 |  165.8 |   2654.5 |      152.9 |
-|     1024 | non-swap M64N128 CGA2x2            |   reuse    |     3033.7 |  267.6 |   3206.0 |      253.2 |
-|     2048 | non-swap M64N128 CGA2x2            |   reuse    |     4229.2 |  383.9 |   4404.9 |      368.6 |
-|     4096 | non-swap M64N128 CGA1x1            |   reuse    |     6910.6 |  469.9 |   7210.6 |      450.3 |
-|     8192 | non-swap M64N128 CGA2x1            |   reuse    |    11497.5 |  564.8 |  11993.1 |      541.5 |
-|    16384 | non-swap M64N128 CGA1x2            |   reuse    |    22066.7 |  588.6 |  23404.0 |      555.0 |
-|    32768 | non-swap M64N128 CGA2x1            |   reuse    |    44415.3 |  584.8 |  47416.1 |      547.8 |
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |      779.8 |    8.1 |   1118.5 |        5.7 |
+|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1133.5 |   11.2 |   1443.6 |        8.8 |
+|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1664.0 |   15.2 |   1939.6 |       13.1 |
+|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1622.9 |   31.3 |   1869.1 |       27.1 |
+|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1612.2 |   62.9 |   1899.4 |       53.4 |
+|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2113.1 |   96.0 |   2383.8 |       85.1 |
+|      512 | non-swap M64N128 CGA1x1            |    epi     |     1991.5 |  203.8 |   2220.0 |      182.8 |
+|     1024 | non-swap M64N128 CGA2x2            |   reuse    |     2848.9 |  284.9 |   3004.7 |      270.2 |
+|     2048 | non-swap M64N128 CGA2x2            |   reuse    |     4021.6 |  403.7 |   4179.9 |      388.4 |
+|     4096 | non-swap M64N128 CGA1x1            |   reuse    |     6355.0 |  510.9 |   6696.1 |      484.9 |
+|     8192 | non-swap M64N128 CGA2x1            |   reuse    |    11224.2 |  578.6 |  11839.0 |      548.5 |
+|    16384 | non-swap M64N128 CGA1x2            |   reuse    |    21862.5 |  594.1 |  23205.8 |      559.7 |
+|    32768 | non-swap M64N128 CGA2x1            |   reuse    |    44183.0 |  587.9 |  47029.5 |      552.3 |
 
 ### e2e overhead (the production path)
 
@@ -143,6 +143,43 @@ derived programmatically) crossed with both validated token-back modes —
   The physical layout stays at 4 (setmaxnreg is warpgroup-granular); warps
   beyond the count skip the whole dispatch body and only rejoin at
   kernel_tail — fully idle, reserved for future in-kernel work.
+- `fc1_store_offload` (default True) — the empty warp runs an FC1 store
+  server: the epilogue only R2S-stages FC1 output and hands
+  (slot, dest, done-flag) over a per-WG smem mailbox FIFO; the server
+  issues the TMA store, waits full completion, and release-publishes
+  fc1_done immediately — hoisting the publication ahead of the epilogue's
+  consume_next stall and boundary barrier (that hoist, not the store work
+  itself, is the win: at small tiles the sched-descriptor wait otherwise
+  defers every fc1_done by ~a tile).  Self-gating to non-ping-pong
+  kernels (ping-pong's retire section already publishes before
+  consume_next, and coop+offload measured 8-30% behind ping-pong);
+  covers BOTH non-swap and swap-AB non-pp.  For swap-AB the offload is
+  strictly better than in-epilogue early publication because it keeps the
+  baseline's store/consume_next overlap (the server drains while the
+  epilogue sits in consume) AND hoists the publish — early publication has
+  to move the drain before consume and loses that overlap, netting ~0.
+  A dynamic register fit sizes the store server to the CTA's remaining
+  64K budget (reclaims the 2-WG epilogue's 216→200 headroom; 224 regs at
+  1 WG, 152 at 2 WG) and falls back to `fc1_early_done_publish` when even
+  a lean 88-reg server does not fit.  The 2-WG (N256 / swap M256) path
+  runs a dual-FIFO server (one slot per epilogue WG) with the fc2 spin
+  threshold scaled x2 (each WG-half publishes +1).  Measured (4x H200,
+  1830 MHz, per-bucket vs no-offload): non-swap bw512 +21~23%,
+  bw1024-4096 +6~8%; swap-AB pt256 +15%, pt512 +13%, bw128 +10% (the
+  heuristic's swap non-pp buckets).  Correctness: multirank swap_ab and
+  torch-oracle tests pass bit-exact with the offload active.
+- `fc1_early_done_publish` (default False) — lighter variant: the epilogue
+  itself publishes fc1_done right after its store drains, before
+  consume_next.  Implemented for every layout (non-swap 1/2-WG, non-swap
+  pp, swap-AB non-pp with a pre-consume drain; the fc2 spin threshold
+  scales x2 for 2-WG non-pp tasks).  Recovers most of the offload's
+  mid-token win on N128 (bw512 +21%) but measured net-neutral-to-negative
+  everywhere else: big tiles pay the fence+red on the epi stream
+  (bw8192-16384 −1~2%), swap-AB non-pp loses the store/consume_next
+  overlap its baseline drain placement had, and non-swap pp's retire
+  section already publishes early.  Superseded by the offload wherever
+  that is active and auto-enabled as its register-fit fallback; kept as a
+  tuner axis.
   Output-invariant: sustained pull bandwidth ~= warps x SMs x hidden_bytes
   / read-RTT, and on H200 two warps per SM is ~2x the bandwidth-delay
   product — enough headroom while keeping the NVLink read queue shallow

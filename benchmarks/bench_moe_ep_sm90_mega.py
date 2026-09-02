@@ -243,6 +243,38 @@ def _parse_args() -> argparse.Namespace:
         "bytes and require --grouped-token-back",
     )
     p.add_argument(
+        "--fc1-store-offload",
+        dest="fc1_store_offload",
+        action="store_true",
+        default=True,
+        help="empty-warp FC1 store offload (default on; self-gating)",
+    )
+    p.add_argument(
+        "--no-fc1-store-offload",
+        dest="fc1_store_offload",
+        action="store_false",
+    )
+    p.add_argument(
+        "--fc1-early-pub",
+        dest="fc1_early_done_publish",
+        action="store_true",
+        default=False,
+        help="early fc1_done publication (measured neutral-to-negative "
+        "outside the offload's domain; kept as a tuner axis)",
+    )
+    p.add_argument(
+        "--no-fc1-early-pub",
+        dest="fc1_early_done_publish",
+        action="store_false",
+    )
+    p.add_argument(
+        "--pingpong",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="force task-tile ping-pong scheduling on/off instead of the "
+        "heuristic table's per-bucket choice (auto)",
+    )
+    p.add_argument(
         "--active-dispatch-warps",
         type=int,
         choices=[1, 2, 4],
@@ -405,14 +437,37 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
     return transformed
 
 
-def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
+def _pingpong_tile_ok(c) -> bool:
+    m, n, _ = c.mma_tiler_mnk
+    return (n == 128) if not c.swap_ab else (m == 128)
+
+
+def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=None):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
+    pingpong = None if args.pingpong == "auto" else args.pingpong == "on"
     if operand_order == "heuristic":
         # All geometry knobs None -> the shim resolves the drop's token-bucket
         # heuristic per point (keyed on scale mode and max tokens per rank).
         swap_ab = None
         mma_tiler_mnk = None
+        if pingpong is not None and tokens is not None:
+            # A pingpong override alone would flip the shim into its
+            # manual-geometry branch (default tiles).  Resolve the bucket's
+            # heuristic config here and pass the full geometry with only
+            # pingpong flipped, so the comparison keeps the bucket's tile.
+            from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                bootstrap_paths,
+            )
+
+            bootstrap_paths()
+            from moe_hopper_fp8.heuristic_config import select_heuristic_config
+
+            c = select_heuristic_config(scale_mode, tokens).config
+            swap_ab = c.swap_ab
+            mma_tiler_mnk = tuple(c.mma_tiler_mnk)
+            if pingpong and not c.pingpong and not _pingpong_tile_ok(c):
+                pingpong = c.pingpong  # bucket tile can't run ping-pong
     else:
         swap_ab = operand_order == "swap_ab"
         mma_tiler_mnk = (tile[0], tile[1], 128)
@@ -432,10 +487,13 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
             if args.grouped_token_back
             else (None if args.token_back == "heuristic" else args.token_back)
         ),
+        pingpong=pingpong,
         dedup_dispatch=args.dedup_dispatch,
         grouped_token_back=args.grouped_token_back,
         combine_format=args.combine_format,
         active_dispatch_warps=args.active_dispatch_warps,
+        fc1_store_offload=args.fc1_store_offload,
+        fc1_early_done_publish=args.fc1_early_done_publish,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -530,7 +588,7 @@ def _run_point(
     result: PointResult | None = None
     error = ""
     try:
-        kcfg = _megakernel_config(args, scale_mode, operand_order, tile)
+        kcfg = _megakernel_config(args, scale_mode, operand_order, tile, tokens=tokens)
         transformed = _make_transformed_weights(
             args, scale_mode, local_experts, rank, device
         )

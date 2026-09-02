@@ -4,6 +4,7 @@
 
 from typing import Literal, Optional, Tuple, Type, Union
 
+import os
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -132,6 +133,8 @@ class Sm90SwigluFp8Fc12Kernel:
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = False,
         token_back_by_dispatch: bool = False,
+        fc1_store_offload: bool = False,
+        fc1_early_done_publish: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
     ) -> None:
@@ -217,6 +220,22 @@ class Sm90SwigluFp8Fc12Kernel:
         self.token_back_by_dispatch = token_back_by_dispatch
         self.fc1_store_pipeline_stages = 1
         self.fc2_store_pipeline_stages = 2
+        # Empty-warp FC1 store offload (see epilogue_fp8): the epilogue
+        # only R2S-stages FC1 output; the empty warp issues the TMA store,
+        # waits completion, and release-publishes fc1_done -- hoisting the
+        # publication ahead of the epilogue's consume_next / boundary path.
+        # Ping-pong keeps the in-epilogue store (its retire section already
+        # publishes before consume_next, and measured coop+offload loses
+        # to ping-pong by 8-30%); capability gate, not an error, so a
+        # heuristic sweep can mix both.
+        self.fc1_store_offload = fc1_store_offload and not self.pingpong
+        # Early fc1_done publication: publish right after the tile's
+        # synchronous store lands, ahead of consume_next and the
+        # task-boundary barrier.  Same completion contract as baseline,
+        # just earlier in program order.  Superseded by the offload where
+        # that is active; also the automatic fallback when the offload's
+        # register fit fails (fit_fc1_offload_registers).
+        self.fc1_early_done_publish = fc1_early_done_publish
         self.epi_flag_batch = epi_flag_batch
         self.gate_up_clamp = (
             abs(gate_up_clamp) if gate_up_clamp is not None else None
@@ -279,6 +298,14 @@ class Sm90SwigluFp8Fc12Kernel:
         self.epilogue_warpgroup_count = (
             2 if self.pingpong else self.wgmma_n_splits
         )
+        # Early pub covers every layout: pp tiles belong to one WG (its
+        # warp0 publishes), 1-WG non-pp has a single publisher, and 2-WG
+        # non-pp publishes once per WG-half with the fc2 spin threshold
+        # scaled x2 (sum reaches 2x the task count exactly when every
+        # half's store landed -- same contract as the offload's 2-WG
+        # mailbox).  The offload supersedes it wherever active.
+        if self.fc1_store_offload:
+            self.fc1_early_done_publish = False
         self.epilogue_warp_id = tuple(
             range(
                 self.epilogue_warps_per_warpgroup
@@ -291,14 +318,19 @@ class Sm90SwigluFp8Fc12Kernel:
         self.tma_a_warp_id = len(self.epilogue_warp_id)
         self.tma_b_warp_id = self.tma_a_warp_id + 1
         self.sched_warp_id = self.tma_b_warp_id + 1
-        self.empty_warp_id = self.sched_warp_id + 1
+        # Auxiliary (epi_aux) warp: the single warp that pads the producer
+        # role set to a whole warpgroup (setmaxnreg is warpgroup-granular).
+        # Idle by default; when fc1_store_offload is active it runs the FC1
+        # epilogue-store S2G server (issues the TMA store, waits completion,
+        # publishes fc1_done) -- see epilogue_fp8{,_swapab}.py.
+        self.epi_aux_warp_id = self.sched_warp_id + 1
         self.threads_per_cta = 32 * len(
             (
                 *self.epilogue_warp_id,
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
+                self.epi_aux_warp_id,
             )
         )
 
@@ -327,7 +359,12 @@ class Sm90SwigluFp8Fc12Kernel:
         self.tma_a_reg_cnt = 32
         self.tma_b_reg_cnt = 32
         self.sched_reg_cnt = 40
-        self.empty_reg_cnt = 24
+        # Register file for the auxiliary (epi_aux) warp -- the warpgroup
+        # padding slot after TMA-A/TMA-B/scheduler.  Idle (24) unless it
+        # runs the epilogue-store S2G offload server, which needs a fat
+        # file for the TMA-partition machinery (sized by
+        # fit_fc1_offload_registers).
+        self.epi_aux_reg_cnt = 224 if self.fc1_store_offload else 24
         self.dispatch_reg_cnt = 48
         self.token_back_reg_cnt = 32
         self.task_reg_cnt = 32
@@ -401,7 +438,7 @@ class Sm90SwigluFp8Fc12Kernel:
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
         if self.enable_token_comm:
-            dispatch_warp_start = self.empty_warp_id + 1
+            dispatch_warp_start = self.epi_aux_warp_id + 1
             self.dispatch_warp_id = tuple(
                 range(dispatch_warp_start, dispatch_warp_start + 4)
             )
@@ -419,7 +456,7 @@ class Sm90SwigluFp8Fc12Kernel:
                     self.tma_a_warp_id,
                     self.tma_b_warp_id,
                     self.sched_warp_id,
-                    self.empty_warp_id,
+                    self.epi_aux_warp_id,
                     *self.dispatch_warp_id,
                     *token_back_warp_ids,
                 )
@@ -483,6 +520,8 @@ class Sm90SwigluFp8Fc12Kernel:
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
             pingpong=self.pingpong,
         )
+        _epi_common["fc1_store_offload"] = self.fc1_store_offload
+        _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
         self.epilogue = Fp8GluEpilogue(**_epi_common)
 
         if self.num_sched_stages is None:
@@ -628,11 +667,42 @@ class Sm90SwigluFp8Fc12Kernel:
             + self.tma_a_reg_cnt
             + self.tma_b_reg_cnt
             + self.sched_reg_cnt
-            + self.empty_reg_cnt
+            + self.epi_aux_reg_cnt
             + dispatch_warps * self.dispatch_reg_cnt
             + token_back_warps * self.token_back_reg_cnt
         )
         return 32 * regs_per_warp
+
+    def fit_fc1_offload_registers(self) -> None:
+        """Size the store server's register file to the CTA's remaining budget.
+
+        Keeps up to 224 regs; under a 2-WG epilogue first reclaims the
+        216->200 epi headroom (the TMA-store partition path those regs
+        served is compiled out when the store is offloaded).  Disables the
+        offload when even a lean server (88 regs) does not fit.  Must run
+        after every warp-role register field is final and before
+        ``validate_register_policy``.
+        """
+        if not getattr(self, "fc1_store_offload", False):
+            # Swap-AB kernels share the Mega init path but have no FC1
+            # store offload (and no offload fields) -- nothing to fit.
+            return
+        if self.epilogue_warpgroup_count == 2 and self.epi_reg_cnt == 216:
+            self.epi_reg_cnt = 200
+        base_regs = (
+            self.estimated_register_budget() // 32 - self.epi_aux_reg_cnt
+        )
+        slack = self._sm90_cta_register_budget // 32 - base_regs
+        fit = min(224, (slack // 8) * 8)
+        if fit >= 88:
+            self.epi_aux_reg_cnt = fit
+        else:
+            # No room for the store server: fall back to early fc1_done
+            # publication, which recovers most of the mid-token win
+            # without a dedicated warp (see TUNING.md).
+            self.fc1_store_offload = False
+            self.fc1_early_done_publish = True
+            self.epi_aux_reg_cnt = 24
 
     def validate_register_policy(self) -> None:
         """Validate setmaxnreg immediates and CTA-level register budget."""
@@ -641,7 +711,7 @@ class Sm90SwigluFp8Fc12Kernel:
             ("tma_a_reg_cnt", self.tma_a_reg_cnt),
             ("tma_b_reg_cnt", self.tma_b_reg_cnt),
             ("sched_reg_cnt", self.sched_reg_cnt),
-            ("empty_reg_cnt", self.empty_reg_cnt),
+            ("epi_aux_reg_cnt", self.epi_aux_reg_cnt),
             ("dispatch_reg_cnt", self.dispatch_reg_cnt),
             ("token_back_reg_cnt", self.token_back_reg_cnt),
             ("task_reg_cnt", self.task_reg_cnt),
@@ -2444,6 +2514,18 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             // (self.cta_tile_shape_mnk[1] * self.cluster_shape_mn[1])
         ) * self.cluster_shape_mn[1]
+        if cutlass.const_expr(
+            (self.fc1_store_offload or self.fc1_early_done_publish)
+            and self.epilogue_warpgroup_count == 2
+            # pp also has 2 epi WGs but each task belongs to ONE WG
+            # (1 publication per task) -- never scale under pp.
+            and not self.pingpong
+        ):
+            # Offload with 2 epi WGs: each fc1 task hands the server one
+            # message per WG-half, each publishing +1 (no cross-WG
+            # rendezvous on the store path).  2x the task count is reached
+            # exactly when every half's store has landed.
+            ext_fc2_spin_threshold = ext_fc2_spin_threshold * 2
 
         ext = GluMxFp8Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
@@ -2504,6 +2586,15 @@ class Sm90SwigluFp8Fc12Kernel:
                 ]
                 math_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
                 epi_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+                fc1_offload_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_empty_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_mbox: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage * 5
+                ]
                 sched_storage: SchedStorage
         else:
             @cute.struct
@@ -2513,6 +2604,15 @@ class Sm90SwigluFp8Fc12Kernel:
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
                     cutlass.Int64, self.num_ab_stage * 2
+                ]
+                fc1_offload_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_empty_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage
+                ]
+                fc1_offload_mbox: cute.struct.MemRange[
+                    cutlass.Int64, self.num_c_stage * 5
                 ]
                 sched_storage: SchedStorage
 
@@ -2635,6 +2735,24 @@ class Sm90SwigluFp8Fc12Kernel:
                 sched_warp_id=self.sched_warp_id,
             )
 
+        if cutlass.const_expr(self.fc1_store_offload):
+            # One thread initializes the offload mbarrier pairs.  No empty
+            # pre-arm: producers wait an empty mbar only when the slot has
+            # an outstanding handoff, so the first server free (phase 0)
+            # pairs with the producer's first conditional wait (bit 0).
+            # pipeline_init_wait below publishes the inits.
+            if tidx == cutlass.Int32(0):
+                for _s in cutlass.range_constexpr(self.num_c_stage):
+                    cute.arch.mbarrier_init(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr() + _s,
+                        self.epilogue_warps_per_warpgroup * 32,
+                    )
+                    cute.arch.mbarrier_init(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr() + _s,
+                        1,
+                    )
+                cute.arch.mbarrier_init_fence()
+
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # ── SMEM tensors A / B (shared by fc1 / fc2) ──
@@ -2681,8 +2799,15 @@ class Sm90SwigluFp8Fc12Kernel:
                 cute.arch.setmaxregister_decrease(self.tma_b_reg_cnt)
             elif warp_idx == self.sched_warp_id:
                 cute.arch.setmaxregister_decrease(self.sched_reg_cnt)
-            elif warp_idx == self.empty_warp_id:
-                cute.arch.setmaxregister_decrease(self.empty_reg_cnt)
+            elif warp_idx == self.epi_aux_warp_id:
+                if cutlass.const_expr(self.fc1_store_offload):
+                    # The store server needs a fat register file (the cute
+                    # TMA-partition machinery spills badly below ~200): this
+                    # is an INCREASE from the launch allocation, not the
+                    # idle warp's usual decrease.
+                    cute.arch.setmaxregister_increase(self.epi_aux_reg_cnt)
+                else:
+                    cute.arch.setmaxregister_decrease(self.epi_aux_reg_cnt)
             else:
                 if cutlass.const_expr(self.token_back_standalone):
                     if warp_idx < self.token_back_warp_id[0]:
@@ -2712,6 +2837,14 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             // (self.cta_tile_shape_mnk[1] * self.cluster_shape_mn[1])
         ) * self.cluster_shape_mn[1]
+        if cutlass.const_expr(
+            (self.fc1_store_offload or self.fc1_early_done_publish)
+            and self.epilogue_warpgroup_count == 2
+            # pp also has 2 epi WGs but each task belongs to ONE WG
+            # (1 publication per task) -- never scale under pp.
+            and not self.pingpong
+        ):
+            fc2_spin_threshold = fc2_spin_threshold * 2
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp — dynamically follows the epilogue warpgroups.
@@ -3149,6 +3282,19 @@ class Sm90SwigluFp8Fc12Kernel:
                 math_wg_order_barrier=math_wg_order_barrier,
                 epi_wg_order_barrier=epi_wg_order_barrier,
             )
+            if cutlass.const_expr(self.fc1_store_offload):
+                _run_kwargs.update(
+                    fc1_offload_full_mbar_ptr=(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_empty_mbar_ptr=(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_mbox=cute.make_tensor(
+                        storage.fc1_offload_mbox.data_ptr(),
+                        cute.make_layout(self.num_c_stage * 5),
+                    ),
+                )
 
             # MegaMoE: pass token_comm_args only when it is a real bundle (not
             # None).  Passing Python None explicitly to @cute.jit methods
@@ -3163,6 +3309,29 @@ class Sm90SwigluFp8Fc12Kernel:
 
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.fence_acq_rel_sys()
+
+        # ════════════════════════════════════════════════════════════════════
+        # Empty-warp FC1 store server (offload experiment).
+        # ════════════════════════════════════════════════════════════════════
+        if cutlass.const_expr(self.fc1_store_offload):
+            if warp_idx == self.epi_aux_warp_id:
+                self.epilogue.fc1_store_offload_server(
+                    sC=sC,
+                    tma_atom_fc1_output=tma_atom_fc1_output,
+                    gmem_fc1_output=tma_tensor_fc1_output,
+                    fc1_offload_full_mbar_ptr=(
+                        storage.fc1_offload_full_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_empty_mbar_ptr=(
+                        storage.fc1_offload_empty_mbar_ptr.data_ptr()
+                    ),
+                    fc1_offload_mbox=cute.make_tensor(
+                        storage.fc1_offload_mbox.data_ptr(),
+                        cute.make_layout(self.num_c_stage * 5),
+                    ),
+                    num_slots=self.num_c_stage,
+                    num_wgs=self.epilogue_warpgroup_count,
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # Dispatch warps hook (dynamically follows the empty warp; Mega-only).

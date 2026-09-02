@@ -142,6 +142,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         grouped_token_back: bool = False,
         combine_format: str = "bf16",
         active_dispatch_warps: int = 1,
+        fc1_store_offload: bool = True,
+        fc1_early_done_publish: bool = False,
     ) -> None:
         if static_expert_shape is None:
             raise NotImplementedError(
@@ -189,12 +191,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
             apply_topk_in_fc1=apply_topk_in_fc1,
             token_back_by_dispatch=token_back_by_dispatch,
+            fc1_store_offload=fc1_store_offload,
+            fc1_early_done_publish=fc1_early_done_publish,
             epi_flag_batch=epi_flag_batch,
             gate_up_clamp=gate_up_clamp,
         )
 
         self.enable_token_comm = True
-        dispatch_warp_start = self.empty_warp_id + 1
+        dispatch_warp_start = self.epi_aux_warp_id + 1
         self.dispatch_warp_id = tuple(
             range(dispatch_warp_start, dispatch_warp_start + 4)
         )
@@ -227,11 +231,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
+                self.epi_aux_warp_id,
                 *self.dispatch_warp_id,
                 *token_back_warp_ids,
             )
         )
+        self.fit_fc1_offload_registers()
         self.validate_register_policy()
 
         # Independent MegaMoE-specific constants.
@@ -331,7 +336,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
+                self.epi_aux_warp_id,
             )
         )
 
