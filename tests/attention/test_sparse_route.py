@@ -463,9 +463,14 @@ def test_qsa_route_from_logical_refuses_a_slot_space_its_route_cannot_hold():
     table = torch.zeros(1, 1, dtype=torch.int32, device=DEV)
     route = torch.empty(1, width, dtype=torch.int32, device=DEV)
     mask = torch.empty(1, dtype=torch.uint8, device=DEV)
+    # A count of 2^31 is slots 0 .. INT32_MAX, which the route holds; one more
+    # is not.
+    flashinfer.qsa_route_from_logical(
+        logical, token_to_req, table, route, mask, 1, 65536, 2147483648
+    )
     with pytest.raises(Exception, match="fit the route dtype"):
         flashinfer.qsa_route_from_logical(
-            logical, token_to_req, table, route, mask, 1, 65536, 2147483648
+            logical, token_to_req, table, route, mask, 1, 65536, 2147483649
         )
 
 
@@ -541,7 +546,10 @@ def test_qsa_route_rejects_a_host_scalar_that_is_not_a_uint32(scalar):
     table = torch.zeros(1, 1, dtype=torch.int32, device=DEV)
     args = dict(compress_ratio=1, page_size=16, num_slots=256)
     args[scalar] = 4294967296
-    width = 4 * args["compress_ratio"] + args["compress_ratio"] - 1
+    # Sized for the ratio the binding will accept, not the one under test: a
+    # width derived from 2^32 is 21 billion columns and the allocation is what
+    # would fail rather than the check.
+    width = 4 * 1 + 1 - 1
     logical = torch.empty(1, width, dtype=torch.int32, device=DEV)
     route = torch.empty(1, width, dtype=torch.int32, device=DEV)
     mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
@@ -559,3 +567,64 @@ def test_qsa_route_rejects_a_host_scalar_that_is_not_a_uint32(scalar):
             args["page_size"],
             args["num_slots"],
         )
+
+
+@pytest.mark.parametrize("bad", _PAST_INT32)
+@pytest.mark.parametrize("field", ["token_to_req", "blocks", "page_table"])
+def test_qsa_route_from_blocks_does_not_wrap_an_index_that_is_not_an_int32(field, bad):
+    """The fused kernel expands and resolves in one pass, with its own copy of
+    every guard, so the same values are injected here and not only into the
+    standalone slot kernel.
+
+    Removing those copies does not fail this: in the fused path the request is
+    compared against its count, the block against the past-block bound and the
+    page against num_slots, all in IdType, so a value an int32 could not hold is
+    rejected before the cast either way. The explicit bounds are belt and
+    braces and this is coverage of the path, not a pin on them. What the
+    boundary test above pins is the one value nothing else bounds -- the query
+    position, and the plus one taken from it.
+    """
+    ratio, page_size, num_slots = 4, 16, 4096
+    blocks = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64, device=DEV)
+    positions = torch.tensor([31], dtype=torch.int64, device=DEV)
+    lengths = torch.tensor([512], dtype=torch.int64, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+    table = torch.zeros(1, 32, dtype=torch.int64, device=DEV)
+    if field == "token_to_req":
+        token_to_req[0] = bad
+    elif field == "blocks":
+        blocks[0, 0] = bad
+    else:
+        table[0, 0] = bad
+
+    width = 4 * ratio + ratio - 1
+    logical = torch.empty(1, width, dtype=torch.int64, device=DEV)
+    route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+    mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+    flashinfer.qsa_route_from_blocks(
+        blocks,
+        positions,
+        lengths,
+        token_to_req,
+        table,
+        logical,
+        route,
+        mask,
+        ratio,
+        page_size,
+        num_slots,
+    )
+    torch.cuda.synchronize()
+    routed = [t for t in logical[0].tolist() if t >= 0]
+    assert len(routed) == len(set(routed)), routed
+    live = [
+        c
+        for c in range(width)
+        if (int(mask[-(-width // 8) * 0 + c // 8]) >> (c % 8)) & 1
+    ]
+    if field == "token_to_req":
+        assert live == [], f"a wrapped request routed: {route[0].tolist()}"
+    else:
+        # Only the rank or the page that carried it goes; the rest still route.
+        assert all(t <= 31 for t in routed), routed
+        assert 0 not in live, f"a wrapped index routed: {route[0].tolist()}"
