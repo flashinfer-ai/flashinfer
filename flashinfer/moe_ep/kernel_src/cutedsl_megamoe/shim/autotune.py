@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from .tuner import (
+    CORRECTNESS_KNOBS,
     default_knobs,
+    describe_invalid_knobs,
     is_valid,
     is_valid_bf16,
     is_valid_bf16_for_config,
@@ -145,9 +147,10 @@ def bf16_mxfp8_candidates(
     Twelve candidates: three legal implementation tuples (N128/tmem,
     N256/smem, N256/tmem-overlap) × ``flag_batch`` {1, 4} ×
     ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}.
-    ``standalone_warps`` is unsupported.  Pass the session's
-    ``in_kernel_fc2_reduce`` so invalid combos are pruned (the mixed kernel
-    keeps ikr config-owned like MXFP8).
+    ``standalone_warps`` is unsupported.  ikr stays config-owned (the symm
+    buffer's combine plane is shaped for it), so pass the session's value to
+    stamp it on every candidate; unlike pure MXFP8 the mixed kernel runs ikr
+    with either token-back mode, so it prunes nothing.
     """
     out: List[Dict[str, Any]] = []
     impl_specs = (
@@ -180,8 +183,6 @@ def bf16_mxfp8_candidates(
     for impl in impl_specs:
         for flag_batch in (1, 4):
             for token_back in ("epi_warps", "reuse_dispatch_warps"):
-                if in_kernel_fc2_reduce and token_back != "epi_warps":
-                    continue
                 knobs = dict(
                     base,
                     **impl,
@@ -192,6 +193,78 @@ def bf16_mxfp8_candidates(
                 if is_valid_bf16_mxfp8(knobs):
                     out.append(knobs)
     return out
+
+
+def _session_candidates(
+    candidates: List[Dict[str, Any]],
+    config: Any,
+    predicate: Callable[[Any, Dict[str, Any]], bool],
+    *,
+    what: str,
+) -> List[Dict[str, Any]]:
+    """Drop candidates a session cannot run (e.g. they would flip its ikr).
+
+    Every drop is reported with the offending knob, so a caller never loses a
+    pinned value silently.  The filter is a pure function of the config and the
+    candidate list, both identical on every rank, so the surviving order stays
+    in collective lockstep (see :func:`autotune_knobs`).
+    """
+    kept: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    for knobs in candidates:
+        if predicate(config, knobs):
+            kept.append(knobs)
+        else:
+            dropped.append(
+                f"    {knobs}\n      -> {describe_invalid_knobs(config, knobs, predicate)}"
+            )
+    if not kept:
+        detail = ("; all were rejected:\n" + "\n".join(dropped)) if dropped else ""
+        raise ValueError(
+            f"no valid {what} autotune candidates for this session{detail}"
+        )
+    if dropped:
+        warnings.warn(
+            f"[cutedsl-autotune] {what}: dropped {len(dropped)}/{len(candidates)} "
+            f"candidate(s) this session cannot run:\n" + "\n".join(dropped),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return kept
+
+
+def _session_correctness_knobs(config: Any) -> Dict[str, Any]:
+    """Snapshot the output-affecting knobs a config currently carries."""
+    # ``token_back_by_dispatch`` is the MXFP8 config's spelling of token-back.
+    return {
+        name: getattr(config, name)
+        for name in (*CORRECTNESS_KNOBS, "token_back_by_dispatch")
+        if hasattr(config, name)
+    }
+
+
+def _warn_on_overridden_session_knobs(
+    config: Any, before: Dict[str, Any], *, label: str
+) -> None:
+    """Warn when the winner replaced an output-affecting session setting.
+
+    The sweep owns the correctness knobs it enumerates, so a winner may
+    legitimately replace what the caller configured; say so rather than let an
+    explicitly requested value disappear into the tuned config.
+    """
+    overridden = [
+        f"{name}: {was!r} -> {getattr(config, name)!r}"
+        for name, was in before.items()
+        if getattr(config, name) != was
+    ]
+    if overridden:
+        warnings.warn(
+            f"[cutedsl-autotune] {label}: the measured winner replaced "
+            f"session-configured output-affecting knobs ({', '.join(overridden)}); "
+            f"pin an explicit knobs dict instead of 'auto' to keep them.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def autotune_knobs(
@@ -219,6 +292,8 @@ def autotune_knobs(
     """
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
+
+    session_knobs = _session_correctness_knobs(frontend.config)
 
     from .comm import ensure_not_capturing
 
@@ -271,6 +346,7 @@ def autotune_knobs(
         )
     winner = candidates[best]
     frontend.apply_knobs(winner)
+    _warn_on_overridden_session_knobs(frontend.config, session_knobs, label=label)
     if on_winner is not None:
         on_winner(winner, float(t[best]))
     if rank == 0:
@@ -466,9 +542,9 @@ def autotune_bf16_mega_moe(
             in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
             token_back_mode=cfg.token_back_mode,
         )
-    candidates = [knobs for knobs in candidates if is_valid_bf16_for_config(cfg, knobs)]
-    if not candidates:
-        raise ValueError("no valid BF16 MegaMoE autotune candidates for this session.")
+    candidates = _session_candidates(
+        candidates, cfg, is_valid_bf16_for_config, what="BF16 MegaMoE"
+    )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -511,13 +587,12 @@ def autotune_bf16_mxfp8_mega_moe(
         candidates = bf16_mxfp8_candidates(
             in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
         )
-    candidates = [
-        knobs for knobs in candidates if is_valid_bf16_mxfp8_for_config(cfg, knobs)
-    ]
-    if not candidates:
-        raise ValueError(
-            "no valid mixed BF16/MXFP8 MegaMoE autotune candidates for this session."
-        )
+    candidates = _session_candidates(
+        candidates,
+        cfg,
+        is_valid_bf16_mxfp8_for_config,
+        what="mixed BF16/MXFP8 MegaMoE",
+    )
 
     return autotune_knobs(
         symm_buffer._frontend,

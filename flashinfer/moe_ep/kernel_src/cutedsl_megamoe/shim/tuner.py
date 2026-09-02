@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Any, Dict, Iterator, Optional, Tuple
+import warnings
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # --- knob value-sets (mirror inference_solver._correctness_knobs / _perf_knobs) ---
 
@@ -303,33 +304,87 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "reuse_dispatch_warps")
-        and not (
-            knobs.get("in_kernel_fc2_reduce", False)
-            and knobs.get("token_back_mode", "epi_warps") != "epi_warps"
-        )
         and knobs.get("clc_bundle_size") is None
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
     )
 
 
 def _effective_knobs(config: Any, knobs: Dict[str, Any]) -> Dict[str, Any]:
-    return {**dataclasses.asdict(config), **knobs}
+    """``knobs`` merged onto ``config``'s values -- the post-``with_knobs`` state."""
+    current = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+    return {**current, **knobs}
+
+
+def _keeps_config_ikr(config: Any, knobs: Dict[str, Any]) -> bool:
+    """``in_kernel_fc2_reduce`` is caller-owned: the symm buffer's combine plane
+    is allocated with its topk axis collapsed, so a knob may not flip it (every
+    other knob stays free to tune)."""
+    return (
+        knobs.get("in_kernel_fc2_reduce", config.in_kernel_fc2_reduce)
+        == config.in_kernel_fc2_reduce
+    )
+
+
+def describe_invalid_knobs(
+    config: Any,
+    knobs: Dict[str, Any],
+    predicate: Callable[[Any, Dict[str, Any]], bool],
+) -> str:
+    """Name what makes ``knobs`` unusable for ``config`` (error / log text).
+
+    Probes each entry on its own so an individually-illegal knob is named by
+    value; knobs that are legal alone and illegal together say so instead.
+    """
+    reasons: List[str] = []
+    if not _keeps_config_ikr(config, knobs):
+        reasons.append(
+            f"in_kernel_fc2_reduce={knobs['in_kernel_fc2_reduce']!r} is caller-owned "
+            f"(the session's combine plane is allocated for "
+            f"in_kernel_fc2_reduce={config.in_kernel_fc2_reduce!r})"
+        )
+    if not predicate(config, {}):
+        reasons.append("the session config is itself outside the supported knob space")
+    else:
+        for key, value in knobs.items():
+            if key != "in_kernel_fc2_reduce" and not predicate(config, {key: value}):
+                reasons.append(f"{key}={value!r} is unsupported")
+    if not reasons:
+        reasons.append("the combination is unsupported (each knob is legal alone)")
+    return "; ".join(reasons)
 
 
 def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate BF16 knobs against a session's caller-owned IKR setting."""
-    effective = _effective_knobs(config, knobs)
-    return effective[
-        "in_kernel_fc2_reduce"
-    ] == config.in_kernel_fc2_reduce and is_valid_bf16(effective)
+    return _keeps_config_ikr(config, knobs) and is_valid_bf16(
+        _effective_knobs(config, knobs)
+    )
 
 
 def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate mixed BF16/MXFP8 knobs against a session's IKR setting."""
-    effective = _effective_knobs(config, knobs)
-    return effective[
-        "in_kernel_fc2_reduce"
-    ] == config.in_kernel_fc2_reduce and is_valid_bf16_mxfp8(effective)
+    return _keeps_config_ikr(config, knobs) and is_valid_bf16_mxfp8(
+        _effective_knobs(config, knobs)
+    )
+
+
+def warn_if_knobs_override_session(before: Any, after: Any, *, what: str) -> None:
+    """Warn when pinned knobs replaced an output-affecting session setting.
+
+    A pinned dict overrides the session's own knob arguments by design; say
+    which ones so an explicitly requested value never disappears quietly.
+    """
+    changes = [
+        f"{name}: {getattr(before, name)!r} -> {getattr(after, name)!r}"
+        for name in (*CORRECTNESS_KNOBS, "token_back_by_dispatch")
+        if hasattr(before, name) and getattr(after, name) != getattr(before, name)
+    ]
+    if changes:
+        warnings.warn(
+            f"{what}: pinned knobs replaced output-affecting session settings "
+            f"({', '.join(changes)}).",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def iter_candidates(
@@ -384,11 +439,13 @@ __all__ = [
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
     "default_knobs",
+    "describe_invalid_knobs",
     "is_valid",
     "is_valid_bf16",
     "is_valid_bf16_for_config",
     "is_valid_bf16_mxfp8",
     "is_valid_bf16_mxfp8_for_config",
     "iter_candidates",
+    "warn_if_knobs_override_session",
     "with_knobs",
 ]
