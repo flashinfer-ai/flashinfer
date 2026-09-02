@@ -433,7 +433,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              W4A4 quantizer instead of the fused GEMM1 epilogue.
-        down_bias: Optional per-expert down-projection bias.
+        down_bias: Optional contiguous float32 per-expert down-projection bias
+             with shape (num_experts, n).
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
@@ -514,6 +515,20 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         raise ValueError(
             f"A and B logical K dimensions must match, got A K={k} and B K={b_k}"
         )
+    use_bias = down_bias is not None
+    if down_bias is not None:
+        if down_bias.dtype is not torch.float32:
+            raise TypeError("down_bias must have dtype torch.float32")
+        if down_bias.device != a.device:
+            raise ValueError("down_bias must be on the same device as a")
+        expected_shape = (num_experts, n)
+        if tuple(down_bias.shape) != expected_shape:
+            raise ValueError(
+                f"down_bias must have shape {expected_shape}, "
+                f"got {tuple(down_bias.shape)}"
+            )
+        if not down_bias.is_contiguous():
+            raise ValueError("down_bias must be contiguous")
 
     seq_len = token_final_scales.shape[0]
     topk = token_final_scales.shape[1]
@@ -689,7 +704,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    use_bias = down_bias is not None
     if is_rubin:
         bias_ptr = None
     else:

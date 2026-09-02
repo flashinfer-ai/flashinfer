@@ -538,10 +538,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
-        bias_up: Optional per-expert bias for the up-projection branch. Must be
-            provided together with ``bias_gate``.
-        bias_gate: Optional per-expert bias for the gate-projection branch. Must
-            be provided together with ``bias_up``.
+        bias_up: Optional float32 per-expert up-projection bias with shape
+            (num_experts, intermediate_size). Must be provided together
+            with bias_gate.
+        bias_gate: Optional float32 per-expert gate-projection bias with shape
+            (num_experts, intermediate_size). Must be provided together
+            with bias_up.
         topk: Number of experts per token. Default: 8
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
@@ -661,6 +663,31 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             f"gated intermediate_size={intermediate_size} must be divisible by "
             f"weight_interleave={weight_interleave}"
         )
+    if (bias_up is None) != (bias_gate is None):
+        raise ValueError("bias_up and bias_gate must be provided together")
+    use_bias = bias_up is not None
+    bias_expert_stride_factor = 1
+    if bias_up is not None:
+        assert bias_gate is not None
+        expected_shape = (num_experts, intermediate_size)
+        for name, bias in (("bias_up", bias_up), ("bias_gate", bias_gate)):
+            if bias.dtype is not torch.float32:
+                raise TypeError(f"{name} must have dtype torch.float32")
+            if bias.device != a.device:
+                raise ValueError(f"{name} must be on the same device as a")
+            if tuple(bias.shape) != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {tuple(bias.shape)}"
+                )
+        if bias_up.stride() != bias_gate.stride() or bias_up.stride(1) != 1:
+            raise ValueError(
+                "bias_up and bias_gate must use matching row-major strides"
+            )
+        bias_expert_stride_factor, remainder = divmod(
+            bias_up.stride(0), intermediate_size
+        )
+        if remainder or bias_expert_stride_factor not in (1, 2):
+            raise ValueError("bias expert stride must be intermediate_size or twice it")
     permuted_m = token_id_mapping.shape[0]
 
     use_a_per_token_scale = a_per_token_scale is not None
@@ -873,19 +900,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         if use_alpha
         else None
     )
-    if (bias_up is None) != (bias_gate is None):
-        raise ValueError("bias_up and bias_gate must be provided together")
-    use_bias = bias_up is not None
     if use_bias:
-        if bias_up.stride() != bias_gate.stride() or bias_up.stride(1) != 1:
-            raise ValueError(
-                "bias_up and bias_gate must use matching row-major strides"
-            )
-        bias_expert_stride_factor, remainder = divmod(
-            bias_up.stride(0), intermediate_size
-        )
-        if remainder or bias_expert_stride_factor not in (1, 2):
-            raise ValueError("bias expert stride must be intermediate_size or twice it")
         bias_up_ptr = make_ptr(
             cutlass.Float32, bias_up.data_ptr(), cute.AddressSpace.gmem
         )
@@ -893,7 +908,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             cutlass.Float32, bias_gate.data_ptr(), cute.AddressSpace.gmem
         )
     else:
-        bias_expert_stride_factor = 1
         bias_up_ptr = None
         bias_gate_ptr = None
     if use_a_per_token_scale:

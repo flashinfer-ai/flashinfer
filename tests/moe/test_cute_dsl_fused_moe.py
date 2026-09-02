@@ -598,6 +598,54 @@ class TestKernelInputValidation:
         with pytest.raises(ValueError, match=match):
             op(**kwargs, a_per_token_scale=per_token_scale)
 
+    @pytest.mark.parametrize("stage", ["gather", "finalize"])
+    @pytest.mark.parametrize(
+        ("invalid_kind", "error", "match"),
+        [
+            ("dtype", TypeError, "dtype torch.float32"),
+            ("device", ValueError, "same device as a"),
+            ("experts", ValueError, "must have shape"),
+            ("lanes", ValueError, "must have shape"),
+            ("layout", ValueError, "row-major|contiguous"),
+        ],
+    )
+    def test_rejects_invalid_bias(self, stage, invalid_kind, error, match):
+        shape = (2, 128)
+        if invalid_kind == "dtype":
+            bias = torch.ones(shape, dtype=torch.float16, device="cuda")
+        elif invalid_kind == "device":
+            bias = torch.ones(shape, dtype=torch.float32)
+        elif invalid_kind == "experts":
+            bias = torch.ones((1, 128), dtype=torch.float32, device="cuda")
+        elif invalid_kind == "lanes":
+            bias = torch.ones((2, 127), dtype=torch.float32, device="cuda")
+        else:
+            bias = torch.ones((128, 2), dtype=torch.float32, device="cuda").t()
+
+        if stage == "gather":
+            from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+                blockscaled_contiguous_gather_grouped_gemm_act_fusion,
+            )
+
+            op = blockscaled_contiguous_gather_grouped_gemm_act_fusion
+            kwargs = self._gather_kwargs()
+            kwargs.update(bias_up=bias, bias_gate=bias)
+        else:
+            from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+                blockscaled_contiguous_grouped_gemm_finalize_fusion,
+            )
+
+            op = blockscaled_contiguous_grouped_gemm_finalize_fusion
+            kwargs = self._finalize_kwargs()
+            kwargs.update(
+                down_bias=bias,
+                a_dtype="float4_e2m1fn",
+                b_dtype="float4_e2m1fn",
+            )
+
+        with pytest.raises(error, match=match):
+            op(**kwargs)
+
     @pytest.mark.parametrize("scale_name", ["out_scale", "global_scale"])
     def test_rejects_output_scales_for_non_fp4_output(self, scale_name):
         from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
