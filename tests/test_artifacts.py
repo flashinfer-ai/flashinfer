@@ -323,6 +323,24 @@ def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
     }
 
 
+def test_get_artifact_download_failure_raises(monkeypatch, tmp_path):
+    """A missing runtime cubin must not become an empty native kernel image."""
+    from flashinfer.jit import cubin_loader
+
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://artifacts.invalid/"
+    )
+    monkeypatch.setattr(
+        cubin_loader, "download_file", lambda *args, **kwargs: False
+    )
+
+    with pytest.raises(RuntimeError, match="missing.cubin") as excinfo:
+        cubin_loader.get_artifact("test-pin/missing.cubin", "0" * 64)
+
+    assert "Install the matching flashinfer-cubin package" in str(excinfo.value)
+
+
 @responses.activate
 def test_get_subdir_file_list(monkeypatch, tmp_path):
     _mock_file_index_responses()

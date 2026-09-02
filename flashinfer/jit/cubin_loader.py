@@ -229,8 +229,19 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching {file_name} from {uri}")
-    download_file(uri, local_path, session=session)
-    return load_cubin(local_path, sha256)
+    download_succeeded = download_file(uri, local_path, session=session)
+    data = load_cubin(local_path, sha256)
+    if data:
+        return data
+
+    status = "download completed but checksum validation failed"
+    if not download_succeeded:
+        status = "download failed"
+    raise RuntimeError(
+        f"Failed to load FlashInfer artifact '{file_name}' from {uri}: {status}. "
+        f"The local cache path is {local_path}. Install the matching "
+        "flashinfer-cubin package or make the artifact repository reachable."
+    )
 
 
 # Backward-compatible alias
@@ -313,7 +324,16 @@ def setup_cubin_loader(dll_path: str) -> None:
 
     def get_cubin_callback(name: bytes, sha256: bytes):
         # Both name and sha256 are bytes (c_char_p)
-        cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
+        artifact_name = name.decode("utf-8")
+        try:
+            cubin = get_artifact(artifact_name, sha256.decode("utf-8"))
+        except Exception:
+            # ctypes callbacks cannot propagate Python exceptions to the native
+            # caller. Explicitly clear the native handoff so it cannot reuse a
+            # cubin from a previous callback, and preserve the real download
+            # failure in the logs.
+            logger.exception(f"Failed to provide FlashInfer cubin {artifact_name}")
+            cubin = b""
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )
