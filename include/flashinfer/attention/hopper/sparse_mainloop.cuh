@@ -173,8 +173,8 @@ struct SparseCollectiveMainloop {
     return num_kv_tiles;
   }
 
-  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
-            typename SharedStorage>
+  template <bool LEFT_SLIDING_WINDOW, bool LEFT_VARIABLE_WINDOW = false, typename BlockCoord,
+            typename Scheduler, typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
                            MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
@@ -207,10 +207,8 @@ struct SparseCollectiveMainloop {
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
     int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
-    if constexpr (LEFT_SLIDING_WINDOW) {
-      swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
-                                                                       q_tile_idx, qo_len, kv_len);
-    }
+    apply_window_kv_tile_skip<CTA_Q, CTA_KV, LEFT_SLIDING_WINDOW, LEFT_VARIABLE_WINDOW>(
+        mainloop_params, qo_indptr, q_tile_idx, qo_len, kv_len, kv_tile_idx, swa_begin_kv_tile_idx);
 
     constexpr int HEAD_DIM_QK = get<2>(TileShape_QKD{});
     constexpr int HEAD_DIM_VO = get<1>(TileShape_PDV{});

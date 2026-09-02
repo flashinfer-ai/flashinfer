@@ -150,8 +150,8 @@ struct FP8CollectiveMainloop {
     return num_kv_tiles;
   }
 
-  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
-            typename SharedStorage>
+  template <bool LEFT_SLIDING_WINDOW, bool LEFT_VARIABLE_WINDOW = false, typename BlockCoord,
+            typename Scheduler, typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
                            MainloopPipeline pipeline_v, MainloopPipelineVt pipeline_vt,
                            PipelineState& smem_pipe_write, PipelineState& smem_pipe_read,
@@ -203,10 +203,8 @@ struct FP8CollectiveMainloop {
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
     int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
-    if constexpr (LEFT_SLIDING_WINDOW) {
-      swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
-                                                                       q_tile_idx, qo_len, kv_len);
-    }
+    apply_window_kv_tile_skip<CTA_Q, CTA_KV, LEFT_SLIDING_WINDOW, LEFT_VARIABLE_WINDOW>(
+        mainloop_params, qo_indptr, q_tile_idx, qo_len, kv_len, kv_tile_idx, swa_begin_kv_tile_idx);
 
     // All WG proceeds here, only one thread in each WG will issue TMA load
     int lane_predicate = cute::elect_one_sync();

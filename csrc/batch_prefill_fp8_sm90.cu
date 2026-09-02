@@ -25,12 +25,14 @@
 namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
+          bool LEFT_VARIABLE_WINDOW, bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant,
+          typename Params>
 cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                       cudaStream_t stream);
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
+          bool LEFT_VARIABLE_WINDOW, bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant,
+          typename Params>
 cudaError_t BatchFP8PrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                        cudaStream_t stream);
 
@@ -159,11 +161,9 @@ void BatchPrefillWithRaggedKVCacheSM90Run(ffi::TensorView float_workspace_buffer
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status =
-              BatchFP8PrefillWithRaggedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
-                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                         AttentionVariant>(params, enable_pdl,
-                                                                           stream);
+          cudaError_t status = BatchFP8PrefillWithRaggedKVCacheDispatched<
+              HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW, USE_VARIABLE_WINDOW,
+              SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(params, enable_pdl, stream);
 
           TVM_FFI_ICHECK(status == cudaSuccess)
               << "BatchPrefillWithRaggedKVCacheSM90Run failed with error: "
@@ -271,11 +271,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status =
-              BatchFP8PrefillWithPagedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
-                                                        SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                        AttentionVariant>(params, enable_pdl,
-                                                                          stream);
+          cudaError_t status = BatchFP8PrefillWithPagedKVCacheDispatched<
+              HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW, USE_VARIABLE_WINDOW,
+              SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(params, enable_pdl, stream);
 
           TVM_FFI_ICHECK(status == cudaSuccess)
               << "BatchPrefillWithPagedKVCacheSM90Run failed with error: "

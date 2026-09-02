@@ -412,6 +412,7 @@ class PODWithPagedKVCacheWrapper:
                 head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left != -1,  # use_sliding_window
+                False,  # use_variable_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             )
@@ -1042,6 +1043,7 @@ class BatchPODWithPagedKVCacheWrapper:
                 head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left != -1,  # use_sliding_window
+                False,  # use_variable_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             )

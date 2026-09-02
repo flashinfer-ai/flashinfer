@@ -75,9 +75,10 @@ def warmup_jit():
                     192,
                     128,
                     0,
-                    False,
-                    False,
-                    False,
+                    False,  # use_sliding_window
+                    False,  # use_variable_window
+                    False,  # use_logits_soft_cap
+                    False,  # use_fp16_qk_reduction
                 )
             )
 

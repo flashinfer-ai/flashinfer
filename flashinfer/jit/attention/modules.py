@@ -443,6 +443,7 @@ def get_batch_prefill_uri(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_variable_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
@@ -456,7 +457,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_use_vw_True" if use_variable_window else "")
     )
 
 
@@ -1032,6 +1035,7 @@ def gen_batch_prefill_module(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_variable_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
 ) -> JitSpec:
@@ -1045,6 +1049,7 @@ def gen_batch_prefill_module(
         head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
+        use_variable_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     )
@@ -1060,6 +1065,11 @@ def gen_batch_prefill_module(
     assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], (
         "FP8 output is not supported in fa2/fa3 backends yet"
     )
+    if use_variable_window:
+        if backend != "fa3":
+            raise ValueError("variable_window is only supported for the fa3 backend")
+        if use_sliding_window:
+            raise ValueError("variable_window cannot be combined with sliding window")
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
@@ -1127,6 +1137,15 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes = ["double", "double", "double", "double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+        if use_variable_window:
+            additional_tensor_names = additional_tensor_names + [
+                "maybe_variable_window_token_starts",
+                "maybe_variable_window_token_ends",
+            ]
+            additional_tensor_dtypes = additional_tensor_dtypes + [
+                "int32_t",
+                "int32_t",
+            ]
 
     return gen_customize_batch_prefill_module(
         backend,
@@ -1145,6 +1164,7 @@ def gen_batch_prefill_module(
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
+        use_variable_window=use_variable_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
@@ -1676,6 +1696,7 @@ def gen_customize_batch_prefill_module(
     variant_decl: str,
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
+    use_variable_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
@@ -1706,6 +1727,7 @@ def gen_customize_batch_prefill_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
+        "use_variable_window": str(use_variable_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
     }

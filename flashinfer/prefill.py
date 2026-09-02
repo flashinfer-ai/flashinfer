@@ -75,6 +75,7 @@ from .utils import (
     get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
+    is_fa3_prefill_head_dim_supported,
     is_float8,
     is_sm12x_supported,
     is_sm100a_supported,
@@ -106,6 +107,85 @@ def _split_scale_param(scale):
         return scale, 1.0
     else:
         return None, float(scale)
+
+
+def _validate_variable_window_bounds(
+    variable_window_token_starts,
+    variable_window_token_ends,
+    *,
+    nnz_qo: int,
+    device: torch.device,
+    window_left: int,
+    causal: bool,
+    custom_mask,
+    packed_custom_mask,
+    prefix_len_ptr,
+    backend: str,
+    head_dim_qk: int,
+    head_dim_vo: int,
+):
+    """Validate packed [nnz_qo] VariableWindow bounds.
+
+    Returns the caller tensors by reference (same contract as ``prefix_len_ptr``).
+    They must stay alive and unchanged from ``plan()`` through ``run()``.
+    Checks are host metadata only (no copy, no device sync on the arrays).
+    """
+    has_starts = variable_window_token_starts is not None
+    has_ends = variable_window_token_ends is not None
+    if has_starts != has_ends:
+        raise ValueError(
+            "variable_window_token_starts and variable_window_token_ends must both "
+            "be provided or both omitted"
+        )
+    if not has_starts:
+        return False, None, None
+    if window_left >= 0:
+        raise ValueError("variable_window cannot be combined with window_left >= 0")
+    if custom_mask is not None or packed_custom_mask is not None:
+        raise ValueError("variable_window cannot be combined with custom_mask")
+    if prefix_len_ptr is not None:
+        raise ValueError(
+            "variable_window cannot be combined with prefix_len_ptr (multi-item scoring)"
+        )
+    if causal:
+        raise ValueError(
+            "variable_window requires causal=False; bake causal into the start/end arrays"
+        )
+    if backend not in ("auto", "fa3"):
+        raise ValueError(
+            "variable_window is only supported for the fa3 backend "
+            f"(got backend={backend!r})"
+        )
+    if not is_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo):
+        raise ValueError(
+            "variable_window requires an FA3-supported head-dim pair: equal "
+            "{64, 128, 256} or (head_dim_qk, head_dim_vo)=(192, 128) "
+            f"(got head_dim_qk={head_dim_qk}, head_dim_vo={head_dim_vo})"
+        )
+    starts = variable_window_token_starts
+    ends = variable_window_token_ends
+    if starts.dtype != torch.int32 or ends.dtype != torch.int32:
+        raise ValueError(
+            "variable_window_token_starts/ends must have dtype torch.int32"
+        )
+    if not starts.is_cuda or not ends.is_cuda:
+        raise ValueError("variable_window_token_starts/ends must be CUDA tensors")
+    if starts.device != device or ends.device != device:
+        raise ValueError(
+            "variable_window_token_starts/ends must be on the same device as the wrapper"
+        )
+    if not starts.is_contiguous() or not ends.is_contiguous():
+        raise ValueError("variable_window_token_starts/ends must be contiguous")
+    if starts.dim() != 1 or ends.dim() != 1:
+        raise ValueError(
+            "variable_window_token_starts/ends must be 1-D tensors of shape [nnz_qo]"
+        )
+    if starts.numel() != nnz_qo or ends.numel() != nnz_qo:
+        raise ValueError(
+            f"variable_window_token_starts/ends must have shape [{nnz_qo}] "
+            f"(got {tuple(starts.shape)} and {tuple(ends.shape)})"
+        )
+    return True, starts, ends
 
 
 @functools.cache
@@ -192,6 +272,7 @@ def get_customize_batch_prefill_module(
     variant_decl: str,
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
+    use_variable_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
@@ -211,11 +292,12 @@ def get_customize_batch_prefill_module(
         additional_scalar_dtypes,
         variant_name,
         variant_decl,
-        pos_encoding_mode,
-        use_sliding_window,
-        use_logits_soft_cap,
-        use_fp16_qk_reduction,
-        fp8_enabled,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_variable_window=use_variable_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
     ).build_and_load()
 
 
@@ -455,17 +537,44 @@ def get_single_prefill_module(backend, *args):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
+def get_batch_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_variable_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+):
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
+        use_variable_window = False
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args)
-        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        module_args = (
+            dtype_q,
+            dtype_kv,
+            dtype_o,
+            dtype_idx,
+            head_dim_qk,
+            head_dim_vo,
+            pos_encoding_mode,
+            use_sliding_window,
+            use_variable_window,
+            use_logits_soft_cap,
+            use_fp16_qk_reduction,
+        )
+        uri = get_batch_prefill_uri(backend, *module_args)
+        module = gen_batch_prefill_module(backend, *module_args).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
@@ -513,6 +622,8 @@ def get_batch_prefill_module(backend, *args):
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
+        maybe_variable_window_token_starts: Optional[torch.Tensor] = None,
+        maybe_variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
@@ -548,10 +659,16 @@ def get_batch_prefill_module(backend, *args):
                 token_pos_in_items_len,
             )
         elif is_fp8:
-            # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
+            # FA3 FP8: scale_q, scale_k, scale_v, [vw starts/ends], sm_scale, scale_*_scalar
             scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
             scale_k_tensor, scale_k_scalar = _split_scale_param(scale_k)
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
+            extra_vw = []
+            if use_variable_window:
+                extra_vw = [
+                    maybe_variable_window_token_starts,
+                    maybe_variable_window_token_ends,
+                ]
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -570,6 +687,7 @@ def get_batch_prefill_module(backend, *args):
                 scale_q_tensor,
                 scale_k_tensor,
                 scale_v_tensor,
+                *extra_vw,
                 sm_scale,
                 scale_q_scalar,
                 scale_k_scalar,
@@ -577,8 +695,15 @@ def get_batch_prefill_module(backend, *args):
             )
         else:
             # FA3 FP16: maybe_prefix_len_ptr, maybe_token_pos_in_items_ptr,
-            # maybe_max_item_len_ptr, scale_v, logits_soft_cap, sm_scale, scale_v_scalar, token_pos_in_items_len
+            # maybe_max_item_len_ptr, scale_v, [vw starts/ends],
+            # logits_soft_cap, sm_scale, scale_v_scalar, token_pos_in_items_len
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
+            extra_vw = []
+            if use_variable_window:
+                extra_vw = [
+                    maybe_variable_window_token_starts,
+                    maybe_variable_window_token_ends,
+                ]
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -598,6 +723,7 @@ def get_batch_prefill_module(backend, *args):
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
                 scale_v_tensor,
+                *extra_vw,
                 logits_soft_cap,
                 sm_scale,
                 scale_v_scalar,
@@ -702,6 +828,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        maybe_variable_window_token_starts: Optional[torch.Tensor] = None,
+        maybe_variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -780,6 +908,12 @@ def get_batch_prefill_module(backend, *args):
             )
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
+            extra_vw = []
+            if use_variable_window:
+                extra_vw = [
+                    maybe_variable_window_token_starts,
+                    maybe_variable_window_token_ends,
+                ]
             if not is_float8(q):
                 paged_run_func(
                     float_workspace_buffer,
@@ -802,6 +936,7 @@ def get_batch_prefill_module(backend, *args):
                     maybe_token_pos_in_items_ptr,
                     maybe_max_item_len_ptr,
                     scale_v_tensor,
+                    *extra_vw,
                     logits_soft_cap,
                     sm_scale,
                     scale_v_scalar,
@@ -830,6 +965,7 @@ def get_batch_prefill_module(backend, *args):
                     scale_q_tensor,
                     scale_k_tensor,
                     scale_v_tensor,
+                    *extra_vw,
                     sm_scale,
                     scale_q_scalar,
                     scale_k_scalar,
@@ -1844,6 +1980,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._use_variable_window = False
+        self._variable_window_token_starts = None
+        self._variable_window_token_ends = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1913,6 +2052,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -1922,6 +2063,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         way as :meth:`plan`.  The wrapper's float workspace buffer is only used
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
+
+        Sizing is currently implemented for the ``fa2`` backend.  ``fa3``
+        (including ``backend="auto"`` when it resolves to FA3) and
+        ``cudnn`` raise :class:`NotImplementedError` without compiling a
+        module.  ``variable_window`` requires FA3, so it is rejected the same
+        way.
 
         Parameters
         ----------
@@ -2002,6 +2149,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The fixed split size for split-kv prefill, in pages.
         disable_split_kv : bool
             Whether to disable the split-kv. Defaults to ``False``.
+        variable_window_token_starts, variable_window_token_ends : Optional[torch.Tensor]
+            Packed ``[nnz_qo]`` bounds as in :meth:`plan`. Not supported here:
+            ``variable_window`` requires the fa3 backend, which does not export
+            ``workspace_size``. Providing either tensor raises
+            :class:`NotImplementedError`.
 
         Returns
         -------
@@ -2020,6 +2172,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
+        if (
+            variable_window_token_starts is not None
+            or variable_window_token_ends is not None
+        ):
+            raise NotImplementedError(
+                "workspace_size is not available for variable_window; "
+                "the fa3 backend does not export workspace_size"
+            )
+        if self._backend in ("fa3", "cudnn"):
+            raise NotImplementedError(
+                f"workspace_size is not available for prefill backend {self._backend!r}"
+            )
         del (
             block_tables,
             max_item_len_ptr,
@@ -2096,10 +2260,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
-            if backend == "cudnn":
+            if backend in ("fa3", "cudnn"):
                 raise NotImplementedError(
-                    "workspace_size is not available for cudnn prefill backend"
+                    f"workspace_size is not available for prefill backend {backend!r}"
                 )
             module = get_batch_prefill_module(
                 backend,
@@ -2111,6 +2277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,
+                False,  # use_variable_window
                 logits_soft_cap > 0,
                 use_fp16_qk_reduction,
             )
@@ -2182,6 +2349,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2292,6 +2461,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        variable_window_token_starts : Optional[torch.Tensor]
+            Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
+            ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
+            FA3 only; mutually exclusive with sliding window, custom mask, causal, and
+            multi-item scoring. Bake causal / SWA into the arrays. Held by reference
+            like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
+            and unchanged until then.
+        variable_window_token_ends : Optional[torch.Tensor]
+            Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2363,6 +2541,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
+        (
+            self._use_variable_window,
+            self._variable_window_token_starts,
+            self._variable_window_token_ends,
+        ) = _validate_variable_window_bounds(
+            variable_window_token_starts,
+            variable_window_token_ends,
+            nnz_qo=total_num_rows,
+            device=self.device,
+            window_left=window_left,
+            causal=causal,
+            custom_mask=custom_mask,
+            packed_custom_mask=packed_custom_mask,
+            prefix_len_ptr=prefix_len_ptr,
+            backend=self._backend,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+        )
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
@@ -2548,6 +2744,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
                 )
+            if self._use_variable_window and self._backend != "fa3":
+                raise ValueError(
+                    "variable_window requires the fa3 backend on SM90 "
+                    f"(resolved backend={self._backend!r})"
+                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2558,10 +2759,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_vo,
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left >= 0,  # use_sliding_window
+                    self._use_variable_window,
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
                 )
-
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -3004,7 +3205,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
                 value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-        if self._custom_mask_buf is not None or self._variant_owns_mask:
+        if self._use_variable_window:
+            mask_mode = MaskMode.NON_CAUSAL.value
+        elif self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:
@@ -3166,7 +3369,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "trtllm-gen":
                 assert self._trtllm_gen_multi_ctas_kv_counter_buffer is not None
             assert self._cached_module is not None, "cached module is not initialized"
-            self._cached_module.paged_run(*run_args)
+            vw_kwargs = {}
+            if self._use_variable_window:
+                vw_kwargs["maybe_variable_window_token_starts"] = (
+                    self._variable_window_token_starts
+                )
+                vw_kwargs["maybe_variable_window_token_ends"] = (
+                    self._variable_window_token_ends
+                )
+            self._cached_module.paged_run(*run_args, **vw_kwargs)
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
@@ -3473,6 +3684,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
+        self._use_variable_window = False
+        self._variable_window_token_starts = None
+        self._variable_window_token_ends = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -3537,6 +3751,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3644,6 +3860,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Required for cudnn backend. This is the indptr of the value tensor.
         o_indptr: Optional[torch.Tensor]
             Required for cudnn backend. This is the indptr of the output tensor.
+        variable_window_token_starts : Optional[torch.Tensor]
+            Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
+            ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
+            FA3 only; mutually exclusive with sliding window, custom mask, causal, and
+            multi-item scoring. Bake causal / SWA into the arrays. Held by reference
+            like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
+            and unchanged until then.
+        variable_window_token_ends : Optional[torch.Tensor]
+            Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3695,6 +3920,24 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
+        (
+            self._use_variable_window,
+            self._variable_window_token_starts,
+            self._variable_window_token_ends,
+        ) = _validate_variable_window_bounds(
+            variable_window_token_starts,
+            variable_window_token_ends,
+            nnz_qo=total_num_rows,
+            device=self.device,
+            window_left=window_left,
+            causal=causal,
+            custom_mask=custom_mask,
+            packed_custom_mask=packed_custom_mask,
+            prefix_len_ptr=prefix_len_ptr,
+            backend=self._backend,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+        )
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3917,6 +4160,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     and prefix_len_ptr is None
                     and token_pos_in_items_ptr is None
                     and max_item_len_ptr is None
+                    and not self._use_variable_window
                     and _should_use_fmha_v2_sm120(
                         self.device,
                         PosEncodingMode[pos_encoding_mode].value,
@@ -3927,18 +4171,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 ):
                     self._backend = "fmha_v2"
 
-            get_module_args = (
-                q_data_type,
-                kv_data_type,
-                o_data_type,
-                kv_indptr.dtype,
-                head_dim_qk,
-                head_dim_vo,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left >= 0,  # use_sliding_window
-                logits_soft_cap > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction,
-            )
+            if self._use_variable_window and self._backend != "fa3":
+                raise ValueError(
+                    "variable_window requires the fa3 backend on SM90 "
+                    f"(resolved backend={self._backend!r})"
+                )
+
             if self._backend == "fmha_v2":
                 # Cache plan data for run() — avoid GPU-CPU sync in hot path
                 self._fmha_v2_seq_lens = kv_len_arr.to(torch.int32).to(
@@ -3950,14 +4188,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
-                new_get_module_args = (
-                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                self._cached_module = get_fmha_module(
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    kv_indptr.dtype,
+                    head_dim_qk,
+                    head_dim_vo,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,  # use_sliding_window
+                    logits_soft_cap > 0,  # use_logits_soft_cap
+                    qo_indptr.device,
+                    use_fp16_qk_reduction,
                 )
-                self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    kv_indptr.dtype,
+                    head_dim_qk,
+                    head_dim_vo,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,
+                    self._use_variable_window,
+                    logits_soft_cap > 0,
+                    use_fp16_qk_reduction,
                 )
 
         if self._backend == "cutlass":
@@ -4405,7 +4662,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-        if self._custom_mask_buf is not None or self._variant_owns_mask:
+        if self._use_variable_window:
+            mask_mode = MaskMode.NON_CAUSAL.value
+        elif self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:
@@ -4464,7 +4723,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 run_args.extend(list(args))  # scale_q, scale_k, scale_v
 
         assert self._cached_module is not None, "cached module is not initialized"
-        self._cached_module.ragged_run(*run_args)
+        vw_kwargs = {}
+        if self._use_variable_window:
+            vw_kwargs["maybe_variable_window_token_starts"] = (
+                self._variable_window_token_starts
+            )
+            vw_kwargs["maybe_variable_window_token_ends"] = (
+                self._variable_window_token_ends
+            )
+        self._cached_module.ragged_run(*run_args, **vw_kwargs)
 
         # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
@@ -4621,6 +4888,7 @@ def fmha_varlen(
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
         q.device,
+        False,  # use_fp16_qk_reduction
     )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape

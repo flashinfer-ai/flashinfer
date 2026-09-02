@@ -132,7 +132,11 @@ def _hopper_fp8_specs(items):
     for backend, d, hd in sorted(single_keys, key=str):
         add(gen_single_prefill_module(backend, d, d, H, hd, hd, 0, False, False, False))
     for d, hd in sorted(batch_keys, key=str):
-        add(gen_batch_prefill_module("fa3", d, d, H, I, hd, hd, 0, False, False, False))
+        add(
+            gen_batch_prefill_module(
+                "fa3", d, d, H, I, hd, hd, 0, False, False, False, False
+            )
+        )
     if need_quantization:
         add(gen_quantization_module())
     return list(specs.values())
@@ -268,10 +272,10 @@ def _batch_prefill_specs(items):
         # head_dim 64 cases (fixture only builds 128/256); references use
         # single_prefill with backend auto (fa3 on SM90 for pos_encoding 0).
         for p in (0, 1):
-            bp("fa2", H, H, H, I, 64, 64, p, False, False, False)
+            bp("fa2", H, H, H, I, 64, 64, p, False, False, False, False)
             sp("fa2", H, H, H, 64, 64, p, False, False, False)
         if sm90:
-            bp("fa3", H, H, H, I, 64, 64, 0, False, False, False)
+            bp("fa3", H, H, H, I, 64, 64, 0, False, False, False, False)
             sp("fa3", H, H, H, 64, 64, 0, False, False, False)
         # Fixture grid, included here so it gets AOT-staged.
         try:
@@ -282,6 +286,7 @@ def _batch_prefill_specs(items):
                 [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
                 [128, 256],
                 [0, 1],
+                [False],
                 [False],
                 [False],
                 [False],
@@ -301,7 +306,7 @@ def _batch_prefill_specs(items):
     }:
         # head_dim 512 forces fa2 for both wrapper and reference.
         for p in (0, 1):
-            bp("fa2", H, H, H, I, 512, 512, p, False, False, False)
+            bp("fa2", H, H, H, I, 512, 512, p, False, False, False, False)
             sp("fa2", H, H, H, 512, 512, p, False, False, False)
 
     if "test_batch_prefill_with_ragged_kv_cache_custom_mask" in fns:
@@ -309,11 +314,11 @@ def _batch_prefill_specs(items):
         for hd in (128, 256):
             for p in (0, 1, 2):
                 for softcap in (False, True):
-                    bp("fa2", H, H, H, I, hd, hd, p, False, softcap, False)
+                    bp("fa2", H, H, H, I, hd, hd, p, False, False, softcap, False)
 
     if "test_batch_prefill_with_paged_kv_cache_multi_item_scoring" in fns:
         for softcap in (False, True):
-            bp("fa2", H, H, H, I, 128, 128, 1, False, softcap, False)
+            bp("fa2", H, H, H, I, 128, 128, 1, False, False, softcap, False)
             sp("fa2", H, H, H, 128, 128, 1, False, softcap, False)
 
     nvfp4_fns = {
@@ -331,13 +336,13 @@ def _batch_prefill_specs(items):
         # NVFP4 KV is uint8 (fp4x2_e2m1) and always fa2; references run on the
         # dequantized dtype (bf16 references are not in the fixture grid).
         for q in (H, B):
-            bp("fa2", q, U8, q, I, 128, 128, 0, False, False, False)
+            bp("fa2", q, U8, q, I, 128, 128, 0, False, False, False, False)
             sp("fa2", q, q, q, 128, 128, 0, False, False, False)
             if sm90:
                 sp("fa3", q, q, q, 128, 128, 0, False, False, False)
             if hd512_ok:
                 for p in (0, 1):
-                    bp("fa2", q, U8, q, I, 512, 512, p, False, False, False)
+                    bp("fa2", q, U8, q, I, 512, 512, p, False, False, False, False)
                     sp("fa2", q, q, q, 512, 512, p, False, False, False)
 
     if (
@@ -345,12 +350,25 @@ def _batch_prefill_specs(items):
         and cc_major >= 10
     ):
         for hd_qk, hd_vo in ((512, 256), (256, 128)):
-            bp("fa2", B, U8, B, I, hd_qk, hd_vo, 0, False, False, False)
+            bp("fa2", B, U8, B, I, hd_qk, hd_vo, 0, False, False, False, False)
 
     if "test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256" in fns and hd512_ok:
-        bp("fa2", H, H, H, I, 448, 256, 0, False, False, False)
+        bp("fa2", H, H, H, I, 448, 256, 0, False, False, False, False)
         if cc_major >= 10:
-            bp("fa2", H, torch.float8_e4m3fn, H, I, 448, 256, 0, False, False, False)
+            bp(
+                "fa2",
+                H,
+                torch.float8_e4m3fn,
+                H,
+                I,
+                448,
+                256,
+                0,
+                False,
+                False,
+                False,
+                False,
+            )
 
     return list(specs.values())
 

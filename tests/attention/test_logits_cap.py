@@ -47,6 +47,7 @@ def warmup_jit():
             [128, 256],  # head_dims
             [0],  # pos_encoding_modes
             [False],  # use_sliding_windows
+            [False],  # use_variable_windows
             [False, True],  # use_logits_soft_caps
             [False],  # use_fp16_qk_reductions
         ),
