@@ -211,6 +211,9 @@ _MLIR_VALUE_FIELDS = (
     "nvlink_barrier_signal",
     "nvlink_barrier_counter",
     "grid_sync_counter",
+    "split_dispatch_ready",
+    "split_k1_done",
+    "split_grid_sync_counter",
     "local_zero_prefix",
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
@@ -270,6 +273,9 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        split_dispatch_ready: cute.Tensor = None,
+        split_k1_done: cute.Tensor = None,
+        split_grid_sync_counter: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -293,6 +299,9 @@ class TokenCommArgs:
         self.nvlink_barrier_signal = nvlink_barrier_signal
         self.nvlink_barrier_counter = nvlink_barrier_counter
         self.grid_sync_counter = grid_sync_counter
+        self.split_dispatch_ready = split_dispatch_ready
+        self.split_k1_done = split_k1_done
+        self.split_grid_sync_counter = split_grid_sync_counter
         self.local_zero_prefix = local_zero_prefix
         self.shared_zero_prefix = shared_zero_prefix
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
@@ -389,6 +398,7 @@ class TokenInPullTokenBackPush:
         is_swap_ab: bool = False,
         sf_atom_swizzled: bool = True,
         token_back_schedule_mode: Literal["static", "atomic_counter"] = "static",
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
     ) -> None:
         self.world_size = world_size
         self.num_topk = num_topk
@@ -416,6 +426,12 @@ class TokenInPullTokenBackPush:
                 f"'atomic_counter'; got {token_back_schedule_mode!r}."
             )
         self.token_back_schedule_mode = token_back_schedule_mode
+        if execution_phase not in ("fused", "fc1", "fc2"):
+            raise ValueError(
+                "execution_phase must be 'fused', 'fc1', or 'fc2'; "
+                f"got {execution_phase!r}."
+            )
+        self.execution_phase = execution_phase
         self.dispatch_warp_start = dispatch_warp_start
         # Warps that share this CTA with the dispatch group but are not part
         # of it. They participate in kernel-tail / dispatch-with-other
@@ -538,8 +554,34 @@ class TokenInPullTokenBackPush:
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
         if cutlass.const_expr(self.is_swap_ab):
-            counter_slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
-            peek_threshold = work_tile_info.valid_tokens_in_cta_tile
+            token_cluster_size: cutlass.Constexpr = self.cluster_shape_mn[1]
+            cluster_token_block_idx = (
+                work_tile_info.tile_n_idx // cutlass.Int32(token_cluster_size)
+            )
+            counter_slot = (
+                work_tile_info.cumulative_token_block_count
+                + cluster_token_block_idx
+            )
+            if cutlass.const_expr(token_cluster_size == 1):
+                # Preserve the existing NVFP4/MXFP8 single-token-CTA path.
+                peek_threshold = work_tile_info.valid_tokens_in_cta_tile
+            else:
+                packed_expert_count = token_comm_args.expert_recv_count_sum[
+                    work_tile_info.expert_idx
+                ]
+                expert_token_count = Int32(
+                    Int64(packed_expert_count) & Int64(0xFFFFFFFF)
+                )
+                remaining_cluster_tokens = cutlass.max(
+                    expert_token_count
+                    - cluster_token_block_idx
+                    * cutlass.Int32(self.cluster_tile_tokens),
+                    Int32(0),
+                )
+                peek_threshold = cutlass.min(
+                    remaining_cluster_tokens,
+                    cutlass.Int32(self.cluster_tile_tokens),
+                )
         else:
             counter_slot = (
                 work_tile_info.cumulative_token_block_count
@@ -548,14 +590,18 @@ class TokenInPullTokenBackPush:
             peek_threshold = work_tile_info.valid_tokens_in_cluster_tile
 
         counter_ptr = token_comm_args.fc1_ready_counter.iterator + counter_slot
-        if not work_tile_info.peek_ready:
-            _iket.range_push("tma_token_fc1_wait")
-            spin_wait(
-                counter_ptr,
-                lambda v: v >= peek_threshold,
-                fail_sleep_cycles=1000,
-            )
-            _iket.range_pop()
+        # Dispatch warps may fill rows within a cluster token block out of
+        # order. Every valid CTA therefore waits for the full cluster-block
+        # count; an invalid tail CTA has no rows to consume and skips the wait.
+        if work_tile_info.valid_tokens_in_cta_tile > Int32(0):
+            if not work_tile_info.peek_ready:
+                _iket.range_push("tma_token_fc1_wait")
+                spin_wait(
+                    counter_ptr,
+                    lambda v: v >= peek_threshold,
+                    fail_sleep_cycles=1000,
+                )
+                _iket.range_pop()
 
     @cute.jit
     def dispatch_prep(
@@ -1480,13 +1526,15 @@ class TokenInPullTokenBackPush:
         bidx, bidy, bidz = cute.arch.block_idx()
         cta_linear_id = (
             Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
             + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
             * Int32(bidz)
         )
         local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
 
-        iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        # Record all four dispatch warps in CTA 0. Recording every persistent
+        # CTA duplicates the same role and makes PIC-C's trace buffer too large.
+        iket_active = cta_linear_id == Int32(0)
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
@@ -1523,6 +1571,20 @@ class TokenInPullTokenBackPush:
             nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
         )
 
+        # Strict split K1 passes a narrow TokenComm payload, while the fused
+        # path leaves this field absent/None.  Key publication off the payload
+        # ABI instead of the frontend phase spelling.
+        if cutlass.const_expr(token_comm_args.split_dispatch_ready is not None):
+            if (
+                cta_linear_id == Int32(0)
+                and local_warp_idx == Int32(0)
+                and lane_idx == Int32(0)
+            ):
+                red_add_release_sys_s32_raw(
+                    token_comm_args.split_dispatch_ready.iterator.toint(),
+                    Int32(1),
+                )
+
         nb_dispatch_to_sched = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
             num_threads=self.dispatch_to_sched_threads,
@@ -1556,7 +1618,11 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_pop()
 
-        if cutlass.const_expr(self.enable_token_back and not self.token_back_standalone):
+        if cutlass.const_expr(
+            self.enable_token_back
+            and not self.token_back_standalone
+            and self.execution_phase != "fc1"
+        ):
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
 
@@ -1585,6 +1651,143 @@ class TokenInPullTokenBackPush:
                 _iket.range_pop()
 
     @cute.jit
+    def split_fc1_token_back_idle_warp_body(self):
+        """Join K1's dispatch-to-scheduler barrier without starting token-back."""
+        nb_dispatch_to_sched = pipeline.NamedBarrier(
+            barrier_id=self.dispatch_to_sched_named_barrier_id,
+            num_threads=self.dispatch_to_sched_threads,
+        )
+        nb_dispatch_to_sched.arrive()
+
+    @cute.jit
+    def split_fc2_dispatch_warp_body(
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        """Wait for K1 dispatch metadata, then reuse dispatch warps for K2 push."""
+        bidx, bidy, bidz = cute.arch.block_idx()
+        cta_linear_id = (
+            Int32(bidx)
+            + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
+            * Int32(bidz)
+        )
+        local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+
+        spin_wait(
+            token_comm_args.split_dispatch_ready.iterator,
+            lambda v: v >= Int32(1),
+            fail_sleep_cycles=100,
+        )
+        cute.arch.load(
+            token_comm_args.split_dispatch_ready.iterator,
+            Int32,
+            sem="acquire",
+            scope="gpu",
+        )
+
+        nb_dispatch_to_sched = pipeline.NamedBarrier(
+            barrier_id=self.dispatch_to_sched_named_barrier_id,
+            num_threads=self.dispatch_to_sched_threads,
+        )
+        nb_dispatch_to_sched.arrive_and_wait()
+
+        if cutlass.const_expr(self.enable_token_back and not self.token_back_standalone):
+            pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
+            pull_buffer_ptr = token_comm_storage.pull_buffer.data_ptr()
+            if lane_idx == Int32(0):
+                cute.arch.mbarrier_init(pull_mbar_ptr + local_warp_idx, 1)
+            cute.arch.sync_warp()
+
+            num_experts_per_lane: cutlass.Constexpr[int] = (
+                self.num_experts_per_rank + 31
+            ) // 32
+            stored_num_tokens_per_expert = []
+            for _ in cutlass.range_constexpr(0, num_experts_per_lane, 1):
+                stored_num_tokens_per_expert.append(Int32(0))
+            for i in cutlass.range_constexpr(0, num_experts_per_lane, 1):
+                expert_idx = Int32(i * self.warp_threads) + lane_idx
+                if expert_idx < Int32(self.num_experts_per_rank):
+                    packed_count = token_comm_args.expert_recv_count_sum[expert_idx]
+                    stored_num_tokens_per_expert[i] = Int32(
+                        Int64(packed_count) & Int64(0xFFFFFFFF)
+                    )
+            cute.arch.sync_warp()
+
+            self.token_back_by_push(
+                pull_buffer_ptr,
+                pull_mbar_ptr,
+                token_comm_args.fc2_output_workspace,
+                token_comm_args.fc2_done_counter,
+                token_comm_args.token_src_metadata,
+                token_comm_args.combine_output,
+                token_comm_args.combine_sf,
+                token_comm_args.fc2_output_sf,
+                token_comm_args.token_back_schedule_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                stored_num_tokens_per_expert,
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                local_rank=token_comm_args.local_rank,
+                num_sms=token_comm_args.sm_count,
+                chunk_bytes=self.hidden_bytes,
+            )
+
+    @cute.jit
+    def split_fc1_kernel_tail(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        """Publish K1 completion after every CTA role has retired."""
+        nb_kernel_tail = pipeline.NamedBarrier(
+            barrier_id=self.kernel_tail_named_barrier_id,
+            num_threads=self.kernel_tail_threads,
+        )
+        nb_kernel_tail.arrive_and_wait()
+
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            bidx, bidy, bidz = cute.arch.block_idx()
+            cta_linear_id = (
+                Int32(bidx)
+                + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
+                + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
+                * Int32(bidz)
+            )
+            local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            tid_in_group = local_warp_idx * Int32(self.warp_threads) + lane_idx
+            software_grid_sync(
+                token_comm_args.split_grid_sync_counter,
+                cta_linear_id,
+                token_comm_args.sm_count,
+                tid_in_group,
+                num_threads=self.num_dispatch_threads,
+            )
+            if (
+                cta_linear_id == Int32(0)
+                and local_warp_idx == Int32(0)
+                and lane_idx == Int32(0)
+            ):
+                cute.arch.atomic_add(
+                    token_comm_args.split_k1_done.iterator,
+                    Int32(1),
+                    sem="release",
+                    scope="gpu",
+                )
+
+    @cute.jit
     def token_back_warp_body(
         self,
         token_comm_args,
@@ -1597,7 +1800,7 @@ class TokenInPullTokenBackPush:
         bidx, bidy, bidz = cute.arch.block_idx()
         cta_linear_id = (
             Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
             + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
             * Int32(bidz)
         )
@@ -1631,7 +1834,7 @@ class TokenInPullTokenBackPush:
                 )
         cute.arch.sync_warp()
 
-        iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        iket_active = cta_linear_id == Int32(0)
         if iket_active:
             _iket.range_push("Token_Back_By_Push_Standalone")
 
@@ -1722,11 +1925,23 @@ class TokenInPullTokenBackPush:
             bidx, bidy, bidz = cute.arch.block_idx()
             cta_linear_id = (
                 Int32(bidx)
-                + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+                + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
                 + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
                 * Int32(bidz)
             )
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            if cutlass.const_expr(self.execution_phase == "fc2"):
+                spin_wait(
+                    token_comm_args.split_k1_done.iterator,
+                    lambda v: v >= Int32(1),
+                    fail_sleep_cycles=100,
+                )
+                cute.arch.load(
+                    token_comm_args.split_k1_done.iterator,
+                    Int32,
+                    sem="acquire",
+                    scope="gpu",
+                )
             # Per-launch nvlink barrier count must be a multiple of 4 so the
             # sense-reversing signal self-cancels back to its start state. The
             # launch already does 1 (dispatch_barrier) + 2 below (drain + publish,

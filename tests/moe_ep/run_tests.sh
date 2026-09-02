@@ -7,6 +7,8 @@
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
+#   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 2/4-GPU Hopper Humming MXFP4 mega correctness
+#   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4_split # 1/2/4-GPU Hopper Humming MXFP4 Green split
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
@@ -115,6 +117,8 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_split_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -285,6 +289,40 @@ run_mega_sm90() {
     -m "gpu_4 and arch_hopper"
 }
 
+# Production packed MXFP4/E8M0 weights through the fused Hopper MegaMoE
+# backend, checked against a test-owned global routing/math oracle. Both 2
+# and 4 ranks are supported; CI/final acceptance defaults to 4.
+NPROC_SM90_MXFP4="${NPROC_SM90_MXFP4:-4}"
+run_mega_sm90_mxfp4() {
+  if [[ "${NPROC_SM90_MXFP4}" != "2" && "${NPROC_SM90_MXFP4}" != "4" ]]; then
+    echo "NPROC_SM90_MXFP4 must be 2 or 4, got ${NPROC_SM90_MXFP4}" >&2
+    return 1
+  fi
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_MXFP4}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py -v \
+    -m "gpu_2 and arch_hopper"
+}
+
+# Production Green Context split path.  The test owns an independent global
+# routing/math oracle, checks the physical E4M3/K64 handoff, and stresses cold,
+# steady single-bank, and dual-bank graph replay. Final acceptance uses 4 H200s.
+NPROC_SM90_MXFP4_SPLIT="${NPROC_SM90_MXFP4_SPLIT:-4}"
+run_mega_sm90_mxfp4_split() {
+  case "${NPROC_SM90_MXFP4_SPLIT}" in
+    1|2|4) ;;
+    *)
+      echo "NPROC_SM90_MXFP4_SPLIT must be 1, 2, or 4, got ${NPROC_SM90_MXFP4_SPLIT}" >&2
+      return 1
+      ;;
+  esac
+  "${TORCHRUN}" --standalone \
+    --nproc_per_node="${NPROC_SM90_MXFP4_SPLIT}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_split_multirank.py -v \
+    -m arch_hopper
+}
+
 # 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
 # Own target rather than folded into `multirank` (upstream PR #4069 runs it
 # there): on non-Hopper nodes the arch-marked files collect 0 tests and
@@ -396,12 +434,14 @@ case "${1:-all}" in
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega correctness (2/4 Hopper GPUs)" run_mega_sm90_mxfp4; print_summary ;;
+  mega_sm90_mxfp4_split) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl Green split correctness (1/2/4 Hopper GPUs)" run_mega_sm90_mxfp4_split; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|mega_sm90_mxfp4|mega_sm90_mxfp4_split|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

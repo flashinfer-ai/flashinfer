@@ -53,6 +53,40 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig = config
+        if config.knobs is not None:
+            if not (isinstance(config.knobs, dict) or config.knobs == "auto"):
+                raise ValueError(
+                    f"knobs must be None, a knob dict, or 'auto'; got {config.knobs!r}"
+                )
+            if any(
+                v is not None
+                for v in (
+                    config.swap_ab,
+                    config.pingpong,
+                    config.mma_tiler_mnk,
+                    config.cluster_shape_mnk,
+                )
+            ):
+                raise ValueError(
+                    "knobs= is mutually exclusive with the explicit geometry "
+                    "fields (swap_ab / pingpong / mma_tiler_mnk / "
+                    "cluster_shape_mnk)"
+                )
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE compile+timing sweep at the "
+                "first forward — never use it inside a serving engine. Tune "
+                "offline instead (python -m flashinfer.moe_ep.tune); winners "
+                "persist in the knob cache and knobs=None then resolves them "
+                "with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -134,13 +168,17 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             kind=k.kind,
             fp8_scale_mode=k.fp8_scale_mode,
             fp8_accum_mode=k.fp8_accum_mode,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
             swap_ab=k.swap_ab,
+            pingpong=k.pingpong,
             mma_tiler_mnk=k.mma_tiler_mnk,
+            cluster_shape_mnk=k.cluster_shape_mnk,
             load_balance_mode=k.load_balance_mode,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
+            token_back_mode=k.token_back_mode,
         )
 
     def validate_forward(
@@ -240,6 +278,11 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if output is not None:
             num_tokens = output.shape[0]
         else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
             staged = staged_tokens(workspace.topk_idx)
             if staged is None:
                 raise ValueError(
@@ -249,6 +292,31 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                autotune_hopper_fp8_mega_moe,
+            )
+
+            autotune_hopper_fp8_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=num_tokens,
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+                process_group=(
+                    self._ep_comm_group
+                    if self._ep_comm_group is not None
+                    else (self.ep_comm_group if self.ep_world_size > 1 else None)
+                ),
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep
+            # holds).
+            self._autotune_pending = False
         view = hopper_fp8_mega_moe(
             output,
             transformed_weights[0],
@@ -265,9 +333,15 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        k = self._kernel_config
+        if k.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
         import torch
 
-        k = self._kernel_config
+        from ......core.kernel.workspace_pool import knobs_pool_key
+
         fp = fleet_params
         return (
             "sm90_fp8_fp8_bf16_pull_cutedsl",
@@ -284,9 +358,13 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.fp8_scale_mode,
             k.fp8_accum_mode,
             k.swap_ab,
+            k.pingpong,
             k.mma_tiler_mnk,
+            k.cluster_shape_mnk,
             k.load_balance_mode,
             _resolve_gate_up_clamp(k),
             k.in_kernel_fc2_reduce,
             k.token_back_by_dispatch,
+            k.token_back_mode,
+            knobs_pool_key(k.knobs),
         )

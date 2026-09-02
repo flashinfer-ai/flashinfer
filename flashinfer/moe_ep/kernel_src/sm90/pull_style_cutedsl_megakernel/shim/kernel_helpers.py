@@ -61,6 +61,33 @@ _LAZY = {
         "moe_hopper_fp8.hopper_moe_utils",
         "quantize_fp8_weight_block_nk",
     ),
+    # Humming MXFP4 -> E4M3 device primitives
+    # (moe_hopper_fp8/mxfp4_cutedsl.py).  These remain lazy: importing this
+    # shim or the package root must not import CuTeDSL on CPU-only hosts.
+    "convert_mxfp4_pair_preprocessed_signs": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "convert_mxfp4_pair_preprocessed_signs",
+    ),
+    "convert_packed_a_kblock": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "convert_packed_a_kblock",
+    ),
+    "convert_packed_a_kblock_from_offset": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "convert_packed_a_kblock_from_offset",
+    ),
+    "make_expanded_offset_view": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "make_expanded_offset_view",
+    ),
+    "make_offset_smem_layout": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "make_offset_smem_layout",
+    ),
+    "make_packed_a_ldsm_views": (
+        "moe_hopper_fp8.mxfp4_cutedsl",
+        "make_packed_a_ldsm_views",
+    ),
     # ground-truth torch reference (moe_hopper_fp8/mega_reference_fp8.py)
     "compute_megamoe_reference_fp8": (
         "moe_hopper_fp8.mega_reference_fp8",

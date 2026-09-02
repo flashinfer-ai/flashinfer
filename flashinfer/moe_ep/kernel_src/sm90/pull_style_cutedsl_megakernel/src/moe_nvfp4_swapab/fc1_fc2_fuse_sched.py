@@ -268,6 +268,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         load_balance_counter_ptr=None,
         override_num_stages: Optional[int] = None,
         is_swap_ab: bool = True,
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
         # Exactly one of the next two must be non-None (sizes preferred when
         # the host can expose a direct view onto ``expert_recv_count_sum``;
         # prefix_sum required when only a host-precomputed cumsum is
@@ -284,6 +285,11 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             raise ValueError(
                 f"load_balance_mode must be one of 'static' / 'atomic_counter' / 'clc', "
                 f"got {load_balance_mode!r}"
+            )
+        if execution_phase not in ("fused", "fc1", "fc2"):
+            raise ValueError(
+                "execution_phase must be 'fused', 'fc1', or 'fc2'; "
+                f"got {execution_phase!r}"
             )
         if load_balance_mode == "atomic_counter" and load_balance_counter_ptr is None:
             raise ValueError(
@@ -321,6 +327,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
+        self.execution_phase = execution_phase
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
 
@@ -387,6 +394,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.token_padding_block = self.token_padding_block
         result.sf_padding_block = self.sf_padding_block
         result.load_balance_mode = self.load_balance_mode
+        result.execution_phase = self.execution_phase
 
         # Type-discriminated rebind: Python int fields copy from
         # prototype (``self``), Int32 fields consume from ``values``.
@@ -613,7 +621,11 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             current_group_idx=Int32(-1),
             current_group_first_expert=Int32(0),
             current_group_last_expert_exclusive=Int32(0),
-            current_phase=Int32(BlockPhase.Linear1),
+            current_phase=Int32(
+                BlockPhase.Linear2
+                if params.execution_phase == "fc2"
+                else BlockPhase.Linear1
+            ),
             current_expert_idx=Int32(-1),
             current_expert_tile_start=Int32(0),
             current_expert_tile_end=Int32(0),
@@ -1147,15 +1159,28 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # Previous group's end = this group's start in tile space.
         group_start_tile = state.current_group_end
-        state.current_group_fc1_subphase_end = (
-            group_start_tile + group_total_fc1_tiles
-        )
-        state.current_group_end = (
-            state.current_group_fc1_subphase_end + group_total_fc2_tiles
-        )
+        if cutlass.const_expr(params.execution_phase == "fc1"):
+            state.current_group_fc1_subphase_end = (
+                group_start_tile + group_total_fc1_tiles
+            )
+            state.current_group_end = state.current_group_fc1_subphase_end
+        elif cutlass.const_expr(params.execution_phase == "fc2"):
+            state.current_group_fc1_subphase_end = group_start_tile
+            state.current_group_end = group_start_tile + group_total_fc2_tiles
+        else:
+            state.current_group_fc1_subphase_end = (
+                group_start_tile + group_total_fc1_tiles
+            )
+            state.current_group_end = (
+                state.current_group_fc1_subphase_end + group_total_fc2_tiles
+            )
 
         # No-op push barrier before priming the group's first expert.
-        state.current_phase = Int32(BlockPhase.Linear1)
+        state.current_phase = Int32(
+            BlockPhase.Linear2
+            if params.execution_phase == "fc2"
+            else BlockPhase.Linear1
+        )
         state.current_expert_idx = state.current_group_first_expert - Int32(1)
         state.current_expert_tile_end = group_start_tile
         state.current_this_expert_token_cnt = Int32(0)
@@ -1323,6 +1348,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         if is_valid:
             # fc1 → fc2 phase transition inside current group, if crossed.
             if (
+                cutlass.const_expr(self.params.execution_phase == "fused")
+                and
                 state.current_phase == Int32(BlockPhase.Linear1)
                 and cluster_linear_tile_idx >= state.current_group_fc1_subphase_end
             ):
