@@ -14,10 +14,16 @@
 
 #pragma once
 // clang-format off
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
 typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "FlashInfer requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) GDNCPRTensorMap { uint64_t opaque[16]; };
@@ -44,7 +50,7 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count));
+        :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
@@ -75,19 +81,22 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
+
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
@@ -183,6 +192,15 @@ for (int j = 0; j < 16; j++)
 __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
     float2 r;
     asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
+          "l"(*(unsigned long long*)&c));
+    return r;
+}
+
+__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
+    float2 r;
+    asm("fma.rn.f32x2 %0, %1, %2, %3;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
           "l"(*(unsigned long long*)&c));

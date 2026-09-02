@@ -89,6 +89,41 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    const int mbar_base = smem;
+    #define k_full_addr (mbar_base + 0)
+    #define k_empty_addr (mbar_base + 24)
+    #define v_full_addr (mbar_base + 48)
+    #define v_empty_addr (mbar_base + 72)
+    #define t_full_addr (mbar_base + 96)
+    #define t_empty_addr (mbar_base + 120)
+    #define alpha_full_addr (mbar_base + 144)
+    #define alpha_empty_addr (mbar_base + 176)
+    #define m_init_full_addr (mbar_base + 208)
+    #define m_init_empty_addr (mbar_base + 216)
+    #define n_init_full_addr (mbar_base + 224)
+    #define n_init_empty_addr (mbar_base + 232)
+    #define x_acc_full_addr (mbar_base + 240)
+    #define x_acc_empty_addr (mbar_base + 248)
+    #define x_ready_full_addr (mbar_base + 256)
+    #define x_ready_empty_addr (mbar_base + 272)
+    #define m_input_full_addr (mbar_base + 288)
+    #define m_input_empty_addr (mbar_base + 296)
+    #define n_input_full_addr (mbar_base + 304)
+    #define n_input_empty_addr (mbar_base + 312)
+    #define z_acc_full_addr (mbar_base + 320)
+    #define z_acc_empty_addr (mbar_base + 328)
+    #define z_ready_full_addr (mbar_base + 336)
+    #define z_ready_empty_addr (mbar_base + 344)
+    #define m_acc_full_addr (mbar_base + 352)
+    #define m_acc_empty_addr (mbar_base + 360)
+    #define y_acc_full_addr (mbar_base + 368)
+    #define y_acc_empty_addr (mbar_base + 376)
+    #define y_ready_full_addr (mbar_base + 384)
+    #define y_ready_empty_addr (mbar_base + 392)
+    #define n_acc_full_addr (mbar_base + 400)
+    #define n_acc_empty_addr (mbar_base + 408)
+    #define done_full_addr (mbar_base + 416)
+    #define done_empty_addr (mbar_base + 424)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -214,7 +249,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
             mbarrier_init(smem + 416, 128);
             // done_empty: 1 barriers, init_count=128
             mbarrier_init(smem + 424, 128);
-            asm volatile("fence.mbarrier_init.release.cluster;");
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
@@ -231,41 +266,6 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    const int mbar_base = smem;
-    #define k_full_addr (mbar_base + 0)
-    #define k_empty_addr (mbar_base + 24)
-    #define v_full_addr (mbar_base + 48)
-    #define v_empty_addr (mbar_base + 72)
-    #define t_full_addr (mbar_base + 96)
-    #define t_empty_addr (mbar_base + 120)
-    #define alpha_full_addr (mbar_base + 144)
-    #define alpha_empty_addr (mbar_base + 176)
-    #define m_init_full_addr (mbar_base + 208)
-    #define m_init_empty_addr (mbar_base + 216)
-    #define n_init_full_addr (mbar_base + 224)
-    #define n_init_empty_addr (mbar_base + 232)
-    #define x_acc_full_addr (mbar_base + 240)
-    #define x_acc_empty_addr (mbar_base + 248)
-    #define x_ready_full_addr (mbar_base + 256)
-    #define x_ready_empty_addr (mbar_base + 272)
-    #define m_input_full_addr (mbar_base + 288)
-    #define m_input_empty_addr (mbar_base + 296)
-    #define n_input_full_addr (mbar_base + 304)
-    #define n_input_empty_addr (mbar_base + 312)
-    #define z_acc_full_addr (mbar_base + 320)
-    #define z_acc_empty_addr (mbar_base + 328)
-    #define z_ready_full_addr (mbar_base + 336)
-    #define z_ready_empty_addr (mbar_base + 344)
-    #define m_acc_full_addr (mbar_base + 352)
-    #define m_acc_empty_addr (mbar_base + 360)
-    #define y_acc_full_addr (mbar_base + 368)
-    #define y_acc_empty_addr (mbar_base + 376)
-    #define y_ready_full_addr (mbar_base + 384)
-    #define y_ready_empty_addr (mbar_base + 392)
-    #define n_acc_full_addr (mbar_base + 400)
-    #define n_acc_empty_addr (mbar_base + 408)
-    #define done_full_addr (mbar_base + 416)
-    #define done_empty_addr (mbar_base + 424)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -276,7 +276,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
     const int tmem_tmem_n_input = taddr + 384;
     const int tmem_tmem_xy_acc = taddr + 448;
 
-    // ---- Register redistribution for WGs split across roles ----
+    // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 72;");
@@ -349,8 +349,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                             "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
-                            : "r"(taddr + 448 + (unsigned int)row_base_0)
-                            : "memory");
+                            : "r"(taddr + 448 + (unsigned int)row_base_0));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         unsigned int packed[16];
                         #pragma unroll
@@ -381,7 +380,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                             #pragma unroll
                             for (int panel_1 = 0; panel_1 < 4; panel_1++) {
                                 float _tmem_load_2[32];
-                                tmem_ld_x32(&_tmem_load_2[0], taddr + (unsigned int)row_base_0_1 + (unsigned int)(panel_1 * 32));
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                    : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31])
+                                    : "r"(taddr + (unsigned int)row_base_0_1 + (unsigned int)(panel_1 * 32)));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 unsigned int packed_1[16];
                                 #pragma unroll
@@ -392,8 +395,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                                 asm volatile(
                                     "tcgen05.st.sync.aligned.32x32b.x16.b32"
                                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                                    :: "r"(taddr + 320 + (unsigned int)row_base_0_1 + (unsigned int)(panel_1 * 16)), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_1[15]))
-                                    : "memory");
+                                    :: "r"(taddr + 320 + (unsigned int)row_base_0_1 + (unsigned int)(panel_1 * 16)), "r"(packed_1[0]), "r"(packed_1[1]), "r"(packed_1[2]), "r"(packed_1[3]), "r"(packed_1[4]), "r"(packed_1[5]), "r"(packed_1[6]), "r"(packed_1[7]), "r"(packed_1[8]), "r"(packed_1[9]), "r"(packed_1[10]), "r"(packed_1[11]), "r"(packed_1[12]), "r"(packed_1[13]), "r"(packed_1[14]), "r"(packed_1[15]));
                             }
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         }
@@ -412,8 +414,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                                 "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[31]))
-                                : "r"(taddr + 256 + (unsigned int)row_base_0_2)
-                                : "memory");
+                                : "r"(taddr + 256 + (unsigned int)row_base_0_2));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             unsigned int packed_2[16];
                             #pragma unroll
@@ -424,8 +425,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                             asm volatile(
                                 "tcgen05.st.sync.aligned.16x128b.x8.b32"
                                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                                :: "r"(taddr + 320 + (unsigned int)row_base_0_2), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[15]))
-                                : "memory");
+                                :: "r"(taddr + 320 + (unsigned int)row_base_0_2), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_2[15])));
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         mbarrier_arrive(z_acc_empty_addr);
@@ -441,7 +441,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     #pragma unroll
                     for (int panel_2 = 0; panel_2 < 4; panel_2++) {
                         float _tmem_load_4[32];
-                        tmem_ld_x32(&_tmem_load_4[0], taddr + (unsigned int)row_base_0_3 + (unsigned int)(panel_2 * 32));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
+                            : "r"(taddr + (unsigned int)row_base_0_3 + (unsigned int)(panel_2 * 32)));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         const float2 _scale2_1 = {block_coeff_m, block_coeff_m};
                         #pragma unroll
@@ -463,7 +467,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                 #pragma unroll
                 for (int panel_3 = 0; panel_3 < 4; panel_3++) {
                     float _tmem_load_5[32];
-                    tmem_ld_x32(&_tmem_load_5[0], taddr + (unsigned int)row_base_0_4 + (unsigned int)(panel_3 * 32));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1]), "=f"(_tmem_load_5[2]), "=f"(_tmem_load_5[3]), "=f"(_tmem_load_5[4]), "=f"(_tmem_load_5[5]), "=f"(_tmem_load_5[6]), "=f"(_tmem_load_5[7]), "=f"(_tmem_load_5[8]), "=f"(_tmem_load_5[9]), "=f"(_tmem_load_5[10]), "=f"(_tmem_load_5[11]), "=f"(_tmem_load_5[12]), "=f"(_tmem_load_5[13]), "=f"(_tmem_load_5[14]), "=f"(_tmem_load_5[15]), "=f"(_tmem_load_5[16]), "=f"(_tmem_load_5[17]), "=f"(_tmem_load_5[18]), "=f"(_tmem_load_5[19]), "=f"(_tmem_load_5[20]), "=f"(_tmem_load_5[21]), "=f"(_tmem_load_5[22]), "=f"(_tmem_load_5[23]), "=f"(_tmem_load_5[24]), "=f"(_tmem_load_5[25]), "=f"(_tmem_load_5[26]), "=f"(_tmem_load_5[27]), "=f"(_tmem_load_5[28]), "=f"(_tmem_load_5[29]), "=f"(_tmem_load_5[30]), "=f"(_tmem_load_5[31])
+                        : "r"(taddr + (unsigned int)row_base_0_4 + (unsigned int)(panel_3 * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
                     for (int vector = 0; vector < 8; vector++) {
@@ -562,7 +570,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                         #pragma unroll
                         for (int panel_5 = 0; panel_5 < 4; panel_5++) {
                             float _tmem_load_8[32];
-                            tmem_ld_x32(&_tmem_load_8[0], taddr + 128 + (unsigned int)row_base_0_5 + (unsigned int)(panel_5 * 32));
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                : "=f"(_tmem_load_8[0]), "=f"(_tmem_load_8[1]), "=f"(_tmem_load_8[2]), "=f"(_tmem_load_8[3]), "=f"(_tmem_load_8[4]), "=f"(_tmem_load_8[5]), "=f"(_tmem_load_8[6]), "=f"(_tmem_load_8[7]), "=f"(_tmem_load_8[8]), "=f"(_tmem_load_8[9]), "=f"(_tmem_load_8[10]), "=f"(_tmem_load_8[11]), "=f"(_tmem_load_8[12]), "=f"(_tmem_load_8[13]), "=f"(_tmem_load_8[14]), "=f"(_tmem_load_8[15]), "=f"(_tmem_load_8[16]), "=f"(_tmem_load_8[17]), "=f"(_tmem_load_8[18]), "=f"(_tmem_load_8[19]), "=f"(_tmem_load_8[20]), "=f"(_tmem_load_8[21]), "=f"(_tmem_load_8[22]), "=f"(_tmem_load_8[23]), "=f"(_tmem_load_8[24]), "=f"(_tmem_load_8[25]), "=f"(_tmem_load_8[26]), "=f"(_tmem_load_8[27]), "=f"(_tmem_load_8[28]), "=f"(_tmem_load_8[29]), "=f"(_tmem_load_8[30]), "=f"(_tmem_load_8[31])
+                                : "r"(taddr + 128 + (unsigned int)row_base_0_5 + (unsigned int)(panel_5 * 32)));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             unsigned int packed_3[16];
                             #pragma unroll
@@ -573,8 +585,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x16.b32"
                                 " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                                :: "r"(taddr + 384 + (unsigned int)row_base_0_5 + (unsigned int)(panel_5 * 16)), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_3[15]))
-                                : "memory");
+                                :: "r"(taddr + 384 + (unsigned int)row_base_0_5 + (unsigned int)(panel_5 * 16)), "r"(packed_3[0]), "r"(packed_3[1]), "r"(packed_3[2]), "r"(packed_3[3]), "r"(packed_3[4]), "r"(packed_3[5]), "r"(packed_3[6]), "r"(packed_3[7]), "r"(packed_3[8]), "r"(packed_3[9]), "r"(packed_3[10]), "r"(packed_3[11]), "r"(packed_3[12]), "r"(packed_3[13]), "r"(packed_3[14]), "r"(packed_3[15]));
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
@@ -597,8 +608,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                             "tcgen05.ld.sync.aligned.16x256b.x8.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_9[31]))
-                            : "r"(taddr + 448 + (unsigned int)row_base_0_6)
-                            : "memory");
+                            : "r"(taddr + 448 + (unsigned int)row_base_0_6));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         float result[32];
                         #pragma unroll
@@ -645,8 +655,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x128b.x8.b32"
                             " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                            :: "r"(taddr + 384 + (unsigned int)row_base_0_6), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[15]))
-                            : "memory");
+                            :: "r"(taddr + 384 + (unsigned int)row_base_0_6), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[15])));
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(y_acc_empty_addr);
@@ -654,7 +663,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     #pragma unroll
                     for (int panel_6 = 0; panel_6 < 4; panel_6++) {
                         float _tmem_load_10[32];
-                        tmem_ld_x32(&_tmem_load_10[0], taddr + 128 + (unsigned int)row_base_0_7 + (unsigned int)(panel_6 * 32));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(_tmem_load_10[0]), "=f"(_tmem_load_10[1]), "=f"(_tmem_load_10[2]), "=f"(_tmem_load_10[3]), "=f"(_tmem_load_10[4]), "=f"(_tmem_load_10[5]), "=f"(_tmem_load_10[6]), "=f"(_tmem_load_10[7]), "=f"(_tmem_load_10[8]), "=f"(_tmem_load_10[9]), "=f"(_tmem_load_10[10]), "=f"(_tmem_load_10[11]), "=f"(_tmem_load_10[12]), "=f"(_tmem_load_10[13]), "=f"(_tmem_load_10[14]), "=f"(_tmem_load_10[15]), "=f"(_tmem_load_10[16]), "=f"(_tmem_load_10[17]), "=f"(_tmem_load_10[18]), "=f"(_tmem_load_10[19]), "=f"(_tmem_load_10[20]), "=f"(_tmem_load_10[21]), "=f"(_tmem_load_10[22]), "=f"(_tmem_load_10[23]), "=f"(_tmem_load_10[24]), "=f"(_tmem_load_10[25]), "=f"(_tmem_load_10[26]), "=f"(_tmem_load_10[27]), "=f"(_tmem_load_10[28]), "=f"(_tmem_load_10[29]), "=f"(_tmem_load_10[30]), "=f"(_tmem_load_10[31])
+                            : "r"(taddr + 128 + (unsigned int)row_base_0_7 + (unsigned int)(panel_6 * 32)));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         const float2 _scale2_0 = {block_coeff_n, block_coeff_n};
                         #pragma unroll
@@ -685,7 +698,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                 #pragma unroll
                 for (int panel_7 = 0; panel_7 < 4; panel_7++) {
                     float _tmem_load_11[32];
-                    tmem_ld_x32(&_tmem_load_11[0], taddr + 128 + (unsigned int)row_base_0_8 + (unsigned int)(panel_7 * 32));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_11[0]), "=f"(_tmem_load_11[1]), "=f"(_tmem_load_11[2]), "=f"(_tmem_load_11[3]), "=f"(_tmem_load_11[4]), "=f"(_tmem_load_11[5]), "=f"(_tmem_load_11[6]), "=f"(_tmem_load_11[7]), "=f"(_tmem_load_11[8]), "=f"(_tmem_load_11[9]), "=f"(_tmem_load_11[10]), "=f"(_tmem_load_11[11]), "=f"(_tmem_load_11[12]), "=f"(_tmem_load_11[13]), "=f"(_tmem_load_11[14]), "=f"(_tmem_load_11[15]), "=f"(_tmem_load_11[16]), "=f"(_tmem_load_11[17]), "=f"(_tmem_load_11[18]), "=f"(_tmem_load_11[19]), "=f"(_tmem_load_11[20]), "=f"(_tmem_load_11[21]), "=f"(_tmem_load_11[22]), "=f"(_tmem_load_11[23]), "=f"(_tmem_load_11[24]), "=f"(_tmem_load_11[25]), "=f"(_tmem_load_11[26]), "=f"(_tmem_load_11[27]), "=f"(_tmem_load_11[28]), "=f"(_tmem_load_11[29]), "=f"(_tmem_load_11[30]), "=f"(_tmem_load_11[31])
+                        : "r"(taddr + 128 + (unsigned int)row_base_0_8 + (unsigned int)(panel_7 * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
                     for (int vector_1 = 0; vector_1 < 8; vector_1++) {
@@ -746,7 +763,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -754,30 +771,38 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_scratch), "r"(_mma_b_lo_0), "r"(tmem_tmem_m_input), "r"(0));
                         mbarrier_wait(z_acc_empty_addr, _phase_z_acc_empty_0);
@@ -831,11 +856,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_tmem_m), "r"(1));
                     } else {
-                        int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x2000000) + (transfer_x_stage) * 1024);
+                        int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (transfer_x_stage) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -843,18 +868,22 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_m), "r"(_mma_b_lo_3), "r"(tmem_tmem_m_input), "r"(1));
                     }
@@ -1131,7 +1160,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1139,30 +1168,38 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 506;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_xy_acc), "r"(_mma_b_lo_5), "r"(tmem_tmem_n_input), "r"(0));
                     elect_commit(y_acc_full_addr);
@@ -1174,11 +1211,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     elect_commit(y_ready_empty_addr);
                     mbarrier_wait(n_acc_empty_addr, _phase_n_acc_empty_0);
                     _phase_n_acc_empty_0 ^= 1;
-                    int _mma_b_lo_7 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x2000000) + (state_x_stage) * 1024);
+                    int _mma_b_lo_7 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (state_x_stage) * 1024);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1186,18 +1223,22 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1(const __grid_constan
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_n), "r"(_mma_b_lo_7), "r"(tmem_tmem_n_input), "r"(1));
                     elect_commit(n_acc_full_addr);
