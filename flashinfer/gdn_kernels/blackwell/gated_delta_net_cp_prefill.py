@@ -2388,6 +2388,12 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tRT_tCcState = thr_state_r2t.partition_S(cState)
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, mS_init.element_type)
+        state_g2r_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyG2ROp(),
+            mS_init.element_type,
+            num_bits_per_copy=128,
+            invariant=True,
+        )
 
         if cutlass.const_expr(mS_indices is not None):
             state_idx = mS_indices[batch_idx]
@@ -2401,10 +2407,21 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tGR_tCrState.shape[2]):
             # 1. Load S_init state_dtype GMEM -> state_dtype registers
-            cute.autovec_copy(
-                tGR_tCgState[None, 0, sub],
+            state_src = tGR_tCgState[None, 0, sub]
+            state_src_ptr = state_src.iterator
+            state_src_aligned = cute.make_tensor(
+                cute.make_ptr(
+                    state_src_ptr.dtype,
+                    state_src_ptr.toint(),
+                    state_src_ptr.memspace,
+                    assumed_align=16,
+                ),
+                state_src.layout,
+            )
+            cute.copy(
+                state_g2r_atom,
+                state_src_aligned,
                 tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
             if cutlass.const_expr(self.acc_dtype != mS_init.element_type):
                 tRT_tCrState[None, 0, sub].store(
