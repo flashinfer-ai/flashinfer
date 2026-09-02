@@ -518,8 +518,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for block-scaled
-            quantized output. Unswapped FP4 scales use the native SM100 MMA
-            layout; other scaled outputs use compact row-major storage.
+            quantized output. Swapped compact scales use row-major storage;
+            all other scaled outputs use the native SM100 MMA layout.
         global_scale: Global scale factor for FP4 output quantization, shape
             (1,), float32.
         a_per_token_scale: Optional per-token row scale for operand A,
@@ -783,7 +783,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 permuted_m,
                 ((scale_intermediate_size + 15) // 16) * 16,
             )
-        elif swap_ab or c_dtype == "float4_e2m1fn":
+        else:
             expected_scale_shape = (
                 32,
                 4,
@@ -791,11 +791,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 4,
                 scale_intermediate_size // 4,
                 1,
-            )
-        else:
-            expected_scale_shape = (
-                permuted_m,
-                ((scale_intermediate_size + 15) // 16) * 16,
             )
         if out_scale is None:
             out_scale = torch.empty(

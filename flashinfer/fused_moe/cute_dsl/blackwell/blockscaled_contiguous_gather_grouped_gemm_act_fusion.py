@@ -1188,33 +1188,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 output_shape = (tokens, interm, rest_l) if self.swap_ab else c.shape
                 # (token, feature // sf_vec_size, L)
                 sfc_layout = compact_sf_layout(output_shape, self.sf_vec_size)
-            elif cutlass.const_expr(
-                self.c_dtype == cutlass.Float4E2M1FN or self.swap_ab
-            ):
+            else:
+                # ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL) layout.
                 output_shape = (tokens, interm, rest_l) if self.swap_ab else c.shape
-                # ((Atom_M, Rest_M), (Atom_K, Rest_K), RestL)
                 sfc_layout = blockscaled_layout.tile_atom_to_shape_SF(
                     output_shape, self.sf_vec_size
-                )
-            elif cutlass.const_expr(not self.swap_ab):
-                # MXFP8 FC2 stages compact row-major activation scales.
-                tokens, interm, restl = c.shape[0], c.shape[1], c.shape[2]
-                scale_k = interm // self.sf_vec_size
-                padded_scale_k = cute.round_up(scale_k, 16)
-                sfc_layout = cute.make_layout(
-                    (
-                        ((32, 4), tokens // 128),
-                        ((self.sf_vec_size, 4), scale_k // 4),
-                        (1, restl),
-                    ),
-                    stride=(
-                        (
-                            (padded_scale_k, 32 * padded_scale_k),
-                            128 * padded_scale_k,
-                        ),
-                        ((0, 1), 4),
-                        (0, tokens * padded_scale_k),
-                    ),
                 )
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
 
@@ -6650,7 +6628,7 @@ def create_output_tensors(
                 dtype=torch.uint8,
                 device=device,
             )
-        elif swap_ab or c_dtype is cutlass.Float4E2M1FN:
+        else:
             out_scale = torch.empty(
                 (
                     32,
@@ -6660,12 +6638,6 @@ def create_output_tensors(
                     intermediate_dim // (sf_vec_size * 4),
                     1,
                 ),
-                dtype=torch.uint8,
-                device=device,
-            )
-        else:
-            out_scale = torch.empty(
-                (valid_m, ((scale_k + 15) // 16) * 16),
                 dtype=torch.uint8,
                 device=device,
             )
