@@ -95,6 +95,14 @@ def test_cake_kda_portfolio_declares_caller_owned_pointer_tma_workspace():
     assert chain_spec.tma_abi == "pointer"
     assert chain_spec.tma_workspace_bytes == 7 * 128
 
+    n16_spec = cake_kda_jit_api.get_cake_kda_module_spec(
+        "sm103a",
+        "bounded_bf16_evolution",
+        "direct_m128_n16",
+    )
+    assert n16_spec.tma_abi == "pointer"
+    assert n16_spec.tma_workspace_bytes == 7 * 128
+
 
 def _valid_cake_kda_affine_selector_kwargs():
     return {
@@ -213,6 +221,8 @@ def _valid_cake_kda_shared_selector_kwargs(
         ((8192,), 96, True, "direct_vtile_m128_generic", 96),
         ((8192,), 64, True, "direct_m64_independent_value_split", 128),
         ((8192,), 32, True, "bt16_prepare_chain_bt16_chain_m64_s8", 64),
+        ((15, 14, 13, 12), 4, False, "direct_m128_n16", 16),
+        ((17, 33, 65), 96, False, "direct_m128_legacy_inverse", 288),
         ((1024,) * 8, 96, False, "persistent_vtile_m128_h96_six_task", 128),
         ((1024,) * 8, 64, False, "persistent_vtile_m128_h64", 128),
         ((1024,) * 8, 32, False, "direct_vtile_m128_generic", 256),
@@ -238,7 +248,6 @@ def _valid_cake_kda_shared_selector_kwargs(
             "direct_m128_h96_commit_order",
             576,
         ),
-        ((15, 14, 13, 12), 4, False, "direct_m128_generic", 16),
     ),
 )
 def test_cake_kda_shared_selector_reuses_variable_shape_physical_policies(

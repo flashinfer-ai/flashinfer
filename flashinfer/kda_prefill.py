@@ -884,6 +884,25 @@ def _select_cake_kda_bounded_evolution_route(
             grid_x=_FLASH_KDA_BT16_VALUE_SPLITS * num_sequences * num_heads,
             sequence_lengths=sequence_lengths,
         )
+    if source_route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
+        return _CakeKDABoundedEvolutionRoute(
+            target=target,
+            policy="direct_m128_n16",
+            sequence_order=sequence_order,
+            grid_x=num_sequences * num_heads,
+            sequence_lengths=sequence_lengths,
+        )
+    if (
+        source_route == _FLASH_KDA_ROUTE_DIRECT_M128
+        and max(sequence_lengths) < 256
+    ):
+        return _CakeKDABoundedEvolutionRoute(
+            target=target,
+            policy="direct_m128_legacy_inverse",
+            sequence_order=sequence_order,
+            grid_x=num_sequences * num_heads,
+            sequence_lengths=sequence_lengths,
+        )
 
     if fixed_layout or uniform_sequences:
         persistent_tasks = 1
@@ -1361,6 +1380,7 @@ def _cake_kda_direct_export_args(
     scale: float,
     lower_bound: float,
     grid_x: int,
+    tma_descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> tuple[object, ...]:
     use_checkpoints = checkpoint_every_n_tokens > 0
     state_checkpoints_tma = (
@@ -1422,6 +1442,7 @@ def _cake_kda_direct_export_args(
         num_sequences,
         state_checkpoints_tma,
         final_state_f32,
+        *((tma_descriptor_workspace,) if tma_descriptor_workspace is not None else ()),
         grid_x,
         1,
         1,
@@ -3945,6 +3966,24 @@ def _run_cake_kda_bounded_evolution(
             lower_bound=lower_bound,
         )
         return
+    if route.policy in {"direct_m128_legacy_inverse", "direct_m128_n16"}:
+        _run_cake_kda_bf16_direct_export(
+            route=route,
+            workspace=workspace,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            out=out,
+            scale=scale,
+            lower_bound=lower_bound,
+        )
+        return
 
     from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
@@ -4216,6 +4255,94 @@ def _run_cake_kda_bf16_bt16_prepare_chain(
         route.grid_x,
         1,
         1,
+    )
+
+
+def _run_cake_kda_bf16_direct_export(
+    *,
+    route: _CakeKDABoundedEvolutionRoute,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    lower_bound: float,
+) -> None:
+    """Launch one exact current-source BF16 direct schedule."""
+
+    from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
+
+    module = get_cake_kda_module(
+        route.target, "bounded_bf16_evolution", route.policy
+    )
+    spec = get_cake_kda_module_spec(
+        route.target, "bounded_bf16_evolution", route.policy
+    )
+    tma_workspace = _cake_kda_workspace_buffer(
+        workspace=workspace,
+        name=f"tma_descriptor_{spec.target}_{spec.family}_{spec.policy}",
+        device=q.device,
+        shape=(spec.tma_workspace_bytes,),
+        dtype=torch.uint8,
+    )
+    seq_order = _cached_int32_metadata(
+        device=q.device,
+        kind=f"cake_shared_{route.policy}_sequence_order",
+        values=route.sequence_order,
+    )
+    empty_bf16 = _dummy_bf16(q.device)
+    empty_f32 = _dummy_f32(q.device)
+    empty_i32 = _dummy_i32(q.device)
+    empty_i64 = _dummy_i64(q.device)
+    empty_u32 = _dummy_u32(q.device)
+    beta_tma = _cake_kda_beta_source(
+        beta,
+        workspace,
+        chunk_tokens=(16 if route.policy == "direct_m128_n16" else 32),
+    )
+    _run_cake_kda_direct_export(
+        module=module,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        beta_tma=beta_tma,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        seq_order=seq_order,
+        state_indices=empty_i32,
+        state_checkpoints=empty_bf16,
+        checkpoint_cu_starts=empty_i64,
+        checkpoint_every_n_tokens=0,
+        initial_state_bf16=initial_state,
+        out=out,
+        final_state_bf16=initial_state,
+        initial_state_f32=empty_f32,
+        final_state_f32=empty_f32,
+        empty_bf16=empty_bf16,
+        empty_f32=empty_f32,
+        empty_i32=empty_i32,
+        empty_i64=empty_i64,
+        empty_u32=empty_u32,
+        num_heads=q.shape[2],
+        num_sequences=len(route.sequence_lengths),
+        use_state_indices=False,
+        use_initial_state=True,
+        store_final_state=True,
+        state_slot_stride=initial_state.stride(0),
+        scale=scale,
+        lower_bound=lower_bound,
+        grid_x=route.grid_x,
+        tma_descriptor_workspace=tma_workspace,
     )
 
 

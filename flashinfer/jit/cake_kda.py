@@ -64,6 +64,8 @@ _EVOLUTION_POLICIES = {
     "bt16_chain_m64_s9",
     "direct_m128_generic",
     "direct_m128_h96_commit_order",
+    "direct_m128_legacy_inverse",
+    "direct_m128_n16",
     "persistent_m128_h64_lpt",
     "persistent_m128_h96_lpt",
     "direct_vtile_m128_generic",
