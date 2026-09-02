@@ -318,6 +318,7 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
+            "cute-dsl-prims",
         ],
         help="Kernel backends to test. Default: fa2. prims-ts selects the experimental task-scheduled Blackwell backend for all attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
@@ -1721,7 +1722,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = backend_wrappers_prims_ts
             resolved_backends[backend] = backend
             continue
-        if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa3", "auto", "trtllm-gen", "cute-dsl-prims"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
@@ -1825,6 +1826,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 out=out,
+            )
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                kv_cache,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -2558,7 +2567,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in [
+            "cutlass",
+            "fa2",
+            "fa3",
+            "trtllm-gen",
+            "cute-dsl-prims",
+        ]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -2699,6 +2714,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
