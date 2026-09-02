@@ -757,8 +757,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cute_dsl` | `CuteDslConfig` | `MXFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `W4A16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
-| `cutile_bf16` | `CuTileBf16Config` | `BF16` | `SwiGLU`, `ReLU2` |
-| `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4` | `SwiGLU`, `ReLU2` |
+| `cutile_bf16` | `CuTileBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_bf16` | `CutlassBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
