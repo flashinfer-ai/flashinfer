@@ -141,7 +141,14 @@ __global__ void __launch_bounds__(THREADS)
       token = tail_start + tail_offset;
       valid = tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
     }
-    valid = valid && token >= 0 && token < sequence_length;
+    // A selected block is meant to be one the query has already passed, which
+    // is what the selector's own visible count bounds it to. Nothing here had
+    // been checking it, though: the block id is the caller's, and the only
+    // bound it met was the sequence length. A block past the query would have
+    // expanded into tokens the query cannot see -- with a ratio of four, a
+    // query at position 3 selecting block 2 routes tokens 8 through 11. The
+    // route drops them rather than carry them.
+    valid = valid && token >= 0 && token <= query_position && token < sequence_length;
     row_out[static_cast<uint32_t>(column) * out_stride] =
         valid ? static_cast<IdType>(token) : IdType(-1);
   }
@@ -227,7 +234,10 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
         token = tail_start + tail_offset;
         valid = tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
       }
-      valid = valid && token >= 0 && token < sequence_length;
+      // Same causal bound as the standalone expansion above: a selected block
+      // the query has not reached would expand into tokens it cannot see, and
+      // the sequence length alone does not stop them.
+      valid = valid && token >= 0 && token <= query_position && token < sequence_length;
       if (!valid) token = -1;
       row_logical[col] = static_cast<IdType>(token);
     }
