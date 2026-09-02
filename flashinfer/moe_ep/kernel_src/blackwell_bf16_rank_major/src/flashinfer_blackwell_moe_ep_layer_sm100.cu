@@ -387,6 +387,8 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
                         unsigned* __local_arrival = pg_flags[0] + __arrival_base + __r;
                         while (true) {
                             unsigned __v;
+                            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
+                            if (__v != __arrival_epoch) continue;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
                             if (__v == __arrival_epoch) break;
                         }
@@ -400,6 +402,8 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
                 } else {
                     while (true) {
                         unsigned __v;
+                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
+                        if (__v != __release_epoch) continue;
                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
                         if (__v == __release_epoch) break;
                     }
@@ -3442,6 +3446,8 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
                         unsigned* __local_arrival = pg_flags[0] + __arrival_base + __r;
                         while (true) {
                             unsigned __v;
+                            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
+                            if (__v != __arrival_epoch) continue;
                             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
                             if (__v == __arrival_epoch) break;
                         }
@@ -3455,6 +3461,8 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
                 } else {
                     while (true) {
                         unsigned __v;
+                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
+                        if (__v != __release_epoch) continue;
                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
                         if (__v == __release_epoch) break;
                     }
