@@ -132,6 +132,28 @@ Every experimental feature must include:
 
 Experimental tests run in a separate CI lane and must pass for PRs that modify the feature.
 
+The PR declares which targets that lane runs, in a fenced `experimental-tests` block in the PR body (see `.github/pull_request_template.md`):
+
+```
+​```experimental-tests
+tests/experimental/test_my_backend.py
+​```
+```
+
+The declaration is required, and targets must live under `tests/experimental/`. Running the whole tree is permitted but gets slower and less relevant to any one change as the track grows, so authors should declare the narrowest scope that covers the change. `scripts/pr_checks/experimental_test_scope.py` parses and validates the block and emits a `TEST_PATH` (`--test-path`), the value both CI systems already accept — GitHub via the `run-ci` label or `@flashinfer-bot run`, GitLab via `/bot run TEST_PATH` — so neither lane reimplements the parsing, and a reviewer triggering a run by hand can paste the same value. Narrowing the scope reduces what runs within each GPU/toolkit matrix cell; it does not change the matrix itself.
+
+Both CI systems take the scope as an argument: GitLab as `/bot run TEST_PATH`, GitHub as `@flashinfer-bot run <paths>`. A parameterised GitHub run retargets the GPU lanes at those paths; `@flashinfer-bot run` with no arguments is unchanged.
+
+There is no arch selection, and none is needed: tests carry their own arch guards and skip themselves where unsupported, so a targeted run still spans the GPU matrix and the right subset executes on each runner. Narrowing the scope reduces what runs *within* each cell rather than which cells run — and no path-to-arch mapping has to be kept in sync with the tests.
+
+**CI runs what it is told, and does not read the declaration.** Turning a declared block into paths happens once, in whoever issues the trigger — a reviewer, or the screening watcher posting under its own identity with the declared scope. There is deliberately no second parser in the workflow: a reviewer who wants to run something else just says so, and the declaration stays the default rather than becoming a constraint.
+
+Because a `run-ci` label carries no payload, `ci-bot-commands.yml` — the one place that already parses this comment — publishes the requested paths as `ci/test-scope-N` commit statuses on the head SHA, and `pr-test.yml` reassembles them. A status description caps at 140 characters — only two or three real test paths (median 41, p90 60) — so the scope is chunked on target boundaries and rebuilt in index order. Indices start at 1 even for a single chunk, so there is one code path rather than a special case; when a scope shrinks, leftover chunks are updated to empty — there is no DELETE for statuses, but re-posting a context supersedes it — since they would otherwise leave stale trailing paths. Both sides read the *combined* status endpoint, which returns one entry per context already resolved to the latest, so nothing depends on the raw list's ordering. Nothing downstream re-reads comments, and keying on the SHA makes staleness structural: a new push is a new SHA with no scope status, so an old scope cannot be resurrected by re-labelling.
+
+The convention is deliberately the same on both systems — `@flashinfer-bot run <paths>` and `/bot run TEST_PATH` — with the status being an implementation detail of the GitHub side. That symmetry also means automation gets no privileged channel: a watcher triggering a screened PR types exactly what a reviewer would, so there is one path to test and no way for the two to drift.
+
+Requested targets are validated with the same rules as a declared scope — strict charset, must exist — but against a wider root (`tests/` rather than `tests/experimental/`), since a reviewer may legitimately want to run anything. Being authorised to trigger CI is not the same as a string being safe to hand to a shell, so the value is passed via `env`, never interpolated into script text, and read into an array with globbing disabled.
+
 Changes under `flashinfer.experimental` receive narrower review focused on eligibility, correctness, containment, licensing, and obvious safety or maintainability risks.
 
 Changes to core follow the normal core review process. Reviewers should verify that integration is explicit, stable behavior is unchanged by default, and backend-specific logic has not leaked into core.
