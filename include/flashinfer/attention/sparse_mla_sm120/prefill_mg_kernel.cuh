@@ -194,8 +194,6 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
-    for (int h = threadIdx.x; h < HPB; h += Cfg::MATH_THREADS) sm.m_smem[h] = -1e30f;
-
     float acc_o[CT::ACC_TILES][4];
 #pragma unroll
     for (int t = 0; t < CT::ACC_TILES; t++)
@@ -206,6 +204,10 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     constexpr bool V_ROPE = KV::V_HAS_ROPE;
     float acc_rope[V_ROPE ? 4 : 1] = {0.f};
     float warp_l[2] = {0.f, 0.f};
+    // Running row max for this thread's two heads, kept in registers: every
+    // math thread redundantly reduces the QK warps' per-warp maxima each tile,
+    // which removes one math-group barrier per tile vs a smem round-trip.
+    float m0 = -1e30f, m1 = -1e30f;
 
     bar_sync_t<2, Cfg::MATH_THREADS>();
     if (actual_ni > 0) mbarrier_wait_parity(sm.mbar_kv + 0, 0);
@@ -375,22 +377,20 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       }  // qk_warp
       bar_sync_t<2, Cfg::MATH_THREADS>();
 
-      if (threadIdx.x < HPB) {
-        int h = threadIdx.x;
-        float old_m = sm.m_smem[h], tm = -1e30f;
-        // Only the QK warps wrote a row max; slots past QK_WARPS are stale.
+      // Redundant per-thread reduction over the QK warps' row maxima. Every
+      // math thread holds heads gid and gid+8, so each reads QK_WARPS pairs
+      // and updates its own running max; identical ops on identical inputs
+      // keep this bitwise-equal to the old single-warp reduction.
+      float tm0 = -1e30f, tm1 = -1e30f;
 #pragma unroll
-        for (int w = 0; w < Cfg::QK_WARPS; w++) tm = fmaxf(tm, sm.reduce_buf[w * HPB + h]);
-        float nm = fmaxf(old_m, tm);
-        float alpha = exp2f(old_m - nm);
-        sm.m_smem[h] = nm;
-        sm.reduce_buf[h] = alpha;
-        sm.reduce_buf[HPB + h] = nm;
+      for (int w = 0; w < Cfg::QK_WARPS; w++) {
+        tm0 = fmaxf(tm0, sm.reduce_buf[w * HPB + gid]);
+        tm1 = fmaxf(tm1, sm.reduce_buf[w * HPB + gid + 8]);
       }
-      bar_sync_t<2, Cfg::MATH_THREADS>();
-
-      float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
-      float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
+      float nm0 = fmaxf(m0, tm0), nm1 = fmaxf(m1, tm1);
+      float alpha0 = exp2f(m0 - nm0), alpha1 = exp2f(m1 - nm1);
+      m0 = nm0;
+      m1 = nm1;
 
       if (alpha0 < 1.0f || alpha1 < 1.0f) {
 #pragma unroll
@@ -593,6 +593,13 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
       }
+    }
+
+    // Publish the register-resident row max for the sink-aware normalizer in
+    // the epilogue. Threads sharing a gid computed identical values.
+    if (tid == 0) {
+      sm.m_smem[gid] = m0;
+      sm.m_smem[gid + 8] = m1;
     }
 
     // ── Finalize deferred row_sum ────────────────────────────────
