@@ -3267,6 +3267,168 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
     replay_and_check(*res)
 
 
+def test_sparse_mla_sm120_runner_scratch_follows_routing(monkeypatch) -> None:
+    """Runner-internal split-K scratch is allocated only when the call routes
+    to a decode kernel, and is cached on the runner (grown on demand): with an
+    injected decode_max_tokens=8 crossover, T=16 routes to prefill and leaves
+    the scratch untouched, T=4/T=8 decode calls allocate and grow it, and a
+    smaller repeat call reuses the grown buffers."""
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, topk = 64, 512
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    sm_scale = d_qk**-0.5
+
+    # Inject the crossover table in-process and invalidate the planner memo.
+    dev_key = cpb_mod._device_key(device)
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    plan_mod._plan_memo.clear()
+
+    runner = sm._SparseMLAPagedAttentionRunner()
+
+    def call(num_tokens: int) -> None:
+        q = (
+            torch.randn(
+                num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        indices = torch.randint(
+            0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+        )
+        indices[:, topk // 2 :] = -1
+        ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        out_lse = runner.run(q, kv_packed, indices, output, sm_scale, return_lse=True)
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+    call(16)  # past the crossover: prefill-routed, no scratch allocated
+    assert runner._mid_out is None
+    assert runner._mid_lse is None
+
+    call(4)  # decode-routed: allocates the cached scratch
+    assert runner._mid_out is not None
+    small = runner._mid_out
+    assert small.shape[0] == 4
+
+    call(8)  # decode-routed, larger: the cache grows
+    assert runner._mid_out is not small
+    grown = runner._mid_out
+    assert grown.shape[0] == 8
+
+    call(4)  # fits the grown buffers: reused, not reallocated
+    assert runner._mid_out is grown
+
+    call(16)  # prefill-routed again: scratch untouched
+    assert runner._mid_out is grown
+
+
+def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> None:
+    """CUDA graph capture with runner-internal split-K scratch (dsv4, H=128,
+    topk=1024, T=8): the warmup calls allocate the cached buffers so capture
+    itself performs no scratch allocation, and replay on fresh data matches
+    the eager reference."""
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, topk = 128, 1024
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+    num_tokens = 8
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    sm_scale = d_qk**-0.5
+
+    # Pin the uncalibrated decode-first policy.
+    dev_key = cpb_mod._device_key(device)
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.delitem(cpb_mod._crossover, dev_key, raising=False)
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    plan_mod._plan_memo.clear()
+
+    runner = sm._SparseMLAPagedAttentionRunner()
+
+    def fresh_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+        q = (
+            torch.randn(
+                num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        indices = torch.randint(
+            0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+        )
+        indices[:, topk // 2 :] = -1
+        return q, indices
+
+    # Everything the replay path touches — static buffers, the fresh replay
+    # payload, and its eager reference — is allocated BEFORE capture: the
+    # captured call performs a small internal allocation whose block would
+    # otherwise be recycled into post-capture tensors that g.replay() then
+    # overwrites.
+    q_s, idx_s = fresh_inputs()
+    q_new, idx_new = fresh_inputs()
+    ref_out, ref_lse = _ref_sparse_attn(q_new, kv_dequant, idx_new, sm_scale, d_v)
+    out_s = torch.zeros(num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device)
+    lse_s = torch.zeros(num_tokens, num_heads, dtype=torch.float32, device=device)
+
+    def run() -> None:
+        runner.run(q_s, kv_packed, idx_s, out_s, sm_scale, out_lse=lse_s)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+    assert runner._mid_out is not None  # scratch allocated pre-capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+
+    q_s.copy_(q_new)
+    idx_s.copy_(idx_new)
+    out_s.zero_()
+    lse_s.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_s, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse_s, ref_lse, atol=5e-2, rtol=5e-2)
+
+
 # ── Envelope consistency: C++ accepts exactly what the planner claims ─────
 
 # (variant, model_type, num_heads, topk, page_block_size, has_extra)

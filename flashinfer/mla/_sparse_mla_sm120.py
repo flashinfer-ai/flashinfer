@@ -830,7 +830,8 @@ class _SparseMLAPagedAttentionRunner:
     both are provided, the wrapper pre-allocates its LSE buffer. Otherwise, the
     buffer is allocated lazily and grown as needed. Decode split-K scratch may be
     supplied by the caller via ``run(mid_out=..., mid_lse=...)``; if omitted for
-    a decode-sized call, this wrapper allocates temporary scratch.
+    a call that dispatches to a decode kernel, the wrapper allocates the scratch
+    and caches it on the instance, growing it on demand.
 
     Parameters
     ----------
@@ -891,6 +892,14 @@ class _SparseMLAPagedAttentionRunner:
         self._max_num_tokens = max_num_tokens
         self._max_num_heads = max_num_heads
         self._d_v = d_v
+
+        # Internally-owned decode split-K scratch, allocated on the first
+        # decode-routed call and grown on demand. Held for the runner's
+        # lifetime: scratch freed after run() returns its block to the
+        # allocator, where a later CUDA graph capture can recycle it while an
+        # older captured graph still replays into it.
+        self._mid_out: Optional[torch.Tensor] = None
+        self._mid_lse: Optional[torch.Tensor] = None
 
         self._out_lse: Optional[torch.Tensor] = None
         if max_num_tokens is not None and max_num_heads is not None:
@@ -967,7 +976,9 @@ class _SparseMLAPagedAttentionRunner:
             num_heads,
             topk,
             model_type,
-            _packed_kv_page_block_size(kv_cache, model_type=model_type, name="kv_cache"),
+            _packed_kv_page_block_size(
+                kv_cache, model_type=model_type, name="kv_cache"
+            ),
             extra_kv_cache is not None,
             _normalize_prefill_impl(prefill_impl),
             q.device,
@@ -977,18 +988,27 @@ class _SparseMLAPagedAttentionRunner:
             return None, None
 
         num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
-        scratch_heads = _decode_scratch_heads(num_heads)
-        mid_out = torch.empty(
-            (num_tokens, scratch_heads, num_splits, self._d_v),
-            dtype=torch.bfloat16,
-            device=q.device,
+        need_out: tuple[int, ...] = (
+            num_tokens,
+            _decode_scratch_heads(num_heads),
+            num_splits,
+            self._d_v,
         )
-        mid_lse = torch.empty(
-            (num_tokens, scratch_heads, num_splits),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        return mid_out, mid_lse
+        if (
+            self._mid_out is None
+            or self._mid_out.device != q.device
+            or any(self._mid_out.size(d) < need_out[d] for d in range(4))
+        ):
+            if self._mid_out is not None and self._mid_out.device == q.device:
+                # Grow-only per dim so smaller later calls keep the buffers.
+                need_out = tuple(
+                    max(self._mid_out.size(d), need_out[d]) for d in range(4)
+                )
+            self._mid_out = torch.empty(need_out, dtype=torch.bfloat16, device=q.device)
+            self._mid_lse = torch.empty(
+                need_out[:3], dtype=torch.float32, device=q.device
+            )
+        return self._mid_out, self._mid_lse
 
     # The runner owns out_lse internally so no separate template is needed.
     def run(
@@ -1021,7 +1041,9 @@ class _SparseMLAPagedAttentionRunner:
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
         a singleton s_q dim); the 4-D form is squeezed in place. Calls that
-        dispatch to a decode kernel must pass ``mid_out`` and ``mid_lse``.
+        dispatch to a decode kernel consume split-K scratch: caller-supplied
+        via ``mid_out``/``mid_lse`` when given, otherwise buffers cached on
+        the runner.
 
         ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
         the prefill-kernel selection for calls that dispatch to prefill;
@@ -1055,7 +1077,13 @@ class _SparseMLAPagedAttentionRunner:
             )
 
         mid_out, mid_lse = self._maybe_allocate_decode_scratch(
-            q, kv_cache, indices, extra_kv_cache, extra_indices, mid_out, mid_lse,
+            q,
+            kv_cache,
+            indices,
+            extra_kv_cache,
+            extra_indices,
+            mid_out,
+            mid_lse,
             prefill_impl,
         )
 
@@ -1087,7 +1115,10 @@ class _SparseMLAPagedAttentionRunner:
 # - Construct once and hold persistently (e.g. per framework attention layer).
 #   The constructor pre-allocates the LSE buffer from the ``max_num_tokens`` /
 #   ``max_num_heads`` upper bounds, so construction must complete before CUDA
-#   graph capture; steady-state ``run()`` calls then allocate nothing.
+#   graph capture. Internally-cached decode scratch is allocated on the first
+#   decode-routed call of each new maximum shape, so warm up every captured
+#   shape (or pass caller scratch) before capture; steady-state ``run()``
+#   calls then allocate nothing.
 # - ``run()`` is the single entry point. There is no separate plan stage;
 #   dispatch decisions are made internally per call and memoized.
 # - ``d_v`` and ``kv_scale_format`` are fixed at construction and select the
