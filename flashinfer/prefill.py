@@ -36,6 +36,7 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
 )
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
@@ -1510,29 +1511,44 @@ def _compute_page_mask_indptr(
     return mask_indptr
 
 
-def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
-    """Whether split-KV must be disabled because the KV cache is NVFP4.
+# Architectures on which the NVFP4 split-KV corruption was actually observed. Keep this as narrow
+# as the evidence: every target added here pays the gate on low-batch decode. Measured on SM90 at
+# batch 1, qo_len 1, head_dim 128, page_size 16, bf16: 3.98x at kv_len 8192, 8.14x at kv_len 32768.
+_NVFP4_SPLIT_KV_BROKEN_ARCHS = ((12, 0), (12, 1))
+
+
+def _nvfp4_kv_requires_disabled_split_kv(
+    kv_data_type: torch.dtype, device: torch.device
+) -> bool:
+    """Whether split-KV must be disabled because the KV cache is NVFP4 on an affected arch.
 
     This gate is an *empirical workaround*: with split-KV (flash-decoding)
     enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
     a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
     and prefix-cache extend), while dense full-prefill was unaffected.
-    Disabling split-KV removes the corruption, and decode-throughput
-    measurements showed no cost from the gate.
+    Disabling split-KV removes the corruption.
 
     The root cause has not been confirmed. The FP8 scale-factor blocks
     themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
     *head-dim* elements of a single token, whereas split-KV partitions the
     *token* axis, so a split boundary never slices a scale block. The current
     hypothesis (unconfirmed) is that the small per-split KV chunks interact
-    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
-    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
-    FP8 and 16-bit KV caches are unaffected and keep split-KV.
+    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path.
+
+    The corruption was only ever reported on SM120/121, alongside the
+    asymmetric VO-split NVFP4 paged prefill path added for those targets, so
+    the gate is scoped to them. Pre-SM100 has no native FP4 conversion, so
+    every such target runs the same generic 1-byte-KV FA2 path; on that path
+    split-KV yields output indistinguishable from the gated result. Review
+    reproduced that on SM90 as well, over symmetric ``head_dim`` 128, the
+    asymmetric 512/256 path and a needle retrieval swept across split
+    boundaries, with the gate-on/gate-off difference staying at output-dtype
+    rounding scale. FP8 and 16-bit KV caches were never gated and keep split-KV
+    everywhere.
     """
-    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
-        return True
-    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
-    return native_fp4 is not None and kv_data_type == native_fp4
+    if not _is_nvfp4_kv_dtype(kv_data_type):
+        return False
+    return get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -2631,7 +2647,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type
+                    kv_data_type, self.device
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
                     # when qo_len << kv_len (decode / prefix-cache extend); see
@@ -3991,7 +4007,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type
+                    kv_data_type, self.device
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
                     # when qo_len << kv_len (decode / prefix-cache extend); see
