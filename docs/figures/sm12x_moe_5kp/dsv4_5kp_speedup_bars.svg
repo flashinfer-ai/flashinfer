@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="90" y="32" font-family="Arial" font-size="22" font-weight="700" fill="#0f172a">DSv4 Flash 5kp speedup by token count</text>
+<text x="90" y="58" font-family="Arial" font-size="13" fill="#475569">Metric: (DeepGEMM median / FlashInfer median - 1) * 100%; plotted TP: 1/2/4</text>
+<text x="90" y="72.00" font-family="Arial" font-size="16" font-weight="700" fill="#0f172a">Prefill tokens={2048,4096,8192,16384}</text>
+<line x1="90" y1="327.48" x2="920" y2="327.48" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="88.00" x2="90" y2="353.00" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="353.00" x2="920" y2="353.00" stroke="#e2e8f0"/>
+<text x="80" y="357.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">-4%</text>
+<line x1="90" y1="286.75" x2="920" y2="286.75" stroke="#e2e8f0"/>
+<text x="80" y="290.75" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">7%</text>
+<line x1="90" y1="220.50" x2="920" y2="220.50" stroke="#e2e8f0"/>
+<text x="80" y="224.50" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">17%</text>
+<line x1="90" y1="154.25" x2="920" y2="154.25" stroke="#e2e8f0"/>
+<text x="80" y="158.25" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">28%</text>
+<line x1="90" y1="88.00" x2="920" y2="88.00" stroke="#e2e8f0"/>
+<text x="80" y="92.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">39%</text>
+<text x="193.75" y="377.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">2048</text>
+<rect x="127.51" y="244.22" width="36.48" height="83.27" fill="#0f766e"/>
+<text x="145.75" y="239.22" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+13.6%</text>
+<rect x="175.51" y="235.07" width="36.48" height="92.41" fill="#2563eb"/>
+<text x="193.75" y="230.07" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+15.1%</text>
+<rect x="223.51" y="196.66" width="36.48" height="130.82" fill="#c2410c"/>
+<text x="241.75" y="191.66" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+21.3%</text>
+<text x="401.25" y="377.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">4096</text>
+<rect x="335.01" y="314.11" width="36.48" height="13.38" fill="#0f766e"/>
+<text x="353.25" y="309.11" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+2.2%</text>
+<rect x="383.01" y="294.59" width="36.48" height="32.89" fill="#2563eb"/>
+<text x="401.25" y="289.59" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+5.4%</text>
+<rect x="431.01" y="193.65" width="36.48" height="133.83" fill="#c2410c"/>
+<text x="449.25" y="188.65" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+21.8%</text>
+<text x="608.75" y="377.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">8192</text>
+<rect x="542.51" y="287.66" width="36.48" height="39.82" fill="#0f766e"/>
+<text x="560.75" y="282.66" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+6.5%</text>
+<rect x="590.51" y="276.37" width="36.48" height="51.11" fill="#2563eb"/>
+<text x="608.75" y="271.37" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+8.3%</text>
+<rect x="638.51" y="244.34" width="36.48" height="83.14" fill="#c2410c"/>
+<text x="656.75" y="239.34" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+13.6%</text>
+<text x="816.25" y="377.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">16384</text>
+<rect x="750.01" y="288.95" width="36.48" height="38.53" fill="#0f766e"/>
+<text x="768.25" y="283.95" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+6.3%</text>
+<rect x="798.01" y="282.20" width="36.48" height="45.28" fill="#2563eb"/>
+<text x="816.25" y="277.20" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+7.4%</text>
+<rect x="846.01" y="261.52" width="36.48" height="65.96" fill="#c2410c"/>
+<text x="864.25" y="256.52" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+10.8%</text>
+<text x="90" y="409.00" font-family="Arial" font-size="16" font-weight="700" fill="#0f172a">Decode tokens={1,8,16,32}</text>
+<line x1="90" y1="664.48" x2="920" y2="664.48" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="425.00" x2="90" y2="690.00" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="690.00" x2="920" y2="690.00" stroke="#e2e8f0"/>
+<text x="80" y="694.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">-4%</text>
+<line x1="90" y1="623.75" x2="920" y2="623.75" stroke="#e2e8f0"/>
+<text x="80" y="627.75" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">7%</text>
+<line x1="90" y1="557.50" x2="920" y2="557.50" stroke="#e2e8f0"/>
+<text x="80" y="561.50" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">17%</text>
+<line x1="90" y1="491.25" x2="920" y2="491.25" stroke="#e2e8f0"/>
+<text x="80" y="495.25" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">28%</text>
+<line x1="90" y1="425.00" x2="920" y2="425.00" stroke="#e2e8f0"/>
+<text x="80" y="429.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">39%</text>
+<text x="193.75" y="714.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">1</text>
+<rect x="127.51" y="443.28" width="36.48" height="221.21" fill="#0f766e"/>
+<text x="145.75" y="438.28" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+36.0%</text>
+<rect x="175.51" y="583.30" width="36.48" height="81.18" fill="#2563eb"/>
+<text x="193.75" y="578.30" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+13.2%</text>
+<rect x="223.51" y="664.48" width="36.48" height="7.24" fill="#c2410c"/>
+<text x="241.75" y="685.72" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">-1.2%</text>
+<text x="401.25" y="714.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">8</text>
+<rect x="335.01" y="573.18" width="36.48" height="91.31" fill="#0f766e"/>
+<text x="353.25" y="568.18" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+14.9%</text>
+<rect x="383.01" y="593.55" width="36.48" height="70.93" fill="#2563eb"/>
+<text x="401.25" y="588.55" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+11.6%</text>
+<rect x="431.01" y="471.20" width="36.48" height="193.29" fill="#c2410c"/>
+<text x="449.25" y="466.20" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+31.5%</text>
+<text x="608.75" y="714.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">16</text>
+<rect x="542.51" y="571.40" width="36.48" height="93.09" fill="#0f766e"/>
+<text x="560.75" y="566.40" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+15.2%</text>
+<rect x="590.51" y="578.33" width="36.48" height="86.15" fill="#2563eb"/>
+<text x="608.75" y="573.33" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+14.0%</text>
+<rect x="638.51" y="572.69" width="36.48" height="91.80" fill="#c2410c"/>
+<text x="656.75" y="567.69" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+15.0%</text>
+<text x="816.25" y="714.00" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">32</text>
+<rect x="750.01" y="547.22" width="36.48" height="117.26" fill="#0f766e"/>
+<text x="768.25" y="542.22" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+19.1%</text>
+<rect x="798.01" y="541.45" width="36.48" height="123.03" fill="#2563eb"/>
+<text x="816.25" y="536.45" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+20.1%</text>
+<rect x="846.01" y="503.53" width="36.48" height="160.95" fill="#c2410c"/>
+<text x="864.25" y="498.53" font-family="Arial" font-size="10" text-anchor="middle" fill="#334155">+26.2%</text>
+<text x="505.0" y="738" font-family="Arial" font-size="13" text-anchor="middle" fill="#334155">Token number</text>
+<text transform="translate(22,380.0) rotate(-90)" font-family="Arial" font-size="13" text-anchor="middle" fill="#334155">Speedup (%)</text>
+<text x="960" y="88" font-family="Arial" font-size="15" font-weight="700" fill="#0f172a">Legend</text>
+<rect x="960" y="108" width="20" height="14" fill="#0f766e"/>
+<text x="990" y="120" font-family="Arial" font-size="12" fill="#334155">TP1</text>
+<rect x="960" y="134" width="20" height="14" fill="#2563eb"/>
+<text x="990" y="146" font-family="Arial" font-size="12" fill="#334155">TP2</text>
+<rect x="960" y="160" width="20" height="14" fill="#c2410c"/>
+<text x="990" y="172" font-family="Arial" font-size="12" fill="#334155">TP4</text>
+</svg>
