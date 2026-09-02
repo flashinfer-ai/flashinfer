@@ -101,7 +101,7 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     ),
     "register_tile16_warp": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_register_tile16_warp.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_register_tile16_warp",
+        symbol="kernel_cake_kda_packed_t1_register_tile16_warp",
         value_tiles=8,
         threads=32,
         smem_bytes=0,
@@ -240,7 +240,6 @@ def _get_binding_cu(metadata: CakeKDAPackedT1VariantMetadata) -> str:
  * Licensed under the Apache License, Version 2.0.
  */
 
-#define CAKE_KDA_PACKED_T1_BODY_FILE "{metadata.body}"
 #define CAKE_KDA_PACKED_T1_KERNEL {metadata.symbol}
 #define CAKE_KDA_PACKED_T1_VALUE_TILES {metadata.value_tiles}
 #define CAKE_KDA_PACKED_T1_THREADS {metadata.threads}
@@ -277,7 +276,7 @@ def gen_cake_kda_packed_t1_module(
     write_if_different(binding, _get_binding_cu(metadata))
     spec = gen_kda_jit_spec(
         name=uri,
-        sources=[binding],
+        sources=[body, binding],
         target=target,
         target_define=(
             "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND="
