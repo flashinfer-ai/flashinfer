@@ -114,6 +114,16 @@ def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     )
 
 
+def test_barrier_flag_pad_covers_release_and_rank_zero_arrival_words():
+    module = _session_module()
+
+    assert module._BARRIER_PHASES == 2
+    assert module._BARRIER_SLOTS_PER_RANK == 18
+    assert module._BARRIER_SLOTS_PER_RANK == module._BARRIER_PHASES * (
+        module._WORLD_SIZE + 1
+    )
+
+
 @pytest.mark.parametrize(
     ("tokens", "route_blocks", "gemm_y"),
     ((1, 1, 32), (4, 1, 35), (5, 2, 36), (127, 32, 158), (128, 32, 512)),

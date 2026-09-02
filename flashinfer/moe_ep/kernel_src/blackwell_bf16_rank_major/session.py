@@ -18,6 +18,8 @@ from filelock import FileLock
 
 
 _WORLD_SIZE = 8
+_BARRIER_PHASES = 2
+_BARRIER_SLOTS_PER_RANK = _BARRIER_PHASES * (_WORLD_SIZE + 1)
 _TOKENS_PER_RANK = 128
 _RANK_MAJOR_TOKENS = _WORLD_SIZE * _TOKENS_PER_RANK
 _HIDDEN_SIZE = 7168
@@ -733,7 +735,10 @@ class BlackwellBf16RankMajorSession:
             group_name=name,
         )
         self._flags = _alloc_symmetric(
-            (2,), torch.uint32, device=self._device, group_name=name
+            (_BARRIER_SLOTS_PER_RANK,),
+            torch.uint32,
+            device=self._device,
+            group_name=name,
         )
         self._flags.local.zero_()
 
