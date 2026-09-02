@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Measure ReplaySSM prefix materialization with a fixed, full launch grid.
+"""Measure ReplaySSM prefix materialization with a persistent launch grid.
 
-The materializer launches one CTA per ``(request, layer, head)``.  Serving
-uses CUDA graphs or avoids a host-side compaction of flushing requests, so the
-launch grid can cover the entire decode batch even when nearly every request
-has ``flush_count == -1``.  This benchmark measures that case directly.
+The materializer uses a fixed CTA pool which grid-strides over the logical
+``(request, layer, head)`` grid. Serving uses CUDA graphs or avoids a host-side
+compaction of flushing requests, so the logical grid can cover the entire
+decode batch even when nearly every request has ``flush_count == -1``. This
+benchmark measures that case directly.
 
 The default shape is the proposed Nemotron-v4 full-model shape:
 ``batch=256, layers=48, heads=256, dim=64, dstate=128``.  It is 3,145,728
-CTAs.  Cache storage is deliberately allocated only for active requests:
+logical work items. Cache storage is deliberately allocated only for active requests:
 inactive requests return before dereferencing a cache pointer, so this is
 equivalent to the full-grid no-op path without requiring a production-sized
 state pool.
@@ -21,7 +22,11 @@ Examples:
 
   # A smaller exploratory sweep.
   python benchmarks/bench_replayssm_materialize.py --batch 32 --layers 48 \
-      --heads 256 --active-requests 0 1
+      --heads 256 --active-requests 0 1 2
+
+  # Override the distributed default positions for the first two active requests.
+  python benchmarks/bench_replayssm_materialize.py --active-requests 0 1 2 \
+      --active-request-indices 17 191
 
   # Full active batch without allocating per-layer state. Outputs intentionally
   # race and are invalid; this is a launch-cost experiment only.
@@ -63,6 +68,23 @@ def _stride_table(tensor: torch.Tensor, logical_layers: int) -> torch.Tensor:
     )
 
 
+def _active_indices(
+    batch: int, active_requests: int, requested_indices: list[int] | None
+) -> list[int]:
+    if active_requests == 0:
+        return []
+    if requested_indices is None:
+        # Spread flushes across the decode batch. This deliberately avoids
+        # rewarding an implementation that happens to front- or back-load work.
+        return [(2 * i + 1) * batch // (2 * active_requests) for i in range(active_requests)]
+    if len(requested_indices) < active_requests:
+        raise ValueError("active-request-indices needs one entry per active request")
+    indices = requested_indices[:active_requests]
+    if len(set(indices)) != len(indices) or any(index < 0 or index >= batch for index in indices):
+        raise ValueError("active-request-indices must be unique indices in [0, batch)")
+    return indices
+
+
 def _build_call(
     *,
     batch: int,
@@ -74,6 +96,7 @@ def _build_call(
     max_window: int,
     flush_count: int,
     active_requests: int,
+    requested_indices: list[int] | None,
     alias_layers: bool,
 ):
     if not 0 <= active_requests <= batch:
@@ -82,6 +105,7 @@ def _build_call(
         raise ValueError("flush_count must be in [0, max_window]")
     if heads % heads_per_group:
         raise ValueError("heads must be divisible by heads_per_group")
+    active_indices = _active_indices(batch, active_requests, requested_indices)
 
     # One source slot plus one unique destination per active request.  An
     # inactive request never reads these buffers, because the CUDA kernel
@@ -126,13 +150,17 @@ def _build_call(
     src_slots = torch.zeros((layers, batch), device="cuda", dtype=torch.int32)
     dst_slots = torch.zeros_like(src_slots)
     if active_requests:
+        active_indices_tensor = torch.tensor(
+            active_indices, device="cuda", dtype=torch.int64
+        )
         destinations = torch.arange(
             1, active_requests + 1, device="cuda", dtype=torch.int32
         )
-        dst_slots[:, :active_requests] = destinations.unsqueeze(0)
+        dst_slots[:, active_indices_tensor] = destinations.unsqueeze(0)
     ring_start = torch.zeros(batch, device="cuda", dtype=torch.int32)
     counts = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
-    counts[:active_requests] = flush_count
+    if active_requests:
+        counts[active_indices_tensor] = flush_count
 
     state_ptrs = _pointer_table(state, layers)
     state_slot_strides = _stride_table(state, layers)
@@ -177,7 +205,7 @@ def _build_call(
         )
 
     # Retain all backing tensors and GPU-resident launch tables in the callable.
-    return run
+    return run, active_indices
 
 
 def _timing_kwargs(args: argparse.Namespace) -> dict[str, object]:
@@ -216,8 +244,17 @@ def main() -> None:
         "--active-requests",
         type=int,
         nargs="+",
-        default=[0, 1],
-        help="number of requests with non-negative flush count (default: 0 1)",
+        default=[0, 1, 2],
+        help="number of requests with non-negative flush count (default: 0 1 2)",
+    )
+    parser.add_argument(
+        "--active-request-indices",
+        type=int,
+        nargs="+",
+        help=(
+            "request positions for active flushes; each sweep entry takes the first N "
+            "positions, otherwise they are spread through the batch"
+        ),
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -230,13 +267,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ctas = args.batch * args.layers * args.heads
+    work_items = args.batch * args.layers * args.heads
     print(
         f"ReplaySSM materialize: B={args.batch}, L={args.layers}, H={args.heads}, "
-        f"grid={ctas:,} CTAs, timing={args.timing}, alias_layers={args.alias_layers}"
+        f"logical_grid={work_items:,} items, timing={args.timing}, "
+        f"alias_layers={args.alias_layers}"
     )
     for active_requests in args.active_requests:
-        run = _build_call(
+        run, active_indices = _build_call(
             batch=args.batch,
             layers=args.layers,
             heads=args.heads,
@@ -246,6 +284,7 @@ def main() -> None:
             max_window=args.max_window,
             flush_count=args.flush_count,
             active_requests=active_requests,
+            requested_indices=args.active_request_indices,
             alias_layers=args.alias_layers,
         )
         measurements = bench_gpu_time(run, **_timing_kwargs(args))
@@ -253,6 +292,7 @@ def main() -> None:
         stdev_us = statistics.pstdev(measurements) * 1000
         print(
             f"active_requests={active_requests:3d}, "
+            f"indices={active_indices}, "
             f"flush_count={args.flush_count if active_requests else -1:2d}: "
             f"median {median_us:9.2f} us, std {stdev_us:7.2f} us"
         )

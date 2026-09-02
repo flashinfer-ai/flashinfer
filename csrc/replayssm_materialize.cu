@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 #include "tvm_ffi_utils.h"
@@ -40,9 +42,28 @@ struct MaterializeParams {
   int batch, layers, heads, ring_buffer_len;
 };
 
+__device__ __forceinline__ void advance_persistent_coordinates(
+    int64_t& work, int& request, int& layer, int& head, int work_stride, int request_delta,
+    int layer_delta, int head_delta, int layers, int heads) {
+  work += work_stride;
+  head += head_delta;
+  if (head >= heads) {
+    head -= heads;
+    ++layer;
+  }
+  layer += layer_delta;
+  if (layer >= layers) {
+    layer -= layers;
+    ++request;
+  }
+  request += request_delta;
+}
+
 // Normal-state path: preserves the current SSU replay representation and
 // invokes its force-inlined tensor-core recurrence.  The only new addressing
-// is layer-table resolution and separate src/dst slots.
+// is layer-table resolution and separate src/dst slots.  A fixed CTA pool
+// walks the logical (request, layer, head) grid so an almost-empty decode
+// batch does not launch one CTA for every no-op item.
 template <typename T>
 __global__ void materialize_replay_kernel(MaterializeParams p) {
   constexpr int NUM_WARPS = 4;
@@ -55,107 +76,138 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
       CheckpointingSsuStorage<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE>>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
-  int const request = blockIdx.x, layer = blockIdx.y, head = blockIdx.z;
-  int const count = p.flush_count[request];
-  if (count < 0) return;
-  int const table = layer * p.batch + request;
-  int const src_slot = p.src_slots[table], dst_slot = p.dst_slots[table];
-  if (src_slot < 0 || dst_slot < 0 || count > MAX_WINDOW) return;
   int const lane = threadIdx.x, warp = threadIdx.y, tid = warp * warpSize + lane;
-  int const group = head / HEADS_PER_GROUP;
-  auto const* state = reinterpret_cast<T const*>(p.state_ptrs[layer]);
-  auto* state_dst = reinterpret_cast<T*>(p.state_ptrs[layer]);
-  int64_t const state_src_base =
-      int64_t(src_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
-  int64_t const state_dst_base =
-      int64_t(dst_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
-  if (count == 0) {
-    for (int i = tid; i < DIM * DSTATE; i += blockDim.x * blockDim.y)
-      state_dst[state_dst_base + i] = state[state_src_base + i];
-    if (p.scale_ptrs[layer] != 0 && tid < DIM) {
-      auto const* scales = reinterpret_cast<float const*>(p.scale_ptrs[layer]);
-      auto* dst_scales = reinterpret_cast<float*>(p.scale_ptrs[layer]);
-      int64_t const scale_src =
-          int64_t(src_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
-      int64_t const scale_dst =
-          int64_t(dst_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
-      dst_scales[scale_dst + tid] = scales[scale_src + tid];
+  int64_t const work_items = int64_t(p.batch) * p.layers * p.heads;
+  int64_t work = blockIdx.x;
+  int head = work % p.heads;
+  int64_t request_layer = work / p.heads;
+  int layer = request_layer % p.layers;
+  int request = request_layer / p.layers;
+  int const work_stride = gridDim.x;
+  int const head_delta = work_stride % p.heads;
+  int64_t const request_layer_delta = work_stride / p.heads;
+  int const layer_delta = request_layer_delta % p.layers;
+  int const request_delta = request_layer_delta / p.layers;
+  int cached_request = -1, count = -1;
+  while (work < work_items) {
+    if (request != cached_request) {
+      count = p.flush_count[request];
+      cached_request = request;
     }
-    return;
-  }
-  load_state_per_warp<T, DIM, DSTATE, NUM_WARPS>(smem, state, state_src_base, warp, lane);
-  auto const* x = reinterpret_cast<input_t const*>(p.x_ptrs[layer]);
-  auto const* b = reinterpret_cast<input_t const*>(p.b_ptrs[layer]);
-  auto const* dt = reinterpret_cast<float const*>(p.dt_ptrs[layer]);
-  int const start = p.ring_start[request];
-  CheckpointingSsuParams view{};
-  view.dt_cache = const_cast<float*>(dt);
-  view.dt_cache_stride_seq = p.dt_slot_strides[layer];
-  view.dt_cache_stride_head = p.ring_buffer_len;
-  view.ring_buffer_len = p.ring_buffer_len;
-  using XShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DIM>>;
-  using BShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
-  // Match checkpointing_ssu's replay load exactly: all four warps issue the
-  // redundant cache gathers, then consume the completed cp.async group.
-  load_ring_tile_async<XShape, MAX_WINDOW>(
-      smem.old_x,
-      x + int64_t(src_slot) * p.x_slot_strides[layer] + int64_t(head) * p.ring_buffer_len * DIM,
-      DIM, lane, start, p.ring_buffer_len, count);
-  load_ring_tile_async<BShape, MAX_WINDOW>(
-      smem.old_B,
-      b + int64_t(src_slot) * p.b_slot_strides[layer] + int64_t(group) * p.ring_buffer_len * DSTATE,
-      DSTATE, lane, start, p.ring_buffer_len, count);
-  float const a = reinterpret_cast<matrixA_t const*>(p.a_ptrs[layer])[head];
-  // Match checkpointing_ssu's warp scan exactly.  In particular it scans dt
-  // then multiplies by A, rather than serially accumulating A * dt.
-  load_old_dt_cumAdt(view, lane, src_slot, start, head, count, a, smem.old_dt, smem.old_cumAdt);
-  __pipeline_commit();
-  __pipeline_wait_prior(0);
-  __syncthreads();
-  int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *p.rand_seed : 0;
-  if constexpr (sizeof(T) == 1) {
-    // The existing int8/fp8 replay uses a two-pass encode.  Reuse both
-    // passes, with the source scale read independently from the destination
-    // scale that pass 1 writes.
-    view.state = state_dst;
-    view.state_stride_seq = p.state_slot_strides[layer];
-    view.state_scale = reinterpret_cast<void*>(p.scale_ptrs[layer]);
-    view.state_scale_stride_seq = p.scale_slot_strides[layer];
-    auto tiled_mma_chain =
-        cute::make_tiled_mma(cute::MMA_Atom<cute::MMA_Traits<checkpointing::MMA_prop::AtomK16>>{},
-                             cute::Layout<cute::Shape<cute::_4, cute::_1>>{});
-    auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
-    auto id_dxt = cute::make_identity_tensor(
-        cute::make_shape(cute::Int<DIM>{}, cute::Int<SmemT::NPREDICTED_PAD_MMA_M>{}));
-    cute::Tensor frag_y_dxt = thr_mma_chain.partition_fragment_C(id_dxt);
-    cute::clear(frag_y_dxt);
-    float encode_scale_per_row[2];
-    float total_scale[2];
-    auto const* source_scale = reinterpret_cast<float const*>(p.scale_ptrs[layer]) +
-                               int64_t(src_slot) * p.scale_slot_strides[layer] +
-                               int64_t(head) * DIM;
-    replay_state_mma_8bit_chain<input_t, T, DIM, DIM, DSTATE, SmemT, decltype(frag_y_dxt), true>(
-        smem, view, warp, lane, count, /*d_tile=*/0, dst_slot, head,
-        /*must_checkpoint=*/true, frag_y_dxt, encode_scale_per_row, total_scale, source_scale);
-    encode_state_replay_8bit<input_t, T, DIM, DIM, DSTATE, PHILOX_ROUNDS>(
-        smem, view, warp, lane, count, /*d_tile=*/0, dst_slot, head, encode_scale_per_row,
-        total_scale, rand_seed, state_dst_base);
+    if (count < 0) {
+      advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
+                                     layer_delta, head_delta, p.layers, p.heads);
+      continue;
+    }
+    int64_t const table = int64_t(layer) * p.batch + request;
+    int const src_slot = p.src_slots[table], dst_slot = p.dst_slots[table];
+    if (src_slot < 0 || dst_slot < 0 || count > MAX_WINDOW) {
+      advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
+                                     layer_delta, head_delta, p.layers, p.heads);
+      continue;
+    }
+    int const group = head / HEADS_PER_GROUP;
+    auto const* state = reinterpret_cast<T const*>(p.state_ptrs[layer]);
+    auto* state_dst = reinterpret_cast<T*>(p.state_ptrs[layer]);
+    int64_t const state_src_base =
+        int64_t(src_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
+    int64_t const state_dst_base =
+        int64_t(dst_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
+    if (count == 0) {
+      for (int i = tid; i < DIM * DSTATE; i += blockDim.x * blockDim.y)
+        state_dst[state_dst_base + i] = state[state_src_base + i];
+      if (p.scale_ptrs[layer] != 0 && tid < DIM) {
+        auto const* scales = reinterpret_cast<float const*>(p.scale_ptrs[layer]);
+        auto* dst_scales = reinterpret_cast<float*>(p.scale_ptrs[layer]);
+        int64_t const scale_src =
+            int64_t(src_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
+        int64_t const scale_dst =
+            int64_t(dst_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
+        dst_scales[scale_dst + tid] = scales[scale_src + tid];
+      }
+      advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
+                                     layer_delta, head_delta, p.layers, p.heads);
+      continue;
+    }
+    load_state_per_warp<T, DIM, DSTATE, NUM_WARPS>(smem, state, state_src_base, warp, lane);
+    auto const* x = reinterpret_cast<input_t const*>(p.x_ptrs[layer]);
+    auto const* b = reinterpret_cast<input_t const*>(p.b_ptrs[layer]);
+    auto const* dt = reinterpret_cast<float const*>(p.dt_ptrs[layer]);
+    int const start = p.ring_start[request];
+    CheckpointingSsuParams view{};
+    view.dt_cache = const_cast<float*>(dt);
+    view.dt_cache_stride_seq = p.dt_slot_strides[layer];
+    view.dt_cache_stride_head = p.ring_buffer_len;
+    view.ring_buffer_len = p.ring_buffer_len;
+    using XShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DIM>>;
+    using BShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
+    // Match checkpointing_ssu's replay load exactly: all four warps issue the
+    // redundant cache gathers, then consume the completed cp.async group.
+    load_ring_tile_async<XShape, MAX_WINDOW>(
+        smem.old_x,
+        x + int64_t(src_slot) * p.x_slot_strides[layer] + int64_t(head) * p.ring_buffer_len * DIM,
+        DIM, lane, start, p.ring_buffer_len, count);
+    load_ring_tile_async<BShape, MAX_WINDOW>(
+        smem.old_B,
+        b + int64_t(src_slot) * p.b_slot_strides[layer] + int64_t(group) * p.ring_buffer_len * DSTATE,
+        DSTATE, lane, start, p.ring_buffer_len, count);
+    float const a = reinterpret_cast<matrixA_t const*>(p.a_ptrs[layer])[head];
+    // Match checkpointing_ssu's warp scan exactly.  In particular it scans dt
+    // then multiplies by A, rather than serially accumulating A * dt.
+    load_old_dt_cumAdt(view, lane, src_slot, start, head, count, a, smem.old_dt, smem.old_cumAdt);
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
     __syncthreads();
-    store_state<T, DIM, DIM, DSTATE, NUM_WARPS>(smem, view, warp, lane, /*d_tile=*/0, head,
-                                                dst_slot);
-  } else {
-    replay_state_mma<input_t, T, DIM, DIM, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
-        smem, view, warp, lane, count, /*d_tile=*/0, state_dst_base, state_dst + state_dst_base,
-        rand_seed, /*must_checkpoint=*/true);
-    // replay_state_mma partitions state by N, while store_state partitions it
-    // by D.  Preserve checkpointing_ssu's cross-warp handoff barrier.
-    __syncthreads();
-    if constexpr (!(PHILOX_ROUNDS > 0 && std::is_same_v<T, __half>)) {
+    int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *p.rand_seed : 0;
+    if constexpr (sizeof(T) == 1) {
+      // The existing int8/fp8 replay uses a two-pass encode.  Reuse both
+      // passes, with the source scale read independently from the destination
+      // scale that pass 1 writes.
       view.state = state_dst;
       view.state_stride_seq = p.state_slot_strides[layer];
+      view.state_scale = reinterpret_cast<void*>(p.scale_ptrs[layer]);
+      view.state_scale_stride_seq = p.scale_slot_strides[layer];
+      auto tiled_mma_chain =
+          cute::make_tiled_mma(cute::MMA_Atom<cute::MMA_Traits<checkpointing::MMA_prop::AtomK16>>{},
+                               cute::Layout<cute::Shape<cute::_4, cute::_1>>{});
+      auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
+      auto id_dxt = cute::make_identity_tensor(
+          cute::make_shape(cute::Int<DIM>{}, cute::Int<SmemT::NPREDICTED_PAD_MMA_M>{}));
+      cute::Tensor frag_y_dxt = thr_mma_chain.partition_fragment_C(id_dxt);
+      cute::clear(frag_y_dxt);
+      float encode_scale_per_row[2];
+      float total_scale[2];
+      auto const* source_scale = reinterpret_cast<float const*>(p.scale_ptrs[layer]) +
+                                 int64_t(src_slot) * p.scale_slot_strides[layer] +
+                                 int64_t(head) * DIM;
+      replay_state_mma_8bit_chain<input_t, T, DIM, DIM, DSTATE, SmemT, decltype(frag_y_dxt), true>(
+          smem, view, warp, lane, count, /*d_tile=*/0, dst_slot, head,
+          /*must_checkpoint=*/true, frag_y_dxt, encode_scale_per_row, total_scale, source_scale);
+      encode_state_replay_8bit<input_t, T, DIM, DIM, DSTATE, PHILOX_ROUNDS>(
+          smem, view, warp, lane, count, /*d_tile=*/0, dst_slot, head, encode_scale_per_row,
+          total_scale, rand_seed, state_dst_base);
+      __syncthreads();
       store_state<T, DIM, DIM, DSTATE, NUM_WARPS>(smem, view, warp, lane, /*d_tile=*/0, head,
                                                   dst_slot);
+    } else {
+      replay_state_mma<input_t, T, DIM, DIM, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
+          smem, view, warp, lane, count, /*d_tile=*/0, state_dst_base, state_dst + state_dst_base,
+          rand_seed, /*must_checkpoint=*/true);
+      // replay_state_mma partitions state by N, while store_state partitions it
+      // by D.  Preserve checkpointing_ssu's cross-warp handoff barrier.
+      __syncthreads();
+      if constexpr (!(PHILOX_ROUNDS > 0 && std::is_same_v<T, __half>)) {
+        view.state = state_dst;
+        view.state_stride_seq = p.state_slot_strides[layer];
+        store_state<T, DIM, DIM, DSTATE, NUM_WARPS>(smem, view, warp, lane, /*d_tile=*/0, head,
+                                                    dst_slot);
+      }
     }
+    // The next grid-stride item reuses shared memory. The preceding store is
+    // partitioned across warps, so wait for every warp before overwriting it.
+    __syncthreads();
+    advance_persistent_coordinates(work, request, layer, head, work_stride, request_delta,
+                                   layer_delta, head_delta, p.layers, p.heads);
   }
 }
 
@@ -255,10 +307,10 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   FLASHINFER_CHECK(num_layers > 0, "num_layers must be positive");
   FLASHINFER_CHECK(num_heads > 0, "num_heads must be positive");
   constexpr int64_t kIntMax = std::numeric_limits<int>::max();
-  FLASHINFER_CHECK(flush_count.size(0) <= kIntMax, "batch must fit in int");
+  FLASHINFER_CHECK(flush_count.size(0) > 0 && flush_count.size(0) <= kIntMax,
+                   "batch must be in [1, INT_MAX]");
   FLASHINFER_CHECK(num_layers <= kIntMax, "num_layers must fit in int");
   FLASHINFER_CHECK(ring_buffer_len <= kIntMax, "ring_buffer_len must fit in int");
-  FLASHINFER_CHECK(num_heads <= 65535, "num_heads exceeds CUDA grid.z limit (65535)");
   auto check_layer_table = [num_layers](TensorView const& table, char const* name) {
     FLASHINFER_CHECK(table.size(0) == num_layers, name, " size must equal num_layers");
   };
@@ -312,13 +364,32 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
       int(ring_buffer_len)};
   ffi::CUDADeviceGuard device_guard(state_ptrs.device().device_id);
   const cudaStream_t stream = get_stream(state_ptrs.device());
-  dim3 grid(p.batch, p.layers, p.heads);
+  int64_t const work_items = int64_t(p.batch) * p.layers * p.heads;
   constexpr size_t smem =
       sizeof(std::conditional_t < sizeof(state_t) == 1,
              CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
              CheckpointingSsuStorage < input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE >>);
   FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(materialize_replay_kernel<state_t>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  constexpr int kThreadsPerCta = warpSize * 4;
+  int device = 0, sm_count = 0, blocks_per_sm = 0;
+  FLASHINFER_CUDA_CHECK(cudaGetDevice(&device));
+  FLASHINFER_CUDA_CHECK(
+      cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  FLASHINFER_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm, materialize_replay_kernel<state_t>, kThreadsPerCta, smem));
+  int64_t const persistent_ctas = int64_t(sm_count) * blocks_per_sm;
+  FLASHINFER_CHECK(persistent_ctas > 0, "ReplaySSM materialize has no resident CTA configuration");
+  dim3 grid(work_items < persistent_ctas ? int(work_items) : int(persistent_ctas));
+  if (std::getenv("FLASHINFER_REPLAYSSM_MATERIALIZE_VERBOSE")) {
+    static bool reported = false;
+    if (!reported) {
+      std::fprintf(stderr,
+                   "ReplaySSM persistent launch: SMs=%d, blocks/SM=%d, CTAs=%u, logical_items=%lld\n",
+                   sm_count, blocks_per_sm, grid.x, static_cast<long long>(work_items));
+      reported = true;
+    }
+  }
   materialize_replay_kernel<state_t><<<grid, dim3(warpSize, 4), smem, stream>>>(p);
   FLASHINFER_CUDA_CHECK(cudaGetLastError());
 }
