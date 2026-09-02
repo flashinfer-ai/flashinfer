@@ -16,13 +16,18 @@
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
 #include <cstdint>
+
+// CUDA 12 and earlier: cuda::fast_mod_div is available in <cuda/cmath>.
+// CUDA 13+ renamed it to cub::detail::fast_div_mod (internal header).
+// We use the public CUDA 12 API when available and fall back to plain division otherwise.
+#if (__CUDACC_VER_MAJOR__ < 13)
 #include <cuda/cmath>
+#endif
 
 namespace flashinfer {
 
-// API-compatible wrapper around cuda::fast_mod_div<uint32_t>.
-// Preserves the default constructor, implicit conversions, and divmod()
-// method expected by existing call sites throughout the attention kernels.
+#if (__CUDACC_VER_MAJOR__ < 13)
+// CUDA 12 path: use cuda::fast_mod_div for hardware-accelerated division.
 struct uint_fastdiv {
   __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
 
@@ -39,6 +44,25 @@ struct uint_fastdiv {
   cuda::fast_mod_div<uint32_t> impl_;
   uint32_t d_;
 };
+#else
+// CUDA 13+ path: cuda::fast_mod_div was removed. Fall back to plain division.
+struct uint_fastdiv {
+  __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
+
+  __host__ __device__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
+
+  __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
+
+  __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t& q, uint32_t& r) const {
+    q = n / impl_;
+    r = n - q * d_;
+  }
+
+ private:
+  uint32_t impl_;
+  uint32_t d_;
+};
+#endif
 
 __host__ __device__ __forceinline__ uint32_t operator/(const uint32_t n,
                                                        const uint_fastdiv& divisor) {
