@@ -760,9 +760,16 @@ __device__ __forceinline__ void finalize_m_(typename KTraits::AttentionVariant v
   }
 }
 
+// Split-KV merge, run by every CTA after the grid-wide sync. A CTA owns `len`
+// packed rows; row `i` has one partial state per KV chunk at partial offsets
+// `partial_offset_start + i`, `+ stride`, `+ 2 * stride`, ... The CTA's threads
+// form NUM_GROUPS groups of one HEAD_DIM_CKV row each. When there are fewer
+// rows than groups (decode with few heads), the groups of a row take
+// interleaved partials and combine through shared memory; the merge is bound
+// by L2 latency, so each group keeps MERGE_BATCH partial loads in flight.
 template <typename KTraits>
 __device__ void DevicePersistentMergeStates(
-    typename KTraits::IdType* merge_packed_offset_start,
+    uint8_t* smem, typename KTraits::IdType* merge_packed_offset_start,
     typename KTraits::IdType* merge_packed_offset_end,
     typename KTraits::IdType* merge_partial_packed_offset_start,
     typename KTraits::IdType* merge_partial_packed_offset_end,
@@ -770,40 +777,98 @@ __device__ void DevicePersistentMergeStates(
     float* partial_lse, typename KTraits::DTypeO* final_o, float* final_lse,
     const uint32_t o_stride_n, const uint32_t o_stride_h, const uint_fastdiv& num_heads,
     const bool& return_lse_base_on_e) {
+  constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
   constexpr uint32_t VEC_SIZE = 8;  // partial o has data type float
-  constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
-  constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
+  constexpr uint32_t NUM_THRS_PER_ROW = HEAD_DIM_CKV / VEC_SIZE;
+  constexpr uint32_t NUM_GROUPS = KTraits::NUM_THREADS / NUM_THRS_PER_ROW;
+  constexpr uint32_t MERGE_BATCH = 8;
+  static_assert(
+      KTraits::NUM_THREADS % NUM_THRS_PER_ROW == 0 && (NUM_GROUPS & (NUM_GROUPS - 1)) == 0,
+      "merge groups must be a power of two");
+  struct GroupState {
+    alignas(16) float o[HEAD_DIM_CKV];
+    float m;
+    float d;
+  };
+  GroupState* group_states = reinterpret_cast<GroupState*>(smem);
+
   const uint32_t cta_idx = (gridDim.x * blockIdx.y + blockIdx.x);
   const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+  const uint32_t group_idx = thread_id / NUM_THRS_PER_ROW;
+  const uint32_t vec_idx = thread_id % NUM_THRS_PER_ROW;
   const uint32_t offset_start = merge_packed_offset_start[cta_idx];
   const uint32_t len = merge_packed_offset_end[cta_idx] - offset_start;
   const uint32_t partial_offset_start = merge_partial_packed_offset_start[cta_idx];
   const uint32_t partial_offset_end = merge_partial_packed_offset_end[cta_idx];
   const uint32_t stride = merge_partial_stride[cta_idx];
+  if (len == 0) return;
+
+  // Rows are merged rows_per_iter at a time (a power of two, at most NUM_GROUPS);
+  // the groups_per_row groups sharing a row split its partials.
+  uint32_t rows_per_iter = 1;
+  while (rows_per_iter * 2 <= min(len, NUM_GROUPS)) rows_per_iter *= 2;
+  const uint32_t groups_per_row = NUM_GROUPS / rows_per_iter;
+  const uint32_t row_in_iter = group_idx / groups_per_row;
+  const uint32_t slice = group_idx % groups_per_row;
+
 #pragma unroll 1
-  for (uint32_t local_packed_offset = thread_id / NUM_THRS_PER_ROW; local_packed_offset < len;
-       local_packed_offset += ROWS_PER_ITERATION) {
-    uint32_t final_packed_offset = offset_start + local_packed_offset;
-    uint32_t q, r;
-    num_heads.divmod(final_packed_offset, q, r);
+  for (uint32_t row_base = 0; row_base < len; row_base += rows_per_iter) {
+    const uint32_t local_row = row_base + row_in_iter;
+    const bool has_row = local_row < len;
     state_t<VEC_SIZE> st;
-#pragma unroll 8
-    for (uint32_t partial_packed_offset = partial_offset_start + local_packed_offset;
-         partial_packed_offset < partial_offset_end; partial_packed_offset += stride) {
-      vec_t<float, VEC_SIZE> o_partial;
-      float lse_partial;
-      o_partial.cast_load(partial_o + partial_packed_offset * KTraits::HEAD_DIM_CKV +
-                          (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE);
-      lse_partial = partial_lse[partial_packed_offset];
-      st.merge(o_partial, lse_partial, 1);
+    if (has_row) {
+      const uint32_t partial_step = groups_per_row * stride;
+#pragma unroll 1
+      for (uint32_t partial_offset = partial_offset_start + local_row + slice * stride;
+           partial_offset < partial_offset_end; partial_offset += MERGE_BATCH * partial_step) {
+        vec_t<float, VEC_SIZE> o_partial[MERGE_BATCH];
+        float lse_partial[MERGE_BATCH];
+#pragma unroll
+        for (uint32_t b = 0; b < MERGE_BATCH; ++b) {
+          const uint32_t p = partial_offset + b * partial_step;
+          if (p < partial_offset_end) {
+            o_partial[b].cast_load(partial_o + p * HEAD_DIM_CKV + vec_idx * VEC_SIZE);
+            lse_partial[b] = partial_lse[p];
+          }
+        }
+#pragma unroll
+        for (uint32_t b = 0; b < MERGE_BATCH; ++b) {
+          if (partial_offset + b * partial_step < partial_offset_end) {
+            st.merge(o_partial[b], lse_partial[b], 1.f);
+          }
+        }
+      }
     }
-    st.normalize();
-    st.o.cast_store(final_o +
-                    (q * o_stride_n + r * o_stride_h + (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE));
-    if (final_lse) {
-      final_lse[q * num_heads + r] = st.get_lse();
-      if (return_lse_base_on_e) {
-        final_lse[q * num_heads + r] *= math::loge2;
+
+    if (groups_per_row > 1) {
+      if (has_row && slice > 0) {
+        st.o.store(group_states[group_idx].o + vec_idx * VEC_SIZE);
+        if (vec_idx == 0) {
+          group_states[group_idx].m = st.m;
+          group_states[group_idx].d = st.d;
+        }
+      }
+      __syncthreads();
+      if (has_row && slice == 0) {
+#pragma unroll 1
+        for (uint32_t other_slice = 1; other_slice < groups_per_row; ++other_slice) {
+          const GroupState& other = group_states[group_idx + other_slice];
+          vec_t<float, VEC_SIZE> other_o;
+          other_o.load(other.o + vec_idx * VEC_SIZE);
+          st.merge(other_o, other.m, other.d);
+        }
+      }
+      __syncthreads();
+    }
+
+    if (has_row && slice == 0) {
+      st.normalize();
+      uint32_t q, r;
+      num_heads.divmod(offset_start + local_row, q, r);
+      st.o.cast_store(final_o + (q * o_stride_n + r * o_stride_h + vec_idx * VEC_SIZE));
+      if (final_lse && vec_idx == 0) {
+        final_lse[q * num_heads + r] =
+            return_lse_base_on_e ? st.get_lse() * math::loge2 : st.get_lse();
       }
     }
   }
@@ -1207,7 +1272,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
   // the second stage, merge partial outputs
   DevicePersistentMergeStates<KTraits>(
-      params.merge_packed_offset_start, params.merge_packed_offset_end,
+      smem, params.merge_packed_offset_start, params.merge_packed_offset_end,
       params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
       params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
       o_stride_h, num_heads, params.return_lse_base_on_e);

@@ -1420,7 +1420,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   __syncthreads();
   // the second stage, merge partial outputs
   DevicePersistentMergeStates<KTraits>(
-      params.merge_packed_offset_start, params.merge_packed_offset_end,
+      smem, params.merge_packed_offset_start, params.merge_packed_offset_end,
       params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
       params.merge_partial_stride, params.partial_o, params.partial_lse, params.final_o,
       params.final_lse, params.o_stride_n, params.o_stride_h, params.num_heads,

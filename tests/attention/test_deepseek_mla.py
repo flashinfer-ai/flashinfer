@@ -796,6 +796,25 @@ def test_batch_mla_narrow_q_tile(
     )
 
 
+# Long-context decode splits the KV cache over every SM (128 partial states per
+# query row here), so the merge runs its batched, multi-group path.
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_long_context_decode(num_heads, causal, backend):
+    test_batch_mla_page_attention(
+        batch_size=1,
+        kv_len=65536,
+        qo_len=1,
+        num_heads=num_heads,
+        causal=causal,
+        page_size=64,
+        backend=backend,
+        use_cuda_graph=False,
+        dtype=torch.bfloat16,
+    )
+
+
 @pytest.mark.parametrize("num_heads", [8, 16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1, 16])
