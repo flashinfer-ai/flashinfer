@@ -107,8 +107,10 @@ def main():
 
     # Replayed from a graph. The smallest shapes here run in a few microseconds,
     # which is the same order as a launch, so timing them one launch at a time
-    # measures the launch as much as the kernel.
-    print(f"{'rows':>6} {'heads':>6} {'head_dim':>9} {'columns':>8} {'us':>9}")
+    # measures the launch as much as the kernel. Warm cache: a step scores
+    # several rows against the same pages, which is what the kernel is shaped
+    # for, and the replays leave the cache alone.
+    print(f"{'rows':>6} {'heads':>6} {'head_dim':>9} {'columns':>8} {'warm us':>9}")
     for rows, num_heads, head_dim, columns, num_requests in SHAPES:
         run = build(
             rows,
@@ -124,6 +126,11 @@ def main():
             run,
             use_cuda_graph=True,
             num_iters_within_graph=args.iters_within_graph,
+            # The closure holds its own tensors, so the helper has nothing to
+            # rotate and cannot cold the cache between replays. Said here
+            # rather than left to the default, which would disable itself with
+            # a warning and read as a cold measurement.
+            cold_l2_cache=False,
         )
         print(
             f"{rows:>6} {num_heads:>6} {head_dim:>9} {columns:>8} "

@@ -49,9 +49,14 @@ def _load_sparse_scores_module():
 
 
 def get_sparse_scores_module(device: Optional[torch.device] = None):
-    _check_sparse_scores_capability(
-        torch.device(device) if device is not None else torch.device("cuda")
-    )
+    resolved = torch.device(device) if device is not None else torch.device("cuda")
+    if resolved.type == "cuda" and resolved.index is None:
+        # `cuda` with no index resolves through whichever device is current at
+        # the time, but it is one cache key. On a host whose GPUs differ, the
+        # first answer would then stand for every later one -- which is the
+        # thing keying on the device is here to prevent.
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    _check_sparse_scores_capability(resolved)
     return _load_sparse_scores_module()
 
 
