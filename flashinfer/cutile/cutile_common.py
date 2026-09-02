@@ -134,10 +134,15 @@ def is_cuda_tile_available(device=None) -> bool:
         import torch
 
         if torch.cuda.is_available():
-            # Avoid get_device_capability before CUDA init — creates a context (#4889).
-            if not torch.cuda.is_initialized():
-                return True
-            major, minor = torch.cuda.get_device_capability(device)
+            if torch.cuda.is_initialized():
+                major, minor = torch.cuda.get_device_capability(device)
+            else:
+                # torch.cuda.get_device_capability would create a CUDA context
+                # here (#4889); NVML reports the same capability without one.
+                from ..compilation_context import get_visible_device_capabilities
+
+                idx = getattr(device, "index", device) or 0
+                major, minor = get_visible_device_capabilities()[idx]
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False
