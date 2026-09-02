@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a).
+"""Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a; the same
+source compiles for sm_103a and Rubin sm_107a — it uses only family-portable
+ops, no tcgen05 / block-scaled MMA — and the compile target follows the current
+device).
 
 Sample-calibrated threshold ladders for exact single-pass top-K: the kernel
 derives its selection threshold from an in-kernel sample of the row itself

@@ -31,9 +31,9 @@ Backend choices
                        or Rubin sm_107), nvidia-cutlass-dsl, and a
                        ``pre_idx`` hint from the previous decode step.
 ``"gvr_2"``          — self-sampling GVR V2 (sample-calibrated threshold
-                       ladders; TRT-LLM PR #17821 port). Requires datacenter
-                       Blackwell (sm_100/103), nvidia-cutlass-dsl, ``pre_idx``,
-                       and fp32 logits.
+                       ladders; TRT-LLM PR #17821 port). Requires a datacentre
+                       Blackwell-class GPU (sm_100/103, or Rubin sm_107),
+                       nvidia-cutlass-dsl, ``pre_idx``, and fp32 logits.
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
@@ -227,7 +227,7 @@ def _gvr2_top_k_varlen_check(
     Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
     explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
     """
-    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+    if not (_cute_dsl_ready(logits.device) and pre_idx is not None):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
     # follow-up (run_varlen raises on any other dtype).
@@ -1335,7 +1335,9 @@ def top_k_varlen(
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
-    backend: Literal["radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"] = "auto",
+    backend: Literal[
+        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"
+    ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1403,7 +1405,8 @@ def top_k_varlen(
         ``"gvr_2"``         — self-sampling GVR V2 (TRT-LLM PR #17821 port):
                               sample-calibrated threshold ladders, exact
                               tie-interchangeable top-K, one launch per batch.
-                              Datacenter Blackwell (sm_100/103) only; requires
+                              Datacentre Blackwell-class only (sm_100/103, or
+                              Rubin sm_107); requires
                               ``pre_idx`` (hints steer sampling, never
                               exactness) and fp32 logits;
                               ``top_k`` in {512, 1024, 2048}. ``load_balance``

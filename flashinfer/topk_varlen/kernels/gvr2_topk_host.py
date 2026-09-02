@@ -136,6 +136,11 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
+    # 148 is the B200 SM count, baked in by the upstream CUDA dispatch (route()
+    # is a pure mirror of it). It only steers occupancy heuristics (one-wave
+    # tests, split factors, cluster sizing), never correctness: on Rubin
+    # (SM107, 208 SMs) the same constants are merely conservative. Retuning
+    # per-arch is a perf follow-up, not a functional requirement.
     wide = b <= 148
 
     # ======================= register-resident block ========================
