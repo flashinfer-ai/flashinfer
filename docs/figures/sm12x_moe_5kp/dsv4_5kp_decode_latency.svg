@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="620" viewBox="0 0 1180 620">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="90" y="32" font-family="Arial" font-size="22" font-weight="700" fill="#0f172a">DSv4 Flash 5kp decode latency</text>
+<text x="90" y="58" font-family="Arial" font-size="13" fill="#475569">Metric: median_us; tokens: 1,8,16,32; plotted TP: 1/2/4; backend: DeepGEMM vs FlashInfer SM12x</text>
+<line x1="90" y1="534" x2="850" y2="534" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="96" x2="90" y2="534" stroke="#0f172a" stroke-width="1"/>
+<line x1="90" y1="534.00" x2="850" y2="534.00" stroke="#e2e8f0"/>
+<text x="80" y="538.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">-103</text>
+<line x1="90" y1="424.50" x2="850" y2="424.50" stroke="#e2e8f0"/>
+<text x="80" y="428.50" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">428</text>
+<line x1="90" y1="315.00" x2="850" y2="315.00" stroke="#e2e8f0"/>
+<text x="80" y="319.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">958</text>
+<line x1="90" y1="205.50" x2="850" y2="205.50" stroke="#e2e8f0"/>
+<text x="80" y="209.50" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">1488</text>
+<line x1="90" y1="96.00" x2="850" y2="96.00" stroke="#e2e8f0"/>
+<text x="80" y="100.00" font-family="Arial" font-size="12" text-anchor="end" fill="#475569">2019</text>
+<line x1="90.00" y1="534" x2="90.00" y2="540" stroke="#cbd5e1"/>
+<text x="90.00" y="558" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">1</text>
+<line x1="343.33" y1="534" x2="343.33" y2="540" stroke="#cbd5e1"/>
+<text x="343.33" y="558" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">8</text>
+<line x1="596.67" y1="534" x2="596.67" y2="540" stroke="#cbd5e1"/>
+<text x="596.67" y="558" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">16</text>
+<line x1="850.00" y1="534" x2="850.00" y2="540" stroke="#cbd5e1"/>
+<text x="850.00" y="558" font-family="Arial" font-size="12" text-anchor="middle" fill="#475569">32</text>
+<polyline fill="none" stroke="#0f766e" stroke-width="2.4" stroke-dasharray="7 5" points="90.00,495.29 343.33,392.39 596.67,284.20 850.00,126.21"/>
+<polygon points="90.00,490.69 85.80,499.09 94.20,499.09" fill="#0f766e"/>
+<polygon points="343.33,387.79 339.13,396.19 347.53,396.19" fill="#0f766e"/>
+<polygon points="596.67,279.60 592.47,288.00 600.87,288.00" fill="#0f766e"/>
+<polygon points="850.00,121.61 845.80,130.01 854.20,130.01" fill="#0f766e"/>
+<polyline fill="none" stroke="#0f766e" stroke-width="2.4" points="90.00,499.92 343.33,407.98 596.67,314.32 850.00,188.22"/>
+<circle cx="90.00" cy="499.92" r="3.5" fill="#0f766e"/>
+<circle cx="343.33" cy="407.98" r="3.5" fill="#0f766e"/>
+<circle cx="596.67" cy="314.32" r="3.5" fill="#0f766e"/>
+<circle cx="850.00" cy="188.22" r="3.5" fill="#0f766e"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.4" stroke-dasharray="7 5" points="90.00,501.38 343.33,448.39 596.67,392.84 850.00,311.23"/>
+<polygon points="90.00,496.78 85.80,505.18 94.20,505.18" fill="#2563eb"/>
+<polygon points="343.33,443.79 339.13,452.19 347.53,452.19" fill="#2563eb"/>
+<polygon points="596.67,388.24 592.47,396.64 600.87,396.64" fill="#2563eb"/>
+<polygon points="850.00,306.63 845.80,315.03 854.20,315.03" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.4" points="90.00,502.71 343.33,455.06 596.67,407.60 850.00,344.89"/>
+<circle cx="90.00" cy="502.71" r="3.5" fill="#2563eb"/>
+<circle cx="343.33" cy="455.06" r="3.5" fill="#2563eb"/>
+<circle cx="596.67" cy="407.60" r="3.5" fill="#2563eb"/>
+<circle cx="850.00" cy="344.89" r="3.5" fill="#2563eb"/>
+<polyline fill="none" stroke="#c2410c" stroke-width="2.4" stroke-dasharray="7 5" points="90.00,503.79 343.33,474.73 596.67,446.24 850.00,400.81"/>
+<polygon points="90.00,499.19 85.80,507.59 94.20,507.59" fill="#c2410c"/>
+<polygon points="343.33,470.13 339.13,478.53 347.53,478.53" fill="#c2410c"/>
+<polygon points="596.67,441.64 592.47,450.04 600.87,450.04" fill="#c2410c"/>
+<polygon points="850.00,396.21 845.80,404.61 854.20,404.61" fill="#c2410c"/>
+<polyline fill="none" stroke="#c2410c" stroke-width="2.4" points="90.00,503.69 343.33,483.85 596.67,454.90 850.00,424.07"/>
+<circle cx="90.00" cy="503.69" r="3.5" fill="#c2410c"/>
+<circle cx="343.33" cy="483.85" r="3.5" fill="#c2410c"/>
+<circle cx="596.67" cy="454.90" r="3.5" fill="#c2410c"/>
+<circle cx="850.00" cy="424.07" r="3.5" fill="#c2410c"/>
+<text x="470.0" y="600" font-family="Arial" font-size="13" text-anchor="middle" fill="#334155">Token number</text>
+<text transform="translate(22,315.0) rotate(-90)" font-family="Arial" font-size="13" text-anchor="middle" fill="#334155">Median latency (us)</text>
+<text x="886" y="114" font-family="Arial" font-size="15" font-weight="700" fill="#0f172a">Legend</text>
+<text x="886" y="136" font-family="Arial" font-size="12" fill="#475569">Color = TP; line style = backend</text>
+<line x1="886" y1="166" x2="918" y2="166" stroke="#0f766e" stroke-width="2.8" stroke-dasharray="7 5"/>
+<polygon points="902.00,161.40 897.80,169.80 906.20,169.80" fill="#0f766e"/>
+<text x="928" y="170" font-family="Arial" font-size="12" fill="#334155">TP1 DeepGEMM</text>
+<line x1="886" y1="190" x2="918" y2="190" stroke="#0f766e" stroke-width="2.8"/>
+<circle cx="902.00" cy="190.00" r="3.5" fill="#0f766e"/>
+<text x="928" y="194" font-family="Arial" font-size="12" fill="#334155">TP1 FlashInfer</text>
+<line x1="886" y1="214" x2="918" y2="214" stroke="#2563eb" stroke-width="2.8" stroke-dasharray="7 5"/>
+<polygon points="902.00,209.40 897.80,217.80 906.20,217.80" fill="#2563eb"/>
+<text x="928" y="218" font-family="Arial" font-size="12" fill="#334155">TP2 DeepGEMM</text>
+<line x1="886" y1="238" x2="918" y2="238" stroke="#2563eb" stroke-width="2.8"/>
+<circle cx="902.00" cy="238.00" r="3.5" fill="#2563eb"/>
+<text x="928" y="242" font-family="Arial" font-size="12" fill="#334155">TP2 FlashInfer</text>
+<line x1="886" y1="262" x2="918" y2="262" stroke="#c2410c" stroke-width="2.8" stroke-dasharray="7 5"/>
+<polygon points="902.00,257.40 897.80,265.80 906.20,265.80" fill="#c2410c"/>
+<text x="928" y="266" font-family="Arial" font-size="12" fill="#334155">TP4 DeepGEMM</text>
+<line x1="886" y1="286" x2="918" y2="286" stroke="#c2410c" stroke-width="2.8"/>
+<circle cx="902.00" cy="286.00" r="3.5" fill="#c2410c"/>
+<text x="928" y="290" font-family="Arial" font-size="12" fill="#334155">TP4 FlashInfer</text>
+</svg>
