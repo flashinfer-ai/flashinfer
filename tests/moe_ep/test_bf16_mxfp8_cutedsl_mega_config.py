@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -65,6 +67,13 @@ def test_mixed_knobs_and_candidates():
     assert not is_valid_bf16_mxfp8({**knobs, "mma_tiler_mnk": (256, 256, 128)})
     assert not is_valid_bf16_mxfp8({**knobs, "token_back_mode": "standalone_warps"})
     assert not is_valid_bf16_mxfp8({**knobs, "clc_bundle_size": 1})
+    assert not is_valid_bf16_mxfp8(
+        {
+            **knobs,
+            "in_kernel_fc2_reduce": True,
+            "token_back_mode": "reuse_dispatch_warps",
+        }
+    )
 
     candidates = bf16_mxfp8_candidates()
     assert len(candidates) == 12
@@ -112,7 +121,7 @@ def test_mixed_frontend_rejects_unsupported_knobs():
         frontend.apply_knobs({"mma_tiler_mnk": (256, 256, 128)})
 
 
-def test_mixed_factory_accepts_pinned_default_knobs(monkeypatch):
+def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
@@ -125,7 +134,6 @@ def test_mixed_factory_accepts_pinned_default_knobs(monkeypatch):
     monkeypatch.setattr(bf16_mxfp8, "sym_zeros", fake_zeros)
     knobs = default_knobs(8, dtype="bf16_mxfp8")
     knobs["token_back_mode"] = "reuse_dispatch_warps"
-    knobs["in_kernel_fc2_reduce"] = True
     buf = bf16_mxfp8.get_symm_buffer_for_bf16_mxfp8_mega_moe(
         4,
         8,
@@ -142,6 +150,64 @@ def test_mixed_factory_accepts_pinned_default_knobs(monkeypatch):
         assert buf._frontend.config.in_kernel_fc2_reduce is False
     finally:
         buf.destroy()
+
+
+def test_mixed_factory_rejects_pinned_ikr_mismatch(monkeypatch):
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
+
+    monkeypatch.setattr(
+        bf16_mxfp8, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
+    )
+    with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
+        bf16_mxfp8.get_symm_buffer_for_bf16_mxfp8_mega_moe(
+            4,
+            8,
+            2,
+            128,
+            128,
+            0,
+            1,
+            knobs={
+                **default_knobs(8, dtype="bf16_mxfp8"),
+                "in_kernel_fc2_reduce": True,
+            },
+        )
+
+
+def test_mixed_frontend_rejects_ikr_changing_knobs():
+    frontend = MegaMoEBf16Mxfp8Frontend(_config())
+    with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
+        frontend.apply_knobs({"in_kernel_fc2_reduce": True})
+
+
+def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
+
+    frontend = MegaMoEBf16Mxfp8Frontend(_config())
+    valid = default_knobs(8, dtype="bf16_mxfp8")
+    monkeypatch.setattr(
+        autotune,
+        "autotune_knobs",
+        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+    )
+    buffer = SimpleNamespace(_frontend=frontend)
+    assert autotune.autotune_bf16_mxfp8_mega_moe(
+        None,
+        None,
+        None,
+        buffer,
+        candidates=[{**valid, "in_kernel_fc2_reduce": True}, valid],
+    ) == [valid]
+    with pytest.raises(ValueError, match="no valid mixed"):
+        autotune.autotune_bf16_mxfp8_mega_moe(
+            None,
+            None,
+            None,
+            buffer,
+            candidates=[{**valid, "in_kernel_fc2_reduce": True}],
+        )
 
 
 def test_mixed_backend_is_registered():

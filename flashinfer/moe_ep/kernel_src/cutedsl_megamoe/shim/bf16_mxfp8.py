@@ -135,9 +135,9 @@ class MegaMoEBf16Mxfp8Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply mixed MegaMoE tuning knobs and invalidate the compiled kernel."""
-        from .tuner import is_valid_bf16_mxfp8, with_knobs
+        from .tuner import is_valid_bf16_mxfp8_for_config, with_knobs
 
-        if not is_valid_bf16_mxfp8(knobs):
+        if not is_valid_bf16_mxfp8_for_config(self.config, knobs):
             raise ValueError(f"unsupported mixed MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self._config, knobs)
         if new_config != self._config:
@@ -429,15 +429,11 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         token_back_mode=token_back_mode,
     )
     if knobs:
-        from .tuner import is_valid_bf16_mxfp8, with_knobs
+        from .tuner import is_valid_bf16_mxfp8_for_config, with_knobs
 
-        if not is_valid_bf16_mxfp8(knobs):
+        if not is_valid_bf16_mxfp8_for_config(config, knobs):
             raise ValueError(f"unsupported mixed MegaMoE knobs: {knobs}.")
         config = with_knobs(config, knobs)
-        if config.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-            config = dataclasses.replace(
-                config, in_kernel_fc2_reduce=in_kernel_fc2_reduce
-            )
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
