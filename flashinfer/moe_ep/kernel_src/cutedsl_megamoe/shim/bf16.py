@@ -121,9 +121,9 @@ class MegaMoEBf16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import is_valid_bf16, with_knobs
+        from .tuner import is_valid_bf16_for_config, with_knobs
 
-        if not is_valid_bf16(knobs):
+        if not is_valid_bf16_for_config(self.config, knobs):
             raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
@@ -434,37 +434,11 @@ def get_symm_buffer_for_bf16_mega_moe(
         token_back_mode=token_back_mode,
     )
     if knobs:
-        from .tuner import is_valid_bf16, with_knobs
+        from .tuner import is_valid_bf16_for_config, with_knobs
 
-        # IKR is caller-owned. Drop it from knobs so with_knobs cannot flip
-        # it, and rewrite epi token-back before replace: BF16 rejects
-        # in_kernel_fc2_reduce + epi_warps in __post_init__.
-        knobs = dict(knobs)
-        knobs.pop("in_kernel_fc2_reduce", None)
-        if in_kernel_fc2_reduce:
-            mode = knobs.get("token_back_mode", token_back_mode)
-            if mode == "epi_warps":
-                knobs["token_back_mode"] = (
-                    token_back_mode
-                    if token_back_mode != "epi_warps"
-                    else "reuse_dispatch_warps"
-                )
-        if not is_valid_bf16(knobs):
+        if not is_valid_bf16_for_config(cfg, knobs):
             raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
         cfg = with_knobs(cfg, knobs)
-        if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-            token_back = cfg.token_back_mode
-            if in_kernel_fc2_reduce and token_back == "epi_warps":
-                token_back = (
-                    token_back_mode
-                    if token_back_mode != "epi_warps"
-                    else "reuse_dispatch_warps"
-                )
-            cfg = dataclasses.replace(
-                cfg,
-                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-                token_back_mode=token_back,
-            )
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
