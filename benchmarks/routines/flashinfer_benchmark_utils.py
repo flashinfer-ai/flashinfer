@@ -57,6 +57,10 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "quant_variant",
+        "autotune",
+        "tactic",
+        "refcheck_passed",
         "fp4_mode",
         "cold_l2_cache",
         # CUTLASS fused MoE specific
@@ -243,6 +247,11 @@ benchmark_apis = {
         "b12x_fused_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
+    ],
+    # Uses each unified backend config's supported(arch) check followed by a
+    # real runner construction/probe, like mm_fp4's runtime backend filtering.
+    "unified_moe": [
+        "unified_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",

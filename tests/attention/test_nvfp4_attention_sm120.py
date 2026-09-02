@@ -780,28 +780,76 @@ def test_nvfp4_attention_sm120_unpadded_k_len_masks_tail_garbage():
 
 
 def test_nvfp4_split_kv_gate_dtype_logic():
-    """The split-KV gate must fire for NVFP4 KV and only for NVFP4 KV.
+    """The split-KV gate's dtype classification must accept NVFP4 KV and only NVFP4 KV.
 
     Split-KV was empirically observed to corrupt NVFP4 KV reads when a short
     query attends a long KV range (decode / prefix-cache extend), so plan()
-    force-disables split-KV when the KV cache is NVFP4 as a workaround (see
-    _nvfp4_kv_requires_disabled_split_kv for the state of the root-cause
-    analysis). FP8 / 16-bit KV are unaffected and must keep split-KV. This is
-    a pure dtype-classification check (no GPU required) guarding that contract.
+    force-disables split-KV for NVFP4 KV on the affected architectures as a
+    workaround (see _nvfp4_kv_requires_disabled_split_kv for the state of the
+    root-cause analysis). FP8 / 16-bit KV are unaffected and must keep split-KV.
+    This is a pure dtype-classification check (no GPU required) guarding that
+    half of the contract; the architecture scoping is covered by
+    test_nvfp4_split_kv_gate_arch_scope.
     """
-    from flashinfer.prefill import _nvfp4_kv_requires_disabled_split_kv
+    from flashinfer.jit.attention.utils import _is_nvfp4_kv_dtype
 
-    # packed NVFP4 (uint8 is the run-path convention) and native fp4 -> gated
-    assert _nvfp4_kv_requires_disabled_split_kv(torch.uint8)
+    # packed NVFP4 (uint8 is the run-path convention) and native fp4 -> NVFP4 KV
+    assert _is_nvfp4_kv_dtype(torch.uint8)
     native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
     if native_fp4 is not None:
-        assert _nvfp4_kv_requires_disabled_split_kv(native_fp4)
+        assert _is_nvfp4_kv_dtype(native_fp4)
 
-    # 16-bit and FP8 KV split-KV is fine -> not gated
+    # 16-bit and FP8 KV split-KV is fine -> never NVFP4 KV
     for dtype in (
         torch.float16,
         torch.bfloat16,
         torch.float8_e4m3fn,
         torch.float8_e5m2,
     ):
-        assert not _nvfp4_kv_requires_disabled_split_kv(dtype)
+        assert not _is_nvfp4_kv_dtype(dtype)
+
+
+def test_nvfp4_split_kv_gate_arch_scope(monkeypatch):
+    """The gate must fire only on the architectures the corruption was seen on.
+
+    SM120/121 stay gated; every other target keeps split-KV, at the low-batch
+    decode saving quantified in the comment above
+    _NVFP4_SPLIT_KV_BROKEN_ARCHS. The compute capability is faked, so this runs
+    without a GPU.
+    """
+    from flashinfer import prefill
+
+    device = torch.device("cuda:0")
+
+    def gated_at(compute_capability):
+        monkeypatch.setattr(
+            prefill, "get_compute_capability", lambda _device: compute_capability
+        )
+        return prefill._nvfp4_kv_requires_disabled_split_kv(torch.uint8, device)
+
+    for compute_capability in ((12, 0), (12, 1)):
+        assert gated_at(compute_capability)
+    for compute_capability in (
+        (8, 0),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (10, 7),
+        (11, 0),
+    ):
+        assert not gated_at(compute_capability)
+
+    # A non-NVFP4 KV cache is never gated, and must not cost an architecture
+    # query to establish that: the dtype test comes first for every plan() call.
+    def _unexpected_query(_device):
+        raise AssertionError("architecture queried for a non-NVFP4 KV cache")
+
+    monkeypatch.setattr(prefill, "get_compute_capability", _unexpected_query)
+    for dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        assert not prefill._nvfp4_kv_requires_disabled_split_kv(dtype, device)
