@@ -69,6 +69,24 @@ def test_cake_kda_portfolio_includes_all_affine_roles():
     }
 
 
+def test_cake_kda_portfolio_declares_caller_owned_pointer_tma_workspace():
+    pointer_spec = cake_kda_jit_api.get_cake_kda_module_spec(
+        "sm103a",
+        "bounded_bf16_evolution",
+        "direct_m64_independent_value_split",
+    )
+    assert pointer_spec.tma_abi == "pointer"
+    assert pointer_spec.tma_workspace_bytes == 6 * 128
+
+    grid_constant_spec = cake_kda_jit_api.get_cake_kda_module_spec(
+        "sm103a",
+        "bounded_bf16_evolution",
+        "direct_m128_generic",
+    )
+    assert grid_constant_spec.tma_abi == "grid_constant"
+    assert grid_constant_spec.tma_workspace_bytes == 0
+
+
 def _valid_cake_kda_affine_selector_kwargs():
     return {
         "export_available": True,
@@ -272,10 +290,10 @@ def test_cake_kda_shared_selector_rejects_out_of_contract_calls(override, value)
     assert kda_prefill_api._select_cake_kda_bounded_evolution_route(**kwargs) is None
 
 
-def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
+def test_cake_kda_workspace_buffer_is_grow_only(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    workspace = SimpleNamespace(_cake_kda_affine_buffers={})
-    first = kda_prefill_api._cake_kda_affine_workspace_buffer(
+    workspace = SimpleNamespace(_cake_kda_workspace_buffers={})
+    first = kda_prefill_api._cake_kda_workspace_buffer(
         workspace=workspace,
         name="carry",
         device=torch.device("cpu"),
@@ -284,7 +302,7 @@ def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
         zero_on_allocate=True,
     )
     assert torch.count_nonzero(first) == 0
-    smaller = kda_prefill_api._cake_kda_affine_workspace_buffer(
+    smaller = kda_prefill_api._cake_kda_workspace_buffer(
         workspace=workspace,
         name="carry",
         device=torch.device("cpu"),
@@ -292,10 +310,10 @@ def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
         dtype=torch.float32,
     )
     assert smaller.data_ptr() == first.data_ptr()
-    assert workspace._cake_kda_affine_buffers["carry"].numel() == 32
+    assert workspace._cake_kda_workspace_buffers["carry"].numel() == 32
 
     with pytest.raises(ValueError, match="dimensions must be positive"):
-        kda_prefill_api._cake_kda_affine_workspace_buffer(
+        kda_prefill_api._cake_kda_workspace_buffer(
             workspace=workspace,
             name="carry",
             device=torch.device("cpu"),

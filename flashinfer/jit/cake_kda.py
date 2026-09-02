@@ -29,6 +29,7 @@ CakeKDASequenceFamily = Literal[
     "unbounded_affine_prefix",
 ]
 CakeKDARole = Literal["main", "prepare", "chain", "map", "scan", "correction"]
+CakeKDATMAABI = Literal["grid_constant", "pointer"]
 
 _MANIFEST = "cake_kda_prefill_portfolio_export_manifest.json"
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
@@ -162,6 +163,8 @@ class CakeKDAModuleSpec:
     device_path: Path
     binding_path: Path
     use_pdl: bool
+    tma_abi: CakeKDATMAABI
+    tma_workspace_bytes: int
 
 
 @dataclass(frozen=True)
@@ -334,8 +337,42 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         closure_sha256 = item.get("closure_sha256")
         compile_flags = item.get("compile_flags")
         launch = item.get("launch")
+        arg_plan = item.get("arg_plan")
+        tma_abi = item.get("tma_abi")
+        tma_workspace_bytes = item.get("tma_workspace_bytes")
         _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
-        _require(item.get("tma_abi") == "grid_constant", f"{label}.tma_abi")
+        _require(
+            isinstance(arg_plan, list)
+            and all(
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(part, str) and part for part in entry)
+                for entry in arg_plan
+            ),
+            f"{label}.arg_plan",
+        )
+        _require(tma_abi in ("grid_constant", "pointer"), f"{label}.tma_abi")
+        _require(
+            isinstance(tma_workspace_bytes, int) and tma_workspace_bytes >= 0,
+            f"{label}.tma_workspace_bytes",
+        )
+        workspace_args = [
+            entry
+            for entry in arg_plan
+            if entry == ["workspace", "tma_descriptor_workspace"]
+        ]
+        if tma_abi == "grid_constant":
+            _require(
+                tma_workspace_bytes == 0 and not workspace_args,
+                f"{label} grid-constant ABI must not request TMA workspace",
+            )
+        else:
+            _require(
+                tma_workspace_bytes > 0
+                and tma_workspace_bytes % 128 == 0
+                and workspace_args == [["workspace", "tma_descriptor_workspace"]],
+                f"{label} pointer ABI requires one aligned caller TMA workspace",
+            )
         _require(isinstance(item.get("name"), str), f"{label}.name")
         _require(isinstance(module_ident, str), f"{label}.module_ident")
         _require(
@@ -361,6 +398,8 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
                 device_path=device_path,
                 binding_path=binding_path,
                 use_pdl=launch.get("use_pdl") is True,
+                tma_abi=tma_abi,
+                tma_workspace_bytes=tma_workspace_bytes,
             )
         )
 

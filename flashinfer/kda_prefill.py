@@ -253,7 +253,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._bt16_qk: Optional[torch.Tensor] = None
         self._bt16_diag: Optional[torch.Tensor] = None
         self._bt16_metadata_signature: Optional[tuple] = None
-        self._cake_kda_affine_buffers: dict[str, torch.Tensor] = {}
+        self._cake_kda_workspace_buffers: dict[str, torch.Tensor] = {}
         self._cake_kda_affine_map_identity_data_ptr: Optional[int] = None
         self._cake_kda_affine_resources: Optional[_CakeKDAAffineResources] = None
         self._cute_dsl_workspace: Optional[torch.Tensor] = None
@@ -1092,7 +1092,7 @@ def _select_cake_kda_affine_route(
     )
 
 
-def _cake_kda_affine_workspace_buffer(
+def _cake_kda_workspace_buffer(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
     name: str,
@@ -1101,14 +1101,14 @@ def _cake_kda_affine_workspace_buffer(
     dtype: torch.dtype,
     zero_on_allocate: bool = False,
 ) -> torch.Tensor:
-    """Return a stable, grow-only workspace view for one affine role."""
+    """Return a stable, grow-only caller-owned Cake workspace view."""
 
     if not name or not shape or any(dimension <= 0 for dimension in shape):
         raise ValueError(
-            "Cake KDA affine workspace names and dimensions must be positive"
+            "Cake KDA workspace names and dimensions must be positive"
         )
     numel = math.prod(shape)
-    buffer = workspace._cake_kda_affine_buffers.get(name)
+    buffer = workspace._cake_kda_workspace_buffers.get(name)
     if (
         buffer is None
         or buffer.numel() < numel
@@ -1117,12 +1117,12 @@ def _cake_kda_affine_workspace_buffer(
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "Cake KDA affine workspace is not warmed for "
+                "Cake KDA workspace is not warmed for "
                 f"{name}; invoke the largest shape before capture"
             )
         factory = torch.zeros if zero_on_allocate else torch.empty
         buffer = factory(numel, dtype=dtype, device=device)
-        workspace._cake_kda_affine_buffers[name] = buffer
+        workspace._cake_kda_workspace_buffers[name] = buffer
     return buffer[:numel].view(shape)
 
 
@@ -1193,7 +1193,7 @@ def _cake_kda_affine_resources(
         *,
         zero_on_allocate: bool = False,
     ) -> torch.Tensor:
-        return _cake_kda_affine_workspace_buffer(
+        return _cake_kda_workspace_buffer(
             workspace=workspace,
             name=name,
             device=device,
@@ -3893,7 +3893,7 @@ def _run_cake_kda_bounded_evolution(
 ) -> None:
     """Launch one manifest-verified shared policy through its exported ABI."""
 
-    from .jit.cake_kda import get_cake_kda_module
+    from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
     total_tokens = q.shape[0] * q.shape[1]
     num_heads = q.shape[2]
@@ -3913,6 +3913,23 @@ def _run_cake_kda_bounded_evolution(
     dummy_f32 = _dummy_f32(q.device)
     state_slot_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     module = get_cake_kda_module(route.target, "bounded_bf16_evolution", route.policy)
+    module_spec = get_cake_kda_module_spec(
+        route.target, "bounded_bf16_evolution", route.policy
+    )
+    tma_workspace = (
+        _cake_kda_workspace_buffer(
+            workspace=workspace,
+            name=(
+                "tma_descriptor_"
+                f"{module_spec.target}_{module_spec.family}_{module_spec.policy}"
+            ),
+            device=q.device,
+            shape=(module_spec.tma_workspace_bytes,),
+            dtype=torch.uint8,
+        )
+        if module_spec.tma_workspace_bytes
+        else None
+    )
     common_prefix = (
         q_flat,
         q_flat,
@@ -3940,12 +3957,14 @@ def _run_cake_kda_bounded_evolution(
         dummy_f32,
         dummy_f32,
     )
-    common_tail = (
+    common_scalars = (
         num_heads,
         1,
         1,
         scale,
         lower_bound,
+    )
+    common_grid = (
         route.grid_x,
         1,
         1,
@@ -3980,11 +3999,19 @@ def _run_cake_kda_bounded_evolution(
             tile_schedule_counts,
             route.schedule_stride,
             *common_state,
-            *common_tail,
+            *common_scalars,
+            *((tma_workspace,) if tma_workspace is not None else ()),
+            *common_grid,
         )
         return
     if route.policy == "direct_m64_independent_value_split":
-        module.run(*common_prefix, *common_state, *common_tail)
+        module.run(
+            *common_prefix,
+            *common_state,
+            *common_scalars,
+            *((tma_workspace,) if tma_workspace is not None else ()),
+            *common_grid,
+        )
         return
     module.run(
         *common_prefix,
@@ -3992,7 +4019,9 @@ def _run_cake_kda_bounded_evolution(
         route.uniform_sequence_length,
         route.persistent_tasks,
         route.persistent_stride,
-        *common_tail,
+        *common_scalars,
+        *((tma_workspace,) if tma_workspace is not None else ()),
+        *common_grid,
     )
 
 
