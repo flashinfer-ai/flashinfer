@@ -54,7 +54,10 @@ def _expand_reference(
         tail = min((position + 1) - tail_start, compress_ratio - 1)
         route.extend(tail_start + offset for offset in range(tail))
         for column, token in enumerate(route[:width]):
-            if 0 <= token < seq:
+            # A block the query has not reached expands into tokens it cannot
+            # see. The block ids are the caller's, so the bound is applied here
+            # rather than assumed.
+            if 0 <= token <= position and token < seq:
                 out[row, column] = token
     return out
 
@@ -151,6 +154,22 @@ def test_expand_block_route_empties_a_row_without_a_request():
     out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, 4)
     assert int((out[1] >= 0).sum()) == 0
     assert int((out[0] >= 0).sum()) > 0
+
+
+def test_expand_block_route_drops_a_block_the_query_has_not_reached():
+    """The block ids are the caller's. A block past the query expands into
+    tokens the query cannot see -- at a ratio of four, a query at position 3
+    selecting block 2 would route tokens 8 through 11 -- and the sequence
+    length alone does not bound them."""
+    ratio = 4
+    blocks = torch.tensor([[2, 0, 0, 0]], dtype=torch.int32, device=DEV)
+    positions = torch.tensor([3], dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([512], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
+    assert int(out.max()) <= 3, f"routed a token past the query: {out.tolist()}"
+    expected = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compress_ratio", [2, 4])
