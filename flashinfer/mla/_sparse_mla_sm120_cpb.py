@@ -150,7 +150,7 @@ _MEASUREMENTS_DOTS3_SWA = (
     (64, 64, 576, 9),
 )
 
-_POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is HBM-faithful
+_POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is DRAM-faithful
 _POOL_BYTES_MIN = 512 << 20
 _WARMUP_ITERS = 3
 # Batched timing (_time_call_fresh_indices): batches per measurement, and the
@@ -173,7 +173,7 @@ class CpbConstants:
     Attributes
     ----------
     inv_bw : float
-        s/byte; inverse aggregate HBM bandwidth.
+        s/byte; inverse aggregate DRAM bandwidth.
     inv_rsm : float
         s/byte; inverse single-SM streaming rate (latency-bound regime).
     c0 : float
@@ -261,7 +261,7 @@ def predict_time_s(
     ``sm_count`` SMs: ``m*(s-1)`` full blocks of ``cpb`` chunks followed by
     ``m`` tail blocks of the short last split, each block paying the fixed
     per-block overhead ``c0`` plus per-chunk time ``t_c``. ``t_c`` is the
-    larger of the bandwidth-bound term (``g`` concurrent blocks share HBM)
+    larger of the bandwidth-bound term (``g`` concurrent blocks share DRAM)
     and the single-SM latency-bound term. Early-exit blocks only write their
     LSE sentinel and retire; their scheduling churn is neglected (charging
     them ``c0`` each measurably over-predicts mid-cpb candidates).
@@ -367,7 +367,7 @@ def _time_call_fresh_indices(
     ~footprint/pool, and the batch length is sized so a set's reuse distance
     ((K-1) calls x per-call gather footprint) exceeds L2 — reusing one index
     set across reps makes the working set L2-resident after warmup and
-    understates the HBM-bound steady state (this tainted earlier calibration
+    understates the DRAM-bound steady state (this tainted earlier calibration
     rounds: decode looked artificially fast). The draws run before timing.
     """
     # A set recurs after K-1 intervening calls; require the reuse distance to
@@ -506,7 +506,7 @@ def calibrate(
     Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
     to 512 MiB), timing queued batches over rotating fresh full-pool uniform
     index sets (:func:`_time_call_fresh_indices`) so the measured working
-    set stays HBM-resident and launch latency stays off the clock, then fits
+    set stays DRAM-resident and launch latency stays off the clock, then fits
     the three constants to six fixed shapes by Levenberg-Marquardt on
     relative residuals.
     ``module_getter`` returns the loaded TVM-FFI kernel module.
@@ -664,7 +664,7 @@ def calibrate_crossover(
     the grid keep the decode-first default) — or on ``grid_override`` when
     given (the public calibration API's arbitrary-shape entries) — both paths
     are timed at
-    each probed T with the HBM-faithful protocol of
+    each probed T with the DRAM-faithful protocol of
     :func:`_time_call_fresh_indices`: the decode kernel runs with the model's
     ``select_cpb`` pick; the prefill orchestrator runs with
     ``prefill_impl=auto`` variant choice (swapAB preferred where

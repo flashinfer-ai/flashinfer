@@ -332,7 +332,7 @@ def test_calibration_smoke(family_constants: tuple[str, CpbConstants]) -> None:
         assert c.l2_cache_bytes == props.L2_cache_size
     bw_gbps = 1.0 / c.inv_bw / 1e9
     print(f"\ncalibrated {family} constants: {c}")
-    print(f"implied aggregate HBM bandwidth: {bw_gbps:.0f} GB/s")
+    print(f"implied aggregate DRAM bandwidth: {bw_gbps:.0f} GB/s")
     # Loose physical-plausibility band around modern datacenter GPUs.
     assert 100 < bw_gbps < 20000
 
