@@ -901,14 +901,14 @@ def test_batch_mla_mixed_qo_len_batch(num_heads, causal, page_size, backend):
 def test_batch_mla_cuda_graph_replan_keeps_kernel_config(backend):
     """A CUDA graph replays the kernel and grid it was captured with, so a
     replan for a batch that would pick another Q tile or cluster size keeps
-    the captured configuration and still computes the right result."""
+    the captured configuration, and replaying the graph is still correct."""
     device = torch.device("cuda:0")
     clear_cuda_cache(device)
     if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     num_heads, head_dim_ckv, head_dim_kpe, page_size = 16, 512, 64, 1
-    kv_len, dtype = 200, torch.half
+    kv_len, qo_len_max, dtype = 200, 10, torch.half
     sm_scale = 1.0 / ((128 + 64) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
@@ -945,22 +945,44 @@ def test_batch_mla_cuda_graph_replan_keeps_kernel_config(backend):
         )
         return wrapper._plan_info[0], wrapper._plan_info[-1]
 
+    # Graph-static buffers sized for the longest replanned query.
+    q_nope = torch.randn(
+        qo_len_max, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(qo_len_max, num_heads, head_dim_kpe, dtype=dtype, device=device)
+    o_buf = torch.zeros(qo_len_max, num_heads, head_dim_ckv, dtype=dtype, device=device)
+    lse_buf = torch.zeros(qo_len_max, num_heads, dtype=torch.float32, device=device)
+
+    def run():
+        wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv, kpe), out=o_buf, lse=lse_buf)
+
     # Captured with 16 packed rows; the replans would otherwise move to the
     # 64-row tile (48 rows) and to two-CTA clusters (160 rows).
     captured = plan(qo_len=1)
-    for qo_len in (3, 10):
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+
+    k, v = generate_kv_from_cache(ckv, kpe, kv_len, 1, num_heads)
+    for qo_len in (1, 3, 10):
         assert plan(qo_len) == captured
-        q_nope = torch.randn(
-            qo_len, num_heads, head_dim_ckv, dtype=dtype, device=device
+        q_nope.normal_()
+        q_pe.normal_()
+        o_buf.zero_()
+        lse_buf.zero_()
+        g.replay()
+        q = torch.cat([q_nope[:qo_len], q_pe[:qo_len]], dim=-1)
+        o_ref, lse_ref = attention_ref(1, q, k, v, True, sm_scale)
+        torch.testing.assert_close(o_buf[:qo_len], o_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(
+            lse_buf[:qo_len], lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3
         )
-        q_pe = torch.randn(qo_len, num_heads, head_dim_kpe, dtype=dtype, device=device)
-        o, lse = wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv, kpe), return_lse=True)
-        k, v = generate_kv_from_cache(ckv, kpe, kv_len, 1, num_heads)
-        o_ref, lse_ref = attention_ref(
-            1, torch.cat([q_nope, q_pe], dim=-1), k, v, True, sm_scale
-        )
-        torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(lse, lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])

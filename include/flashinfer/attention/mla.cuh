@@ -790,6 +790,8 @@ __device__ void DevicePersistentMergeStates(
     float m;
     float d;
   };
+  static_assert(NUM_GROUPS * sizeof(GroupState) <= sizeof(typename KTraits::SharedStorage),
+                "merge scratch exceeds the kernel's dynamic shared memory");
   GroupState* group_states = reinterpret_cast<GroupState*>(smem);
 
   const uint32_t cta_idx = (gridDim.x * blockIdx.y + blockIdx.x);

@@ -33,10 +33,14 @@ namespace mma {
 #endif
 #endif
 
-#if (__CUDACC_VER_MAJOR__ >= 11)
+// stmatrix needs PTX ISA 7.8 (CUDA 11.8) and sm_90.
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 110800)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
 #define FLASHINFER_STMATRIX_M8N8X4_ENABLED
 #endif
+#endif
+
+#if (__CUDACC_VER_MAJOR__ >= 11)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
 #define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
 #define FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED
@@ -215,7 +219,7 @@ template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("stmatrix.sync.aligned.trans.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
+  asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
                :
                : "r"(smem_int_ptr), "r"(R[0]), "r"(R[1]), "r"(R[2]), "r"(R[3]));
 #else
