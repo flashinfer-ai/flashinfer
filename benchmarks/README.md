@@ -51,7 +51,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16 and NVFP4 W4A4 with SwiGLU or ReLU2, filters unsupported backends at runtime, and can autotune each backend independently.
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16 and NVFP4 W4A4 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
