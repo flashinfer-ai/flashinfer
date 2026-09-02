@@ -38,7 +38,7 @@ _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
 
 
 def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
-    """Select the legacy exact target or the SM100-family target."""
+    """Select the measured physical target for the optimized Cake route."""
 
     compute_capability = get_compute_capability(device)
     if compute_capability == (10, 0):
@@ -52,7 +52,7 @@ def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
             raise RuntimeError(
                 "packed KDA T=1 on compute capability 10.3 requires CUDA 12.9 or newer"
             )
-        return "sm100f"
+        return "sm103a"
     raise RuntimeError(
         "packed KDA T=1 requires compute capability 10.0 "
         "or 10.3 in the SM100 family; got "
@@ -148,8 +148,9 @@ def run_packed_kda_decode(
         aux_vec4_aligned=aux_vec4_aligned,
     )
     if optimized_variant is None:
+        legacy_target = "sm100f" if target == "sm103a" else target
         legacy_variant = _legacy_variant_for_batch(batch)
-        module = get_flash_kda_packed_t1_module(legacy_variant, target)
+        module = get_flash_kda_packed_t1_module(legacy_variant, legacy_target)
     else:
         module = get_cake_kda_packed_t1_module(optimized_variant, target)
     module.run(

@@ -40,7 +40,7 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile128_register_pipeline",
     "cpasync_tile128_ilp2",
 ]
-CakeKDAPackedT1Target = Literal["sm100a", "sm100f"]
+CakeKDAPackedT1Target = Literal["sm100a", "sm100f", "sm103a"]
 
 CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "register_tile16",
@@ -60,8 +60,13 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
 _CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
     "sm100a",
     "sm100f",
+    "sm103a",
 )
-_CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100}
+_CAKE_KDA_PACKED_T1_TARGET_KIND = {
+    "sm100a": 1000,
+    "sm100f": 100,
+    "sm103a": 1003,
+}
 
 
 class CakeKDAPackedT1VariantMetadata(NamedTuple):

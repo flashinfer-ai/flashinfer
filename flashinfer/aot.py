@@ -565,6 +565,9 @@ def gen_all_modules(
     has_flash_kda_packed_t1_sm100f = sm_capabilities.get(
         "flash_kda_packed_t1_sm100f", False
     )
+    has_cake_kda_packed_t1_sm103a = sm_capabilities.get(
+        "cake_kda_packed_t1_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm107 = sm_capabilities.get("sm107", False)
@@ -707,6 +710,11 @@ def gen_all_modules(
         )
         jit_specs.extend(
             gen_cake_kda_packed_t1_module(variant, "sm100f")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
+        )
+    if has_cake_kda_packed_t1_sm103a:
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm103a")
             for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
 
@@ -1251,6 +1259,10 @@ def detect_sm_capabilities():
         ),
         "flash_kda_packed_t1_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_kda_packed_t1_sm103a": (
+            bool(flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "sm103": has_sm("compute_103", "12.9"),
