@@ -904,7 +904,11 @@ def _select_cake_kda_bounded_evolution_route(
     if source_route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
         return _CakeKDABoundedEvolutionRoute(
             target=target,
-            policy="direct_m128_n16",
+            policy=(
+                "direct_m128_n16_h12_scalar"
+                if has_state_indices and num_heads == 12
+                else "direct_m128_n16"
+            ),
             sequence_order=sequence_order,
             grid_x=num_sequences * num_heads,
             sequence_lengths=sequence_lengths,
@@ -4068,7 +4072,11 @@ def _run_cake_kda_bounded_evolution(
             lower_bound=lower_bound,
         )
         return
-    if route.policy in {"direct_m128_legacy_inverse", "direct_m128_n16"}:
+    if route.policy in {
+        "direct_m128_legacy_inverse",
+        "direct_m128_n16",
+        "direct_m128_n16_h12_scalar",
+    }:
         _run_cake_kda_bf16_direct_export(
             route=route,
             workspace=workspace,
@@ -4414,7 +4422,7 @@ def _run_cake_kda_bf16_direct_export(
     empty_i32 = _dummy_i32(q.device)
     empty_i64 = _dummy_i64(q.device)
     empty_u32 = _dummy_u32(q.device)
-    chunk_tokens = 16 if route.policy == "direct_m128_n16" else 32
+    chunk_tokens = 16 if route.policy.startswith("direct_m128_n16") else 32
     beta_tma = _cake_kda_beta_source(
         beta,
         workspace,

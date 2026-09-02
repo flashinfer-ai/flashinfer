@@ -717,6 +717,18 @@
       "sha256": "1f1fec1b5ff743b976973c578c7c9cbc7dbcd0156af68915c733ff56ac0e22f2"
     },
     {
+      "bytes": 191529,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16.cu",
+      "sha256": "10daacb9c415dbd12e15cbd070e93958576511b4cc25f69fdf0ae9d13b755622"
+    },
+    {
+      "bytes": 37148,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16_binding.cu",
+      "sha256": "28d7283a3bb12dc95c4cc94146ed0644d1c246b16155148b4f6a5948fb19f4d5"
+    },
+    {
       "bytes": 182288,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
@@ -982,10 +994,10 @@
     }
   ],
   "generation_inputs": {
-    "observed_checkout_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "observed_tracked_tree_clean": true,
+    "observed_checkout_revision": null,
+    "observed_tracked_tree_clean": false,
     "producer_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "recipe_sha256": "72e42feffff1bf6e8fc82fd8c134afe4d4b47a3c1ca3ab2186e63ada22fb4003",
+    "recipe_sha256": "d6de66b76de2620f3e9b1b436c1c48738af1eb2d1597439e502c7fbadc2b8b39",
     "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
@@ -5593,6 +5605,297 @@
         "binding": "csrc/kda/cake_kda_prefill_m128_n16_bf16_binding.cu",
         "compile_separately": true,
         "device": "csrc/kda/cake_kda_prefill_m128_n16_bf16.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 191529,
+          "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16.cu",
+          "sha256": "10daacb9c415dbd12e15cbd070e93958576511b4cc25f69fdf0ae9d13b755622"
+        },
+        {
+          "bytes": 37148,
+          "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16_binding.cu",
+          "sha256": "28d7283a3bb12dc95c4cc94146ed0644d1c246b16155148b4f6a5948fb19f4d5"
+        }
+      ],
+      "closure_sha256": "bb0b75b4faed7e0fd5dd0f54aebcdeff68ba16ef23fd9921ba3d577addc3e05b",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_n16_h12_scalar_bf16",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 117376,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_n16_h12_scalar_bf16_ffi",
+      "name": "cake_kda_prefill_m128_n16_h12_scalar_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "direct_m128_n16_h12_scalar"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16.cu"
       }
     },
     {
@@ -14722,6 +15025,297 @@
         "binding": "csrc/kda/cake_kda_prefill_m128_n16_bf16_binding.cu",
         "compile_separately": true,
         "device": "csrc/kda/cake_kda_prefill_m128_n16_bf16.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 191529,
+          "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16.cu",
+          "sha256": "10daacb9c415dbd12e15cbd070e93958576511b4cc25f69fdf0ae9d13b755622"
+        },
+        {
+          "bytes": 37148,
+          "path": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16_binding.cu",
+          "sha256": "28d7283a3bb12dc95c4cc94146ed0644d1c246b16155148b4f6a5948fb19f4d5"
+        }
+      ],
+      "closure_sha256": "f2500ad148d4ac4ba0c6bb705dd6f25a51c36147e2078ec673b685be5bb7ce64",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_n16_h12_scalar_bf16",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 117376,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_n16_h12_scalar_bf16_ffi",
+      "name": "cake_kda_prefill_m128_n16_h12_scalar_bf16",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_bf16_evolution",
+        "policy": "direct_m128_n16_h12_scalar"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_n16_h12_scalar_bf16.cu"
       }
     },
     {
