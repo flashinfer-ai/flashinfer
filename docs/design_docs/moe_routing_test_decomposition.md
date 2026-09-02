@@ -123,7 +123,5 @@ Executed-volume cut on the shards: 1,398 → 201 (−86%).
 
 ## Follow-ups
 
-- `num_fused_shared_experts > 0` and routing-replay output are not yet covered
-  in the standalone routing test.
 - The from-logits grids could thin further once an fp8-per-tensor routed entry
   point exists; it currently has no pre-routed counterpart.

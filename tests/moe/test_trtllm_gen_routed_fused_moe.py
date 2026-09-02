@@ -1394,6 +1394,353 @@ def test_fp8_block_scale_moe_routing_replay(
     )
 
 
+def _assert_routed_replay(replay, *, num_tokens, top_k, num_experts):
+    replay_cpu = replay.cpu()
+    active = replay_cpu[:num_tokens]
+    assert (active >= 0).all() and (active < num_experts).all(), (
+        "Replay must record routed expert IDs only, not fused shared slots "
+        f"(range [0, {num_experts})); got min={int(active.min())} max={int(active.max())}"
+    )
+    for t in range(num_tokens):
+        unique_experts = active[t].unique()
+        assert unique_experts.numel() == top_k, (
+            f"Token {t}: expected {top_k} unique routed experts, got "
+            f"{unique_experts.numel()} ({active[t].tolist()})"
+        )
+    if replay_cpu.shape[0] > num_tokens:
+        assert (replay_cpu[num_tokens:] == -1).all(), (
+            "Kernel should not write beyond active token rows"
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 32])
+@pytest.mark.parametrize("num_shared", [1, 2])
+def test_fp8_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared):
+    """Fused-shared FP8 replay stays [T, K] routed-only and matches S=0.
+
+    The DeepSeek routing kernel packs ids at stride ``top_k + S``. Replay must
+    keep stride ``top_k`` so a multi-token ``[T, K]`` buffer is not scrambled.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    hidden_size = 1024
+    intermediate_size = 1024
+    num_experts = 16
+    top_k = 2
+    n_group = 4
+    topk_group = 2
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    weight_rows = num_experts + num_shared
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.float32
+    )
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+    hidden_states_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    hidden_states = hidden_states_bf16.to(torch.float8_e4m3fn)
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, device=device, dtype=torch.float32
+    )
+    gemm1_weights = torch.randn(
+        weight_rows, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        weight_rows, hidden_size, intermediate_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm1_weights_scale = torch.ones(
+        weight_rows,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+    gemm2_weights_scale = torch.ones(
+        weight_rows,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    def _launch(*, rows, shared, replay):
+        return trtllm_fp8_block_scale_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights[:rows],
+            gemm1_weights_scale[:rows],
+            gemm2_weights[:rows],
+            gemm2_weights_scale[:rows],
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            0,
+            num_experts,
+            1.0,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            use_shuffled_weight=False,
+            weight_layout=0,
+            enable_pdl=enable_pdl,
+            num_fused_shared_experts=shared,
+            routing_replay_out=replay,
+        )
+
+    replay_s0 = torch.full(
+        (num_tokens + 5, top_k), -1, device=device, dtype=torch.int16
+    )
+    _launch(rows=num_experts, shared=0, replay=replay_s0)
+
+    replay_s = torch.full((num_tokens + 5, top_k), -1, device=device, dtype=torch.int16)
+    output_with_replay = _launch(rows=weight_rows, shared=num_shared, replay=replay_s)
+    output_without_replay = _launch(rows=weight_rows, shared=num_shared, replay=None)
+
+    torch.testing.assert_close(
+        output_with_replay.to(torch.float),
+        output_without_replay.to(torch.float),
+        rtol=0,
+        atol=0,
+    )
+    _assert_routed_replay(
+        replay_s, num_tokens=num_tokens, top_k=top_k, num_experts=num_experts
+    )
+    torch.testing.assert_close(
+        replay_s[:num_tokens].to(torch.int32),
+        replay_s0[:num_tokens].to(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_fp8_block_scale_moe_fused_shared_routing_replay_cuda_graph():
+    """Oversized replay buffer is written under CUDA-graph capture and replay.
+
+    vLLM pre-allocates ``max_num_batched_tokens`` and captures graphs against
+    that buffer; ``dim0`` is not required to equal ``num_tokens``. Warmup
+    outside the capture so autotune allocations are not recorded.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    num_tokens = 8
+    replay_capacity = 32
+    num_shared = 1
+    hidden_size = 1024
+    intermediate_size = 1024
+    num_experts = 16
+    top_k = 2
+    n_group = 4
+    topk_group = 2
+    torch.manual_seed(7)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    weight_rows = num_experts + num_shared
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.float32
+    )
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    ).to(torch.float8_e4m3fn)
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, device=device, dtype=torch.float32
+    )
+    gemm1_weights = torch.randn(
+        weight_rows, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        weight_rows, hidden_size, intermediate_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm1_weights_scale = torch.ones(
+        weight_rows,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+    gemm2_weights_scale = torch.ones(
+        weight_rows,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+    output = torch.empty((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
+    replay = torch.full((replay_capacity, top_k), -1, device=device, dtype=torch.int16)
+
+    def _launch():
+        return trtllm_fp8_block_scale_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            0,
+            num_experts,
+            1.0,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            use_shuffled_weight=False,
+            weight_layout=0,
+            enable_pdl=enable_pdl,
+            num_fused_shared_experts=num_shared,
+            routing_replay_out=replay,
+            output=output,
+        )
+
+    eager = _launch().clone()
+    eager_replay = replay.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch()
+    replay.fill_(-1)
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output.to(torch.float), eager.to(torch.float), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        replay.to(torch.int32), eager_replay.to(torch.int32), rtol=0, atol=0
+    )
+    _assert_routed_replay(
+        replay, num_tokens=num_tokens, top_k=top_k, num_experts=num_experts
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 32])
+@pytest.mark.parametrize("num_shared", [1, 2])
+def test_fp4_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared):
+    """FP4 sibling of the fused-shared routed-only replay contract."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 16
+    top_k = 2
+    n_group = 4
+    topk_group = 2
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    weight_rows = num_experts + num_shared
+    global_sf = torch.tensor([448.0 * 6.0], device=device)
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.bfloat16
+    )
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+    hidden_states, hidden_states_scale = fp4_quantize(
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1,
+        global_sf,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        num_tokens, -1
+    )
+    w13_bf16 = (
+        torch.randn(weight_rows, intermediate_size * 2, hidden_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    w2_bf16 = (
+        torch.randn(weight_rows, hidden_size, intermediate_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    w13, w13_scale = fp4_quantize(
+        w13_bf16, global_sf, sf_vec_size=16, sf_use_ue8m0=False
+    )
+    w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
+        weight_rows, intermediate_size * 2, -1
+    )
+    w2, w2_scale = fp4_quantize(w2_bf16, global_sf, sf_vec_size=16, sf_use_ue8m0=False)
+    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(weight_rows, hidden_size, -1)
+    scale = 1.0 / 448.0 / 6.0
+    output1_scale_scalar = torch.full(
+        (weight_rows,), scale * scale, device=device, dtype=torch.float32
+    )
+    output1_scale_gate_scalar = output1_scale_scalar.clone()
+    output2_scale_scalar = output1_scale_scalar.clone()
+
+    def _launch(*, rows, shared, replay):
+        return trtllm_fp4_block_scale_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            w13[:rows],
+            w13_scale[:rows],
+            None,
+            None,
+            None,
+            None,
+            w2[:rows],
+            w2_scale[:rows],
+            None,
+            output1_scale_scalar[:rows],
+            output1_scale_gate_scalar[:rows],
+            output2_scale_scalar[:rows],
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            0,
+            num_experts,
+            2.5,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            enable_pdl=enable_pdl,
+            num_fused_shared_experts=shared,
+            routing_replay_out=replay,
+        )[0]
+
+    replay_s0 = torch.full(
+        (num_tokens + 5, top_k), -1, device=device, dtype=torch.int16
+    )
+    _launch(rows=num_experts, shared=0, replay=replay_s0)
+
+    replay_s = torch.full((num_tokens + 5, top_k), -1, device=device, dtype=torch.int16)
+    output_with_replay = _launch(rows=weight_rows, shared=num_shared, replay=replay_s)
+    output_without_replay = _launch(rows=weight_rows, shared=num_shared, replay=None)
+
+    torch.testing.assert_close(
+        output_with_replay.to(torch.float),
+        output_without_replay.to(torch.float),
+        rtol=0,
+        atol=0,
+    )
+    _assert_routed_replay(
+        replay_s, num_tokens=num_tokens, top_k=top_k, num_experts=num_experts
+    )
+    torch.testing.assert_close(
+        replay_s[:num_tokens].to(torch.int32),
+        replay_s0[:num_tokens].to(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
 # Each (num_tokens, num_experts) entry is chosen to land in exactly one of the
 # five top-K kernels in `routing_custom.cu`. See the dispatch logic comment in
 # `trtllm_fused_moe_routing_custom.cuh` (around the `useSplitTopKPath` block):

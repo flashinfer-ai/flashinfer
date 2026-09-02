@@ -5115,16 +5115,14 @@ def _validate_bf16_gemm1_activation_params(
 def _validate_routing_replay_out(
     routing_replay_out: Optional[torch.Tensor],
     top_k: int,
-    num_fused_shared_experts: int = 0,
 ) -> None:
-    """Validate routing_replay_out tensor properties before passing to C++ kernels."""
+    """Validate routing_replay_out tensor properties before passing to C++ kernels.
+
+    The buffer is routed-only: ``dim1 == top_k``. Fused shared-expert slots are
+    not written, so ``top_k + num_fused_shared_experts`` is not a valid width.
+    """
     if routing_replay_out is None:
         return
-    if num_fused_shared_experts > 0:
-        # Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
-        raise ValueError(
-            "routing_replay_out is not supported with num_fused_shared_experts > 0"
-        )
     if routing_replay_out.dtype != torch.int16:
         raise ValueError(
             f"routing_replay_out must be int16, got {routing_replay_out.dtype}"
@@ -6262,6 +6260,9 @@ def trtllm_fp8_block_scale_moe(
         matches ``topk_indices``.  When ``None`` (default) the kernel skips
         the write entirely.  The buffer may be larger than ``num_tokens`` for
         CUDA-graph pre-allocation; only rows ``[0, num_tokens)`` are written.
+        With fused shared experts the layout stays routed-only: ``dim1`` is
+        ``top_k``, not ``top_k + num_fused_shared_experts``, and shared slots
+        are not recorded.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -6315,7 +6316,7 @@ def trtllm_fp8_block_scale_moe(
             "Fused shared experts (num_fused_shared_experts > 0) are only supported "
             f"with DeepSeekV3 routing; got routing_method_type={routing_method_type}."
         )
-    _validate_routing_replay_out(routing_replay_out, top_k, nfse)
+    _validate_routing_replay_out(routing_replay_out, top_k)
     _validate_fp8_block_scale_gemm1_activation_params(
         fp8_quantization_type,
         activation_type,
@@ -6746,7 +6747,10 @@ def trtllm_fp4_block_scale_moe(
         order matches ``topk_indices``.  When ``None`` (default) the
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
-        ``[0, num_tokens)`` are written.
+        ``[0, num_tokens)`` are written.  With fused shared experts the
+        layout stays routed-only: ``dim1`` is ``top_k``, not
+        ``top_k + num_fused_shared_experts``, and shared slots are not
+        recorded.
     num_fused_shared_experts : Optional[int]
         Number of shared experts to fuse into the MoE kernel (default
         ``None`` / ``0``).  When ``> 0``, every per-expert tensor
@@ -6789,7 +6793,7 @@ def trtllm_fp4_block_scale_moe(
             "Fused shared experts (num_fused_shared_experts > 0) are only supported "
             f"with DeepSeekV3 routing; got routing_method_type={routing_method_type}."
         )
-    _validate_routing_replay_out(routing_replay_out, top_k, nsfe)
+    _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
         routing_logits,
