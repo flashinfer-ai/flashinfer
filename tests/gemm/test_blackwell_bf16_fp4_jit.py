@@ -46,6 +46,10 @@ def _integration_manifest(target: str) -> dict:
             component
         ]
         grid_mode = integration_grid_modes[variant["grid_kind"]]
+        logical_grid_mode = grid_mode
+        if component == "cute_warp_mma_m16_bf16":
+            grid_mode = "flat_overflow"
+            ir_symbol = blackwell_jit._INTEGRATION_M16_WINNER_IR_SYMBOL
         arg_plan = blackwell_jit._expected_integration_arg_plan(component)
         kernel = {
             "arg_plan": arg_plan,
@@ -55,7 +59,7 @@ def _integration_manifest(target: str) -> dict:
             "enable_pdl": variant["enable_pdl"],
             "flat_grid": variant["flat_grid"],
             "grid_mode": grid_mode,
-            "logical_grid_mode": grid_mode,
+            "logical_grid_mode": logical_grid_mode,
             "has_alpha": variant["has_alpha"],
             "ir_symbol": ir_symbol,
             "kernel_symbol": f"kernel_flashinfer_bf16_fp4_synthetic_{index}",
@@ -345,8 +349,13 @@ def test_binding_kernel_specs_are_rendered_from_selected_manifest(
     assert "FLASHINFER_BLACKWELL_BF16_FP4_MODULE_IDENT" not in rendered
 
 
-def test_integration_manifest_preserves_exact_row7_then_generic_m32() -> None:
+def test_integration_manifest_preserves_exact_m16_then_row7_and_generic_m32() -> None:
     manifest = _integration_manifest("sm100")
+    m16_kernels = [
+        kernel
+        for kernel in manifest["kernels"]
+        if kernel["component"] == "cute_warp_mma_m16_bf16"
+    ]
     m32_kernels = [
         kernel
         for kernel in manifest["kernels"]
@@ -359,6 +368,17 @@ def test_integration_manifest_preserves_exact_row7_then_generic_m32() -> None:
         kernel for kernel in m32_kernels if kernel["arg_plan_kind"] == "cute_warp"
     ]
 
+    assert len(m16_kernels) == 4
+    assert {kernel["ir_symbol"] for kernel in m16_kernels} == {
+        blackwell_jit._INTEGRATION_M16_WINNER_IR_SYMBOL
+    }
+    assert all(kernel["arg_plan_kind"] == "raw_pointer" for kernel in m16_kernels)
+    assert all(kernel["grid_mode"] == "flat_overflow" for kernel in m16_kernels)
+    assert all(kernel["logical_grid_mode"] == "persistent" for kernel in m16_kernels)
+    assert all(
+        (kernel["threads"], kernel["smem_bytes"]) == (128, 27648)
+        for kernel in m16_kernels
+    )
     assert len(raw_pointer) == 1
     assert len(canonical) == 4
     assert raw_pointer[0]["exact_shape"] == {
@@ -401,6 +421,29 @@ def test_integration_manifest_preserves_exact_row7_then_generic_m32() -> None:
         }
         for specialization in m32_route["specializations"][1:]
     )
+    selection = blackwell_jit._DISPATCH_SELECTION
+    m16_selection_index = next(
+        index
+        for index, route in enumerate(selection)
+        if route["components"] == ["cute_warp_mma_m16_bf16"]
+    )
+    m32_selection_index = next(
+        index
+        for index, route in enumerate(selection)
+        if route["components"] == ["cute_warp_mma_m32_bf16"]
+    )
+    assert m16_selection_index < m32_selection_index
+    assert selection[m16_selection_index]["when"] == {
+        "K": 1024,
+        "M_at_most": 16,
+        "backend": "cute-dsl",
+    }
+    assert selection[m32_selection_index]["when"] == {
+        "K_at_least": 128,
+        "K_multiple": 64,
+        "M_at_most": 32,
+        "backend": "cute-dsl",
+    }
     blackwell_jit._validate_integration_manifest(manifest)
 
 

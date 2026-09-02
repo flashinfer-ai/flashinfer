@@ -147,8 +147,7 @@ _DISPATCH_SELECTION = [
             "s0e5m3_f16mma_v2"
         ),
         "when": {
-            "K_at_least": 128,
-            "K_multiple": 64,
+            "K": 1024,
             "M_at_most": 16,
             "backend": "cute-dsl",
         },
@@ -162,7 +161,7 @@ _DISPATCH_SELECTION = [
         "when": {
             "K_at_least": 128,
             "K_multiple": 64,
-            "M_between_inclusive": [17, 32],
+            "M_at_most": 32,
             "backend": "cute-dsl",
         },
     },
@@ -403,6 +402,9 @@ _INTEGRATION_KERNEL_KEYS = {
     "use_pdl",
 }
 _INTEGRATION_ROW7_EXACT_SHAPE = {"M": 17, "N": 3072, "K": 3072}
+_INTEGRATION_M16_WINNER_IR_SYMBOL = (
+    "flashinfer_blackwell_bf16_fp4_gemm_seed_v27_cute_m16_abi_shallow_v2"
+)
 _INTEGRATION_GRID_KINDS = {
     "two_dimensional": "generic_2d",
     "flat_overflow": "generic_flat",
@@ -424,7 +426,7 @@ _INTEGRATION_COMPONENT_METADATA = {
     "cute_warp_mma_m16_k16_bf16": ("cute_warp_short", "cute_dsl", "compute"),
     "cute_warp_mma_m16_k32_bf16": ("cute_warp_short", "cute_dsl", "compute"),
     "cute_warp_mma_m16_k48_bf16": ("cute_warp_short", "cute_dsl", "compute"),
-    "cute_warp_mma_m16_bf16": ("cute_warp", "cute_dsl", "compute"),
+    "cute_warp_mma_m16_bf16": ("raw_pointer", "cute_dsl", "compute"),
     "cute_warp_mma_m32_bf16": ("cute_warp", "cute_dsl", "compute"),
     "cute_warp_mma_m64_bf16": ("cute_warp", "cute_dsl", "compute"),
 }
@@ -440,7 +442,7 @@ _INTEGRATION_LAUNCH_RESOURCES = {
     "cute_warp_mma_m16_k16_bf16": (96, 150528),
     "cute_warp_mma_m16_k32_bf16": (96, 150528),
     "cute_warp_mma_m16_k48_bf16": (96, 150528),
-    "cute_warp_mma_m16_bf16": (96, 150528),
+    "cute_warp_mma_m16_bf16": (128, 27648),
     "cute_warp_mma_m32_bf16": (160, 218112),
     "cute_warp_mma_m64_bf16": (160, 73728),
 }
@@ -908,6 +910,7 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
     observed_components: set[str] = set()
     exact_row7: list[dict[str, Any]] = []
     generic_row7: list[dict[str, Any]] = []
+    winner_m16: list[dict[str, Any]] = []
 
     for kernel in kernels:
         if not isinstance(kernel, dict):
@@ -1018,6 +1021,13 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
 
         component = _integration_component(kernel)
         observed_components.add(component)
+        if component == "cute_warp_mma_m16_bf16":
+            if kernel["ir_symbol"] != _INTEGRATION_M16_WINNER_IR_SYMBOL:
+                raise ValueError(
+                    "Blackwell BF16 x FP4 integration manifest M16 route is not "
+                    "bound to the promoted exact-K winner IR"
+                )
+            winner_m16.append(kernel)
         expected_arg_plan_kind, expected_prepared_abi, expected_stage = (
             _INTEGRATION_COMPONENT_METADATA[component]
         )
@@ -1098,6 +1108,11 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
     if observed_components != set(_COMPONENT_SPECS):
         raise ValueError(
             "Blackwell BF16 x FP4 integration manifest component inventory is incomplete"
+        )
+    if len(winner_m16) != 4 or len({kernel["ir_symbol"] for kernel in winner_m16}) != 1:
+        raise ValueError(
+            "Blackwell BF16 x FP4 integration manifest requires four exact-K "
+            "M16 winner specializations sharing one physical IR"
         )
     if len(exact_row7) != 1 or len(generic_row7) != 1:
         raise ValueError(

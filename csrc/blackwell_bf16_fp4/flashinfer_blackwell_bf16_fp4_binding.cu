@@ -585,11 +585,15 @@ inline void LaunchWarp(const Problem& problem, const TensorView& a, const Tensor
   const int64_t sm_multiplier = spec.persistent_m16_2sm ? 2 : 1;
   const int64_t total_tiles =
       CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64);
-  const int64_t persistent_grid =
-      std::min<int64_t>(total_tiles,
-                        sm_multiplier * MultiProcessorCount(a.device().device_id));
-  LaunchKernel(spec, args, CheckedGrid(persistent_grid, "persistent grid.x"), 1u, 1u,
-               stream);
+  const bool exact_k1024_m16 =
+      spec.raw_pointer_abi && component == Component::kTiledWarpM16Bf16;
+  const int64_t launch_grid =
+      exact_k1024_m16
+          ? total_tiles
+          : std::min<int64_t>(
+                total_tiles,
+                sm_multiplier * MultiProcessorCount(a.device().device_id));
+  LaunchKernel(spec, args, CheckedGrid(launch_grid, "warp grid.x"), 1u, 1u, stream);
 }
 
 struct WorkspaceKey {
@@ -718,13 +722,12 @@ void Run(TensorView a, TensorView b, TensorView b_descale, TensorView alpha,
                Component::kTiledWarpM16K48Bf16, 16u, 48u, enable_pdl, stream);
     return;
   }
-  if (problem.tiled && problem.m <= 16 && problem.k >= 128 && problem.k % 64 == 0) {
+  if (problem.tiled && problem.m <= 16 && problem.k == 1024) {
     LaunchWarp(problem, a, b, b_descale, alpha, out,
                Component::kTiledWarpM16Bf16, 16u, 128u, enable_pdl, stream);
     return;
   }
-  if (problem.tiled && problem.m >= 17 && problem.m <= 32 && problem.k >= 128 &&
-      problem.k % 64 == 0) {
+  if (problem.tiled && problem.m <= 32 && problem.k >= 128 && problem.k % 64 == 0) {
     LaunchWarp(problem, a, b, b_descale, alpha, out,
                Component::kTiledWarpM32Bf16, 32u, 128u, enable_pdl, stream);
     return;
