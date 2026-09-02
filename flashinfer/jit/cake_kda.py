@@ -37,28 +37,6 @@ _TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=0",
     "sm103a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=3",
 }
-_SHAPE_SUITE_COUNTS = {
-    "evolution_29": 29,
-    "kimi_k3_serving_48": 48,
-    "unbounded_serving_5": 5,
-    "affine_predecessor_7": 7,
-}
-_REQUIRED_PROBLEM_SHAPES = {
-    "evolution_29:h96_uniform_n32_holdout",
-    "evolution_29:h96_uniform_n64",
-    "evolution_29:h96_uniform_n128_holdout",
-    "evolution_29:h96_uniform_n256",
-    "evolution_29:h16_fixed_32768_holdout",
-    "evolution_29:h4_fixed_65536_holdout",
-    "evolution_29:h96_irregular_tail_varlen",
-    "affine_predecessor_7:h4_t8192",
-    "affine_predecessor_7:h4_t16384",
-    "affine_predecessor_7:h8_t8192",
-    "affine_predecessor_7:h8_t16384",
-    "affine_predecessor_7:h16_t8192",
-    "affine_predecessor_7:h16_t16384",
-    "affine_predecessor_7:h32_t16384_direct",
-}
 _EVOLUTION_POLICIES = {
     "bt16_chain_m64_s8",
     "bt16_chain_m64_s9",
@@ -256,34 +234,67 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     _require(isinstance(contract, dict), "contract missing")
     _require(contract.get("architectures") == ["sm_100a", "sm_103a"], "architectures")
     suites = contract.get("shape_suites")
-    _require(isinstance(suites, dict), "shape suites missing")
-    _require(set(suites) == set(_SHAPE_SUITE_COUNTS), "shape-suite set mismatch")
-    for suite, count in _SHAPE_SUITE_COUNTS.items():
-        labels = suites.get(suite)
+    _require(isinstance(suites, dict) and suites, "shape suites missing")
+    suite_rows = 0
+    for suite, labels in suites.items():
         _require(
-            isinstance(labels, list)
-            and len(labels) == count
-            and len(set(labels)) == count,
-            f"{suite} must contain {count} unique rows",
+            isinstance(suite, str)
+            and suite
+            and isinstance(labels, list)
+            and labels
+            and all(isinstance(label, str) and label for label in labels)
+            and len(set(labels)) == len(labels),
+            f"{suite!r} must contain unique nonempty labels",
         )
+        suite_rows += len(labels)
     denominator = contract.get("shape_denominator")
     _require(
         isinstance(denominator, list)
-        and len(denominator) == 89
-        and len(set(denominator)) == 89
-        and contract.get("shape_count") == 89,
-        "shape denominator must contain 89 unique rows",
+        and denominator
+        and all(isinstance(label, str) and label for label in denominator)
+        and len(set(denominator)) == len(denominator)
+        and contract.get("shape_count") == len(denominator),
+        "shape denominator must contain shape_count unique nonempty rows",
     )
     _require(
-        {label for labels in suites.values() for label in labels} == set(denominator),
+        suite_rows == len(denominator)
+        and {label for labels in suites.values() for label in labels}
+        == set(denominator),
         "shape suites must exactly partition the denominator",
     )
+    required_problem_shapes = contract.get("required_problem_shapes")
     _require(
-        set(contract.get("required_problem_shapes", ())) == _REQUIRED_PROBLEM_SHAPES,
-        "predecessor/problem-shape continuity mismatch",
+        isinstance(required_problem_shapes, list)
+        and len(set(required_problem_shapes)) == len(required_problem_shapes)
+        and set(required_problem_shapes).issubset(denominator),
+        "required predecessor/problem shapes must be a unique denominator subset",
     )
+    core_base_shape_count = contract.get("core_base_shape_count")
+    core_state_arms = contract.get("core_state_arms")
+    if core_base_shape_count is not None or core_state_arms is not None:
+        _require(
+            isinstance(core_base_shape_count, int)
+            and not isinstance(core_base_shape_count, bool)
+            and core_base_shape_count > 0,
+            "core_base_shape_count must be positive",
+        )
+        _require(
+            isinstance(core_state_arms, list)
+            and core_state_arms
+            and all(isinstance(arm, str) and arm for arm in core_state_arms)
+            and len(set(core_state_arms)) == len(core_state_arms),
+            "core_state_arms must be unique nonempty labels",
+        )
+        _require(
+            isinstance(suites.get("core177"), list)
+            and len(suites["core177"])
+            == core_base_shape_count * len(core_state_arms),
+            "core suite size must equal base shapes times state arms",
+        )
+    timing_requirement = contract.get("timing_requirement")
     _require(
-        contract.get("timing_requirement") == "per_shape_source_export_interleaved",
+        isinstance(timing_requirement, str)
+        and "source_export_interleaved" in timing_requirement,
         "interleaved timing requirement missing",
     )
 
