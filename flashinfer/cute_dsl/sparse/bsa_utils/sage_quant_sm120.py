@@ -352,8 +352,8 @@ def _require_sm120_bf16_bhsd(name: str, tensor: torch.Tensor) -> None:
         raise TypeError(f"{name} must use torch.bfloat16")
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must use contiguous BHSD storage")
+    if tensor.stride(-1) != 1:
+        raise ValueError(f"{name} must have a contiguous head-dim (stride(-1) == 1)")
     if tensor.shape[-1] != SAGE_HEAD_DIM:
         raise ValueError(f"{name} must have head dimension 128")
     if tensor.shape[0] < 1 or tensor.shape[1] < 1 or tensor.shape[2] < 1:
