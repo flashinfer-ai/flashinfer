@@ -24,6 +24,10 @@ CakeKDAFamily = Literal[
     "unbounded_bf16_serving",
     "unbounded_affine_prefix",
 ]
+CakeKDASequenceFamily = Literal[
+    "bounded_fp32_affine_prefix",
+    "unbounded_affine_prefix",
+]
 CakeKDARole = Literal["main", "prepare", "chain", "map", "scan", "correction"]
 
 _MANIFEST = "cake_kda_prefill_portfolio_export_manifest.json"
@@ -159,6 +163,21 @@ class CakeKDAModuleSpec:
     use_pdl: bool
 
 
+@dataclass(frozen=True)
+class CakeKDASequenceSpec:
+    """One manifest-sealed prepared multi-kernel source closure."""
+
+    target: CakeKDATarget
+    family: CakeKDASequenceFamily
+    name: str
+    closure_sha256: str
+    compile_flags: tuple[str, ...]
+    stage_order: tuple[str, ...]
+    arg_plan: tuple[tuple[str, str], ...]
+    device_paths: tuple[Path, ...]
+    binding_path: Path
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(f"invalid Cake KDA portfolio export manifest: {message}")
@@ -243,7 +262,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     )
 
     files = payload.get("files")
-    _require(isinstance(files, list) and len(files) == 64, "file inventory mismatch")
+    _require(isinstance(files, list) and len(files) == 68, "file inventory mismatch")
     file_sha256: dict[str, str] = {}
     for index, item in enumerate(files):
         _require(isinstance(item, dict), f"files[{index}] must be an object")
@@ -348,8 +367,184 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     return tuple(specs)
 
 
+@functools.cache
+def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
+    """Load the four prepared affine sequences from the sealed manifest."""
+
+    module_specs = get_cake_kda_module_specs()
+    module_by_identity = {
+        (spec.target, spec.name, spec.role): spec for spec in module_specs
+    }
+    csrc_dir = get_kda_csrc_dir()
+    payload: Any = json.loads((csrc_dir / _MANIFEST).read_text())
+    files = payload.get("files")
+    assert isinstance(files, list)
+    file_sha256 = {
+        item["path"]: item["sha256"]
+        for item in files
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("sha256"), str)
+    }
+    raw_sequences = payload.get("sequences")
+    _require(
+        isinstance(raw_sequences, list) and len(raw_sequences) == 4,
+        "prepared sequence inventory mismatch",
+    )
+    expected = {
+        (target, family)
+        for target in _TARGET_ARCH
+        for family in (
+            "bounded_fp32_affine_prefix",
+            "unbounded_affine_prefix",
+        )
+    }
+    observed: set[tuple[str, str]] = set()
+    specs: list[CakeKDASequenceSpec] = []
+    target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
+    for index, item in enumerate(raw_sequences):
+        label = f"sequences[{index}]"
+        _require(isinstance(item, dict), f"{label} must be an object")
+        arch = item.get("arch")
+        route = item.get("route")
+        _require(arch in target_by_arch, f"{label}.arch unsupported")
+        _require(isinstance(route, dict), f"{label}.route missing")
+        family = route.get("family")
+        target = target_by_arch[arch]
+        key = (target, family)
+        _require(key in expected, f"{label} unsupported route {key}")
+        _require(key not in observed, f"duplicate sequence {key}")
+        observed.add(key)
+        _require(
+            route.get("policy") == "affine_prepared_sequence",
+            f"{label}.route policy",
+        )
+        _require(item.get("role") == "composite", f"{label}.role")
+        expected_name = (
+            "cake_kda_affine_bounded_fp32_sequence"
+            if family == "bounded_fp32_affine_prefix"
+            else "cake_kda_affine_unbounded_softplus_sequence"
+        )
+        _require(item.get("name") == expected_name, f"{label}.name")
+        _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
+        _require(
+            item.get("ffi_abi") == "packed_positional",
+            f"{label}.ffi_abi",
+        )
+        stage_order = item.get("stage_order")
+        _require(
+            stage_order == ["main", "map", "scan", "correction"],
+            f"{label}.stage order",
+        )
+        stages = item.get("stages")
+        _require(isinstance(stages, list) and len(stages) == 4, f"{label}.stages")
+        expected_stage_specs = (
+            get_cake_kda_module_spec(target, family, "affine_split_main", "main"),
+            get_cake_kda_module_spec(target, family, "affine_split_map", "map"),
+            get_cake_kda_module_spec(
+                target,
+                "unbounded_affine_prefix",
+                "affine_prefix_scan",
+                "scan",
+            ),
+            get_cake_kda_module_spec(
+                target,
+                family,
+                "affine_split_correction",
+                "correction",
+            ),
+        )
+        device_raw: list[str] = []
+        for stage_index, (stage, expected_spec, stage_name) in enumerate(
+            zip(stages, expected_stage_specs, stage_order, strict=True)
+        ):
+            stage_label = f"{label}.stages[{stage_index}]"
+            _require(isinstance(stage, dict), f"{stage_label} must be an object")
+            _require(stage.get("name") == stage_name, f"{stage_label}.name")
+            module_ref = stage.get("module")
+            _require(isinstance(module_ref, dict), f"{stage_label}.module")
+            identity = (target, module_ref.get("name"), module_ref.get("role"))
+            _require(
+                module_by_identity.get(identity) == expected_spec,
+                f"{stage_label}.module identity",
+            )
+            raw_device = stage.get("device")
+            _require(isinstance(raw_device, str), f"{stage_label}.device")
+            _require(
+                _resolve_source(csrc_dir, raw_device, f"{stage_label}.device")
+                == expected_spec.device_path,
+                f"{stage_label}.device path",
+            )
+            device_raw.append(raw_device)
+        units = item.get("translation_units")
+        _require(isinstance(units, dict), f"{label}.translation_units")
+        _require(units.get("compile_separately") is True, f"{label}.compile_separately")
+        _require(units.get("devices") == device_raw, f"{label}.device closure")
+        binding_raw = units.get("binding")
+        binding_path = _resolve_source(csrc_dir, binding_raw, f"{label}.binding")
+        closure = item.get("closure")
+        _require(
+            isinstance(closure, list) and len(closure) == 5,
+            f"{label}.closure",
+        )
+        closure_map = {
+            entry.get("path"): entry.get("sha256")
+            for entry in closure
+            if isinstance(entry, dict)
+        }
+        expected_closure = {
+            path: file_sha256[path] for path in [*device_raw, binding_raw]
+        }
+        _require(closure_map == expected_closure, f"{label}.closure mismatch")
+        compile_flags = item.get("compile_flags")
+        _require(
+            isinstance(compile_flags, list)
+            and all(isinstance(flag, str) for flag in compile_flags),
+            f"{label}.compile_flags",
+        )
+        arg_plan = item.get("arg_plan")
+        _require(
+            isinstance(arg_plan, list)
+            and len(arg_plan) > 0
+            and all(
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(part, str) and part for part in entry)
+                for entry in arg_plan
+            ),
+            f"{label}.arg_plan",
+        )
+        closure_sha256 = item.get("closure_sha256")
+        _require(
+            isinstance(closure_sha256, str) and len(closure_sha256) == 64,
+            f"{label}.closure_sha256",
+        )
+        specs.append(
+            CakeKDASequenceSpec(
+                target=target,
+                family=family,
+                name=expected_name,
+                closure_sha256=closure_sha256,
+                compile_flags=tuple(compile_flags),
+                stage_order=tuple(stage_order),
+                arg_plan=tuple(tuple(entry) for entry in arg_plan),
+                device_paths=tuple(
+                    _resolve_source(csrc_dir, path, f"{label}.device")
+                    for path in device_raw
+                ),
+                binding_path=binding_path,
+            )
+        )
+    _require(observed == expected, "prepared sequence set mismatch")
+    specs.sort(key=lambda spec: (spec.target, spec.family))
+    return tuple(specs)
+
+
 def cake_kda_is_available() -> bool:
-    return len(get_cake_kda_module_specs()) == 60
+    return (
+        len(get_cake_kda_module_specs()) == 60
+        and len(get_cake_kda_sequence_specs()) == 4
+    )
 
 
 def get_cake_kda_module_spec(
@@ -367,6 +562,16 @@ def get_cake_kda_module_spec(
         ):
             return spec
     raise ValueError(f"unsupported Cake KDA module: {target}/{family}/{policy}/{role}")
+
+
+def get_cake_kda_sequence_spec(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+) -> CakeKDASequenceSpec:
+    for spec in get_cake_kda_sequence_specs():
+        if (spec.target, spec.family) == (target, family):
+            return spec
+    raise ValueError(f"unsupported Cake KDA prepared sequence: {target}/{family}")
 
 
 @functools.cache
@@ -403,14 +608,50 @@ def get_cake_kda_module(
     return gen_cake_kda_module(target, family, policy, role).build_and_load()
 
 
+@functools.cache
+def gen_cake_kda_sequence(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+) -> JitSpec:
+    spec = get_cake_kda_sequence_spec(target, family)
+    jit_spec = gen_kda_jit_spec(
+        name=f"{spec.name}_{target}_{spec.closure_sha256}",
+        sources=[*spec.device_paths, spec.binding_path],
+        target=target,
+        target_define=_TARGET_DEFINE[target],
+        csrc_dir=get_kda_csrc_dir(),
+        include_dir=get_flashinfer_include_dir(),
+        extra_cuda_cflags=spec.compile_flags,
+    )
+    logger.info(
+        "Generated Cake KDA prepared-sequence JIT spec: "
+        f"target={target}, family={family}, stages={spec.stage_order}"
+    )
+    return jit_spec
+
+
+@functools.cache
+def get_cake_kda_sequence(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+):
+    return gen_cake_kda_sequence(target, family).build_and_load()
+
+
 __all__ = [
     "CakeKDAFamily",
     "CakeKDAModuleSpec",
     "CakeKDARole",
+    "CakeKDASequenceFamily",
+    "CakeKDASequenceSpec",
     "CakeKDATarget",
     "cake_kda_is_available",
     "gen_cake_kda_module",
+    "gen_cake_kda_sequence",
     "get_cake_kda_module",
     "get_cake_kda_module_spec",
     "get_cake_kda_module_specs",
+    "get_cake_kda_sequence",
+    "get_cake_kda_sequence_spec",
+    "get_cake_kda_sequence_specs",
 ]

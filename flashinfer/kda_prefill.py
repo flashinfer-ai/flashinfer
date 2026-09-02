@@ -189,14 +189,6 @@ class _CakeKDAAffineModule(Protocol):
 
 
 @dataclass(frozen=True)
-class _CakeKDAAffineModuleBundle:
-    main: _CakeKDAAffineModule
-    map: _CakeKDAAffineModule
-    scan: _CakeKDAAffineModule
-    correction: _CakeKDAAffineModule
-
-
-@dataclass(frozen=True)
 class _CakeKDAAffineResourcesKey:
     target: Literal["sm100a", "sm103a"]
     family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"]
@@ -231,7 +223,7 @@ class _CakeKDAAffineResources:
     empty_i32: torch.Tensor
     empty_i64: torch.Tensor
     empty_u32: torch.Tensor
-    modules: _CakeKDAAffineModuleBundle
+    sequence: _CakeKDAAffineModule
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -246,6 +238,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._state_scratch: Optional[torch.Tensor] = None
         self._beta_padding: Optional[torch.Tensor] = None
         self._cake_export_beta_padding: Optional[torch.Tensor] = None
+        self._cake_export_beta_tail_padding: Optional[torch.Tensor] = None
         self._small_bh_packet_workspace: Optional[torch.Tensor] = None
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
@@ -1134,27 +1127,15 @@ def _cake_kda_affine_workspace_buffer(
 
 
 @functools.cache
-def _get_cake_kda_affine_module_bundle(
+def _get_cake_kda_affine_sequence(
     target: Literal["sm100a", "sm103a"],
     family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"],
-) -> _CakeKDAAffineModuleBundle:
-    """Load one sealed affine family and its shared scan module."""
+) -> _CakeKDAAffineModule:
+    """Load one manifest-sealed, allocation-free affine launch sequence."""
 
-    from .jit.cake_kda import get_cake_kda_module
+    from .jit.cake_kda import get_cake_kda_sequence
 
-    return _CakeKDAAffineModuleBundle(
-        main=get_cake_kda_module(target, family, "affine_split_main", "main"),
-        map=get_cake_kda_module(target, family, "affine_split_map", "map"),
-        scan=get_cake_kda_module(
-            target, "unbounded_affine_prefix", "affine_prefix_scan", "scan"
-        ),
-        correction=get_cake_kda_module(
-            target,
-            family,
-            "affine_split_correction",
-            "correction",
-        ),
-    )
+    return get_cake_kda_sequence(target, family)
 
 
 def _cake_kda_affine_resources(
@@ -1275,7 +1256,7 @@ def _cake_kda_affine_resources(
             "Cake KDA affine tail offsets are not warmed for CUDA graph capture"
         ),
     )
-    modules = _get_cake_kda_affine_module_bundle(
+    sequence = _get_cake_kda_affine_sequence(
         affine_route.target,
         affine_route.family,
     )
@@ -1305,15 +1286,14 @@ def _cake_kda_affine_resources(
         empty_i32=empty_i32,
         empty_i64=empty_i64,
         empty_u32=empty_u32,
-        modules=modules,
+        sequence=sequence,
     )
     workspace._cake_kda_affine_resources = resolved
     return resolved
 
 
-def _run_cake_kda_direct_export(
+def _cake_kda_direct_export_args(
     *,
-    module: _CakeKDAAffineModule,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1347,12 +1327,12 @@ def _run_cake_kda_direct_export(
     scale: float,
     lower_bound: float,
     grid_x: int,
-) -> None:
+) -> tuple[object, ...]:
     use_checkpoints = checkpoint_every_n_tokens > 0
     state_checkpoints_tma = (
         state_checkpoints if use_checkpoints else _dummy_state_tma(q.device)
     )
-    module.run(
+    return (
         q,
         q,
         k,
@@ -1414,6 +1394,16 @@ def _run_cake_kda_direct_export(
     )
 
 
+def _run_cake_kda_direct_export(
+    *,
+    module: _CakeKDAAffineModule,
+    **launch_args: object,
+) -> None:
+    """Submit one exported kernel using its mechanically shared argument ABI."""
+
+    module.run(*_cake_kda_direct_export_args(**launch_args))
+
+
 def _run_cake_kda_affine_route(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
@@ -1462,8 +1452,7 @@ def _run_cake_kda_affine_route(
     compact_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     external_state_is_fp32 = affine_route.external_state_dtype == torch.float32
 
-    _run_cake_kda_direct_export(
-        module=resources.modules.main,
+    main_args = _cake_kda_direct_export_args(
         q=q,
         k=k,
         v=v,
@@ -1501,11 +1490,15 @@ def _run_cake_kda_affine_route(
         lower_bound=affine_route.gate_lower_bound,
         grid_x=resources.num_parts * num_heads,
     )
-    # The main and tail carriers can share workspace. Queue the tail refresh
-    # only after the main launch so stream ordering preserves the main input.
-    tail_beta_source = _cake_kda_beta_source(beta_tail, workspace, chunk_tokens=32)
-    _run_cake_kda_direct_export(
-        module=resources.modules.map,
+    # Every stage is prepared before the first launch, so padded main and tail
+    # carriers must remain distinct until the complete sequence is submitted.
+    tail_beta_source = _cake_kda_beta_source(
+        beta_tail,
+        workspace,
+        chunk_tokens=32,
+        workspace_attribute="_cake_export_beta_tail_padding",
+    )
+    map_args = _cake_kda_direct_export_args(
         q=q_tail,
         k=k_tail,
         v=resources.zero_v,
@@ -1540,7 +1533,7 @@ def _run_cake_kda_affine_route(
         lower_bound=affine_route.gate_lower_bound,
         grid_x=(resources.num_parts - 1) * num_heads,
     )
-    resources.modules.scan.run(
+    scan_args = (
         resources.main_final,
         resources.map_state,
         resources.carry,
@@ -1550,8 +1543,7 @@ def _run_cake_kda_affine_route(
         1,
         1,
     )
-    _run_cake_kda_direct_export(
-        module=resources.modules.correction,
+    correction_args = _cake_kda_direct_export_args(
         q=q_tail,
         k=k_tail,
         v=resources.zero_v,
@@ -1586,6 +1578,7 @@ def _run_cake_kda_affine_route(
         lower_bound=affine_route.gate_lower_bound,
         grid_x=(resources.num_parts - 1) * num_heads,
     )
+    resources.sequence.run(*main_args, *map_args, *scan_args, *correction_args)
     out_flat[resources.tail_start :].add_(
         resources.correction_out.reshape_as(out_flat[resources.tail_start :])
     )
@@ -2700,32 +2693,38 @@ def _cake_kda_beta_source(
     workspace: _RecurrentKDAPrefillWorkspaceBase,
     *,
     chunk_tokens: int,
+    workspace_attribute: str = "_cake_export_beta_padding",
 ) -> torch.Tensor:
     """Return one contiguous beta carrier for a standard exported binding."""
 
     beta_flat = _flatten_beta_source(beta)
     total_tokens, num_heads = beta_flat.shape
-    source = _beta_tma_source(beta, workspace, chunk_tokens=chunk_tokens)
-    if not source.is_contiguous():
-        padded_tokens = max(total_tokens, chunk_tokens)
-        padded_heads = (
-            (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
-            // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
-            * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
-        )
-        source = _workspace_buffer(
-            workspace=workspace,
-            attribute="_cake_export_beta_padding",
-            device=beta.device,
-            numel=padded_tokens * padded_heads,
-            capture_error=(
-                "recurrent_kda prefill Cake export beta workspace is not large "
-                "enough for CUDA graph capture; warm the largest token/head "
-                "shape on this stream before capture"
-            ),
-        ).view(padded_tokens, padded_heads)
-    if source.data_ptr() != beta_flat.data_ptr():
-        source[:total_tokens, :num_heads].copy_(beta_flat)
+    if (
+        total_tokens >= chunk_tokens
+        and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        and beta_flat.is_contiguous()
+        and beta_flat.data_ptr() % 16 == 0
+        and beta_flat.stride(0) * beta.element_size() % 16 == 0
+    ):
+        return beta_flat
+    padded_tokens = max(total_tokens, chunk_tokens)
+    padded_heads = (
+        (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
+        // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+    )
+    source = _workspace_buffer(
+        workspace=workspace,
+        attribute=workspace_attribute,
+        device=beta.device,
+        numel=padded_tokens * padded_heads,
+        capture_error=(
+            "recurrent_kda prefill Cake export beta workspace is not large "
+            "enough for CUDA graph capture; warm the largest token/head "
+            "shape on this stream before capture"
+        ),
+    ).view(padded_tokens, padded_heads)
+    source[:total_tokens, :num_heads].copy_(beta_flat)
     return source
 
 
