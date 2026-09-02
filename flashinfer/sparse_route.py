@@ -73,10 +73,14 @@ def expand_block_route(
     each. Attention works on tokens, so every selected block becomes its
     ``compress_ratio`` tokens, in selection order.
 
-    The block a query sits in is only partially in the past, so it is never selected
+    The block a query sits in is only partially in the past, so it is never expanded
     whole; its already-seen tokens are appended after the expanded blocks instead. That
     tail is at most ``compress_ratio - 1`` tokens, which fixes the route width at
     ``block_topk * compress_ratio + compress_ratio - 1``.
+
+    The selection is the caller's, so this is enforced rather than assumed: a selected
+    block the query has not passed is dropped whole, all ``compress_ratio`` of its
+    positions. Keeping only its seen tokens would repeat exactly what the tail appends.
 
     Positions no token reaches are written as ``-1``, for the consumer to mask.
 
@@ -105,12 +109,19 @@ def expand_block_route(
     --------
     >>> import torch
     >>> import flashinfer
-    >>> blocks = torch.tensor([[2, 0]], dtype=torch.int32, device="cuda")
+    >>> blocks = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
     >>> positions = torch.tensor([9], dtype=torch.int32, device="cuda")
     >>> seq_lens = torch.tensor([16], dtype=torch.int32, device="cuda")
     >>> token_to_req = torch.tensor([0], dtype=torch.int32, device="cuda")
     >>> flashinfer.expand_block_route(blocks, positions, seq_lens, token_to_req, 4)
-    tensor([[8, 9, 10, 11, 0, 1, 2, 3, 8, 9, -1]], device='cuda:0', dtype=torch.int32)
+    tensor([[4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1]], device='cuda:0', dtype=torch.int32)
+
+    Block 2 is the one the query at position 9 sits in, so selecting it drops those
+    four positions instead:
+
+    >>> blocks = torch.tensor([[2, 0]], dtype=torch.int32, device="cuda")
+    >>> flashinfer.expand_block_route(blocks, positions, seq_lens, token_to_req, 4)
+    tensor([[-1, -1, -1, -1, 0, 1, 2, 3, 8, 9, -1]], device='cuda:0', dtype=torch.int32)
     """
     if block_indices.ndim != 2:
         raise ValueError(
