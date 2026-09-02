@@ -1727,10 +1727,10 @@ def test_block_sparse_builds_standard_decode_schedule(
     else:
         assert "smemKv" not in resource_names
         assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resource_names
-    for task_name, resource_name in (
-        ("Softmax0Task", "tmemS0"),
-        ("Softmax1Task", "tmemS1"),
-    ):
+    for inst_idx in (0, 1):
+        task_name = f"Softmax{inst_idx}Task"
+        resource_name = f"tmemS{inst_idx}"
+        metadata_name = f"smemBlockSparseSoftmaxMetadata{inst_idx}"
         softmax_task = tasks_by_name[task_name]
         tmem_s = next(
             resource
@@ -1744,6 +1744,23 @@ def test_block_sparse_builds_standard_decode_schedule(
             if entry[0] is tmem_s and entry[1] == ScheduleStage.ConsumerWork
         ]
         assert consumer_labels == ["compute_block_sparse_softmax_loop"]
+        schedule_positions = {
+            (entry[0].name, entry[1], entry[-1]): position
+            for position, entry in enumerate(softmax_task.loop_schedule_list)
+        }
+        metadata_wait = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerWait, None)
+        ]
+        metadata_load = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerWork, "load_route")
+        ]
+        metadata_release = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerRelease, None)
+        ]
+        score_wait = schedule_positions[
+            (resource_name, ScheduleStage.ConsumerWait, None)
+        ]
+        assert metadata_wait < metadata_load < metadata_release < score_wait
 
 
 @pytest.mark.parametrize("storage", ("dense", "sparse"))

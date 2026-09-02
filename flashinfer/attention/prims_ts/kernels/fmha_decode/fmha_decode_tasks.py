@@ -2878,9 +2878,9 @@ def create_softmax0_task(
             sparse_softmax_metadata.init_read_state()
 
         with domain_loop(0, domain, 1, unroll=1) as d:
-            # ConsWait/ConsWork: load S from TMEM and compute the tile max.
-            tmem_s0.wait()
             if sparse_softmax_metadata is not None:
+                # Consume the independent metadata stream first so its SMEM
+                # loads and release can overlap the subsequent score wait.
                 sparse_softmax_metadata.wait()
                 # Copy the complete payload to registers before release, so
                 # masking cannot race the producer's next SMEM-stage reuse.
@@ -2894,6 +2894,9 @@ def create_softmax0_task(
                     sparse_token_word3,
                 ) = sparse_softmax_metadata.load_route()
                 sparse_softmax_metadata.release()
+            # ConsWait/ConsWork: load S from TMEM and compute the tile max.
+            tmem_s0.wait()
+            if sparse_softmax_metadata is not None:
                 old_max_arr, sum_arr, new_max_arr, s_arr = (
                     tmem_s0.compute_block_sparse_softmax_loop(
                         old_max_arr=old_max_arr,
@@ -3121,9 +3124,9 @@ def create_softmax1_task(
             sparse_softmax_metadata.init_read_state()
 
         with domain_loop(0, domain, 1, unroll=1) as d:
-            # ConsWait/ConsWork: load the second S instance and compute max.
-            tmem_s1.wait()
             if sparse_softmax_metadata is not None:
+                # Consume the independent metadata stream first so its SMEM
+                # loads and release can overlap the subsequent score wait.
                 sparse_softmax_metadata.wait()
                 # Copy to registers before release so the producer can reuse
                 # the SMEM stage while this warp group applies the masks.
@@ -3137,6 +3140,9 @@ def create_softmax1_task(
                     sparse_token_word3,
                 ) = sparse_softmax_metadata.load_route()
                 sparse_softmax_metadata.release()
+            # ConsWait/ConsWork: load the second S instance and compute max.
+            tmem_s1.wait()
+            if sparse_softmax_metadata is not None:
                 old_max_arr, sum_arr, new_max_arr, s_arr = (
                     tmem_s1.compute_block_sparse_softmax_loop(
                         old_max_arr=old_max_arr,
