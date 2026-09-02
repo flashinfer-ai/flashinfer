@@ -939,10 +939,13 @@ class _SparseMLAPagedAttentionRunner:
     def _maybe_allocate_decode_scratch(
         self,
         q: torch.Tensor,
+        kv_cache: torch.Tensor,
         indices: torch.Tensor,
+        extra_kv_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
+        prefill_impl: Optional[str],
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if (mid_out is None) != (mid_lse is None):
             raise ValueError("mid_out and mid_lse must be passed together")
@@ -950,14 +953,30 @@ class _SparseMLAPagedAttentionRunner:
             return mid_out, mid_lse
 
         num_tokens, num_heads, d_qk = q.shape
-        if num_tokens > _DECODE_MAX_TOKENS:
+        if num_tokens == 0:
+            # The op no-ops on empty requests before planning.
             return None, None
-
+        model_type = _resolve_model_type(d_qk, self._kv_scale_format)
         topk = indices.shape[-1]
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = _decode_dsv4_num_splits(
-            topk, extra_topk, _resolve_model_type(d_qk, self._kv_scale_format)
+        # Route with the same memoized plan() the op makes; only a
+        # decode-routed call consumes split-K scratch. A dispatch miss
+        # (None) falls through so the op reports it.
+        planned = plan(
+            num_tokens,
+            num_heads,
+            topk,
+            model_type,
+            _packed_kv_page_block_size(kv_cache, model_type=model_type, name="kv_cache"),
+            extra_kv_cache is not None,
+            _normalize_prefill_impl(prefill_impl),
+            q.device,
+            extra_topk=extra_topk,
         )
+        if planned is None or planned.variant is not KernelVariant.DECODE_SPLITK:
+            return None, None
+
+        num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
         scratch_heads = _decode_scratch_heads(num_heads)
         mid_out = torch.empty(
             (num_tokens, scratch_heads, num_splits, self._d_v),
@@ -1036,7 +1055,8 @@ class _SparseMLAPagedAttentionRunner:
             )
 
         mid_out, mid_lse = self._maybe_allocate_decode_scratch(
-            q, indices, extra_indices, mid_out, mid_lse
+            q, kv_cache, indices, extra_kv_cache, extra_indices, mid_out, mid_lse,
+            prefill_impl,
         )
 
         out_lse_view = self._get_out_lse(num_tokens, num_heads, out_lse)
