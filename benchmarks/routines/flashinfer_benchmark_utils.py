@@ -57,6 +57,10 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "quant_variant",
+        "autotune",
+        "tactic",
+        "refcheck_passed",
         "fp4_mode",
         "cold_l2_cache",
         # CUTLASS fused MoE specific
@@ -240,9 +244,15 @@ benchmark_apis = {
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
+        "cute_dsl_bf16_moe",
         "b12x_fused_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
+    ],
+    # Uses each unified backend config's supported(arch) check followed by a
+    # real runner construction/probe, like mm_fp4's runtime backend filtering.
+    "unified_moe": [
+        "unified_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
@@ -445,7 +455,14 @@ routine_cc_to_supported_backends = {
             "prims-ts",
         ],
         "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
@@ -475,7 +492,13 @@ routine_cc_to_supported_backends = {
             "trtllm-native",
             "prims-ts",
         ],
-        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.0": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+        ],
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
@@ -612,6 +635,17 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "cute_dsl_bf16_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["cute-dsl"],
+        "10.0": [],
+        "10.3": [],
         "12.0": [],
         "12.1": [],
     },

@@ -15,10 +15,10 @@ limitations under the License.
 """
 
 """
-Auto-tuner for CuteDSL NVFP4 MoE kernels.
+Auto-tuner for CuteDSL block-scaled MoE kernels.
 
-This module provides a TunableRunner implementation for the CuteDSL NVFP4 MoE
-kernels, enabling automatic performance tuning across different GEMM tactics.
+This module provides TunableRunner implementations for CuteDSL MoE kernels,
+enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style and is architecture-dependent:
 - Blackwell (SM100): tactic = (mma_tiler_mn, cluster_shape_mn, raster_along_m)
@@ -30,6 +30,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -60,6 +61,15 @@ from .moe_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _seeded_activation(shapes, dtype, device):
+    generator = torch.Generator(device=device).manual_seed(515)
+    if dtype is torch.float8_e4m3fn:
+        return torch.randn(shapes, device=device, generator=generator).to(dtype)
+    return torch.randint(
+        0, 256, shapes, dtype=dtype, device=device, generator=generator
+    )
 
 
 # =============================================================================
@@ -132,6 +142,24 @@ def get_blackwell_moe_valid_tactics() -> List[Tuple]:
         ):
             tactics.append((tile_size, gemm1_tactic, gemm2_tactic))
     return tactics
+
+
+def get_w4a8_moe_valid_tactics() -> List[Tuple]:
+    """Get the Blackwell tactics for W4A8 mixed-format MoE.
+
+    The mixed finalize kernel also supports N tiles 64 and 192. Keep its
+    tactic space distinct so W4A8 does not change W4A4 tuning results.
+    """
+    return [
+        (
+            tile,
+            ((tile, gemm1_n), (tile // 128, 1), False),
+            ((tile, gemm2_n), (tile // 128, cluster_n), False),
+        )
+        for tile, gemm1_n, gemm2_n, cluster_n in itertools.product(
+            VALID_TILE_SIZES, (128, 256), (64, 128, 192, 256), (1, 2)
+        )
+    ]
 
 
 # Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
@@ -288,12 +316,12 @@ def get_rubin_moe_valid_tactics() -> List[Tuple]:
 # =============================================================================
 
 ALL_BLACKWELL_MOE_TACTICS = get_blackwell_moe_valid_tactics()
+ALL_W4A8_MOE_TACTICS = get_w4a8_moe_valid_tactics()
 ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 
 # Backwards-compatible alias.  Before the tactic space became
-# architecture-dependent, the Blackwell list was simply ALL_MOE_TACTICS;
-# tests/moe/test_cute_dsl_mxfp8_mxfp4_fused_moe.py and mixed_tuner's docs
-# still refer to it by that name.  Use _get_arch_tactics() for new code.
+# architecture-dependent, the Blackwell list was simply ALL_MOE_TACTICS.
+# Use _get_arch_tactics() for new code.
 ALL_MOE_TACTICS = ALL_BLACKWELL_MOE_TACTICS
 
 
@@ -308,6 +336,23 @@ DEFAULT_RUBIN_MOE_TACTIC = (
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
 )
+
+
+def canonicalize_w4a8_tactic(tactic: Any) -> Tuple:
+    """Canonicalize and validate a W4A8 tactic from Python or JSON."""
+    if not isinstance(tactic, (tuple, list)) or len(tactic) != 3:
+        raise ValueError("tactic must be (tile_size, gemm1_tactic, gemm2_tactic)")
+
+    def as_tuple(value: Any) -> Any:
+        if isinstance(value, (tuple, list)):
+            return tuple(as_tuple(item) for item in value)
+        return value
+
+    result = as_tuple(tactic)
+    if result not in ALL_W4A8_MOE_TACTICS:
+        raise ValueError(f"unsupported W4A8 MoE tactic: {result!r}")
+    return result
+
 
 # =============================================================================
 # Tactic parameter extraction
@@ -407,10 +452,10 @@ def _get_default_tactic() -> Tuple:
 # =============================================================================
 
 
-class CuteDslFusedMoENvfp4Runner(TunableRunner):
-    """TunableRunner for CuteDSL NVFP4 MoE kernels.
+class CuteDslFusedMoERunner(TunableRunner):
+    """TunableRunner for CuteDSL W4A4 and W4A8 MoE kernels.
 
-    This runner enables auto-tuning of the CuteDSL NVFP4 MoE pipeline by
+    This runner enables auto-tuning of the W4A4 and W4A8 MoE pipelines by
     trying different combinations of GEMM tactics.
 
     Tactic format follows TRT-LLM style:
@@ -463,9 +508,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
+        quant_mode: str = "w4a4",
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+        quant_mode = quant_mode.lower()
+        if quant_mode not in ("w4a4", "w4a8"):
+            raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
+        if quant_mode == "w4a8" and use_per_token_activation:
+            raise ValueError("per-token activation scaling is not supported for W4A8")
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -482,6 +533,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
+        self.quant_mode = quant_mode
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -512,19 +564,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             # match input_idx above: 11 is per_token_scale when per-token
             # activation is enabled (else moe_output), 12 is moe_output.
             tensor_initializers=(
-                # 0: x — FP4 quantized input (uint8 packed). Seeded
+                # 0: x — packed FP4 or MXFP8 activation. Seeded
                 # for cross-process determinism of autotune picks
                 # (matches trt-llm's seed=515 convention).
                 (
                     0,
-                    lambda shapes, dtype, device: torch.randint(
-                        0,
-                        256,
-                        shapes,
-                        dtype=torch.uint8,
-                        device=device,
-                        generator=torch.Generator(device=device).manual_seed(515),
-                    ),
+                    _seeded_activation,
                 ),
                 # 1: x_sf — FP8 scale factors (uint8). Seeded.
                 (
@@ -596,7 +641,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
             # Cold-L2 measurement matches TRT-LLM's
-            # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
+            # CuteDslFusedMoERunner.tuning_config; flushing L2
             # between profile iterations yields autotune timings
             # representative of production cold-cache conditions.
             use_cold_l2_cache=True,
@@ -618,11 +663,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
                 self.use_per_token_activation,
+                self.quant_mode,
             )
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         return (
+            self.quant_mode,
             int(self.activation_type),
             self.swiglu_alpha,
             self.swiglu_beta,
@@ -650,16 +697,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
         gated = self.gated
         num_tokens = x.shape[0]
-        hidden_size = x.shape[1] * 2  # FP4 packed
+        is_mxfp8 = self.quant_mode == "w4a8"
+        hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
         # has a single intermediate-row projection.
         gemm1_n = w1_weight.shape[1]
         intermediate_size = gemm1_n // 2 if gated else gemm1_n
 
-        ab_dtype = cutlass.Float4E2M1FN
-        sf_dtype = cutlass.Float8E4M3FN
-        sf_vec_size = 16
+        a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
+        b_dtype = cutlass.Float4E2M1FN
+        sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
+        sf_vec_size = 32 if is_mxfp8 else 16
 
         if self.use_per_token_activation:
             if self.output_dtype == torch.float16:
@@ -669,10 +718,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             else:
                 return []
         else:
-            gemm1_c_dtype = cutlass.Float4E2M1FN
+            gemm1_c_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
 
-        all_tactics = _get_arch_tactics()
+        all_tactics = ALL_W4A8_MOE_TACTICS if is_mxfp8 else _get_arch_tactics()
 
         token_final_scales = inputs[3]
         if token_final_scales.dtype == torch.float32:
@@ -694,6 +743,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 if not gated:
                     return False
 
+                # The SM107 kernels need cutlass.utils.rubin_helpers, which only
+                # exists from CuTe DSL 4.8. Without this probe the import below
+                # raises ModuleNotFoundError instead of merely declining the
+                # tactic, aborting autotuning rather than falling back.
+                #
+                # Imported inside the function because ``cute_dsl/utils`` pulls in
+                # cutlass at module scope and this module deliberately does not.
+                from ...cute_dsl.utils import is_rubin_cute_dsl_available
+
+                if not is_rubin_cute_dsl_available():
+                    return False
+
                 from .rubin import (
                     Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
                     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
@@ -707,8 +768,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 )
 
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
-                    a_dtype=ab_dtype,
-                    b_dtype=ab_dtype,
+                    a_dtype=a_dtype,
+                    b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     c_dtype=gemm1_c_dtype,
@@ -724,8 +785,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     c_major="n",
                 )
                 gemm2_ok = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-                    a_dtype=ab_dtype,
-                    b_dtype=ab_dtype,
+                    a_dtype=a_dtype,
+                    b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     c_dtype=gemm2_out_dtype,
@@ -750,8 +811,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, _ = gemm2_tactic
 
                 gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-                    a_dtype=ab_dtype,
-                    b_dtype=ab_dtype,
+                    a_dtype=a_dtype,
+                    b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     c_dtype=gemm1_c_dtype,
@@ -766,8 +827,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     c_major="n",
                 )
                 gemm2_ok = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-                    a_dtype=ab_dtype,
-                    b_dtype=ab_dtype,
+                    a_dtype=a_dtype,
+                    b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     out_dtype=gemm2_out_dtype,
@@ -830,7 +891,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             Output tensor from the MoE computation.
         """
         if tactic is None or tactic == -1:
-            tactic = _get_default_tactic()
+            tactic = (
+                DEFAULT_BLACKWELL_MOE_TACTIC
+                if self.quant_mode == "w4a8"
+                else _get_default_tactic()
+            )
+        elif self.quant_mode == "w4a8":
+            tactic = canonicalize_w4a8_tactic(tactic)
 
         params = _extract_tactic_params(tactic)
 
@@ -1213,3 +1280,15 @@ def print_all_tactics():
                 gemm1_tactic,
                 gemm2_tactic,
             )
+
+
+def __getattr__(name: str):
+    if name == "CuteDslFusedMoENvfp4Runner":
+        warnings.warn(
+            "CuteDslFusedMoENvfp4Runner is deprecated; use "
+            "CuteDslFusedMoERunner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CuteDslFusedMoERunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

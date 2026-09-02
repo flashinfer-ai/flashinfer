@@ -38,9 +38,11 @@ from .trace.templates.attention import (
 _MAX_COMPACT_BLOCKS = 64
 _MAX_DIRECT_TOPK = 32
 _MAX_LONGSEQ_BLOCKS = 192
+_BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS = 24
 _EXPECTED_PROFILES = {
     "blk128_compact",
     "blk64_persistent",
+    "blk64_persistent_ws_m64n256",
     "longseq",
     "ultrasparse_bsr",
     "gqa_mask",
@@ -131,9 +133,19 @@ def _manifest_source_records(
                     f"invalid Cake VSA source identity for {profile_name}"
                 )
             records.append((source_path, digest))
-    if len({source_path for source_path, _ in records}) != len(records):
+    source_paths = {source_path for source_path, _ in records}
+    if len(source_paths) != len(records):
         raise RuntimeError("duplicate Cake VSA source path in manifest")
-    if profile_names != _EXPECTED_PROFILES or len(records) != 27:
+    expected_source_paths = {
+        f"cake_vsa_{profile}_{suffix}"
+        for profile in _EXPECTED_PROFILES
+        for suffix in ("host.cpp", "sm_100a.cu", "sm_103a.cu")
+    }
+    if (
+        profile_names != _EXPECTED_PROFILES
+        or len(records) != 3 * len(_EXPECTED_PROFILES)
+        or source_paths != expected_source_paths
+    ):
         raise RuntimeError("incomplete Cake VSA source manifest inventory")
     return records
 
@@ -494,7 +506,14 @@ def plan_cake_vsa(
         )
 
     planned_kv_block_lens = None
+    blk64_profile = None
+    blk64_selected_blocks_total = None
     if R == 64:
+        # Planning already validates the device-resident row counts. Cache the
+        # measured schedule crossover here so repeated run() calls do not add a
+        # reduction or host synchronization. Use the actual mixed row counts,
+        # not the padded q2k_indices capacity or a min/max surrogate.
+        blk64_selected_blocks_total = int(row_counts.sum().item())
         if kv_block_lens is None:
             planned_kv_block_lens = torch.full(
                 (nb,), C, dtype=torch.int32, device=device
@@ -511,6 +530,22 @@ def plan_cake_vsa(
                 ).item()
             ):
                 raise ValueError("kv_block_lens entries must be in [1, C]")
+        slots = torch.arange(q2k_indices.shape[2], device=device)
+        active_indices = q2k_indices[slots < q2k_num.unsqueeze(-1)]
+        full_kv_groups = bool(torch.all(row_counts.remainder(4) == 0).item())
+        if full_kv_groups:
+            full_kv_groups = bool(
+                torch.all(
+                    planned_kv_block_lens[active_indices.to(torch.int64)] == C
+                ).item()
+            )
+        blk64_profile = (
+            "blk64_persistent_ws_m64n256"
+            if full_kv_groups
+            and blk64_selected_blocks_total
+            > _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS * row_counts.numel()
+            else "blk64_persistent"
+        )
     shared_indptr = shared_indices = None
     if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(
@@ -540,6 +575,8 @@ def plan_cake_vsa(
         "q2k_indices": q2k_indices,
         "q2k_num": q2k_num,
         "kv_block_lens": planned_kv_block_lens,
+        "blk64_profile": blk64_profile,
+        "blk64_selected_blocks_total": blk64_selected_blocks_total,
         "workspace": {},
     }
 
@@ -691,7 +728,7 @@ def _run_blk64(
 ) -> None:
     import tvm_ffi
 
-    module = _load_module("blk64_persistent", _arch_for_device(q.device))
+    module = _load_module(plan["blk64_profile"], _arch_for_device(q.device))
     total_tiles = plan["mb"] * plan["num_qo_heads"]
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     persistent_ctas = min(total_tiles, sm_count)
@@ -746,6 +783,7 @@ def _fp16_metadata(plan: dict[str, Any], q: torch.Tensor):
         torch.zeros((1,), dtype=torch.int32, device=device),
         torch.tensor([plan["N"]], dtype=torch.int32, device=device),
         torch.zeros((1,), dtype=torch.int32, device=device),
+        torch.empty((1, 1, 128, 8), dtype=torch.uint8, device=device),
         topk,
     )
     plan["workspace"]["fp16_metadata"] = cached
@@ -764,13 +802,24 @@ def _run_fp16(
     import tvm_ffi
 
     module = _load_module("fp16_direct", _arch_for_device(q.device))
-    q2k, cu_q, cu_k, q_offsets, kv_lens, page_table, topk = _fp16_metadata(plan, q)
+    (
+        q2k,
+        cu_q,
+        cu_k,
+        q_offsets,
+        kv_lens,
+        page_table,
+        scale_dummy,
+        topk,
+    ) = _fp16_metadata(plan, q)
     scale = float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"]))
     with tvm_ffi.use_torch_stream():
         module.run(
             q,
             k,
+            scale_dummy,
             v,
+            scale_dummy,
             out,
             stats,
             stats,
@@ -788,7 +837,10 @@ def _run_fp16(
             0,
             0,
             0,
+            0,
             scale / math.log(2.0),
+            1.0,
+            1.0,
             1.0,
             int(return_lse),
             0,

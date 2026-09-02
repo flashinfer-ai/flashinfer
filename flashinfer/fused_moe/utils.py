@@ -354,7 +354,11 @@ def make_random_topk_ids(
 
 
 def get_b12x_activation_name(activation_type: ActivationType) -> str:
-    """Translate an activation type to the b12x kernel name."""
+    """Map an activation enum to its b12x kernel name.
+
+    Validate typed scalars before this conversion. Unsupported types raise
+    ``ValueError``; backend selection should expose them as ``NotImplementedError``.
+    """
     if activation_type is ActivationType.Swiglu:
         return "silu"
     if activation_type is ActivationType.GegluTanh:
@@ -362,3 +366,16 @@ def get_b12x_activation_name(activation_type: ActivationType) -> str:
     if activation_type is ActivationType.Relu2:
         return "relu2"
     raise ValueError(f"Unsupported b12x activation type {activation_type!r}.")
+
+
+def resolve_b12x_activation_name(activation) -> str:
+    """Resolve a typed activation, rejecting scalars b12x cannot represent."""
+    from .api import SwiGLU
+
+    if activation is None:
+        activation = SwiGLU()
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        raise NotImplementedError(
+            f"b12x cannot represent non-default SwiGLU scalars; got {activation!r}."
+        )
+    return get_b12x_activation_name(activation.type)

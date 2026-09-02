@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 
 from packaging.version import Version
+import pytest
 
 from flashinfer.artifacts import ArtifactPath
 
@@ -26,6 +27,8 @@ from .cli_cmd_helpers import (
     _assert_output_contains_all,
     _assert_output_contains_any,
 )
+
+_SOURCE_CUDA_CONFIG_PATH = Path(__file__).parents[2] / "ci" / "cuda-versions.json"
 
 
 def test_show_config_cmd_real():
@@ -468,11 +471,14 @@ def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
     assert recorded["cmd"][-1] == "flashinfer-jit-cache==0.4.2+cu129"
 
 
+@pytest.mark.skipif(
+    not _SOURCE_CUDA_CONFIG_PATH.is_file(),
+    reason="requires the source-tree CUDA configuration",
+)
 def test_supported_jit_cache_versions_match_cuda_config():
     from flashinfer.__main__ import _SUPPORTED_JIT_CACHE_CUDA_VERSIONS
 
-    config_path = Path(__file__).parents[2] / "ci" / "cuda-versions.json"
-    config = json.loads(config_path.read_text())
+    config = json.loads(_SOURCE_CUDA_CONFIG_PATH.read_text())
 
     assert [str(version) for version in _SUPPORTED_JIT_CACHE_CUDA_VERSIONS] == [
         entry["version"] for entry in config["jit_cache"]

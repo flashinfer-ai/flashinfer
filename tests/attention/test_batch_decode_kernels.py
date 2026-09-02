@@ -1116,6 +1116,16 @@ def test_single_decode_torch_compile_cuda_graph():
     env = os.environ.copy()
     env.setdefault("USER", "ci")
 
+    # Preflight in-process so a module missing from the jit-cache skips via
+    # conftest's MissingJITCacheError handler instead of failing in the
+    # subprocess; also keeps JIT compilation out of the subprocess timeout.
+    KV_LEN, QH, KH, D = 256, 8, 8, 128
+    flashinfer.single_decode_with_kv_cache(
+        torch.randn(QH, D, device="cuda", dtype=torch.float16),
+        torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16),
+        torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16),
+    )
+
     # The parent pytest process has already run thousands of decode cases in this
     # file. Release its cached blocks before the subprocess initializes
     # torch.compile/cudagraph state on memory-constrained A10G runners.
