@@ -2101,8 +2101,7 @@ def test_sparse_mla_sm120_prefill_dots3_swa(
 
     torch.testing.assert_close(output, ref_out, atol=1e-2, rtol=5e-3)
     if attn_sink is None:
-        # The empty-window token's LSE is the kernel's -1e30 sentinel while
-        # the dense reference emits -inf; compare only non-empty rows here.
+        # Empty row: kernel emits the -1e30 sentinel, the reference -inf.
         nonempty = topk_length.bool()
         torch.testing.assert_close(
             out_lse[nonempty], ref_lse[nonempty], atol=5e-3, rtol=5e-3

@@ -346,10 +346,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
         wfp8[(gid + 8) * CT::W_FP8_STRIDE + e1i] = f11.__x;
       }
       bar_arrive_alt<6, 7, Cfg::MATH_THREADS>(buf);  // w_ready
-      // The producer also joins the KV release: its QK/vsc reads of this
-      // buffer are not otherwise ordered against IO's refill (the consumer's
-      // release only covers the consumer's own reads; racecheck flags the
-      // scale-buffer pair without this).
+      // The producer's QK/vsc reads of this buffer join the release too.
       bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(buf);
 
       if (ti + 1 < actual_ni) {
