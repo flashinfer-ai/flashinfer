@@ -208,7 +208,10 @@ class TmemCResource(MemoryResource):
             c_total_cols = self._tmem_c_cols_per_stage() * self.cfg.num_stages_tmem_acc
             sf_stage_mult = (
                 self.cfg.num_stages_tmem_sfa
-                if self.cfg.uses_unfused_tmem_sf_copy
+                if (
+                    self.cfg.uses_unfused_tmem_sf_copy
+                    or self.cfg.dsfp8_mxfp8_expands_in_tmem
+                )
                 else 1
             )
             if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
@@ -519,7 +522,11 @@ class TmemCResource(MemoryResource):
 
         else:
             # FP4 path: block-scaled MMA
-            if cutlass.const_expr(not self.cfg.uses_unfused_tmem_sf_copy):
+            if cutlass.const_expr(self.cfg.dsfp8_mxfp8_expands_in_tmem):
+                # Compact FP32 scales were converted directly into the TMEM
+                # rings by LoadSfAbNativeTask.
+                pass
+            elif cutlass.const_expr(not self.cfg.uses_unfused_tmem_sf_copy):
                 # Fused S2T+MMA: do S2T copy here, then MMA.
                 s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
                 num_sfa_iters = self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
@@ -574,7 +581,10 @@ class TmemCResource(MemoryResource):
                 pass
 
             # Block-scaled MMA with scale factors in TMEM
-            if cutlass.const_expr(self.cfg.uses_unfused_tmem_sf_copy):
+            if cutlass.const_expr(
+                self.cfg.uses_unfused_tmem_sf_copy
+                or self.cfg.dsfp8_mxfp8_expands_in_tmem
+            ):
                 # SF stage offsets from separate CopySf pipeline
                 sfa_offset = sfa_stage_col_offset
                 sfb_offset = sfb_stage_col_offset

@@ -776,8 +776,14 @@ def is_prims_ts_fp8_block_scale_supported(
         return False, "hidden_size and intermediate_size must be multiples of 128"
 
     if is_deepseek:
-        if moe_inputs.hidden_states_scale.dtype != torch.float32:
-            return False, "DeepSeek FP8 hidden_states_scale must be float32"
+        native_mx_input = bool(getattr(runner, "use_mxfp8_backed_dsfp8", False))
+        expected_hidden_scale_dtype = torch.uint8 if native_mx_input else torch.float32
+        if moe_inputs.hidden_states_scale.dtype != expected_hidden_scale_dtype:
+            return False, (
+                "MXFP8-backed DSFP8 hidden_states_scale must be uint8"
+                if native_mx_input
+                else "DeepSeek FP8 hidden_states_scale must be float32"
+            )
         if (
             kwargs.get("gemm1_weights_scale") is None
             or kwargs.get("gemm2_weights_scale") is None
@@ -814,6 +820,9 @@ def is_prims_ts_fp8_block_scale_supported(
                 num_local_experts=getattr(runner, "num_local_experts", None),
                 weight_layout=_weight_layout_arg(runner, kwargs),
                 enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                use_mxfp8_backed_dsfp8=bool(
+                    getattr(runner, "use_mxfp8_backed_dsfp8", False)
+                ),
             )
         else:
             pair = mapper(
@@ -837,6 +846,24 @@ def is_prims_ts_fp8_block_scale_supported(
         return False, str(exc)
 
     return True, ""
+
+
+def is_prims_ts_mxfp8_backed_dsfp8_supported(
+    runner: Any,
+    moe_inputs: Any,
+    tactic: int | Sequence[int],
+    **kwargs: Any,
+) -> tuple[bool, str]:
+    """Return whether the selected MXFP8-backed DeepSeek recipe is supported."""
+
+    if not bool(getattr(runner, "use_mxfp8_backed_dsfp8", False)):
+        return False, "MXFP8-backed DSFP8 recipe is not selected"
+    return is_prims_ts_fp8_block_scale_supported(
+        runner,
+        moe_inputs,
+        tactic,
+        **kwargs,
+    )
 
 
 _SUPPORT_CHECKS = {

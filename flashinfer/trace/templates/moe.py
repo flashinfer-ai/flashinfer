@@ -183,6 +183,7 @@ def _fp8_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    use_mxfp8_backed_dsfp8=False,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
@@ -200,22 +201,40 @@ def _fp8_moe_run_experts(
         )
     device = hidden_states.device
 
+    def nearest_ue8m0(scales):
+        lower = torch.pow(2.0, torch.floor(torch.log2(scales)))
+        nearest = torch.where(scales >= 1.5 * lower, 2.0 * lower, lower)
+        return nearest.to(torch.float8_e8m0fnu).to(torch.float32)
+
     A_fp32 = hidden_states.to(torch.float32)
-    A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
-    A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
-    A_scale_expanded = (
-        A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
-    )
+    if use_mxfp8_backed_dsfp8:
+        # Native-MX activation scales are token-major UE8M0 K32 IDs stored as
+        # uint8 so trace JSON remains portable across PyTorch versions.
+        A_scale_TH = hidden_states_scale.contiguous().view(torch.float8_e8m0fnu)
+        A_scale_TH = A_scale_TH.to(torch.float32)
+        A_scale_expanded = (
+            A_scale_TH.unsqueeze(-1).repeat(1, 1, 32).reshape(T, H).contiguous()
+        )
+    else:
+        A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
+        A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
+        A_scale_expanded = (
+            A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
+        )
     A = A_fp32 * A_scale_expanded
 
     W13_fp32 = gemm1_weights.to(torch.float32)
     S13 = gemm1_weights_scale.to(torch.float32)
+    if use_mxfp8_backed_dsfp8:
+        S13 = nearest_ue8m0(S13)
     S13_expanded = torch.repeat_interleave(S13, BLOCK, dim=1)
     S13_expanded = torch.repeat_interleave(S13_expanded, BLOCK, dim=2)
     W13 = W13_fp32 * S13_expanded
 
     W2_fp32 = gemm2_weights.to(torch.float32)
     S2 = gemm2_weights_scale.to(torch.float32)
+    if use_mxfp8_backed_dsfp8:
+        S2 = nearest_ue8m0(S2)
     S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)
     S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)
     W2 = W2_fp32 * S2_expanded
@@ -286,6 +305,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    use_mxfp8_backed_dsfp8=False,
 ):
     """
     FP8 block-scale MoE with DeepSeek-V3 routing:
@@ -364,6 +384,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
     )
 
 
@@ -949,6 +970,42 @@ def _moe_fp8_block_scale_ds_init(
     }
 
 
+def _moe_fp8_block_scale_mx_backed_ds_init(
+    *,
+    seq_len: int,
+    hidden_size: int = 7168,
+    device: str = "cuda",
+    seed: int = 0,
+    **kwargs,
+):
+    """Build the explicit MXFP8-backed DeepSeek recipe trace inputs."""
+
+    kwargs.pop("num_hidden_mx_blocks", None)
+    out = _moe_fp8_block_scale_ds_init(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        device=device,
+        seed=seed,
+        **kwargs,
+    )
+    torch.manual_seed(seed)
+    a_bf16 = 2.0 * torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    hs, hs_scale = fp8_block_quant_1d(a_bf16, block=32)
+    out["hidden_states"] = hs
+    out["hidden_states_scale"] = (
+        hs_scale.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+    )
+    out["use_mxfp8_backed_dsfp8"] = True
+    return out
+
+
+cast(Any, _moe_fp8_block_scale_mx_backed_ds_init)._trace_init_dependencies = (
+    _moe_fp8_block_scale_ds_init,
+)
+
+
 def _moe_fp8_block_scale_ds_shared_experts_init(
     *,
     seq_len: int,
@@ -1005,7 +1062,9 @@ cast(Any, _moe_fp8_block_scale_ds_shared_experts_init)._trace_init_dependencies 
 )
 
 
-def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
+def _make_fp8_block_ds_trace(
+    *, shared_experts: bool, mxfp8_backed: bool = False
+) -> TraceTemplate:
     """Build routed and shared-expert DeepSeek-V3 block-FP8 traces.
 
     Shared experts need a separate template: using physical ``E + S`` rows as
@@ -1013,6 +1072,8 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
     definition. Both variants share this factory to keep their specs aligned.
     """
     # Expert-major tensors use physical rows; local_num_experts is routed-only.
+    if shared_experts and mxfp8_backed:
+        raise ValueError("MXFP8-backed DSFP8 does not support fused shared experts")
     rows = "num_weight_rows" if shared_experts else "num_local_experts"
     extra_axes = {}
     extra_inputs = {}
@@ -1041,9 +1102,13 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
     return TraceTemplate(
         op_type="moe",
         name_prefix=(
-            "moe_fp8_block_scale_ds_shared_experts"
-            if shared_experts
-            else "moe_fp8_block_scale_ds_routing"
+            "moe_fp8_block_scale_mx_backed_ds"
+            if mxfp8_backed
+            else (
+                "moe_fp8_block_scale_ds_shared_experts"
+                if shared_experts
+                else "moe_fp8_block_scale_ds_routing"
+            )
         ),
         description=(
             "FP8 block scale MoE with DeepSeek-V3 routing. Includes grouped "
@@ -1084,6 +1149,16 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
                 description="Number of quantized blocks along the hidden_size dimension (block_size=128).",
                 abbrev="",
             ),
+            **(
+                {
+                    "num_hidden_mx_blocks": Const(
+                        description="Number of MXFP8 activation blocks along hidden_size (block_size=32).",
+                        abbrev="",
+                    )
+                }
+                if mxfp8_backed
+                else {}
+            ),
             "num_intermediate_blocks": Const(
                 description="Number of quantized blocks along the intermediate_size dimension (block_size=128).",
                 abbrev="",
@@ -1108,8 +1183,17 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
                 description="Input hidden states tensor (FP8 quantized).",
             ),
             "hidden_states_scale": Tensor(
-                ["num_hidden_blocks", "seq_len"],
-                description="Block-wise scaling factors for hidden states.",
+                (
+                    ["seq_len", "num_hidden_mx_blocks"]
+                    if mxfp8_backed
+                    else ["num_hidden_blocks", "seq_len"]
+                ),
+                dtype="uint8" if mxfp8_backed else None,
+                description=(
+                    "Token-major UE8M0 K32 scale IDs for hidden states."
+                    if mxfp8_backed
+                    else "Block-wise scaling factors for hidden states."
+                ),
             ),
             "gemm1_weights": Tensor(
                 [rows, "gemm1_out_size", "hidden_size"],
@@ -1165,6 +1249,16 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
                 "float32",
                 description="Scaling factor for routing weights.",
             ),
+            **(
+                {
+                    "use_mxfp8_backed_dsfp8": Scalar(
+                        "bool",
+                        description="Select compact-weight-scale MXFP8 execution.",
+                    )
+                }
+                if mxfp8_backed
+                else {}
+            ),
         },
         outputs={
             "output": Tensor(
@@ -1176,9 +1270,13 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
         tags=["status:verified", "quantization:float8_e4m3fn"],
         reference=_trtllm_fp8_block_scale_moe_ds_routing_reference,
         init=(
-            _moe_fp8_block_scale_ds_shared_experts_init
-            if shared_experts
-            else _moe_fp8_block_scale_ds_init
+            _moe_fp8_block_scale_mx_backed_ds_init
+            if mxfp8_backed
+            else (
+                _moe_fp8_block_scale_ds_shared_experts_init
+                if shared_experts
+                else _moe_fp8_block_scale_ds_init
+            )
         ),
     )
 
@@ -1188,6 +1286,9 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = _make_fp8_block_ds_trace(
 )
 trtllm_fp8_block_scale_moe_ds_shared_experts_trace = _make_fp8_block_ds_trace(
     shared_experts=True
+)
+trtllm_fp8_block_scale_moe_mx_backed_ds_trace = _make_fp8_block_ds_trace(
+    shared_experts=False, mxfp8_backed=True
 )
 
 # Backward-compatible alias (the original name used in fused_moe/core.py import).
@@ -1276,6 +1377,19 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
 trtllm_fp8_block_scale_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
     *_MOE_TRACE_BY_ROUTING_TYPE.values(),
     trtllm_fp8_block_scale_moe_ds_shared_experts_trace,
+]
+
+
+def prims_ts_fp8_block_scale_moe_trace_dispatch(**kwargs):
+    """Select the explicit MX-backed recipe only on the Prims-TS API."""
+    if bool(kwargs.get("use_mxfp8_backed_dsfp8", False)):
+        return trtllm_fp8_block_scale_moe_mx_backed_ds_trace
+    return trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs)
+
+
+prims_ts_fp8_block_scale_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    *trtllm_fp8_block_scale_moe_trace_dispatch.templates,  # type: ignore[attr-defined]
+    trtllm_fp8_block_scale_moe_mx_backed_ds_trace,
 ]
 
 
@@ -2757,6 +2871,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    use_mxfp8_backed_dsfp8=False,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
@@ -2788,6 +2903,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
     )
 
 
@@ -3367,74 +3483,120 @@ trtllm_fp8_per_tensor_scale_routed_moe_trace = TraceTemplate(
 
 
 # FP8 block-scale routed (precomputed topk_ids)
-trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
-    op_type="moe",
-    name_prefix="trtllm_fp8_block_scale_routed_moe",
-    description="TRT-LLM FP8 block-scale MoE with precomputed topk_ids.",
-    axes={
-        **_TRTLLM_MOE_ROUTED_AXES,
-        "num_hidden_blocks": Const(abbrev=""),
-        "num_intermediate_blocks": Const(abbrev=""),
-        "num_gemm1_out_blocks": Const(abbrev=""),
-    },
-    inputs={
-        "topk_ids": Tensor(
-            ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
+def _make_fp8_block_scale_routed_trace(*, mxfp8_backed: bool) -> TraceTemplate:
+    return TraceTemplate(
+        op_type="moe",
+        name_prefix=(
+            "trtllm_fp8_block_scale_routed_mx_backed_ds"
+            if mxfp8_backed
+            else "trtllm_fp8_block_scale_routed_moe"
         ),
-        "routing_bias": Tensor(
-            ["num_experts"], optional=True, description="Optional routing bias."
-        ),
-        "hidden_states": Tensor(
-            ["seq_len", "hidden_size"],
-            description="FP8-quantized hidden states.",
-        ),
-        "hidden_states_scale": Tensor(
-            ["num_hidden_blocks", "seq_len"],
-            description="Block-wise hidden_states scale.",
-        ),
-        "gemm1_weights": Tensor(
-            ["num_local_experts", "gemm1_out_size", "hidden_size"],
-            description="FC1 FP8 weights.",
-        ),
-        "gemm1_weights_scale": Tensor(
-            ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
-            description="FC1 block-wise scale.",
-        ),
-        "gemm1_alpha": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
-        ),
-        "gemm1_beta": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
-        ),
-        "gemm1_clamp_limit": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
-        ),
-        "gemm2_weights": Tensor(
-            ["num_local_experts", "hidden_size", "intermediate_size"],
-            description="FC2 FP8 weights.",
-        ),
-        "gemm2_weights_scale": Tensor(
-            ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
-            description="FC2 block-wise scale.",
-        ),
-        "num_experts": Scalar("int32", description="Total number of experts."),
-        "top_k": Scalar("int32"),
-        "local_expert_offset": Scalar("int32"),
-        "routed_scaling_factor": Scalar("float32", optional=True),
-    },
-    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
-    tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
-    reference=_trtllm_fp8_block_scale_routed_moe_reference,
+        description="TRT-LLM FP8 block-scale MoE with precomputed topk_ids.",
+        axes={
+            **_TRTLLM_MOE_ROUTED_AXES,
+            "num_hidden_blocks": Const(abbrev=""),
+            **({"num_hidden_mx_blocks": Const(abbrev="")} if mxfp8_backed else {}),
+            "num_intermediate_blocks": Const(abbrev=""),
+            "num_gemm1_out_blocks": Const(abbrev=""),
+        },
+        inputs={
+            "topk_ids": Tensor(
+                ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
+            ),
+            "routing_bias": Tensor(
+                ["num_experts"], optional=True, description="Optional routing bias."
+            ),
+            "hidden_states": Tensor(
+                ["seq_len", "hidden_size"],
+                description="FP8-quantized hidden states.",
+            ),
+            "hidden_states_scale": Tensor(
+                (
+                    ["seq_len", "num_hidden_mx_blocks"]
+                    if mxfp8_backed
+                    else ["num_hidden_blocks", "seq_len"]
+                ),
+                dtype="uint8" if mxfp8_backed else None,
+                description=(
+                    "Token-major UE8M0 K32 scale IDs for hidden states."
+                    if mxfp8_backed
+                    else "Block-wise hidden_states scale."
+                ),
+            ),
+            "gemm1_weights": Tensor(
+                ["num_local_experts", "gemm1_out_size", "hidden_size"],
+                description="FC1 FP8 weights.",
+            ),
+            "gemm1_weights_scale": Tensor(
+                ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+                description="FC1 block-wise scale.",
+            ),
+            "gemm1_alpha": Tensor(
+                ["num_local_experts"],
+                dtype="float32",
+                optional=True,
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
+            ),
+            "gemm1_beta": Tensor(
+                ["num_local_experts"],
+                dtype="float32",
+                optional=True,
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
+            ),
+            "gemm1_clamp_limit": Tensor(
+                ["num_local_experts"],
+                dtype="float32",
+                optional=True,
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
+            ),
+            "gemm2_weights": Tensor(
+                ["num_local_experts", "hidden_size", "intermediate_size"],
+                description="FC2 FP8 weights.",
+            ),
+            "gemm2_weights_scale": Tensor(
+                ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+                description="FC2 block-wise scale.",
+            ),
+            "num_experts": Scalar("int32", description="Total number of experts."),
+            "top_k": Scalar("int32"),
+            "local_expert_offset": Scalar("int32"),
+            "routed_scaling_factor": Scalar("float32", optional=True),
+            **(
+                {
+                    "use_mxfp8_backed_dsfp8": Scalar(
+                        "bool",
+                        description="Select compact-weight-scale MXFP8 execution.",
+                    )
+                }
+                if mxfp8_backed
+                else {}
+            ),
+        },
+        outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+        tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
+        reference=_trtllm_fp8_block_scale_routed_moe_reference,
+    )
+
+
+trtllm_fp8_block_scale_routed_moe_trace = _make_fp8_block_scale_routed_trace(
+    mxfp8_backed=False
 )
+trtllm_fp8_block_scale_routed_mx_backed_ds_trace = _make_fp8_block_scale_routed_trace(
+    mxfp8_backed=True
+)
+
+
+def prims_ts_fp8_block_scale_routed_moe_trace_dispatch(**kwargs):
+    """Select the explicit MX-backed recipe only on the Prims-TS API."""
+    if bool(kwargs.get("use_mxfp8_backed_dsfp8", False)):
+        return trtllm_fp8_block_scale_routed_mx_backed_ds_trace
+    return trtllm_fp8_block_scale_routed_moe_trace
+
+
+prims_ts_fp8_block_scale_routed_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_routed_mx_backed_ds_trace,
+]
 
 # FP4 block-scale routed (precomputed topk_ids)
 trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(

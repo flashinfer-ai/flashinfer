@@ -1210,10 +1210,18 @@ class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style or MxFp8 x MxFp8)."""
 
     def __init__(
-        self, fp8_quantization_type: QuantMode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+        self,
+        fp8_quantization_type: QuantMode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+        *,
+        use_mxfp8_backed_dsfp8: bool = False,
     ):
         super().__init__()
         self.fp8_quantization_type = fp8_quantization_type
+        self.use_mxfp8_backed_dsfp8 = bool(use_mxfp8_backed_dsfp8)
+        if self.use_mxfp8_backed_dsfp8 and (
+            fp8_quantization_type != QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+        ):
+            raise ValueError("use_mxfp8_backed_dsfp8 requires FP8_BLOCK_SCALE_DEEPSEEK")
 
     @property
     def quant_mode(self) -> QuantMode:
@@ -1333,11 +1341,17 @@ class FP8BlockScaleMoe(Moe):
             return quantized_x, scales
 
         # todo(Yingyi):quantize bf16 to fp8
-        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+        if (
+            self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+            and not self.use_mxfp8_backed_dsfp8
+        ):
             hidden_states_quant, hidden_states_scale = to_float8_blockwise(
                 hidden_states
             )
-        elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+        elif (
+            self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
+            or self.use_mxfp8_backed_dsfp8
+        ):
             hidden_states_quant, hidden_states_scale = mxfp8_quantize(
                 hidden_states, is_swizzling
             )
@@ -1372,10 +1386,19 @@ class FP8BlockScaleMoe(Moe):
 
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
-            epilogue_tile_m = (
-                64
-                if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
-                else 128
+            epilogue_tile_m = weight_processing.get(
+                "epilogue_tile_m",
+                (
+                    64
+                    if (
+                        self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+                        and not self.use_mxfp8_backed_dsfp8
+                    )
+                    else 128
+                ),
+            )
+            gemm2_epilogue_tile_m = weight_processing.get(
+                "gemm2_epilogue_tile_m", epilogue_tile_m
             )
 
             intermediate_size_factor = (
@@ -1385,10 +1408,15 @@ class FP8BlockScaleMoe(Moe):
             gemm1_weights_fp8_interleaved = args.gemm1_weights.clone()
             gemm1_scales_fp8_interleaved = args.gemm1_scales.clone()
             gemm1_bias_fp8_interleaved = args.gemm1_bias
-            if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+            native_deepseek_mxfp8 = self.use_mxfp8_backed_dsfp8
+            if (
+                self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
+                or native_deepseek_mxfp8
+            ):
                 # Reorder rows of W1 only for fused gated activation.
                 gemm1_weights_fp8_interleaved = []
-                gemm1_scales_fp8_interleaved = []
+                if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                    gemm1_scales_fp8_interleaved = []
                 gemm1_bias_fp8_interleaved = [] if args.gemm1_bias is not None else None
                 for i in range(num_experts):
                     gemm1_w = (
@@ -1396,29 +1424,34 @@ class FP8BlockScaleMoe(Moe):
                         .clone()
                         .reshape(intermediate_size_factor * intermediate_size, -1)
                     )
-                    gemm1_s = (
-                        args.gemm1_scales[i]
-                        .clone()
-                        .reshape(intermediate_size_factor * intermediate_size, -1)
-                    )
+                    gemm1_s = None
+                    if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                        gemm1_s = (
+                            args.gemm1_scales[i]
+                            .clone()
+                            .reshape(intermediate_size_factor * intermediate_size, -1)
+                        )
                     if is_gated_activation(args.activation_type):
                         gemm1_w = reorder_rows_for_gated_act_gemm(gemm1_w)
-                        gemm1_s = reorder_rows_for_gated_act_gemm(gemm1_s)
+                        if gemm1_s is not None:
+                            gemm1_s = reorder_rows_for_gated_act_gemm(gemm1_s)
                     if gemm1_bias_fp8_interleaved is not None:
                         gemm1_b = args.gemm1_bias[i].clone().reshape(-1, 1)
                         if is_gated_activation(args.activation_type):
                             gemm1_b = reorder_rows_for_gated_act_gemm(gemm1_b)
                         gemm1_bias_fp8_interleaved.append(gemm1_b.reshape(-1))
                     gemm1_weights_fp8_interleaved.append(gemm1_w)
-                    gemm1_scales_fp8_interleaved.append(gemm1_s)
+                    if gemm1_s is not None:
+                        gemm1_scales_fp8_interleaved.append(gemm1_s)
 
                 # Stack weights and scales for all experts
                 gemm1_weights_fp8_interleaved = torch.stack(
                     gemm1_weights_fp8_interleaved
                 ).reshape(args.gemm1_weights.shape)
-                gemm1_scales_fp8_interleaved = torch.stack(
-                    gemm1_scales_fp8_interleaved
-                ).reshape(args.gemm1_scales.shape)
+                if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                    gemm1_scales_fp8_interleaved = torch.stack(
+                        gemm1_scales_fp8_interleaved
+                    ).reshape(args.gemm1_scales.shape)
                 if gemm1_bias_fp8_interleaved is not None:
                     gemm1_bias_fp8_interleaved = torch.stack(
                         gemm1_bias_fp8_interleaved
@@ -1435,7 +1468,7 @@ class FP8BlockScaleMoe(Moe):
                     gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
                 )
                 tmp_weights2 = shuffle_matrix_a(
-                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                    args.gemm2_weights[i].view(torch.uint8), gemm2_epilogue_tile_m
                 )
                 if gemm1_bias_shuffled is not None:
                     gemm1_bias_shuffled.append(
@@ -1449,7 +1482,7 @@ class FP8BlockScaleMoe(Moe):
                 if gemm2_bias_shuffled is not None:
                     gemm2_bias_shuffled.append(
                         shuffle_matrix_a(
-                            args.gemm2_bias[i].reshape(-1, 1), epilogue_tile_m
+                            args.gemm2_bias[i].reshape(-1, 1), gemm2_epilogue_tile_m
                         )
                         .reshape(-1)
                         .contiguous()
@@ -1658,6 +1691,11 @@ class FP8BlockScaleMoe(Moe):
                     gemm1_clamp_limit=gemm1_clamp_limit,
                     gemm1_bias=gemm1_bias,
                     gemm2_bias=gemm2_bias,
+                    **(
+                        {"use_mxfp8_backed_dsfp8": self.use_mxfp8_backed_dsfp8}
+                        if moe_gemm_backend == MoeGemmBackend.PRIMS_TS
+                        else {}
+                    ),
                 )
         if isinstance(output, list):
             if kwargs.get("return_full_output", False):
@@ -1668,7 +1706,9 @@ class FP8BlockScaleMoe(Moe):
     def compute_reference(self, args):
         """FP8 block-scale reference implementation."""
         if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
-            return run_moe_reference_dsfp8(args)
+            return run_moe_reference_dsfp8(
+                args, hidden_states_are_mxfp8=self.use_mxfp8_backed_dsfp8
+            )
         elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
             return run_moe_reference_mxfp8(args)
         else:
@@ -3378,7 +3418,7 @@ def run_moe_reference_mxfp8(args):
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_MXFP8), args_dequant
 
 
-def run_moe_reference_dsfp8(args):
+def run_moe_reference_dsfp8(args, *, hidden_states_are_mxfp8=False):
     """FP8 block-scale reference implementation (DeepSeek style)."""
     # Generate block scales at runtime for FP8 block scaling
 
@@ -3408,9 +3448,16 @@ def run_moe_reference_dsfp8(args):
         return output
 
     # todo(Yingyi): use original hidden_states??
-    hidden_states_dequant = dequant_reference_dsfp8(
-        args.hidden_states, args.hidden_states_scale, True, False, True
-    )
+    if hidden_states_are_mxfp8:
+        hidden_states_dequant = mxfp8_dequantize_host(
+            args.hidden_states.cpu().view(torch.uint8),
+            args.hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
+            False,
+        ).cuda()
+    else:
+        hidden_states_dequant = dequant_reference_dsfp8(
+            args.hidden_states, args.hidden_states_scale, True, False, True
+        )
 
     gemm1_weights_dequant = {}
     for i in range(args.num_experts):

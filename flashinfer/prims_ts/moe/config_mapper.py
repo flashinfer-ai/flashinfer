@@ -34,7 +34,23 @@ SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_MXFP4_BF16_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_DSFP8_TILE_N = (8, 16, 32, 64, 128)
+SUPPORTED_DSFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
+
+# Keep custom native-MX tactic IDs outside the JSON-generated index space. The
+# second component is persisted in autotune caches, so these IDs are stable and
+# must never alias an ordinary JSON FC1/FC2 Cartesian-product index.
+DSFP8_MXFP8_CUSTOM_TACTICS = {
+    128: ((128, 10_000), (128, 10_001), (128, 10_002)),
+    256: ((256, 10_000), (256, 10_001)),
+}
+
+
+def is_dsfp8_mxfp8_custom_tactic(tile_n: int, config_index: int) -> bool:
+    return (int(tile_n), int(config_index)) in DSFP8_MXFP8_CUSTOM_TACTICS.get(
+        int(tile_n), ()
+    )
+
 
 _ACTIVATION_TO_ACT_KIND = {
     int(ActivationType.Identity): 0,
@@ -1689,9 +1705,15 @@ def valid_prims_ts_deepseek_fp8_moe_tactics(
     num_local_experts: int | None = None,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> list[list[int]]:
-    return _valid_json_moe_tactics(
-        supported_tiles=SUPPORTED_DSFP8_TILE_N,
+    supported_tiles = (
+        SUPPORTED_DSFP8_MXFP8_TILE_N
+        if use_mxfp8_backed_dsfp8
+        else SUPPORTED_DSFP8_TILE_N
+    )
+    tactics = _valid_json_moe_tactics(
+        supported_tiles=supported_tiles,
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
@@ -1705,6 +1727,18 @@ def valid_prims_ts_deepseek_fp8_moe_tactics(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+    if use_mxfp8_backed_dsfp8:
+        selected_tiles = _selected_tile_ns(
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            supported_tiles=supported_tiles,
+        )
+        for tile_n in selected_tiles:
+            tactics.extend(
+                [list(tactic) for tactic in DSFP8_MXFP8_CUSTOM_TACTICS.get(tile_n, ())]
+            )
+    return tactics
 
 
 def map_trtllm_bf16_moe_tactic(
@@ -2038,24 +2072,43 @@ def map_trtllm_deepseek_fp8_moe_tactic(
     num_local_experts: int | None = None,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> PrimsTsGemmPair:
-    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE."""
+    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE.
 
+    ``use_mxfp8_backed_dsfp8=True`` selects the direct-TMEM path. Both FCs
+    consume native UE8M0 K32 activation scales, while weights retain compact
+    K128 FP32 checkpoint scales. FC1 SwiGLU emits true MXFP8 for FC2 to consume
+    directly. The former pre-expanded GMEM recipe has been removed.
+    """
+
+    native_mxfp8 = use_mxfp8_backed_dsfp8
+    supported_tiles = (
+        SUPPORTED_DSFP8_MXFP8_TILE_N if native_mxfp8 else SUPPORTED_DSFP8_TILE_N
+    )
     tile_n, moe_config_index = _parse_tactic(
         tactic,
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
-        supported_tiles=SUPPORTED_DSFP8_TILE_N,
+        supported_tiles=supported_tiles,
     )
-    if tile_n not in SUPPORTED_DSFP8_TILE_N:
+    if tile_n not in supported_tiles:
         raise ValueError(f"Unsupported Prims-TS DeepSeek FP8 tile_N={tile_n}")
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    return _required_json_moe_config_pair(
-        tile_n=tile_n,
-        moe_config_index=moe_config_index,
+    # The true-DeepSeek JSON predates native-MX tile-N 256 and the CTA-2
+    # experiments below.  Start experimental native tactics from the stable
+    # tile-N 128 DeepSeek ABI, then apply the MX-style shape explicitly.
+    native_custom_index = native_mxfp8 and is_dsfp8_mxfp8_custom_tactic(
+        tile_n, moe_config_index
+    )
+    json_tile_n = 128 if native_custom_index else tile_n
+    json_config_index = 0 if native_custom_index else moe_config_index
+    pair = _required_json_moe_config_pair(
+        tile_n=json_tile_n,
+        moe_config_index=json_config_index,
         num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
@@ -2069,3 +2122,115 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+    if not use_mxfp8_backed_dsfp8:
+        return pair
+
+    interstage_sf_layout = (
+        int(_SfLayout.R8c4) if tile_n < 128 else int(_SfLayout.R128c4)
+    )
+    native_common = dict(
+        dtype_a=int(_DType.MXE4M3),
+        dtype_b=int(_DType.MXE4M3),
+        # Each native scale producer synchronizes once per K tile.  Consume
+        # two compact K128 blocks per stage, matching the tile-K used by the
+        # tuned MXFP8/MXFP4 paths, to halve that synchronization frequency.
+        tile_k=512 if tile_n == 8 else 256,
+        use_deepseek_fp8=0,
+        use_mxfp8_deepseek_fp8=1,
+        # The source DeepSeek JSON row may now carry independent PR tactics
+        # for fused operand loads and 2x MMA unrolling. This recipe replaces
+        # the scale pipeline, so do not inherit those unrelated policies.
+        fuse_operand_sf_loads=0,
+        fuse_sf_copy_to_mma=0,
+        use_unroll_loop_2x_for_mma=0,
+        mma_m=128,
+        epi_tile_m=128,
+        cluster_m=1,
+        sf_layout_a=int(_SfLayout.R128c4),
+        sf_layout_b=interstage_sf_layout,
+        num_load_sfab_warps=0,
+    )
+    if tile_n == 128:
+        # The DeepSeek JSON includes FC2 variants with four accumulator stages.
+        # Native direct-TMEM SFA/SFB adds 48 columns, so those variants would
+        # require 560 columns and cannot fit tcgen05's 512-column allocation.
+        # Two accumulator stages preserve the ping-pong contract and leave room
+        # for both scale rings.
+        native_common["num_stages_tmem_acc"] = 2
+    if native_custom_index:
+        # Explicit MX-inspired CTA-2/MMA-M256 tuning space. Tile-N256 uses the
+        # generated maximum-overlap accumulator layout below.
+        native_common.update(
+            tile_n=tile_n,
+            mma_n=tile_n,
+            mma_m=256,
+            cluster_m=2,
+            epi_tile_n=64 if tile_n == 256 or moe_config_index != 5 else 128,
+            tile_scheduler=int(_TileScheduler.PERSISTENT),
+            # One TMA issuer per CTA keeps native FC1 at 384 threads. The
+            # generic tile-N256 fallback otherwise expands this to eight
+            # routed-B warps and a 640-thread CTA during realization.
+            num_load_b_warps=1,
+            num_stages_tmem_acc=1 if tile_n == 256 else 2,
+            # Tile-N256 uses the generated 512-column ping-pong accumulator
+            # contract.  The ordinary one-stage layout launches, but its four
+            # epi-N64 calls read the wrong accumulator half after the first
+            # release.  Tile-N128 keeps its validated two-stage ring.
+            use_max_tmem_overlap=1 if tile_n == 256 else 0,
+        )
+        if (tile_n, moe_config_index) in ((128, 10_002), (256, 10_001)):
+            native_common.update(tile_k=128)
+    fc1_kwargs = dict(pair.fc1.cfg.kwargs)
+    fc1_kwargs.update(native_common)
+    # FC1 consumes dynamically quantized MXFP8 activation scales while its
+    # weight operand keeps compact FP32 checkpoint scales.  It otherwise uses
+    # the established true-MX fused SwiGLU epilogue, writing MXE4M3 plus UE8M0
+    # scales directly in the layout consumed by FC2.
+    fc1_kwargs.update(
+        dtype_c=int(_DType.MXE4M3),
+        act_kind=int(_ActKind.SWIGLU),
+        sf_layout_c=interstage_sf_layout,
+    )
+    fc2_kwargs = dict(pair.fc2.cfg.kwargs)
+    fc2_kwargs.update(
+        native_common,
+        route_sfs_act=int(_RouteImpl.NONE),
+    )
+    # Preserve approximately the same buffered K depth and memory footprint
+    # after doubling tile_k.  Direct TMEM does not allocate the SMEM scale
+    # stages, but keeping every pipeline's stage count paired avoids inflated
+    # TMEM allocation and makes the mapping explicit.
+    for native_kwargs in (fc1_kwargs, fc2_kwargs):
+        k128_blocks_per_stage = int(native_kwargs["tile_k"]) // 128
+        for stage_name in (
+            "num_stages_a",
+            "num_stages_b",
+            "num_stages_smem_sfa",
+            "num_stages_smem_sfb",
+            "num_stages_tmem_sfa",
+            "num_stages_tmem_sfb",
+        ):
+            if stage_name in native_kwargs:
+                native_kwargs[stage_name] = max(
+                    2,
+                    (int(native_kwargs[stage_name]) + k128_blocks_per_stage - 1)
+                    // k128_blocks_per_stage,
+                )
+        if native_custom_index and tile_n == 256:
+            direct_stages = 3 if native_kwargs["tile_k"] == 128 else 1
+            native_kwargs["num_stages_tmem_sfa"] = direct_stages
+            native_kwargs["num_stages_tmem_sfb"] = direct_stages
+    result = PrimsTsGemmPair(
+        tile_n=tile_n,
+        moe_config_index=moe_config_index,
+        fc1=PrimsTsMoeGemmConfig(
+            cfg=_make_config_spec(**fc1_kwargs),
+            prims_ts_gemm_config_index=pair.fc1.prims_ts_gemm_config_index,
+        ),
+        fc2=PrimsTsMoeGemmConfig(
+            cfg=_make_config_spec(**fc2_kwargs),
+            prims_ts_gemm_config_index=pair.fc2.prims_ts_gemm_config_index,
+        ),
+    )
+
+    return result

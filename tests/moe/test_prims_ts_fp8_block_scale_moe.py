@@ -143,6 +143,170 @@ def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     )
 
 
+@pytest.mark.parametrize(
+    ("exact_e8m0_checkpoint_scales", "max_relative_l2"),
+    ((True, 0.15), (False, 0.45)),
+)
+def test_prims_ts_deepseek_native_mxfp8_tile8_stays_close_to_true_dsfp8(
+    cache_permute_indices,
+    monkeypatch,
+    exact_e8m0_checkpoint_scales,
+    max_relative_l2,
+):
+    """Low-tile native MX stays numerically close to the true-DSFP8 recipe.
+
+    This is intentionally an end-to-end comparison of the low-tile path whose
+    FC1-output/FC2-input scale layout is R8c4.  Both invocations reset the
+    test-data RNG to the same seed in ``run_moe_test``, giving them identical
+    inputs, weights, scales, and routing. The exact-E8M0 case isolates runtime
+    dataflow. The ordinary-FP32 case keeps the production checkpoint-scale
+    approximation in scope and guards its end-to-end relative-L2 envelope.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    def make_moe(*, use_mxfp8_backed_dsfp8):
+        moe = FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+            use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
+        )
+        if exact_e8m0_checkpoint_scales:
+            quantize_weights = moe.quantize_weights
+
+            def quantize_with_power_of_two_scales(*args, **kwargs):
+                quantized = quantize_weights(*args, **kwargs)
+                for name in ("gemm1_scales", "gemm2_scales"):
+                    scale = quantized[name]
+                    quantized[name] = scale.to(torch.float8_e8m0fnu).float()
+                return quantized
+
+            moe.quantize_weights = quantize_with_power_of_two_scales
+        return moe
+
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(
+        tuner,
+        "choose_one",
+        lambda *args, **kwargs: (None, [8, 0]),
+    )
+
+    common = dict(
+        num_tokens=32,
+        hidden_size=512,
+        intermediate_size=512,
+        routing_config={
+            "num_experts": 64,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [512],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        check_reference=False,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+    _, true_dsfp8, _ = run_moe_test(
+        moe_impl=make_moe(use_mxfp8_backed_dsfp8=False),
+        **common,
+    )
+    _, mxfp8_backed, _ = run_moe_test(
+        moe_impl=make_moe(use_mxfp8_backed_dsfp8=True),
+        **common,
+    )
+
+    relative_l2 = torch.linalg.vector_norm(
+        mxfp8_backed - true_dsfp8
+    ) / torch.linalg.vector_norm(true_dsfp8).clamp_min(torch.finfo(torch.float32).tiny)
+    cosine_similarity = torch.nn.functional.cosine_similarity(
+        mxfp8_backed.flatten(), true_dsfp8.flatten(), dim=0
+    )
+    norm_ratio = torch.linalg.vector_norm(mxfp8_backed) / torch.linalg.vector_norm(
+        true_dsfp8
+    ).clamp_min(torch.finfo(torch.float32).tiny)
+    assert relative_l2.item() < max_relative_l2, (
+        "MXFP8-backed DSFP8 drifted too far from true DSFP8 for tile-N8/R8c4: "
+        f"relative L2={relative_l2.item():.6f}, limit={max_relative_l2:.6f}, "
+        f"cosine={cosine_similarity.item():.6f}, norm ratio={norm_ratio.item():.6f}, "
+        f"exact_e8m0_checkpoint_scales={exact_e8m0_checkpoint_scales}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tile128_tactic", "tile256_tactic"),
+    [((128, 10_000), (256, 10_000)), ((128, 10_002), (256, 10_001))],
+)
+def test_prims_ts_deepseek_native_mxfp8_tile256_matches_tile128(
+    cache_permute_indices,
+    monkeypatch,
+    tile128_tactic,
+    tile256_tactic,
+):
+    """Tile-N256 preserves the validated tile-N128 fused-MX result."""
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+
+    def run(tactic):
+        monkeypatch.setattr(
+            tuner,
+            "choose_one",
+            lambda *args, **kwargs: (None, list(tactic)),
+        )
+        _, actual, _ = run_moe_test(
+            num_tokens=65,
+            hidden_size=512,
+            intermediate_size=512,
+            moe_impl=FP8BlockScaleMoe(
+                fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+                use_mxfp8_backed_dsfp8=True,
+            ),
+            routing_config={
+                "num_experts": 64,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "compatible_activation_types": [ActivationType.Swiglu],
+                "enable_autotune": False,
+            },
+            weight_processing={
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+            },
+            activation_type=ActivationType.Swiglu,
+            cache_permute_indices=cache_permute_indices,
+            routing_logits_dtype=torch.bfloat16,
+            check_reference=False,
+            moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+        )
+        return actual
+
+    tile128 = run(tile128_tactic)
+    tile256 = run(tile256_tactic)
+    torch.testing.assert_close(tile256, tile128, rtol=0.05, atol=0.05)
+
+
 def test_prims_ts_deepseek_fp8_accepts_fp32_logits(cache_permute_indices):
     _skip_prims_ts_on_sm107()
     run_moe_test(
@@ -248,10 +412,28 @@ def test_prims_ts_mxfp8_block_scale_bias(
     )
 
 
-def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
+@pytest.mark.parametrize(
+    ("quant_mode", "fp8_quantization_type", "use_mxfp8_backed_dsfp8"),
+    (
+        (
+            QuantMode.FP8_BLOCK_SCALE_MXFP8,
+            Fp8QuantizationType.MxFp8,
+            False,
+        ),
+        (
+            QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+            Fp8QuantizationType.DeepSeekFp8,
+            True,
+        ),
+    ),
+)
+def test_prims_ts_fp8_block_scale_routed_modes_match_logits(
     cache_permute_indices,
+    quant_mode,
+    fp8_quantization_type,
+    use_mxfp8_backed_dsfp8,
 ):
-    """Packed and unpacked MXFP8 Prims-TS routed inputs match the logits path."""
+    """Packed and unpacked Prims-TS routed inputs match the logits path."""
     _skip_prims_ts_on_sm107()
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -269,7 +451,10 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
     padding = 8
     activation_type = ActivationType.Swiglu
 
-    moe_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    moe_impl = FP8BlockScaleMoe(
+        fp8_quantization_type=quant_mode,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
+    )
     moe_impl._cache_permute_indices = cache_permute_indices
     hidden_states = torch.randn(
         (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
@@ -364,9 +549,10 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
         do_finalize=True,
         enable_pdl=device_support_pdl(device),
         tune_max_num_tokens=4096,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        fp8_quantization_type=fp8_quantization_type,
         activation_type=activation_type.value,
         norm_topk_prob=True,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
     )
     routed_kwargs = dict(common_kwargs)
     routed_kwargs.pop("norm_topk_prob")

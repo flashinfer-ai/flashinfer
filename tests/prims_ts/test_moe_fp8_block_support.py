@@ -19,12 +19,15 @@ import torch
 
 from flashinfer.fused_moe.backends.prims_ts.fp8_op import _resolve_routing_inputs
 from flashinfer.fused_moe.shared.inputs import RoutingInputMode
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
 from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
+    valid_prims_ts_deepseek_fp8_moe_tactics,
 )
 from flashinfer.prims_ts.moe import support
+from flashinfer.prims_ts.moe.runner import PrimsTsFp8BlockScaleMoERunner
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -74,6 +77,41 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
 
 
+def _block_scale_runner(**overrides):
+    kwargs = dict(
+        top_k=1,
+        num_local_experts=1,
+        hidden_size=128,
+        intermediate_size=128,
+        fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+    )
+    kwargs.update(overrides)
+    return PrimsTsFp8BlockScaleMoERunner(SimpleNamespace(), **kwargs)
+
+
+def test_dsfp8_mxfp8_recipe_has_stable_distinct_autotune_cache_identity():
+    inputs = MoeRunnerInputs(
+        output=torch.empty((4, 128)),
+        routing_logits=torch.empty((4, 1)),
+        topk_ids=torch.empty((4,), dtype=torch.int32),
+        expert_weights=torch.empty((4,), dtype=torch.bfloat16),
+        hidden_states=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.empty((4, 4), dtype=torch.uint8),
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    ).to_list()
+
+    true_dsfp8 = _block_scale_runner(use_mxfp8_backed_dsfp8=False)
+    mx_backed = _block_scale_runner(use_mxfp8_backed_dsfp8=True)
+    equivalent = _block_scale_runner(use_mxfp8_backed_dsfp8=True)
+    assert true_dsfp8.get_cache_key_extras(inputs) != mx_backed.get_cache_key_extras(
+        inputs
+    )
+    assert mx_backed.get_cache_key_extras(inputs) == equivalent.get_cache_key_extras(
+        inputs
+    )
+
+
 def test_mxfp8_mxfp8_mapper_supports_tile256():
     pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
         [256, 0],
@@ -90,6 +128,31 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
     assert not fc2.has_epilogue_quant
+
+
+def test_dsfp8_mxfp8_autotuner_enumerates_complete_wide_tactics():
+    tactics = valid_prims_ts_deepseek_fp8_moe_tactics(
+        num_tokens=4096,
+        top_k=8,
+        num_local_experts=64,
+        use_mxfp8_backed_dsfp8=True,
+    )
+
+    assert len(tactics) == len({tuple(tactic) for tactic in tactics})
+    wide_tiles = set()
+    for tactic in tactics:
+        if tactic[0] not in (128, 256):
+            continue
+        pair = map_trtllm_deepseek_fp8_moe_tactic(
+            tactic,
+            num_tokens=4096,
+            top_k=8,
+            num_local_experts=64,
+            use_mxfp8_backed_dsfp8=True,
+        )
+        assert pair.fc1.cfg.kwargs["tile_n"] == pair.fc2.cfg.kwargs["tile_n"]
+        wide_tiles.add(pair.tile_n)
+    assert wide_tiles == {128, 256}
 
 
 def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
@@ -293,7 +356,7 @@ def test_deepseek_fp8_mapper_default_matches_trtllm_fallback(
 
 def test_deepseek_fp8_mapper_rejects_trtllm_unsupported_tile256():
     with pytest.raises(ValueError, match="DeepSeek FP8 tile_N=256"):
-        map_trtllm_deepseek_fp8_moe_tactic([256, 0])
+        map_trtllm_deepseek_fp8_moe_tactic([256, 10_000])
 
 
 def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):

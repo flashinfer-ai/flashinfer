@@ -908,6 +908,103 @@ def create_load_sfb_task(
     )
 
 
+def create_load_sfab_native_task(
+    cfg,
+    gmem_sfa,
+    gmem_sfb,
+    tmem_sfa,
+    tmem_sfb,
+    work_queue,
+    num_k_tiles: int,
+    pdl_wait_resource=None,
+    pdl_launch_resource=None,
+) -> Task:
+    """Expand both compact FP32 scale operands with one TMEM warpgroup.
+
+    The four producer warps issue the SFA and SFB stores back-to-back, then
+    share one TMEM wait/fence/CTA barrier.  This halves both the dedicated
+    scale-loader warps and the synchronization count of the direct-TMEM path.
+    """
+    is_persistent = _is_persistent(cfg)
+    has_pdl_wait = pdl_wait_resource is not None
+    has_pdl_launch = pdl_launch_resource is not None
+
+    @schedule
+    def load_sfab_schedule(
+        gmem_a: MemoryResource,
+        gmem_b: MemoryResource,
+        tmem_a: MemoryResource,
+        tmem_b: MemoryResource,
+        *extra,
+    ) -> None:
+        idx = 0
+        pdl_wait = extra[idx] if has_pdl_wait else None
+        idx += 1 if has_pdl_wait else 0
+        pdl_launch = extra[idx] if has_pdl_launch else None
+        idx += 1 if has_pdl_launch else 0
+        wq = extra[idx] if is_persistent else None
+        if pdl_wait is not None:
+            pdl_wait.wait_griddep()
+        _ = gmem_a.init_coords_state()
+        _ = gmem_b.init_coords_state()
+        tmem_a.init_load_state()
+        tmem_b.init_load_state()
+        with _work_tile_schedule_loop(cfg, wq):
+            _ = gmem_b.init_tile_state()
+            with domain_loop(0, num_k_tiles, 1):
+                coord_sfa_k, coord_sfa_mn = gmem_a.compute_sfa_coords_loop()
+                coord_sfb_k, coord_sfb_mn = gmem_b.compute_sfb_coords_loop()
+                tmem_a.try_acquire()
+                tmem_a.acquire()
+                tmem_b.try_acquire()
+                tmem_b.acquire()
+                tmem_a.load_sfa_tile_no_sync(
+                    coord_sfa_k=coord_sfa_k,
+                    coord_sfa_mn=coord_sfa_mn,
+                )
+                # SFB is issued second; its ordinary producer work performs
+                # the one wait/fence/barrier covering both operands' stores.
+                tmem_b.load_sfb_tile(
+                    coord_sfb_k=coord_sfb_k,
+                    coord_sfb_mn=coord_sfb_mn,
+                )
+                tmem_a.commit()
+                tmem_b.commit()
+        if pdl_launch is not None:
+            pdl_launch.launch_griddep()
+
+    extra_resources = []
+    if pdl_wait_resource is not None:
+        extra_resources.append(pdl_wait_resource)
+    if pdl_launch_resource is not None:
+        extra_resources.append(pdl_launch_resource)
+    if is_persistent:
+        extra_resources.append(work_queue)
+    captured_schedule = load_sfab_schedule(
+        gmem_sfa,
+        gmem_sfb,
+        tmem_sfa,
+        tmem_sfb,
+        *extra_resources,
+    )
+    return Task(
+        src_resources=(
+            [gmem_sfa, gmem_sfb]
+            + _pdl_wait_resources(pdl_wait_resource)
+            + ([work_queue] if cfg.is_persistent else [])
+        ),
+        dst_resources=[tmem_sfa, tmem_sfb] + _pdl_launch_resources(pdl_launch_resource),
+        warp_idx=cfg.load_sfa_warp_idx,
+        num_warps=cfg.num_load_sfa_warps,
+        schedule=captured_schedule,
+        num_registers=max(cfg.load_sfa_task_regs, cfg.load_sfb_task_regs),
+        name="LoadSfAbNativeTask",
+        # CTA-2 MMA owns one cluster-wide TMEM allocation. CTA 0 writes the
+        # complete M256 SFA and shared SFB tile for both MMA CTAs.
+        run_only_on_cta_id=0 if cfg.has_cluster else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Copy SF tasks (LDS+STTM, only when not UTCCP-fused)
 # ---------------------------------------------------------------------------

@@ -226,7 +226,7 @@ class SmemSfBResource(MemoryResource):
         if self._alloc_sfb is None:
             self._alloc_sfb = SmemAllocation(
                 f"{self.name}_sfb",
-                size_bytes=self.cfg.num_bytes_sfb_per_stage
+                size_bytes=self.cfg.num_bytes_sfb_smem_stride
                 * self.cfg.num_stages_smem_sfb,
                 alignment=1024,
             )
@@ -277,7 +277,7 @@ class SmemSfBResource(MemoryResource):
             self.cfg.tile_k // sf_vec_size // TMEM_SF_PACK_SIZE_BYTES
         )
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
+            self.cfg.num_bytes_sfb_smem_stride * stage_info.stage_idx
         )
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
@@ -378,7 +378,7 @@ class SmemSfBResource(MemoryResource):
     def build_sfb_s2t_desc(self, stage_info: StageInfo) -> Int64:
         """Build SMEM descriptor for S2T copy of SFB."""
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
+            self.cfg.num_bytes_sfb_smem_stride * stage_info.stage_idx
         )
         desc_s2t = prims.Tcgen05SmemDesc.build(
             stage_base,

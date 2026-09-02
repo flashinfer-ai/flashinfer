@@ -725,6 +725,15 @@ class BatchedGemmConfig:
     # with tile_k=128 and is mutually exclusive with MX/NVFP4 block scaling
     # and per-token SF.
     use_deepseek_fp8: int = 0
+    use_mxfp8_deepseek_fp8: int = 0
+    """Use native MXFP8 MMA for compact DeepSeek FP8 FP32 input scales.
+
+    ``0`` keeps this path disabled. ``1`` converts compact weight FP32 scales
+    through UE8M0 directly into TMEM. FC1 and FC2 activation inputs already use
+    native MXFP8 packed UE8M0 K32 scales. This option is mutually exclusive
+    with :attr:`use_deepseek_fp8`.
+    """
+
     load_sfab_warp_idx: int = 12
     num_load_sfab_warps: int = 0
     load_sfab_regs: int = 48
@@ -933,15 +942,17 @@ class BatchedGemmConfig:
 
     @property
     def uses_fp8_output(self) -> bool:
-        """True for plain FP8 MMA writing an ``E4M3`` output
-        (no output block scaling).
-        """
-        return self.is_fp8_mma and self.dtype_c_kind == int(DType.E4M3)
+        """True for an FP8-input MMA writing plain ``E4M3`` output."""
+        return (
+            self.is_fp8_mma or self.has_mxfp8_deepseek_fp8
+        ) and self.dtype_c_kind == int(DType.E4M3)
 
     @property
     def has_deepseek_fp8_c_scale(self) -> bool:
         """DeepSeek FP8 E4M3 output uses the C-scale pointer for FP32 dq scales."""
-        return self.has_deepseek_fp8 and self.uses_fp8_output
+        return (
+            self.has_deepseek_fp8 or self.has_mxfp8_deepseek_fp8
+        ) and self.uses_fp8_output
 
     @property
     def has_per_token_sf_a(self) -> bool:
@@ -988,6 +999,39 @@ class BatchedGemmConfig:
         and per-token SF.
         """
         return self.use_deepseek_fp8 != 0
+
+    @property
+    def has_mxfp8_deepseek_fp8(self) -> bool:
+        """Native-MX DeepSeek FP8 input-scale evaluation path."""
+        return self.use_mxfp8_deepseek_fp8 != 0
+
+    @property
+    def dsfp8_mxfp8_expands_in_tmem(self) -> bool:
+        """Whether the MoE scale producer writes packed scales into TMEM."""
+        return self.has_mxfp8_deepseek_fp8
+
+    @property
+    def dsfp8_mxfp8_sfb_is_mxfp8(self) -> bool:
+        """Whether activation operand B already carries native UE8M0 K32 scales.
+
+        The production direct-TMEM recipe dynamically quantizes FC1 input as
+        token-major MXFP8 and consumes FC1's R128c4 MXFP8 output in FC2.  Both
+        GEMMs therefore load SFB natively; only weight SFA is converted from
+        compact DeepSeek FP32 K128x128 scales.
+        """
+        return self.dsfp8_mxfp8_expands_in_tmem
+
+    @property
+    def dsfp8_mxfp8_native_sfb_layout(self) -> int:
+        """Physical GMEM layout of an already-quantized native-MX SFB.
+
+        Routed FC1 input is token-major LINEAR.  The fused FC1 output and FC2
+        input use the tactic's interstage layout: R8c4 below tile-N128 and
+        R128c4 for tile-N128/256.
+        """
+        if self.has_routed_sfs:
+            return int(SfLayout.LINEAR)
+        return self.sf_layout_b
 
     @property
     def has_deepseek_fp8_two_epilogue(self) -> bool:
@@ -1411,6 +1455,18 @@ class BatchedGemmConfig:
         return mn * (self.tile_k // self.input_sf_block_size_b)
 
     @property
+    def num_bytes_sfb_smem_stride(self) -> int:
+        """SMEM byte stride between B scale-factor pipeline stages.
+
+        TMA bulk tensor copies require a 128-byte-aligned shared-memory
+        destination. Low-N MX tiles can contain less than 128 bytes of SFB
+        data, so padding must be applied between stages without changing the
+        logical transaction size reported by :attr:`num_bytes_sfb_per_stage`.
+        """
+        stage_bytes = self.num_bytes_sfb_per_stage
+        return ((stage_bytes + 127) // 128) * 128
+
+    @property
     def num_bytes_sfb_tma_per_stage(self) -> int:
         """GMEM bytes moved by one SFB TMA load.
 
@@ -1642,6 +1698,7 @@ class BatchedGemmConfig:
         """
         if not (
             self.uses_unfused_tmem_sf_copy
+            and not self.dsfp8_mxfp8_expands_in_tmem
             and self.is_swap_ab
             and self.is_persistent
             and self.has_cluster
@@ -2064,7 +2121,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         )
         return
 
-    if cfg.use_tile256_tmem_overlap:
+    if cfg.use_tile256_tmem_overlap and not cfg.dsfp8_mxfp8_expands_in_tmem:
         cfg.num_mma_warps = 1
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
@@ -2211,7 +2268,14 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
             cfg.num_load_a_warps = 0
     elif cfg.has_tma_route:
         if cfg.is_swap_ab:
-            if requested_load_b_warps > 1:
+            if cfg.dsfp8_mxfp8_expands_in_tmem and cfg.has_cluster:
+                # Native-MX CTA-2 tactics intentionally use one routed-B TMA
+                # issuer.  Falling through to the generic tile-N256 default
+                # silently inflated FC1 from 384 to 640 threads and made CuTe
+                # lowering exceed the bounded correctness timeout before the
+                # kernel ever launched.
+                cfg.num_load_b_warps = max(1, requested_load_b_warps)
+            elif requested_load_b_warps > 1:
                 cfg.num_load_b_warps = requested_load_b_warps
             elif cfg.is_fp8_mma and cfg.has_cluster:
                 cfg.num_load_b_warps = 8
@@ -2247,6 +2311,12 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     else:
         cfg.num_load_sfa_warps = 0
         cfg.num_load_sfb_warps = 0
+    if cfg.dsfp8_mxfp8_expands_in_tmem:
+        # tcgen05_st writes one TMEM subpartition per participating warp.
+        # A full warpgroup duplicates the packed scales across all four
+        # subpartitions consumed by block-scale MMA.
+        cfg.num_load_sfa_warps = 4
+        cfg.num_load_sfb_warps = 4
 
     if cfg.has_gather:
         routed_rows = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
@@ -2272,7 +2342,12 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     # CopySf warps copy scale factors to TMEM before the MMA. The compact low-N
     # SFB path needs the 4-warp STTM warpgroup; all bulk S2T paths use one warp
     # to stay inside the launch envelope.
-    if cfg.uses_unfused_tmem_sf_copy:
+    if cfg.dsfp8_mxfp8_expands_in_tmem:
+        # Direct TMEM expansion is performed by the LoadSf producer warps.
+        # There is no intermediate SMEM stage or CopySf task.
+        cfg.num_copy_sfa_warps = 0
+        cfg.num_copy_sfb_warps = 0
+    elif cfg.uses_unfused_tmem_sf_copy:
         cfg.num_copy_sfa_warps = (
             4 if cfg.sfa_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM) else 1
         )
@@ -2285,6 +2360,30 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     else:
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
+
+    if cfg.dsfp8_mxfp8_expands_in_tmem:
+        _pack_warp_layout(
+            cfg,
+            WarpLayout(
+                (
+                    "epilogue",
+                    "load_sfa",
+                    "load_b",
+                    "load_a",
+                    "gather",
+                    "sync",
+                    "mma",
+                    "workid",
+                    "copy_sfa",
+                    "copy_sfb",
+                )
+            ),
+        )
+        # The direct-TMEM producer expands SFA and SFB back-to-back on the
+        # same physical warpgroup.  Keep both logical counts at four because
+        # each operand pipeline is produced collectively by four warps.
+        cfg.load_sfb_warp_idx = cfg.load_sfa_warp_idx
+        return
 
     if cfg.fuse_operand_sf_loads:
         # Gen's high-throughput FC1 layout:
@@ -2924,6 +3023,59 @@ def validate_config(
     if cfg.use_deepseek_fp8 not in (0, 1):
         raise ValueError(f"use_deepseek_fp8 must be 0 or 1, got {cfg.use_deepseek_fp8}")
 
+    if cfg.use_mxfp8_deepseek_fp8 not in (0, 1):
+        raise ValueError(
+            f"use_mxfp8_deepseek_fp8 must be 0 or 1, got {cfg.use_mxfp8_deepseek_fp8}"
+        )
+    if cfg.has_deepseek_fp8 and cfg.has_mxfp8_deepseek_fp8:
+        raise ValueError(
+            "use_deepseek_fp8 and use_mxfp8_deepseek_fp8 are mutually exclusive"
+        )
+
+    if cfg.has_mxfp8_deepseek_fp8:
+        if cfg.dtype_a_kind != int(DType.MXE4M3) or cfg.dtype_b_kind != int(
+            DType.MXE4M3
+        ):
+            raise ValueError("use_mxfp8_deepseek_fp8=1 requires dtype_a=dtype_b=MXE4M3")
+        if cfg.mma_m not in (128, 256):
+            raise ValueError(
+                f"use_mxfp8_deepseek_fp8=1 requires mma_m=128 or 256, got {cfg.mma_m}"
+            )
+        if cfg.tile_k not in (128, 256, 512):
+            raise ValueError(
+                "use_mxfp8_deepseek_fp8=1 requires tile_k=128, 256, or 512 "
+                f"to contain whole DeepSeek K128 scale-factor blocks, got {cfg.tile_k}"
+            )
+        if cfg.cluster_m == 2 and cfg.mma_m != 256:
+            raise ValueError(
+                "use_mxfp8_deepseek_fp8=1 requires mma_m=256 for cluster_m=2"
+            )
+        if not cfg.is_swap_ab:
+            raise ValueError("use_mxfp8_deepseek_fp8=1 requires swap-AB mode")
+        if cfg.use_per_token_sf_a != 0 or cfg.use_per_token_sf_b != 0:
+            raise ValueError(
+                "use_mxfp8_deepseek_fp8=1 is incompatible with use_per_token_sf_a/b"
+            )
+        if not cfg.uses_unfused_tmem_sf_copy and not cfg.use_tile256_tmem_overlap:
+            raise ValueError(
+                "in-kernel DeepSeek-to-MXFP8 expansion requires a staged TMEM "
+                "scale pipeline"
+            )
+        if cfg.dsfp8_mxfp8_expands_in_tmem and (
+            cfg.num_load_sfa_warps != 4
+            or cfg.num_load_sfb_warps != 4
+            or cfg.num_copy_sfa_warps != 0
+            or cfg.num_copy_sfb_warps != 0
+        ):
+            raise ValueError(
+                "TMEM DeepSeek-to-MXFP8 expansion requires one shared four-warp "
+                "LoadSf group and no CopySf warps"
+            )
+        if cfg.sf_layout_a != int(SfLayout.R128c4):
+            raise ValueError(
+                "use_mxfp8_deepseek_fp8=1 requires sf_layout_a=R128c4 "
+                "for the weight operand"
+            )
     if cfg.has_deepseek_fp8:
         if not cfg.is_fp8_mma:
             raise ValueError(

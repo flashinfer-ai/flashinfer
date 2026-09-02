@@ -149,6 +149,7 @@ def make_moe_tuning_config(
     init_packed_topk_ids: Callable | None,
     tune_max_num_tokens: int = 8192,
     act_sf_layout: SfLayout = SUPPORTED_MOE_ACT_SF_LAYOUT,
+    deepseek_input_is_mxfp8: bool = False,
     **kwargs: Any,
 ) -> TuningConfig:
     """Build a TuningConfig for a MoE runner instance.
@@ -272,7 +273,10 @@ def make_moe_tuning_config(
             # 1-D layout never reaches here — it is filtered out above
             # and handled by a ConstraintSpec.
             t = moe_inputs.hidden_states_scale
-            if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            if (
+                fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                and not deepseek_input_is_mxfp8
+            ):
                 assert t.shape == (hidden_size // 128, num_tokens), (
                     f"hidden_states_scale shape {tuple(t.shape)} does not match "
                     f"expected DeepSeekFp8 layout "

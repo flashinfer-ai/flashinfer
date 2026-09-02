@@ -37,8 +37,8 @@ from flashinfer.prims_ts.moe.support import (
 )
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
 from flashinfer.trace.templates.moe import (
-    trtllm_fp8_block_scale_moe_trace_dispatch,
-    trtllm_fp8_block_scale_routed_moe_trace,
+    prims_ts_fp8_block_scale_moe_trace_dispatch,
+    prims_ts_fp8_block_scale_routed_moe_trace_dispatch,
     trtllm_fp8_per_tensor_scale_moe_trace,
 )
 from flashinfer.utils import (
@@ -467,7 +467,7 @@ def _fake_prims_ts_fp8_per_tensor_scale_moe(
     "flashinfer::prims_ts_fp8_block_scale_moe",
     mutates_args=("routing_replay_out",),
 )
-@flashinfer_api(trace=trtllm_fp8_block_scale_moe_trace_dispatch)
+@flashinfer_api(trace=prims_ts_fp8_block_scale_moe_trace_dispatch)
 def prims_ts_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -503,6 +503,7 @@ def prims_ts_fp8_block_scale_moe(
     *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 block-scaled MoE using the Prims-TS backend on SM100.
 
@@ -518,7 +519,9 @@ def prims_ts_fp8_block_scale_moe(
     hidden_states : torch.Tensor
         Activations (BF16/FP16 or ``float8_e4m3fn`` depending on mode).
     hidden_states_scale : torch.Tensor
-        Block scales for ``hidden_states``.
+        Block scales for ``hidden_states``. The explicit MXFP8-backed DSFP8
+        recipe requires token-major UE8M0 K32 scales; true DSFP8 requires
+        FP32 K128 scales.
     gemm1_weights : torch.Tensor
         FC1 expert weights.
     gemm1_weights_scale : torch.Tensor
@@ -577,6 +580,16 @@ def prims_ts_fp8_block_scale_moe(
         Optional FC1 bias (keyword-only).
     gemm2_bias : Optional[torch.Tensor]
         Optional FC2 bias (keyword-only).
+    use_mxfp8_backed_dsfp8 : bool
+        Use the fused MXFP8 FC1/FC2 recipe. Activations and their scales are
+        MXFP8 E4M3 plus token-major UE8M0 K32; checkpoint weights retain
+        compact DeepSeek FP32 K128x128 scales. For each FC1 expert, first apply
+        :func:`flashinfer.fused_moe.reorder_rows_for_gated_act_gemm` to the
+        logical ``[gate; up]`` weight rows, then apply
+        :func:`flashinfer.quantization.fp4_quantization.shuffle_matrix_a` with
+        ``epilogue_tile_m=128`` to the byte view. Keep the compact FC1 scale
+        tensor in checkpoint order; the direct-TMEM loader maps shuffled weight
+        rows back to those logical K128x128 scale blocks.
 
     Returns
     -------
@@ -620,11 +633,12 @@ def prims_ts_fp8_block_scale_moe(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
         routing_input_mode=RoutingInputMode.FromLogits,
     )
 
 
-@flashinfer_api(trace=trtllm_fp8_block_scale_routed_moe_trace)
+@flashinfer_api(trace=prims_ts_fp8_block_scale_routed_moe_trace_dispatch)
 def prims_ts_fp8_block_scale_routed_moe(
     topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     routing_bias: Optional[torch.Tensor],
@@ -658,6 +672,7 @@ def prims_ts_fp8_block_scale_routed_moe(
     *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 block-scaled MoE using the Prims-TS backend on SM100.
 
@@ -675,7 +690,9 @@ def prims_ts_fp8_block_scale_routed_moe(
     hidden_states : torch.Tensor
         Activations (BF16/FP16 or ``float8_e4m3fn`` depending on mode).
     hidden_states_scale : torch.Tensor
-        Block scales for ``hidden_states``.
+        Block scales for ``hidden_states``. The explicit MXFP8-backed DSFP8
+        recipe requires token-major UE8M0 K32 scales; true DSFP8 requires
+        FP32 K128 scales.
     gemm1_weights : torch.Tensor
         FC1 expert weights.
     gemm1_weights_scale : torch.Tensor
@@ -730,6 +747,16 @@ def prims_ts_fp8_block_scale_routed_moe(
         Optional FC1 bias (keyword-only).
     gemm2_bias : Optional[torch.Tensor]
         Optional FC2 bias (keyword-only).
+    use_mxfp8_backed_dsfp8 : bool
+        Use the fused MXFP8 FC1/FC2 recipe. Activations and their scales are
+        MXFP8 E4M3 plus token-major UE8M0 K32; checkpoint weights retain
+        compact DeepSeek FP32 K128x128 scales. For each FC1 expert, first apply
+        :func:`flashinfer.fused_moe.reorder_rows_for_gated_act_gemm` to the
+        logical ``[gate; up]`` weight rows, then apply
+        :func:`flashinfer.quantization.fp4_quantization.shuffle_matrix_a` with
+        ``epilogue_tile_m=128`` to the byte view. Keep the compact FC1 scale
+        tensor in checkpoint order; the direct-TMEM loader maps shuffled weight
+        rows back to those logical K128x128 scale blocks.
 
     Returns
     -------
@@ -782,6 +809,7 @@ def prims_ts_fp8_block_scale_routed_moe(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         gemm1_lora_delta=gemm1_lora_delta,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
         routing_input_mode=routing_mode,
     )
 
@@ -824,6 +852,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
     gemm1_beta: Optional[torch.Tensor],
     gemm1_clamp_limit: Optional[torch.Tensor],
     routing_input_mode: int,
+    use_mxfp8_backed_dsfp8: bool,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -885,6 +914,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
         activation_type=activation_type,
         use_shuffled_weight=use_shuffled_weight,
         weight_layout=weight_layout,
+        use_mxfp8_backed_dsfp8=use_mxfp8_backed_dsfp8,
         num_experts=num_experts,
     )
     moe_inputs = MoeRunnerInputs(
@@ -1012,6 +1042,7 @@ def _fake_prims_ts_fp8_block_scale_moe(
     *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     del (
         routing_logits,
@@ -1044,6 +1075,7 @@ def _fake_prims_ts_fp8_block_scale_moe(
         gemm1_clamp_limit,
         gemm1_bias,
         gemm2_bias,
+        use_mxfp8_backed_dsfp8,
     )
     out = (
         output

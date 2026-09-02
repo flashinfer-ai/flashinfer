@@ -55,6 +55,7 @@ from .config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
+    is_dsfp8_mxfp8_custom_tactic,
     valid_prims_ts_bf16_moe_tactics,
     valid_prims_ts_deepseek_fp8_moe_tactics,
     valid_prims_ts_fp8_per_tensor_moe_tactics,
@@ -67,6 +68,7 @@ from .support import (
     is_prims_ts_bf16_supported,
     is_prims_ts_fp8_block_scale_supported,
     is_prims_ts_fp8_per_tensor_supported,
+    is_prims_ts_mxfp8_backed_dsfp8_supported,
     is_prims_ts_mxfp4_bf16_supported,
     is_prims_ts_mxfp4_mxfp8_supported,
     is_prims_ts_nvfp4_supported,
@@ -88,6 +90,21 @@ def _moe_topk_ids_init_for_routing(
         num_experts,
         packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
     )
+
+
+def _deepseek_fp8_routing_tactic(
+    resolved_tactic: list[int], *, use_mxfp8_backed_dsfp8: bool
+) -> list[int]:
+    """Map a public native-MX tactic to its routing-metadata base config."""
+
+    tile_n, config_index = (int(value) for value in resolved_tactic)
+    if use_mxfp8_backed_dsfp8 and is_dsfp8_mxfp8_custom_tactic(tile_n, config_index):
+        # These tactics are generated from DeepSeek JSON config 0 and then
+        # reshaped to the MX-style cluster/MMA topology by the mapper. Routing
+        # must allocate metadata from that same base config; the public tactic
+        # index remains distinct for autotune/cache selection.
+        config_index = 0
+    return [tile_n, config_index]
 
 
 def _per_token_sf_dtype_value(tensor: torch.Tensor) -> int:
@@ -448,6 +465,10 @@ class _PrimsTsMoERunnerMixin:
             ("activation_type", int(self.activation_type)),
             ("use_per_token_scaling", bool(self.use_per_token_scaling)),
             ("per_token_scale", moe_inputs.per_token_scale is not None),
+            (
+                "use_mxfp8_backed_dsfp8",
+                bool(getattr(self, "use_mxfp8_backed_dsfp8", False)),
+            ),
             ("gemm1_lora_delta", moe_inputs.gemm1_lora_delta is not None),
             (
                 "routing_logits",
@@ -480,25 +501,18 @@ class _PrimsTsMoERunnerMixin:
                 self.forward(inputs, tactic=tactic, **kwargs)
                 torch.cuda.current_stream(device=hidden_states.device).synchronize()
             except Exception as exc:
-                with contextlib.suppress(Exception):
-                    torch.cuda.synchronize(hidden_states.device)
-                with contextlib.suppress(Exception):
-                    torch.cuda.cudart().cudaGetLastError()
-                logger.debug(
-                    "[Prims-TS MoE] Skipping precompile for "
-                    f"{self.__class__.__name__} tactic {tactic}: {exc}"
-                )
+                raise RuntimeError(
+                    "Prims-TS MoE tactic precompile failed for "
+                    f"{self.__class__.__name__} tactic {tactic}"
+                ) from exc
 
-        # Compilation is mostly host-side; fan out tactics when there are several.
-        max_workers = min(4, max(1, len(tactics)))
-        if max_workers == 1 or len(tactics) <= 1:
-            for tactic in tactics:
-                _precompile_one(tactic)
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                list(pool.map(_precompile_one, tactics))
+        # CuTe DSL's MLIR Location context is thread-local.  Compiling tactics in
+        # worker threads can therefore abort the process when the compiler tries
+        # to create an MLIR function without the main thread's active Location.
+        # Keep precompilation serial; this affects autotune setup only, not the
+        # selected kernel's steady-state execution.
+        for tactic in tactics:
+            _precompile_one(tactic)
         return True
 
 
@@ -2111,6 +2125,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         activation_type: int = ActivationType.Swiglu.value,
         use_shuffled_weight: bool = True,
         weight_layout: int = WeightLayout.MajorK,
+        use_mxfp8_backed_dsfp8: bool = False,
         num_experts: Optional[int] = None,
     ):
         self.moe_op = moe_op
@@ -2134,6 +2149,16 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = False
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+        self.use_mxfp8_backed_dsfp8 = bool(use_mxfp8_backed_dsfp8)
+        if self.use_mxfp8_backed_dsfp8 and (
+            self.fp8_quantization_type != Fp8QuantizationType.DeepSeekFp8
+        ):
+            raise ValueError(
+                "use_mxfp8_backed_dsfp8 requires Fp8QuantizationType.DeepSeekFp8"
+            )
+        # The MX-backed recipe always converts compact FP32 DeepSeek K128 scales
+        # directly in TMEM. Recipe selection is explicit because its fused FC1
+        # epilogue requires a different gated-row weight shuffle.
 
     def _make_tuning_config(
         self,
@@ -2147,6 +2172,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
+            deepseek_input_is_mxfp8=self.use_mxfp8_backed_dsfp8,
             init_packed_topk_ids=_moe_topk_ids_init_for_routing(
                 self.num_experts, routing_input_mode
             ),
@@ -2174,6 +2200,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             self.use_shuffled_weight,
             self.weight_layout,
             self.use_per_token_scaling,
+            self.use_mxfp8_backed_dsfp8,
             num_tokens,
             False,
             _gemm_config_flags_cache_key(gemm_config_flags),
@@ -2186,7 +2213,20 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                         top_k=self.top_k,
                         num_local_experts=self.num_local_experts,
                         weight_layout=int(self.weight_layout),
+                        use_mxfp8_backed_dsfp8=self.use_mxfp8_backed_dsfp8,
                     )
+                    if self.use_mxfp8_backed_dsfp8:
+                        valid_tactics = _filter_valid_moe_tactics(
+                            valid_tactics,
+                            lambda candidate: map_trtllm_deepseek_fp8_moe_tactic(
+                                candidate,
+                                num_tokens=num_tokens,
+                                top_k=self.top_k,
+                                num_local_experts=self.num_local_experts,
+                                weight_layout=int(self.weight_layout),
+                                use_mxfp8_backed_dsfp8=True,
+                            ),
+                        )
                 else:
                     valid_tactics = valid_prims_ts_mxfp8_mxfp8_moe_tactics(
                         activation_type=int(self.activation_type),
@@ -2227,6 +2267,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 num_local_experts=self.num_local_experts,
                 weight_layout=int(kwargs.get("weight_layout", self.weight_layout)),
                 enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                use_mxfp8_backed_dsfp8=self.use_mxfp8_backed_dsfp8,
             )
         else:
             pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
@@ -2242,7 +2283,23 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 **_gemm1_oa_flags_from_kwargs(kwargs),
             )
         resolved_tactic = _concrete_tactic(pair)
-        ok, reason = is_prims_ts_fp8_block_scale_supported(
+        fc1_tile_n = int(pair.fc1.cfg.kwargs["tile_n"])
+        fc2_tile_n = int(pair.fc2.cfg.kwargs["tile_n"])
+        if fc1_tile_n != fc2_tile_n:
+            raise RuntimeError(
+                "FP8 block-scale MoE requires one tile-N for routing, FC1, and FC2; "
+                f"got FC1={fc1_tile_n}, FC2={fc2_tile_n}"
+            )
+        routing_tactic = _deepseek_fp8_routing_tactic(
+            resolved_tactic,
+            use_mxfp8_backed_dsfp8=self.use_mxfp8_backed_dsfp8,
+        )
+        support_check = (
+            is_prims_ts_mxfp8_backed_dsfp8_supported
+            if self.use_mxfp8_backed_dsfp8
+            else is_prims_ts_fp8_block_scale_supported
+        )
+        ok, reason = support_check(
             self,
             moe_inputs,
             resolved_tactic,
@@ -2278,12 +2335,16 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             kwargs["routed_scaling_factor"],
             kwargs["routing_method_type"],
             kwargs["enable_pdl"],
-            resolved_tactic,
+            routing_tactic,
             int(kwargs.get("weight_layout", self.weight_layout)),
             int(self.activation_type),
             int(self.fp8_quantization_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
+            bool(
+                self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                and pair.fc2.cfg.build().dsfp8_mxfp8_sfb_is_mxfp8
+            ),
         )
 
         (
@@ -2304,7 +2365,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
-            resolved_tactic,
+            routing_tactic,
             total_num_padded_tokens,
             kwargs,
         )
@@ -2312,12 +2373,16 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_cfg = pair.fc1.cfg.build()
         fc2_cfg = pair.fc2.cfg.build()
         hidden_states_scale_for_gemm = moe_inputs.hidden_states_scale
-        if self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+        if (
+            self.fp8_quantization_type == Fp8QuantizationType.MxFp8
+            or self.use_mxfp8_backed_dsfp8
+        ):
             hidden_states_scale_for_gemm = _pad_mxfp8_linear_scale_for_prims(
                 moe_inputs.hidden_states_scale,
                 num_tokens=num_tokens,
                 hidden_size=self.hidden_size,
             )
+        if self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
             activation_output = gemm1_output
             activation_output_scale = gemm1_output_scale
 
@@ -2358,7 +2423,10 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_fn = get_compiled_gemm(fc1_hash, "fp8_block_scale_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))
 
-        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+        if (
+            self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            and not fc1_cfg.has_epilogue_quant
+        ):
             self.moe_op.trtllm_moe_run_deepseek_fp8_activation(
                 gemm1_output,
                 gemm1_output_scale,

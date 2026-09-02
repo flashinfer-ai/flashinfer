@@ -57,6 +57,8 @@ from .smem_deepseek_sf_resources import (
 )
 from .tmem_sf_resources import (
     TmemCastAResource,
+    TmemDsFp8MxFp8SfAResource,
+    TmemDsFp8MxFp8SfBResource,
     TmemSfAResource,
     TmemSfABResource,
     TmemSfBResource,
@@ -91,6 +93,8 @@ __all__ = [
     "SmemTmaGatherResource",
     "TmemCastAResource",
     "TmemCResource",
+    "TmemDsFp8MxFp8SfAResource",
+    "TmemDsFp8MxFp8SfBResource",
     "TmemSfAResource",
     "TmemSfABResource",
     "TmemSfBResource",
