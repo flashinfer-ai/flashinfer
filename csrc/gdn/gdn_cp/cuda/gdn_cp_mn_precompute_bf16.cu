@@ -1029,7 +1029,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1(const __grid_co
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_tmem_m), "r"(1));
                     } else {
-                        int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (transfer_x_stage) * 1024);
+                        int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x2000000) + (transfer_x_stage) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1444,7 +1444,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1(const __grid_co
                     elect_commit(y_ready_empty_addr);
                     mbarrier_wait(n_acc_empty_addr, _phase_n_acc_empty_0);
                     _phase_n_acc_empty_0 ^= 1;
-                    int _mma_b_lo_7 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (state_x_stage) * 1024);
+                    int _mma_b_lo_7 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x2000000) + (state_x_stage) * 1024);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

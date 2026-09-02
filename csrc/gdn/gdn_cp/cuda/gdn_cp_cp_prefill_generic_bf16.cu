@@ -2043,7 +2043,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     mbarrier_wait(decay_v_ready_addr, decay_v_phase_state);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     {
-                        int _mma_b_lo_11 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x4000000) + (k_stage_state) * 1024);
+                        int _mma_b_lo_11 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_state) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2073,7 +2073,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_tmem_state), "r"(_mma_b_lo_11), "r"(tmem_tmem_shared_input), "r"(1));
-                        int _mma_b_lo_12 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x4000000) + (k_stage_state) * 1024);
+                        int _mma_b_lo_12 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_state) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

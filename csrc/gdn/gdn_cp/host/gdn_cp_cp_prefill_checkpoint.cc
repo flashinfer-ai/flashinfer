@@ -29,9 +29,9 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_06b637cb3c);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_972249da36);
 
-namespace gdn_cp_host_shim_5971273da714b960 {
+namespace gdn_cp_host_shim_5a20ca2e82e7f53d {
 
 using tvm::ffi::TensorView;
 
@@ -468,7 +468,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   float v_scale = (float)arg_scale;
   void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_source_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_06b637cb3c::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1");
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_972249da36::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1");
   static signed char gdn_cp_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = GDNCPConfigureDynamicSmem(
       kernel, (int)arg_Q.device().device_id, 224768,
@@ -481,7 +481,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 224768u));
 }
 
-}  // namespace gdn_cp_host_shim_5971273da714b960
+}  // namespace gdn_cp_host_shim_5a20ca2e82e7f53d
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_cp_prefill_checkpoint, gdn_cp_host_shim_5971273da714b960::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_cp_prefill_checkpoint, gdn_cp_host_shim_5a20ca2e82e7f53d::Run);
 // clang-format on

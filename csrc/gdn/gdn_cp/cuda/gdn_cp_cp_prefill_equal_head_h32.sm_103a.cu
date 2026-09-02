@@ -1574,7 +1574,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1(const __grid_
                     mbarrier_wait(decay_v_ready_addr, decay_v_phase_state);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     {
-                        int _mma_b_lo_13 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x4000000) + (k_stage_state) * 1024);
+                        int _mma_b_lo_13 = make_warp_uniform(((((smem_k_trans_addr) >> 4) & 0x3FFF) | 0x2000000) + (k_stage_state) * 1024);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
