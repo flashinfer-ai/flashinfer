@@ -658,8 +658,9 @@ def test_plan_glm53_nope_decode_and_prefill(known_crossover) -> None:
         torch.device("cpu"),
     )
     assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
-    # (64, 2048): decode-eligible under runtime-topk (any width >= 1), though
-    # NOPE prefill still serves topk=2176 only. Decode-first default applies.
+    # (64, 2048): decode-eligible under runtime-topk (any width >= 1), and
+    # prefill-eligible too (2048 % 64 == 0 — NOPE prefill serves any
+    # whole-tile width). Decode-first default applies.
     planned = plan_mod.plan(
         4,
         64,
@@ -738,7 +739,8 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
         )
         assert planned is not None
         assert planned.variant is plan_mod.KernelVariant.PREFILL_SG
-    # topk != 576 is uninstantiated on both sides.
+    # topk=512 is below the 513 sliding-window floor, so neither side serves
+    # it (prefill otherwise takes any topk >= 513 with topk % 64 == 0).
     assert (
         plan_mod.plan(
             4,
@@ -752,6 +754,20 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
         )
         is None
     )
+    # A wider window-sized buffer (640 >= 513, whole tiles) is served by
+    # prefill past the decode-form cutoff.
+    planned = plan_mod.plan(
+        65,
+        64,
+        640,
+        _MODEL_TYPE_DOTS3_SWA,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.PREFILL_SG
     # Forcing swapAB on the SG-only family raises.
     with pytest.raises(ValueError, match="V32-family"):
         plan_mod.plan(
@@ -759,6 +775,68 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
             64,
             576,
             _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_SWAPAB,
+            torch.device("cpu"),
+        )
+
+
+def test_plan_prefill_runtime_topk_widths(known_crossover) -> None:
+    """Prefill topk is a runtime kernel argument: every variant serves any
+    whole-tile width (topk >= 1, topk % 64 == 0; DOTS3_SWA also >= 513), and
+    ragged widths fall out of the envelope."""
+    plan_mod, _ = known_crossover
+    # Widths that were template-pinned before (V32 2048/2176, DSV4
+    # {128..2048}, MG_DUAL 128, DOTS3_SWA 576) now ride one instantiation.
+    assert plan_mod.prefill_swapab_eligible(_MODEL_TYPE_DSV3_2, 64, 1024, 64, False)
+    assert plan_mod.prefill_swapab_eligible(
+        _MODEL_TYPE_GLM53_NOPE, 128, 2048, 64, False
+    )
+    assert plan_mod.prefill_sg_eligible(_MODEL_TYPE_GLM_NSA, 16, 384, 64, False)
+    assert plan_mod.prefill_mg_eligible(_MODEL_TYPE_DSV4, 64, 384, 64, False)
+    assert plan_mod.prefill_mg_dual_eligible(_MODEL_TYPE_DSV4, 64, 256, 64, True)
+    assert plan_mod.prefill_sg_eligible(_MODEL_TYPE_DOTS3_SWA, 64, 640, 64, False)
+    # Ragged widths (not a whole number of 64-wide tiles) are not served.
+    assert not plan_mod.prefill_swapab_eligible(_MODEL_TYPE_DSV3_2, 64, 1000, 64, False)
+    assert not plan_mod.prefill_sg_eligible(_MODEL_TYPE_DSV3_2, 16, 1000, 64, False)
+    assert not plan_mod.prefill_mg_eligible(_MODEL_TYPE_DSV4, 64, 100, 64, False)
+    assert not plan_mod.prefill_mg_dual_eligible(_MODEL_TYPE_DSV4, 64, 1000, 64, True)
+    # DOTS3_SWA's window floor: 448 is a whole-tile width below 513.
+    assert not plan_mod.prefill_sg_eligible(_MODEL_TYPE_DOTS3_SWA, 64, 448, 64, False)
+    # Auto routing picks the same variants it had at the pinned widths.
+    planned = plan_mod.plan(
+        128,
+        64,
+        1024,
+        _MODEL_TYPE_DSV3_2,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
+    # Forced swapab accepts an off-pin whole-tile width now.
+    planned = plan_mod.plan(
+        128,
+        64,
+        1024,
+        _MODEL_TYPE_DSV3_2,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_SWAPAB,
+        torch.device("cpu"),
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
+    # ...but still rejects a ragged width loudly at the plan layer.
+    with pytest.raises(ValueError, match="topk % 64"):
+        plan_mod.plan(
+            128,
+            64,
+            1000,
+            _MODEL_TYPE_DSV3_2,
             64,
             False,
             plan_mod._PREFILL_IMPL_SWAPAB,

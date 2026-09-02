@@ -2166,6 +2166,70 @@ def test_sparse_mla_sm120_prefill_dots3_swa_no_topk_length(num_heads: int) -> No
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
 
 
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_sparse_mla_sm120_prefill_dots3_swa_offpin_topk(num_heads: int) -> None:
+    """DOTS3_SWA prefill at topk=640 (>= 513, whole tiles, not the 576 pin).
+
+    topk is a runtime kernel argument; the kernel still clamps the scan to
+    the 513-wide window, so the extra buffer rows only matter through
+    topk_length. Same coverage shape and tolerance rationale as
+    test_sparse_mla_sm120_prefill_dots3_swa.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v, topk, window = 1088, 1024, 640, 513
+    page_block_size = 64
+    num_blocks = 64
+    num_tokens = 128
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dots3_swa(kv_bf16)
+    kv_dequant = dequantize_kv_dots3_swa(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    topk_length = torch.randint(
+        1, window + 1, (num_tokens,), device=device, dtype=torch.int32
+    )
+    topk_length[0] = window  # pin one token to the full window
+
+    sm_scale = d_qk**-0.5
+
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, topk_length=topk_length
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        topk_length=topk_length,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=1e-2, rtol=5e-3)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
+
+
 @pytest.mark.parametrize("num_tokens", [16, 128])
 def test_sparse_mla_sm120_dots3_swa_runner(num_tokens: int) -> None:
     """DOTS3_SWA through _SparseMLAPagedAttentionRunner.
@@ -2805,6 +2869,56 @@ def _run_prefill_impl(case: tuple, prefill_impl) -> tuple:
     return output, out_lse
 
 
+@pytest.mark.parametrize("num_heads", [8, 32, 64])
+def test_sparse_mla_sm120_prefill_dsv3_2_offpin_topk(num_heads: int) -> None:
+    """DSv3.2 prefill at topk=1024 (not the historical 2048 pin).
+
+    topk is a runtime kernel argument: one instantiation per variant serves
+    every whole-tile width. num_heads 8/32/64 route auto to SG/MG/swapAB, so
+    the three V32 prefill variants are all exercised at an off-pin width.
+    """
+    case = _make_dsv3_2_prefill_case(num_heads, num_tokens=128, topk=1024)
+    output, out_lse = _run_prefill_impl(case, None)
+    torch.testing.assert_close(output, case[5], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, case[6], atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_prefill_ragged_topk_rejected() -> None:
+    """Prefill rejects an indices width that is not a whole number of 64-wide
+    index tiles (the kernels issue whole tiles and do not mask the tail), and
+    a DOTS3_SWA width below the 513-wide sliding window. Both checks live in
+    the FFI binding, ahead of dispatch."""
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    device = torch.device("cuda")
+    num_tokens = 2
+    module = _get_sparse_mla_sm120_decode_module()
+
+    def call(d_qk: int, d_v: int, bpt: int, topk: int, model_type: int, variant: int):
+        module.sparse_mla_sm120_paged_attention(
+            torch.zeros(num_tokens, 64, d_qk, dtype=torch.bfloat16, device=device),
+            torch.zeros(4, 64 * bpt, dtype=torch.uint8, device=device),
+            torch.zeros(num_tokens, topk, dtype=torch.int32, device=device),
+            torch.zeros(num_tokens, 64, d_v, dtype=torch.bfloat16, device=device),
+            torch.zeros(num_tokens, 64, dtype=torch.float32, device=device),
+            d_qk**-0.5,
+            model_type,
+            variant,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    # topk=1000: 15 whole tiles plus a ragged 40-entry tail.
+    with pytest.raises(RuntimeError, match=r"topk % 64 == 0"):
+        call(512, 512, 584, 1000, 1, 2)  # DSV4, PREFILL_MG
+    # DOTS3_SWA at topk=512: whole tiles, but below the sliding-window floor.
+    with pytest.raises(RuntimeError, match=r"topk >= 513"):
+        call(1088, 1024, 1160, 512, 4, 1)  # DOTS3_SWA, PREFILL_SG
+
+
 @pytest.mark.parametrize("num_heads", [64, 128])
 def test_sparse_mla_sm120_prefill_impl_swapab_forced(num_heads: int) -> None:
     """Forced swapAB matches the reference at an eligible DSv3.2 shape."""
@@ -2890,7 +3004,7 @@ def test_sparse_mla_sm120_prefill_impl_auto_matches_swapab(num_heads: int) -> No
     "num_heads,topk,match",
     [
         (32, 2048, "num_heads"),
-        (64, 512, "topk"),
+        (64, 1000, "topk"),  # ragged width: not a whole number of index tiles
     ],
 )
 def test_sparse_mla_sm120_prefill_impl_swapab_ineligible_dsv3_2(
@@ -3157,55 +3271,60 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
 
 # (variant, model_type, num_heads, topk, page_block_size, has_extra)
 _ENVELOPE_PROBES = [
-    # PREFILL_SWAPAB: DSV3_2 family, H in {64,128}, topk=2048, single cache.
+    # PREFILL_SWAPAB: DSV3_2 family, H in {64,128}, any whole-tile topk,
+    # single cache.
     ("swapab", 0, 64, 2048, 64, False),
     ("swapab", 2, 128, 2048, 64, False),
+    ("swapab", 0, 64, 512, 64, False),  # runtime topk: 512 is served
+    ("swapab", 0, 64, 1000, 64, False),  # ragged topk (not a whole tile)
     ("swapab", 0, 32, 2048, 64, False),  # H below swapAB
-    ("swapab", 0, 64, 512, 64, False),  # topk below
     ("swapab", 0, 64, 2048, 32, False),  # pbs mismatch
     ("swapab", 1, 64, 2048, 64, False),  # DSV4 has no swapAB
     ("swapab", 0, 64, 2048, 64, True),  # dual-cache
-    # PREFILL_SG: DSV3_2 family, H in {8,16}, topk=2048.
+    # PREFILL_SG: DSV3_2 family, H in {8,16}, any whole-tile topk.
     ("sg", 0, 8, 2048, 64, False),
     ("sg", 2, 16, 2048, 64, False),
+    ("sg", 0, 16, 512, 64, False),  # runtime topk: 512 is served
+    ("sg", 0, 16, 63, 64, False),  # ragged topk (not a whole tile)
     ("sg", 0, 32, 2048, 64, False),  # H above SG
-    ("sg", 0, 16, 512, 64, False),  # topk below
     ("sg", 1, 8, 2048, 64, False),  # DSV4 has no SG
-    # PREFILL_MG: DSV3_2 family H in {32,64,128} topk=2048; DSV4 H in
-    # {8..128} topk in {128,192,256,512,1024,2048}.
+    # PREFILL_MG: DSV3_2 family H in {32,64,128} and DSV4 H in {8..128}, any
+    # whole-tile topk.
     ("mg", 0, 32, 2048, 64, False),
     ("mg", 2, 128, 2048, 64, False),
     ("mg", 0, 16, 2048, 64, False),  # v32 H=16 is SG territory
-    ("mg", 0, 64, 1024, 64, False),  # v32 topk below 2048
+    ("mg", 0, 64, 1024, 64, False),  # runtime topk: v32 serves 1024 too
     ("mg", 1, 8, 128, 64, False),
     ("mg", 1, 128, 2048, 64, False),
     ("mg", 1, 64, 192, 64, False),
-    ("mg", 1, 64, 384, 64, False),  # dsv4 topk between instantiations
+    ("mg", 1, 64, 384, 64, False),  # runtime topk: between the old pins
+    ("mg", 1, 64, 100, 64, False),  # ragged topk (not a whole tile)
     ("mg", 1, 17, 128, 64, False),  # dsv4 H off boundary
     ("mg", 1, 64, 512, 32, False),  # pbs mismatch
     ("mg", 1, 64, 512, 64, True),  # dual-cache must use MG_DUAL
-    # PREFILL_MG_DUAL: DSV4 only, topk=128, extra cache present.
+    # PREFILL_MG_DUAL: DSV4 only, any whole-tile topk, extra cache present.
     ("mg_dual", 1, 32, 128, 64, True),
     ("mg_dual", 1, 128, 128, 64, True),
     ("mg_dual", 0, 32, 128, 64, True),  # dual is DSV4-only
-    ("mg_dual", 1, 32, 256, 64, True),  # dual topk must be 128
+    ("mg_dual", 1, 32, 256, 64, True),  # runtime topk: dual serves 256 too
     ("mg_dual", 1, 32, 128, 64, False),  # requires the extra cache
-    # GLM53_NOPE: V32 family at topk=2176 (swapAB included).
+    # GLM53_NOPE: V32 family at any whole-tile topk (swapAB included).
     ("sg", 3, 8, 2176, 64, False),
-    ("sg", 3, 16, 2048, 64, False),  # NOPE serves topk=2176 only
+    ("sg", 3, 16, 2048, 64, False),  # runtime topk: 2048 is served too
     ("mg", 3, 32, 2176, 64, False),
     ("mg", 3, 128, 2176, 64, False),
     ("mg", 3, 64, 2048, 64, False),
     ("swapab", 3, 64, 2176, 64, False),
     ("swapab", 3, 128, 2176, 64, False),
     ("swapab", 3, 32, 2176, 64, False),  # H below swapAB
-    ("swapab", 3, 64, 2048, 64, False),  # NOPE serves topk=2176 only
+    ("swapab", 3, 64, 2048, 64, False),  # runtime topk: 2048 is served too
     ("mg_dual", 3, 32, 128, 64, True),  # dual is DSV4-only
-    # DOTS3_SWA: SG-only at topk=576, H in {8,16,32,64}.
+    # DOTS3_SWA: SG-only, H in {8,16,32,64}, whole-tile topk >= 513.
     ("sg", 4, 8, 576, 64, False),
     ("sg", 4, 64, 576, 64, False),
+    ("sg", 4, 64, 640, 64, False),  # runtime topk: wider than 576 is served
     ("sg", 4, 128, 576, 64, False),  # H above the DOTS3_SWA SG set
-    ("sg", 4, 64, 512, 64, False),  # DOTS3_SWA serves topk=576 only
+    ("sg", 4, 64, 512, 64, False),  # below the 513 sliding-window floor
     ("sg", 4, 64, 576, 32, False),  # pbs mismatch
     ("mg", 4, 32, 576, 64, False),  # DOTS3_SWA is SG-only (no MG)
     ("swapab", 4, 64, 576, 64, False),  # and no swapAB

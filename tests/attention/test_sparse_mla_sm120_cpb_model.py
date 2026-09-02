@@ -737,11 +737,13 @@ def test_public_calibrate_offgrid_shape_idempotent_force(clean_cpb_state) -> Non
     for h in (64, 80):
         for k in (384, 512):
             assert f"dsv4|{h}|{k}" in xo
-    # Off-grid H=80 / topk=384: the prefill envelope cannot serve them, so
-    # decode always wins by construction.
+    # Off-grid H=80: the prefill envelope has no H=80 instantiation, so
+    # decode always wins by construction. Off-grid topk=384 at H=64 is
+    # prefill-served (topk is a runtime kernel argument), so its entry is a
+    # measured crossover in [0, 64], not forced.
     assert xo["dsv4|80|384"] == 64
     assert xo["dsv4|80|512"] == 64
-    assert xo["dsv4|64|384"] == 64
+    assert 0 <= xo["dsv4|64|384"] <= 64
 
     # The (64, 512) entry must be a real measured crossover below 64 on this
     # GPU class, and plan() must pick it up in-process via the
