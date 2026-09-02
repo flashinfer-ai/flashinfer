@@ -1932,19 +1932,50 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         cT = cute.make_identity_tensor((self.b_t, self.b_t))
         tTcT = thr_t_s2r.partition_D(cT)
         tTcT = thr_t_s2r.retile(tTcT)
-        for i in cutlass.range_constexpr(cute.size(tTrT)):
-            t, s = tTcT[i]
-            pred = s >= t
-            if is_final_block:
-                pred = pred and s < valid_tokens and t < valid_tokens
-            gamma = cutlass.Float32(0.0)
-            if pred:
-                gamma = cute.math.exp2(
-                    sCumsumlog[s, 0, gate_handle.index]
-                    - sCumsumlog[t, 0, gate_handle.index],
-                    fastmath=True,
-                )
-            tTrT[i] = self.io_dtype(-gamma * cutlass.Float32(tTrT[i]))
+        # Coordinate semantics:
+        #   tTcT[((s2, t8, s8), s16), _, _] -> (t, s)
+        # where s2 advances s by 1, t8 advances t by 8, s8 advances s by 8,
+        # and s16 advances s by 16. The T register fragment and QK TMEM fragment
+        # enumerate these transposed matrix coordinates in the same order.
+        # Cache the gate values varying along t8 once in tRowLog, and those
+        # varying along (s2, s8) once per s16 tile in tColLog.
+        tQKrScale = cute.make_rmem_tensor_like(tTR_cS, self.acc_dtype)
+        fragment_layout = cute.make_layout(tTcT.shape)
+        tTrT_mn = cute.make_tensor(tTrT.iterator, fragment_layout)
+        tQKrScale_mn = cute.make_tensor(tQKrScale.iterator, fragment_layout)
+
+        tRowLog = cute.make_rmem_tensor((2,), self.acc_dtype)
+        for row in cutlass.range_constexpr(2):
+            t, _ = tTcT[((0, row, 0), 0), 0, 0]
+            tRowLog[row] = sCumsumlog[t, 0, gate_handle.index]
+
+        for tile in cutlass.range_constexpr(4):
+            tColLog = cute.make_rmem_tensor((2, 2), self.acc_dtype)
+            for group in cutlass.range_constexpr(2):
+                for column in cutlass.range_constexpr(2):
+                    _, s = tTcT[((column, 0, group), tile), 0, 0]
+                    tColLog[column, group] = sCumsumlog[s, 0, gate_handle.index]
+
+            for group in cutlass.range_constexpr(2):
+                for row in cutlass.range_constexpr(2):
+                    for column in cutlass.range_constexpr(2):
+                        coord = ((column, row, group), tile), 0, 0
+                        t, s = tTcT[coord]
+                        valid = cutlass.Boolean(True)
+                        if cutlass.const_expr(is_final_block):
+                            valid = s < valid_tokens and t < valid_tokens
+                        gate_delta = tColLog[column, group] - tRowLog[row]
+                        t_gamma = cutlass.Float32(0.0)
+                        qk_gamma = cutlass.Float32(0.0)
+                        if valid:
+                            if s >= t:
+                                t_gamma = cute.math.exp2(gate_delta, fastmath=True)
+                            if t >= s:
+                                qk_gamma = cute.math.exp2(-gate_delta, fastmath=True)
+                        tTrT_mn[coord] = self.io_dtype(
+                            -t_gamma * cutlass.Float32(tTrT_mn[coord])
+                        )
+                        tQKrScale_mn[coord] = qk_gamma
 
         sAinv_t = cute.make_tensor(
             sAinv_mn.iterator,
@@ -1989,18 +2020,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 tQKrQK[None, 0, sub],
             )
             for i in cutlass.range(32):
-                s, t = tTR_cS[i, 0, sub]
-                pred = s >= t
-                if is_final_block:
-                    pred = pred and s < valid_tokens and t < valid_tokens
-                gamma = cutlass.Float32(0.0)
-                if pred:
-                    gamma = cute.math.exp2(
-                        sCumsumlog[s, 0, gate_handle.index]
-                        - sCumsumlog[t, 0, gate_handle.index],
-                        fastmath=True,
-                    )
-                tQKrQK_out[i, 0, sub] = self.io_dtype(tQKrQK[i, 0, sub] * gamma * scale)
+                tQKrQK_out[i, 0, sub] = self.io_dtype(
+                    tQKrQK[i, 0, sub] * tQKrScale[i] * scale
+                )
             cute.copy(
                 tiled_qk_r2s,
                 tQrQK[None, 0, sub],
@@ -2091,15 +2113,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         for chunk_in_pair in range(2):
             chunk_idx = pair_idx * 2 + chunk_in_pair
             valid_tokens = chunk_len - chunk_idx * self.b_t
-            pipeline_args = self.compute_group_0_cp(
-                tidx,
-                tmem_ptr,
-                scale,
-                mma_args,
-                smem_args,
-                pipeline_args,
-                (chunk_idx >= num_valid_chunks - 1, valid_tokens),
-            )
+            if chunk_idx >= num_valid_chunks - 1:
+                pipeline_args = self.compute_group_0_cp(
+                    tidx,
+                    tmem_ptr,
+                    scale,
+                    mma_args,
+                    smem_args,
+                    pipeline_args,
+                    (True, valid_tokens),
+                )
+            else:
+                pipeline_args = self.compute_group_0_cp(
+                    tidx,
+                    tmem_ptr,
+                    scale,
+                    mma_args,
+                    smem_args,
+                    pipeline_args,
+                    (False, valid_tokens),
+                )
         return pipeline_args
 
     @cute.jit
