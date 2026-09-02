@@ -799,6 +799,63 @@ def test_gvr2_adversarial_patterns(pattern, n_valid, batch):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+def _check_complete_exact(out, logits, n_valid, ref_vals, sentinel):
+    """Every output slot written (no sentinel left), then tie-aware exact."""
+    torch.cuda.synchronize()
+    assert int((out == sentinel).sum()) == 0, "unwritten output slots"
+    _check_exact(logits, out, n_valid, ref_vals)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("n_valid", [3072, 4096], ids=["n3072", "n4096"])
+def test_gvr2_high_anchor_hint_completeness(n_valid):
+    """Port of TRT-LLM PR #18501's first regression (register family): anchor-only
+    hints whose gathered values all sit ABOVE the true k-th value -- an argmax
+    anchor over the all-zero cold-start hint buffer, with row[0] = second-max so
+    the hint-derived bracket holds exactly two entries -- make the classify
+    histogram total fall short of k. The kernel must then escape to the
+    key-space ranking instead of stopping at the histogram total (pre-fix:
+    out[tot:k) left unwritten, 130,304 of 131,072 slots per cell here). The
+    shapes pin the vulnerable non-BRL reg variant (BRL classify clamps
+    out-of-bracket values into bin 0 and cannot under-count)."""
+    top_k, bs = 512, 256
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, 0] = torch.topk(logits, 2, dim=1).values[:, 1]  # bracket = [2nd max, max]
+    ref_vals = torch.topk(logits, top_k, dim=1).values
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    seq_lens = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    out = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+    _check_complete_exact(out, logits, n_valid, ref_vals, -7)
+
+
+@requires_gvr2
+def test_gvr2_neginf_tail_completeness():
+    """Port of TRT-LLM PR #18501's second regression: an in-window -inf in the
+    row's tail column (n_valid % 4 == 1, so that column lives outside the
+    float4 register batch) drags the hint-free DEG bracket to -inf, every
+    classify product becomes NaN and the histogram total is zero (pre-fix:
+    whole rows unwritten). Odd rows keep fewer than top_k finite entries so the
+    -inf tie class exercises the escape's fill-lane bound (pre-fix: duplicate
+    indices from the -inf fill lanes of the last partial float4)."""
+    top_k, bs, npad, n_valid = 1024, 256, 4096, 4093
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, n_valid:] = 3e38  # poison past the window
+    logits[:, n_valid - 1] = float("-inf")  # in-window -inf in the tail column
+    logits[1::2, 500:n_valid] = float("-inf")  # odd rows: n_finite < top_k
+    masked = logits.clone()
+    masked[:, n_valid:] = float("-inf")
+    ref_vals = torch.topk(masked, top_k, dim=1).values
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    seq_lens = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    out = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+    _check_complete_exact(out, logits, n_valid, ref_vals, -7)
+
+
 @requires_gvr2
 @pytest.mark.xfail(
     reason="UPSTREAM CAVEAT (TRT-LLM #17821 kernels, reproduced bit-identically "
