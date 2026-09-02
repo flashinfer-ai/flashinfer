@@ -112,6 +112,34 @@ def validate(targets: list[str], root: str = ROOT) -> list[str]:
     return targets
 
 
+def chunk(targets: list[str], limit: int) -> list[str]:
+    """Split targets into space-joined chunks of at most ``limit`` characters.
+
+    A GitHub commit status description caps at 140 characters, which fits only two
+    or three real test paths (median 41, p90 60), so a scope is published across
+    several statuses. Splitting happens on target boundaries -- never mid-path,
+    which would produce a chunk that looks like a valid path and is not.
+    """
+    too_long = [x for x in targets if len(x) > limit]
+    if too_long:
+        raise ValueError(
+            f"target longer than the {limit}-character chunk limit and so cannot be "
+            f"split: {', '.join(too_long)}"
+        )
+    chunks: list[str] = []
+    current = ""
+    for target in targets:
+        candidate = f"{current} {target}" if current else target
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = target
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def check_exists(targets: list[str], repo_root: str) -> None:
     """Verify each declared target exists. Raises ValueError listing what is missing.
 
@@ -201,6 +229,25 @@ def _selftest() -> int:
         except ValueError:
             pass
 
+    # Chunking: split on target boundaries, never mid-path, and round-trip exactly.
+    long_targets = [f"tests/experimental/test_{c}_{'x' * 40}.py" for c in "abcde"]
+    cs = chunk(long_targets, 140)
+    if any(len(c) > 140 for c in cs):
+        print(f"FAIL: chunk exceeded 140: {[len(c) for c in cs]}", file=sys.stderr)
+        failures += 1
+    if " ".join(cs).split() != long_targets:
+        print("FAIL: chunking did not round-trip", file=sys.stderr)
+        failures += 1
+    if chunk(["tests/experimental/a.py"], 140) != ["tests/experimental/a.py"]:
+        print("FAIL: single target should be one chunk", file=sys.stderr)
+        failures += 1
+    try:
+        chunk(["tests/experimental/" + "z" * 200 + ".py"], 140)
+        print("FAIL: oversized single target accepted", file=sys.stderr)
+        failures += 1
+    except ValueError:
+        pass
+
     for body, want in ok:
         try:
             got = parse(body)
@@ -251,6 +298,13 @@ def main() -> int:
         action="store_true",
         help="skip the existence check (parsing/validation only)",
     )
+    ap.add_argument(
+        "--chunk",
+        type=int,
+        metavar="N",
+        help="print space-joined chunks of at most N chars, one per line "
+        "(N=140 matches a GitHub commit status description)",
+    )
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -277,7 +331,10 @@ def main() -> int:
     except ValueError as e:
         print(f"experimental test scope: {e}", file=sys.stderr)
         return 1
-    print(" ".join(targets) if args.test_path else "\n".join(targets))
+    if args.chunk:
+        print("\n".join(chunk(targets, args.chunk)))
+    else:
+        print(" ".join(targets) if args.test_path else "\n".join(targets))
     return 0
 
 

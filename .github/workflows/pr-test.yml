@@ -169,8 +169,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          # Newest status per ci/test-scope-N context, ordered by N, joined. Statuses
+          # come back newest-first, so `first` per context is the latest value; a blanked
+          # chunk contributes nothing.
           SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" \
-            --jq 'map(select(.context == "ci/test-scope")) | first | .description // ""')
+            --paginate --jq '
+              [ .[]
+                | select(.context | test("^ci/test-scope-[0-9]+$"))
+                | {n: (.context | sub("^ci/test-scope-"; "") | tonumber),
+                   d: .description} ]
+              | group_by(.n) | map(first) | sort_by(.n)
+              | map(.d // "") | map(select(. != "")) | join(" ")')
           if [ -z "$SCOPE" ]; then
             echo "No requested scope for ${HEAD_SHA}; running the full suite"
           else
