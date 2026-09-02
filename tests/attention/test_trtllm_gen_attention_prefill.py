@@ -1069,6 +1069,36 @@ def test_trtllm_batch_prefill_wrapper_rejects_noncausal_sliding_window():
         )
 
 
+def test_trtllm_ragged_prefill_rejects_noncausal_sliding_window():
+    _skip_if_not_blackwell()
+    query = torch.empty((1, 1, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    with pytest.raises(
+        NotImplementedError, match="previously the window was silently ignored"
+    ):
+        flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            query=query,
+            key=key,
+            value=value,
+            workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device=GPU_DEVICE),
+            seq_lens=torch.tensor([1], dtype=torch.int32, device=GPU_DEVICE),
+            max_q_len=1,
+            max_kv_len=1,
+            bmm1_scale=1.0,
+            bmm2_scale=1.0,
+            o_sf_scale=1.0,
+            batch_size=1,
+            window_left=1,
+            cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32, device=GPU_DEVICE),
+            cum_seq_lens_kv=torch.tensor([0, 1], dtype=torch.int32, device=GPU_DEVICE),
+            enable_pdl=False,
+            is_causal=False,
+            return_lse=False,
+            backend="trtllm-gen",
+        )
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("provide_lse", [False, True])
 def test_trtllm_batch_prefill_lse_contract(return_lse, provide_lse):
