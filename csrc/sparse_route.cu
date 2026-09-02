@@ -107,18 +107,25 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
 
   const int64_t rows = block_indices.size(0);
   const int64_t block_topk = block_indices.size(1);
-  const int64_t output_width = block_topk * compress_ratio + compress_ratio - 1;
-  const int64_t mask_bytes = (output_width + 7) / 8;
   // These are narrowed to uint32 for the kernel, so a value past that wraps:
-  // 2^32 would arrive as a page size or a compression ratio of zero.
+  // 2^32 would arrive as a page size or a compression ratio of zero. Bounded
+  // before the width is derived from them: block_topk * compress_ratio is
+  // signed overflow long before the check below would reject the ratio.
   constexpr int64_t kUint32Max = 4294967295LL;
   TVM_FFI_ICHECK_GT(compress_ratio, 0) << "compress_ratio must be positive";
   TVM_FFI_ICHECK_LE(compress_ratio, kUint32Max) << "compress_ratio must fit in 32 bits";
+  const int64_t output_width = block_topk * compress_ratio + compress_ratio - 1;
+  const int64_t mask_bytes = (output_width + 7) / 8;
   TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
   TVM_FFI_ICHECK_LE(page_size, kUint32Max) << "page_size must fit in 32 bits";
   TVM_FFI_ICHECK_GT(num_slots, 0) << "num_slots must be positive";
   TVM_FFI_ICHECK_LE(num_slots, kUint32Max) << "num_slots must fit in 32 bits";
   TVM_FFI_ICHECK_EQ(out_route.size(0), rows);
+  // A slot is stored in the route's dtype, so num_slots also has to fit it:
+  // an int32 route would take 2^31 back out as a negative index with its
+  // mask bit set.
+  TVM_FFI_ICHECK_LE(num_slots, out_route.dtype() == dl_int32 ? 2147483647LL : kUint32Max)
+      << "num_slots must fit the route dtype";
   TVM_FFI_ICHECK_EQ(out_route.size(1), output_width);
   TVM_FFI_ICHECK_EQ(out_logical.size(1), output_width);
   TVM_FFI_ICHECK_GE(out_logical.size(0), rows);
@@ -193,6 +200,11 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_req, TensorV
   TVM_FFI_ICHECK_LE(page_size, kUint32Max) << "page_size must fit in 32 bits";
   TVM_FFI_ICHECK_GT(num_slots, 0) << "num_slots must be positive";
   TVM_FFI_ICHECK_LE(num_slots, kUint32Max) << "num_slots must fit in 32 bits";
+  // A slot is stored in the route's dtype, so num_slots also has to fit it:
+  // an int32 route would take 2^31 back out as a negative index with its
+  // mask bit set.
+  TVM_FFI_ICHECK_LE(num_slots, out_route.dtype() == dl_int32 ? 2147483647LL : kUint32Max)
+      << "num_slots must fit the route dtype";
   TVM_FFI_ICHECK_GE(logical.size(0), valid_rows) << "logical route must cover every live row";
   TVM_FFI_ICHECK_EQ(logical.size(1), width) << "logical route width must match the route";
   TVM_FFI_ICHECK_GE(valid_rows, 0);
