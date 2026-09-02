@@ -228,6 +228,7 @@ def _build_mla_paged_inputs(kv_len, page_size, permute_pages, device="cuda:0"):
 def test_nvfp4_quantize_append_paged_mla_kv_cache(
     kv_len, page_size, dtype, permute_pages
 ):
+    _skip_if_fp8_e4m3_unsupported()
     torch.manual_seed(42)
     device = "cuda:0"
     (
@@ -380,7 +381,9 @@ def test_nvfp4_quantize_append_paged_mla_kv_cache_dequant_close():
     assert rel_kpe < 0.05
 
 
-@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("inf"), float("nan")])
+@pytest.mark.parametrize(
+    "bad_scale", [0.0, -1.0, float("inf"), float("nan"), 1e-50, 1e300]
+)
 def test_nvfp4_quantize_append_paged_mla_kv_cache_rejects_bad_scale(bad_scale):
     _skip_if_fp8_e4m3_unsupported()
     device = "cuda:0"

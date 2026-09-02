@@ -533,9 +533,15 @@ void nvfp4_quantize_append_paged_mla_kv_cache(TensorView append_ckv, TensorView 
   TVM_FFI_ICHECK(kv_indices.dtype() == dl_int32) << "kv_indices must be int32";
   TVM_FFI_ICHECK(kv_indptr.dtype() == dl_int32) << "kv_indptr must be int32";
   TVM_FFI_ICHECK(kv_last_page_len.dtype() == dl_int32) << "kv_last_page_len must be int32";
-  TVM_FFI_ICHECK(std::isfinite(ckv_scale) && std::isfinite(kpe_scale) && ckv_scale > 0.0 &&
-                 kpe_scale > 0.0)
-      << "ckv_scale and kpe_scale must be positive finite global decode scales";
+  // The kernel computes in float32; validate after the cast so scales that
+  // underflow or overflow float32 fail here instead of silently corrupting
+  // the cache (subnormals are rejected as their reciprocal overflows).
+  const float ckv_scale_f = static_cast<float>(ckv_scale);
+  const float kpe_scale_f = static_cast<float>(kpe_scale);
+  TVM_FFI_ICHECK(std::isnormal(ckv_scale_f) && std::isnormal(kpe_scale_f) && ckv_scale_f > 0.0f &&
+                 kpe_scale_f > 0.0f)
+      << "ckv_scale and kpe_scale must be positive global decode scales in the normal float32 "
+         "range";
 
   const unsigned int nnz = append_ckv.size(0);
   const unsigned int batch_size = kv_last_page_len.size(0);
@@ -580,7 +586,7 @@ void nvfp4_quantize_append_paged_mla_kv_cache(TensorView append_ckv, TensorView 
         static_cast<int32_t*>(batch_indices.data_ptr()),
         static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n, append_kpe_stride_n,
         static_cast<uint8_t*>(ckv_sf_cache.data_ptr()), ckv_sf_stride_page, ckv_sf_stride_n,
-        static_cast<float>(ckv_scale), static_cast<float>(kpe_scale), stream);
+        ckv_scale_f, kpe_scale_f, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "NVFP4QuantizeAppendPagedKVMlaCache failed with error: " << cudaGetErrorString(status);
     return true;

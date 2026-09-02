@@ -518,9 +518,10 @@ def nvfp4_quantize_append_paged_mla_kv_cache(
         The number of entries in the last page of each request in the paged
         kv cache, shape ``[batch_size]``.
     ckv_scale : float
-        Positive finite global decode scale for the compressed-kv part.
+        Global decode scale for the compressed-kv part; must lie in the
+        positive normal float32 range (the kernel computes in float32).
     kpe_scale : float
-        Positive finite global decode scale for the rope part.
+        Global decode scale for the rope part, same range requirement.
 
     Returns
     -------
@@ -550,14 +551,14 @@ def nvfp4_quantize_append_paged_mla_kv_cache(
         raise ValueError("kpe_cache must have dtype torch.float8_e4m3fn")
     ckv_scale = float(ckv_scale)
     kpe_scale = float(kpe_scale)
-    if (
-        not math.isfinite(ckv_scale)
-        or not math.isfinite(kpe_scale)
-        or ckv_scale <= 0.0
-        or kpe_scale <= 0.0
+    fp32_min_normal = 2.0**-126
+    fp32_max = 3.402823466e38
+    if not (fp32_min_normal <= ckv_scale <= fp32_max) or not (
+        fp32_min_normal <= kpe_scale <= fp32_max
     ):
         raise ValueError(
-            "ckv_scale and kpe_scale must be positive finite global decode scales"
+            "ckv_scale and kpe_scale must be positive global decode scales in "
+            "the normal float32 range"
         )
     _nvfp4_quantize_append_paged_mla_kv_cache_kernel(
         append_ckv,
