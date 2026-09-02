@@ -4618,9 +4618,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
             swiglu_limit=swiglu_limit,
             enable_pdl=False,
         )
-        with pytest.warns(
-            DeprecationWarning, match="cute_dsl_fused_moe_mxfp8_mxfp4"
-        ):
+        with pytest.warns(DeprecationWarning, match="cute_dsl_fused_moe_mxfp8_mxfp4"):
             deprecated_functional = cute_dsl_fused_moe_mxfp8_mxfp4(
                 **deprecated_inputs,
                 **deprecated_api_kwargs,
@@ -4643,9 +4641,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         torch.testing.assert_close(
             functional, deprecated_functional, atol=0.5, rtol=0.05
         )
-        torch.testing.assert_close(
-            functional, deprecated_wrapped, atol=0.5, rtol=0.05
-        )
+        torch.testing.assert_close(functional, deprecated_wrapped, atol=0.5, rtol=0.05)
 
         functional_params = inspect.signature(cute_dsl_fused_moe_mxfp8_mxfp4).parameters
         wrapper_params = inspect.signature(CuteDslMxfp8Mxfp4MoEWrapper.run).parameters
@@ -4749,6 +4745,9 @@ def test_w4a8_fused_moe_tactics_and_apis(
             activation_format=QuantVariant.MXFP8,
             weight_format=QuantVariant.MXFP4,
             tactic=tactic,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             **bias_kwargs,
             enable_pdl=False,
         )

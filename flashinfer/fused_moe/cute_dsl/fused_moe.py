@@ -356,8 +356,7 @@ def _moe_core_impl(
         expected_shape = (num_local_experts, w1_weight.size(1))
         if tuple(w1_bias.shape) != expected_shape:
             raise ValueError(
-                f"w1_bias must have shape {expected_shape}, "
-                f"got {tuple(w1_bias.shape)}"
+                f"w1_bias must have shape {expected_shape}, got {tuple(w1_bias.shape)}"
             )
         if w1_bias.dtype is not torch.float32:
             raise TypeError("w1_bias must have dtype torch.float32")
@@ -375,8 +374,7 @@ def _moe_core_impl(
         expected_shape = (num_local_experts, hidden_size)
         if tuple(w2_bias.shape) != expected_shape:
             raise ValueError(
-                f"w2_bias must have shape {expected_shape}, "
-                f"got {tuple(w2_bias.shape)}"
+                f"w2_bias must have shape {expected_shape}, got {tuple(w2_bias.shape)}"
             )
         if w2_bias.dtype is not torch.float32:
             raise TypeError("w2_bias must have dtype torch.float32")
