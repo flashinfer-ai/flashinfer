@@ -134,10 +134,15 @@ def is_cuda_tile_available() -> bool:
         import torch
 
         if torch.cuda.is_available():
-            # Avoid get_device_capability before CUDA init — creates a context (#4889).
-            if not torch.cuda.is_initialized():
-                return True
-            major, minor = torch.cuda.get_device_capability()
+            if torch.cuda.is_initialized():
+                major, minor = torch.cuda.get_device_capability()
+            else:
+                # torch.cuda.get_device_capability would create a CUDA context
+                # here (#4889); NVML reports the same capability without one,
+                # so the arch check below still runs before CUDA init.
+                from ..compilation_context import get_visible_device_capabilities
+
+                major, minor = get_visible_device_capabilities()[0]
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
                 return False
