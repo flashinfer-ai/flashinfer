@@ -134,6 +134,9 @@ def is_cuda_tile_available() -> bool:
         import torch
 
         if torch.cuda.is_available():
+            # Avoid get_device_capability before CUDA init — creates a context (#4889).
+            if not torch.cuda.is_initialized():
+                return True
             major, minor = torch.cuda.get_device_capability()
             sm_arch = f"sm_{major}{minor}"
             if not _tileiras_supports_arch(tileiras_path, sm_arch):
