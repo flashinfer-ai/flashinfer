@@ -21,7 +21,7 @@ from typing import TypeAlias
 import cuda.tile as ct
 import torch
 
-from ...tllm_enums import ActivationType
+from ...tllm_enums import ActivationType, DEFAULT_SWIGLU_LIMIT
 from ...utils import next_positive_power_of_2
 from ..api import (
     _CUTILE_SUPPORTED_ACTIVATIONS,
@@ -41,7 +41,6 @@ _GEGLU = int(ActivationType.Geglu)
 _GEGLU_TANH = int(ActivationType.GegluTanh)
 _SITU = int(ActivationType.Situ)
 _RELU2 = int(ActivationType.Relu2)
-_IDENTITY = int(ActivationType.Identity)
 _GELU = int(ActivationType.Gelu)
 _RELU = int(ActivationType.Relu)
 _SILU = int(ActivationType.Silu)
@@ -53,11 +52,15 @@ def _activation_kernel_args(
     """Lower a typed activation to the compact scalar cuTile kernel ABI."""
     activation = _validate_activation(activation)
     if isinstance(activation, SwiGLU):
+        # Zero represents the API's unbounded float32-max default.
+        clamp_limit = (
+            0.0 if activation.limit == DEFAULT_SWIGLU_LIMIT else float(activation.limit)
+        )
         return (
             int(activation.type),
             float(activation.alpha),
             float(activation.beta),
-            float(activation.limit),
+            clamp_limit,
         )
     if isinstance(activation, SwiGLUStep):
         return int(activation.type), float(activation.limit), 0.0, 0.0
@@ -109,8 +112,6 @@ def _apply_ungated_activation(
     param3: ConstFloat,
 ):
     """Apply a non-gated activation in FP32; all scalars are compile-time."""
-    if activation_type == _IDENTITY:
-        return x
     if activation_type == _GELU:
         return _gelu(x)
     if activation_type == _RELU:
@@ -120,7 +121,8 @@ def _apply_ungated_activation(
     if activation_type == _RELU2:
         relu = ct.maximum(x, 0.0)
         return relu * relu
-    return x + 0.0 * (param1 + param2 + param3)
+    # _IDENTITY
+    return x
 
 
 def _apply_gated_activation(
@@ -133,9 +135,7 @@ def _apply_gated_activation(
 ):
     """Apply a gated activation in FP32; all scalars are compile-time."""
     if activation_type == _SWIGLU:
-        # The default float32-max limit is semantically unbounded. Keeping it
-        # on a compile-time branch preserves the original unclamped hot path.
-        if param3 < 3.0e38:
+        if param3 > 0.0:
             gate = ct.minimum(gate, param3)
             up = ct.maximum(ct.minimum(up, param3), -param3)
         return gate * (1.0 / (1.0 + ct.exp(-(param1 * gate)))) * (up + param2)
@@ -149,8 +149,6 @@ def _apply_gated_activation(
         return _gelu_tanh(gate) * up
 
     if activation_type == _SITU:
-        # Zero marks an omitted optional scale/clamp because explicit values
-        # are required to be positive by ActivationConfig validation.
         if param3 > 0.0:
             gate = ct.minimum(gate, param3)
             up = ct.maximum(ct.minimum(up, param3), -param3)
@@ -158,6 +156,7 @@ def _apply_gated_activation(
         if param2 > 0.0:
             up = param2 * _tanh_via_sigmoid(up / param2)
         return gate * up
+    # Should not reach here.
     return gate * up
 
 
