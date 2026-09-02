@@ -38,7 +38,10 @@ from .blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1 import (
 from .blackwell_sm12x.moe_mxfp8_mxfp4_fc2_finalize import (
     cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
 )
-from .blackwell_sm12x.moe_mxfp8_q0_route_triton import mxfp8_q0_route_triton
+from .blackwell_sm12x.moe_mxfp8_q0_route_triton import (
+    Mxfp8Q0RouteWorkspace,
+    mxfp8_q0_route_triton,
+)
 
 _SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Situ)
 
@@ -98,6 +101,9 @@ def cute_dsl_sm12x_fused_moe_mxfp8_mxfp4(
     situ_beta: float = DEFAULT_SITU_BETA,
     situ_linear_beta: float = DEFAULT_SITU_LINEAR_BETA,
     tactic: Optional[Any] = None,
+    workspace13: Optional[torch.Tensor] = None,
+    workspace2: Optional[torch.Tensor] = None,
+    q0_route_workspace: Optional[Mxfp8Q0RouteWorkspace] = None,
 ) -> torch.Tensor:
     """Run fused MoE with BF16 activations, MXFP8 activation quant and packed MXFP4 weights.
 
@@ -141,7 +147,8 @@ def cute_dsl_sm12x_fused_moe_mxfp8_mxfp4(
 
     num_tokens = x.shape[0]
     offsets, token_map, token_weights, a_q, a_sf = mxfp8_q0_route_triton(
-        x, token_selected_experts, token_final_scales, num_experts
+        x, token_selected_experts, token_final_scales, num_experts,
+        workspace=q0_route_workspace, workspace13=workspace13, workspace2=workspace2
     )
     q1, sf1 = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
         a_q,
@@ -162,10 +169,10 @@ def cute_dsl_sm12x_fused_moe_mxfp8_mxfp4(
         token_map,
         token_weights,
         num_tokens,
+        out=moe_output,
     )
     if moe_output is None:
         return out
-    moe_output.copy_(out)
     return moe_output
 
 
