@@ -111,6 +111,7 @@ def _get_xqa_module_cached(
         v_sf_cache: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
+        max_kv_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
         kv_scale: Union[float, torch.Tensor],
@@ -138,6 +139,7 @@ def _get_xqa_module_cached(
             v_sf_cache,
             page_table,
             max_seq_len,
+            max_kv_len,
             seq_lens,
             batch_size,
             1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
@@ -167,6 +169,7 @@ def _get_xqa_module_cached(
         v_sf_cache: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
+        max_kv_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
         kv_scale: Union[float, torch.Tensor],
@@ -210,6 +213,7 @@ def xqa(
     q_cu_seq_lens: Optional[torch.Tensor] = None,
     k_sf_cache: Optional[torch.Tensor] = None,
     v_sf_cache: Optional[torch.Tensor] = None,
+    max_kv_len: Optional[int] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -298,6 +302,11 @@ def xqa(
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
         cumulative offsets.
+    max_kv_len : Optional[int], default=None
+        Upper bound on the KV lengths in ``seq_lens``. It only steers how many
+        CTAs each sequence is split across, so a tight bound gives the best
+        split. Defaults to the page-table capacity
+        ``page_table.shape[-1] * page_size``.
 
     Note
     ----
@@ -361,6 +370,9 @@ def xqa(
     # Calculate max_seq_len from page_table and page_size
     num_pages_per_seq = page_table.shape[-1]
     max_seq_len = num_pages_per_seq * page_size
+    max_kv_len = (
+        max_seq_len if max_kv_len is None else max(1, min(max_kv_len, max_seq_len))
+    )
 
     # Determine if sliding window is used
     use_sliding_window = sliding_win_size > 0
@@ -444,6 +456,7 @@ def xqa(
         v_sf_cache,
         page_table,
         max_seq_len,
+        max_kv_len,
         seq_lens,
         batch_size,
         kv_scale,

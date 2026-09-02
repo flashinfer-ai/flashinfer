@@ -513,6 +513,14 @@ class ScratchMem {
     return makePtr<Vec<IOHead, ctaNbValidQHeads>>(mTokens);
   }
 
+  // Number of chunks whose partial results fit in scratchBytes (offsets are uint32_t).
+  static HOST_DEVICE_FUNC uint32_t maxNbChunks(uint64_t scratchBytes) {
+    constexpr uint64_t alignment = sizeof(Vec<IOHead, ctaNbValidQHeads>);
+    constexpr uint64_t chunkBytes = sizeof(ColWiseVec) + sizeof(Vec<IOHead, ctaNbValidQHeads>);
+    scratchBytes = mha::min<uint64_t>(scratchBytes, 0xFFFFFFFFu);
+    return scratchBytes > alignment ? uint32_t((scratchBytes - alignment) / chunkBytes) : 0U;
+  }
+
  private:
   template <typename T>
   HOST_DEVICE_FUNC TinyPtr<T> makePtr(uint32_t offset) const {
@@ -3042,34 +3050,74 @@ static uint32_t configureKernel() {
 
 static uint32_t const hostSmemSize = configureKernel();
 
-void launchHopperF8MHAFlashInfer(
-    uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize, float qScale,
-    float const* qScalePtr, OutputHead* output,
-#if LOW_PREC_OUTPUT
-    float rcpOutScale,
-#endif
-    InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-    uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
-#if SPEC_DEC
-    uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
-#endif
-    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
-  uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
-    float const factor = 0.25f;
-    return mha::min<uint32_t>(
-        mha::max<uint32_t>(
-            1U, (uint32_t)round(multiProcessorCount * 3 / (batchSize * nbKHeads) * factor)),
-        divUp(maxSeqLen, gemm0CtaTileNbTokens));
+// Per-CTA fixed cost (prologue, epilogue, semaphore) and per-partial merge cost, in units of one
+// tile of per-CTA streaming time. Measured on GH200; only used to pick the split count.
+constexpr float kCtaOverheadTiles = 10.f;
+constexpr float kMergeCostPerSubSeqTiles = 0.22f;
+constexpr uint32_t kMaxNbSubSeqPerSeq = 256;
+
+// gridDim.y: the split count minimizing waves * (tiles / split + overhead) + merge * split, so the
+// grid fills every resident CTA slot with little wave quantization while short sequences are not
+// split into CTAs dominated by fixed cost. Capped at 2 tiles per CTA and by the scratch capacity.
+static uint32_t computeNbSubSeqPerSeq(uint32_t multiProcessorCount, uint32_t nbSeq,
+                                      uint32_t nbInputSeqSplit, uint32_t maxSeqLen,
+                                      uint32_t maxKvLen, uint64_t scratchBytes) {
+  static uint32_t const maxCtasPerSm = [] {
+    int nbCtas = 0;
+    checkCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbCtas, kernel_mha,
+                                                            warp_size * nbWarps, hostSmemSize));
+    return mha::max<uint32_t>(1U, nbCtas);
   }();
+  uint32_t const nbTiles = divUp(mha::min(maxKvLen, maxSeqLen), gemm0CtaTileNbTokens);
+  uint32_t const nbCtaSlots = maxCtasPerSm * multiProcessorCount;
+  uint32_t const nbChunksPerSubSeq = nbSeq * nbInputSeqSplit;
+  uint32_t const maxNbSubSeq = mha::min(mha::min(nbTiles / 2, kMaxNbSubSeqPerSeq),
+                                        ScratchMem::maxNbChunks(scratchBytes) / nbChunksPerSubSeq);
+  auto const cost = [&](uint32_t nbSubSeq) {
+    float const nbWaves = divUp(nbChunksPerSubSeq * nbSubSeq, nbCtaSlots);
+    return nbWaves * (float(nbTiles) / nbSubSeq + kCtaOverheadTiles) +
+           kMergeCostPerSubSeqTiles * nbSubSeq;
+  };
+  uint32_t best = 1;
+  float bestCost = cost(1);
+  for (uint32_t nbSubSeq = 2; nbSubSeq <= maxNbSubSeq; nbSubSeq++) {
+    float const c = cost(nbSubSeq);
+    if (c < bestCost) {
+      best = nbSubSeq;
+      bestCost = c;
+    }
+  }
+  return best;
+}
+
+void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
+                                 uint32_t slidingWinSize, float qScale, float const* qScalePtr,
+                                 OutputHead* output,
+#if LOW_PREC_OUTPUT
+                                 float rcpOutScale,
+#endif
+                                 InputHead const* q, float const* attentionSinks,
+                                 GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+                                 KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+                                 uint32_t maxKvLen, uint32_t const* seqLen, uint32_t batchSize,
+                                 float kvCacheScale, float const* kvScalePtr,
+#if SPEC_DEC
+                                 uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+#endif
+                                 uint32_t* semaphores, void* scratch, uint64_t scratchBytes,
+                                 bool enable_pdl, uint64_t kv_stride_page, uint64_t kv_stride_token,
+                                 uint64_t kv_stride_head, cudaStream_t stream) {
 #if SPEC_DEC
   auto specDecParams = SpecDecParams{qSeqLen, qCuSeqLens, mask};
   uint32_t const qLen = qSeqLen;
 #else
   uint32_t const qLen = 1;
 #endif
-  dim3 const dimGrid{divUp(qLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
+  uint32_t const nbInputSeqSplit = divUp(qLen, inputTokensPerCta);
+  uint32_t const nbSubSeqPerSeq =
+      computeNbSubSeqPerSeq(multiProcessorCount, nbKHeads * batchSize, nbInputSeqSplit, maxSeqLen,
+                            maxKvLen, scratchBytes);
+  dim3 const dimGrid{nbInputSeqSplit, nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);

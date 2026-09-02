@@ -3931,7 +3931,8 @@ def xqa_batch_decode_with_kv_cache(
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
 
     max_seq_len : int
-        max sequence length for kv_cache
+        max sequence length for kv_cache; also sizes the multi-block split, so
+        pass the batch's actual maximum rather than the page-table capacity
 
     bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
@@ -4086,6 +4087,7 @@ def xqa_batch_decode_with_kv_cache(
         q_seq_len=q_len_per_req,
         q_cu_seq_lens=q_cu_seq_lens,
         mask=mask,
+        max_kv_len=max_seq_len,
     )
 
     return out
