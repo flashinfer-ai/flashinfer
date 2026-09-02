@@ -3424,7 +3424,8 @@ def _run_cake_kda_bt16_prepare_chain(
     chain_module = _get_cake_kda_export_module(
         target, "bounded_fp32_serving", chain_variant, "chain"
     )
-    beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=16)
+    beta_flat = _flatten_beta_source(beta)
+    beta_tma = _cake_kda_beta_source(beta, workspace, chunk_tokens=16)
     total_tasks = (len(offsets) - 1) * num_heads
     prepare_module.run(
         q,
@@ -3433,8 +3434,8 @@ def _run_cake_kda_bt16_prepare_chain(
         k,
         g,
         g,
-        beta_source,
-        beta_source,
+        beta_flat,
+        beta_tma,
         A_log,
         dt_bias,
         cu_seqlens,
