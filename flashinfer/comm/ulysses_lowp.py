@@ -53,6 +53,10 @@ ABI_VERSION = 3
 # already final and no boundary descriptor/merge machinery exists.  Ranks
 # disagreeing on this value must refuse the low-precision path group-wide.
 STATS_PROTOCOL = 3
+# Both stats protocols share the payload ABI: 3 = ALIGN-128 (no boundary
+# machinery, aligned unpack); 2 = 64-aligned global packing (boundary
+# descriptor/min-max machinery below + unpack_for_sage(aligned=False)).
+SUPPORTED_STATS_PROTOCOLS = (2, 3)
 HEAD_DIM = 128
 Q_GROUP = 32
 K_GROUP = 64
@@ -194,6 +198,24 @@ def get_ulysses_lowp_module():
         )
 
     @register_custom_op(
+        "flashinfer::ulysses_lowp_unpack_for_sage_unaligned",
+        mutates_args=["q", "k", "v", "q_scale", "k_scale"],
+    )
+    def ulysses_lowp_unpack_for_sage_unaligned(
+        input: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: torch.Tensor,
+        k_scale: torch.Tensor,
+        local_sequence: int,
+        world_size: int,
+    ) -> None:
+        module.ulysses_lowp_unpack_for_sage_unaligned(
+            input, q, k, v, q_scale, k_scale, local_sequence, world_size
+        )
+
+    @register_custom_op(
         "flashinfer::ulysses_lowp_quant_v_fp8_with_scale", mutates_args=["output"]
     )
     def ulysses_lowp_quant_v_fp8_with_scale(
@@ -214,6 +236,7 @@ def get_ulysses_lowp_module():
         ulysses_lowp_quant_q_int8_pack=ulysses_lowp_quant_q_int8_pack,
         ulysses_lowp_quant_kv_int8_fp8_pack=ulysses_lowp_quant_kv_int8_fp8_pack,
         ulysses_lowp_unpack_for_sage=ulysses_lowp_unpack_for_sage,
+        ulysses_lowp_unpack_for_sage_unaligned=ulysses_lowp_unpack_for_sage_unaligned,
         ulysses_lowp_quant_v_fp8_with_scale=ulysses_lowp_quant_v_fp8_with_scale,
         ulysses_lowp_abi_version=ulysses_lowp_abi_version,
     )
@@ -576,6 +599,213 @@ def k_grouped_amax(
 
 
 # ---------------------------------------------------------------------------
+# Boundary machinery (stats protocol 2: 64-aligned global packing)
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api
+def boundary_descriptors(
+    grouped_amax: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    group: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Extract the ``[B, H, 2]`` boundary descriptor for one stats collective.
+
+    slot0 is the first touched group's partial amax and slot1 the last's.
+    When the rank touches a single group both slots carry the same value; the
+    downstream max merge is idempotent, so no dedup special case is needed.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    touched_count = touched(rank, local_sequence, group)
+    first = grouped_amax[..., 0:1]
+    last = grouped_amax[..., touched_count - 1 : touched_count]
+    return torch.cat([first, last], dim=-1).contiguous()
+
+
+@flashinfer_api
+def merge_boundary_amax(
+    grouped_amax: torch.Tensor,
+    gathered_descriptors: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    group: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Overwrite this rank's boundary slots with the cross-rank max merge.
+
+    ``gathered_descriptors`` is ``[P, B, H, 2]`` in group-rank order.  For each
+    of this rank's (at most two) boundary groups, the final amax is the max of
+    the partial amax from every rank whose interval intersects that group.
+    The merge uses only ``max`` (exact, order-independent), so the result is
+    bit-identical on every participating rank.  Returns ``grouped_amax``
+    (modified in place) for convenience.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if gathered_descriptors.shape[0] != world_size or gathered_descriptors.shape[-1] != 2:
+        raise ValueError("gathered_descriptors must have shape [P, B, H, 2]")
+    my_first = group_first(rank, local_sequence, group)
+    touched_count = touched(rank, local_sequence, group)
+    for boundary_group in {my_first, my_first + touched_count - 1}:
+        parts = []
+        for other in range(world_size):
+            other_first = group_first(other, local_sequence, group)
+            other_last = group_last(other, local_sequence, group)
+            if not other_first <= boundary_group <= other_last:
+                continue
+            slot = 0 if boundary_group == other_first else 1
+            parts.append(gathered_descriptors[other, ..., slot])
+        merged = parts[0]
+        for part in parts[1:]:
+            merged = torch.maximum(merged, part)
+        grouped_amax[..., boundary_group - my_first] = merged
+    return grouped_amax
+
+
+@flashinfer_api
+def k_boundary_minmax(
+    k: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+) -> torch.Tensor:
+    """Per-channel raw-K min/max of this rank's two K boundary slices.
+
+    Returns ``[B, H, 2, 2, D]`` fp32: dim2 is the boundary slot (0 = first
+    touched global 64-group's slice, 1 = last touched group's; when the rank
+    touches a single group both slots describe the same slice, and the
+    downstream max-combine is idempotent).  dim3 is (min, max).
+
+    Stats-protocol 2 gathers this INSTEAD of the mean-dependent K boundary
+    amax: raw-K min/max needs no global mean, so it rides in AllGather #1,
+    and after ``k_mean_global`` is derived every rank reconstructs each
+    boundary group's exact |K - mean| amax locally (see
+    :func:`derive_k_boundary_amax`), eliminating the second collective.
+
+    fp32 transport is exact: every BF16/FP16 value converts to fp32 without
+    rounding, and min/max are selections.  ``used_sequence`` applies the
+    live-rows rule one stage earlier: rows ``[used, S)`` are zero-filled
+    padding whose inclusion would contribute ``min=0/max=0`` and hence
+    ``|0 - mean| = |mean|`` after the derive -- exactly the tail-group
+    pollution the k_grouped_amax fix removes.  A slice that is entirely
+    padding gets the sentinels ``min=+inf, max=-inf``; the derive turns those
+    into ``-inf`` before its 1e-7 floor, i.e. the same "this rank contributes
+    nothing" value the two-collective path used.
+
+    ``used_sequence`` must satisfy the padding admission condition
+    ``ceil(used_sequence/64) == ceil(S/64)`` (all padding inside the single
+    last global K group); violations raise :class:`ValueError`.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None:
+        if not 0 < int(used_sequence) <= global_sequence:
+            raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+        # Enforced admission condition (comment-only precondition upstream):
+        # all padding must live in the single last global K group.
+        if (int(used_sequence) + K_GROUP - 1) // K_GROUP != (
+            global_sequence + K_GROUP - 1
+        ) // K_GROUP:
+            raise ValueError(
+                "used_sequence must satisfy ceil(used_sequence/64) == ceil(S/64): "
+                "all tail padding must lie inside the last global K group"
+            )
+    used = int(used_sequence) if used_sequence is not None else global_sequence
+
+    out = torch.empty(
+        (batch, num_heads, 2, 2, head_dim), dtype=torch.float32, device=k.device
+    )
+    g_first = group_first(rank, local_sequence, K_GROUP)
+    g_last = group_last(rank, local_sequence, K_GROUP)
+    base = rank * local_sequence
+    for slot, group_id in enumerate((g_first, g_last)):
+        lo = max(group_id * K_GROUP, base)
+        hi = min((group_id + 1) * K_GROUP, base + local_sequence, used)
+        if hi > lo:
+            # [B, rows, H, D] slice in local coordinates; fp32 convert is
+            # exact for BF16/FP16, min/max are selections (no rounding).
+            rows = k[:, lo - base : hi - base].float()
+            out[:, :, slot, 0] = rows.amin(dim=1)
+            out[:, :, slot, 1] = rows.amax(dim=1)
+        else:
+            out[:, :, slot, 0] = float("inf")
+            out[:, :, slot, 1] = float("-inf")
+    return out
+
+
+@flashinfer_api
+def derive_k_boundary_amax(
+    grouped_amax: torch.Tensor,
+    gathered_minmax: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Overwrite this rank's K boundary slots with the derived cross-rank amax.
+
+    ``gathered_minmax`` is ``[P, B, H, 2, 2, D]`` fp32 in group-rank order
+    (from AllGather #1 under stats protocol 2).  For each of this rank's (at
+    most two) boundary groups g and every rank r touching g:
+
+        contrib(r, g) = max_d max( rn(maxK[r,g,d] - m[d]),
+                                   rn(m[d]  - minK[r,g,d]) )   floored at 1e-7
+
+    which is bit-equal to r's |K - m| partial amax over its slice of g: fp32
+    round-to-nearest subtraction is monotone in its tensor argument, so
+    ``max_t rn(k_t - m) = rn(max_t k_t - m)`` and likewise for the min side,
+    and ``max_t |rn(k_t - m)| = max(rn(maxK - m), rn(m - minK))`` exactly.
+    The final slot value is ``max_r contrib(r, g)`` -- the same values the
+    retired AllGather #2 merge produced, computed from identical gathered
+    inputs with identical exact ops on every rank, hence bit-identical
+    group-wide without a second collective.  A padding-only slice's sentinels
+    (min=+inf, max=-inf) yield ``-inf`` before the floor, i.e. contribute
+    1e-7 exactly as the two-collective path did.  Non-crossing boundary
+    groups (single toucher) reduce to the kernel's own partial, so the
+    unconditional overwrite is bit-neutral there.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if gathered_minmax.shape[0] != world_size or gathered_minmax.shape[-3:-1] != (2, 2):
+        raise ValueError("gathered_minmax must have shape [P, B, H, 2, 2, D]")
+    mean32 = k_mean_global.float()
+    my_first = group_first(rank, local_sequence, K_GROUP)
+    touched_count = touched(rank, local_sequence, K_GROUP)
+    for boundary_group in {my_first, my_first + touched_count - 1}:
+        merged = None
+        for other in range(world_size):
+            other_first = group_first(other, local_sequence, K_GROUP)
+            other_last = group_last(other, local_sequence, K_GROUP)
+            if not other_first <= boundary_group <= other_last:
+                continue
+            slot = 0 if boundary_group == other_first else 1
+            mn = gathered_minmax[other, :, :, slot, 0]
+            mx = gathered_minmax[other, :, :, slot, 1]
+            contrib = (
+                torch.maximum(mx - mean32, mean32 - mn)
+                .amax(dim=-1)
+                .clamp_(min=1e-7)
+            )
+            merged = contrib if merged is None else torch.maximum(merged, contrib)
+        grouped_amax[..., boundary_group - my_first] = merged
+    return grouped_amax
+
+
+
+# ---------------------------------------------------------------------------
 # Quantize-and-pack into the headerless payload
 # ---------------------------------------------------------------------------
 
@@ -752,6 +982,7 @@ def unpack_for_sage(
     local_heads: int,
     head_dim: int,
     world_size: int,
+    aligned: bool = True,
     out: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
@@ -768,10 +999,11 @@ def unpack_for_sage(
     local_heads = _positive_int("local_heads", local_heads)
     head_dim = _positive_int("head_dim", head_dim)
     world_size = _world_size(world_size)
-    if local_sequence % 128:
+    if aligned and local_sequence % 128:
         raise ValueError(
             "ALIGN-128 (stats protocol 3): local_sequence must be a whole "
-            f"number of 128-token blocks, got {local_sequence}"
+            f"number of 128-token blocks, got {local_sequence}; pass "
+            "aligned=False for the protocol-2 (64-aligned global) receiver"
         )
     spec = payload_spec(
         batch_size=batch_size,
@@ -821,7 +1053,12 @@ def unpack_for_sage(
         if not isinstance(out, tuple) or len(out) != 5:
             raise TypeError("out must be a five-tensor global-grid Sage tuple")
         q_logical, k_logical, v_packed, q_scale, k_scale = out
-    get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage(
+    fn = (
+        get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage
+        if aligned
+        else get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage_unaligned
+    )
+    fn(
         recv_u8,
         q_logical,
         k_logical,
@@ -978,6 +1215,11 @@ __all__ = [
     "owner",
     "payload_spec",
     "q_grouped_amax",
+    "boundary_descriptors",
+    "derive_k_boundary_amax",
+    "k_boundary_minmax",
+    "merge_boundary_amax",
+    "SUPPORTED_STATS_PROTOCOLS",
     "quant_kv_into_payload",
     "quant_q_into_payload",
     "quant_qkv_pack",

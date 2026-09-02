@@ -353,3 +353,110 @@ def test_bit_parity_vs_fork(world, local_sequence):
         )
         for x, y in zip(o_fi, o_rf):
             assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+
+
+# ---------------------------------------------------------------------------
+# 5. Protocol-2 (64-aligned global packing) additions
+# ---------------------------------------------------------------------------
+
+
+@requires_sm120
+@pytest.mark.parametrize("world", [4, 8])
+@pytest.mark.parametrize("local_sequence", [65, 193, 1180])
+def test_unaligned_unpack_reproduces_packed_bytes(world, local_sequence):
+    """Protocol-2 receiver: Q/K logical tensors and owner-rule scale rebuild
+    must byte-match the payload sections for arbitrary (unaligned) L."""
+    L = local_sequence
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    spec = lowp.payload_spec(
+        batch_size=1, local_sequence=L, num_heads=_HEADS,
+        head_dim=_HEAD_DIM, world_size=world,
+    )
+    local_heads = _HEADS // world
+    S = world * L
+    sends = _run_pipeline(q, k, v, k_mean, v_scale, world, L)
+    d = world - 1
+    recv = torch.stack([sends[r][d] for r in range(world)]).contiguous()
+    q_u, k_u, v_u, q_scale_u, k_scale_u = lowp.unpack_for_sage(
+        recv, batch_size=1, local_sequence=L, local_heads=local_heads,
+        head_dim=_HEAD_DIM, world_size=world, aligned=False,
+    )
+    rebuilt_q = torch.cat(
+        [recv[src, : int(spec["main_bytes"])]
+         .view(L, 1, local_heads, _HEAD_DIM).permute(1, 0, 2, 3)
+         for src in range(world)], dim=1)
+    assert torch.equal(q_u.view(torch.uint8), rebuilt_q.contiguous().view(torch.uint8))
+    # owner-rule scale rebuild incl. deterministic zero tail
+    q_groups_total = (S + 31) // 32
+    for g in range(int(spec["q_scale_alloc"])):
+        col = q_scale_u[..., g]
+        if g >= q_groups_total:
+            assert torch.all(col == 0.0), f"tail slot {g} not zero"
+            continue
+        owner = (g * 32) // L
+        owner_slot = g - (owner * L) // 32
+        section = recv[
+            owner,
+            int(spec["q_scale_offset"]) : int(spec["q_scale_offset"])
+            + local_heads * int(spec["q_slots_per_source"]) * 4,
+        ].view(torch.float32).view(1, local_heads, -1)
+        assert torch.equal(col, section[..., owner_slot]), f"slot {g}"
+
+
+@requires_sm120
+@pytest.mark.parametrize("world", [4, 8])
+def test_boundary_derive_matches_direct_computation(world):
+    """derive_k_boundary_amax must reproduce, bit-exactly, the max over every
+    touching rank's directly-computed |K - mean| partial amax."""
+    L = 193
+    S = world * L
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    k_mean, _ = _stats(k, v, world, L)
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        k_r = k[:, s].contiguous()
+        ka = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
+        gathered = torch.stack([
+            lowp.k_boundary_minmax(k[:, o * L : (o + 1) * L].contiguous(),
+                                   rank=o, world_size=world)
+            for o in range(world)
+        ])
+        lowp.derive_k_boundary_amax(ka, gathered, k_mean, rank=r,
+                                    local_sequence=L, world_size=world)
+        g_first = lowp.group_first(r, L, 64)
+        touched_count = lowp.touched(r, L, 64)
+        for g in {g_first, g_first + touched_count - 1}:
+            direct = None
+            for o in range(world):
+                lo = max(g * 64, o * L)
+                hi = min((g + 1) * 64, (o + 1) * L, S)
+                if hi <= lo:
+                    continue
+                kc = k[:, lo:hi].float() - k_mean.float().unsqueeze(1)
+                part = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+                direct = part if direct is None else torch.maximum(direct, part)
+            assert torch.equal(ka[..., g - g_first], direct), f"group {g}"
+
+
+@requires_sm120
+def test_boundary_merge_is_idempotent_and_max():
+    world, L = 4, 65
+    q, _, _ = _global_inputs(torch.bfloat16, world, L)
+    amaxes = [lowp.q_grouped_amax(q[:, r * L : (r + 1) * L].contiguous(),
+                                  rank=r, world_size=world) for r in range(world)]
+    descs = torch.stack([
+        lowp.boundary_descriptors(amaxes[r], rank=r, local_sequence=L,
+                                  group=32, world_size=world)
+        for r in range(world)
+    ])
+    once = [a.clone() for a in amaxes]
+    for r in range(world):
+        lowp.merge_boundary_amax(once[r], descs, rank=r, local_sequence=L,
+                                 group=32, world_size=world)
+    twice = [a.clone() for a in once]
+    for r in range(world):
+        lowp.merge_boundary_amax(twice[r], descs, rank=r, local_sequence=L,
+                                 group=32, world_size=world)
+    for a, b in zip(once, twice):
+        assert torch.equal(a, b)

@@ -767,6 +767,153 @@ __global__ void UnpackForSageKernel(
   }
 }
 
+// V2-G receiver, UNALIGNED variant (boundary-stats protocol 2, 64-aligned
+// GLOBAL packing): local_sequence carries no 128-alignment guarantee, so a
+// 64-token CTA tile may span two source chunks and the tail of the global
+// grid may be partial.  Every token computes its own source (global_token /
+// local_sequence) behind a validity guard; the Sage 16-token permutation is
+// applied on the global token index with zero padding for invalid rows, and
+// the scale rebuild is owner-only with deterministic zeroing of the unused
+// tail slots (scale_alloc may exceed groups_total here).  Bit-exact port of
+// the SageAttention protocol-2 kernel (p2-upstream-prep @8a1d1f6).
+template <uint32_t head_dim, uint32_t CTA_SIZE>
+__global__ void UnpackForSageUnalignedKernel(
+    const uint8_t *__restrict__ input,
+    uint8_t *__restrict__ q,
+    uint8_t *__restrict__ k,
+    uint8_t *__restrict__ v,
+    uint8_t *__restrict__ q_scale,
+    uint8_t *__restrict__ k_scale,
+    const uint64_t main_bytes,
+    const uint64_t chunk_bytes,
+    const uint32_t batch_size,
+    const uint32_t local_sequence,
+    const uint32_t logical_sequence,
+    const uint32_t padded_sequence,
+    const uint32_t q_slots_per_source,
+    const uint32_t k_slots_per_source,
+    const uint32_t q_scale_alloc,
+    const uint32_t k_scale_alloc)
+{
+  static_assert(head_dim == 128 && CTA_SIZE == 64);
+  constexpr uint32_t vector_size = 16;
+  constexpr uint32_t vectors_per_token = head_dim / vector_size;
+  constexpr uint32_t sequence_vectors = CTA_SIZE / vector_size;
+  const uint32_t block_token_base = blockIdx.x * CTA_SIZE;
+  const uint32_t local_head = blockIdx.y;
+  const uint32_t batch_id = blockIdx.z;
+  const uint32_t thread_id = threadIdx.x;
+  const uint32_t local_heads = gridDim.y;
+
+  const uint32_t token_in_block = thread_id / vectors_per_token;
+  const uint32_t global_token = block_token_base + token_in_block;
+  const bool token_valid = global_token < logical_sequence;
+  const uint32_t d_base = thread_id % vectors_per_token * vector_size;
+
+  uint4 q_value = make_uint4(0, 0, 0, 0);
+  uint4 k_value = make_uint4(0, 0, 0, 0);
+  uint4 v_value = make_uint4(0, 0, 0, 0);
+  if (token_valid)
+  {
+    const uint32_t source = global_token / local_sequence;
+    const uint32_t local_token = global_token - source * local_sequence;
+    const uint64_t source_chunk = static_cast<uint64_t>(source) * chunk_bytes;
+    const uint64_t source_element =
+        ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads +
+         local_head) *
+            head_dim +
+        d_base;
+    q_value = *reinterpret_cast<const uint4 *>(input + source_chunk + source_element);
+    k_value =
+        *reinterpret_cast<const uint4 *>(input + source_chunk + main_bytes + source_element);
+    v_value = *reinterpret_cast<const uint4 *>(
+        input + source_chunk + 2 * main_bytes + source_element);
+
+    const uint64_t logical_element =
+        ((static_cast<uint64_t>(batch_id) * logical_sequence + global_token) * local_heads +
+         local_head) *
+            head_dim +
+        d_base;
+    *reinterpret_cast<uint4 *>(q + logical_element) = q_value;
+    *reinterpret_cast<uint4 *>(k + logical_element) = k_value;
+  }
+
+  // Sage private 16-token permutation on the global token index.  The block
+  // base is 64-aligned, hence 16-aligned, so token_in_block mod 16 equals
+  // global_token mod 16.
+  const uint32_t token_mod_16 = token_in_block & 15;
+  const uint32_t packed_row =
+      (token_in_block & ~15U) +
+      (token_mod_16 / 8) * 2 +
+      ((token_mod_16 / 2) % 4) * 4 +
+      token_mod_16 % 2;
+  __shared__ uint8_t shared_load[CTA_SIZE][head_dim];
+  __shared__ uint8_t shared_store[head_dim][CTA_SIZE];
+  *reinterpret_cast<uint4 *>(&shared_load[packed_row][d_base]) = v_value;
+  __syncthreads();
+#pragma unroll
+  for (uint32_t i = 0; i < vector_size; ++i)
+  {
+    shared_store[d_base + i][packed_row] = shared_load[packed_row][d_base + i];
+  }
+  __syncthreads();
+  const uint32_t output_d = thread_id / sequence_vectors;
+  const uint32_t output_token_base = thread_id % sequence_vectors * vector_size;
+  const uint64_t v_output_offset =
+      ((static_cast<uint64_t>(batch_id) * head_dim + output_d) * local_heads + local_head) *
+          padded_sequence +
+      block_token_base + output_token_base;
+  *reinterpret_cast<uint4 *>(v + v_output_offset) =
+      *reinterpret_cast<uint4 *>(&shared_store[output_d][output_token_base]);
+
+  if (blockIdx.x != 0)
+  {
+    return;
+  }
+
+  // Owner-only global-grid scale reconstruction plus deterministic zeroing of
+  // the unused Q/K-scale tail slots.  Each (b, local_head) pair is handled by
+  // its own CTA (blockIdx.y/z), so every output slot has exactly one writer.
+  uint32_t *q_scale_output = reinterpret_cast<uint32_t *>(q_scale);
+  uint32_t *k_scale_output = reinterpret_cast<uint32_t *>(k_scale);
+  const uint64_t q_scale_section = 3 * main_bytes;
+  const uint64_t q_scale_chunk_bytes =
+      static_cast<uint64_t>(batch_size) * local_heads * q_slots_per_source * sizeof(float);
+  const uint64_t scale_head = static_cast<uint64_t>(batch_id) * local_heads + local_head;
+  const uint32_t q_groups_total = (logical_sequence + 31) / 32;
+  const uint32_t k_groups_total = (logical_sequence + 63) / 64;
+
+  for (uint32_t g = thread_id; g < q_scale_alloc; g += blockDim.x)
+  {
+    uint32_t value = 0u;
+    if (g < q_groups_total)
+    {
+      const uint32_t owner = (g * 32) / local_sequence;
+      const uint32_t owner_first = (owner * local_sequence) / 32;
+      const uint32_t owner_slot = g - owner_first;
+      const uint32_t *q_scale_input = reinterpret_cast<const uint32_t *>(
+          input + static_cast<uint64_t>(owner) * chunk_bytes + q_scale_section);
+      value = q_scale_input[scale_head * q_slots_per_source + owner_slot];
+    }
+    q_scale_output[scale_head * q_scale_alloc + g] = value;
+  }
+  for (uint32_t g = thread_id; g < k_scale_alloc; g += blockDim.x)
+  {
+    uint32_t value = 0u;
+    if (g < k_groups_total)
+    {
+      const uint32_t owner = (g * 64) / local_sequence;
+      const uint32_t owner_first = (owner * local_sequence) / 64;
+      const uint32_t owner_slot = g - owner_first;
+      const uint32_t *k_scale_input = reinterpret_cast<const uint32_t *>(
+          input + static_cast<uint64_t>(owner) * chunk_bytes + q_scale_section +
+          q_scale_chunk_bytes);
+      value = k_scale_input[scale_head * k_slots_per_source + owner_slot];
+    }
+    k_scale_output[scale_head * k_scale_alloc + g] = value;
+  }
+}
+
 }  // namespace ulysses_lowp
 }  // namespace flashinfer
 

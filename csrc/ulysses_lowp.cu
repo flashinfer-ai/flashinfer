@@ -509,8 +509,91 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
       << "UnpackForSageKernel failed with error code " << cudaGetErrorString(status);
 }
 
+// UNALIGNED receiver (boundary-stats protocol 2, 64-aligned GLOBAL packing):
+// identical tensor contract to ulysses_lowp_unpack_for_sage but without the
+// ALIGN-128 local_sequence precondition; a 64-token tile may span two source
+// chunks and unused scale tail slots are deterministically zeroed by the
+// kernel itself.
+void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, TensorView k,
+                                            TensorView v, TensorView q_scale,
+                                            TensorView k_scale, int64_t local_sequence,
+                                            int64_t world_size) {
+  CHECK_CUDA(input);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
+  CHECK_CUDA(q_scale);
+  CHECK_CUDA(k_scale);
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(q);
+  CHECK_CONTIGUOUS(k);
+  CHECK_CONTIGUOUS(v);
+  CHECK_CONTIGUOUS(q_scale);
+  CHECK_CONTIGUOUS(k_scale);
+  CHECK_DIM(2, input);
+  CHECK_DIM(4, q);
+  CHECK_DIM(4, k);
+  CHECK_DIM(4, v);
+  CHECK_DIM(3, q_scale);
+  CHECK_DIM(3, k_scale);
+  CHECK_INPUT_TYPE(input, dl_uint8);
+  CHECK_INPUT_TYPE(q, dl_int8);
+  CHECK_INPUT_TYPE(k, dl_int8);
+  CHECK_INPUT_TYPE(v, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(q_scale, dl_float32);
+  CHECK_INPUT_TYPE(k_scale, dl_float32);
+  TVM_FFI_ICHECK_GT(local_sequence, 0) << "local_sequence must be positive";
+  TVM_FFI_ICHECK(world_size == 2 || world_size == 4 || world_size == 6 || world_size == 8)
+      << "V2-G requires world_size in {2,4,6,8}";
+  CHECK_DEVICE(input, q);
+  CHECK_DEVICE(input, k);
+  CHECK_DEVICE(input, v);
+  CHECK_DEVICE(input, q_scale);
+  CHECK_DEVICE(input, k_scale);
+  TVM_FFI_ICHECK_EQ(input.size(0), world_size) << "input source dimension must equal world_size";
+  TVM_FFI_ICHECK(q.size(0) > 0 && q.size(2) > 0 && q.size(3) == 128)
+      << "q must have non-empty [B,S,h,128] shape";
+
+  const int64_t batch_size = q.size(0);
+  const int64_t logical_sequence = local_sequence * world_size;
+  const int64_t local_heads = q.size(2);
+  const int64_t head_dim = q.size(3);
+  const int64_t padded_sequence = (logical_sequence + 63) / 64 * 64;
+  const int64_t q_scale_alloc = (logical_sequence + 127) / 128 * 4;
+  const int64_t k_scale_alloc = (logical_sequence + 63) / 64;
+  const lowp::grid::ChunkSpec spec =
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
+  TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
+  check_shape_4d(k, "k", batch_size, logical_sequence, local_heads, head_dim);
+  check_shape_4d(v, "v", batch_size, head_dim, local_heads, padded_sequence);
+  check_shape_3d(q_scale, "q_scale", batch_size, local_heads, q_scale_alloc);
+  check_shape_3d(k_scale, "k_scale", batch_size, local_heads, k_scale_alloc);
+  TVM_FFI_ICHECK_EQ(input.size(1), spec.chunk_bytes)
+      << "input chunk size does not match the V2-G ABI";
+
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
+  constexpr uint32_t HEAD_DIM = 128;
+  constexpr uint32_t CTA_SIZE = 64;
+  constexpr uint32_t VECTOR_SIZE = 16;
+  dim3 grid(padded_sequence / CTA_SIZE, local_heads, batch_size);
+  dim3 block(CTA_SIZE * HEAD_DIM / VECTOR_SIZE);
+  lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE><<<grid, block, 0, stream>>>(
+      static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
+      static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
+      static_cast<uint8_t*>(q_scale.data_ptr()), static_cast<uint8_t*>(k_scale.data_ptr()),
+      static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
+      static_cast<uint32_t>(batch_size), static_cast<uint32_t>(local_sequence),
+      static_cast<uint32_t>(logical_sequence), static_cast<uint32_t>(padded_sequence),
+      static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(spec.k_slots),
+      static_cast<uint32_t>(q_scale_alloc), static_cast<uint32_t>(k_scale_alloc));
+  cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "UnpackForSageUnalignedKernel failed with error code " << cudaGetErrorString(status);
+}
+
 // Payload ABI version consumed by the Python capability handshake
-// (ABI v3 = ALIGN-128 chunk layout).
+// (ABI v3 = chunk layout shared by both stats protocols).
 int64_t ulysses_lowp_abi_version() { return 3; }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_k_sum_v_amax, ulysses_lowp_k_sum_v_amax);
@@ -520,6 +603,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_q_int8_pack, ulysses_lowp_quant
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_kv_int8_fp8_pack,
                               ulysses_lowp_quant_kv_int8_fp8_pack);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_unpack_for_sage, ulysses_lowp_unpack_for_sage);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_unpack_for_sage_unaligned,
+                              ulysses_lowp_unpack_for_sage_unaligned);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_v_fp8_with_scale,
                               ulysses_lowp_quant_v_fp8_with_scale);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_abi_version, ulysses_lowp_abi_version);

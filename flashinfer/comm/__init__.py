@@ -72,7 +72,11 @@ from .ulysses_lowp import abi_version as ulysses_lowp_abi_version
 from .ulysses_lowp import capability as ulysses_lowp_capability
 from .ulysses_lowp import gen_ulysses_lowp_module as gen_ulysses_lowp_module
 from .ulysses_lowp import get_ulysses_lowp_module as get_ulysses_lowp_module
+from .ulysses_lowp import boundary_descriptors as boundary_descriptors
+from .ulysses_lowp import derive_k_boundary_amax as derive_k_boundary_amax
+from .ulysses_lowp import k_boundary_minmax as k_boundary_minmax
 from .ulysses_lowp import k_grouped_amax as k_grouped_amax
+from .ulysses_lowp import merge_boundary_amax as merge_boundary_amax
 from .ulysses_lowp import k_sum_v_amax as k_sum_v_amax
 from .ulysses_lowp import payload_spec as payload_spec
 from .ulysses_lowp import q_grouped_amax as q_grouped_amax
