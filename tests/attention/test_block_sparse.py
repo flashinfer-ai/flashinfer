@@ -670,6 +670,7 @@ def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
 
+@requires_cuda_sm80
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_paged_fp8_cache_sizes_its_default_scales_by_the_head_count(layout):
     """A higher-precision query over an FP8 paged cache, with no explicit
@@ -753,3 +754,40 @@ def test_paged_fp8_cache_sizes_its_default_scales_by_the_head_count(layout):
     # and is here to show the coincidence rather than to catch anything.
     widths = [t.numel() for t in seen]
     assert widths.count(num_kv_heads) >= 2, widths
+
+
+@requires_cuda_sm80
+def test_a_second_plan_still_takes_a_page_size_after_auto_resolved():
+    """plan() resolves "auto" and keeps the answer on the wrapper. Gating the
+    page size on that resolved value refused a second plan for a backend the
+    caller never named -- so a wrapper that first planned a flat route could not
+    then plan a paged one."""
+    device = "cuda:0"
+    rows, width, heads, head_dim = 4, 8, 4, 128
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        backend="auto",
+    )
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    indices = torch.zeros(rows * width, dtype=torch.int32, device=device)
+    common = dict(
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+    )
+    # First a flat route, which lets plan() resolve and store a backend.
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
+    # What it resolves to depends on the device: sm_80 gives fa2, which the
+    # gate accepts either way, so the case that matters is written out rather
+    # than waited for. This is what plan() leaves behind on sm_90.
+    wrapper._backend = "fa3"
+    assert wrapper._requested_backend == "auto"
+    # Then a paged one on the same wrapper. Gating on the resolved backend
+    # refuses this for an fa3 the caller never named.
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, kv_cache_page_size=1, **common)

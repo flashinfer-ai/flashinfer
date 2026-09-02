@@ -560,6 +560,11 @@ class BlockSparseAttentionWrapper:
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
         self._backend = _BACKEND_ALIASES.get(backend, backend)
+        # plan() overwrites _backend when it resolves "auto", and the wrapper
+        # keeps that. Gates that are about what the caller selected have to read
+        # this instead, or a second plan() is refused for a backend the caller
+        # never named.
+        self._requested_backend = self._backend
         if self._backend == "cake":
             # Cake consumes the caller's direct VSA metadata and never invokes
             # the generic sparse planner. Avoid allocating its per-wrapper 8 MiB
@@ -806,10 +811,13 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
-        if kv_cache_page_size is not None and self._backend not in ("auto", "fa2"):
+        if kv_cache_page_size is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
             raise ValueError(
                 "kv_cache_page_size is read by the FA2 planner and is not "
-                f"supported for backend={self._backend!r}"
+                f"supported for backend={self._requested_backend!r}"
             )
 
         if self._backend != "vsa_sm100_blk64" and (
@@ -1421,13 +1429,19 @@ class BlockSparseAttentionWrapper:
                 # Only the FA2 paged entry point divides a route element back
                 # into (page, entry); every other backend would read the slots
                 # as page ids and address past the cache.
-                if self._backend == "auto":
+                #
+                # Read from what the caller asked for, not from what a previous
+                # plan() left here: "auto" that resolved to fa3 once would
+                # otherwise refuse a paged route the caller is entitled to.
+                if self._requested_backend == "auto":
                     self._backend = "fa2"
-                elif self._backend != "fa2":
+                elif self._requested_backend != "fa2":
                     raise ValueError(
                         "a route over a raw paged cache is only served by the "
-                        f"fa2 backend, got {self._backend!r}"
+                        f"fa2 backend, got {self._requested_backend!r}"
                     )
+                else:
+                    self._backend = "fa2"
             if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
@@ -1916,8 +1930,13 @@ class BlockSparseAttentionWrapper:
 
         if v_scale is not None and v_scale != 1.0:
             # Mirrors the paged wrapper: the value scale folds into the
-            # normalized output rather than the dots.
-            out *= v_scale
+            # normalized output rather than the dots, and an 8-bit output takes
+            # the multiply in float32 because torch has no in-place float
+            # multiply for it.
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
+            else:
+                out *= v_scale
 
         return (out, lse) if return_lse else out
 

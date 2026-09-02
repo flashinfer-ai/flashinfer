@@ -896,6 +896,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        # Keep new parameters last, as the real implementation does.
+        kv_logical_block_size: int = 0,
     ) -> None:
         pass
 
