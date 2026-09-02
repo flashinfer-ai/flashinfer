@@ -1579,7 +1579,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     cum_seq_lens_q : Optional[torch.Tensor]
         Cumulative query lengths for varlen query input, shape ``[batch_size + 1]``
         INT32. When provided, dynamic top-k lengths are consumed in flattened
-        query-token order.
+        query-token order. On SM120/SM121 (``sparse`` backend) the query is
+        processed per token and per-token sparse indices fully determine
+        visibility, so ``cum_seq_lens_q`` and ``max_q_len`` are accepted for
+        call-site compatibility but do not affect the result.
     max_q_len : Optional[int]
         Maximum query length in the varlen batch. Required with
         ``cum_seq_lens_q``.
