@@ -751,6 +751,7 @@ class TestTacticEnumeration:
 
     def test_blackwell_tactic_options(self):
         from flashinfer.fused_moe.cute_dsl.tuner import (
+            CuteDslFusedMoERunner,
             _extract_tactic_params,
             get_blackwell_moe_valid_tactics,
         )
@@ -780,6 +781,53 @@ class TestTacticEnumeration:
             weight_interleave=16,
         )
         assert {tactic[3] for tactic in fixed_split_tactics} == {True}
+
+        captured = {}
+        runner = CuteDslFusedMoERunner(
+            forward_impl=lambda **kwargs: captured.update(kwargs),
+            num_experts=2,
+            top_k=2,
+            num_local_experts=2,
+            activation_format=QuantVariant.NVFP4,
+            weight_format=QuantVariant.NVFP4,
+            weight_interleave=16,
+            w1_pdl_count=None,
+            w2_pdl_count=1,
+            w1_split_k=2,
+        )
+        forward_tactics = get_blackwell_moe_valid_tactics(
+            autotune_swap_ab=True,
+            w1_pdl_count=None,
+            w2_pdl_count=1,
+            w1_split_k=2,
+            weight_interleave=16,
+        )
+        tactic = next(
+            tactic
+            for tactic in forward_tactics
+            if tactic[3] and tactic[1][2] and tactic[2][2]
+        )
+        runner.forward([torch.empty(1)] * 14, tactic=tactic)
+        assert {
+            name: captured[name]
+            for name in (
+                "swap_ab",
+                "weight_interleave",
+                "w1_raster_along_m",
+                "w1_pdl_count",
+                "w1_split_k",
+                "w2_raster_along_m",
+                "w2_pdl_count",
+            )
+        } == {
+            "swap_ab": True,
+            "weight_interleave": 16,
+            "w1_raster_along_m": True,
+            "w1_pdl_count": None,
+            "w1_split_k": 2,
+            "w2_raster_along_m": True,
+            "w2_pdl_count": 1,
+        }
 
     def test_w4a16_tactic_enumeration_invariants(self):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
@@ -2269,10 +2317,12 @@ class TestCuteDslFusedMoeFunctional:
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
+            w1_bias=None,
             fc2_input_scale=tensors["fc2_input_scale"],
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            w2_bias=None,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_experts,
@@ -4242,7 +4292,7 @@ class TestMoeOutputMemsetInplaceContract:
             id="n128-bias-off",
         ),
         pytest.param(
-            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), True)),
             256,
             1.0,
             0.0,

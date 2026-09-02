@@ -1054,7 +1054,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 autotune_swap_ab=self.weight_interleave == 16,
                 w1_pdl_count=self.w1_pdl_count,
                 w2_pdl_count=self.w2_pdl_count,
-                w1_split_k=(1 if self._base_callback_contract else self.w1_split_k),
+                w1_split_k=self.w1_split_k,
                 gated=gated,
                 weight_interleave=self.weight_interleave,
             )
@@ -1181,20 +1181,19 @@ class CuteDslFusedMoERunner(TunableRunner):
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
         )
+        common_kwargs.update(
+            w1_raster_along_m=params["w1_raster_along_m"],
+            w1_pdl_count=params["w1_pdl_count"],
+            w1_split_k=params["w1_split_k"],
+            w2_raster_along_m=params["w2_raster_along_m"],
+            w2_pdl_count=params["w2_pdl_count"],
+            swap_ab=(
+                params["swap_ab"] if params["swap_ab"] is not None else self.swap_ab
+            ),
+            weight_interleave=self.weight_interleave,
+        )
         if self._base_callback_contract:
             common_kwargs["enable_pdl"] = self.enable_pdl
-        else:
-            common_kwargs.update(
-                w1_raster_along_m=params["w1_raster_along_m"],
-                w1_pdl_count=params["w1_pdl_count"],
-                w1_split_k=params["w1_split_k"],
-                w2_raster_along_m=params["w2_raster_along_m"],
-                w2_pdl_count=params["w2_pdl_count"],
-                swap_ab=(
-                    params["swap_ab"] if params["swap_ab"] is not None else self.swap_ab
-                ),
-                weight_interleave=self.weight_interleave,
-            )
         common_kwargs.update(kwargs)
         return self.forward_impl(**common_kwargs)
 

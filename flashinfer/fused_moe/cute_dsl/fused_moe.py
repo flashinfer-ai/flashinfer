@@ -232,8 +232,13 @@ def _moe_core_impl(
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w1_raster_along_m: bool = False,
+    w1_pdl_count: Optional[int] = 1,
+    w1_split_k: int = 1,
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w2_raster_along_m: bool = False,
+    w2_pdl_count: Optional[int] = 1,
     # Tactic parameters (Rubin — when set, use SM107 kernel)
     gemm1_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -255,6 +260,7 @@ def _moe_core_impl(
     use_fused_finalize: bool = True,
     enable_pdl: bool = True,
     swap_ab: bool = False,
+    weight_interleave: Optional[int] = None,
     use_compact_sf: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -294,8 +300,13 @@ def _moe_core_impl(
         tile_size: Tile size for moe_sort.
         gemm1_mma_tiler_mn: GEMM1 MMA tiler shape.
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
+        w1_raster_along_m: GEMM1 rasterization direction.
+        w1_pdl_count: GEMM1 dependent-launch K-tile count.
+        w1_split_k: GEMM1 split-K factor.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
+        w2_raster_along_m: GEMM2 rasterization direction.
+        w2_pdl_count: GEMM2 dependent-launch K-tile count.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -309,6 +320,7 @@ def _moe_core_impl(
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
         swap_ab: Swap both GEMMs' device operand assignments.
+        weight_interleave: Physical GEMM1 up/gate weight interleave.
         use_compact_sf: Use the compact GEMM1-output/GEMM2-input scale layout.
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
@@ -482,11 +494,14 @@ def _moe_core_impl(
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
+            raster_along_m=w1_raster_along_m,
             mma_tiler=gemm1_mma_tiler,
             mma_inst_shape=gemm1_mma_inst_shape,
-            enable_pdl=enable_pdl,
+            pdl_count=w1_pdl_count if enable_pdl else None,
+            split_k=w1_split_k,
             swap_ab=swap_ab,
             use_compact_sf=use_compact_sf,
+            weight_interleave=weight_interleave,
             activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -556,7 +571,8 @@ def _moe_core_impl(
         mma_tiler=gemm2_mma_tiler,
         mma_inst_shape=gemm2_mma_inst_shape,
         cluster_shape_mn=gemm2_cluster_shape_mn,
-        enable_pdl=enable_pdl,
+        raster_along_m=w2_raster_along_m,
+        pdl_count=w2_pdl_count if enable_pdl else None,
         swap_ab=swap_ab,
         use_compact_sf=use_compact_sf,
         use_fused_finalize=use_fused_finalize,
@@ -901,8 +917,13 @@ class CuteDslMoEWrapper:
         tile_size: int = 128,
         gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
+        w1_raster_along_m: bool = False,
+        w1_pdl_count: Optional[int] = 1,
+        w1_split_k: int = 1,
         gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
         gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+        w2_raster_along_m: bool = False,
+        w2_pdl_count: Optional[int] = 1,
         gemm1_mma_tiler=None,
         gemm1_mma_inst_shape=None,
         gemm2_mma_tiler=None,
@@ -912,6 +933,8 @@ class CuteDslMoEWrapper:
         moe_output: Optional[torch.Tensor] = None,
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
+        swap_ab: bool = False,
+        weight_interleave: Optional[int] = None,
         use_async_memset: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -937,8 +960,13 @@ class CuteDslMoEWrapper:
             tile_size=tile_size,
             gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
             gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
+            w1_raster_along_m=w1_raster_along_m,
+            w1_pdl_count=w1_pdl_count,
+            w1_split_k=w1_split_k,
             gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
             gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+            w2_raster_along_m=w2_raster_along_m,
+            w2_pdl_count=w2_pdl_count,
             gemm1_mma_tiler=gemm1_mma_tiler,
             gemm1_mma_inst_shape=gemm1_mma_inst_shape,
             gemm2_mma_tiler=gemm2_mma_tiler,
@@ -955,6 +983,8 @@ class CuteDslMoEWrapper:
             use_async_memset=use_async_memset,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
+            swap_ab=swap_ab,
+            weight_interleave=weight_interleave,
             activation_type=self.activation_type.value,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
@@ -1199,8 +1229,13 @@ def _cute_dsl_fused_moe_impl(
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w1_raster_along_m: bool = False,
+    w1_pdl_count: Optional[int] = 1,
+    w1_split_k: int = 1,
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
+    w2_raster_along_m: bool = False,
+    w2_pdl_count: Optional[int] = 1,
     gemm1_mma_tiler=None,
     gemm1_mma_inst_shape=None,
     gemm2_mma_tiler=None,
@@ -1211,6 +1246,8 @@ def _cute_dsl_fused_moe_impl(
     per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    swap_ab: bool = False,
+    weight_interleave: Optional[int] = None,
     use_async_memset: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -1241,8 +1278,13 @@ def _cute_dsl_fused_moe_impl(
         tile_size=tile_size,
         gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
         gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
+        w1_raster_along_m=w1_raster_along_m,
+        w1_pdl_count=w1_pdl_count,
+        w1_split_k=w1_split_k,
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
+        w2_raster_along_m=w2_raster_along_m,
+        w2_pdl_count=w2_pdl_count,
         gemm1_mma_tiler=gemm1_mma_tiler,
         gemm1_mma_inst_shape=gemm1_mma_inst_shape,
         gemm2_mma_tiler=gemm2_mma_tiler,
@@ -1254,6 +1296,8 @@ def _cute_dsl_fused_moe_impl(
         use_async_memset=use_async_memset,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        swap_ab=swap_ab,
+        weight_interleave=weight_interleave,
         activation_type=activation_type,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
