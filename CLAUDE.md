@@ -26,6 +26,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable API logging (with stats) | `export FLASHINFER_LOGLEVEL=5` |
 | Set API log destination | `export FLASHINFER_LOGDEST=mylog.txt` |
 | Enable verbose JIT logging | `export FLASHINFER_JIT_VERBOSE=1` |
+- `FLASHINFER_JIT_TRUST_CACHE_STAMP`: opt-in ("1"; default "0"). Trust the sha256 stamp recorded after a successful JIT build (build.ninja contents + source file contents) and skip the ninja invocation when it matches — for restored/relocated caches of released packages, where ninja's mtime scan would rebuild despite byte-identical inputs. Transitively included headers are not hashed, so leave it unset for editable checkouts.
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |

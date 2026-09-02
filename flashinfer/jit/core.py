@@ -400,7 +400,23 @@ class JitSpecNvcc(JitSpec):
         return self.ninja_path.parent / "flashinfer_jit.stamp"
 
     def _stamp_digest(self) -> str:
-        return hashlib.sha256(self.ninja_path.read_bytes()).hexdigest()
+        """Digest of the build inputs the stamp vouches for.
+
+        Covers the exact ``build.ninja`` contents (toolkit path, flags,
+        absolute source list) plus the contents of every listed source file,
+        so editing a source in place invalidates the stamp even though the
+        ninja file is unchanged. Transitively included headers are NOT
+        hashed — that residual risk is why the stamp is opt-in and aimed at
+        restored caches of released packages, not editable checkouts.
+        """
+        h = hashlib.sha256(self.ninja_path.read_bytes())
+        for src in sorted(Path(s) for s in self.sources):
+            h.update(str(src).encode())
+            try:
+                h.update(src.read_bytes())
+            except OSError:
+                h.update(b"<unreadable>")
+        return h.hexdigest()
 
     def _stamp_is_current(self) -> bool:
         """Whether a trusted stamp proves the cached library is up to date.
