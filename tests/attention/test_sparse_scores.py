@@ -218,6 +218,29 @@ def test_scores_agree_between_a_block_per_tile_and_a_block_per_eight():
 
 
 @requires_cuda_sm80
+def test_scores_reject_a_page_that_holds_nothing():
+    """A cache with no pages is a shape the kernel handles; a page with no
+    entries is not. The column is divided by the page size to reach its page,
+    so zero there is a divisor of zero, and passing num_columns explicitly gets
+    past the width the page table would otherwise imply."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    empty_pages = k_cache[:, :0]
+    columns = table.shape[1] * k_cache.shape[1]
+    with pytest.raises(ValueError, match="a page holds at least one"):
+        flashinfer.sparse_paged_scores(
+            q,
+            empty_pages,
+            table,
+            t2r,
+            pos,
+            lens,
+            1,
+            q.shape[2] ** 0.5,
+            num_columns=columns,
+        )
+
+
+@requires_cuda_sm80
 def test_scores_read_a_cache_with_no_pages_at_all():
     """A column with no page carries the first page's address so the staging
     loop needs no predicate. With no page there is no first one to carry, so the
