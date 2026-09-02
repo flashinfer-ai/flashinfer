@@ -4246,6 +4246,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
+      // NVFP4 also stages one UE4M3 scale factor per NVFP4_SF_VEC_SIZE elements for K and for V
+      // (KVScaleFactorSmem), which grows with NUM_MMA_KV like the K/V tiles do.
+      (is_fp4_type_v<DTypeKV>
+           ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV / NVFP4_SF_VEC_SIZE)
+           : 0u) +
       (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
   constexpr uint32_t kVOSplitFixedSmem =
       kVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
@@ -4445,6 +4450,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
+      // NVFP4 also stages one UE4M3 scale factor per NVFP4_SF_VEC_SIZE elements for K and for V
+      // (KVScaleFactorSmem), which grows with NUM_MMA_KV like the K/V tiles do.
+      (is_fp4_type_v<DTypeKV>
+           ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV / NVFP4_SF_VEC_SIZE)
+           : 0u) +
       (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
   constexpr uint32_t kVOSplitFixedSmem =
       kVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;

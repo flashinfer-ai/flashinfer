@@ -1448,7 +1448,7 @@ def test_attention_ts_context_plan_rejects_causal_q_longer_than_kv(paged: bool):
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key():
+def test_attention_ts_context_paged_uniform_geometry_has_distinct_compile_spec():
     """Only max-filled Q and uniform snapshotted K select uniform offsets."""
 
     uniform_case = _make_paged_context_case(
@@ -1501,10 +1501,12 @@ def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key()
     assert redistributable_metadata.seq_lens == uniform_metadata.seq_lens
     assert redistributable_geometry.uniform_packed_lengths is False
 
-    uniform_key = context_module._paged_semantic_key(uniform_geometry)
-    redistributable_key = context_module._paged_semantic_key(redistributable_geometry)
-    assert uniform_key != redistributable_key
-    assert uniform_key == context_module._paged_semantic_key(
+    uniform_spec = context_module._paged_context_compile_spec(uniform_geometry)
+    redistributable_spec = context_module._paged_context_compile_spec(
+        redistributable_geometry
+    )
+    assert uniform_spec != redistributable_spec
+    assert uniform_spec == context_module._paged_context_compile_spec(
         replace(redistributable_geometry, uniform_packed_lengths=True)
     )
 
@@ -1989,6 +1991,77 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
+    packed: bool,
+):
+    """One resolved context topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_context_case(
+            q_lengths=(33,) * batch_size,
+            k_lengths=(65,) * batch_size,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.float16,
+            packed=packed,
+            mask_type="dense",
+            output_dtype=torch.float16,
+            device="cuda",
+            seed=2026071420 + batch_size,
+        )
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, case)
+        actual = wrapper.run(case.q, case.k, case.v)
+        _assert_context_correct(actual, case)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes():
+    """One paged-context topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_paged_context_case(
+            q_lengths=(33,) * batch_size,
+            k_lengths=(65,) * batch_size,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            qkv_dtype=torch.float16,
+            mask_type="dense",
+            output_dtype=torch.float16,
+            seed=2026071430 + batch_size,
+        )
+        wrapper = BatchPrefillPagedTSWrapper()
+        wrapper.plan(
+            case.reference.q,
+            case.k_cache,
+            case.v_cache,
+            case.qo_indptr,
+            case.paged_kv_indptr,
+            case.paged_kv_indices,
+            case.paged_kv_last_page_len,
+            page_size=case.page_size,
+            mask_type=case.reference.mask_type,
+            sm_scale=case.reference.sm_scale,
+            output_scale=case.reference.output_scale,
+            out_dtype=case.reference.output_dtype,
+        )
+        actual = wrapper.run(case.reference.q, case.k_cache, case.v_cache)
+        _assert_context_correct(actual, case.reference)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
     # With zero Q/K, every real key has score zero. A missing right-edge mask
     # therefore dilutes the output by 65/128 because TMA zero-fills the rest
@@ -2324,11 +2397,9 @@ def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
-    # Dense query pairing carries S/P state between work tiles and publishes
-    # correction stats through SMEM.  BF16 is the largest input footprint and
-    # therefore guards the B200 dynamic-SMEM launch limit for the static
-    # persistent single-instance schedule.
+def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
+    # BF16 D256 is the largest fixed-input footprint and therefore guards the
+    # B200 dynamic-SMEM launch limit independently of automatic scheduling.
     case = _make_context_case(
         q_lengths=(129,),
         k_lengths=(257,),
@@ -2344,7 +2415,6 @@ def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["scheduler"] == "static_persistent"
 
     for _ in range(2):
         output = wrapper.run(case.q, case.k, case.v)

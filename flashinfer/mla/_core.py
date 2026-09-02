@@ -778,8 +778,14 @@ def _normalize_dsv4_topk_lens(
     return topk_lens
 
 
-def _validate_dsv4_sync_checks() -> bool:
-    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+def _validate_dsv4_sync_checks(device: torch.device) -> bool:
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
+        return False
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                return False
+    return True
 
 
 def _check_dsv4_sparse_mla_inputs(
@@ -964,7 +970,7 @@ def _check_dsv4_sparse_mla_inputs(
         query.device,
         cum_seq_lens_q,
     )
-    if _validate_dsv4_sync_checks() and normalized_sparse_lens.numel() > 0:
+    if _validate_dsv4_sync_checks(query.device) and normalized_sparse_lens.numel() > 0:
         sparse_topk_capacity = sparse_indices.size(-1)
         invalid_sparse_lens = torch.logical_or(
             normalized_sparse_lens < 128,
@@ -1477,6 +1483,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_is_causal: bool = True,
     hca_use_persistent: bool = False,
     hca_sparse_indices_format: Optional[Literal["compressed-page-aligned"]] = None,
+    remapped_sparse_indices_buffer: Optional[torch.Tensor] = None,
+    sparse_indices_are_storage_offsets: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1607,8 +1615,28 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         with
         :func:`convert_compressed_page_aligned_sparse_indices_to_hca_metadata`
         and reuse the returned metadata through the explicit HCA arguments.
+    remapped_sparse_indices_buffer : Optional[torch.Tensor]
+        Optional INT32 output buffer matching ``sparse_indices``. TRTLLM-GEN
+        uses it when either KV pool has a strided page layout. Passing a stable
+        buffer avoids an allocation in serving and CUDA graph paths. Concurrent
+        calls must use distinct buffers. The buffer must not share storage
+        with ``sparse_indices`` when remapping is required.
+    sparse_indices_are_storage_offsets : Optional[bool]
+        Encoding of ``sparse_indices`` for strided TRTLLM-GEN KV pools. Set to
+        ``False`` for logical flattened token indices or ``True`` for indices
+        already adjusted to storage-row offsets. Strided pools require an
+        explicit value to prevent accidental double remapping.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+
+    if backend != "trtllm-gen" and (
+        remapped_sparse_indices_buffer is not None
+        or sparse_indices_are_storage_offsets is not None
+    ):
+        raise ValueError(
+            f"backend={backend!r} does not accept remapped_sparse_indices_buffer "
+            "or sparse_indices_are_storage_offsets"
+        )
 
     if backend == "cute-dsl":
         if not hca_is_causal:
@@ -1855,7 +1883,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
     else:
         q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-    if _validate_dsv4_sync_checks() and torch.any(seq_lens < q_lens).item():
+    if _validate_dsv4_sync_checks(query.device) and torch.any(seq_lens < q_lens).item():
         raise ValueError(
             "seq_lens must be greater than or equal to the per-request query "
             "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
@@ -1864,6 +1892,39 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     primary_kv_cache = compressed_kv_cache
     sparse_indices = sparse_indices.reshape(query_flat.size(0), -1).contiguous()
     sparse_topk_lens = sparse_topk_lens.contiguous()
+    has_strided_pages = any(
+        kv_cache.stride(-2) != kv_cache.size(-1)
+        or kv_cache.stride(0) != kv_cache.size(-2) * kv_cache.stride(-2)
+        for kv_cache in (primary_kv_cache, swa_kv_cache)
+    )
+    if has_strided_pages and sparse_indices_are_storage_offsets is None:
+        raise ValueError(
+            "sparse_indices_are_storage_offsets must be set for strided KV pools"
+        )
+    needs_index_remap = has_strided_pages and not sparse_indices_are_storage_offsets
+    if remapped_sparse_indices_buffer is not None:
+        check_shape_dtype_device(
+            remapped_sparse_indices_buffer,
+            tuple(sparse_indices.shape),
+            torch.int32,
+            query.device,
+            "remapped_sparse_indices_buffer",
+        )
+        if not remapped_sparse_indices_buffer.is_contiguous():
+            raise ValueError("remapped_sparse_indices_buffer must be contiguous")
+        if (
+            needs_index_remap
+            and remapped_sparse_indices_buffer.untyped_storage().data_ptr()
+            == sparse_indices.untyped_storage().data_ptr()
+        ):
+            raise ValueError(
+                "remapped_sparse_indices_buffer must not share storage with "
+                "sparse_indices"
+            )
+    elif needs_index_remap:
+        remapped_sparse_indices_buffer = torch.empty_like(sparse_indices)
+    else:
+        remapped_sparse_indices_buffer = sparse_indices
 
     op = get_trtllm_gen_fmha_module()
     run_func = getattr(op, "trtllm_paged_attention_decode_sparse_mla_dsv4", None)
@@ -1887,6 +1948,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         workspace_buffer,
         multi_ctas_kv_counter_buffer,
         sparse_indices,
+        remapped_sparse_indices_buffer,
+        sparse_indices_are_storage_offsets is True,
         seq_lens.contiguous(),
         sparse_topk_lens,
         bmm1_scale,
