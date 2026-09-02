@@ -27,7 +27,7 @@ non-negative.  FP8 multiplies the result by the per-token KV scale
 (``· scale[pos]``); FP4 folds its per-(token, K-group) UE8M0 scales into
 dequantizing Q and K, so it has no trailing scale factor.
 
-Both kernels are Blackwell (SM100/SM103) only.
+Both kernels run on datacentre Blackwell (SM100/SM103) and Rubin (SM107).
 """
 
 import torch
@@ -286,7 +286,8 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
     name_prefix="fp8_paged_mqa_logits",
     description=(
         "FP8 paged MQA logits: weighted dot-product attention scores against a paged "
-        "KV cache, with per-token FP32 KV scales. Blackwell (SM100/SM103) only."
+        "KV cache, with per-token FP32 KV scales. Datacentre Blackwell "
+        "(SM100/SM103) and Rubin (SM107)."
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
@@ -342,7 +343,7 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
         "block_row_bytes == head_dim + 4",
         "num_kv_heads == 1",
     ],
-    tags=["status:verified", "arch:sm100"],
+    tags=["status:verified", "arch:sm100", "arch:sm103", "arch:sm107"],
     reference=_fp8_paged_mqa_logits_reference,
     check=_paged_mqa_logits_masked_check,
     init=_fp8_paged_mqa_logits_init,
@@ -591,7 +592,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
     description=(
         "FP4 (MXFP4) paged MQA logits: weighted dot-product attention scores against a "
         "paged KV cache, with block-scaled FP4 Q/K and per-(token, K-group) UE8M0 scale "
-        "factors. Blackwell (SM100/SM103) only."
+        "factors. Datacentre Blackwell (SM100/SM103) and Rubin (SM107)."
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
@@ -652,7 +653,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
         "block_row_bytes == packed_head_dim + 4",
         "num_kv_heads == 1",
     ],
-    tags=["status:verified", "arch:sm100"],
+    tags=["status:verified", "arch:sm100", "arch:sm103", "arch:sm107"],
     reference=_fp4_paged_mqa_logits_reference,
     check=_paged_mqa_logits_masked_check,
     init=_fp4_paged_mqa_logits_init,
