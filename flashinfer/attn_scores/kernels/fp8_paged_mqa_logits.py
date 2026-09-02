@@ -17,7 +17,7 @@
 # Original copyright: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100).
+CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100/SM103) and Rubin (SM107).
 
 Architecture:
   - 384 threads: 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
@@ -239,7 +239,7 @@ def _is_rubin_arch(arch: str) -> bool:
 
 
 class FP8MQALogitsKernel:
-    """FP8 paged MQA logits kernel for Blackwell (SM100).
+    """FP8 paged MQA logits kernel for Blackwell (SM100/SM103) and Rubin (SM107).
 
     Each CTA processes a range of (q_idx, kv_split) pairs.
     A split = 2 consecutive KV blocks within a sequence (one per warp group).

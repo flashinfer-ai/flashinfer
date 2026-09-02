@@ -3,7 +3,8 @@
 flashinfer.attn_scores
 ======================
 
-Paged MQA logits ("attention scores") kernels for Blackwell (SM100/SM103).
+Paged MQA logits ("attention scores") kernels for datacentre Blackwell
+(SM100/SM103) and Rubin (SM107).
 
 These compute, for every request and KV position, the per-head weighted sum of
 rectified query-key scores that a sparse-attention indexer uses to choose which

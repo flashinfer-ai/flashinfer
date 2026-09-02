@@ -987,6 +987,21 @@ def test_fp4_next_n_limits():
             with pytest.raises(ValueError, match=r"next_n in 1\.\.4"):
                 fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
 
+    # Malformed next_n_atom values must fail with a domain error naming the
+    # legal forms, not be int()-coerced: True is an int subclass and would
+    # silently mean atom=1 (a full split with num_atoms x KV traffic), 2.5
+    # would silently truncate to atom=2, and a junk string would surface a
+    # bare int() parse error instead of the accepted values.
+    next_n = 2
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    args = (q, sf_q, kv, w, context_lens, block_table, ctx)
+    for bad in (True, 2.5, "bogus"):
+        with pytest.raises(ValueError, match=r"next_n_atom must be None"):
+            fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16, next_n_atom=bad)
+
 
 def test_fp4_next_n4_split_rejects_caller_schedule():
     """A caller-supplied schedule_meta is refused when next_n=4 must split.
