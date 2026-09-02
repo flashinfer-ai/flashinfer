@@ -3944,6 +3944,7 @@ def _run_cake_kda_fp32_source_route(
 
 def _run_cake_kda_fp32_serving_export(
     *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
     target: "CakeKDATarget",
     variant: str,
     max_sequence_length: int,
@@ -3996,7 +3997,28 @@ def _run_cake_kda_fp32_serving_export(
     )
     if policy is None:
         return False
+    from .jit.cake_kda import get_cake_kda_module_spec
+
     module = _get_cake_kda_export_module(target, "bounded_fp32_serving", policy)
+    module_spec = get_cake_kda_module_spec(
+        target,
+        "bounded_fp32_serving",
+        policy,
+    )
+    tma_workspace = (
+        _cake_kda_workspace_buffer(
+            workspace=workspace,
+            name=(
+                "tma_descriptor_"
+                f"{module_spec.target}_{module_spec.family}_{module_spec.policy}"
+            ),
+            device=q.device,
+            shape=(module_spec.tma_workspace_bytes,),
+            dtype=torch.uint8,
+        )
+        if module_spec.tma_workspace_bytes
+        else None
+    )
     total_tasks = num_sequences * num_heads
     initial_f32 = initial_state if use_initial_state else empty_f32
     final_f32 = final_state if store_final_state else empty_f32
@@ -4044,6 +4066,7 @@ def _run_cake_kda_fp32_serving_export(
             scale=scale,
             lower_bound=lower_bound,
             grid_x=total_tasks,
+            tma_descriptor_workspace=tma_workspace,
         )
         return True
 
@@ -4080,7 +4103,14 @@ def _run_cake_kda_fp32_serving_export(
         lower_bound,
     )
     if variant == "m64":
-        module.run(*common, *state_tail, 2 * total_tasks, 1, 1)
+        module.run(
+            *common,
+            *state_tail,
+            *((tma_workspace,) if tma_workspace is not None else ()),
+            2 * total_tasks,
+            1,
+            1,
+        )
         return True
     if variant == "small_bh_m128":
         assert packet_workspace is not None
@@ -5536,6 +5566,7 @@ def _run_flash_kda_prefill(
                     else _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
                 )
                 launched = _run_cake_kda_fp32_serving_export(
+                    workspace=workspace,
                     target=shared_target,
                     variant=variant,
                     max_sequence_length=max_sequence_length,

@@ -11,6 +11,8 @@ static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+template <int N>
+struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -672,7 +674,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __grid_constant__ CUtensorMap q_tma, __nv_bfloat16* __restrict__ k, const __grid_constant__ CUtensorMap k_tma, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap v_tma, __nv_bfloat16* __restrict__ g, const __grid_constant__ CUtensorMap g_tma, __nv_bfloat16* __restrict__ beta, const __grid_constant__ CUtensorMap beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, const __grid_constant__ CUtensorMap state_checkpoints_tma, float* __restrict__ final_state_f32)
+kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -710,6 +712,16 @@ kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __gri
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    if (warp == 8 && lane == 0) {
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(k_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(v_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(g_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(beta_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(out_tma)) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(state_checkpoints_tma)) : "memory");
+    }
+
 
     // Kernel setup ops
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -1442,7 +1454,7 @@ kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __gri
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (epilogue_local_warp == 0) {
                         if (elect_sync()) {
-                            tma_store_4d((&out_tma), 0, (int)(bos_1 + (long long)(chunk_idx_1 * 16)), head_idx_1, 0, smem_out_addr + output_stage * 4096);
+                            tma_store_4d(out_tma, 0, (int)(bos_1 + (long long)(chunk_idx_1 * 16)), head_idx_1, 0, smem_out_addr + output_stage * 4096);
                         }
                         asm volatile("cp.async.bulk.commit_group;");
                     }
@@ -2363,12 +2375,12 @@ kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __gri
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
                             mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 4352);
-                            tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * 21504, (&g_tma), 0, head_idx_3, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), gate_raw_full_addr + (prep_stage) * 8);
+                            tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * 21504, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), gate_raw_full_addr + (prep_stage) * 8);
                             {
-                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 21504, (&beta_tma), ((0) ? 0 : head_idx_3 / 8 * 8), (int)(((0) ? (bos_4 + (long long)(chunk_idx_3 * 16)) / 2 : bos_4 + (long long)(chunk_idx_3 * 16))), gate_raw_full_addr + (prep_stage) * 8);
+                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 21504, beta_tma, ((0) ? 0 : head_idx_3 / 8 * 8), (int)(((0) ? (bos_4 + (long long)(chunk_idx_3 * 16)) / 2 : bos_4 + (long long)(chunk_idx_3 * 16))), gate_raw_full_addr + (prep_stage) * 8);
                             }
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 8192);
-                            tma_4d_gmem2smem(smem_kd_addr + prep_stage * 21504, (&k_tma), 0, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
+                            tma_4d_gmem2smem(smem_kd_addr + prep_stage * 21504, k_tma, 0, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                         }
                     }
                     mbarrier_wait(gate_raw_full_addr + (prep_stage) * 8, _phase_gate_raw_full);
@@ -2418,7 +2430,7 @@ kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __gri
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
-                            tma_4d_gmem2smem(smem_q_raw_prefetch_addr + prep_stage * 21504, (&q_tma), 0, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
+                            tma_4d_gmem2smem(smem_q_raw_prefetch_addr + prep_stage * 21504, q_tma, 0, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                         }
                     }
                 }
@@ -2903,8 +2915,8 @@ kernel_cake_kda_serving_m128_n16_fp32(__nv_bfloat16* __restrict__ q, const __gri
                             mbarrier_arrive_expect_tx(v_full_addr + (prep_stage) * 8, 4096);
                             {
                                 int v_token = (int)(bos_4 + (long long)(chunk_idx_3 * 16));
-                                tma_4d_gmem2smem(smem_v_addr + prep_stage * 21504, (&v_tma), 0, head_idx_3, v_token, 0, v_full_addr + (prep_stage) * 8);
-                                tma_4d_gmem2smem(smem_v_addr + prep_stage * 21504 + 2048, (&v_tma), 0, head_idx_3, v_token, 1, v_full_addr + (prep_stage) * 8);
+                                tma_4d_gmem2smem(smem_v_addr + prep_stage * 21504, v_tma, 0, head_idx_3, v_token, 0, v_full_addr + (prep_stage) * 8);
+                                tma_4d_gmem2smem(smem_v_addr + prep_stage * 21504 + 2048, v_tma, 0, head_idx_3, v_token, 1, v_full_addr + (prep_stage) * 8);
                             }
                         }
                     }

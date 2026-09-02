@@ -15,8 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-struct CakeTensorMap;
-extern "C" __global__ void kernel_cake_kda_prefill_m128_h12_short_compact_bf16(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32);
+extern "C" __global__ void kernel_cake_kda_prefill_m128_h12_short_compact_bf16(__nv_bfloat16* __restrict__ q, const __grid_constant__ CUtensorMap q_tma, __nv_bfloat16* __restrict__ k, const __grid_constant__ CUtensorMap k_tma, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap v_tma, __nv_bfloat16* __restrict__ g, const __grid_constant__ CUtensorMap g_tma, __nv_bfloat16* __restrict__ beta, const __grid_constant__ CUtensorMap beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, const __grid_constant__ CUtensorMap state_checkpoints_tma, float* __restrict__ final_state_f32);
 
 
 namespace cake_host_shim {
@@ -111,60 +110,6 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
           << ", expected " << expected;
     }
   }
-}
-
-// Upload one encoded tensor map into a caller-owned immutable slot. The
-// caller supplies the CUDA storage; this helper never allocates device memory.
-// Stable descriptor bytes are uploaded once before capture and reused by warm
-// launches. A changed binding must be prepared outside CUDA Graph capture.
-static inline void* CallerTmaWorkspaceSlot(
-    const CUtensorMap& tm,
-    const tvm::ffi::TensorView& workspace,
-    size_t slot,
-    cudaStream_t stream) {
-  static std::mutex mu;
-  static auto* descriptor_by_slot =
-      new std::unordered_map<std::string, std::string>();
-
-  CUcontext current_context = nullptr;
-  CUresult result = cuCtxGetCurrent(&current_context);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS && current_context != nullptr, RuntimeError)
-      << "caller-owned pointer TMA ABI requires an active CUDA context: "
-      << "CUresult=" << static_cast<int>(result);
-
-  const uintptr_t base = reinterpret_cast<uintptr_t>(workspace.data_ptr());
-  const uintptr_t address = base + slot * sizeof(CUtensorMap);
-  std::string key =
-      std::to_string(reinterpret_cast<uintptr_t>(current_context));
-  key.push_back(':');
-  key.append(std::to_string(base));
-  key.push_back(':');
-  key.append(std::to_string(slot));
-  const std::string descriptor(
-      reinterpret_cast<const char*>(&tm), sizeof(CUtensorMap));
-
-  std::lock_guard<std::mutex> lock(mu);
-  auto it = descriptor_by_slot->find(key);
-  if (it != descriptor_by_slot->end() && it->second == descriptor) {
-    return reinterpret_cast<void*>(address);
-  }
-
-  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-  cudaError_t capture_error = cudaStreamIsCapturing(stream, &capture_status);
-  TVM_FFI_CHECK(capture_error == cudaSuccess, RuntimeError)
-      << "cudaStreamIsCapturing for caller-owned TMA workspace failed: "
-      << cudaGetErrorString(capture_error);
-  TVM_FFI_CHECK(capture_status == cudaStreamCaptureStatusNone, RuntimeError)
-      << "caller-owned pointer TMA workspace is not prepared for this tensor "
-         "binding; warm the exact tensors before CUDA Graph capture";
-
-  result = cuMemcpyHtoD(
-      static_cast<CUdeviceptr>(address), &tm, sizeof(CUtensorMap));
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuMemcpyHtoD into caller-owned TMA workspace failed: CUresult="
-      << static_cast<int>(result);
-  (*descriptor_by_slot)[key] = descriptor;
-  return reinterpret_cast<void*>(address);
 }
 
 // 4D TMA descriptor for buffer 'q_tma' — compiled from the
@@ -412,7 +357,7 @@ inline CUtensorMap EncodeTma_state_checkpoints_tma(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView arg_k_tma, TensorView arg_v, TensorView arg_v_tma, TensorView arg_g, TensorView arg_g_tma, TensorView arg_beta, TensorView arg_beta_tma, TensorView arg_A_log, TensorView arg_dt_bias, TensorView arg_cu_seqlens, TensorView arg_seq_order, TensorView arg_initial_state, TensorView arg_out, TensorView arg_out_tma, TensorView arg_final_state, int64_t arg_num_heads, int64_t arg_use_initial_state, int64_t arg_store_final_state, double arg_scale, double arg_lower_bound, int64_t arg_state_indices_addr, int64_t arg_state_checkpoints_addr, int64_t arg_checkpoint_cu_starts_addr, int64_t arg_beta_token_stride, int64_t arg_state_slot_stride, int64_t arg_use_state_indices, int64_t arg_checkpoint_every_n_tokens, TensorView arg_cu_chunk_offsets, TensorView arg_chunk_state, TensorView arg_state_checkpoint_needed, TensorView arg_tape_qd, TensorView arg_tape_kd, TensorView arg_tape_kr, TensorView arg_tape_j, TensorView arg_tape_restore_factor, TensorView arg_tape_e, TensorView arg_tape_x, TensorView arg_tape_r, TensorView arg_norm_inv_out, TensorView arg_decay_out, TensorView arg_beta_active_out, TensorView arg_initial_state_f32, TensorView arg_zero_workspace, int64_t arg_zero_words, int64_t arg_num_sequences, TensorView arg_state_checkpoints_tma, TensorView arg_final_state_f32, TensorView arg_tma_descriptor_workspace, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView arg_k_tma, TensorView arg_v, TensorView arg_v_tma, TensorView arg_g, TensorView arg_g_tma, TensorView arg_beta, TensorView arg_beta_tma, TensorView arg_A_log, TensorView arg_dt_bias, TensorView arg_cu_seqlens, TensorView arg_seq_order, TensorView arg_initial_state, TensorView arg_out, TensorView arg_out_tma, TensorView arg_final_state, int64_t arg_num_heads, int64_t arg_use_initial_state, int64_t arg_store_final_state, double arg_scale, double arg_lower_bound, int64_t arg_state_indices_addr, int64_t arg_state_checkpoints_addr, int64_t arg_checkpoint_cu_starts_addr, int64_t arg_beta_token_stride, int64_t arg_state_slot_stride, int64_t arg_use_state_indices, int64_t arg_checkpoint_every_n_tokens, TensorView arg_cu_chunk_offsets, TensorView arg_chunk_state, TensorView arg_state_checkpoint_needed, TensorView arg_tape_qd, TensorView arg_tape_kd, TensorView arg_tape_kr, TensorView arg_tape_j, TensorView arg_tape_restore_factor, TensorView arg_tape_e, TensorView arg_tape_x, TensorView arg_tape_r, TensorView arg_norm_inv_out, TensorView arg_decay_out, TensorView arg_beta_active_out, TensorView arg_initial_state_f32, TensorView arg_zero_workspace, int64_t arg_zero_words, int64_t arg_num_sequences, TensorView arg_state_checkpoints_tma, TensorView arg_final_state_f32, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_q, "q");
   CheckDtype(arg_q, "q", 4, 16, 1);
   CheckContiguous(arg_q, "q");
@@ -582,16 +527,6 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
   CheckSameCudaDevice(arg_state_checkpoints_tma, arg_q, "state_checkpoints_tma", "q");
   CheckSameCudaDevice(arg_final_state_f32, arg_q, "final_state_f32", "q");
   CheckCurrentCudaDevice(arg_q, "q");
-  CheckCudaTensor(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
-  CheckSameCudaDevice(arg_tma_descriptor_workspace, arg_q, "tma_descriptor_workspace", "q");
-  CheckContiguous(arg_tma_descriptor_workspace, "tma_descriptor_workspace");
-  CheckDtype(arg_tma_descriptor_workspace, "tma_descriptor_workspace", 1, 8, 1);
-  TVM_FFI_CHECK(arg_tma_descriptor_workspace.numel() >= 896, ValueError)
-      << "tma_descriptor_workspace requires at least 896 bytes";
-  TVM_FFI_CHECK(
-      reinterpret_cast<uintptr_t>(arg_tma_descriptor_workspace.data_ptr()) % 128 == 0,
-      ValueError)
-      << "tma_descriptor_workspace must be 128-byte aligned";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -599,28 +534,22 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
   DLDevice dev = arg_q.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   __nv_bfloat16* p_q = static_cast<__nv_bfloat16*>(arg_q.data_ptr());
-  CUtensorMap h_q_tma = EncodeTma_q_tma(arg_q_tma);
-  CakeTensorMap const* p_q_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_q_tma, arg_tma_descriptor_workspace, 0u, stream));
+  CUtensorMap p_q_tma = EncodeTma_q_tma(arg_q_tma);
   __nv_bfloat16* p_k = static_cast<__nv_bfloat16*>(arg_k.data_ptr());
-  CUtensorMap h_k_tma = EncodeTma_k_tma(arg_k_tma);
-  CakeTensorMap const* p_k_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_k_tma, arg_tma_descriptor_workspace, 1u, stream));
+  CUtensorMap p_k_tma = EncodeTma_k_tma(arg_k_tma);
   __nv_bfloat16* p_v = static_cast<__nv_bfloat16*>(arg_v.data_ptr());
-  CUtensorMap h_v_tma = EncodeTma_v_tma(arg_v_tma);
-  CakeTensorMap const* p_v_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_v_tma, arg_tma_descriptor_workspace, 2u, stream));
+  CUtensorMap p_v_tma = EncodeTma_v_tma(arg_v_tma);
   __nv_bfloat16* p_g = static_cast<__nv_bfloat16*>(arg_g.data_ptr());
-  CUtensorMap h_g_tma = EncodeTma_g_tma(arg_g_tma);
-  CakeTensorMap const* p_g_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_g_tma, arg_tma_descriptor_workspace, 3u, stream));
+  CUtensorMap p_g_tma = EncodeTma_g_tma(arg_g_tma);
   __nv_bfloat16* p_beta = static_cast<__nv_bfloat16*>(arg_beta.data_ptr());
-  CUtensorMap h_beta_tma = EncodeTma_beta_tma(arg_beta_tma);
-  CakeTensorMap const* p_beta_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_beta_tma, arg_tma_descriptor_workspace, 4u, stream));
+  CUtensorMap p_beta_tma = EncodeTma_beta_tma(arg_beta_tma);
   float* p_A_log = static_cast<float*>(arg_A_log.data_ptr());
   float* p_dt_bias = static_cast<float*>(arg_dt_bias.data_ptr());
   long long* p_cu_seqlens = static_cast<long long*>(arg_cu_seqlens.data_ptr());
   int* p_seq_order = static_cast<int*>(arg_seq_order.data_ptr());
   __nv_bfloat16* p_initial_state = static_cast<__nv_bfloat16*>(arg_initial_state.data_ptr());
   __nv_bfloat16* p_out = static_cast<__nv_bfloat16*>(arg_out.data_ptr());
-  CUtensorMap h_out_tma = EncodeTma_out_tma(arg_out_tma);
-  CakeTensorMap const* p_out_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_out_tma, arg_tma_descriptor_workspace, 5u, stream));
+  CUtensorMap p_out_tma = EncodeTma_out_tma(arg_out_tma);
   __nv_bfloat16* p_final_state = static_cast<__nv_bfloat16*>(arg_final_state.data_ptr());
   int32_t v_num_heads = (int32_t)arg_num_heads;
   int32_t v_use_initial_state = (int32_t)arg_use_initial_state;
@@ -652,8 +581,7 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
   unsigned int* p_zero_workspace = static_cast<unsigned int*>(arg_zero_workspace.data_ptr());
   int32_t v_zero_words = (int32_t)arg_zero_words;
   int32_t v_num_sequences = (int32_t)arg_num_sequences;
-  CUtensorMap h_state_checkpoints_tma = EncodeTma_state_checkpoints_tma(arg_state_checkpoints_tma);
-  CakeTensorMap const* p_state_checkpoints_tma = static_cast<CakeTensorMap const*>(CallerTmaWorkspaceSlot(h_state_checkpoints_tma, arg_tma_descriptor_workspace, 6u, stream));
+  CUtensorMap p_state_checkpoints_tma = EncodeTma_state_checkpoints_tma(arg_state_checkpoints_tma);
   float* p_final_state_f32 = static_cast<float*>(arg_final_state_f32.data_ptr());
   void* kargs[] = {&p_q, &p_q_tma, &p_k, &p_k_tma, &p_v, &p_v_tma, &p_g, &p_g_tma, &p_beta, &p_beta_tma, &p_A_log, &p_dt_bias, &p_cu_seqlens, &p_seq_order, &p_initial_state, &p_out, &p_out_tma, &p_final_state, &v_num_heads, &v_use_initial_state, &v_store_final_state, &v_scale, &v_lower_bound, &v_state_indices_addr, &v_state_checkpoints_addr, &v_checkpoint_cu_starts_addr, &v_beta_token_stride, &v_state_slot_stride, &v_use_state_indices, &v_checkpoint_every_n_tokens, &p_cu_chunk_offsets, &p_chunk_state, &p_state_checkpoint_needed, &p_tape_qd, &p_tape_kd, &p_tape_kr, &p_tape_j, &p_tape_restore_factor, &p_tape_e, &p_tape_x, &p_tape_r, &p_norm_inv_out, &p_decay_out, &p_beta_active_out, &p_initial_state_f32, &p_zero_workspace, &v_zero_words, &v_num_sequences, &p_state_checkpoints_tma, &p_final_state_f32};
 
