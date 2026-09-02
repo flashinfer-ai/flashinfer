@@ -2749,6 +2749,7 @@ def _cake_kda_beta_source(
     *,
     chunk_tokens: int,
     workspace_attribute: str = "_cake_export_beta_padding",
+    refresh: bool = True,
 ) -> torch.Tensor:
     """Return one contiguous beta carrier for a standard exported binding."""
 
@@ -2779,7 +2780,8 @@ def _cake_kda_beta_source(
             "shape on this stream before capture"
         ),
     ).view(padded_tokens, padded_heads)
-    source[:total_tokens, :num_heads].copy_(beta_flat)
+    if refresh:
+        source[:total_tokens, :num_heads].copy_(beta_flat)
     return source
 
 
@@ -4306,10 +4308,12 @@ def _run_cake_kda_bf16_direct_export(
     empty_i32 = _dummy_i32(q.device)
     empty_i64 = _dummy_i64(q.device)
     empty_u32 = _dummy_u32(q.device)
+    chunk_tokens = 16 if route.policy == "direct_m128_n16" else 32
     beta_tma = _cake_kda_beta_source(
         beta,
         workspace,
-        chunk_tokens=(16 if route.policy == "direct_m128_n16" else 32),
+        chunk_tokens=chunk_tokens,
+        refresh=any(length >= chunk_tokens for length in route.sequence_lengths),
     )
     _run_cake_kda_direct_export(
         module=module,
