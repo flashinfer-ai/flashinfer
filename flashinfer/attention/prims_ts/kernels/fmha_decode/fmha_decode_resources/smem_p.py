@@ -64,6 +64,7 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
+    _swaps_routed_coordinate,
     _wait_for_mbarrier_phase,
 )
 from .helpers_output import (
@@ -322,32 +323,6 @@ class SmemPResource(DecodeGenResourceBase):
             if cutlass.const_expr(tail_delta != 0):
                 local_sum += Float32(tail_delta) * tail_p
         return local_sum
-
-    @cute.jit
-    def _proxy_swaps_logical_k(
-        self,
-        lane_k_offset: Int32,
-        origin0: Int32,
-        origin1: Int32,
-        origin2: Int32,
-        origin3: Int32,
-        *,
-        token_group_idx: Constexpr[int],
-    ) -> tuple[Int32, Int32]:
-        """Return a SWAP probability register's atom and summary coordinates."""
-
-        atom_size = min(self.cfg.kv_block_size, 32)
-        groups_per_atom = atom_size // 8
-        origin_idx = token_group_idx // groups_per_atom
-        atom_origin = origin0
-        if cutlass.const_expr(origin_idx == 1):
-            atom_origin = origin1
-        elif cutlass.const_expr(origin_idx == 2):
-            atom_origin = origin2
-        elif cutlass.const_expr(origin_idx == 3):
-            atom_origin = origin3
-        token_offset = (token_group_idx % groups_per_atom) * 8
-        return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
     @cute.jit
     def _compute_p_fragment_impl(
@@ -1012,7 +987,8 @@ class SmemPResource(DecodeGenResourceBase):
                                 cfg.static_seq_len_kv,
                                 cfg.kv_block_size,
                             )
-                            atom_origin, logical_summary = self._proxy_swaps_logical_k(
+                            atom_origin, logical_summary = _swaps_routed_coordinate(
+                                cfg,
                                 lane_idx >> Int32(2),
                                 route_origin0,
                                 route_origin1,
@@ -1266,7 +1242,8 @@ class SmemPResource(DecodeGenResourceBase):
                 for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
                     proxy_tail_p = Float32(0.0)
                     for token_group_idx in cutlass.range_constexpr(4):
-                        atom_origin, logical_summary = self._proxy_swaps_logical_k(
+                        atom_origin, logical_summary = _swaps_routed_coordinate(
+                            cfg,
                             lane_idx >> Int32(2),
                             route_origin0,
                             route_origin1,

@@ -548,6 +548,22 @@ _PROXY_ROUTE_CASES = (
         expected_q_tile=64,
         expected_kv_tile=256,
     ),
+    _Case(
+        "proxy_bk64_keeps_kv128",
+        1,
+        1,
+        128,
+        269,
+        128,
+        64,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=128,
+        expected_kv_tile=128,
+    ),
 )
 
 
@@ -2543,16 +2559,20 @@ def _validate_cpu_routing(
     )
 
 
-def test_runtime_metadata_allows_unreferenced_spare_indices() -> None:
-    """Both planned frontends accept their compact host structural ABI."""
+def test_reusable_runtime_trusts_routing_values() -> None:
+    """Reusable validation checks tensor ABI without inspecting route values."""
 
     _validate_cpu_routing(
         block_indptr=torch.tensor([[[0, 1]]], dtype=torch.int32),
-        block_indices=torch.arange(17, dtype=torch.int32),
+        block_indices=torch.tensor([17], dtype=torch.int32),
     )
     _validate_cpu_routing(
         sparse_format="bitmask",
-        exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.uint32),
+        exact_block_bits=torch.full(
+            (1, 1, 1, 1),
+            0xFFFFFFFF,
+            dtype=torch.uint32,
+        ),
     )
 
 
@@ -4052,7 +4072,7 @@ def test_public_block_sparse_correctness(
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
-    ids=("bk8-swaps", "bk64-keeps"),
+    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128"),
 )
 @torch.no_grad()
 def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(

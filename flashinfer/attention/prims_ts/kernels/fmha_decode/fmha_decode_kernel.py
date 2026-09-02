@@ -3092,91 +3092,48 @@ def fmha_block_sparse_launch(
     seqlens_kv_iter = (
         g_seqlens_kv if cutlass.const_expr(use_variable_seqlens_kv) else null_i32_ptr
     )
-    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-        decode_gen_kernel(
-            q_desc,
-            k_desc_primary,
-            v_desc_primary,
-            k_desc_atom,
-            v_desc_atom,
-            o_iter,
-            s_k,
-            h_k,
-            Float32(scale_s * log2_e),
-            Float32(1.0),
-            seqlens_kv_iter,
-            null_i32_ptr,
-            null_i32_ptr,
-            o_iter,
-            null_f32_ptr,
-            null_i32_ptr,
-            null_f32_ptr,
-            h_r,
-            tile_sched_params,
-            cfg,
-            seq_len_kv,
-            use_variable_seqlens_kv,
-            False,  # use_native_paged_kv
-            False,  # use_static_native_seqlens_kv
-            null_i32_ptr,  # g_paged_kv_indptr
-            null_i32_ptr,  # g_paged_kv_indices
-            row_route_offsets_iter,
-            row_route_counts_iter,
-            route_metadata_iter,
-            False,  # static_full_split_prefix
-            tma_desc_k_summary=k_desc_summary_primary,
-            tma_desc_v_summary=v_desc_summary_primary,
-            tma_desc_k_summary_atom=k_desc_summary_atom,
-            tma_desc_v_summary_atom=v_desc_summary_atom,
-        ).launch(
-            grid=grid,
-            block=[cfg.threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            # Reuse dense decode's entry-occupancy contract, including the long
-            # KV256 profiles that execute dynamic register reallocation.
-            min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, seq_len_kv),
-            use_pdl=cfg.use_parallel_separate_reduction_pdl,
-        )
-    else:
-        decode_gen_kernel(
-            q_desc,
-            k_desc_primary,
-            v_desc_primary,
-            k_desc_atom,
-            v_desc_atom,
-            o_iter,
-            s_k,
-            h_k,
-            Float32(scale_s * log2_e),
-            Float32(1.0),
-            seqlens_kv_iter,
-            null_i32_ptr,
-            null_i32_ptr,
-            o_iter,
-            null_f32_ptr,
-            null_i32_ptr,
-            null_f32_ptr,
-            h_r,
-            tile_sched_params,
-            cfg,
-            seq_len_kv,
-            use_variable_seqlens_kv,
-            False,  # use_native_paged_kv
-            False,  # use_static_native_seqlens_kv
-            null_i32_ptr,  # g_paged_kv_indptr
-            null_i32_ptr,  # g_paged_kv_indices
-            row_route_offsets_iter,
-            row_route_counts_iter,
-            route_metadata_iter,
-            False,  # static_full_split_prefix
-        ).launch(
-            grid=grid,
-            block=[cfg.threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            # Reuse dense decode's entry-occupancy contract, including the long
-            # KV256 profiles that execute dynamic register reallocation.
-            min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, seq_len_kv),
-            use_pdl=cfg.use_parallel_separate_reduction_pdl,
-        )
+    decode_gen_kernel(
+        q_desc,
+        k_desc_primary,
+        v_desc_primary,
+        k_desc_atom,
+        v_desc_atom,
+        o_iter,
+        s_k,
+        h_k,
+        Float32(scale_s * log2_e),
+        Float32(1.0),
+        seqlens_kv_iter,
+        null_i32_ptr,
+        null_i32_ptr,
+        o_iter,
+        null_f32_ptr,
+        null_i32_ptr,
+        null_f32_ptr,
+        h_r,
+        tile_sched_params,
+        cfg,
+        seq_len_kv,
+        use_variable_seqlens_kv,
+        False,  # use_native_paged_kv
+        False,  # use_static_native_seqlens_kv
+        null_i32_ptr,  # g_paged_kv_indptr
+        null_i32_ptr,  # g_paged_kv_indices
+        row_route_offsets_iter,
+        row_route_counts_iter,
+        route_metadata_iter,
+        False,  # static_full_split_prefix
+        tma_desc_k_summary=k_desc_summary_primary,
+        tma_desc_v_summary=v_desc_summary_primary,
+        tma_desc_k_summary_atom=k_desc_summary_atom,
+        tma_desc_v_summary_atom=v_desc_summary_atom,
+    ).launch(
+        grid=grid,
+        block=[cfg.threads_per_cta, 1, 1],
+        cluster=[1, 1, 1],
+        stream=stream,
+        # Reuse dense decode's entry-occupancy contract, including the long
+        # KV256 profiles that execute dynamic register reallocation.
+        min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, seq_len_kv),
+        use_pdl=cfg.use_parallel_separate_reduction_pdl,
+    )

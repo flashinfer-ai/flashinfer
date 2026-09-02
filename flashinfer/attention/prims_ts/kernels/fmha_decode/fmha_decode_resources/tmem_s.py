@@ -76,6 +76,7 @@ from .helpers_common import (
     _mma_kind_for_qkv,
     _neg_max_f32,
     _softmax_scale_pair_width,
+    _swaps_routed_coordinate,
     _q_row_is_valid_for_seq,
     _q_row_token_and_local_head,
     _q_group_token_base,
@@ -1655,32 +1656,6 @@ class TmemSResource(DecodeGenResourceBase):
         return s_arr
 
     @cute.jit
-    def _sparse_swaps_logical_k(
-        self,
-        lane_k_offset: Int32,
-        sparse_origin0: Int32,
-        sparse_origin1: Int32,
-        sparse_origin2: Int32,
-        sparse_origin3: Int32,
-        *,
-        token_group_idx: Constexpr[int],
-    ) -> tuple[Int32, Int32]:
-        """Map one SWAP register group to its routed logical K position."""
-
-        atom_size = min(self.cfg.kv_block_size, 32)
-        groups_per_atom = atom_size // 8
-        origin_idx = token_group_idx // groups_per_atom
-        atom_origin = sparse_origin0
-        if cutlass.const_expr(origin_idx == 1):
-            atom_origin = sparse_origin1
-        elif cutlass.const_expr(origin_idx == 2):
-            atom_origin = sparse_origin2
-        elif cutlass.const_expr(origin_idx == 3):
-            atom_origin = sparse_origin3
-        token_offset = (token_group_idx % groups_per_atom) * 8
-        return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
-
-    @cute.jit
     def _compute_softmax_loop_swaps(
         self,
         stage_info: StageInfo,
@@ -1912,7 +1887,8 @@ class TmemSResource(DecodeGenResourceBase):
                 lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
                 token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
                 for token_group_idx in cutlass.range_constexpr(4):
-                    atom_origin, logical_k = self._sparse_swaps_logical_k(
+                    atom_origin, logical_k = _swaps_routed_coordinate(
+                        cfg,
                         lane_k_offset,
                         sparse_origin0,
                         sparse_origin1,
@@ -2080,7 +2056,8 @@ class TmemSResource(DecodeGenResourceBase):
                             tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
                         )
                         if cutlass.const_expr(use_sparse):
-                            _, token_idx = self._sparse_swaps_logical_k(
+                            _, token_idx = _swaps_routed_coordinate(
+                                cfg,
                                 lane_idx >> Int32(2),
                                 sparse_origin0,
                                 sparse_origin1,

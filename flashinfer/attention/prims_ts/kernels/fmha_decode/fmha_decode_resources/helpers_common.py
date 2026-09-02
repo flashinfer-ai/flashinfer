@@ -127,6 +127,33 @@ def _warp_broadcast_i32(value: Int32, source_lane: Constexpr[int]) -> Int32:
     )
 
 
+@cute.jit
+def _swaps_routed_coordinate(
+    cfg: Constexpr[FmhaDecodeConfig],
+    lane_k_offset: Int32,
+    origin0: Int32,
+    origin1: Int32,
+    origin2: Int32,
+    origin3: Int32,
+    *,
+    token_group_idx: Constexpr[int],
+) -> tuple[Int32, Int32]:
+    """Map one SWAP register group to its staged atom and logical coordinate."""
+
+    atom_size = min(cfg.kv_block_size, 32)
+    groups_per_atom = atom_size // 8
+    origin_idx = token_group_idx // groups_per_atom
+    atom_origin = origin0
+    if cutlass.const_expr(origin_idx == 1):
+        atom_origin = origin1
+    elif cutlass.const_expr(origin_idx == 2):
+        atom_origin = origin2
+    elif cutlass.const_expr(origin_idx == 3):
+        atom_origin = origin3
+    token_offset = (token_group_idx % groups_per_atom) * 8
+    return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
+
+
 def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
     """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
     return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16

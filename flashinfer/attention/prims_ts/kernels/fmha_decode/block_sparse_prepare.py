@@ -135,6 +135,47 @@ def _positive_i32_ceil_div(
 
 
 @cute.jit
+def _prepared_route_counts(
+    selected_block_count: cutlass.Int32,
+    cfg: cutlass.Constexpr[_RouteConfig],
+) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """Return exact atoms, exact routes, and total prepared routes for one row."""
+
+    exact_atom_count = selected_block_count * cutlass.Int32(cfg.atoms_per_block)
+    exact_route_count = (
+        exact_atom_count + cutlass.Int32(cfg.logical_origins_per_route - 1)
+    ) // cutlass.Int32(cfg.logical_origins_per_route)
+    total_route_count = exact_route_count
+    if cutlass.const_expr(cfg.use_proxy_routes):
+        total_route_count += cutlass.Int32(cfg.num_proxy_groups)
+    return exact_atom_count, exact_route_count, total_route_count
+
+
+@cute.jit
+def _prepared_row_route_begin(
+    row_route_offsets: cute.Tensor,
+    linear_row_idx: cutlass.Int32,
+    lane_idx: cutlass.Int32,
+    row_is_valid: cutlass.Boolean,
+    total_route_count: cutlass.Int32,
+) -> cutlass.Int32:
+    """Load and validate one row's plan-owned prepared-route span."""
+
+    row_route_begin = cutlass.Int32(0)
+    if lane_idx == cutlass.Int32(0) and row_is_valid:
+        row_route_begin = cutlass.Int32(row_route_offsets[linear_row_idx])
+        row_route_end = cutlass.Int32(row_route_offsets[linear_row_idx + 1])
+        row_capacity = row_route_end - row_route_begin
+        runtime_assert(
+            row_route_begin >= cutlass.Int32(0)
+            and row_capacity >= cutlass.Int32(0)
+            and total_route_count <= row_capacity,
+            "prepared routes exceed planned row capacity",
+        )
+    return _warp_broadcast_i32(row_route_begin, 0)
+
+
+@cute.jit
 def _resolve_route_logical_atom_origin(
     block_indices: cute.Tensor,
     row_begin: cutlass.Int32,
@@ -497,7 +538,8 @@ def _load_bsr_proxy_word(
 @cute.jit
 def _emit_proxy_route(
     route_workspace: cute.Tensor,
-    route_metadata_word_index: cutlass.Int32,
+    row_route_begin: cutlass.Int32,
+    exact_route_count: cutlass.Int32,
     group_idx: cutlass.Int32,
     proxy_word: cutlass.Uint32,
     lane_idx: cutlass.Int32,
@@ -505,6 +547,9 @@ def _emit_proxy_route(
 ) -> None:
     """Emit one fixed summary-group proxy record, including an empty mask."""
 
+    route_metadata_word_index = cutlass.Int32(cfg.route_metadata_base_word_offset) + (
+        row_route_begin + exact_route_count + group_idx
+    ) * cutlass.Int32(cfg.route_metadata_stride_words)
     group_start = group_idx * cutlass.Int32(cfg.token_words_per_route * _WARP_SIZE)
     group_size = cutlass.Int32(cfg.num_kv_blocks) - group_start
     if group_size > cutlass.Int32(cfg.token_words_per_route * _WARP_SIZE):
@@ -725,33 +770,22 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                 )
             request_begin = _warp_broadcast_i32(request_begin, 0)
 
-        exact_atom_count = selected_block_count * cutlass.Int32(
-            self.cfg.atoms_per_block
+        _, exact_route_count, total_route_count = _prepared_route_counts(
+            selected_block_count,
+            self.cfg,
         )
-        exact_route_count = (
-            exact_atom_count + cutlass.Int32(self.cfg.logical_origins_per_route - 1)
-        ) // cutlass.Int32(self.cfg.logical_origins_per_route)
-
-        total_route_count = exact_route_count
-        if cutlass.const_expr(self.cfg.use_proxy_routes):
-            total_route_count += cutlass.Int32(self.cfg.num_proxy_groups)
-
-        row_route_begin = cutlass.Int32(0)
         if lane_idx == cutlass.Int32(0) and row_is_valid:
-            row_route_begin = cutlass.Int32(row_route_offsets[linear_row_idx])
-            row_route_end = cutlass.Int32(row_route_offsets[linear_row_idx + 1])
-            row_capacity = row_route_end - row_route_begin
             runtime_assert(
                 selected_block_count <= max_blocks_per_row,
                 "selected BSR blocks exceed planned semantic capacity",
             )
-            runtime_assert(
-                row_route_begin >= cutlass.Int32(0)
-                and row_capacity >= cutlass.Int32(0)
-                and total_route_count <= row_capacity,
-                "prepared routes exceed planned row capacity",
-            )
-        row_route_begin = _warp_broadcast_i32(row_route_begin, 0)
+        row_route_begin = _prepared_row_route_begin(
+            row_route_offsets,
+            linear_row_idx,
+            lane_idx,
+            row_is_valid,
+            total_route_count,
+        )
 
         if row_is_valid:
             route_idx = cutlass.Int32(0)
@@ -828,14 +862,10 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                                 logical_word_idx,
                                 self.cfg,
                             )
-                    route_word_index = cutlass.Int32(
-                        self.cfg.route_metadata_base_word_offset
-                    ) + (
-                        row_route_begin + exact_route_count + group_idx
-                    ) * cutlass.Int32(self.cfg.route_metadata_stride_words)
                     _emit_proxy_route(
                         route_workspace,
-                        route_word_index,
+                        row_route_begin,
+                        exact_route_count,
                         group_idx,
                         proxy_word,
                         lane_idx,
@@ -944,31 +974,22 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             cute.arch.warp_redux_sync(lane_exact_count, "add")
         )
 
-        exact_atom_count = exact_block_count * cutlass.Int32(self.cfg.atoms_per_block)
-        exact_route_count = (
-            exact_atom_count + cutlass.Int32(self.cfg.logical_origins_per_route - 1)
-        ) // cutlass.Int32(self.cfg.logical_origins_per_route)
-
-        total_route_count = exact_route_count
-        if cutlass.const_expr(self.cfg.use_proxy_routes):
-            total_route_count += cutlass.Int32(self.cfg.num_proxy_groups)
-
-        row_route_begin = cutlass.Int32(0)
+        exact_atom_count, exact_route_count, total_route_count = _prepared_route_counts(
+            exact_block_count,
+            self.cfg,
+        )
         if lane_idx == cutlass.Int32(0) and row_is_valid:
-            row_route_begin = cutlass.Int32(row_route_offsets[linear_row_idx])
-            row_route_end = cutlass.Int32(row_route_offsets[linear_row_idx + 1])
-            row_capacity = row_route_end - row_route_begin
             runtime_assert(
                 exact_block_count <= max_blocks_per_row,
                 "selected bitmask blocks exceed planned semantic capacity",
             )
-            runtime_assert(
-                row_route_begin >= cutlass.Int32(0)
-                and row_capacity >= cutlass.Int32(0)
-                and total_route_count <= row_capacity,
-                "prepared routes exceed planned row capacity",
-            )
-        row_route_begin = _warp_broadcast_i32(row_route_begin, 0)
+        row_route_begin = _prepared_row_route_begin(
+            row_route_offsets,
+            linear_row_idx,
+            lane_idx,
+            row_is_valid,
+            total_route_count,
+        )
 
         if row_is_valid:
             exact_prefix = cutlass.Int32(0)
@@ -1067,14 +1088,10 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
                                 self.cfg,
                                 for_proxy=True,
                             )
-                    route_word_index = cutlass.Int32(
-                        self.cfg.route_metadata_base_word_offset
-                    ) + (
-                        row_route_begin + exact_route_count + group_idx
-                    ) * cutlass.Int32(self.cfg.route_metadata_stride_words)
                     _emit_proxy_route(
                         route_workspace,
-                        route_word_index,
+                        row_route_begin,
+                        exact_route_count,
                         group_idx,
                         proxy_word,
                         lane_idx,
