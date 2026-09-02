@@ -4427,7 +4427,10 @@ def _run_cake_kda_bf16_direct_export(
         beta,
         workspace,
         chunk_tokens=chunk_tokens,
-        refresh=any(length >= chunk_tokens for length in route.sequence_lengths),
+        refresh=(
+            route.policy != "direct_m128_n16_h12_scalar"
+            and any(length >= chunk_tokens for length in route.sequence_lengths)
+        ),
     )
     _run_cake_kda_direct_export(
         module=module,
