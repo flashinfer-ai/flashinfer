@@ -809,11 +809,13 @@ def _select_cake_kda_bounded_evolution_route(
     """Select only semantics represented by the sealed shared export."""
 
     num_sequences = len(sequence_lengths)
-    expected_state_shape = (
-        num_sequences,
-        num_heads,
-        _FLASH_KDA_HEAD_DIM,
-        _FLASH_KDA_HEAD_DIM,
+    state_shape_matches = (
+        initial_state_shape is not None
+        and len(initial_state_shape) == 4
+        and initial_state_shape[0] > 0
+        and initial_state_shape[1:]
+        == (num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+        and (has_state_indices or initial_state_shape[0] == num_sequences)
     )
     if (
         not requested
@@ -828,11 +830,10 @@ def _select_cake_kda_bounded_evolution_route(
         or qkv_dtype != torch.bfloat16
         or not beta_contiguous
         or beta_dtype != torch.bfloat16
-        or initial_state_shape != expected_state_shape
+        or not state_shape_matches
         or initial_state_dtype != torch.bfloat16
         or not initial_state_contiguous
         or has_explicit_seq_order
-        or has_state_indices
         or has_checkpoints
         or lower_bound != -5.0
         or not math.isclose(
@@ -865,6 +866,11 @@ def _select_cake_kda_bounded_evolution_route(
         uniform_sequences=uniform_sequences,
         max_sequence_length=max(sequence_lengths),
     )
+    if source_route == _FLASH_KDA_ROUTE_BT16_M64 and has_state_indices:
+        source_route = _direct_m128_route(
+            num_heads=num_heads,
+            max_sequence_length=max(sequence_lengths),
+        )
     if source_route == _FLASH_KDA_ROUTE_M64:
         return _CakeKDABoundedEvolutionRoute(
             target=target,
@@ -4035,6 +4041,7 @@ def _run_cake_kda_bounded_evolution(
     dt_bias: torch.Tensor,
     cu_seqlens: torch.Tensor,
     initial_state: torch.Tensor,
+    state_indices: Optional[torch.Tensor],
     out: torch.Tensor,
     scale: float,
     lower_bound: float,
@@ -4042,6 +4049,8 @@ def _run_cake_kda_bounded_evolution(
     """Launch one manifest-verified shared policy through its exported ABI."""
 
     if route.policy.startswith("bt16_prepare_chain_"):
+        if state_indices is not None:
+            raise RuntimeError("indexed BF16 state cannot use the exported BT16 route")
         _run_cake_kda_bf16_bt16_prepare_chain(
             route=route,
             workspace=workspace,
@@ -4072,6 +4081,7 @@ def _run_cake_kda_bounded_evolution(
             dt_bias=dt_bias,
             cu_seqlens=cu_seqlens,
             initial_state=initial_state,
+            state_indices=state_indices,
             out=out,
             scale=scale,
             lower_bound=lower_bound,
@@ -4096,7 +4106,7 @@ def _run_cake_kda_bounded_evolution(
     )
     dummy_i32 = _dummy_i32(q.device)
     dummy_f32 = _dummy_f32(q.device)
-    state_slot_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    state_slot_stride = initial_state.stride(0)
     module = get_cake_kda_module(route.target, "bounded_bf16_evolution", route.policy)
     module_spec = get_cake_kda_module_spec(
         route.target, "bounded_bf16_evolution", route.policy
@@ -4136,9 +4146,13 @@ def _run_cake_kda_bounded_evolution(
         out_flat,
         out_flat,
         initial_state,
-        dummy_i32.data_ptr(),
+        (
+            state_indices.data_ptr()
+            if state_indices is not None
+            else dummy_i32.data_ptr()
+        ),
         state_slot_stride,
-        0,
+        int(state_indices is not None),
         dummy_f32,
         dummy_f32,
     )
@@ -4364,6 +4378,7 @@ def _run_cake_kda_bf16_direct_export(
     dt_bias: torch.Tensor,
     cu_seqlens: torch.Tensor,
     initial_state: torch.Tensor,
+    state_indices: Optional[torch.Tensor],
     out: torch.Tensor,
     scale: float,
     lower_bound: float,
@@ -4418,7 +4433,7 @@ def _run_cake_kda_bf16_direct_export(
         dt_bias=dt_bias,
         cu_seqlens=cu_seqlens,
         seq_order=seq_order,
-        state_indices=empty_i32,
+        state_indices=state_indices if state_indices is not None else empty_i32,
         state_checkpoints=empty_bf16,
         checkpoint_cu_starts=empty_i64,
         checkpoint_every_n_tokens=0,
@@ -4434,7 +4449,7 @@ def _run_cake_kda_bf16_direct_export(
         empty_u32=empty_u32,
         num_heads=q.shape[2],
         num_sequences=len(route.sequence_lengths),
-        use_state_indices=False,
+        use_state_indices=state_indices is not None,
         use_initial_state=True,
         store_final_state=True,
         state_slot_stride=initial_state.stride(0),
@@ -4665,6 +4680,7 @@ def _run_flash_kda_prefill(
                 dt_bias=dt_bias,
                 cu_seqlens=cu_seqlens_i64,
                 initial_state=initial_state,
+                state_indices=state_indices,
                 out=out_buf,
                 scale=scale_value,
                 lower_bound=float(lower_bound),
