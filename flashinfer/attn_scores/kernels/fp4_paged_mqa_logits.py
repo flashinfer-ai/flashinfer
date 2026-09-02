@@ -361,13 +361,27 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
         st_shared_b32(smem_ptr + offset, values[i])
 
 
-def _target_is_rubin() -> bool:
-    """Whether the JIT target is a Rubin arch (sm_107 / sm_109), which natively
+def _arch_major_minor(arch: str) -> "tuple[int, int]":
+    """Parse a codegen arch string (``"sm_107a"``, ``"sm_100f"``, ``"sm_100"``)
+    into its compute-capability ``(major, minor)`` pair, e.g. ``(10, 7)``."""
+    digits = arch.removeprefix("sm_").rstrip("af")
+    return int(digits[:-1]), int(digits[-1])
+
+
+def _is_rubin_arch(arch: str) -> bool:
+    """Whether ``arch`` is a Rubin part (sm_107 / sm_109), which natively
     supports a per-atom FP4 next_n of 4.
 
     next_n=4 needs 544 raw TMEM columns. Blackwell (sm_100/sm_103) caps at 512,
     so there next_n=4 must run as a 2-atom split; Rubin's 576 columns fit it
     directly via exclusive (non-power-of-two) allocation.
+
+    Takes the compile-target arch as an explicit string (the same value the
+    caller passes to ``cute.compile`` as ``--gpu-arch``) instead of querying
+    the DSL: this is consulted at kernel *construction* time, before
+    ``cute.compile`` installs the target, when a DSL arch query would return
+    the ambient arch (``CUTE_DSL_ARCH`` or a device-ordinal-0 probe) -- the
+    wrong device on a heterogeneous node.
 
     There is no canonical "is Rubin" Arch API: ``Arch.BlackwellArchs()`` lumps
     sm_107/sm_109 in with Blackwell, and ``Arch.is_family_of()`` compares only
@@ -375,13 +389,13 @@ def _target_is_rubin() -> bool:
     sm_100/sm_103 (Blackwell) and sm_107/sm_109 (Rubin), so ``minor >= 7`` is
     the robust discriminator; sm_110 is major 11 and therefore excluded.
     """
-    arch = BaseDSL._get_dsl().get_arch_enum()
-    return arch.major == 10 and arch.minor >= 7
+    major, minor = _arch_major_minor(arch)
+    return major == 10 and minor >= 7
 
 
-def max_next_n_for_target() -> int:
-    """Largest per-atom FP4 next_n the JIT target's TMEM can hold."""
-    return 4 if _target_is_rubin() else 3
+def max_next_n_for_target(arch: str) -> int:
+    """Largest per-atom FP4 next_n that the TMEM of ``arch`` can hold."""
+    return 4 if _is_rubin_arch(arch) else 3
 
 
 class FP4MQALogitsKernel:
@@ -414,7 +428,13 @@ class FP4MQALogitsKernel:
         use_batched_store: bool = True,
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
+        *,
+        arch: str,
     ):
+        # arch is the cute.compile --gpu-arch target (e.g. "sm_107a"), passed
+        # explicitly and required: __init__ runs before compilation installs
+        # the target, so a DSL arch query here would silently read the ambient
+        # (device-0 / CUTE_DSL_ARCH) arch instead -- see _is_rubin_arch.
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
@@ -426,7 +446,7 @@ class FP4MQALogitsKernel:
             f"num_next_n_atoms={num_next_n_atoms} must divide next_n={next_n}"
         )
         _next_n_atom = next_n // num_next_n_atoms
-        _max_atom = max_next_n_for_target()
+        _max_atom = max_next_n_for_target(arch)
         assert 1 <= _next_n_atom <= _max_atom, (
             f"FP4 next_n_atom={_next_n_atom} (next_n={next_n} / "
             f"num_next_n_atoms={num_next_n_atoms}) must be in 1..{_max_atom} "
@@ -490,7 +510,7 @@ class FP4MQALogitsKernel:
         # b=64/ctx=16K graph-timed both-on at -5.0%, either alone at -3..-5%,
         # both-off at baseline. On Rubin the same ablation is neutral either
         # way, so gating atom=3 off everywhere costs nothing there.
-        is_rubin = _target_is_rubin()
+        is_rubin = _is_rubin_arch(arch)
         if use_flat_logits_view is None:
             use_flat_logits_view = not is_rubin and _next_n_atom != 3
         if use_two_level_task_loop is None:
