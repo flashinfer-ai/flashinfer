@@ -3830,9 +3830,7 @@ def _cake_kda_serving_policy(
             if max_sequence_length >= 256
             else "direct_m128_legacy_inverse"
         )
-    if variant == "m128_n16_short":
-        return "direct_m128_legacy_inverse"
-    if variant == "m128_n16":
+    if variant in {"m128_n16", "m128_n16_short"}:
         return (
             "direct_m128_n16_h12_scalar"
             if num_heads == 12
