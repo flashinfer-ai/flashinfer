@@ -856,14 +856,6 @@ def _select_cake_kda_bounded_evolution_route(
         length % _FLASH_KDA_M128_CHUNK == 0 for length in sequence_lengths
     )
 
-    if fixed_layout and num_sequences == 1 and num_heads == 64:
-        return _CakeKDABoundedEvolutionRoute(
-            target=target,
-            policy="direct_m64_independent_value_split",
-            sequence_order=sequence_order,
-            grid_x=2 * num_heads,
-        )
-
     source_route = _select_flash_kda_bf16_route(
         compute_capability=(10, 0) if target == "sm100a" else (10, 3),
         sm_count=sm_count,
@@ -873,6 +865,13 @@ def _select_cake_kda_bounded_evolution_route(
         uniform_sequences=uniform_sequences,
         max_sequence_length=max(sequence_lengths),
     )
+    if source_route == _FLASH_KDA_ROUTE_M64:
+        return _CakeKDABoundedEvolutionRoute(
+            target=target,
+            policy="direct_m64_independent_value_split",
+            sequence_order=sequence_order,
+            grid_x=2 * num_sequences * num_heads,
+        )
     if source_route == _FLASH_KDA_ROUTE_BT16_M64:
         prepare_variant, chain_variant, _dense_wavefront = (
             _select_bt16_physical_variants(
