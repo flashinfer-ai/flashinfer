@@ -155,6 +155,28 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
     const int32_t* idx_base = indices + (size_t)s_i * topk;
 
+    // Candidate slice of this warp. Meaningful only for a QK warp: past
+    // QK_WARPS it runs off both the BI-wide KV buffer and the token's index
+    // row, so everything derived from it stays inside `if (qk_warp)`.
+    const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
+
+    // BI=32 tiles (DOTS3_SWA: the 1040B KV stride caps the smem double buffer)
+    // are too short to cover the index→rope address-chain latency, and with a
+    // runtime topk the compiler does not pipeline these reads across the
+    // loop's barriers — so stage the three per-tile index reads one tile ahead
+    // in registers. BI=64 tiles are long enough that the staging is pure
+    // overhead there (measured +2.3% on DSv3.2 SG at H=8/16, topk=2048 when
+    // applied unconditionally), so it compiles out for them.
+    constexpr bool STAGE_IDX = Cfg::BI < 64;
+    int idx_rope_cur = 0, mask0_cur = 0, mask1_cur = 0;
+    if constexpr (STAGE_IDX) {
+      if (qk_warp && actual_ni > 0) {
+        idx_rope_cur = idx_base[qk_nb + gid];
+        mask0_cur = idx_base[qk_nb + tid * 2];
+        mask1_cur = idx_base[qk_nb + tid * 2 + 1];
+      }
+    }
+
     if constexpr (CM == ComputeMode::BF16) {
       load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
     } else {
@@ -184,10 +206,6 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     for (int ti = 0; ti < actual_ni; ti++) {
       uint8_t* kv_smem = sm.kv_bufs[ti & 1];
       const int32_t* ib = idx_base + ti * Cfg::BI;
-      // Candidate slice of this warp. Meaningful only for a QK warp: past
-      // QK_WARPS it runs off both the BI-wide KV buffer and the token's index
-      // row, so everything derived from it stays inside `if (qk_warp)`.
-      const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
 
       for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS)
         sm.w_head_sc_all[i] = 0.f;
@@ -196,12 +214,33 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       if (qk_warp) {
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-        // Only this lane's own entry is needed, for the QK rope prefetch — the
+        int idx_rope, mask0, mask1;
+        if constexpr (STAGE_IDX) {
+          // Issue the next tile's index loads before consuming the staged ones
+          // (see the prologue above the loop).
+          int idx_rope_nxt = 0, mask0_nxt = 0, mask1_nxt = 0;
+          if (ti + 1 < actual_ni) {
+            const int32_t* ibn = idx_base + (ti + 1) * Cfg::BI;
+            idx_rope_nxt = ibn[qk_nb + gid];
+            mask0_nxt = ibn[qk_nb + tid * 2];
+            mask1_nxt = ibn[qk_nb + tid * 2 + 1];
+          }
+          idx_rope = idx_rope_cur;
+          mask0 = mask0_cur;
+          mask1 = mask1_cur;
+          idx_rope_cur = idx_rope_nxt;
+          mask0_cur = mask0_nxt;
+          mask1_cur = mask1_nxt;
+        } else {
+          idx_rope = ib[qk_nb + gid];
+          mask0 = ib[qk_nb + tid * 2];
+          mask1 = ib[qk_nb + tid * 2 + 1];
+        }
+
+        // Only this lane's own entry is needed for the QK rope prefetch — the
         // XV rope MMA re-derives its addresses from `ib` inside xv_rope_mma.
-        // Scalar rather than an ENTRIES_PER_WARP array indexed by a runtime
-        // lane id, which nvcc has to spill to local memory. Matches MG.
         const uint8_t* entry_base_gid =
-            prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, ib[qk_nb + gid], stride_kv_block);
+            prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx_rope, stride_kv_block);
 
         KVRopePrefetch<MT> rope_pf = prefetch_kv_rope<MT>(
             reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
@@ -287,11 +326,11 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         // ── Invalid index masking + topk_length overflow ─────
         {
           int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-          if (ib[e0] < 0) {
+          if (mask0 < 0) {
             qk[0] = -1e30f;
             qk[2] = -1e30f;
           }
-          if (ib[e1] < 0) {
+          if (mask1 < 0) {
             qk[1] = -1e30f;
             qk[3] = -1e30f;
           }
