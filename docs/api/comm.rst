@@ -240,6 +240,17 @@ output through ``gather_heads``):
 with ``H_local = H // world_size`` and ``S_global = S_local * world_size``.
 All backends produce bit-identical results.
 
+A third entry point, ``exchange_chunks``, takes ``[1, 1, world_size, chunk]``
+to the same shape: chunk ``r`` goes to peer ``r`` and lands in slot ``rank``
+there, which is ``dist.all_to_all_single`` over an already-packed payload. It
+interleaves nothing, so it is for operands a preceding pack (a quantizer, say)
+already laid out destination-major — the head-axis transforms would make such a
+producer emit head-major and repack. On the ``"pcie"`` RDMA routes it is also
+the cheaper descriptor: each peer's bytes are contiguous on both ends, so the
+NIC addresses them with the plain memory region and a linear offset instead of
+an interleaved MKey, which is what exempts it from the 65535-byte stride limit
+that bounds ``H*D*element_size`` for the other two.
+
 **Backend policy.** :class:`UlyssesCommunicator` selects its backend in the
 constructor, strictly before any IPC allocation or JIT compilation:
 

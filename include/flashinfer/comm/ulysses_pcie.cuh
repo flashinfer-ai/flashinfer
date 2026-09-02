@@ -127,12 +127,19 @@ inline cudaError_t EnqueueAbort(uint64_t* const* peer_signals, int world_size, i
 
 // Enqueue the portion of a Ulysses layout transform sent from this rank to
 // one same-NUMA peer. Cross-NUMA peers use mlx5 UMRs in the host transport.
+//
+// ``mode == 2`` is the equal-length chunk exchange over ``[1, 1, world_size,
+// chunk]``: both sides are already contiguous per peer, so it degenerates to a
+// single-row 2-D copy.
 inline cudaError_t EnqueuePeerCopy(const void* input, void* peer_output, int mode, int64_t batch,
                                    int64_t seq, int64_t heads, int64_t dim, int64_t element_size,
                                    int rank, int peer, int world_size, cudaStream_t stream) {
+  // Fail closed: an unhandled mode must not fall into the last branch.
+  if (mode != 0 && mode != 1 && mode != 2) return cudaErrorInvalidValue;
   const auto* source = static_cast<const uint8_t*>(input);
   auto* destination = static_cast<uint8_t*>(peer_output);
-  const int64_t width = (mode == 0 ? heads / world_size : heads) * dim * element_size;
+  const int64_t width =
+      (mode == 2 ? 1 : (mode == 0 ? heads / world_size : heads)) * dim * element_size;
 
   for (int64_t batch_index = 0; batch_index < batch; ++batch_index) {
     int64_t src_offset, dst_offset, src_pitch, dst_pitch, rows;
@@ -143,6 +150,12 @@ inline cudaError_t EnqueuePeerCopy(const void* input, void* peer_output, int mod
       src_pitch = heads * dim * element_size;
       dst_pitch = local_heads * dim * element_size;
       rows = seq;
+    } else if (mode == 2) {
+      src_offset = peer * dim * element_size;
+      dst_offset = rank * dim * element_size;
+      src_pitch = dim * element_size;
+      dst_pitch = dim * element_size;
+      rows = 1;
     } else {
       const int64_t local_seq = seq / world_size;
       const int64_t global_heads = heads * world_size;

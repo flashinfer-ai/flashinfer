@@ -67,10 +67,24 @@ void FlushHybridWrites(Transport* transport) {
                 "cudaDeviceFlushGPUDirectRDMAWrites");
 }
 
+// The shape one transform turns [batch, seq, heads, dim] into.  Every caller
+// that needs it goes through here: the duplicate that used to sit in
+// allocate_ulysses_pcie_output silently gave mode 2 seq/world_size == 0.
+struct OutputGeometry {
+  int64_t seq;
+  int64_t heads;
+};
+
+inline OutputGeometry GetOutputGeometry(int64_t mode, int64_t seq, int64_t heads, int world_size) {
+  if (mode == 0) return {seq * world_size, heads / world_size};
+  if (mode == 1) return {seq / world_size, heads * world_size};
+  return {seq, heads};  // mode 2: equal-length chunks exchange in place
+}
+
 int64_t ValidateGeometry(TensorView tensor, int64_t mode, int64_t batch, int64_t seq, int64_t heads,
                          int64_t dim, int world_size, bool output, bool use_rdma) {
   CHECK_INPUT(tensor);
-  TVM_FFI_ICHECK(mode == 0 || mode == 1) << "mode must be 0 or 1";
+  TVM_FFI_ICHECK(mode == 0 || mode == 1 || mode == 2) << "mode must be 0, 1 or 2";
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 4) << "PCIe Ulysses operands must be 4-D";
   TVM_FFI_ICHECK(batch > 0 && seq > 0 && heads > 0 && dim > 0)
       << "PCIe Ulysses dimensions must be positive";
@@ -79,15 +93,23 @@ int64_t ValidateGeometry(TensorView tensor, int64_t mode, int64_t batch, int64_t
   }
   if (mode == 0) {
     TVM_FFI_ICHECK_EQ(heads % world_size, 0) << "heads must be divisible by world_size";
-  } else {
+  } else if (mode == 1) {
     TVM_FFI_ICHECK_EQ(seq % world_size, 0) << "sequence must be divisible by world_size";
+  } else {
+    // Equal-length chunk exchange: [1, 1, world_size, chunk] in and out, which
+    // is all_to_all_single over an already-packed payload.  Pinning batch and
+    // seq to 1 is what makes one "head" one peer's contiguous chunk, and that
+    // is what lets a single-row MKey descriptor address it.
+    TVM_FFI_ICHECK(batch == 1 && seq == 1)
+        << "chunk-exchange operands must be [1, 1, world_size, chunk]";
+    TVM_FFI_ICHECK_EQ(heads, world_size) << "chunk-exchange needs one chunk per peer, got " << heads
+                                         << " chunks for world size " << world_size;
   }
-  const int64_t out_seq = mode == 0 ? seq * world_size : seq / world_size;
-  const int64_t out_heads = mode == 0 ? heads / world_size : heads * world_size;
+  const OutputGeometry out = GetOutputGeometry(mode, seq, heads, world_size);
   const int64_t sizes[4] = {
       batch,
-      output ? out_seq : seq,
-      output ? out_heads : heads,
+      output ? out.seq : seq,
+      output ? out.heads : heads,
       dim,
   };
   for (int axis = 0; axis < 4; ++axis) {
@@ -135,11 +157,9 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
   const int64_t dim = input.size(3);
   const int64_t input_bytes = ValidateGeometry(input, mode, batch, seq, heads, dim,
                                                transport->world_size, false, transport->use_rdma);
-  const int64_t out_seq = mode == 0 ? seq * transport->world_size : seq / transport->world_size;
-  const int64_t out_heads =
-      mode == 0 ? heads / transport->world_size : heads * transport->world_size;
+  const OutputGeometry out = GetOutputGeometry(mode, seq, heads, transport->world_size);
   const int64_t element_size = get_element_size(input);
-  const int64_t elements = batch * out_seq * out_heads * dim;
+  const int64_t elements = batch * out.seq * out.heads * dim;
   TVM_FFI_ICHECK_GE(capacity_elements, elements)
       << "declared capacity is smaller than the operand this call would produce";
   const int64_t capacity_bytes = capacity_elements * element_size;
@@ -149,7 +169,7 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
                           tvm::ffi::Shape({capacity_elements}), input.dtype(), input.device());
   // Describe the initial geometry over that storage. Null strides mean compact
   // row-major, which is what every operand on this path is.
-  int64_t view_shape[4] = {batch, out_seq, out_heads, dim};
+  int64_t view_shape[4] = {batch, out.seq, out.heads, dim};
   DLTensor view = *storage.GetDLTensorPtr();
   view.ndim = 4;
   view.shape = view_shape;
@@ -167,7 +187,7 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
   }
   fi::RegisterOutput(transport, input, TensorView(&view), mode, std::move(storage_owner),
                      std::move(landing_owner), capacity_bytes, element_size, input_bytes,
-                     batch * out_seq * out_heads * dim * element_size);
+                     batch * out.seq * out.heads * dim * element_size);
 
   // Rank-local registration record to all_gather and feed back through
   // connect_output.
@@ -338,7 +358,25 @@ void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, i
       if (!transport->Cross(peer)) continue;
       TVM_FFI_ICHECK(transport->qps[peer] != nullptr && transport->qpxs[peer] != nullptr)
           << "missing mlx5 QP for peer " << peer;
-      if (mode == 0) {
+      if (mode == 2) {
+        // Neither side is interleaved: read this peer's chunk out of the
+        // landing buffer, write it into our slot of the peer's output.  This
+        // is mode 1's local addressing with mode 0's remote addressing, and
+        // needs no MKey on either end.
+        TVM_FFI_ICHECK(active_input_mr != nullptr) << "missing RDMA input registration";
+        local_keys[peer] = active_input_mr->lkey;
+        const uint64_t local_offset = uint64_t(peer) * payload64;
+        TVM_FFI_ICHECK_LE(local_offset + payload64, static_cast<uint64_t>(input_bytes))
+            << "chunk-exchange local payload exceeds input buffer";
+        local_addresses[peer] = reinterpret_cast<uint64_t>(source) + local_offset;
+        TVM_FFI_ICHECK(buffer->peers[peer].address != 0 && buffer->peers[peer].rkey != 0)
+            << "missing chunk-exchange output registration for peer " << peer;
+        const uint64_t remote_offset = uint64_t(transport->rank) * payload64;
+        TVM_FFI_ICHECK_LE(remote_offset + payload64, static_cast<uint64_t>(buffer->output_bytes))
+            << "chunk-exchange remote payload exceeds output buffer";
+        remote_addresses[peer] = buffer->peers[peer].address + remote_offset;
+        remote_keys[peer] = buffer->peers[peer].rkey;
+      } else if (mode == 0) {
         TVM_FFI_ICHECK(active_source_mkeys[peer] != nullptr)
             << "missing scatter_heads source MKey for peer " << peer;
         local_keys[peer] = active_source_mkeys[peer]->lkey;

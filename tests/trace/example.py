@@ -100,6 +100,7 @@ top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
+ulysses_exchange_chunks_ws1_c128.json
 ulysses_gather_heads_ws1_d128.json
 ulysses_scatter_heads_ws1_d128.json
 
@@ -2297,6 +2298,16 @@ try:
         ) as _ulysses_comm:
             _ulysses_comm.scatter_heads(_ulysses_x)
             _ulysses_comm.gather_heads(_ulysses_x)
+        # Chunk exchange takes [1, 1, world_size, chunk], so it needs its own
+        # operand rather than a view of the head-major one above.
+        _ulysses_chunks = torch.randn(1, 1, 1, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_chunks.nbytes,
+            dtype=_ulysses_chunks.dtype,
+            backend="nccl",
+            device=_ulysses_chunks.device,
+        ) as _ulysses_chunk_comm:
+            _ulysses_chunk_comm.exchange_chunks(_ulysses_chunks)
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()

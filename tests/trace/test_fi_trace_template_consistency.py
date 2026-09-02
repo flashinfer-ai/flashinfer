@@ -759,6 +759,7 @@ _E2E_SKIP = {
     # generation and the multi-rank trace-apply routing miss.
     "ulysses_scatter_heads",
     "ulysses_gather_heads",
+    "ulysses_exchange_chunks",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]

@@ -21,6 +21,7 @@ import torch
 
 from flashinfer.comm import UlyssesCommunicator
 from flashinfer.trace.templates.comm import (
+    ulysses_exchange_chunks_trace,
     ulysses_gather_heads_trace,
     ulysses_scatter_heads_trace,
 )
@@ -31,22 +32,35 @@ FI_TRACE_OUT = Path(__file__).parent / "fi_trace_out"
 
 
 @pytest.mark.parametrize(
-    ("method", "name", "x_axes"),
+    ("method", "name", "x_axes", "shape", "constraints"),
     (
         (
             UlyssesCommunicator.scatter_heads,
             "ulysses_scatter_heads_ws1_d128",
             ["batch_size", "local_seq_len", "global_num_heads", "head_dim"],
+            (1, 128, 8, 128),
+            ["world_size == 1"],
         ),
         (
             UlyssesCommunicator.gather_heads,
             "ulysses_gather_heads_ws1_d128",
             ["batch_size", "global_seq_len", "local_num_heads", "head_dim"],
+            (1, 128, 8, 128),
+            ["world_size == 1"],
+        ),
+        (
+            UlyssesCommunicator.exchange_chunks,
+            "ulysses_exchange_chunks_ws1_c128",
+            ["batch_size", "seq_len", "chunk_count", "chunk"],
+            (1, 1, 1, 128),
+            ["world_size == 1", "chunk_count == world_size"],
         ),
     ),
 )
-def test_ulysses_trace_schema_and_committed_example(tmp_path, method, name, x_axes):
-    x = torch.zeros(1, 128, 8, 128, dtype=torch.bfloat16)
+def test_ulysses_trace_schema_and_committed_example(
+    tmp_path, method, name, x_axes, shape, constraints
+):
+    x = torch.zeros(shape, dtype=torch.bfloat16)
     communicator = SimpleNamespace(world_size=1)
     definition = method.fi_trace(save_dir=tmp_path, self=communicator, x=x)
 
@@ -56,7 +70,7 @@ def test_ulysses_trace_schema_and_committed_example(tmp_path, method, name, x_ax
         "value": 1,
         "description": "fi_trace models the single-rank identity case only.",
     }
-    assert definition["constraints"] == ["world_size == 1"]
+    assert definition["constraints"] == constraints
     assert definition["inputs"]["x"] == {
         "shape": x_axes,
         "dtype": "bfloat16",
@@ -97,10 +111,19 @@ def test_ulysses_trace_schema_and_committed_example(tmp_path, method, name, x_ax
             ulysses_gather_heads_trace,
             "ulysses_gather_heads",
         ),
+        (
+            UlyssesCommunicator.exchange_chunks,
+            ulysses_exchange_chunks_trace,
+            "ulysses_exchange_chunks",
+        ),
     ),
 )
 def test_ulysses_trace_never_routes_multi_rank_to_identity(method, dispatch, prefix):
-    x = torch.zeros(1, 8, 8, 128, dtype=torch.bfloat16)
+    x = (
+        torch.zeros(1, 1, 8, 128, dtype=torch.bfloat16)
+        if prefix == "ulysses_exchange_chunks"
+        else torch.zeros(1, 8, 8, 128, dtype=torch.bfloat16)
+    )
     communicator = SimpleNamespace(world_size=8)
 
     assert method.fi_trace(self=communicator, x=x) == {}
@@ -112,4 +135,5 @@ def test_ulysses_trace_never_routes_multi_rank_to_identity(method, dispatch, pre
     # The world_size axis comes off the communicator, not off any tensor dim or
     # scalar argument, so a regressed extractor would fall back to the template's
     # fixed Const(value=1) and name this ws1 instead.
-    assert template.definition_name(axes) == f"{prefix}_ws8_d128"
+    suffix = "c128" if prefix == "ulysses_exchange_chunks" else "d128"
+    assert template.definition_name(axes) == f"{prefix}_ws8_{suffix}"

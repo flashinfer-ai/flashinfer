@@ -33,6 +33,7 @@ from torch.distributed import ProcessGroup
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_a2a_module, gen_ulysses_pcie_module
 from ..trace.templates.comm import (
+    ulysses_exchange_chunks_trace,
     ulysses_gather_heads_trace,
     ulysses_scatter_heads_trace,
 )
@@ -600,8 +601,9 @@ class UlyssesCommunicator:
             Operand the output is sized for: a contiguous 4-D CUDA tensor with
             the shape ``op`` consumes.
         op : str
-            ``"scatter_heads"`` or ``"gather_heads"``. Outputs are registered
-            per transform and are not interchangeable between the two.
+            ``"scatter_heads"``, ``"gather_heads"`` or ``"exchange_chunks"``.
+            Outputs are registered per transform and are not interchangeable
+            between them.
         dtype : torch.dtype, optional
             Element type for the calls this output serves, overriding the
             communicator dtype. pcie backend only. The allocation keeps the
@@ -615,8 +617,10 @@ class UlyssesCommunicator:
             device and dtype as ``x``. On multi-rank pcie it stays registered
             with the transport until :meth:`close`.
         """
-        if op not in ("scatter_heads", "gather_heads"):
-            raise ValueError("op must be 'scatter_heads' or 'gather_heads'")
+        if op not in ("scatter_heads", "gather_heads", "exchange_chunks"):
+            raise ValueError(
+                "op must be 'scatter_heads', 'gather_heads' or 'exchange_chunks'"
+            )
         self._validate(x, op, dtype)
         shape, mode = self._output_geometry(x, op)
         if self.backend != "pcie" or self.world_size == 1:
@@ -772,6 +776,21 @@ class UlyssesCommunicator:
         and its error message cannot drift between them.
         """
         B, S, H, D = x.shape
+        if op == "exchange_chunks":
+            # Equal-length chunk all-to-all: geometry in == geometry out. The
+            # payload is already packed destination-major, so there is nothing
+            # to scatter or gather -- only chunk r to deliver to peer r.
+            if B != 1 or S != 1:
+                raise ValueError(
+                    f"exchange_chunks expects [1, 1, world_size, chunk], got "
+                    f"shape {tuple(x.shape)}"
+                )
+            if self.world_size != H:
+                raise ValueError(
+                    f"exchange_chunks requires one chunk per peer (dim 2 == "
+                    f"world size {self.world_size}), got shape {tuple(x.shape)}"
+                )
+            return (B, S, H, D), 2
         if op == "scatter_heads":
             if H % self.world_size != 0:
                 raise ValueError(
@@ -1346,6 +1365,73 @@ class UlyssesCommunicator:
         out.copy_(self._nccl_scatter_heads(x))
         return out
 
+    @flashinfer_api(trace=ulysses_exchange_chunks_trace)
+    def exchange_chunks(
+        self,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        r"""``[1, 1, W, C] -> [1, 1, W, C]``: equal-length chunk all-to-all.
+
+        Chunk ``r`` of this rank's input goes to peer ``r``, and lands in slot
+        ``rank`` of that peer's output -- the semantics of
+        ``torch.distributed.all_to_all_single`` on an already-packed payload.
+
+        This is the transform for a payload that was produced destination-major
+        by a preceding pack (a quantizer, say), so its per-peer bytes are
+        already contiguous. :meth:`scatter_heads` and :meth:`gather_heads` do
+        the head-axis interleave instead, which forces a head-major layout on
+        the producer; this entry point removes that constraint. On the RDMA
+        routes it is also the cheaper descriptor -- a single-row MKey, exempt
+        from the 65535-byte interleaved-stride limit that bounds ``H*D*
+        element_size`` for the other two.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Contiguous 4-D CUDA tensor shaped ``[1, 1, world_size, chunk]``.
+            ``chunk`` is in elements of ``x``'s dtype; a packed uint8 payload
+            passes ``dtype=torch.uint8`` and ``chunk`` in bytes.
+        out : torch.Tensor, optional
+            Preallocated output of the same shape, not overlapping ``x``.
+            Multi-rank PCIe requires an output from :meth:`allocate_output`.
+        dtype : torch.dtype, optional
+            Element type for this call, overriding the communicator dtype.
+            pcie backend only.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of the same shape, device and dtype as ``x``.
+        """
+        if self.backend == "pcie" and self.world_size > 1:
+            return self._pcie_collective(x, out, "exchange_chunks", dtype)
+        self._validate(x, "exchange_chunks", dtype)
+        shape, _mode = self._output_geometry(x, "exchange_chunks")
+        if self.world_size == 1:
+            if out is None:
+                return x
+            self._validate_out(out, shape, "exchange_chunks", dtype)
+            self._validate_no_overlap(x, out, "exchange_chunks")
+            out.copy_(x)
+            return out
+        # nvlink's fused kernel is parameterized by the head-axis interleave,
+        # so a chunk exchange has no fused form; NCCL's all_to_all_single is
+        # exactly this operation and is what both remaining backends use.
+        if out is None:
+            return self._nccl_exchange_chunks(x)
+        self._validate_out(out, shape, "exchange_chunks", dtype)
+        self._validate_no_overlap(x, out, "exchange_chunks")
+        dist.all_to_all_single(out.view(-1), x.reshape(-1), group=self.group)
+        return out
+
+    def _nccl_exchange_chunks(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        dist.all_to_all_single(out.view(-1), x.reshape(-1), group=self.group)
+        return out
+
     @flashinfer_api(trace=ulysses_gather_heads_trace)
     def gather_heads(
         self,
@@ -1515,7 +1601,13 @@ class UlyssesCommunicator:
                 f"{op} tensor has {x.numel()} elements, over the int32 index "
                 f"range {_INT32_MAX}"
             )
-        if self.backend == "pcie" and self.transport in _PCIE_RDMA_TRANSPORTS:
+        if (
+            self.backend == "pcie"
+            and self.transport in _PCIE_RDMA_TRANSPORTS
+            and op != "exchange_chunks"
+        ):
+            # exchange_chunks is exempt by construction: its descriptor has a
+            # single row, so there is no stride to fit in mlx5's 16-bit field.
             global_heads = (
                 x.shape[2] if op == "scatter_heads" else x.shape[2] * self.world_size
             )
