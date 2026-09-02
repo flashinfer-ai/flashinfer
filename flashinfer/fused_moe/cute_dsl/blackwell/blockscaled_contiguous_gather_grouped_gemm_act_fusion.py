@@ -501,7 +501,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gated: bool = True,
         swap_ab: bool = False,
         weight_interleave: Optional[int] = None,
-        apply_expert_alpha: bool = True,
+        use_alpha: bool = True,
+        use_bias: bool = False,
         activation_type: Optional[int] = None,
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
@@ -565,8 +566,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param weight_interleave: Physical up/gate interleave. Unswapped mode
             supports 16 or 64; swapped mode supports 16.
         :type weight_interleave: Optional[int]
-        :param apply_expert_alpha: Whether to apply a per-expert alpha scale.
-        :type apply_expert_alpha: bool
+        :param use_alpha: Whether to apply a per-expert alpha scale.
+        :type use_alpha: bool
+        :param use_bias: Whether to apply per-expert branch bias.
+        :type use_bias: bool
         :param activation_type: FC1 activation type. Use ActivationType.Swiglu
             for gated SwiGLU/OAI/SiTU, ActivationType.GegluTanh for
             tanh-approximate GeGLU, and ActivationType.Relu2 for non-gated
@@ -612,7 +615,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.weight_interleave = weight_interleave
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.apply_expert_alpha = apply_expert_alpha
+        self.use_alpha = use_alpha
+        self.use_bias = use_bias
         if activation_type is None:
             activation_type = ActivationType.Swiglu if gated else ActivationType.Relu2
         activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
@@ -622,6 +626,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             raise ValueError(
                 f"gated={gated} is inconsistent with activation_type {activation_type!r}"
             )
+        if use_bias and not gated:
+            raise ValueError("branch bias is only supported by the gated path")
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         self.activation_type = int(activation_type)
         self.swiglu_alpha = swiglu_alpha
@@ -1015,8 +1021,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         sfb: cute.Tensor,
         sfc_tensor: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
-        bias_up_tensor: cute.Tensor,
-        bias_gate_tensor: cute.Tensor,
+        bias_up_tensor: Optional[cute.Tensor],
+        bias_gate_tensor: Optional[cute.Tensor],
         tile_idx_to_expert_idx: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
@@ -1080,10 +1086,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type num_non_exiting_tiles: cute.Tensor
         :param alpha: Alpha tensor for each group
         :type alpha: Optional[cute.Tensor]
-        :param bias_up_tensor: Bias tensor for up activation
-        :type bias_up_tensor: cute.Tensor
-        :param bias_gate_tensor: Bias tensor for gate activation
-        :type bias_gate_tensor: cute.Tensor
+        :param bias_up_tensor: Optional bias tensor for up activation.
+        :type bias_up_tensor: Optional[cute.Tensor]
+        :param bias_gate_tensor: Optional bias tensor for gate activation.
+        :type bias_gate_tensor: Optional[cute.Tensor]
         :param a_per_token_scale: Optional per-token row scale for operand A.
         :type a_per_token_scale: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
@@ -1120,22 +1126,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     stride=(1, interm, interm * tokens),
                 ),
             )
-            bias_l = bias_up_tensor.shape[2]
-            bias_expert_stride = interm * self.bias_expert_stride_factor
-            # (M=feature, N=token, L)
-            bias_up_tensor = cute.make_tensor(
-                bias_up_tensor.iterator,
-                cute.make_layout(
-                    (interm, tokens, bias_l), stride=(1, 0, bias_expert_stride)
-                ),
-            )
-            # (M=feature, N=token, L)
-            bias_gate_tensor = cute.make_tensor(
-                bias_gate_tensor.iterator,
-                cute.make_layout(
-                    (interm, tokens, bias_l), stride=(1, 0, bias_expert_stride)
-                ),
-            )
+            if cutlass.const_expr(self.use_bias):
+                bias_l = bias_up_tensor.shape[2]
+                bias_expert_stride = interm * self.bias_expert_stride_factor
+                # (M=feature, N=token, L)
+                bias_up_tensor = cute.make_tensor(
+                    bias_up_tensor.iterator,
+                    cute.make_layout(
+                        (interm, tokens, bias_l), stride=(1, 0, bias_expert_stride)
+                    ),
+                )
+                # (M=feature, N=token, L)
+                bias_gate_tensor = cute.make_tensor(
+                    bias_gate_tensor.iterator,
+                    cute.make_layout(
+                        (interm, tokens, bias_l), stride=(1, 0, bias_expert_stride)
+                    ),
+                )
 
         self.c_layout = utils.LayoutEnum.from_tensor(c)
         self.mxf8f6f4 = self.needs_unpack_tma(self.a_dtype, self.b_dtype)
@@ -1628,8 +1635,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         mSFB_nkl: cute.Tensor,
         mSFC_mnl: Optional[cute.Tensor],
         norm_const_tensor: Optional[cute.Tensor],
-        mBiasUp_mnl: cute.Tensor,
-        mBiasGate_mnl: cute.Tensor,
+        mBiasUp_mnl: Optional[cute.Tensor],
+        mBiasGate_mnl: Optional[cute.Tensor],
         tile_idx_to_expert_idx: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         token_id_mapping_tensor: cute.Tensor,
@@ -1954,16 +1961,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         k_tile_cnt = k_tile_end - k_tile_start
 
         # (bM, bN, loopM, loopN, loopL)
-        gBiasUp_mnl = cute.local_tile(
-            mBiasUp_mnl,
-            cute.slice_(c_tile, (None, None, 0)),
-            (None, None, None),
-        )
-        gBiasGate_mnl = cute.local_tile(
-            mBiasGate_mnl,
-            cute.slice_(c_tile, (None, None, 0)),
-            (None, None, None),
-        )
+        gBiasUp_mnl = None
+        gBiasGate_mnl = None
+        if cutlass.const_expr(self.use_bias):
+            gBiasUp_mnl = cute.local_tile(
+                mBiasUp_mnl,
+                cute.slice_(c_tile, (None, None, 0)),
+                (None, None, None),
+            )
+            gBiasGate_mnl = cute.local_tile(
+                mBiasGate_mnl,
+                cute.slice_(c_tile, (None, None, 0)),
+                (None, None, None),
+            )
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -1974,12 +1984,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
         tCgC = thr_mma.partition_C(gC_mnl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
-        tCgBiasUp = thr_mma.partition_C(gBiasUp_mnl)
-        tCgBiasGate = thr_mma.partition_C(gBiasGate_mnl)
+        tCgBiasUp = None
+        tCgBiasGate = None
+        if cutlass.const_expr(self.use_bias):
+            tCgBiasUp = thr_mma.partition_C(gBiasUp_mnl)
+            tCgBiasGate = thr_mma.partition_C(gBiasGate_mnl)
         if cutlass.const_expr(self.swap_ab and self.gated and self.use_2cta_instrs):
             tCgC = thr_mma_epilogue.partition_C(gC_mnl)
-            tCgBiasUp = thr_mma_epilogue.partition_C(gBiasUp_mnl)
-            tCgBiasGate = thr_mma_epilogue.partition_C(gBiasGate_mnl)
+            if cutlass.const_expr(self.use_bias):
+                tCgBiasUp = thr_mma_epilogue.partition_C(gBiasUp_mnl)
+                tCgBiasGate = thr_mma_epilogue.partition_C(gBiasGate_mnl)
 
         if cutlass.const_expr(not self.swap_ab):
             # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
@@ -3299,15 +3313,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 else epi_tidx
             )
             thr_copy_t2r_bias = tiled_copy_epi.get_slice(epi_data_tidx)
-            tCgBiasUp_epi = cute.flat_divide(
-                tCgBiasUp[((None, None), 0, 0, None, None, None)], epi_tile
-            )
-            tCgBiasGate_epi = cute.flat_divide(
-                tCgBiasGate[((None, None), 0, 0, None, None, None)], epi_tile
-            )
-            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
-            tTR_gBiasUp = thr_copy_t2r_bias.partition_D(tCgBiasUp_epi)
-            tTR_gBiasGate = thr_copy_t2r_bias.partition_D(tCgBiasGate_epi)
+            tTR_gBiasUp = None
+            tTR_gBiasGate = None
+            if cutlass.const_expr(self.use_bias):
+                tCgBiasUp_epi = cute.flat_divide(
+                    tCgBiasUp[((None, None), 0, 0, None, None, None)], epi_tile
+                )
+                tCgBiasGate_epi = cute.flat_divide(
+                    tCgBiasGate[((None, None), 0, 0, None, None, None)], epi_tile
+                )
+                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
+                tTR_gBiasUp = thr_copy_t2r_bias.partition_D(tCgBiasUp_epi)
+                tTR_gBiasGate = thr_copy_t2r_bias.partition_D(tCgBiasGate_epi)
             tTR_gC_output = None
             unswapped_fp4_sfc = (
                 self.generate_sfc
@@ -3466,10 +3483,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tile_info[2],
                     )
                 #
-                # Get alpha for current group (identity when apply_expert_alpha=False)
+                # Get alpha for current group (identity when use_alpha=False)
                 #
                 expert_idx = mma_tile_coord_mnl[2]
-                if cutlass.const_expr(self.apply_expert_alpha):
+                if cutlass.const_expr(self.use_alpha):
                     alpha_val = alpha[expert_idx]
                 else:
                     alpha_val = cutlass.Float32(1.0)
@@ -3565,7 +3582,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tTR_gBiasUp_tile = None
                 tTR_gBiasGate_tile = None
                 tTR_gC_output_tile = None
-                if cutlass.const_expr(self.gated):
+                if cutlass.const_expr(self.gated and self.use_bias):
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
                     tTR_gBiasUp_tile = tTR_gBiasUp[
                         (
@@ -3998,23 +4015,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 #
                                 # Per-expert bias (C-shaped): index by output epi (c_m, c_n)
                                 #
-                                bias_up_frg = tTR_gBiasUp_tile[
-                                    (None, None, None, c_m, c_n)
-                                ]
-                                bias_gate_frg = tTR_gBiasGate_tile[
-                                    (None, None, None, c_m, c_n)
-                                ]
-                                if cutlass.const_expr(self.swap_ab):
-                                    output_half = warp_idx & 1
-                                    bias_up_vec = bias_up_frg[
-                                        (None, output_half, None)
-                                    ].load()
-                                    bias_gate_vec = bias_gate_frg[
-                                        (None, output_half, None)
-                                    ].load()
-                                else:
-                                    bias_up_vec = bias_up_frg.load()
-                                    bias_gate_vec = bias_gate_frg.load()
+                                bias_up_vec = None
+                                bias_gate_vec = None
+                                if cutlass.const_expr(self.use_bias):
+                                    bias_up_frg = tTR_gBiasUp_tile[
+                                        (None, None, None, c_m, c_n)
+                                    ]
+                                    bias_gate_frg = tTR_gBiasGate_tile[
+                                        (None, None, None, c_m, c_n)
+                                    ]
+                                    if cutlass.const_expr(self.swap_ab):
+                                        output_half = warp_idx & 1
+                                        bias_up_vec = bias_up_frg[
+                                            (None, output_half, None)
+                                        ].load()
+                                        bias_gate_vec = bias_gate_frg[
+                                            (None, output_half, None)
+                                        ].load()
+                                    else:
+                                        bias_up_vec = bias_up_frg.load()
+                                        bias_gate_vec = bias_gate_frg.load()
 
                                 n_eff = cutlass.const_expr(cute.size(tTR_rAcc_up))
                                 tCompute = cute.make_rmem_tensor(
@@ -4038,14 +4058,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                             f32_reciprocal(self.situ_linear_beta)
                                         )
                                     for i in cutlass.range_constexpr(n_eff):
-                                        up = (
-                                            acc_vec_up[i] * cutlass.Float32(alpha_val)
-                                            + bias_up_vec[i]
+                                        up = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                                        gate = acc_vec_gate[i] * cutlass.Float32(
+                                            alpha_val
                                         )
-                                        gate = (
-                                            acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                                            + bias_gate_vec[i]
-                                        )
+                                        if cutlass.const_expr(self.use_bias):
+                                            up += bias_up_vec[i]
+                                            gate += bias_gate_vec[i]
                                         if cutlass.const_expr(
                                             self.situ_linear_beta is not None
                                         ):
@@ -4060,14 +4079,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     == ActivationType.GegluTanh.value
                                 ):
                                     for i in cutlass.range_constexpr(n_eff):
-                                        up = (
-                                            acc_vec_up[i] * cutlass.Float32(alpha_val)
-                                            + bias_up_vec[i]
+                                        up = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                                        gate = acc_vec_gate[i] * cutlass.Float32(
+                                            alpha_val
                                         )
-                                        gate = (
-                                            acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                                            + bias_gate_vec[i]
-                                        )
+                                        if cutlass.const_expr(self.use_bias):
+                                            up += bias_up_vec[i]
+                                            gate += bias_gate_vec[i]
                                         tCompute[i] = up * gelu_tanh_f32(
                                             gate, fastmath=True
                                         )
@@ -4075,26 +4093,39 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     # Generalized scaled/clamped SwiGLU family.
                                     #   out = (up_c + offset) * gate_c * sigmoid(swiglu_alpha * gate_c)
                                     for i in cutlass.range_constexpr(0, n_eff, 2):
-                                        acc_vec_up_alpha = cute.arch.add_packed_f32x2(
-                                            cute.arch.mul_packed_f32x2(
-                                                (acc_vec_up[i], acc_vec_up[i + 1]),
-                                                (
-                                                    cutlass.Float32(alpha_val),
-                                                    cutlass.Float32(alpha_val),
-                                                ),
+                                        acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                                            (acc_vec_up[i], acc_vec_up[i + 1]),
+                                            (
+                                                cutlass.Float32(alpha_val),
+                                                cutlass.Float32(alpha_val),
                                             ),
-                                            (bias_up_vec[i], bias_up_vec[i + 1]),
                                         )
-                                        acc_vec_gate_alpha = cute.arch.add_packed_f32x2(
-                                            cute.arch.mul_packed_f32x2(
-                                                (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                                                (
-                                                    cutlass.Float32(alpha_val),
-                                                    cutlass.Float32(alpha_val),
-                                                ),
+                                        acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                                            (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                                            (
+                                                cutlass.Float32(alpha_val),
+                                                cutlass.Float32(alpha_val),
                                             ),
-                                            (bias_gate_vec[i], bias_gate_vec[i + 1]),
                                         )
+                                        if cutlass.const_expr(self.use_bias):
+                                            acc_vec_up_alpha = (
+                                                cute.arch.add_packed_f32x2(
+                                                    acc_vec_up_alpha,
+                                                    (
+                                                        bias_up_vec[i],
+                                                        bias_up_vec[i + 1],
+                                                    ),
+                                                )
+                                            )
+                                            acc_vec_gate_alpha = (
+                                                cute.arch.add_packed_f32x2(
+                                                    acc_vec_gate_alpha,
+                                                    (
+                                                        bias_gate_vec[i],
+                                                        bias_gate_vec[i + 1],
+                                                    ),
+                                                )
+                                            )
                                         if cutlass.const_expr(
                                             self.swiglu_limit is not None
                                         ):
@@ -4201,14 +4232,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         )
                                 else:
                                     for i in cutlass.range_constexpr(n_eff):
-                                        acc_vec_up_alpha = (
-                                            acc_vec_up[i] * cutlass.Float32(alpha_val)
-                                            + bias_up_vec[i]
-                                        )
-                                        acc_vec_gate_alpha = (
-                                            acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                                            + bias_gate_vec[i]
-                                        )
+                                        acc_vec_up_alpha = acc_vec_up[
+                                            i
+                                        ] * cutlass.Float32(alpha_val)
+                                        acc_vec_gate_alpha = acc_vec_gate[
+                                            i
+                                        ] * cutlass.Float32(alpha_val)
+                                        if cutlass.const_expr(self.use_bias):
+                                            acc_vec_up_alpha += bias_up_vec[i]
+                                            acc_vec_gate_alpha += bias_gate_vec[i]
                                         if cutlass.const_expr(
                                             self.swiglu_limit is not None
                                         ):
@@ -6181,8 +6213,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: cute.Pointer,
-        bias_up_ptr: cute.Pointer,
-        bias_gate_ptr: cute.Pointer,
+        bias_up_ptr: Optional[cute.Pointer],
+        bias_gate_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
@@ -6231,9 +6263,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
         else:
             c_sf = None
-        if cutlass.const_expr(self.apply_expert_alpha):
+        if cutlass.const_expr(self.use_alpha):
+            assert alpha_ptr is not None
             alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
         else:
+            assert alpha_ptr is None
             alpha = None
 
         tile_idx_to_group_idx = cute.make_tensor(
@@ -6259,19 +6293,27 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         else:
             a_per_token_scale = None
 
-        bias_expert_stride = interm_size * self.bias_expert_stride_factor
-        bias_up = cute.make_tensor(
-            bias_up_ptr,
-            layout=cute.make_layout(
-                (m, interm_size, l), stride=(0, 1, bias_expert_stride)
-            ),
-        )
-        bias_gate = cute.make_tensor(
-            bias_gate_ptr,
-            layout=cute.make_layout(
-                (m, interm_size, l), stride=(0, 1, bias_expert_stride)
-            ),
-        )
+        if cutlass.const_expr(self.use_bias):
+            assert bias_up_ptr is not None
+            assert bias_gate_ptr is not None
+            bias_expert_stride = interm_size * self.bias_expert_stride_factor
+            bias_up = cute.make_tensor(
+                bias_up_ptr,
+                layout=cute.make_layout(
+                    (m, interm_size, l), stride=(0, 1, bias_expert_stride)
+                ),
+            )
+            bias_gate = cute.make_tensor(
+                bias_gate_ptr,
+                layout=cute.make_layout(
+                    (m, interm_size, l), stride=(0, 1, bias_expert_stride)
+                ),
+            )
+        else:
+            assert bias_up_ptr is None
+            assert bias_gate_ptr is None
+            bias_up = None
+            bias_gate = None
         return self(
             a,
             b,
@@ -6385,9 +6427,12 @@ def quantize_scaled_output(source, dtype, sf_dtype, sf_vec_size, global_scale):
         if dtype is cutlass.Float4E2M1FN
         else torch.finfo(cutlass.torch.dtype(dtype)).max
     )
-    scale = (blocks.abs().amax(dim=-1) * (global_scale / limit)).to(
-        cutlass.torch.dtype(sf_dtype)
-    )
+    ratio = blocks.abs().amax(dim=-1) * (global_scale / limit)
+    if sf_dtype is cutlass.Float8E8M0FNU:
+        # E8M0 rounds to the nearest power of two; rounding up avoids
+        # overflowing the output type (NaN for E4M3), matching the kernel.
+        ratio = torch.where(ratio > 0, torch.exp2(torch.ceil(torch.log2(ratio))), ratio)
+    scale = ratio.to(cutlass.torch.dtype(sf_dtype))
     scale_f32 = scale.float()
     multiplier = torch.where(
         scale_f32 == 0,
@@ -6772,9 +6817,9 @@ def run(
     vectorized_f32: bool = True,
     raster_along_m: bool = False,
     pdl_count: Optional[int] = -1,
-    expert_alpha_enabled: bool = True,
+    use_alpha: bool = True,
     expert_alpha_value: float = 1.0,
-    bias_enabled: bool = False,
+    use_bias: bool = False,
     bias_value: Optional[float] = None,
     combined_bias: bool = False,
     swiglu_alpha: float = 1.0,
@@ -6812,10 +6857,10 @@ def run(
     :param pdl_count: Persistent K-tile index at which to launch dependent
         grids. None disables PDL; -1 releases grids at kernel completion.
     :type pdl_count: Optional[int]
-    :param expert_alpha_enabled: Whether to apply per-expert alpha, defaults to True.
-    :type expert_alpha_enabled: bool, optional
-    :param bias_enabled: Whether to apply branch bias, defaults to False.
-    :type bias_enabled: bool, optional
+    :param use_alpha: Whether to apply per-expert alpha, defaults to True.
+    :type use_alpha: bool, optional
+    :param use_bias: Whether to apply branch bias, defaults to False.
+    :type use_bias: bool, optional
     :param generate_scaled_output: Whether to generate output block scales, defaults to False.
     :type generate_scaled_output: bool, optional
     :param use_compact_sfc: Whether swapped output scales use compact row-major
@@ -6880,7 +6925,7 @@ def run(
         raise ValueError("sf_vec_size=16 requires E4M3 scale factors")
     if sf_vec_size == 32 and sf_dtype is not cutlass.Float8E8M0FNU:
         raise ValueError("sf_vec_size=32 requires UE8M0 scale factors")
-    if bias_enabled and not gated:
+    if use_bias and not gated:
         raise ValueError("branch bias is only supported by the gated SwiGLU path")
     if swiglu_limit is not None and swiglu_limit <= 0:
         raise ValueError("swiglu_limit must be positive")
@@ -6959,12 +7004,11 @@ def run(
     print(f"Split K: {split_k}")
     print(f"Weight interleave: {weight_interleave}")
     print(
-        f"Expert alpha: {expert_alpha_enabled}"
-        + (f" ({expert_alpha_value})" if expert_alpha_enabled else "")
+        f"Expert alpha: {use_alpha}" + (f" ({expert_alpha_value})" if use_alpha else "")
     )
     print(
-        f"Bias: {bias_enabled}"
-        + (f" ({bias_value})" if bias_enabled and bias_value is not None else "")
+        f"Bias: {use_bias}"
+        + (f" ({bias_value})" if use_bias and bias_value is not None else "")
     )
     print(f"SwiGLU alpha: {swiglu_alpha}, beta: {swiglu_beta}, limit: {swiglu_limit}")
     print(f"Generate scaled output: {generate_scaled_output}")
@@ -7073,10 +7117,10 @@ def run(
                 dtype=torch.float32,
                 device=device,
             )
-            if expert_alpha_enabled
+            if use_alpha
             else None
         )
-        if bias_enabled and bias_value is None:
+        if use_bias and bias_value is None:
             bias_up = (
                 torch.randn(
                     (num_experts, intermediate_dim),
@@ -7094,7 +7138,7 @@ def run(
                 * 0.01
             )
         else:
-            fill = bias_value if bias_enabled else 0.0
+            fill = bias_value if use_bias else 0.0
             bias_up = torch.full(
                 (num_experts, intermediate_dim),
                 fill,
@@ -7141,8 +7185,12 @@ def run(
         mn_limit_ptr = make_ptr(cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), gmem)
         token_id_ptr = make_ptr(cutlass.Int32, token_id_mapping.data_ptr(), gmem)
         num_tiles_ptr = make_ptr(cutlass.Int32, num_non_exiting.data_ptr(), gmem)
-        bias_up_ptr = make_ptr(cutlass.Float32, bias_up.data_ptr(), gmem)
-        bias_gate_ptr = make_ptr(cutlass.Float32, bias_gate.data_ptr(), gmem)
+        bias_up_ptr = (
+            make_ptr(cutlass.Float32, bias_up.data_ptr(), gmem) if use_bias else None
+        )
+        bias_gate_ptr = (
+            make_ptr(cutlass.Float32, bias_gate.data_ptr(), gmem) if use_bias else None
+        )
 
         jit_args = cutlass.testing.JitArguments(
             a_ptr,
@@ -7213,7 +7261,8 @@ def run(
         weight_interleave=weight_interleave,
         gated=gated,
         swap_ab=swap_ab,
-        apply_expert_alpha=expert_alpha_enabled,
+        use_alpha=use_alpha,
+        use_bias=use_bias,
         activation_type=activation_type,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -7263,7 +7312,7 @@ def run(
                 valid_m,
                 intermediate_dim,
                 float(initial_tensors["global_scale"].item()),
-                not compact_sfc and (swap_ab or c_dtype is cutlass.Float4E2M1FN),
+                not compact_sfc,
             )
             if output_global_scale == 1.0:
                 _, expected_scale, expected = quantize_scaled_output(
@@ -7468,13 +7517,13 @@ if __name__ == "__main__":
         help="Physical up/gate weight interleave; defaults by swap mode",
     )
     parser.add_argument(
-        "--expert_alpha_enabled",
+        "--use_alpha",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument("--expert_alpha_value", type=float, default=1.0)
     parser.add_argument(
-        "--bias_enabled", action=argparse.BooleanOptionalAction, default=False
+        "--use_bias", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
         "--bias_value",
@@ -7537,9 +7586,9 @@ if __name__ == "__main__":
         args.vectorized_f32,
         args.raster_along_m,
         args.pdl_count,
-        args.expert_alpha_enabled,
+        args.use_alpha,
         args.expert_alpha_value,
-        args.bias_enabled,
+        args.use_bias,
         args.bias_value,
         args.swiglu_alpha,
         args.swiglu_beta,

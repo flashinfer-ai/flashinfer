@@ -2126,42 +2126,12 @@ class TestCuteDslMoeKernelAccuracy:
             split_k=split_k,
             use_compact_sfc=use_compact_sfc,
         )
-        bias_cases = [(bias_enabled, 0.25 if bias_enabled else None)]
-        canonical_bias_case = not is_matrix and case == (
-            QuantVariant.MXFP8,
-            8,
-            128,
-            True,
-            16,
-            1,
+        run_gemm1(
+            **run_kwargs,
+            gated=True,
+            use_bias=bias_enabled,
+            bias_value=0.25 if bias_enabled else None,
         )
-        if canonical_bias_case:
-            # Keep the bias contract inside one canonical kernel case: matched
-            # off/zero runs, signed constants, and deterministic independent
-            # up/gate tensors (bias_value=None).
-            bias_cases = [
-                (False, None),
-                (True, 0.0),
-                (True, 0.25),
-                (True, -0.25),
-                (True, None),
-            ]
-            with pytest.raises(ValueError, match="branch bias.*gated SwiGLU"):
-                run_gemm1(
-                    **run_kwargs,
-                    gated=False,
-                    bias_enabled=True,
-                    bias_value=0.25,
-                )
-
-        for case_bias_enabled, bias_value in bias_cases:
-            run_gemm1(
-                **run_kwargs,
-                gated=True,
-                bias_enabled=case_bias_enabled,
-                bias_value=bias_value,
-                combined_bias=canonical_bias_case and case_bias_enabled,
-            )
 
     @pytest.mark.parametrize(
         "case",
@@ -2293,21 +2263,84 @@ class TestCuteDslMoeKernelAccuracy:
             router_scale_value=router_scale_value,
             use_compact_sfb=use_compact_sfb,
         )
-        bias_cases = [(bias_enabled, 0.25 if bias_enabled else None)]
-        if not is_matrix and case == (QuantVariant.MXFP8, 8, 128, True):
-            # Mirror GEMM1's canonical bias sweep for the down projection.
-            bias_cases = [
-                (False, None),
-                (True, 0.0),
-                (True, 0.25),
-                (True, -0.25),
-                (True, None),
-            ]
-        for case_bias_enabled, bias_value in bias_cases:
-            run_gemm2(
-                **run_kwargs,
-                bias_enabled=case_bias_enabled,
-                bias_value=bias_value,
+        run_gemm2(
+            **run_kwargs,
+            use_bias=bias_enabled,
+            bias_value=0.25 if bias_enabled else None,
+        )
+
+    @pytest.mark.parametrize("stage", ["gemm1", "gemm2"])
+    @pytest.mark.parametrize("use_alpha", [False, True], ids=["no-alpha", "alpha"])
+    @pytest.mark.parametrize(
+        "use_bias,bias_value",
+        [
+            pytest.param(False, None, id="no-bias"),
+            pytest.param(True, 0.0, id="zero-bias"),
+            pytest.param(True, 0.25, id="positive-bias"),
+            pytest.param(True, -0.25, id="negative-bias"),
+            pytest.param(True, None, id="generated-bias"),
+        ],
+    )
+    def test_alpha_bias(self, stage, use_alpha, use_bias, bias_value):
+        import cutlass
+
+        common = dict(
+            num_tokens=64,
+            hidden_dim=128,
+            num_experts=2,
+            topk=2,
+            a_dtype=cutlass.Float8E4M3FN,
+            b_dtype=cutlass.Float4E2M1FN,
+            sf_dtype=cutlass.Float8E8M0FNU,
+            sf_vec_size=32,
+            mma_tiler_mn=(8, 128),
+            cluster_shape_mn=(1, 1),
+            tolerance=0.25,
+            warmup_iterations=0,
+            iterations=1,
+            swap_ab=True,
+            use_alpha=use_alpha,
+            use_bias=use_bias,
+            bias_value=bias_value,
+        )
+        if stage == "gemm1":
+            from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+                run as run_gemm,
+            )
+
+            if use_alpha and use_bias and bias_value == 0.25:
+                with pytest.raises(ValueError, match="branch bias.*gated SwiGLU"):
+                    run_gemm(
+                        **common,
+                        intermediate_dim=128,
+                        c_dtype=cutlass.BFloat16,
+                        a_major="k",
+                        b_major="k",
+                        c_major="n",
+                        gated=False,
+                    )
+            run_gemm(
+                **common,
+                intermediate_dim=128,
+                c_dtype=cutlass.BFloat16,
+                a_major="k",
+                b_major="k",
+                c_major="n",
+                combined_bias=use_bias,
+            )
+        else:
+            from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+                run as run_gemm,
+            )
+
+            run_gemm(
+                **common,
+                output_dim=128,
+                out_dtype=cutlass.BFloat16,
+                a_major="k",
+                b_major="k",
+                out_major="n",
+                router_scale_value=0.5,
             )
 
 
@@ -4310,7 +4343,8 @@ class TestMoeOutputMemsetInplaceContract:
 @cute_dsl_available
 @mxfp8_required
 @pytest.mark.parametrize(
-    "tactic,hidden_size,swiglu_alpha,swiglu_beta,swiglu_limit,check_contract",
+    "tactic,hidden_size,swiglu_alpha,swiglu_beta,swiglu_limit,"
+    "use_alpha,bias_values,check_contract",
     [
         pytest.param(
             (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
@@ -4319,7 +4353,53 @@ class TestMoeOutputMemsetInplaceContract:
             0.0,
             torch.finfo(torch.float32).max,
             True,
+            None,
+            True,
             id="n128-bias-off",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            256,
+            1.0,
+            0.0,
+            torch.finfo(torch.float32).max,
+            False,
+            None,
+            False,
+            id="n128-no-alpha",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            256,
+            1.0,
+            0.0,
+            torch.finfo(torch.float32).max,
+            True,
+            (0.0, 0.0),
+            False,
+            id="n128-zero-bias",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            256,
+            1.0,
+            0.0,
+            torch.finfo(torch.float32).max,
+            True,
+            (0.125, -0.25),
+            False,
+            id="n128-signed-bias",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            256,
+            1.0,
+            0.0,
+            torch.finfo(torch.float32).max,
+            True,
+            "generated",
+            False,
+            id="n128-generated-bias",
         ),
         pytest.param(
             (128, ((128, 128), (1, 1), False), ((128, 64), (1, 1), False)),
@@ -4327,6 +4407,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.25,
             0.5,
             10.0,
+            True,
+            None,
             False,
             id="n64-custom-bias",
         ),
@@ -4336,6 +4418,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.702,
             1.0,
             7.0,
+            True,
+            None,
             False,
             id="n192-2cta-oai",
         ),
@@ -4345,6 +4429,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.702,
             1.0,
             7.0,
+            True,
+            None,
             False,
             id="n128-2cta-oai",
         ),
@@ -4354,6 +4440,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.0,
             0.0,
             torch.finfo(torch.float32).max,
+            True,
+            None,
             False,
             id="n192-1cta",
         ),
@@ -4363,6 +4451,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.25,
             0.5,
             10.0,
+            True,
+            None,
             False,
             id="n64-2cta-custom-bias",
         ),
@@ -4372,6 +4462,8 @@ class TestMoeOutputMemsetInplaceContract:
             1.702,
             1.0,
             7.0,
+            True,
+            None,
             False,
             id="n192-partial-oai",
         ),
@@ -4384,6 +4476,8 @@ def test_w4a8_fused_moe_tactics_and_apis(
     swiglu_alpha,
     swiglu_beta,
     swiglu_limit,
+    use_alpha,
+    bias_values,
     check_contract,
 ):
     from flashinfer import (
@@ -4455,6 +4549,29 @@ def test_w4a8_fused_moe_tactics_and_apis(
         w2_weight_sf=view["w2_weight_sf"],
         w2_alpha=view["w2_alpha"],
     )
+    if not use_alpha:
+        inputs.update(w1_alpha=None, w2_alpha=None)
+    bias_shapes = (
+        (num_experts, 2 * intermediate_size),
+        (num_experts, hidden_size),
+    )
+    if bias_values == "generated":
+        gemm1_bias, gemm2_bias = (
+            torch.linspace(start, end, shape[0] * shape[1], device=device).reshape(
+                shape
+            )
+            for shape, (start, end) in zip(
+                bias_shapes, ((-0.2, 0.2), (0.15, -0.15)), strict=True
+            )
+        )
+    elif bias_values is not None:
+        gemm1_bias, gemm2_bias = (
+            torch.full(shape, value, device=device)
+            for shape, value in zip(bias_shapes, bias_values, strict=True)
+        )
+    else:
+        gemm1_bias = gemm2_bias = None
+    bias_kwargs = dict(w1_bias=gemm1_bias, w2_bias=gemm2_bias)
     monkeypatch.setattr(
         AutoTuner,
         "choose_one",
@@ -4470,23 +4587,9 @@ def test_w4a8_fused_moe_tactics_and_apis(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        **bias_kwargs,
         enable_pdl=False,
     )
-    deprecated_inputs = dict(inputs)
-    deprecated_inputs.pop("fc2_input_scale")
-    deprecated_api_kwargs = dict(
-        num_experts=num_experts,
-        top_k=top_k,
-        tactic=tactic,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        enable_pdl=False,
-    )
-    with pytest.warns(DeprecationWarning, match="cute_dsl_fused_moe_mxfp8_mxfp4"):
-        deprecated_functional = cute_dsl_fused_moe_mxfp8_mxfp4(
-            **deprecated_inputs, **deprecated_api_kwargs
-        )
     wrapper = CuteDslMoEWrapper(
         num_experts=num_experts,
         top_k=top_k,
@@ -4499,126 +4602,82 @@ def test_w4a8_fused_moe_tactics_and_apis(
         swiglu_limit=swiglu_limit,
         enable_pdl=False,
     )
-    wrapped = wrapper.run(**inputs, tactic=tactic)
-    with pytest.warns(DeprecationWarning, match="CuteDslMxfp8Mxfp4MoEWrapper"):
-        deprecated_wrapper = CuteDslMxfp8Mxfp4MoEWrapper(
+    wrapped = wrapper.run(**inputs, tactic=tactic, **bias_kwargs)
+    torch.testing.assert_close(functional, wrapped, atol=0.5, rtol=0.05)
+    if check_contract:
+        import inspect
+
+        deprecated_inputs = dict(inputs)
+        deprecated_inputs.pop("fc2_input_scale")
+        deprecated_api_kwargs = dict(
             num_experts=num_experts,
             top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+            tactic=tactic,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             enable_pdl=False,
         )
-    deprecated_wrapped = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
-    torch.testing.assert_close(functional, wrapped, atol=0.5, rtol=0.05)
-    torch.testing.assert_close(functional, deprecated_functional, atol=0.5, rtol=0.05)
-    torch.testing.assert_close(functional, deprecated_wrapped, atol=0.5, rtol=0.05)
-    if check_contract:
-        import inspect
+        with pytest.warns(
+            DeprecationWarning, match="cute_dsl_fused_moe_mxfp8_mxfp4"
+        ):
+            deprecated_functional = cute_dsl_fused_moe_mxfp8_mxfp4(
+                **deprecated_inputs,
+                **deprecated_api_kwargs,
+            )
+        with pytest.warns(DeprecationWarning, match="CuteDslMxfp8Mxfp4MoEWrapper"):
+            deprecated_wrapper = CuteDslMxfp8Mxfp4MoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                enable_pdl=False,
+            )
+        deprecated_wrapped = deprecated_wrapper.run(
+            **deprecated_inputs,
+            tactic=tactic,
+        )
+        torch.testing.assert_close(
+            functional, deprecated_functional, atol=0.5, rtol=0.05
+        )
+        torch.testing.assert_close(
+            functional, deprecated_wrapped, atol=0.5, rtol=0.05
+        )
 
         functional_params = inspect.signature(cute_dsl_fused_moe_mxfp8_mxfp4).parameters
         wrapper_params = inspect.signature(CuteDslMxfp8Mxfp4MoEWrapper.run).parameters
         assert "fc2_input_scale" not in functional_params
         assert "fc2_input_scale" not in wrapper_params
-        for name in ("tactic", "gemm1_bias", "gemm2_bias"):
-            assert name in functional_params
-            assert name in wrapper_params
-
-        bias_shapes = (
-            (num_experts, 2 * intermediate_size),
-            (num_experts, hidden_size),
-        )
-        for bias_values in ((0.0, 0.0), (0.125, -0.25), None):
-            if bias_values is None:
-                gemm1_bias, gemm2_bias = (
-                    torch.linspace(
-                        start, end, shape[0] * shape[1], device=device
-                    ).reshape(shape)
-                    for shape, (start, end) in zip(
-                        bias_shapes, ((-0.2, 0.2), (0.15, -0.15)), strict=True
-                    )
-                )
-            else:
-                gemm1_bias, gemm2_bias = (
-                    torch.full(shape, value, device=device)
-                    for shape, value in zip(bias_shapes, bias_values, strict=True)
-                )
-            biased = cute_dsl_fused_moe(
-                **inputs,
-                num_experts=num_experts,
-                top_k=top_k,
-                activation_format=QuantVariant.MXFP8,
-                weight_format=QuantVariant.MXFP4,
-                tactic=tactic,
-                gemm1_bias=gemm1_bias,
-                gemm2_bias=gemm2_bias,
-                enable_pdl=False,
-            )
-            biased_wrapped = wrapper.run(
-                **inputs,
-                tactic=tactic,
-                gemm1_bias=gemm1_bias,
-                gemm2_bias=gemm2_bias,
-            )
-            biased_reference = compute_reference_moe_fp4(
-                hidden_states=x_bf16,
-                gemm1_weights=w1,
-                gemm2_weights=w2,
-                token_selected_experts=topk_ids,
-                token_final_scales=topk_weights,
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                gemm1_bias=gemm1_bias,
-                gemm2_bias=gemm2_bias,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-            )
-            torch.testing.assert_close(biased, biased_wrapped, atol=0.5, rtol=0.05)
-            passed, percent_within, atol = check_accuracy(
-                biased, biased_reference, percent_threshold=0.95
-            )
-            assert passed, (
-                f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
-            )
-        with pytest.warns(DeprecationWarning):
-            deprecated_biased = cute_dsl_fused_moe_mxfp8_mxfp4(
-                **deprecated_inputs,
-                **deprecated_api_kwargs,
-                gemm1_bias=gemm1_bias,
-                gemm2_bias=gemm2_bias,
-            )
-        deprecated_biased_wrapped = deprecated_wrapper.run(
-            **deprecated_inputs,
-            tactic=tactic,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
-        )
-        torch.testing.assert_close(biased, deprecated_biased, atol=0.5, rtol=0.05)
-        torch.testing.assert_close(
-            biased, deprecated_biased_wrapped, atol=0.5, rtol=0.05
-        )
+        assert "tactic" in functional_params
+        assert "tactic" in wrapper_params
 
         snapshot = deprecated_wrapped.clone()
-        rerun = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
+        rerun = deprecated_wrapper.run(
+            **deprecated_inputs,
+            tactic=tactic,
+        )
         assert torch.equal(snapshot, deprecated_wrapped)
         torch.testing.assert_close(functional, rerun, atol=0.5, rtol=0.05)
 
         smaller_inputs = dict(deprecated_inputs)
         for name in ("x", "x_sf", "token_selected_experts", "token_final_scales"):
             smaller_inputs[name] = smaller_inputs[name][:9]
-        smaller = deprecated_wrapper.run(**smaller_inputs, tactic=tactic)
+        smaller = deprecated_wrapper.run(
+            **smaller_inputs,
+            tactic=tactic,
+        )
         assert smaller.shape == (9, hidden_size)
         assert torch.isfinite(smaller).all()
 
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
-            streamed = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
+            streamed = deprecated_wrapper.run(
+                **deprecated_inputs,
+                tactic=tactic,
+            )
         stream.synchronize()
         assert streamed.shape == functional.shape
 
@@ -4655,25 +4714,45 @@ def test_w4a8_fused_moe_tactics_and_apis(
             pytest.raises(ValueError, match="MMA scale strides"),
         ):
             cute_dsl_fused_moe_mxfp8_mxfp4(**bad_inputs, **deprecated_api_kwargs)
-    reference = compute_reference_moe_fp4(
-        hidden_states=x_bf16,
-        gemm1_weights=w1,
-        gemm2_weights=w2,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
-        num_tokens=num_tokens,
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-    )
-    passed, percent_within, atol = check_accuracy(
-        functional, reference, percent_threshold=0.94
-    )
-    assert passed, f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
+    if use_alpha:
+        reference = compute_reference_moe_fp4(
+            hidden_states=x_bf16,
+            gemm1_weights=w1,
+            gemm2_weights=w2,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gemm1_bias=gemm1_bias,
+            gemm2_bias=gemm2_bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+        passed, percent_within, atol = check_accuracy(functional, reference)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
+        )
+    else:
+        unit_alpha_inputs = dict(
+            inputs,
+            w1_alpha=torch.ones(num_experts, dtype=torch.float32, device=device),
+            w2_alpha=torch.ones(num_experts, dtype=torch.float32, device=device),
+        )
+        unit_alpha = cute_dsl_fused_moe(
+            **unit_alpha_inputs,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_format=QuantVariant.MXFP8,
+            weight_format=QuantVariant.MXFP4,
+            tactic=tactic,
+            **bias_kwargs,
+            enable_pdl=False,
+        )
+        torch.testing.assert_close(functional, unit_alpha, atol=0.5, rtol=0.05)
 
 
 if __name__ == "__main__":

@@ -141,10 +141,12 @@ def validate_w4a8_inputs(
     token_final_scales: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
+    w1_bias: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
+    w2_bias: Optional[torch.Tensor],
     moe_output: Optional[torch.Tensor],
 ) -> None:
     """Validate mixed-format contracts not checked by the GEMM entry points."""
@@ -182,8 +184,22 @@ def validate_w4a8_inputs(
                 f"{name} must use MMA scale strides {strides}, shape {shape}"
             )
     for name, alpha in (("w1_alpha", w1_alpha), ("w2_alpha", w2_alpha)):
-        if alpha.dtype is not torch.float32:
+        if alpha is not None and alpha.dtype is not torch.float32:
             raise TypeError(f"{name} must have dtype torch.float32")
+    for name, bias, expected_shape in (
+        ("w1_bias", w1_bias, w1_weight.shape[:2]),
+        ("w2_bias", w2_bias, w2_weight.shape[:2]),
+    ):
+        if bias is None:
+            continue
+        if tuple(bias.shape) != tuple(expected_shape):
+            raise ValueError(f"{name} must have shape {tuple(expected_shape)}")
+        if bias.dtype is not torch.float32:
+            raise TypeError(f"{name} must have dtype torch.float32")
+        if bias.device != x.device:
+            raise ValueError(f"{name} must be on the same device as x")
+        if not bias.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     if moe_output is not None and moe_output.dtype is not torch.bfloat16:
         raise TypeError("moe_output must have dtype torch.bfloat16")
 
@@ -198,19 +214,19 @@ def _moe_core_impl(
     # GEMM1 weights
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
+    w1_bias: Optional[torch.Tensor],
     # GEMM2 intermediate scale
     fc2_input_scale: Optional[torch.Tensor],
     # GEMM2 weights
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
+    w2_bias: Optional[torch.Tensor],
     # MoE config
     num_experts: int,
     top_k: int,
     num_local_experts: int,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
     local_expert_offset: int = 0,
     # Tactic parameters (Blackwell)
     tile_size: int = 128,
@@ -263,17 +279,17 @@ def _moe_core_impl(
         w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
             single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
-        w1_alpha: Per-expert global scale for GEMM1.
+        w1_alpha: Optional per-expert global scale for GEMM1.
+        w1_bias: Optional per-expert FC1 bias.
         fc2_input_scale: Global scale for W4A4 GEMM2 input quantization;
             must be None for W4A8.
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
-        w2_alpha: Per-expert global scale for GEMM2.
+        w2_alpha: Optional per-expert global scale for GEMM2.
+        w2_bias: Optional per-expert FC2 bias.
         num_experts: Total number of experts.
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for EP).
-        gemm1_bias: Optional per-expert FC1 bias.
-        gemm2_bias: Optional per-expert FC2 bias.
         local_expert_offset: Expert offset for EP.
         tile_size: Tile size for moe_sort.
         gemm1_mma_tiler_mn: GEMM1 MMA tiler shape.
@@ -336,38 +352,38 @@ def _moe_core_impl(
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
 
-    if gemm1_bias is not None:
+    if w1_bias is not None:
         expected_shape = (num_local_experts, w1_weight.size(1))
-        if tuple(gemm1_bias.shape) != expected_shape:
+        if tuple(w1_bias.shape) != expected_shape:
             raise ValueError(
-                f"gemm1_bias must have shape {expected_shape}, "
-                f"got {tuple(gemm1_bias.shape)}"
+                f"w1_bias must have shape {expected_shape}, "
+                f"got {tuple(w1_bias.shape)}"
             )
-        if gemm1_bias.dtype is not torch.float32:
-            raise TypeError("gemm1_bias must have dtype torch.float32")
-        if gemm1_bias.device != x.device:
-            raise ValueError("gemm1_bias must be on the same device as x")
-        if not gemm1_bias.is_contiguous():
-            raise ValueError("gemm1_bias must be contiguous")
+        if w1_bias.dtype is not torch.float32:
+            raise TypeError("w1_bias must have dtype torch.float32")
+        if w1_bias.device != x.device:
+            raise ValueError("w1_bias must be on the same device as x")
+        if not w1_bias.is_contiguous():
+            raise ValueError("w1_bias must be contiguous")
         if gated:
-            bias_up, bias_gate = gemm1_bias.chunk(2, dim=1)
+            bias_up, bias_gate = w1_bias.chunk(2, dim=1)
         else:
-            bias_up, bias_gate = gemm1_bias, None
+            bias_up, bias_gate = w1_bias, None
     else:
         bias_up = bias_gate = None
-    if gemm2_bias is not None:
+    if w2_bias is not None:
         expected_shape = (num_local_experts, hidden_size)
-        if tuple(gemm2_bias.shape) != expected_shape:
+        if tuple(w2_bias.shape) != expected_shape:
             raise ValueError(
-                f"gemm2_bias must have shape {expected_shape}, "
-                f"got {tuple(gemm2_bias.shape)}"
+                f"w2_bias must have shape {expected_shape}, "
+                f"got {tuple(w2_bias.shape)}"
             )
-        if gemm2_bias.dtype is not torch.float32:
-            raise TypeError("gemm2_bias must have dtype torch.float32")
-        if gemm2_bias.device != x.device:
-            raise ValueError("gemm2_bias must be on the same device as x")
-        if not gemm2_bias.is_contiguous():
-            raise ValueError("gemm2_bias must be contiguous")
+        if w2_bias.dtype is not torch.float32:
+            raise TypeError("w2_bias must have dtype torch.float32")
+        if w2_bias.device != x.device:
+            raise ValueError("w2_bias must be on the same device as x")
+        if not w2_bias.is_contiguous():
+            raise ValueError("w2_bias must be contiguous")
 
     if moe_output is None:
         moe_output = torch.empty(
@@ -415,7 +431,7 @@ def _moe_core_impl(
     # enters the cluster barrier while the other skips it.
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
     if is_rubin:
-        if gemm1_bias is not None or gemm2_bias is not None:
+        if w1_bias is not None or w2_bias is not None:
             raise ValueError("fused expert bias is not supported on SM107")
         kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
     else:
@@ -532,7 +548,7 @@ def _moe_core_impl(
         token_final_scales=token_final_scales,
         out=gemm2_output,
         a_per_token_scale=intermediate_per_token_scale,
-        down_bias=gemm2_bias,
+        down_bias=w2_bias,
         a_dtype=a_dtype,
         b_dtype="float4_e2m1fn",
         sf_dtype=sf_dtype,
@@ -873,16 +889,16 @@ class CuteDslMoEWrapper:
         token_final_scales: torch.Tensor,
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
+        w1_alpha: Optional[torch.Tensor],
+        w1_bias: Optional[torch.Tensor],
         fc2_input_scale: Optional[torch.Tensor],
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
-        w2_alpha: torch.Tensor,
+        w2_alpha: Optional[torch.Tensor],
+        w2_bias: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         num_local_experts: int,
-        gemm1_bias: Optional[torch.Tensor] = None,
-        gemm2_bias: Optional[torch.Tensor] = None,
         local_expert_offset: int = 0,
         tile_size: int = 128,
         gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
@@ -910,15 +926,15 @@ class CuteDslMoEWrapper:
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
+            w1_bias=w1_bias,
             fc2_input_scale=fc2_input_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
+            w2_bias=w2_bias,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
             local_expert_offset=local_expert_offset,
             tile_size=tile_size,
             gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
@@ -958,16 +974,16 @@ class CuteDslMoEWrapper:
         token_final_scales: torch.Tensor,
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
+        w1_alpha: Optional[torch.Tensor],
         fc2_input_scale: Optional[torch.Tensor],
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
-        w2_alpha: torch.Tensor,
+        w2_alpha: Optional[torch.Tensor],
         tactic: Optional[Tuple] = None,
         *,
         per_token_scale: Optional[torch.Tensor] = None,
-        gemm1_bias: Optional[torch.Tensor] = None,
-        gemm2_bias: Optional[torch.Tensor] = None,
+        w1_bias: Optional[torch.Tensor] = None,
+        w2_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL fused-MoE forward pass.
 
@@ -991,8 +1007,8 @@ class CuteDslMoEWrapper:
             projection for non-gated activations).
         w1_weight_sf : torch.Tensor
             Scale factors for ``w1_weight``.
-        w1_alpha : torch.Tensor
-            Per-expert global scale for GEMM1.
+        w1_alpha : Optional[torch.Tensor]
+            Optional per-expert global scale for GEMM1; required for W4A16.
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for W4A4 GEMM2 input quantization; must be ``None``
             for W4A8 and W4A16.
@@ -1000,17 +1016,17 @@ class CuteDslMoEWrapper:
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
             Scale factors for ``w2_weight``.
-        w2_alpha : torch.Tensor
-            Per-expert global scale for GEMM2.
+        w2_alpha : Optional[torch.Tensor]
+            Optional per-expert global scale for GEMM2; required for W4A16.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
-        gemm1_bias : Optional[torch.Tensor]
+        w1_bias : Optional[torch.Tensor]
             Optional per-expert FC1 bias with the same first two dimensions as
             ``w1_weight``.
-        gemm2_bias : Optional[torch.Tensor]
+        w2_bias : Optional[torch.Tensor]
             Optional per-expert FC2 bias of shape
             ``[num_local_experts, hidden_size]``.
 
@@ -1039,9 +1055,11 @@ class CuteDslMoEWrapper:
                 w1_weight,
                 w1_weight_sf,
                 w1_alpha,
+                w1_bias,
                 w2_weight,
                 w2_weight_sf,
                 w2_alpha,
+                w2_bias,
                 None,
             )
         elif (
@@ -1061,6 +1079,10 @@ class CuteDslMoEWrapper:
                 "W4A16 requires token_final_scales.dtype=torch.float32, "
                 f"got {token_final_scales.dtype}"
             )
+        if self.activation_format is QuantVariant.BF16 and (
+            w1_alpha is None or w2_alpha is None
+        ):
+            raise ValueError("w1_alpha and w2_alpha are required when format is W4A16")
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
@@ -1089,12 +1111,12 @@ class CuteDslMoEWrapper:
                 w1_weight,
                 w1_weight_sf,
                 w1_alpha,
+                w1_bias,
                 fc2_input_scale,
                 w2_weight,
                 w2_weight_sf,
                 w2_alpha,
-                gemm1_bias,
-                gemm2_bias,
+                w2_bias,
             ]
             if use_per_token_activation:
                 inputs.append(per_token_scale)
@@ -1104,12 +1126,12 @@ class CuteDslMoEWrapper:
                 x_sf is not None
                 or fc2_input_scale is not None
                 or per_token_scale is not None
-                or gemm1_bias is not None
-                or gemm2_bias is not None
+                or w1_bias is not None
+                or w2_bias is not None
             ):
                 raise ValueError(
-                    "x_sf, fc2_input_scale, per_token_scale, gemm1_bias, and "
-                    "gemm2_bias must be None when format is W4A16"
+                    "x_sf, fc2_input_scale, per_token_scale, w1_bias, and "
+                    "w2_bias must be None when format is W4A16"
                 )
             runner = self._w4a16_runner
             inputs = [
@@ -1165,16 +1187,16 @@ def _cute_dsl_fused_moe_impl(
     token_final_scales: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
+    w1_bias: Optional[torch.Tensor],
     fc2_input_scale: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
+    w2_bias: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     num_local_experts: int,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
     local_expert_offset: int = 0,
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
@@ -1208,15 +1230,15 @@ def _cute_dsl_fused_moe_impl(
         w1_weight=w1_weight,
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
+        w1_bias=w1_bias,
         fc2_input_scale=fc2_input_scale,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
+        w2_bias=w2_bias,
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
-        gemm1_bias=gemm1_bias,
-        gemm2_bias=gemm2_bias,
         local_expert_offset=local_expert_offset,
         tile_size=tile_size,
         gemm1_mma_tiler_mn=gemm1_mma_tiler_mn,
@@ -1252,11 +1274,11 @@ def cute_dsl_fused_moe(
     token_final_scales: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_alpha: Optional[torch.Tensor],
     fc2_input_scale: Optional[torch.Tensor],
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_alpha: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     num_local_experts: Optional[int] = None,
@@ -1266,14 +1288,14 @@ def cute_dsl_fused_moe(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     *,
     quant_mode: Optional[str] = None,
     activation_format: QuantVariant = QuantVariant.NVFP4,
@@ -1308,8 +1330,8 @@ def cute_dsl_fused_moe(
         projection for non-gated activations).
     w1_weight_sf : torch.Tensor
         Scale factors for ``w1_weight``.
-    w1_alpha : torch.Tensor
-        Per-expert global scale for GEMM1.
+    w1_alpha : Optional[torch.Tensor]
+        Optional per-expert global scale for GEMM1; required for W4A16.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
         W4A8 and W4A16.
@@ -1317,8 +1339,8 @@ def cute_dsl_fused_moe(
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
         Scale factors for ``w2_weight``.
-    w2_alpha : torch.Tensor
-        Per-expert global scale for GEMM2.
+    w2_alpha : Optional[torch.Tensor]
+        Optional per-expert global scale for GEMM2; required for W4A16.
     num_experts : int
         Total number of experts.
     top_k : int
@@ -1339,12 +1361,6 @@ def cute_dsl_fused_moe(
         main computation.
     enable_pdl : bool
         Enable Programmatic Dependent Launch.  Defaults to ``True``.
-    gemm1_bias : Optional[torch.Tensor]
-        Optional per-expert FC1 bias with shape
-        ``[num_local_experts, gemm1_out_size]``.
-    gemm2_bias : Optional[torch.Tensor]
-        Optional per-expert FC2 bias with shape
-        ``[num_local_experts, hidden_size]``.
     activation_type : int
         FC1 activation type. Use ``ActivationType.Swiglu`` for gated
         SwiGLU/SiTU, ``ActivationType.GegluTanh`` for tanh-approximate GeGLU,
@@ -1364,6 +1380,12 @@ def cute_dsl_fused_moe(
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
     situ_linear_beta : Optional[float]
         Optional SiTU tanh clamp for the up branch.
+    w1_bias : Optional[torch.Tensor]
+        Optional per-expert FC1 bias with shape
+        ``[num_local_experts, gemm1_out_size]``.
+    w2_bias : Optional[torch.Tensor]
+        Optional per-expert FC2 bias with shape
+        ``[num_local_experts, hidden_size]``.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
     tactic : Optional[Tuple]
@@ -1430,9 +1452,11 @@ def cute_dsl_fused_moe(
             w1_weight,
             w1_weight_sf,
             w1_alpha,
+            w1_bias,
             w2_weight,
             w2_weight_sf,
             w2_alpha,
+            w2_bias,
             moe_output,
         )
     elif activation_format is QuantVariant.NVFP4:
@@ -1445,6 +1469,10 @@ def cute_dsl_fused_moe(
             "W4A16 requires token_final_scales.dtype=torch.float32, "
             f"got {token_final_scales.dtype}"
         )
+    if activation_format is QuantVariant.BF16 and (
+        w1_alpha is None or w2_alpha is None
+    ):
+        raise ValueError("w1_alpha and w2_alpha are required when format is W4A16")
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -1494,12 +1522,12 @@ def cute_dsl_fused_moe(
             w1_weight,
             w1_weight_sf,
             w1_alpha,
+            w1_bias,
             fc2_input_scale,
             w2_weight,
             w2_weight_sf,
             w2_alpha,
-            gemm1_bias,
-            gemm2_bias,
+            w2_bias,
         ]
         if use_per_token_activation:
             inputs.append(per_token_scale)
@@ -1510,12 +1538,12 @@ def cute_dsl_fused_moe(
             x_sf is not None
             or fc2_input_scale is not None
             or per_token_scale is not None
-            or gemm1_bias is not None
-            or gemm2_bias is not None
+            or w1_bias is not None
+            or w2_bias is not None
         ):
             raise ValueError(
-                "x_sf, fc2_input_scale, per_token_scale, gemm1_bias, and "
-                "gemm2_bias must be None when format is W4A16"
+                "x_sf, fc2_input_scale, per_token_scale, w1_bias, and "
+                "w2_bias must be None when format is W4A16"
             )
         runner = CuteDslFusedMoEW4A16Runner(
             num_experts=num_experts,
@@ -1596,8 +1624,6 @@ def cute_dsl_fused_moe_nvfp4(
     *,
     quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1639,8 +1665,6 @@ def cute_dsl_fused_moe_nvfp4(
         moe_output,
         aux_stream,
         enable_pdl,
-        gemm1_bias,
-        gemm2_bias,
         activation_type,
         swiglu_alpha,
         swiglu_beta,
@@ -1678,8 +1702,6 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MoE with MXFP8 activations and packed MXFP4 weights.
 
@@ -1720,8 +1742,6 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
         moe_output,
         aux_stream,
         enable_pdl,
-        gemm1_bias,
-        gemm2_bias,
         activation_type,
         swiglu_alpha,
         swiglu_beta,
@@ -1819,8 +1839,6 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple[Any, ...]] = None,
-        gemm1_bias: Optional[torch.Tensor] = None,
-        gemm2_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the MXFP8 x MXFP4 fused-MoE forward pass.
 
@@ -1848,8 +1866,6 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
             w2_weight_sf,
             w2_alpha,
             tactic,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
         )
 
 

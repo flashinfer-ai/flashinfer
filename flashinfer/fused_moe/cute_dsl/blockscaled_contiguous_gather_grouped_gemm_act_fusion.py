@@ -277,7 +277,8 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
-    apply_expert_alpha: bool = True,
+    use_alpha: bool = True,
+    use_bias: bool = False,
     bias_expert_stride_factor: int = 1,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
@@ -302,6 +303,16 @@ def _get_compiled_gather_kernel(
     )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if is_rubin and use_bias:
+        raise NotImplementedError(
+            "gemm1 bias is not supported by the Rubin (SM107) "
+            "gather grouped GEMM kernel yet."
+        )
+    if is_rubin and not use_alpha:
+        raise NotImplementedError(
+            "disabling GEMM1 alpha is not supported by the Rubin (SM107) "
+            "gather grouped GEMM kernel yet."
+        )
 
     cache_key = (
         "sm107" if is_rubin else "sm100",
@@ -331,7 +342,8 @@ def _get_compiled_gather_kernel(
         situ_linear_beta,
         gated,
         use_a_per_token_scale,
-        apply_expert_alpha,
+        use_alpha,
+        use_bias,
         bias_expert_stride_factor,
     )
 
@@ -394,7 +406,8 @@ def _get_compiled_gather_kernel(
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
-                apply_expert_alpha=apply_expert_alpha,
+                use_alpha=use_alpha,
+                use_bias=use_bias,
                 bias_expert_stride_factor=bias_expert_stride_factor,
             )
         wrapper_fn = gemm.wrapper
@@ -525,8 +538,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
-        bias_up: Optional per-expert bias for the up-projection branch.
-        bias_gate: Optional per-expert bias for the gate-projection branch.
+        bias_up: Optional per-expert bias for the up-projection branch. Must be
+            provided together with ``bias_gate``.
+        bias_gate: Optional per-expert bias for the gate-projection branch. Must
+            be provided together with ``bias_up``.
         topk: Number of experts per token. Default: 8
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
@@ -852,29 +867,35 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         c_sf_ptr = None
         norm_const_ptr = None
 
-    apply_expert_alpha = alpha is not None
+    use_alpha = alpha is not None
     alpha_ptr = (
         make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
-        if apply_expert_alpha
+        if use_alpha
         else None
     )
-    if bias_up is None:
-        bias_up = torch.zeros(
-            (num_experts, intermediate_size), dtype=torch.float32, device=a.device
+    if (bias_up is None) != (bias_gate is None):
+        raise ValueError("bias_up and bias_gate must be provided together")
+    use_bias = bias_up is not None
+    if use_bias:
+        if bias_up.stride() != bias_gate.stride() or bias_up.stride(1) != 1:
+            raise ValueError(
+                "bias_up and bias_gate must use matching row-major strides"
+            )
+        bias_expert_stride_factor, remainder = divmod(
+            bias_up.stride(0), intermediate_size
         )
-    if bias_gate is None:
-        bias_gate = torch.zeros(
-            (num_experts, intermediate_size), dtype=torch.float32, device=a.device
+        if remainder or bias_expert_stride_factor not in (1, 2):
+            raise ValueError("bias expert stride must be intermediate_size or twice it")
+        bias_up_ptr = make_ptr(
+            cutlass.Float32, bias_up.data_ptr(), cute.AddressSpace.gmem
         )
-    if bias_up.stride() != bias_gate.stride() or bias_up.stride(1) != 1:
-        raise ValueError("bias_up and bias_gate must use matching row-major strides")
-    bias_expert_stride_factor, remainder = divmod(bias_up.stride(0), intermediate_size)
-    if remainder or bias_expert_stride_factor not in (1, 2):
-        raise ValueError("bias expert stride must be intermediate_size or twice it")
-    bias_up_ptr = make_ptr(cutlass.Float32, bias_up.data_ptr(), cute.AddressSpace.gmem)
-    bias_gate_ptr = make_ptr(
-        cutlass.Float32, bias_gate.data_ptr(), cute.AddressSpace.gmem
-    )
+        bias_gate_ptr = make_ptr(
+            cutlass.Float32, bias_gate.data_ptr(), cute.AddressSpace.gmem
+        )
+    else:
+        bias_expert_stride_factor = 1
+        bias_up_ptr = None
+        bias_gate_ptr = None
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -954,7 +975,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
-        apply_expert_alpha=apply_expert_alpha,
+        use_alpha=use_alpha,
+        use_bias=use_bias,
     )
 
     # Execute kernel with runtime parameters.

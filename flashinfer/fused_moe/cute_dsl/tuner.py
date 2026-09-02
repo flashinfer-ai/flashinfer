@@ -1004,6 +1004,13 @@ class CuteDslFusedMoERunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        if len(inputs) > 12:
+            w1_alpha = inputs[6]
+            w1_bias = inputs[7]
+            w2_alpha = inputs[11]
+            w2_bias = inputs[12]
+        else:
+            w1_alpha = w1_bias = w2_alpha = w2_bias = None
         return (
             self.activation_format,
             self.weight_format,
@@ -1025,6 +1032,10 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.gemm2_pdl_count,
             self.gemm1_split_k,
             self.weight_interleave,
+            w1_alpha is not None,
+            w2_alpha is not None,
+            w1_bias is not None,
+            w2_bias is not None,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -1467,8 +1478,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         Args:
             inputs: List of input tensors:
                 [x, x_sf, token_selected_experts, token_final_scales,
-                 w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                 w2_weight, w2_weight_sf, w2_alpha, gemm1_bias, gemm2_bias,
+                 w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale,
+                 w2_weight, w2_weight_sf, w2_alpha, w2_bias,
                  per_token_scale (optional), moe_output (optional)]
             tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
             do_preparation: If True, perform one-time setup (not used).
@@ -1490,12 +1501,12 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_weight,
             w1_weight_sf,
             w1_alpha,
+            w1_bias,
             fc2_input_scale,
             w2_weight,
             w2_weight_sf,
             w2_alpha,
-            gemm1_bias,
-            gemm2_bias,
+            w2_bias,
             *optional_inputs,
         ) = inputs
 
@@ -1518,12 +1529,12 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
+            w1_bias=w1_bias,
             fc2_input_scale=fc2_input_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
+            w2_bias=w2_bias,
             num_experts=self.num_experts,
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,

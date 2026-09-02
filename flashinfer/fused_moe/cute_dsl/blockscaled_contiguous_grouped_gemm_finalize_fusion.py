@@ -225,7 +225,8 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
-    apply_expert_alpha: bool = True,
+    use_alpha: bool = True,
+    use_bias: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -242,6 +243,16 @@ def _get_compiled_finalize_kernel(
     global _finalize_kernel_cache
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if is_rubin and use_bias:
+        raise NotImplementedError(
+            "gemm 2 bias is not supported by the Rubin (SM107) "
+            "finalize grouped GEMM kernel yet."
+        )
+    if is_rubin and not use_alpha:
+        raise NotImplementedError(
+            "disabling GEMM2 alpha is not supported by the Rubin (SM107) "
+            "finalize grouped GEMM kernel yet."
+        )
 
     # Cache key includes tactic and pointer dtype parameters, NOT problem dimensions.
     cache_key = (
@@ -263,7 +274,8 @@ def _get_compiled_finalize_kernel(
         use_compact_sf,
         use_a_per_token_scale,
         use_fused_finalize,
-        apply_expert_alpha,
+        use_alpha,
+        use_bias,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -316,7 +328,8 @@ def _get_compiled_finalize_kernel(
                 use_compact_sfb=use_compact_sf,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
-                apply_expert_alpha=apply_expert_alpha,
+                use_alpha=use_alpha,
+                use_bias=use_bias,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -650,10 +663,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         out_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
 
-    apply_expert_alpha = alpha is not None
+    use_alpha = alpha is not None
     alpha_ptr = (
         make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
-        if apply_expert_alpha
+        if use_alpha
         else None
     )
     tile_idx_ptr = make_ptr(
@@ -676,9 +689,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    if down_bias is None:
-        down_bias = torch.zeros((num_experts, n), dtype=torch.float32, device=a.device)
-    bias_ptr = make_ptr(cutlass.Float32, down_bias.data_ptr(), cute.AddressSpace.gmem)
+    use_bias = down_bias is not None
+    if is_rubin:
+        bias_ptr = None
+    else:
+        bias_ptr = (
+            make_ptr(cutlass.Float32, down_bias.data_ptr(), cute.AddressSpace.gmem)
+            if use_bias
+            else None
+        )
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -732,7 +751,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=pdl_count is not None,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
-        apply_expert_alpha=apply_expert_alpha,
+        use_alpha=use_alpha,
+        use_bias=use_bias,
     )
 
     # Execute kernel with runtime parameters.

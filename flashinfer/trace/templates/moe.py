@@ -3665,9 +3665,10 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert FC1 global scale.",
+            optional=True,
+            description="Optional per-expert FC1 global scale; required for W4A16.",
         ),
-        "gemm1_bias": Tensor(
+        "w1_bias": Tensor(
             ["num_local_experts", "gemm1_out_size"],
             dtype="float32",
             optional=True,
@@ -3702,9 +3703,10 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "w2_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert FC2 global scale.",
+            optional=True,
+            description="Optional per-expert FC2 global scale; required for W4A16.",
         ),
-        "gemm2_bias": Tensor(
+        "w2_bias": Tensor(
             ["num_local_experts", "hidden_size"],
             dtype="float32",
             optional=True,
@@ -3938,12 +3940,6 @@ cute_dsl_fused_moe_mxfp8_mxfp4_trace = TraceTemplate(
             dtype="float32",
             description="Per-expert FC1 global scale.",
         ),
-        "gemm1_bias": Tensor(
-            ["num_local_experts", "gemm1_out_size"],
-            dtype="float32",
-            optional=True,
-            description="Optional per-expert FC1 bias.",
-        ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
             dtype="uint8",
@@ -3965,12 +3961,6 @@ cute_dsl_fused_moe_mxfp8_mxfp4_trace = TraceTemplate(
             ["num_local_experts"],
             dtype="float32",
             description="Per-expert FC2 global scale.",
-        ),
-        "gemm2_bias": Tensor(
-            ["num_local_experts", "hidden_size"],
-            dtype="float32",
-            optional=True,
-            description="Optional per-expert FC2 bias.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -4232,8 +4222,8 @@ def _cute_dsl_fused_moe_reference(
     situ_beta=None,
     situ_linear_beta=None,
     per_token_scale=None,
-    gemm1_bias=None,
-    gemm2_bias=None,
+    w1_bias=None,
+    w2_bias=None,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
@@ -4296,8 +4286,10 @@ def _cute_dsl_fused_moe_reference(
     )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
-    W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
-    W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
+    if w1_alpha is not None:
+        W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
+    if w2_alpha is not None:
+        W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
     return _moe_bf16_run_experts(
         hs_deq,
         W1,
@@ -4312,8 +4304,8 @@ def _cute_dsl_fused_moe_reference(
         gemm1_clamp_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
-        gemm1_bias=gemm1_bias,
-        gemm2_bias=gemm2_bias,
+        gemm1_bias=w1_bias,
+        gemm2_bias=w2_bias,
     )
 
 

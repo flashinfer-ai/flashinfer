@@ -378,7 +378,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         pdl_count: Optional[int] = -1,
         swap_ab: bool = False,
-        apply_expert_alpha: bool = True,
+        use_alpha: bool = True,
+        use_bias: bool = False,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
         use_compact_sfb: bool = True,
@@ -407,8 +408,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type pdl_count: Optional[int]
         :param swap_ab: Whether to swap the MMA-A/MMA-B assignments and M/N roles.
         :type swap_ab: bool
-        :param apply_expert_alpha: Whether to apply a per-expert alpha scale.
-        :type apply_expert_alpha: bool
+        :param use_alpha: Whether to apply a per-expert alpha scale.
+        :type use_alpha: bool
+        :param use_bias: Whether to apply branch bias.
+        :type use_bias: bool
         :param use_a_per_token_scale: Whether operand A has an additional
             per-token row scale.
         :type use_a_per_token_scale: bool
@@ -426,7 +429,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         self.swap_ab = swap_ab
-        self.apply_expert_alpha = apply_expert_alpha
+        self.use_alpha = use_alpha
+        self.use_bias = use_bias
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
         self.use_compact_sfb = swap_ab and use_compact_sfb
@@ -739,7 +743,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
-        down_bias: cute.Tensor,
+        down_bias: Optional[cute.Tensor],
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation in steps:
@@ -766,7 +770,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type num_non_exiting_tiles: cute.Tensor
         :param tile_idx_to_mn_limit: M-N boundary limit for each tile.
         :type tile_idx_to_mn_limit: cute.Tensor
-        :param alpha: Alpha tensor for each group, or None when apply_expert_alpha=False
+        :param alpha: Alpha tensor for each group, or None when use_alpha=False
         :type alpha: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
@@ -778,8 +782,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type token_final_scales: cute.Tensor
         :param a_per_token_scale: Optional per-row scale for operand A.
         :type a_per_token_scale: Optional[cute.Tensor]
-        :param down_bias: Down-projection bias tensor.
-        :type down_bias: cute.Tensor
+        :param down_bias: Optional down-projection bias tensor.
+        :type down_bias: Optional[cute.Tensor]
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
@@ -800,8 +804,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             if cutlass.const_expr(self.mma_tiler[0] == 256):
                 raise ValueError("SFB does not support a 256-row activation tile")
 
-        mma_bias = down_bias
-        if cutlass.const_expr(self.swap_ab):
+        if cutlass.const_expr(self.use_bias):
+            assert down_bias is not None
+            mma_bias = down_bias
+        else:
+            assert down_bias is None
+            mma_bias = None
+        if cutlass.const_expr(self.swap_ab and self.use_bias):
             tokens, weights, experts = (
                 down_bias.shape[0],
                 down_bias.shape[1],
@@ -1288,7 +1297,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
-        mBias_mnl: cute.Tensor,
+        mBias_mnl: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1642,16 +1651,38 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         epilogue_tile = self.mma_tiler
         if cutlass.const_expr(self.swap_ab and use_2cta_instrs):
             epilogue_tile = self.cta_tile_shape_mnk
-        gBias_mnl = cute.local_tile(
-            mBias_mnl, cute.slice_(epilogue_tile, (None, None, 0)), (None, None, None)
+        mC_mnl = cute.make_tensor(
+            out.iterator,
+            cute.make_layout(
+                (mA_mkl.shape[0], mB_nkl.shape[0], mB_nkl.shape[2]),
+                stride=(0, 1, mB_nkl.shape[0]),
+            ),
         )
+        gC_mnl = cute.local_tile(
+            mC_mnl, cute.slice_(epilogue_tile, (None, None, 0)), (None, None, None)
+        )
+        gBias_mnl = None
+        if cutlass.const_expr(self.use_bias):
+            gBias_mnl = cute.local_tile(
+                mBias_mnl,
+                cute.slice_(epilogue_tile, (None, None, 0)),
+                (None, None, None),
+            )
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
         if cutlass.const_expr(self.swap_ab and use_2cta_instrs):
-            tCgBias = thr_mma_epilogue.partition_C(gBias_mnl)
-            tCgC = thr_mma_epilogue.partition_C(gBias_mnl)
+            tCgC = thr_mma_epilogue.partition_C(gC_mnl)
+            tCgBias = (
+                thr_mma_epilogue.partition_C(gBias_mnl)
+                if cutlass.const_expr(self.use_bias)
+                else None
+            )
         else:
-            tCgBias = thr_mma.partition_C(gBias_mnl)
-            tCgC = thr_mma.partition_C(gBias_mnl)
+            tCgC = thr_mma.partition_C(gC_mnl)
+            tCgBias = (
+                thr_mma.partition_C(gBias_mnl)
+                if cutlass.const_expr(self.use_bias)
+                else None
+            )
 
         #
         # Cluster wait before tensor memory alloc
@@ -2560,7 +2591,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_m_start = tile_info[1] * self.cta_tile_shape_mnk[1]
                     token_tile = self.cta_tile_shape_mnk[1]
                 expert_idx = tile_info[2]
-                if cutlass.const_expr(self.apply_expert_alpha):
+                if cutlass.const_expr(self.use_alpha):
                     alpha_val = alpha[expert_idx]
                 else:
                     alpha_val = cutlass.Float32(1.0)
@@ -2597,7 +2628,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             ) * cutlass.Float32(a_per_token_scale[permuted_row])
                         sMetaTokenIdx[(r, meta_stage)] = token_idx
                         sMetaScale[(r, meta_stage)] = alpha_val * token_scale
-                        sMetaBiasScale[(r, meta_stage)] = token_scale
+                        if cutlass.const_expr(self.use_bias):
+                            sMetaBiasScale[(r, meta_stage)] = token_scale
                 cute.arch.fence_proxy("async.shared", space="cta")
                 meta_pipeline.producer_commit(meta_producer_state)
                 meta_producer_state.advance()
@@ -2659,10 +2691,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
 
             thr_copy_t2r_bias = tiled_copy_t2r.get_slice(epi_tidx)
-            tCgBias_epi = cute.flat_divide(
-                tCgBias[((None, None), 0, 0, None, None, None)], epi_tile
-            )
-            tTR_gBias = thr_copy_t2r_bias.partition_D(tCgBias_epi)
+            tTR_gBias = None
+            if cutlass.const_expr(self.use_bias):
+                tCgBias_epi = cute.flat_divide(
+                    tCgBias[((None, None), 0, 0, None, None, None)], epi_tile
+                )
+                tTR_gBias = thr_copy_t2r_bias.partition_D(tCgBias_epi)
 
             tTR_cId = None
             if cutlass.const_expr(self.swap_ab):
@@ -2726,23 +2760,28 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     is_valid_row = permuted_row < tile_info[4]
                     token_idx = sMetaTokenIdx[(epi_tidx, meta_consumer_state.index)]
                     meta_scale = sMetaScale[(epi_tidx, meta_consumer_state.index)]
-                    bias_scale = sMetaBiasScale[(epi_tidx, meta_consumer_state.index)]
+                    if cutlass.const_expr(self.use_bias):
+                        bias_scale = sMetaBiasScale[
+                            (epi_tidx, meta_consumer_state.index)
+                        ]
 
-                tTR_gBias_tile = tTR_gBias[
-                    (
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        tile_info[0],
-                        tile_info[1],
-                        tile_info[2],
+                tTR_gBias_tile = None
+                if cutlass.const_expr(self.use_bias):
+                    tTR_gBias_tile = tTR_gBias[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            tile_info[0],
+                            tile_info[1],
+                            tile_info[2],
+                        )
+                    ]
+                    tTR_gBias_tile = cute.group_modes(
+                        tTR_gBias_tile, 3, cute.rank(tTR_gBias_tile)
                     )
-                ]
-                tTR_gBias_tile = cute.group_modes(
-                    tTR_gBias_tile, 3, cute.rank(tTR_gBias_tile)
-                )
 
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
@@ -2795,14 +2834,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
-                    # Get vectorized accumulator and apply the combined finalize scale,
-                    # then add the router-weighted per-expert down bias
+                    # Apply the combined finalize scale and optional down bias.
                     acc_vec = tTR_rAcc.load()
-                    bias_vec = tTR_gBias_tile[
-                        (None, None, None, real_subtile_idx)
-                    ].load()
+                    if cutlass.const_expr(self.use_bias):
+                        bias_vec = tTR_gBias_tile[
+                            (None, None, None, real_subtile_idx)
+                        ].load()
                     if cutlass.const_expr(not self.swap_ab):
-                        acc_vec_final = meta_scale * acc_vec + bias_scale * bias_vec
+                        acc_vec_final = meta_scale * acc_vec
+                        if cutlass.const_expr(self.use_bias):
+                            acc_vec_final += bias_scale * bias_vec
                     else:
                         acc_vec_final = cute.make_rmem_tensor(
                             tTR_rAcc.shape, self.acc_dtype
@@ -2813,13 +2854,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             element_scale = sMetaScale[
                                 (token_local, meta_consumer_state.index)
                             ]
-                            element_bias_scale = sMetaBiasScale[
-                                (token_local, meta_consumer_state.index)
-                            ]
-                            acc_vec_final[i] = (
-                                element_scale * acc_vec[i]
-                                + element_bias_scale * bias_vec[i]
-                            )
+                            acc_vec_final[i] = element_scale * acc_vec[i]
+                            if cutlass.const_expr(self.use_bias):
+                                element_bias_scale = sMetaBiasScale[
+                                    (token_local, meta_consumer_state.index)
+                                ]
+                                acc_vec_final[i] += element_bias_scale * bias_vec[i]
 
                     if cutlass.const_expr(not self.swap_ab):
                         tRS_rC.store(epilogue_op(acc_vec_final.to(self.out_dtype)))
@@ -3679,7 +3719,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
-        bias_ptr: cute.Pointer,
+        bias_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -3722,9 +3762,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((output_rows, n, 1), order=(1, 0, 2))
         )
-        if cutlass.const_expr(self.apply_expert_alpha):
+        if cutlass.const_expr(self.use_alpha):
+            assert alpha_ptr is not None
             alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
         else:
+            assert alpha_ptr is None
             alpha = None
 
         tile_idx_to_group_idx = cute.make_tensor(
@@ -3743,10 +3785,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             token_final_scales_ptr,
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
-        # Per-expert down bias broadcast over the permuted-row (m) dimension.
-        down_bias = cute.make_tensor(
-            bias_ptr, layout=cute.make_layout((m, n, l), stride=(0, 1, n))
-        )
+        if cutlass.const_expr(self.use_bias):
+            assert bias_ptr is not None
+            # Per-expert down bias broadcast over the permuted-row dimension.
+            down_bias = cute.make_tensor(
+                bias_ptr, layout=cute.make_layout((m, n, l), stride=(0, 1, n))
+            )
+        else:
+            assert bias_ptr is None
+            down_bias = None
         if cutlass.const_expr(self.use_a_per_token_scale):
             a_per_token_scale = cute.make_tensor(
                 a_per_token_scale_ptr, layout=cute.make_layout((m,))
@@ -4015,9 +4062,9 @@ def run(
     swap_ab: bool = False,
     raster_along_m: bool = False,
     pdl_count: int = -1,
-    expert_alpha_enabled: bool = True,
+    use_alpha: bool = True,
     expert_alpha_value: float = 1.0,
-    bias_enabled: bool = False,
+    use_bias: bool = False,
     bias_value: Optional[float] = None,
     router_scale_value: Optional[float] = None,
     seed: int = 2025,
@@ -4179,10 +4226,10 @@ def run(
                 dtype=torch.float32,
                 device=device,
             )
-            if expert_alpha_enabled
+            if use_alpha
             else None
         )
-        if bias_enabled and bias_value is None:
+        if use_bias and bias_value is None:
             down_bias = (
                 torch.randn(
                     (num_experts, n), generator=generator, device=device
@@ -4192,7 +4239,7 @@ def run(
         else:
             down_bias = torch.full(
                 (num_experts, n),
-                bias_value if bias_enabled else 0.0,
+                bias_value if use_bias else 0.0,
                 dtype=torch.float32,
                 device=device,
             )
@@ -4229,7 +4276,9 @@ def run(
         final_scales_ptr = make_ptr(
             cutlass.Float32, token_final_scales.data_ptr(), gmem
         )
-        bias_ptr = make_ptr(cutlass.Float32, down_bias.data_ptr(), gmem)
+        bias_ptr = (
+            make_ptr(cutlass.Float32, down_bias.data_ptr(), gmem) if use_bias else None
+        )
 
         jit_args = testing.JitArguments(
             a_ptr,
@@ -4290,7 +4339,8 @@ def run(
         raster_along_m=raster_along_m,
         pdl_count=pdl_count,
         swap_ab=swap_ab,
-        apply_expert_alpha=expert_alpha_enabled,
+        use_alpha=use_alpha,
+        use_bias=use_bias,
         use_compact_sfb=use_compact_sfb,
     )
     compiled = cute.compile(
@@ -4425,13 +4475,13 @@ if __name__ == "__main__":
         help="K-tile index for launching dependent grids; -1 releases at exit",
     )
     parser.add_argument(
-        "--expert_alpha_enabled",
+        "--use_alpha",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument("--expert_alpha_value", type=float, default=1.0)
     parser.add_argument(
-        "--bias_enabled", action=argparse.BooleanOptionalAction, default=False
+        "--use_bias", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
         "--bias_value",
@@ -4487,9 +4537,9 @@ if __name__ == "__main__":
         args.swap_ab,
         args.raster_along_m,
         args.pdl_count,
-        args.expert_alpha_enabled,
+        args.use_alpha,
         args.expert_alpha_value,
-        args.bias_enabled,
+        args.use_bias,
         args.bias_value,
         args.router_scale_value,
         args.seed,
