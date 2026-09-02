@@ -30,7 +30,17 @@ requires_cuda_sm80 = pytest.mark.skipif(
 def _expand_reference(
     block_indices, query_positions, sequence_lengths, token_to_req, compress_ratio
 ):
-    """Expand the selection one row at a time, in plain Python."""
+    """Expand the selection one row at a time, in plain Python.
+
+    The index tensors may be int64 while the kernel works in int32, so a value
+    outside that range is not an index at all. Python has no such range, so the
+    rule is written out here rather than inherited.
+    """
+    int32_max = 2147483647
+
+    def in_range(value):
+        return 0 <= value <= int32_max
+
     rows, block_topk = block_indices.shape
     width = block_topk * compress_ratio + compress_ratio - 1
     num_requests = sequence_lengths.shape[0]
@@ -41,8 +51,10 @@ def _expand_reference(
     requests = token_to_req.tolist()
     for row in range(rows):
         request = requests[row]
-        seq = lengths[request] if 0 <= request < num_requests else 0
-        position = positions[row]
+        request_ok = in_range(request) and request < num_requests
+        raw_seq = lengths[request] if request_ok else 0
+        seq = raw_seq if in_range(raw_seq) else 0
+        position = positions[row] if in_range(positions[row]) else -1
         past = min((position + 1) // compress_ratio, seq // compress_ratio)
         complete = min(past, block_topk)
         route = []
@@ -51,7 +63,7 @@ def _expand_reference(
             # The whole block or none of it: the block the query sits in is
             # partly ahead of it, and the tail below appends its seen half, so
             # expanding it here would route those tokens twice.
-            base = block * compress_ratio if 0 <= block < past else None
+            base = block * compress_ratio if in_range(block) and block < past else None
             route.extend(
                 None if base is None else base + offset
                 for offset in range(compress_ratio)
@@ -351,3 +363,44 @@ def test_route_ops_reject_bad_arguments():
     # a ratio the dispatch has no kernel for
     with pytest.raises(Exception, match="compress_ratio"):
         flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, 3)
+
+
+# Values that do not fit an int32. The index tensors may be int64 and the
+# kernels narrow, so a wrapped one must not become a valid position, request or
+# block: 2^32 exactly wraps to zero, which is a real block and a real request.
+_PAST_INT32 = [2147483648, 4294967296, 9223372036854775807, -2147483649]
+
+
+@pytest.mark.parametrize("bad", _PAST_INT32)
+@pytest.mark.parametrize("field", ["positions", "token_to_req", "blocks", "lengths"])
+def test_expand_block_route_does_not_wrap_an_index_that_is_not_an_int32(field, bad):
+    ratio = 4
+    # Distinct blocks, so a repeat in the output can only come from the kernel
+    # and not from a selector that named the same block twice.
+    blocks = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64, device=DEV)
+    positions = torch.tensor([31], dtype=torch.int64, device=DEV)
+    lengths = torch.tensor([512], dtype=torch.int64, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+    field_map = {
+        "positions": positions,
+        "token_to_req": token_to_req,
+        "lengths": lengths,
+    }
+    if field == "blocks":
+        blocks[0, 0] = bad  # rank 0; ranks 1..3 stay valid
+    else:
+        field_map[field][0] = bad
+
+    out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
+    torch.cuda.synchronize()
+    routed = [t for t in out[0].tolist() if t >= 0]
+    assert len(routed) == len(set(routed)), f"a token is routed twice: {routed}"
+    if field == "blocks":
+        # The rank that named it contributes nothing; the rest still route.
+        assert out[0, :ratio].tolist() == [-1] * ratio
+    else:
+        # No request, no position and no length the row can resolve, so it
+        # routes nothing at all.
+        assert routed == [], routed
+    expected = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
