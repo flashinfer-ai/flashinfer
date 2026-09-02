@@ -508,6 +508,29 @@ def test_rejects_a_short_query_start_loc():
     _expect_rejected(case, "one entry past")
 
 
+@pytest.mark.parametrize("which", ["q_weight", "k_weight"])
+def test_rejects_a_norm_weight_shorter_than_the_head(which):
+    """A lane reads its slice of the weight by head_dim whatever the tensor
+    holds, so a short one is read past its end however contiguous it is."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8)
+    case[which] = case[which][:-8].contiguous()
+    _expect_rejected(case, "one weight per feature")
+
+
+@pytest.mark.parametrize("width", [0, 2])
+def test_rejects_a_ring_table_that_is_not_one_block_per_request(width):
+    """The kernel reads the first entry of the row it is given. A row of no
+    entries reads off the table, and a wider one is a layout it does not walk."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8)
+    table = case["state_block_table"]
+    case["state_block_table"] = (
+        table[:, :0].contiguous() if width == 0 else table.repeat(1, 2).contiguous()
+    )
+    _expect_rejected(case, "one ring block per request")
+
+
 def _constant_row_out(fill, num_tokens=8, head_dim=128, dtype=torch.bfloat16):
     """A row of one value, normalised with a zero affine, and what came out."""
     case = _case(num_tokens=num_tokens, num_heads=1, head_dim=head_dim, dtype=dtype)
