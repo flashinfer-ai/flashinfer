@@ -226,7 +226,9 @@ class _CakeKDAAffineResources:
     empty_i32: torch.Tensor
     empty_i64: torch.Tensor
     empty_u32: torch.Tensor
-    sequence: _CakeKDAAffineModule
+    sequence: Optional[_CakeKDAAffineModule]
+    stages: tuple[_CakeKDAAffineModule, ...]
+    stage_tma_workspaces: tuple[Optional[torch.Tensor], ...]
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -1323,10 +1325,47 @@ def _cake_kda_affine_resources(
             "Cake KDA affine tail offsets are not warmed for CUDA graph capture"
         ),
     )
-    sequence = _get_cake_kda_affine_sequence(
-        affine_route.target,
-        affine_route.family,
-    )
+    if affine_route.family == "unbounded_affine_prefix":
+        sequence = _get_cake_kda_affine_sequence(
+            affine_route.target,
+            affine_route.family,
+        )
+        stages: tuple[_CakeKDAAffineModule, ...] = ()
+        stage_tma_workspaces: tuple[Optional[torch.Tensor], ...] = ()
+    else:
+        from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
+
+        stage_routes = (
+            ("bounded_fp32_affine_prefix", "affine_split_main", "main"),
+            ("bounded_fp32_affine_prefix", "affine_split_map", "map"),
+            ("unbounded_affine_prefix", "affine_prefix_scan", "scan"),
+            (
+                "bounded_fp32_affine_prefix",
+                "affine_split_correction",
+                "correction",
+            ),
+        )
+        stages = tuple(
+            get_cake_kda_module(affine_route.target, family, policy, role)
+            for family, policy, role in stage_routes
+        )
+        stage_specs = tuple(
+            get_cake_kda_module_spec(affine_route.target, family, policy, role)
+            for family, policy, role in stage_routes
+        )
+        stage_tma_workspaces = tuple(
+            (
+                buffer(
+                    f"tma_descriptor_{spec.target}_{spec.family}_{spec.policy}_{spec.role}",
+                    (spec.tma_workspace_bytes,),
+                    torch.uint8,
+                )
+                if spec.tma_workspace_bytes
+                else None
+            )
+            for spec in stage_specs
+        )
+        sequence = None
     resolved = _CakeKDAAffineResources(
         key=key,
         num_parts=num_parts,
@@ -1356,6 +1395,8 @@ def _cake_kda_affine_resources(
         empty_i64=empty_i64,
         empty_u32=empty_u32,
         sequence=sequence,
+        stages=stages,
+        stage_tma_workspaces=stage_tma_workspaces,
     )
     workspace._cake_kda_affine_resources = resolved
     return resolved
@@ -1659,7 +1700,21 @@ def _run_cake_kda_affine_route(
         lower_bound=affine_route.gate_lower_bound,
         grid_x=(resources.num_parts - 1) * num_heads,
     )
-    resources.sequence.run(*main_args, *map_args, *scan_args, *correction_args)
+    if resources.sequence is not None:
+        resources.sequence.run(*main_args, *map_args, *scan_args, *correction_args)
+    else:
+        stage_args = (main_args, map_args, scan_args, correction_args)
+        for module, args, tma_workspace in zip(
+            resources.stages,
+            stage_args,
+            resources.stage_tma_workspaces,
+            strict=True,
+        ):
+            module.run(
+                *args[:-3],
+                *((tma_workspace,) if tma_workspace is not None else ()),
+                *args[-3:],
+            )
     out_flat[resources.tail_start :].add_(
         resources.correction_out.reshape_as(out_flat[resources.tail_start :])
     )

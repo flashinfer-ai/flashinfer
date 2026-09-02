@@ -25,7 +25,6 @@ CakeKDAFamily = Literal[
     "unbounded_affine_prefix",
 ]
 CakeKDASequenceFamily = Literal[
-    "bounded_fp32_affine_prefix",
     "unbounded_affine_prefix",
 ]
 CakeKDARole = Literal["main", "prepare", "chain", "map", "scan", "correction"]
@@ -419,7 +418,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
 
 @functools.cache
 def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
-    """Load the four prepared affine sequences from the sealed manifest."""
+    """Load the two allocation-free unbounded affine sequences."""
 
     module_specs = get_cake_kda_module_specs()
     module_by_identity = {
@@ -438,16 +437,13 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
     }
     raw_sequences = payload.get("sequences")
     _require(
-        isinstance(raw_sequences, list) and len(raw_sequences) == 4,
+        isinstance(raw_sequences, list) and len(raw_sequences) == 2,
         "prepared sequence inventory mismatch",
     )
     expected = {
         (target, family)
         for target in _TARGET_ARCH
-        for family in (
-            "bounded_fp32_affine_prefix",
-            "unbounded_affine_prefix",
-        )
+        for family in ("unbounded_affine_prefix",)
     }
     observed: set[tuple[str, str]] = set()
     specs: list[CakeKDASequenceSpec] = []
@@ -470,11 +466,7 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
             f"{label}.route policy",
         )
         _require(item.get("role") == "composite", f"{label}.role")
-        expected_name = (
-            "cake_kda_affine_bounded_fp32_sequence"
-            if family == "bounded_fp32_affine_prefix"
-            else "cake_kda_affine_unbounded_softplus_sequence"
-        )
+        expected_name = "cake_kda_affine_unbounded_softplus_sequence"
         _require(item.get("name") == expected_name, f"{label}.name")
         _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
         _require(
@@ -593,7 +585,7 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
 def cake_kda_is_available() -> bool:
     return (
         len(get_cake_kda_module_specs()) == len(_expected_module_keys())
-        and len(get_cake_kda_sequence_specs()) == 4
+        and len(get_cake_kda_sequence_specs()) == 2
     )
 
 
