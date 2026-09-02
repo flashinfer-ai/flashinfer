@@ -38,7 +38,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from .tuner import default_knobs, is_valid, is_valid_bf16_mxfp8
+from .tuner import (
+    default_knobs,
+    is_valid,
+    is_valid_bf16,
+    is_valid_bf16_for_config,
+    is_valid_bf16_mxfp8,
+    is_valid_bf16_mxfp8_for_config,
+)
 
 # Shared base of the sweep restriction (values that won every profile so far).
 _SWEEP_BASE: Dict[str, Any] = {
@@ -112,14 +119,21 @@ def mxfp8_candidates(
     return out
 
 
-def bf16_candidates() -> List[Dict[str, Any]]:
-    """Return the currently supported BF16 tuning candidate.
+def bf16_candidates(
+    *,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_mode: str = "epi_warps",
+) -> List[Dict[str, Any]]:
+    """Return supported BF16 candidates for a session's output contract.
 
     This is intentionally a one-entry autotune surface. Keeping the same
     collective autotune lifecycle as the other Mega kernels means additional
     validated geometries can be added without changing the public API.
     """
-    return [default_knobs(0, dtype="bf16")]
+    knobs = default_knobs(0, dtype="bf16")
+    knobs["in_kernel_fc2_reduce"] = in_kernel_fc2_reduce
+    knobs["token_back_mode"] = token_back_mode
+    return [knobs] if is_valid_bf16(knobs) else []
 
 
 def bf16_mxfp8_candidates(
@@ -446,10 +460,20 @@ def autotune_bf16_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
+    if candidates is None:
+        candidates = bf16_candidates(
+            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
+            token_back_mode=cfg.token_back_mode,
+        )
+    candidates = [knobs for knobs in candidates if is_valid_bf16_for_config(cfg, knobs)]
+    if not candidates:
+        raise ValueError("no valid BF16 MegaMoE autotune candidates for this session.")
+
     return autotune_knobs(
         symm_buffer._frontend,
         launch,
-        bf16_candidates() if candidates is None else candidates,
+        candidates,
         label="bf16_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
@@ -486,6 +510,13 @@ def autotune_bf16_mxfp8_mega_moe(
     if candidates is None:
         candidates = bf16_mxfp8_candidates(
             in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
+        )
+    candidates = [
+        knobs for knobs in candidates if is_valid_bf16_mxfp8_for_config(cfg, knobs)
+    ]
+    if not candidates:
+        raise ValueError(
+            "no valid mixed BF16/MXFP8 MegaMoE autotune candidates for this session."
         )
 
     return autotune_knobs(
