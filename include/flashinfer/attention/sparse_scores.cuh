@@ -539,36 +539,35 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
   // on the same SM, and it keeps winning until the query re-staging outweighs
   // the pipelining the eight-tile shape does instead.
   //
-  // Measured on SM80, the turn is at four waves and not at one. Sweeping rows
-  // at three shapes, the last row count the single-tile shape wins and the
-  // first the eight-tile shape does, in blocks: 1536 then 2048 at sixteen heads
-  // and head dim 128, 2048 then 4096 at four heads, and already lost by 2048 at
-  // eight heads and head dim 256. Those blocks per SM are 7, 8 and 4, so one
-  // wave would be 490, 560 and 280 -- and four waves splits every one of them
-  // correctly where one wave puts the whole 8-to-24 row range on the wrong side
-  // and costs up to 1.64x there.
+  // How many more is not a multiple of the occupancy, which is the surprise
+  // here. Sweeping rows at three shapes on SM80 -- the last block count the
+  // single-tile shape wins, then the first the eight-tile shape does:
   //
-  // The answer depends on the tile width too, since that is part of the block's
-  // shared memory.
-  constexpr uint32_t kWavesBeforeWide = 4;
-  static thread_local int blocks_per_sm = 0;
-  static thread_local int occupancy_dev = -1;
-  static thread_local uint32_t occupancy_tile_n = 0;
-  if (occupancy_dev != dev_id || occupancy_tile_n != tile_n) {
-    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm,
-        tile_n == kNarrowTileN
-            ? SparsePagedScoresKernel<HEAD_DIM, 1, HEAD_DIM, kWarpsPerBlock, kNarrowTileN, DType,
-                                      IdType>
-            : SparsePagedScoresKernel<HEAD_DIM, 1, HEAD_DIM, kWarpsPerBlock, kTileN, DType, IdType>,
-        kWarpsPerBlock * 32, smem_for(1, HEAD_DIM)));
-    occupancy_dev = dev_id;
-    occupancy_tile_n = tile_n;
-  }
-  const uint32_t narrow_blocks = rows * ceil_div(num_columns, kBlockN);
-  const bool narrow = blocks_per_sm == 0 ||
-                      narrow_blocks <= kWavesBeforeWide * static_cast<uint32_t>(num_sms) *
-                                           static_cast<uint32_t>(blocks_per_sm);
+  //   16 heads, head dim 128, 7 blocks/SM:   1536 then 2048
+  //    4 heads, head dim 128, 7 blocks/SM:   2048 then 4096
+  //    8 heads, head dim 256, 4 blocks/SM:   1536 then 2048
+  //
+  // The first and third turn at the same block count with very different
+  // occupancy, so a threshold in waves cannot fit them: in waves those windows
+  // are (3.1, 4.2], (4.2, 8.4] and (5.5, 7.3], and the first and second do not
+  // even overlap. Per SM they are (21.9, 29.3], (29.3, 58.5] and (21.9, 29.3],
+  // which 24 splits -- so that is what this counts, and the occupancy query
+  // this used to make is gone with it.
+  //
+  // The one shape it gets wrong is four heads at 2048 blocks, which it sends to
+  // the eight-tile shape and which the single-tile one wins by 1.09x. No single
+  // threshold can take that point and the 2048 of the other two, whose
+  // eight-tile shape wins there.
+  //
+  // Measured on SM80 only. This decides which shape runs, never what it
+  // computes, so on another architecture the worst case is a slower choice.
+  constexpr uint64_t kBlocksPerSMBeforeWide = 24;
+  // Sixty-four bit: rows times column tiles is the caller's shape, and a launch
+  // big enough to wrap 32 bits would pick the wrong shape rather than fail.
+  const uint64_t narrow_blocks =
+      static_cast<uint64_t>(rows) * ceil_div(num_columns, kBlockN);
+  const bool narrow =
+      narrow_blocks <= kBlocksPerSMBeforeWide * static_cast<uint64_t>(num_sms);
   if (tile_n == kNarrowTileN) {
     constexpr std::integral_constant<uint32_t, kNarrowTileN> n{};
     return narrow ? launch(std::integral_constant<uint32_t, 1>{}, n)
