@@ -422,3 +422,23 @@ def test_scores_take_a_position_at_the_top_of_the_int32_range():
     )
     torch.testing.assert_close(got_visible, want_visible)
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+def test_scores_reject_a_compress_ratio_that_is_not_a_uint32():
+    """The ratio is narrowed to uint32 for the kernel, where it is a divisor, so
+    2^32 would arrive as zero."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    columns = table.shape[1] * k_cache.shape[1]
+    with pytest.raises(Exception, match="fit in 32 bits"):
+        flashinfer.sparse_paged_scores(
+            q,
+            k_cache,
+            table,
+            t2r,
+            pos,
+            lens,
+            4294967296,
+            q.shape[2] ** 0.5,
+            num_columns=columns,
+        )
