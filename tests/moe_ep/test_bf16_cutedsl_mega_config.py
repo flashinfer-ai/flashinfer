@@ -74,17 +74,18 @@ def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     monkeypatch.setattr(bf16, "sym_zeros", fake_zeros)
     knobs = default_knobs(8, dtype="bf16")
     knobs["token_back_mode"] = "reuse_dispatch_warps"
-    buf = bf16.get_symm_buffer_for_bf16_mega_moe(
-        4,
-        8,
-        2,
-        128,
-        128,
-        0,
-        1,
-        token_back_mode="epi_warps",
-        knobs=knobs,
-    )
+    with pytest.warns(RuntimeWarning, match="token_back_mode: 'epi_warps'"):
+        buf = bf16.get_symm_buffer_for_bf16_mega_moe(
+            4,
+            8,
+            2,
+            128,
+            128,
+            0,
+            1,
+            token_back_mode="epi_warps",
+            knobs=knobs,
+        )
     try:
         assert buf._frontend.config.token_back_mode == "reuse_dispatch_warps"
         assert buf._frontend.config.in_kernel_fc2_reduce is False
@@ -155,14 +156,17 @@ def test_bf16_autotune_filters_ikr_changing_candidates(monkeypatch):
         lambda _frontend, _launch, candidates, **_kwargs: candidates,
     )
     buffer = SimpleNamespace(_frontend=frontend)
-    assert autotune.autotune_bf16_mega_moe(
-        None,
-        None,
-        None,
-        buffer,
-        candidates=[{**valid, "in_kernel_fc2_reduce": True}, valid],
-    ) == [valid]
-    with pytest.raises(ValueError, match="no valid BF16"):
+    with pytest.warns(
+        RuntimeWarning, match="in_kernel_fc2_reduce=True is caller-owned"
+    ):
+        assert autotune.autotune_bf16_mega_moe(
+            None,
+            None,
+            None,
+            buffer,
+            candidates=[{**valid, "in_kernel_fc2_reduce": True}, valid],
+        ) == [valid]
+    with pytest.raises(ValueError, match="no valid BF16") as excinfo:
         autotune.autotune_bf16_mega_moe(
             None,
             None,
@@ -170,6 +174,67 @@ def test_bf16_autotune_filters_ikr_changing_candidates(monkeypatch):
             buffer,
             candidates=[{**valid, "in_kernel_fc2_reduce": True}],
         )
+    assert "in_kernel_fc2_reduce=True is caller-owned" in str(excinfo.value)
+
+
+def test_autotune_reports_a_winner_that_replaces_session_knobs():
+    """A measured winner may flip a correctness knob -- it must say so."""
+    import warnings
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
+
+    config = SimpleNamespace(
+        in_kernel_fc2_reduce=True, token_back_mode="reuse_dispatch_warps"
+    )
+    before = autotune._session_correctness_knobs(config)
+    assert before["token_back_mode"] == "reuse_dispatch_warps"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        autotune._warn_on_overridden_session_knobs(config, before, label="bf16_mega")
+
+    config.token_back_mode = "epi_warps"
+    with pytest.warns(
+        RuntimeWarning, match=r"token_back_mode: 'reuse_dispatch_warps' -> 'epi_warps'"
+    ):
+        autotune._warn_on_overridden_session_knobs(config, before, label="bf16_mega")
+
+
+def test_bf16_autotune_keeps_an_ikr_session_token_back_mode(monkeypatch):
+    """The default sweep for an ikr session must be runnable as-is."""
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import (
+        MegaMoEBf16Frontend,
+    )
+
+    frontend = MegaMoEBf16Frontend(
+        MegaMoEBf16Config(
+            rank=0,
+            world_size=1,
+            num_tokens_per_rank=8,
+            num_topk=2,
+            num_total_experts=4,
+            hidden=128,
+            intermediate=128,
+            in_kernel_fc2_reduce=True,
+            token_back_mode="reuse_dispatch_warps",
+        )
+    )
+    monkeypatch.setattr(
+        autotune,
+        "autotune_knobs",
+        lambda _frontend, _launch, candidates, **_kwargs: candidates,
+    )
+    candidates = autotune.autotune_bf16_mega_moe(
+        None, None, None, SimpleNamespace(_frontend=frontend)
+    )
+    assert candidates == [
+        {
+            **default_knobs(8, dtype="bf16"),
+            "in_kernel_fc2_reduce": True,
+            "token_back_mode": "reuse_dispatch_warps",
+        }
+    ]
 
 
 def test_bf16_backend_defaults_to_scale_free_contract():
