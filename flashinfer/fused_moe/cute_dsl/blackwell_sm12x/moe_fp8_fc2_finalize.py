@@ -166,6 +166,8 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
     tile=None,
     epi: EpiMethod = DEFAULT_EPI,
     enable_pdl: bool = False,
+    *,
+    out: torch.Tensor | None = None,
 ):
     n, k = int(b_q.shape[1]), int(b_q.shape[2])
     _check_a_scale_granularity(a_scale, k)
@@ -180,7 +182,10 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
             num_sms=grid_x,
         )
     op = CuteDslSm120GroupedFp8Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
-    out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
+    if out is None:
+        out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
+    else:
+        out.zero_()
     args = make_args(
         a_q,
         a_scale,
