@@ -397,16 +397,16 @@
       "sha256": "dfcc5ba5ae292fcc3991ce880989c88dac2a662304c9f202a5dc9c7562724b2c"
     },
     {
-      "bytes": 233256,
+      "bytes": 232420,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16.cu",
-      "sha256": "fab0c7a973782df642f039cc3f0706dfeda64f01c1117d257335762ab1464ab1"
+      "sha256": "69a9fc23ca1175257dfa5b8dd86440e6edbe6cabb71da9582648eb2779255292"
     },
     {
-      "bytes": 40991,
+      "bytes": 36911,
       "kind": "tvm_ffi_binding",
       "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16_binding.cu",
-      "sha256": "5430bbc42ed0ae01cf9bd622df0e9ebb23eb785e848aa9a4aea0801189fd1418"
+      "sha256": "6cf70d4240c6f1024da700a499c62b6c3181fcc615956d01b4d6288c933ab993"
     },
     {
       "bytes": 183795,
@@ -689,7 +689,7 @@
     "observed_checkout_revision": "606e98713d705afb835659bfbd112fcdfe501206",
     "observed_tracked_tree_clean": true,
     "producer_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "recipe_sha256": "4149931acdc8b3acdbf55b64fb982d6dc20c3937d74f5c2bd1c3b59f2e66b5b0",
+    "recipe_sha256": "e9a22db355326b841a37665c8b5c4bdda135036a535855f0c1d07f2f1a0667ff",
     "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
@@ -4036,10 +4036,6 @@
           "final_state_f32"
         ],
         [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
           "grid",
           "grid_x"
         ],
@@ -4052,7 +4048,7 @@
           "grid_z"
         ]
       ],
-      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
       "binding_infrastructure": {
         "runtime": "flashinfer_tvm_ffi_utils",
         "target_owned_headers": [
@@ -4061,17 +4057,17 @@
       },
       "closure": [
         {
-          "bytes": 233256,
+          "bytes": 232420,
           "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16.cu",
-          "sha256": "fab0c7a973782df642f039cc3f0706dfeda64f01c1117d257335762ab1464ab1"
+          "sha256": "69a9fc23ca1175257dfa5b8dd86440e6edbe6cabb71da9582648eb2779255292"
         },
         {
-          "bytes": 40991,
+          "bytes": 36911,
           "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16_binding.cu",
-          "sha256": "5430bbc42ed0ae01cf9bd622df0e9ebb23eb785e848aa9a4aea0801189fd1418"
+          "sha256": "6cf70d4240c6f1024da700a499c62b6c3181fcc615956d01b4d6288c933ab993"
         }
       ],
-      "closure_sha256": "8a01ca205bcd34ef18d75a6f2e82bfd7824840726231a6b2f89ec548c86e80b2",
+      "closure_sha256": "6b5d6ca0512dc015dc786353d3ad70a4a0b6522983291b0e3b86a2da30042356",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -4119,8 +4115,8 @@
         "use_pdl": false,
         "validate": false
       },
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 896,
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16_binding.cu",
         "compile_separately": true,
@@ -12284,10 +12280,6 @@
           "final_state_f32"
         ],
         [
-          "workspace",
-          "tma_descriptor_workspace"
-        ],
-        [
           "grid",
           "grid_x"
         ],
@@ -12300,7 +12292,7 @@
           "grid_z"
         ]
       ],
-      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
       "binding_infrastructure": {
         "runtime": "flashinfer_tvm_ffi_utils",
         "target_owned_headers": [
@@ -12309,17 +12301,17 @@
       },
       "closure": [
         {
-          "bytes": 233256,
+          "bytes": 232420,
           "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16.cu",
-          "sha256": "fab0c7a973782df642f039cc3f0706dfeda64f01c1117d257335762ab1464ab1"
+          "sha256": "69a9fc23ca1175257dfa5b8dd86440e6edbe6cabb71da9582648eb2779255292"
         },
         {
-          "bytes": 40991,
+          "bytes": 36911,
           "path": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16_binding.cu",
-          "sha256": "5430bbc42ed0ae01cf9bd622df0e9ebb23eb785e848aa9a4aea0801189fd1418"
+          "sha256": "6cf70d4240c6f1024da700a499c62b6c3181fcc615956d01b4d6288c933ab993"
         }
       ],
-      "closure_sha256": "d0a706c3f1f5ec96b2389cc1e39243f527badaed5a258f2eac54c705b3e6efff",
+      "closure_sha256": "b0ca096bf54fc319e66812f281091aa759f37eb8765ec380a152f9dcc17d508d",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -12367,8 +12359,8 @@
         "use_pdl": false,
         "validate": false
       },
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 896,
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
       "translation_units": {
         "binding": "csrc/kda/cake_kda_prefill_m128_legacy_inverse_bf16_binding.cu",
         "compile_separately": true,
