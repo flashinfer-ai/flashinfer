@@ -117,8 +117,10 @@ def gloo_pg():
             rank=0,
             world_size=1,
         )
-        yield dist.group.WORLD
-        dist.destroy_process_group()
+        try:
+            yield dist.group.WORLD
+        finally:
+            dist.destroy_process_group()
 
 
 def _forbid_ipc_and_jit(monkeypatch):
@@ -562,6 +564,47 @@ def test_pcie_collectives_bind_to_the_first_caller_stream(monkeypatch):
     with pytest.raises(RuntimeError, match="bound to the stream"):
         comm.scatter_heads(x, out=out)
     assert calls == ["exchange"]
+
+
+def test_pcie_per_call_dtype_is_held_to_the_registered_output(monkeypatch):
+    """A per-call dtype cannot drift from the width the group registered.
+
+    ``allocate_output`` is where an element type becomes group-wide: every rank
+    all-gathers ``(op, shape, dtype)`` there and a disagreement breaks the group
+    before any transfer exists. Each later call is then held to that agreement
+    without a collective of its own -- the operand must be what ``dtype=`` says,
+    ``out=`` must carry the dtype it was registered with, and native re-checks
+    both against ``buffer->dtype``. So a rank cannot reach the transport with an
+    element width its peers did not agree to, which is what would let the copy
+    and RDMA paths derive different transfer widths from the same exchange.
+    """
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    module = SimpleNamespace(
+        exchange=lambda *_args: pytest.fail(
+            "a dtype disagreement must not reach the transport"
+        ),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: object())
+
+    packed = torch.empty((1, 2, 4, 2), dtype=torch.uint8)
+
+    # An output registered for the construction dtype, reached by a narrower
+    # per-call one: the call names a width the group never registered.
+    wide_out = torch.empty((1, 4, 2, 2), dtype=torch.float16)
+    comm._pcie_outputs[wide_out.data_ptr()] = 0
+    with pytest.raises(ValueError, match="out dtype .* does not match the expected"):
+        comm.scatter_heads(packed, out=wide_out, dtype=torch.uint8)
+
+    # And the mirror: an output registered narrow, called without dtype= so the
+    # communicator's own width applies. Neither direction is silently widened.
+    packed_out = torch.empty((1, 4, 2, 2), dtype=torch.uint8)
+    comm._pcie_outputs[packed_out.data_ptr()] = 0
+    with pytest.raises(ValueError, match="tensor dtype .* does not match the expected"):
+        comm.scatter_heads(packed, out=packed_out)
 
 
 def test_pcie_batch_validation_precedes_capture_and_native(monkeypatch):

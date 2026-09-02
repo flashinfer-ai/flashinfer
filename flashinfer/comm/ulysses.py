@@ -1481,6 +1481,10 @@ class UlyssesCommunicator:
             # across ranks, so re-check locally what that check would have
             # caught. Local only, and only on rank-invariant values: adding a
             # collective here would tear the group apart on a bad argument.
+            # Staying local costs no group-wide agreement on the element width:
+            # allocate_output all-gathers (op, shape, dtype), and _validate_out
+            # below plus native's buffer->dtype check hold every later call to
+            # what that registration agreed.
             if self.backend != "pcie":
                 raise ValueError(
                     f"{op} per-call dtype is only supported on the pcie "
