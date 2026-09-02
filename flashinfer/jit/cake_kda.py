@@ -21,6 +21,7 @@ CakeKDAFamily = Literal[
     "bounded_bf16_evolution",
     "bounded_fp32_serving",
     "bounded_fp32_affine_prefix",
+    "bounded_fp32_affine_h12_prefix",
     "unbounded_bf16_serving",
     "unbounded_affine_prefix",
 ]
@@ -122,6 +123,19 @@ def _expected_module_keys() -> set[tuple[str, str, str, str]]:
             (
                 arch,
                 "bounded_fp32_affine_prefix",
+                policy,
+                _ROLE_BY_POLICY.get(policy, "main"),
+            )
+            for policy in (
+                "affine_split_main",
+                "affine_split_map",
+                "affine_split_correction",
+            )
+        )
+        expected.update(
+            (
+                arch,
+                "bounded_fp32_affine_h12_prefix",
                 policy,
                 _ROLE_BY_POLICY.get(policy, "main"),
             )

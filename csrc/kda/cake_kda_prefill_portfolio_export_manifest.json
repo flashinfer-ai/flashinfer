@@ -229,10 +229,10 @@
   },
   "files": [
     {
-      "bytes": 250014,
+      "bytes": 251356,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
-      "sha256": "d6f86ff86174c6d4b722ca4e1bcb9ccbc3558ef16fc127dfb8bbf56b0fc6cf8a"
+      "sha256": "adaabf03453128738bf79d322e5990a0d6d40871d05ca27c3c2b03152aeadec1"
     },
     {
       "bytes": 41207,
@@ -241,10 +241,46 @@
       "sha256": "3937c5f4ca0c47f912dd79704d625f81a6e372a69495bafa8ad5425e10dc4653"
     },
     {
-      "bytes": 250412,
+      "bytes": 250018,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction.cu",
+      "sha256": "7725039b8df25ef0afb7570822e867eddb64d7646c4c72527d862b83e5f2785a"
+    },
+    {
+      "bytes": 41231,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction_binding.cu",
+      "sha256": "49f7664c538a95a3e96ea0d953dc0d313f4c4e50a17450ff7dcbe371fff8339d"
+    },
+    {
+      "bytes": 250416,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main.cu",
+      "sha256": "4724eec6f8e194f3dbcc29274e33f7e28d10a4c79b67372e8eefcd92415b39a9"
+    },
+    {
+      "bytes": 40967,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main_binding.cu",
+      "sha256": "153b4503f371563014f4c0a151e6942166102fd703cc6321142049ab41c1ffe5"
+    },
+    {
+      "bytes": 256627,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map.cu",
+      "sha256": "3590ff568c9477192e6839f431ff39d43be8a0cf289fa0e41d5892e413b30eca"
+    },
+    {
+      "bytes": 41189,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map_binding.cu",
+      "sha256": "768246996b20b4bcd3a664c919a340a20e0ed27a61e0b892c8ede52dd6298827"
+    },
+    {
+      "bytes": 251754,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
-      "sha256": "0c07daf26e3f6f7c75ae694fd807a051795a94a2da77e658197ad91723700555"
+      "sha256": "9714ebc6915217a73deff918340f60d85661c969f8b7f6292f73c5279312bae1"
     },
     {
       "bytes": 40943,
@@ -253,10 +289,10 @@
       "sha256": "0e5c950a3d14966933f474c80e7c4e3e315cf371a9a86ff9746bf6176658d8a2"
     },
     {
-      "bytes": 256623,
+      "bytes": 257965,
       "kind": "device_source",
       "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
-      "sha256": "fae3e9e620647924decae944a073c08828a13dec08573e38026bfeadafa0ef05"
+      "sha256": "baff4715ca25c3972e76cc5801d5c59a6be2a59a1d9187ef9600b0bcf86b1bf2"
     },
     {
       "bytes": 41165,
@@ -689,7 +725,7 @@
     "observed_checkout_revision": "606e98713d705afb835659bfbd112fcdfe501206",
     "observed_tracked_tree_clean": true,
     "producer_revision": "606e98713d705afb835659bfbd112fcdfe501206",
-    "recipe_sha256": "e9a22db355326b841a37665c8b5c4bdda135036a535855f0c1d07f2f1a0667ff",
+    "recipe_sha256": "c5f1a1d49f97b222d96c973174b062254e67e4773f9dfc1205bcadd617cc70b4",
     "schema": "cake.library_export.generation_inputs.v2"
   },
   "library": "flashinfer",
@@ -923,9 +959,9 @@
       },
       "closure": [
         {
-          "bytes": 250014,
+          "bytes": 251356,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
-          "sha256": "d6f86ff86174c6d4b722ca4e1bcb9ccbc3558ef16fc127dfb8bbf56b0fc6cf8a"
+          "sha256": "adaabf03453128738bf79d322e5990a0d6d40871d05ca27c3c2b03152aeadec1"
         },
         {
           "bytes": 41207,
@@ -933,7 +969,7 @@
           "sha256": "3937c5f4ca0c47f912dd79704d625f81a6e372a69495bafa8ad5425e10dc4653"
         }
       ],
-      "closure_sha256": "e0af2aad15be3efa6c108662b29f3297d2792441d8fb93f4931d52b08a532839",
+      "closure_sha256": "78cda612696fc70ea60a8814509fa1f8f5867e7ac6045e988c8535cd4400173c",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1218,9 +1254,894 @@
       },
       "closure": [
         {
-          "bytes": 250412,
+          "bytes": 250018,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction.cu",
+          "sha256": "7725039b8df25ef0afb7570822e867eddb64d7646c4c72527d862b83e5f2785a"
+        },
+        {
+          "bytes": 41231,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction_binding.cu",
+          "sha256": "49f7664c538a95a3e96ea0d953dc0d313f4c4e50a17450ff7dcbe371fff8339d"
+        }
+      ],
+      "closure_sha256": "1e0865421b45d0cdb0efeaece5bd12b348c5a4890394e790883bb1163d97aa4d",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_correction",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_correction_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_correction",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "correction",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_correction"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 250416,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main.cu",
+          "sha256": "4724eec6f8e194f3dbcc29274e33f7e28d10a4c79b67372e8eefcd92415b39a9"
+        },
+        {
+          "bytes": 40967,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main_binding.cu",
+          "sha256": "153b4503f371563014f4c0a151e6942166102fd703cc6321142049ab41c1ffe5"
+        }
+      ],
+      "closure_sha256": "7a7af079dfe8be6c6965e394c2eaf0bb115cc73d04a301420ecf91e98a8bcca9",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_main",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_main_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_main",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_main"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 256627,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map.cu",
+          "sha256": "3590ff568c9477192e6839f431ff39d43be8a0cf289fa0e41d5892e413b30eca"
+        },
+        {
+          "bytes": 41189,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map_binding.cu",
+          "sha256": "768246996b20b4bcd3a664c919a340a20e0ed27a61e0b892c8ede52dd6298827"
+        }
+      ],
+      "closure_sha256": "f9184f0c61c715a0c479646c64f0880eb7671cbe2bb5a0520cbf75a61942a525",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_map",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_map_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_map",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "map",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_map"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 251754,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
-          "sha256": "0c07daf26e3f6f7c75ae694fd807a051795a94a2da77e658197ad91723700555"
+          "sha256": "9714ebc6915217a73deff918340f60d85661c969f8b7f6292f73c5279312bae1"
         },
         {
           "bytes": 40943,
@@ -1228,7 +2149,7 @@
           "sha256": "0e5c950a3d14966933f474c80e7c4e3e315cf371a9a86ff9746bf6176658d8a2"
         }
       ],
-      "closure_sha256": "852fbf386dbfab0a450cd9f4a72cf0e74473c1040b5a3a6b252cf8fb1c92c681",
+      "closure_sha256": "faedc7d47e2f528090ac056b0b3afb5a14794e58b8dec235644472a259c88c0f",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -1513,9 +2434,9 @@
       },
       "closure": [
         {
-          "bytes": 256623,
+          "bytes": 257965,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
-          "sha256": "fae3e9e620647924decae944a073c08828a13dec08573e38026bfeadafa0ef05"
+          "sha256": "baff4715ca25c3972e76cc5801d5c59a6be2a59a1d9187ef9600b0bcf86b1bf2"
         },
         {
           "bytes": 41165,
@@ -1523,7 +2444,7 @@
           "sha256": "e93bca435943c4cf9e74230e79432d382986c2dc6cbd910c855623a97010d537"
         }
       ],
-      "closure_sha256": "171af3665b456f579dc5d4d43d11d77bfada5279d84c860d8a4cfa971eac856d",
+      "closure_sha256": "19b0219e51f791f8ff73e29daa5b6c8be11aa760219951b3ecfc8520480e3dba",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9167,9 +10088,9 @@
       },
       "closure": [
         {
-          "bytes": 250014,
+          "bytes": 251356,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_correction.cu",
-          "sha256": "d6f86ff86174c6d4b722ca4e1bcb9ccbc3558ef16fc127dfb8bbf56b0fc6cf8a"
+          "sha256": "adaabf03453128738bf79d322e5990a0d6d40871d05ca27c3c2b03152aeadec1"
         },
         {
           "bytes": 41207,
@@ -9177,7 +10098,7 @@
           "sha256": "3937c5f4ca0c47f912dd79704d625f81a6e372a69495bafa8ad5425e10dc4653"
         }
       ],
-      "closure_sha256": "01ef996445ff97d3a7ee21a3553fba07ba85bb6140793fd0013e596817a32443",
+      "closure_sha256": "15ebf54c9411bf3c734f4da70d28beca7542c063f37f530f52a5770486290e80",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9462,9 +10383,894 @@
       },
       "closure": [
         {
-          "bytes": 250412,
+          "bytes": 250018,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction.cu",
+          "sha256": "7725039b8df25ef0afb7570822e867eddb64d7646c4c72527d862b83e5f2785a"
+        },
+        {
+          "bytes": 41231,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction_binding.cu",
+          "sha256": "49f7664c538a95a3e96ea0d953dc0d313f4c4e50a17450ff7dcbe371fff8339d"
+        }
+      ],
+      "closure_sha256": "e0c3ce2c0dd56a1c4d9cae385abc2a26e1b6dfc507d6ff42351baa2f6fff669b",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_correction",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_correction_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_correction",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "correction",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_correction"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_correction.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 250416,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main.cu",
+          "sha256": "4724eec6f8e194f3dbcc29274e33f7e28d10a4c79b67372e8eefcd92415b39a9"
+        },
+        {
+          "bytes": 40967,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main_binding.cu",
+          "sha256": "153b4503f371563014f4c0a151e6942166102fd703cc6321142049ab41c1ffe5"
+        }
+      ],
+      "closure_sha256": "1d34275ef7d680a22d6e4f1f77334f49e6d0542acc34d5d9b6c80e9c6b5125e9",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_main",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_main_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_main",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "main",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_main"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": false,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_main.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 256627,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map.cu",
+          "sha256": "3590ff568c9477192e6839f431ff39d43be8a0cf289fa0e41d5892e413b30eca"
+        },
+        {
+          "bytes": 41189,
+          "path": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map_binding.cu",
+          "sha256": "768246996b20b4bcd3a664c919a340a20e0ed27a61e0b892c8ede52dd6298827"
+        }
+      ],
+      "closure_sha256": "98dbf5a23d890acd1c2ba1860404b9856680658272489eb62977cfb11cd08e30",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_affine_bounded_fp32_h12_map",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227968,
+        "use_pdl": true
+      },
+      "module_ident": "cake_kda_affine_bounded_fp32_h12_map_ffi",
+      "name": "cake_kda_affine_bounded_fp32_h12_map",
+      "noncontiguous_tensors": [
+        "initial_state",
+        "final_state",
+        "initial_state_f32",
+        "final_state_f32"
+      ],
+      "role": "map",
+      "route": {
+        "family": "bounded_fp32_affine_h12_prefix",
+        "policy": "affine_split_map"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "pointer",
+        "use_pdl": true,
+        "validate": false
+      },
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 896,
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_affine_bounded_fp32_h12_map.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_checkpoints_addr"
+        ],
+        [
+          "parameter",
+          "checkpoint_cu_starts_addr"
+        ],
+        [
+          "parameter",
+          "beta_token_stride"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "parameter",
+          "checkpoint_every_n_tokens"
+        ],
+        [
+          "buffer",
+          "cu_chunk_offsets"
+        ],
+        [
+          "buffer",
+          "chunk_state"
+        ],
+        [
+          "buffer",
+          "state_checkpoint_needed"
+        ],
+        [
+          "buffer",
+          "tape_qd"
+        ],
+        [
+          "buffer",
+          "tape_kd"
+        ],
+        [
+          "buffer",
+          "tape_kr"
+        ],
+        [
+          "buffer",
+          "tape_j"
+        ],
+        [
+          "buffer",
+          "tape_restore_factor"
+        ],
+        [
+          "buffer",
+          "tape_e"
+        ],
+        [
+          "buffer",
+          "tape_x"
+        ],
+        [
+          "buffer",
+          "tape_r"
+        ],
+        [
+          "buffer",
+          "norm_inv_out"
+        ],
+        [
+          "buffer",
+          "decay_out"
+        ],
+        [
+          "buffer",
+          "beta_active_out"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "zero_workspace"
+        ],
+        [
+          "parameter",
+          "zero_words"
+        ],
+        [
+          "parameter",
+          "num_sequences"
+        ],
+        [
+          "tma_buffer",
+          "state_checkpoints_tma"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "8fbb55893c73a81b3d09bde3b910cff88f6c0e69c0161451ccb292bc7f9e6b4a",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 251754,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_main.cu",
-          "sha256": "0c07daf26e3f6f7c75ae694fd807a051795a94a2da77e658197ad91723700555"
+          "sha256": "9714ebc6915217a73deff918340f60d85661c969f8b7f6292f73c5279312bae1"
         },
         {
           "bytes": 40943,
@@ -9472,7 +11278,7 @@
           "sha256": "0e5c950a3d14966933f474c80e7c4e3e315cf371a9a86ff9746bf6176658d8a2"
         }
       ],
-      "closure_sha256": "b746540f675618109f3010e6643ddcc123465c50cee788ad108c531591313125",
+      "closure_sha256": "1c8822ef5c237afce55a887bd1f3f3b631ec3194f4d3ffc6fe5db5568e5f4339",
       "compile_flags": [
         "--use_fast_math"
       ],
@@ -9757,9 +11563,9 @@
       },
       "closure": [
         {
-          "bytes": 256623,
+          "bytes": 257965,
           "path": "csrc/kda/cake_kda_affine_bounded_fp32_map.cu",
-          "sha256": "fae3e9e620647924decae944a073c08828a13dec08573e38026bfeadafa0ef05"
+          "sha256": "baff4715ca25c3972e76cc5801d5c59a6be2a59a1d9187ef9600b0bcf86b1bf2"
         },
         {
           "bytes": 41165,
@@ -9767,7 +11573,7 @@
           "sha256": "e93bca435943c4cf9e74230e79432d382986c2dc6cbd910c855623a97010d537"
         }
       ],
-      "closure_sha256": "56382ec7cfe9a4a26f17f507a4eb4663f4ae8ada0ece511c4e3d267195c4e613",
+      "closure_sha256": "9dd9a33f02fb3b5daa010dd07dde45b67acadc09bd8d3b5a2affa420191ec661",
       "compile_flags": [
         "--use_fast_math"
       ],

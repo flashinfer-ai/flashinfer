@@ -145,7 +145,11 @@ class _CakeKDAAffineRoute:
     """Exact target and token partition for the sealed affine composite."""
 
     target: Literal["sm100a", "sm103a"]
-    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"]
+    family: Literal[
+        "bounded_fp32_affine_prefix",
+        "bounded_fp32_affine_h12_prefix",
+        "unbounded_affine_prefix",
+    ]
     token_offsets: tuple[int, ...]
     gate_lower_bound: float
     external_state_dtype: torch.dtype
@@ -192,7 +196,11 @@ class _CakeKDAAffineModule(Protocol):
 @dataclass(frozen=True)
 class _CakeKDAAffineResourcesKey:
     target: Literal["sm100a", "sm103a"]
-    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"]
+    family: Literal[
+        "bounded_fp32_affine_prefix",
+        "bounded_fp32_affine_h12_prefix",
+        "unbounded_affine_prefix",
+    ]
     token_offsets: tuple[int, ...]
     num_heads: int
 
@@ -1105,10 +1113,6 @@ def _select_cake_kda_affine_route(
         or beta_dtype != torch.bfloat16
         or not indexed_state
         or not (bounded_fp32 or unbounded_bf16)
-        # Cake's bounded affine source route uses the H12 scalar-beta physical
-        # schedule. Other bounded head counts retain their exact direct or
-        # persistent source route instead of sharing a mismatched cubin.
-        or (bounded_fp32 and num_heads != 12)
         or has_checkpoints
         or sm_count <= 0
     ):
@@ -1143,7 +1147,11 @@ def _select_cake_kda_affine_route(
     return _CakeKDAAffineRoute(
         target=target,
         family=(
-            "bounded_fp32_affine_prefix" if bounded_fp32 else "unbounded_affine_prefix"
+            "bounded_fp32_affine_h12_prefix"
+            if bounded_fp32 and num_heads == 12
+            else "bounded_fp32_affine_prefix"
+            if bounded_fp32
+            else "unbounded_affine_prefix"
         ),
         token_offsets=tuple(
             chunk_offset * _FLASH_KDA_M128_CHUNK for chunk_offset in chunk_offsets
@@ -1190,7 +1198,11 @@ def _cake_kda_workspace_buffer(
 @functools.cache
 def _get_cake_kda_affine_sequence(
     target: Literal["sm100a", "sm103a"],
-    family: Literal["bounded_fp32_affine_prefix", "unbounded_affine_prefix"],
+    family: Literal[
+        "bounded_fp32_affine_prefix",
+        "bounded_fp32_affine_h12_prefix",
+        "unbounded_affine_prefix",
+    ],
 ) -> _CakeKDAAffineModule:
     """Load one manifest-sealed, allocation-free affine launch sequence."""
 
@@ -1336,11 +1348,11 @@ def _cake_kda_affine_resources(
         from .jit.cake_kda import get_cake_kda_module, get_cake_kda_module_spec
 
         stage_routes = (
-            ("bounded_fp32_affine_prefix", "affine_split_main", "main"),
-            ("bounded_fp32_affine_prefix", "affine_split_map", "map"),
+            (affine_route.family, "affine_split_main", "main"),
+            (affine_route.family, "affine_split_map", "map"),
             ("unbounded_affine_prefix", "affine_prefix_scan", "scan"),
             (
-                "bounded_fp32_affine_prefix",
+                affine_route.family,
                 "affine_split_correction",
                 "correction",
             ),
@@ -1562,7 +1574,7 @@ def _run_cake_kda_affine_route(
     g_tail = g_flat[resources.tail_start :].view_as(q_tail)
     beta_tail = beta_flat[resources.tail_start :].view(1, tail_tokens, num_heads)
     scalar_beta = (
-        affine_route.family == "bounded_fp32_affine_prefix" and num_heads == 12
+        affine_route.family == "bounded_fp32_affine_h12_prefix"
     )
     main_beta_source = _cake_kda_beta_source(
         beta,

@@ -599,7 +599,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_affine_bounded_fp32_main(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32)
+kernel_cake_kda_affine_bounded_fp32_h12_main(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1709,11 +1709,8 @@ kernel_cake_kda_affine_bounded_fp32_main(__nv_bfloat16* __restrict__ q, CakeTens
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
-                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8192);
                             tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * 41984, g_tma, 0, head_idx_3, (int)(bos_3 + (long long)(chunk_idx_2 * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                            {
-                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 41984, beta_tma, ((0) ? 0 : head_idx_3 / 8 * 8), (int)(((0) ? (bos_3 + (long long)(chunk_idx_2 * 32)) / 2 : bos_3 + (long long)(chunk_idx_2 * 32))), gate_raw_full_addr + (prep_stage) * 8);
-                            }
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 16384);
                             tma_4d_gmem2smem(smem_kd_addr + prep_stage * 41984, k_tma, 0, (int)(bos_3 + (long long)(chunk_idx_2 * 32)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                         }
@@ -1723,23 +1720,8 @@ kernel_cake_kda_affine_bounded_fp32_main(__nv_bfloat16* __restrict__ q, CakeTens
                         float beta_logit = 0.0f;
                         {
                             {
-                                unsigned int beta_raw_pair[1];
-                                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&beta_raw_pair[0])) : "r"(smem_beta_raw_addr + prep_stage * 41984 + (unsigned int)(lane * 16) + (unsigned int)(head_idx_3 % 8 / 2 * 4)));
-                                float beta_raw_pair_f32[2];
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        "shl.b32 %0, %2, 16;\n\t"
-                                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                                        "}\n"
-                                        : "=f"((&beta_raw_pair_f32[_pair * 2])[0]), "=f"((&beta_raw_pair_f32[_pair * 2])[1])
-                                        : "r"(beta_raw_pair[_pair]));
-                                }
-                                beta_logit = beta_raw_pair_f32[0];
-                                if (head_idx_3 % 2 != 0) {
-                                    beta_logit = beta_raw_pair_f32[1];
-                                }
+                                long long beta_token = bos_3 + (long long)(chunk_idx_2 * 32 + lane);
+                                beta_logit = (float)beta[beta_token * beta_token_stride + (long long)head_idx_3];
                             }
                         }
                         float _tanh_approx_1;
@@ -1780,12 +1762,12 @@ kernel_cake_kda_affine_bounded_fp32_main(__nv_bfloat16* __restrict__ q, CakeTens
                     asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
                 }
                 if (prep_local_warp == 2 && lane < 32) {
-                    long long beta_token = bos_3 + (long long)(chunk_idx_2 * 32 + lane);
+                    long long beta_token_1 = bos_3 + (long long)(chunk_idx_2 * 32 + lane);
                     float beta_value = early_beta_value;
                     if (chunk_is_full_1 == 0) {
-                        if (beta_token < eos_3) {
-                            float beta_logit_1 = (float)beta[beta_token * (long long)num_heads + (long long)head_idx_3];
-                            beta_logit_1 = (float)beta[beta_token * beta_token_stride + (long long)head_idx_3];
+                        if (beta_token_1 < eos_3) {
+                            float beta_logit_1 = (float)beta[beta_token_1 * (long long)num_heads + (long long)head_idx_3];
+                            beta_logit_1 = (float)beta[beta_token_1 * beta_token_stride + (long long)head_idx_3];
                             float _tanh_approx_3;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(beta_logit_1 * 0.5f));
                             beta_value = _tanh_approx_3 * 0.5f + 0.5f;
