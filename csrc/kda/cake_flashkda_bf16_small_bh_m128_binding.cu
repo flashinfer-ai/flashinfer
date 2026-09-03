@@ -105,8 +105,7 @@ void RunSmallBHM128(TensorView q, TensorView k, TensorView v, TensorView g, Tens
       CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
                         initial_state, out, final_state, descriptor_storage, prepare_descriptors,
                         num_heads, use_initial_state, store_final_state, scale, lower_bound);
-  TVM_FFI_ICHECK(
-      q.ndim() == 4 && (q.size(0) == num_seqs || q.size(0) == 1))
+  TVM_FFI_ICHECK(q.ndim() == 4 && (q.size(0) == num_seqs || q.size(0) == 1))
       << "small-BH FlashKDA requires canonical fixed or packed "
          "[B, T, H, 128] storage";
   TVM_FFI_ICHECK(q.size(1) >= kSmallBHMinSequenceLength)

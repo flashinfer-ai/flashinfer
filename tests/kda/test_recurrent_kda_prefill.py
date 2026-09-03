@@ -3516,9 +3516,7 @@ def test_multi_token_gqa_expands_query_heads_for_prefill(cuda_device, monkeypatc
         prefill_calls.append(kwargs)
         return sentinel
 
-    monkeypatch.setattr(
-        kda_prefill_cute_api, "_run_cute_dsl_kda_prefill", run_prefill
-    )
+    monkeypatch.setattr(kda_prefill_cute_api, "_run_cute_dsl_kda_prefill", run_prefill)
     monkeypatch.setattr(
         kda_decode_api,
         "_run_recurrent_kda",
