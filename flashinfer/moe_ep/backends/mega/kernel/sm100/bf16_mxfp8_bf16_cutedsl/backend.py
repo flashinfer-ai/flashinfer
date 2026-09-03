@@ -61,12 +61,15 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
+            alignment=32,
         )
         if fleet_params.token_hidden_size % 32:
-            raise ValueError("mixed MegaMoE requires hidden size divisible by 32.")
+            raise ValueError(
+                "Mixed BF16 x MXFP8 MegaMoE requires hidden size divisible by 32."
+            )
         if self._kernel_config.intermediate_size % 64:
             raise ValueError(
-                "mixed MegaMoE requires intermediate size divisible by 64."
+                "Mixed BF16 x MXFP8 MegaMoE requires intermediate size divisible by 64."
             )
 
     def preprocess_weights(

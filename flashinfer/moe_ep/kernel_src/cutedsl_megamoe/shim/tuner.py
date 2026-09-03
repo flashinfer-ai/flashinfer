@@ -175,13 +175,6 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "static",
 }
 
-# Mirrors ``Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs``.
-_BF16_MXFP8_IMPLS = {
-    ((256, 128, 128), "tmem", False, 128),
-    ((256, 256, 128), "smem", False, 128),
-    ((256, 256, 128), "tmem", True, 64),
-}
-
 
 def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
@@ -290,6 +283,13 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
 
 def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
     """Validate the implementation tuples accepted by mixed MXFP8/BF16 MegaMoE."""
+
+    from ..src.moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
+        Sm100SwapABMxfp8Bf16Fc12Kernel,
+    )
+
+    _BF16_MXFP8_IMPLS = Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs
+
     impl = (
         knobs.get("mma_tiler_mnk", (256, 128, 128)),
         knobs.get("transform_buffer", "tmem"),

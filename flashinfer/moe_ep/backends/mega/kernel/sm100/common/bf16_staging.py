@@ -32,6 +32,10 @@ def validate_bf16_forward_inputs(
     top_k: int,
     scales: torch.Tensor | None = None,
 ) -> None:
+    if hidden_states.dtype != torch.bfloat16:
+        raise MoEEpConfigError(
+            f"Expected bf16 hidden_states; got {hidden_states.dtype}."
+        )
     if scales is not None:
         raise MoEEpConfigError("BF16 MegaMoE does not accept MoEEpTensors.scales.")
     validate_mega_forward_inputs(
