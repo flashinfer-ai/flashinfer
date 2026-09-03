@@ -773,15 +773,38 @@ class DaMoeOperationState:
                     ):
                         baseline_latency = candidate_latency
                     else:
-                        baseline_latency = self._measurements.measure(
-                            (realization_key, "noda", normalized_baseline),
-                            lambda: tuner.profile_tactic(
+                        selected_identity = tuple(
+                            int(value) for value in selected.tactic
+                        )
+
+                        def profile_selected_for_guard() -> float:
+                            return tuner.profile_tactic(
+                                profile_runner,
+                                profile_inputs,
+                                list(selected_identity),
+                                effective_config,
+                                profile_batches,
+                            )
+
+                        def profile_baseline_for_guard() -> float:
+                            return tuner.profile_tactic(
                                 baseline_profile_runner,
                                 baseline_profile_inputs,
                                 list(normalized_baseline),
                                 baseline_config,
                                 baseline_batches,
-                            ),
+                            )
+
+                        # Candidate selection can contain many tactics. Retime only the winner and
+                        # its matched ordinary baseline in ABBA order so guard admission is not
+                        # determined by which path happened to occupy the earlier timing position.
+                        candidate_latency, baseline_latency = (
+                            self._measurements.measure_counterbalanced_pair(
+                                (realization_key, "guard_da", selected_identity),
+                                profile_selected_for_guard,
+                                (realization_key, "guard_noda", normalized_baseline),
+                                profile_baseline_for_guard,
+                            )
                         )
                     selections.append(
                         DAProfileSelection(
@@ -796,8 +819,13 @@ class DaMoeOperationState:
 
             # Measure each retained body against every exemplar only when a guarded multi-body
             # plan could profitably collapse to one body and remove control overhead.
+            # Host dispatch keeps the original distribution winners; only capture may prune them.
+            eager_selections = tuple(selections)
+            capture_selections = eager_selections
             candidate_bodies = tuple(
-                dict.fromkeys(selection.selected_tactic for selection in selections)
+                dict.fromkeys(
+                    selection.selected_tactic for selection in capture_selections
+                )
             )
             candidate_latencies: dict[tuple[RoutingRealizationKey, Any], float] = {}
             if config.baseline_guard_enabled and len(candidate_bodies) > 1:
@@ -825,16 +853,18 @@ class DaMoeOperationState:
                             (selection.realization_key, "da", identity),
                             profile_candidate,
                         )
-                selections = list(
-                    compiler.prefer_control_aware_singleton(
-                        selections, candidate_latencies
-                    )
+                capture_selections = compiler.prefer_control_aware_singleton(
+                    capture_selections, candidate_latencies
                 )
         finally:
             routing_adapter.restore(inputs, original_routing)
 
         # Publish only after routing restoration and complete host-side compilation succeed.
-        compiled = compiler.compile(selections, normalized_baseline)
+        compiled = compiler.compile(
+            capture_selections,
+            normalized_baseline,
+            eager_selections=eager_selections,
+        )
         publish_compiled_plan(self.dispatcher, compiled)
         self._published_policy = compiled.policy.value
         self._eager_body = (
