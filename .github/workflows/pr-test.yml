@@ -106,6 +106,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Validate CUDA configuration
+        run: python3 ci/validate_cuda_versions.py
+
       - name: Get Docker Tag
         id: get-tag
         run: |
@@ -116,6 +119,10 @@ jobs:
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Docker tag: $TAG"
+
+      - name: Load runtime CUDA matrix
+        id: cuda-versions
+        run: echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
       - name: Check Skip Conditions
         id: check
@@ -154,11 +161,12 @@ jobs:
         env:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
+          RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
-                for cuda in cu126 cu128 cu129 cu130; do
+                for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
                   jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
                     name: "AOT Build Import (\($arch), \($cuda))",
                     kind: "aot",
@@ -229,6 +237,9 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+      MATRIX_ARCH: ${{ matrix.runner[2] }}
+      MATRIX_CUDA: ${{ matrix.cuda }}
+      TEST_SCRIPT: ${{ matrix.script }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -285,6 +296,10 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
+          if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
+            echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
+            exit 1
+          fi
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
           bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
@@ -292,7 +307,7 @@ jobs:
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
-            --no-gpu ./scripts/${{ matrix.script }}
+            --no-gpu "./scripts/${TEST_SCRIPT}"
 
       - name: Display sccache stats
         if: always() && matrix.kind == 'aot'
@@ -313,8 +328,8 @@ jobs:
             printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
             printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
             printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
-            printf 'matrix_cuda=%s\n' "${{ matrix.cuda }}"
-            printf 'matrix_arch=%s\n' "${{ matrix.runner[2] }}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
           } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
 
       - name: Upload sccache stats
@@ -328,7 +343,15 @@ jobs:
 
       - name: Run Test
         if: matrix.kind != 'aot'
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/${{ matrix.script }}
+        run: |
+          case "${TEST_SCRIPT}" in
+            task_jit_run_tests_part[1-5].sh|task_run_unit_tests.sh) ;;
+            *)
+              echo "::error::Unexpected GPU test script: ${TEST_SCRIPT}"
+              exit 1
+              ;;
+          esac
+          bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
 
       - name: Make JUnit XML readable
         if: ${{ always() && matrix.kind == 'h100' }}

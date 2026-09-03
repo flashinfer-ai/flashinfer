@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplates for the numeric MSA ops; references mirror the torch oracles
-in ``tests/msa_ops/``. Metadata ops (topk select, union builders) produce
-indices, not numeric tensors, so they are not traced."""
+"""TraceTemplates for the MSA ops; references mirror the torch oracles in
+``tests/msa_ops/``. Internal metadata helpers (union builders) are not
+traced."""
 
 import torch
 
@@ -379,6 +379,180 @@ msa_proxy_score_fp4_trace = TraceTemplate(
     reference=_msa_proxy_score_fp4_reference,
     check=_msa_score_check,
     init=_msa_proxy_score_fp4_init,
+)
+
+# ── msa_topk_select (block selection) ─────────────────────────────────────────
+
+
+@torch.no_grad()
+def _msa_topk_select_reference(
+    max_score, topk, num_valid_pages=None, force_begin_blocks=0, force_end_blocks=0
+):
+    """Top-k KV blocks per (query, head): forced begin/end blocks always kept,
+    the rest by score rank within [0, num_valid_pages); ascending, -1 padded."""
+    H, P, S = max_score.shape
+    if num_valid_pages is None:
+        nvps = torch.full((S,), P, dtype=torch.long)
+    elif isinstance(num_valid_pages, torch.Tensor):
+        nvps = num_valid_pages.long().clamp(0, P).cpu()
+    else:
+        nvps = torch.full((S,), max(0, min(int(num_valid_pages), P)), dtype=torch.long)
+    scores = max_score.float().cpu()
+    out = torch.full((S, H, topk), -1, dtype=torch.int32)
+    for q in range(S):
+        nvp = int(nvps[q])
+        mid_end = max(nvp - force_end_blocks, force_begin_blocks)
+        forced = set(range(min(force_begin_blocks, nvp))) | set(range(mid_end, nvp))
+        free = topk - len(forced)
+        for h in range(H):
+            mid = scores[h, force_begin_blocks:mid_end, q]
+            k = min(free, mid.numel())
+            picked = (torch.topk(mid, k).indices + force_begin_blocks).tolist()
+            sel = sorted(forced | set(picked))
+            out[q, h, : len(sel)] = torch.tensor(sel, dtype=torch.int32)
+    return out.to(max_score.device)
+
+
+def _msa_topk_select_check(
+    reference_outputs,
+    actual_outputs,
+    max_score=None,
+    num_valid_pages=None,
+    force_begin_blocks=0,
+    force_end_blocks=0,
+    **_unused,
+):
+    """Near-tied scores make the selected index set ambiguous (see the
+    msa_topk_select docstring), so with ``max_score`` rows are compared by
+    their selected score multisets against the reference, plus forced-block
+    membership (a tied block must not displace a forced one). Without
+    ``max_score``, exact equality."""
+
+    # Nested: the JSON-embedded source must be self-contained.
+    def unwrap(x):
+        if isinstance(x, dict):
+            x = next(iter(x.values()))
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        return x
+
+    ref = unwrap(reference_outputs)
+    act = unwrap(actual_outputs)
+    if not (isinstance(ref, torch.Tensor) and isinstance(act, torch.Tensor)):
+        return False
+    if ref.shape != act.shape:
+        return False
+    ref, act = ref.cpu(), act.cpu()
+    scores = None if max_score is None else max_score.float().cpu()
+    S, H, _ = act.shape
+    nvps = None
+    if scores is not None:
+        P = scores.shape[1]
+        if num_valid_pages is None:
+            nvps = torch.full((S,), P, dtype=torch.long)
+        elif isinstance(num_valid_pages, torch.Tensor):
+            nvps = num_valid_pages.long().clamp(0, P).cpu()
+        else:
+            nvps = torch.full(
+                (S,), max(0, min(int(num_valid_pages), P)), dtype=torch.long
+            )
+    for q in range(S):
+        for h in range(H):
+            r, a = ref[q, h], act[q, h]
+            av = a[a >= 0]
+            # Valid entries must form a strictly ascending prefix, -1 tail only.
+            if (
+                (a[: av.numel()] != av).any()
+                or (a[av.numel() :] != -1).any()
+                or (av.diff() <= 0).any()
+            ):
+                return False
+            rv = r[r >= 0]
+            if av.numel() != rv.numel():
+                return False
+            if scores is None:
+                if not torch.equal(av, rv):
+                    return False
+                continue
+            nvp = int(nvps[q])
+            if (av >= nvp).any():
+                return False
+            mid_end = max(nvp - force_end_blocks, force_begin_blocks)
+            forced = set(range(min(force_begin_blocks, nvp))) | set(range(mid_end, nvp))
+            if not forced <= set(av.tolist()):
+                return False
+            got = scores[h, av.long(), q].sort(descending=True).values
+            exp = scores[h, rv.long(), q].sort(descending=True).values
+            # rtol absorbs the radix kernel's dropped low key bits (<= 3 ulp).
+            if not torch.allclose(got, exp, rtol=1e-5, atol=0.0, equal_nan=True):
+                return False
+    return True
+
+
+def _msa_topk_select_init(
+    *,
+    total_q: int,
+    max_k_tiles: int = 256,
+    num_qo_heads: int = 4,
+    topk: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Random proxy scores; defaults follow MiniMax-M3 (4 index heads) at a
+    32k-token context (256 KV blocks of 128)."""
+    torch.manual_seed(seed)
+    max_score = torch.randn(
+        num_qo_heads, max_k_tiles, total_q, dtype=torch.float32, device=device
+    )
+    return {"max_score": max_score, "topk": topk}
+
+
+msa_topk_select_trace = TraceTemplate(
+    op_type="msa_topk",
+    name_prefix="msa_topk_select",
+    description=(
+        "MSA block selection: per-(query token, head) top-k KV blocks by proxy "
+        "score, ascending indices with -1 tail padding; consumes msa_proxy_score "
+        "output and feeds msa_sparse_attention."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "max_k_tiles": Var(description="Number of candidate KV-block columns."),
+        "total_q": Var(description="Total query tokens across the batch."),
+        "topk": Const(abbrev="topk"),
+    },
+    inputs={
+        "max_score": Tensor(
+            ["num_qo_heads", "max_k_tiles", "total_q"],
+            description="Per-(head, KV-block, query) proxy scores; invalid tiles -inf.",
+        ),
+        "topk": Scalar("int32", description="KV blocks selected per (token, head)."),
+        "num_valid_pages": Tensor(
+            ["total_q"],
+            dtype="int32",
+            optional=True,
+            description="Per-token valid KV pages; a scalar int is also "
+            "accepted batch-wide.",
+        ),
+        "force_begin_blocks": Scalar("int32", optional=True),
+        "force_end_blocks": Scalar("int32", optional=True),
+    },
+    outputs={
+        "block_indices": Tensor(
+            ["total_q", "num_qo_heads", "topk"],
+            dtype="int32",
+            description="Ascending selected KV-block ids; -1 tail padding.",
+        ),
+    },
+    constraints=[
+        "max_score.shape[0] == num_qo_heads",
+        "max_score.shape[1] == max_k_tiles",
+        "max_score.shape[2] == total_q",
+    ],
+    tags=["status:verified", "stage:indexer", "sparse:topk"],
+    reference=_msa_topk_select_reference,
+    check=_msa_topk_select_check,
+    init=_msa_topk_select_init,
 )
 
 # ── msa_sparse_attention (prefill) ─────────────────────────────────────────────

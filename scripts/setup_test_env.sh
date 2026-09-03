@@ -10,23 +10,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Pin the preinstalled CUDA torch for every job-time pip install (same guard as
-# test_utils.sh; idempotent — whichever is sourced first wins). Prevents a dep's
-# transitive constraints from making pip re-resolve torch and silently evict the
-# CUDA build (on aarch64 pip backtracks to the CPU-only PyPI wheel -> "Torch not
-# compiled with CUDA enabled"); with the constraint such a resolution fails
-# loudly at install time. The +cuXXX local tag is stripped: PEP 440 lets the
-# installed 2.X.Y+cuNNN satisfy ==2.X.Y, but PEP-517 build envs (flashinfer-
-# jit-cache's build-system.requires includes torch) inherit PIP_CONSTRAINT and
-# must be able to resolve the pin from PyPI, where local-version wheels don't
-# exist.
+# test_utils.sh; idempotent — whichever is sourced first wins). Branch
+# requirement synchronization below uses --no-deps to preserve the image's
+# validated cuda-python and cuDNN packages. Pinning those packages would contradict
+# torch's own exact dependency metadata. The +cuXXX local tag is stripped so
+# PEP-517 build environments can resolve the constraint from PyPI.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-  _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
+  if ! _torch_pin=$(python -c \
+    'import torch; print("torch==" + torch.__version__.split("+")[0])'); then
+    echo "ERROR: failed to inspect the image torch; refusing unpinned pip installs" >&2
+    return 1
+  fi
   if [ -n "${_torch_pin}" ]; then
     _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
-    echo "${_torch_pin}" > "${_constraint_file}"
+    printf '%s\n' "${_torch_pin}" > "${_constraint_file}"
     export PIP_CONSTRAINT="${_constraint_file}"
-    echo "Pinning for all pip installs in this job: ${_torch_pin}"
+    echo "Pinning image torch for job-time pip installs: ${_torch_pin}"
     unset _constraint_file
+  else
+    echo "ERROR: image torch inspection returned no package constraint" >&2
+    return 1
   fi
   unset _torch_pin
 fi
@@ -46,12 +49,12 @@ case "${_reqs_status}" in
     while IFS= read -r _req; do
       [ -n "${_req}" ] && _reqs_list+=("${_req}")
     done <<< "${_reqs_output}"
-    pip install "${_reqs_list[@]}"
+    pip install --no-deps "${_reqs_list[@]}"
     unset _reqs_list _req
     ;;
   *)
     echo "WARNING: requirement check failed; syncing the full requirements" >&2
-    pip install -r "${REPO_ROOT}/requirements.txt"
+    pip install --no-deps -r "${REPO_ROOT}/requirements.txt"
     ;;
 esac
 unset _reqs_output _reqs_status

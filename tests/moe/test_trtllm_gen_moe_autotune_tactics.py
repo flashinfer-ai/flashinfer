@@ -321,6 +321,7 @@ def _enumerate_valid_tactics(
     num_experts: int,
     num_tokens: int,
     use_per_token_scaling: bool = False,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given problem shape."""
@@ -336,7 +337,7 @@ def _enumerate_valid_tactics(
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
-            ActivationType.Swiglu.value,
+            activation_type.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
             use_per_token_scaling,
@@ -346,13 +347,24 @@ def _enumerate_valid_tactics(
     )
 
 
-def test_nvfp4_per_token_all_tactics_are_correct(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+def test_nvfp4_per_token_all_tactics_are_correct(
+    monkeypatch: pytest.MonkeyPatch, activation_type: ActivationType
+):
     """Every advertised per-token NVFP4 tactic must be numerically correct."""
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
 
     torch.manual_seed(42)
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -362,6 +374,7 @@ def test_nvfp4_per_token_all_tactics_are_correct(monkeypatch: pytest.MonkeyPatch
         num_experts=128,
         num_tokens=4096,
         use_per_token_scaling=True,
+        activation_type=activation_type,
     )
     assert valid_tactics
 
@@ -391,10 +404,12 @@ def test_nvfp4_per_token_all_tactics_are_correct(monkeypatch: pytest.MonkeyPatch
                     top_k=8,
                     use_4over6=True,
                     weights_use_4over6=True,
+                    activation_type=activation_type,
                 )
         except Exception as err:
             raise AssertionError(
-                f"Per-token NVFP4 tactic {tactic} failed accuracy"
+                f"Per-token NVFP4 tactic {tactic} failed accuracy "
+                f"for {activation_type.name}"
             ) from err
         torch.cuda.empty_cache()
 
@@ -460,7 +475,9 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
         torch.cuda.synchronize()
         return output
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -582,7 +599,9 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         quant_mode,
@@ -926,7 +945,9 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_fp8_valid_tactics(
         moe_op,
         quant_mode,

@@ -18,8 +18,8 @@ Fused GDN Decode Step - two-launch CuTe-DSL impl with PDL (SM120)
 
 Host and kernel side of the ``cutedsl_sm120_pdl`` registry impl: a
 two-launch CuTe-DSL implementation of the fused GDN decode step, compiled
-per (batch, scale, conv-state layout) and launched on the current torch
-stream.  The conv-state pool arrives as a logical [P, QKV_DIM,
+per (layer geometry, batch, scale, conv-state layout) and launched on the
+current torch stream.  The conv-state pool arrives as a logical [P, QKV_DIM,
 CONV_STATE_LEN] view of either a transposed SD pool (vLLM default) or a
 DS-dense pool; indexing is stride-generic, so the layouts differ only in
 which mode carries the static unit stride. The first launch
@@ -30,10 +30,10 @@ wait/trigger contract that makes that safe is stated in full above
 :func:`pre_kernel` and pinned by ``tests/gdn/test_fused_decode.py``.
 
 Implements the impl-module interface documented in ../README.md.
-Compilation is lazy: the first eager :func:`execute` of a (batch, scale,
-conv-state layout) variant compiles it and allocates the per-(batch,
-device) workspace; once warm, calls are capture-safe (kernel launches plus
-one stream memset).  Consumed by
+Compilation is lazy: the first eager :func:`execute` of a (geometry, batch,
+scale, conv-state layout) variant compiles it and allocates the
+per-(geometry, batch, device) workspace; once warm, calls are capture-safe
+(kernel launches plus one stream memset).  Consumed by
 :mod:`flashinfer.gdn_kernels.experimental.gdn_fused_decode_specialized`;
 import errors are tolerated there (the cutlass DSL dependency stays
 optional).
@@ -50,21 +50,49 @@ from cutlass.cute.runtime import from_dlpack
 from ....cuda_utils import checkCudaErrors
 from ._stream_order import order_after_previous_stream
 
-HIDDEN = 5120
-N_BA = 96
-QKV_DIM = 10240
-H_Q = 16
-HV = 48
-D = 128
-CONV_WIDTH = 4
-CONV_STATE_LEN = 3
-GQA = HV // H_Q  # 3
+# The layer geometry (HIDDEN, N_BA, QKV_DIM, H_Q, HV, D) is a compile-time
+# parameter: it is passed down as ``cutlass.Constexpr`` and baked into the
+# kernel exactly as a module constant would be, so one variant is compiled
+# per (geometry, batch, scale, conv-state layout).  The block shape, the
+# warp->row mapping and the reduction trees do not depend on it; only the
+# sizes and the derived tile counts do.
 RPB = 8  # v-rows per block in delta kernel (8 warps = 256 thr)
-NRB = D // RPB  # row-blocks per head = 16
 KS = 512  # K-split factor for the GEMV (atomic fp32 partials)
-KCHUNK = HIDDEN // KS  # 10
+CONV_TILE = 256  # conv channels per block (== block threads)
 
-NCONV = QKV_DIM // 256  # conv tiles per batch = 40
+
+def _derived(hidden: int, qkv_dim: int, hv: int, h_q: int, d: int) -> tuple:
+    """Tile counts derived from a geometry: (GQA, NRB, KCHUNK, NCONV).
+
+    Every division here is exact for a supported geometry; the dispatch
+    registry only lists geometries that satisfy these relations (asserted in
+    :func:`_check_geometry`).
+    """
+    return (hv // h_q, d // RPB, hidden // KS, qkv_dim // CONV_TILE)
+
+
+def _check_geometry(hidden: int, n_ba: int, qkv_dim: int, h_q: int, hv: int, d: int):
+    """Reject a geometry whose tiling would not be exact.
+
+    The registry is the dispatch surface, so this is a guard against a bad
+    row rather than a runtime condition; it raises, and the dispatch layer
+    turns that into a fallback.
+    """
+    if (
+        hv % h_q
+        or d % RPB
+        or hidden % KS
+        or qkv_dim % CONV_TILE
+        or n_ba != 2 * hv
+        or d != 4 * 32
+        or qkv_dim != (2 * h_q + hv) * d
+        or n_ba > CONV_TILE
+    ):
+        raise RuntimeError(
+            "unsupported fused GDN decode geometry for the CuTe-DSL impl: "
+            f"hidden={hidden} n_ba={n_ba} qkv_dim={qkv_dim} h_q={h_q} "
+            f"hv={hv} d={d}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +171,9 @@ def pre_kernel(
     w_ba: cute.Tensor,  # [HIDDEN, N_BA] bf16
     part: cute.Tensor,  # [B, N_BA] f32, zeroed before launch
     Bc: cutlass.Constexpr,
+    N_BA: cutlass.Constexpr,
+    NCONV: cutlass.Constexpr,
+    KCHUNK: cutlass.Constexpr,
 ):
     """First of the two launches: conv1d state update and the b/a GEMV.
 
@@ -179,7 +210,7 @@ def pre_kernel(
     if bidx < Bc * NCONV:
         b_idx = bidx // NCONV
         tile = bidx % NCONV
-        c = tile * 256 + tidx
+        c = tile * CONV_TILE + tidx
         pp = cutlass.Int32(state_indices[b_idx])
         # A negative slot index (vLLM's PAD_SLOT_ID = -1) marks a padded batch
         # row -- what a CUDA-graph replay carries between the live request
@@ -235,6 +266,11 @@ def delta_kernel(
     state_indices: cute.Tensor,  # [B] int32
     output: cute.Tensor,  # [B, 1, HV, D] bf16
     scale: cutlass.Constexpr,
+    H_Q: cutlass.Constexpr,
+    HV: cutlass.Constexpr,
+    D: cutlass.Constexpr,
+    GQA: cutlass.Constexpr,
+    NRB: cutlass.Constexpr,
 ):
     """Second launch: gates, qk-L2-norm and the gated delta-rule update.
 
@@ -433,11 +469,18 @@ def fused_launch(
     stream: cuda_driver.CUstream,
     B: cutlass.Constexpr,
     scale: cutlass.Constexpr,
+    HIDDEN: cutlass.Constexpr,
+    N_BA: cutlass.Constexpr,
+    QKV_DIM: cutlass.Constexpr,
+    H_Q: cutlass.Constexpr,
+    HV: cutlass.Constexpr,
+    D: cutlass.Constexpr,
 ):
     """Host-side launcher: ``pre_kernel`` then ``delta_kernel``, PDL-chained.
 
-    Compiled once per (batch size, scale, conv-state stride mode); ``B`` and
-    ``scale`` are constexpr because both shape the generated code.
+    Compiled once per (layer geometry, batch size, scale, conv-state stride
+    mode); ``B``, ``scale`` and the geometry are constexpr because all of
+    them shape the generated code.
 
     ``use_pdl=True`` on BOTH launches is a promise about the kernels, not just
     a scheduling hint: each of them may start before its stream predecessor has
@@ -445,6 +488,7 @@ def fused_launch(
     reading what a predecessor produced.  Do not add a third PDL launch here
     without reading the contract block above ``pre_kernel``.
     """
+    GQA, NRB, KCHUNK, NCONV = _derived(HIDDEN, QKV_DIM, HV, H_Q, D)
     pre_kernel(
         mixed_qkv,
         conv_weight,
@@ -456,8 +500,14 @@ def fused_launch(
         w_ba,
         part,
         B,
+        N_BA,
+        NCONV,
+        KCHUNK,
     ).launch(
-        grid=[B * NCONV + B * KS, 1, 1], block=[256, 1, 1], stream=stream, use_pdl=True
+        grid=[B * NCONV + B * KS, 1, 1],
+        block=[CONV_TILE, 1, 1],
+        stream=stream,
+        use_pdl=True,
     )
     delta_kernel(
         qkv_act,
@@ -468,22 +518,34 @@ def fused_launch(
         state_indices,
         output,
         scale,
-    ).launch(grid=[B * HV * NRB, 1, 1], block=[256, 1, 1], stream=stream, use_pdl=True)
+        H_Q,
+        HV,
+        D,
+        GQA,
+        NRB,
+    ).launch(
+        grid=[B * HV * NRB, 1, 1],
+        block=[RPB * 32, 1, 1],  # one warp per state row block
+        stream=stream,
+        use_pdl=True,
+    )
 
 
-# Keyed by the three things that change the generated kernel -- batch size,
-# the softmax scale baked in as a constant, and the conv-state stride mode --
-# and, for the workspace, by (batch size, device).  The compiled-kernel value
-# is whatever ``cute.compile`` returns, which has no public static type.
-_compiled: dict[tuple[int, float, int], Any] = {}
-_workspace_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+# Keyed by the four things that change the generated kernel -- the layer
+# geometry, batch size, the softmax scale baked in as a constant, and the
+# conv-state stride mode -- and, for the workspace, by (geometry, batch size,
+# device).  The compiled-kernel value is whatever ``cute.compile`` returns,
+# which has no public static type.
+_compiled: dict[tuple[tuple, int, float, int], Any] = {}
+_workspace_cache: dict[tuple[tuple, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 _launch_count = 0
 
-# Stream that last used the per-(batch, device) workspace, per device.  The
-# workspace (``part``/``qkv_act``) is shared by every call with that batch
-# size, so two calls in flight on different streams would interleave writes
-# into the same buffers; order_after_previous_stream() (see _stream_order.py)
-# makes the later call wait on the earlier one instead.
+# Stream that last used the per-(geometry, batch, device) workspace, per
+# device.  The workspace (``part``/``qkv_act``) is shared by every call with
+# that geometry and batch size, so two calls in flight on different streams
+# would interleave writes into the same buffers;
+# order_after_previous_stream() (see _stream_order.py) makes the later call
+# wait on the earlier one instead.
 _workspace_stream: dict[str, torch.cuda.Stream] = {}
 
 
@@ -494,24 +556,52 @@ def conv_state_leading_dim(conv_state: torch.Tensor) -> int:
     return 1 if conv_state.stride(1) == 1 else 2
 
 
+def geometry_key(signature: dict) -> tuple:
+    """Compile-time geometry key of a dispatch signature."""
+    return (
+        int(signature["hidden"]),
+        int(signature["n_ba"]),
+        int(signature["qkv_dim"]),
+        int(signature["h_q"]),
+        int(signature["hv"]),
+        int(signature["d"]),
+    )
+
+
 def _cache_has(
-    B: int, scale: float, device: torch.device, conv_leading_dim: int = 1
+    geometry: tuple,
+    B: int,
+    scale: float,
+    device: torch.device,
+    conv_leading_dim: int = 1,
 ) -> bool:
-    """True if the (B, scale, conv-state layout) variant is compiled AND the
-    per-(B, device) workspace exists — i.e. a call is capture-safe (kernel
-    launches plus one stream memset, no compilation or allocation)."""
-    return (int(B), float(scale), int(conv_leading_dim)) in _compiled and (
+    """True if the (geometry, B, scale, conv-state layout) variant is compiled
+    AND the per-(geometry, B, device) workspace exists — i.e. a call is
+    capture-safe (kernel launches plus one stream memset, no compilation or
+    allocation)."""
+    return (geometry, int(B), float(scale), int(conv_leading_dim)) in _compiled and (
+        geometry,
         int(B),
         str(device),
     ) in _workspace_cache
 
 
 def ready_for_graph_capture(
-    hidden_states: torch.Tensor, conv_state: torch.Tensor, scale: float
+    signature: dict,
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    scale: float,
 ) -> bool:
-    """True when this exact call (batch size, scale, conv-state layout) can
-    be recorded into a CUDA graph without compiling or allocating."""
+    """True when this exact call (geometry, batch size, scale, conv-state
+    layout) can be recorded into a CUDA graph without compiling or
+    allocating.
+
+    The geometry comes from the matched dispatch signature rather than being
+    re-derived here: readiness must be answered about the exact compiled
+    variant the dispatcher is about to run, so a process warm for one model
+    cannot make a differently-shaped model's call look capture-ready."""
     return _cache_has(
+        geometry_key(signature),
         int(hidden_states.shape[0]),
         float(scale),
         hidden_states.device,
@@ -543,6 +633,17 @@ def execute(
     scale_f = float(scale)
     dev = hidden_states.device
 
+    # Layer geometry of this call (the dispatch layer has already matched it
+    # against the registry); h_q is derived from the q/k/v head split.
+    HIDDEN = int(hidden_states.shape[1])
+    N_BA = int(w_ba.shape[1])
+    QKV_DIM = int(mixed_qkv.shape[1])
+    HV = int(A_log.shape[0])
+    D = int(ssm_state.shape[-1])
+    H_Q = (QKV_DIM - HV * D) // (2 * D)
+    _check_geometry(HIDDEN, N_BA, QKV_DIM, H_Q, HV, D)
+    geometry = (HIDDEN, N_BA, QKV_DIM, H_Q, HV, D)
+
     output = (
         out
         if out is not None
@@ -552,7 +653,7 @@ def execute(
     # Persistent workspace: the GEMV partials are accumulated with atomics, so
     # `part` is re-zeroed each call with a driver memset on the current stream
     # (no extra torch kernel launch; captured as a memset node under graphs).
-    wkey = (B, str(dev))
+    wkey = (geometry, B, str(dev))
     workspace = _workspace_cache.get(wkey)
     if workspace is None:
         workspace = (
@@ -584,7 +685,7 @@ def execute(
     # static stride-1 mode differs).
     cs_ld = conv_state_leading_dim(conv_state)
 
-    key = (B, scale_f, cs_ld)
+    key = (geometry, B, scale_f, cs_ld)
     fn = _compiled.get(key)
     if fn is None:
         # The DLPack markers exist only to describe the argument layouts to
@@ -625,6 +726,12 @@ def execute(
             stream,
             B,
             scale_f,
+            HIDDEN,
+            N_BA,
+            QKV_DIM,
+            H_Q,
+            HV,
+            D,
             options="--enable-tvm-ffi",
         )
         _compiled[key] = fn
@@ -653,17 +760,25 @@ def launch_count() -> int:
     return _launch_count
 
 
+def _geometry_tag(geometry: tuple) -> str:
+    hidden, n_ba, qkv_dim, h_q, hv, d = geometry
+    return f"h{hidden}_nba{n_ba}_qkv{qkv_dim}_hq{h_q}_hv{hv}_d{d}"
+
+
 def compiled_variant_keys() -> list:
     """Compiled-kernel descriptors resident in this process."""
     return [
-        f"b{B}_scale{scale}_ld{leading_dim}"
-        for (B, scale, leading_dim) in sorted(_compiled)
+        f"{_geometry_tag(geometry)}_b{B}_scale{scale}_ld{leading_dim}"
+        for (geometry, B, scale, leading_dim) in sorted(_compiled)
     ]
 
 
 def variant_plan(rows) -> set:
     """Distinct compiled kernels this impl needs for its registry rows: one
-    per (batch size, conv-state layout).  The query scale is also part of
-    the compile key but is a runtime value (a serving process uses one
-    scale), so the plan counts (b, conv_layout) pairs."""
-    return {f"b{row['b']}_{row['conv_layout']}" for row in rows}
+    per (layer geometry, batch size, conv-state layout).  The query scale is
+    also part of the compile key but is a runtime value (a serving process
+    uses one scale), so the plan counts (geometry, b, conv_layout) triples."""
+    return {
+        f"{_geometry_tag(geometry_key(row))}_b{row['b']}_{row['conv_layout']}"
+        for row in rows
+    }

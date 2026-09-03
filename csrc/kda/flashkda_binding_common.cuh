@@ -147,7 +147,8 @@ inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char*
 
 #if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
 constexpr int kFlashKDATargetMinor = FLASHINFER_FLASH_KDA_TARGET_MINOR;
-static_assert(kFlashKDATargetMinor == 0, "legacy exact FlashKDA target must be SM100a");
+static_assert(kFlashKDATargetMinor == 0 || kFlashKDATargetMinor == 3,
+              "exact FlashKDA target must be SM100a or SM103a");
 #else
 constexpr int kFlashKDATargetFamily = FLASHINFER_FLASH_KDA_TARGET_FAMILY;
 static_assert(kFlashKDATargetFamily == 100, "FlashKDA family target must be SM100f");
@@ -193,7 +194,8 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
                                  const TensorView& descriptor_storage, int64_t prepare_descriptors,
                                  int64_t num_heads, int64_t use_initial_state,
                                  int64_t store_final_state, double scale, double lower_bound,
-                                 bool allow_serving_layouts = false, int64_t state_pool_slots = 0) {
+                                 bool allow_serving_layouts = false, int64_t state_pool_slots = 0,
+                                 bool allow_pair_packed_beta_tma = false) {
   TVM_FFI_ICHECK(prepare_descriptors == 0 || prepare_descriptors == 1)
       << "prepare_descriptors must be 0 or 1, got " << prepare_descriptors;
   TVM_FFI_ICHECK(num_heads > 0 && num_heads <= std::numeric_limits<int32_t>::max())
@@ -284,12 +286,25 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   const int64_t padded_beta_tma_heads = RoundUpBetaTmaHeads(num_heads);
   const int64_t beta_tma_heads = beta_tma.size(beta_tma.ndim() - 1);
   const bool direct_beta_tma = allow_serving_layouts && beta_tma_heads == num_heads;
-  TVM_FFI_ICHECK(
-      beta_tma.ndim() >= 2 && (beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
-      beta_tma.numel() % beta_tma_heads == 0 && beta_tma.numel() / beta_tma_heads >= token_count)
+  const bool pair_packed_beta_tma = allow_pair_packed_beta_tma && num_heads == 12 &&
+                                    beta_tma_heads == 24 && token_count % 2 == 0 &&
+                                    beta_tma.numel() == token_count * num_heads;
+  TVM_FFI_ICHECK(beta_tma.ndim() >= 2 &&
+                 (((beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
+                   beta_tma.numel() % beta_tma_heads == 0 &&
+                   beta_tma.numel() / beta_tma_heads >= token_count) ||
+                  pair_packed_beta_tma))
       << "beta_tma must have at least [tokens, H] direct storage or "
-         "[tokens, round_up(H, 8)] padded storage";
-  CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma");
+         "[tokens, round_up(H, 8)] padded storage, or the enabled H12 "
+         "[tokens / 2, 24] pair-packed alias";
+  if (pair_packed_beta_tma) {
+    const TensorByteRange beta_range = GetTensorByteRange(beta, "beta");
+    const TensorByteRange beta_tma_range = GetTensorByteRange(beta_tma, "beta_tma");
+    TVM_FFI_ICHECK(beta_range.begin == beta_tma_range.begin && beta_range.end == beta_tma_range.end)
+        << "pair-packed beta_tma must exactly alias beta storage";
+  } else {
+    CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma");
+  }
   if (!direct_beta_tma) {
     CheckNoOverlap(beta_tma, "beta_tma", q, "q");
     CheckNoOverlap(beta_tma, "beta_tma", k, "k");
@@ -433,11 +448,14 @@ inline int64_t ResolveAndCheckServingStatePool(
 inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
                                          const TensorView& checkpoint_cu_starts, int32_t device_id,
                                          int64_t num_seqs, int64_t num_heads,
-                                         int64_t checkpoint_every_n_tokens) {
+                                         int64_t checkpoint_every_n_tokens,
+                                         int64_t checkpoint_token_granularity = 32) {
+  TVM_FFI_ICHECK(checkpoint_token_granularity > 0)
+      << "checkpoint_token_granularity must be positive";
   TVM_FFI_ICHECK(checkpoint_every_n_tokens >= 0 &&
                  checkpoint_every_n_tokens <= std::numeric_limits<int32_t>::max() &&
-                 checkpoint_every_n_tokens % 32 == 0)
-      << "checkpoint_every_n_tokens must be zero or a multiple of 32";
+                 checkpoint_every_n_tokens % checkpoint_token_granularity == 0)
+      << "checkpoint_every_n_tokens must be zero or a multiple of " << checkpoint_token_granularity;
   if (checkpoint_every_n_tokens == 0) {
     return;
   }
@@ -502,10 +520,11 @@ inline void CheckServingAuxiliaryNoOverlap(
 inline void PackBetaForTmaIfNeeded(const TensorView& beta, const TensorView& beta_tma,
                                    int64_t num_heads, int64_t beta_token_stride,
                                    cudaStream_t stream) {
-  // Full chunks TMA-load an eight-head beta box, so any partial final group
-  // needs a materialized row padded to the next eight-head boundary.
+  // TMA may require separate storage for either token or head padding. Head
+  // counts can therefore match even though beta_tma is an uninitialized
+  // workspace; only an exact pointer alias is already populated.
   const int64_t padded_num_heads = beta_tma.size(beta_tma.ndim() - 1);
-  if (padded_num_heads == num_heads) {
+  if (beta_tma.data_ptr() == beta.data_ptr()) {
     return;
   }
   const int64_t token_count = beta.numel() / num_heads;
@@ -556,6 +575,26 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
+  if constexpr (ValueRows == 128 && ChunkTokens == 16) {
+    TVM_FFI_ICHECK(d1 >= ValueRows && d1 % 64 == 0 && d2 >= 1 && outer2 > 0)
+        << "v cannot encode the (64, 1, 16, 1) split-panel TMA box";
+    uint64_t global_dim[4] = {64, static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2),
+                              static_cast<uint64_t>(d1 / 64)};
+    uint64_t global_strides[3] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(d1 * d2 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
+    uint32_t box_dim[4] = {64, 1, ChunkTokens, 1};
+    uint32_t elem_strides[4] = {1, 1, 1, 1};
+    CUtensorMap tensor_map{};
+    const CUresult result =
+        cuTensorMapEncodeTiled(&tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, tensor.data_ptr(),
+                               global_dim, global_strides, box_dim, elem_strides,
+                               CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                               CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TVM_FFI_ICHECK(result == CUDA_SUCCESS)
+        << "cuTensorMapEncodeTiled failed for split-panel v with CUresult=" << int(result);
+    return tensor_map;
+  }
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
   TVM_FFI_ICHECK(global_dim[0] >= ValueRows && global_dim[1] >= 1 && global_dim[2] > 0)
@@ -601,14 +640,17 @@ inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
   return tensor_map;
 }
 
-template <int ChunkTokens>
+template <int ChunkTokens, bool PairPacked = false>
 inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
   static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(!PairPacked || ChunkTokens == 32);
+  constexpr uint32_t kBoxHeads = PairPacked ? 24 : 8;
+  constexpr uint32_t kBoxTokens = PairPacked ? ChunkTokens / 2 + 1 : ChunkTokens;
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t outer1 = tensor.numel() / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
-  TVM_FFI_ICHECK(global_dim[0] >= 8 && global_dim[1] >= ChunkTokens)
-      << "beta_tma cannot encode the (8, " << ChunkTokens << ") TMA box";
+  TVM_FFI_ICHECK(global_dim[0] >= kBoxHeads && global_dim[1] >= kBoxTokens)
+      << "beta_tma cannot encode the (" << kBoxHeads << ", " << kBoxTokens << ") TMA box";
   TVM_FFI_ICHECK(tensor.stride(tensor.ndim() - 1) == 1 && tensor.stride(tensor.ndim() - 2) >= d1)
       << "beta_tma must have unit head stride and non-overlapping token rows";
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0)
@@ -617,7 +659,7 @@ inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
       << "beta_tma token stride must be a multiple of 16 bytes";
   uint64_t global_strides[1] = {
       static_cast<uint64_t>(tensor.stride(tensor.ndim() - 2) * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[2] = {8, ChunkTokens};
+  uint32_t box_dim[2] = {kBoxHeads, kBoxTokens};
   uint32_t elem_strides[2] = {1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -681,7 +723,7 @@ static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords s
   }
 }
 
-template <int ValueRows, int ChunkTokens = 32>
+template <int ValueRows, int ChunkTokens = 32, bool PairPackedBeta = false>
 inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, const TensorView& v,
                                      const TensorView& g, const TensorView& beta_tma,
                                      const TensorView& out, const TensorView& descriptor_storage,
@@ -695,9 +737,12 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
            "this exact workspace and tensor signature before capture";
 
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
-        EncodeQkTma<ChunkTokens>(q, "q"),          EncodeQkTma<ChunkTokens>(k, "k"),
-        EncodeValueTma<ValueRows, ChunkTokens>(v), EncodeGateTma<ChunkTokens>(g),
-        EncodeBetaTma<ChunkTokens>(beta_tma),      EncodeOutputTma<ValueRows, ChunkTokens>(out),
+        EncodeQkTma<ChunkTokens>(q, "q"),
+        EncodeQkTma<ChunkTokens>(k, "k"),
+        EncodeValueTma<ValueRows, ChunkTokens>(v),
+        EncodeGateTma<ChunkTokens>(g),
+        EncodeBetaTma<ChunkTokens, PairPackedBeta>(beta_tma),
+        EncodeOutputTma<ValueRows, ChunkTokens>(out),
     };
     static_assert(sizeof(host_maps) == kDescriptorStorageBytes);
     TensorMapWords words{};
