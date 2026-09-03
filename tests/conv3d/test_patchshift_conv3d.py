@@ -46,6 +46,7 @@ def _reference(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         ((1, 2, 17, 31, 64), 96),
         ((1, 4, 16, 30, 96), 128),
         ((1, 2, 17, 31, 128), 160),
+        ((1, 3, 64, 120, 128), 192),
     ],
 )
 def test_patchshift_conv3d_matches_torch(shape, out_channels):
@@ -66,11 +67,13 @@ def test_patchshift_conv3d_matches_torch(shape, out_channels):
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_patchshift_conv3d_out_and_cuda_graph():
+def test_patchshift_conv3d_concurrent_out_caller_stream_and_cuda_graph():
     torch.manual_seed(1)
-    shape = (1, 2, 17, 31, 64)
-    out_channels = 96
-    input = torch.randn(shape, dtype=torch.bfloat16, device="cuda") * 0.125
+    # K=160 selects disjoint M128 main and M32 auxiliary output intervals.
+    shape = (1, 2, 17, 31, 128)
+    out_channels = 160
+    source = torch.randn(shape, dtype=torch.bfloat16, device="cuda") * 0.125
+    input = torch.zeros_like(source)
     weight = (
         torch.randn(
             out_channels, shape[-1], 3, 3, 3, dtype=torch.bfloat16, device="cuda"
@@ -80,19 +83,40 @@ def test_patchshift_conv3d_out_and_cuda_graph():
     packed_weight = pack_patchshift_conv3d_weight(weight)
     workspace = prepare_patchshift_conv3d(input, packed_weight, out_channels)
     out = torch.empty((*shape[:-1], out_channels), dtype=input.dtype, device="cuda")
+    consumed = torch.empty_like(out)
 
-    patchshift_conv3d(input, packed_weight, workspace, out_channels, out=out)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    assert hasattr(workspace, "_patchshift_conv3d_concurrency_state")
+
+    caller_stream = torch.cuda.Stream()
+    with torch.cuda.stream(caller_stream):
+        input.copy_(source)
         returned = patchshift_conv3d(
             input, packed_weight, workspace, out_channels, out=out
         )
+        consumed.copy_(out)
+    caller_stream.synchronize()
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(
+        consumed, _reference(source, weight), rtol=2e-2, atol=2e-2
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        input.copy_(source)
+        returned = patchshift_conv3d(
+            input, packed_weight, workspace, out_channels, out=out
+        )
+        consumed.copy_(out)
+    input.zero_()
+    consumed.zero_()
     graph.replay()
     torch.cuda.synchronize()
 
     assert returned.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(out, _reference(input, weight), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        consumed, _reference(source, weight), rtol=2e-2, atol=2e-2
+    )
 
 
 def test_patchshift_conv3d_rejects_invalid_input_channels():

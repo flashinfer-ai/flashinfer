@@ -42,6 +42,35 @@ def _require_sm100a(tensor: torch.Tensor) -> None:
         raise ValueError("PatchShift Conv3d currently requires SM100a/B200")
 
 
+class _PatchShiftConcurrencyState:
+    """Resources owned by one prepared descriptor workspace."""
+
+    def __init__(
+        self,
+        input: torch.Tensor,
+        packed_weight: torch.Tensor,
+        out_channels: int,
+    ) -> None:
+        self.input_shape = tuple(input.shape)
+        self.packed_weight_data_ptr = packed_weight.data_ptr()
+        self.out_channels = out_channels
+        self.main_stream = torch.cuda.Stream(device=input.device)
+        self.auxiliary_stream = torch.cuda.Stream(device=input.device)
+        self.fork_event = torch.cuda.Event(enable_timing=False)
+        self.main_done_event = torch.cuda.Event(enable_timing=False)
+        self.auxiliary_done_event = torch.cuda.Event(enable_timing=False)
+
+        # Materialize streams and events before a possible CUDA Graph capture.
+        caller_stream = torch.cuda.current_stream(input.device)
+        self.fork_event.record(caller_stream)
+        self.main_stream.wait_event(self.fork_event)
+        self.auxiliary_stream.wait_event(self.fork_event)
+        self.main_done_event.record(self.main_stream)
+        self.auxiliary_done_event.record(self.auxiliary_stream)
+        caller_stream.wait_event(self.main_done_event)
+        caller_stream.wait_event(self.auxiliary_done_event)
+
+
 def pack_patchshift_conv3d_weight(weight: torch.Tensor) -> torch.Tensor:
     """Prepack a BF16 ``[K, C, 3, 3, 3]`` weight for PatchShift Conv3d."""
     if weight.ndim != 5 or tuple(weight.shape[2:]) != (3, 3, 3):
@@ -89,6 +118,10 @@ def prepare_patchshift_conv3d(
         module.descriptor_workspace_size(), dtype=torch.uint8, device=input.device
     )
     module.prepare(workspace, input, packed_weight, out_channels)
+    if module.concurrency_mode(input, out_channels) != 0:
+        workspace._patchshift_conv3d_concurrency_state = (  # type: ignore[attr-defined]
+            _PatchShiftConcurrencyState(input, packed_weight, out_channels)
+        )
     return workspace
 
 
@@ -118,6 +151,14 @@ def _check_patchshift_conv3d(
         raise ValueError("workspace must be uint8 on the input device")
     if workspace.ndim != 1 or not workspace.is_contiguous():
         raise ValueError("workspace must be a contiguous 1D tensor")
+    concurrency_state = getattr(workspace, "_patchshift_conv3d_concurrency_state", None)
+    if concurrency_state is not None:
+        if concurrency_state.input_shape != tuple(input.shape):
+            raise ValueError("workspace was prepared for a different input shape")
+        if concurrency_state.out_channels != out_channels:
+            raise ValueError("workspace was prepared for different output channels")
+        if concurrency_state.packed_weight_data_ptr != packed_weight.data_ptr():
+            raise ValueError("workspace was prepared for a different packed_weight")
     if out is not None:
         expected = (*input.shape[:-1], out_channels)
         if tuple(out.shape) != expected:
@@ -152,8 +193,40 @@ def patchshift_conv3d(
             dtype=input.dtype,
             device=input.device,
         )
-    _patchshift_conv3d_impl(out, input, packed_weight, workspace)
+    concurrency_state = getattr(workspace, "_patchshift_conv3d_concurrency_state", None)
+    if concurrency_state is None:
+        _patchshift_conv3d_impl(out, input, packed_weight, workspace)
+    else:
+        _patchshift_conv3d_concurrent(
+            out, input, packed_weight, workspace, concurrency_state
+        )
     return out
+
+
+def _patchshift_conv3d_concurrent(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+    state: _PatchShiftConcurrencyState,
+) -> None:
+    """Fork from and join back into the caller's current CUDA stream."""
+    caller_stream = torch.cuda.current_stream(input.device)
+    _patchshift_conv3d_update_impl(out, input, packed_weight, workspace)
+    state.fork_event.record(caller_stream)
+    state.main_stream.wait_event(state.fork_event)
+    state.auxiliary_stream.wait_event(state.fork_event)
+
+    with torch.cuda.stream(state.main_stream):
+        _patchshift_conv3d_main_impl(out, input, packed_weight, workspace)
+    state.main_done_event.record(state.main_stream)
+
+    with torch.cuda.stream(state.auxiliary_stream):
+        _patchshift_conv3d_auxiliary_impl(out, input, packed_weight, workspace)
+    state.auxiliary_done_event.record(state.auxiliary_stream)
+
+    caller_stream.wait_event(state.main_done_event)
+    caller_stream.wait_event(state.auxiliary_done_event)
 
 
 @register_custom_op("flashinfer::patchshift_conv3d", mutates_args=("out", "workspace"))
@@ -168,6 +241,68 @@ def _patchshift_conv3d_impl(
 
 @register_fake_op("flashinfer::patchshift_conv3d")
 def _patchshift_conv3d_impl_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::patchshift_conv3d_update", mutates_args=("workspace",))
+def _patchshift_conv3d_update_impl(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    get_patchshift_conv3d_module().update_input_maps(
+        workspace, input, packed_weight, out
+    )
+
+
+@register_fake_op("flashinfer::patchshift_conv3d_update")
+def _patchshift_conv3d_update_impl_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::patchshift_conv3d_main", mutates_args=("out",))
+def _patchshift_conv3d_main_impl(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    get_patchshift_conv3d_module().run_main(workspace, input, packed_weight, out)
+
+
+@register_fake_op("flashinfer::patchshift_conv3d_main")
+def _patchshift_conv3d_main_impl_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::patchshift_conv3d_auxiliary", mutates_args=("out",))
+def _patchshift_conv3d_auxiliary_impl(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    get_patchshift_conv3d_module().run_auxiliary(workspace, input, packed_weight, out)
+
+
+@register_fake_op("flashinfer::patchshift_conv3d_auxiliary")
+def _patchshift_conv3d_auxiliary_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
     packed_weight: torch.Tensor,

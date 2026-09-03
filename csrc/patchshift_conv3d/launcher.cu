@@ -76,8 +76,55 @@ __global__ void UpdateInputMapAddresses(DescriptorWorkspace* workspace, Element*
 
 }  // namespace
 
+ConcurrencyMode GetConcurrencyMode(const Conv3dProblem& problem, int multi_processor_count) {
+  auto const& opts = problem;
+  struct {
+    int multiProcessorCount;
+  } device_prop{multi_processor_count};
+
+  using namespace kernel;
+#include "select_policy.inl"
+
+  // These launches write disjoint output-channel or spatial intervals.  ID18
+  // is deliberately excluded: its cluster-A main grid needs a graph
+  // launch-completion dependency before its edge CTAs can safely overlap.
+  bool use_disjoint_main_auxiliary =
+      (((use_exact_m32_tail || use_exact_m64_tail) && m128_tiles > 0 && m64_tiles > 0) ||
+       use_hybrid_compact_p1_c96) &&
+      !use_split_cluster_a_compact_edges;
+  return use_disjoint_main_auxiliary ? ConcurrencyMode::kDisjointMainAuxiliary
+                                     : ConcurrencyMode::kSequential;
+}
+
+Status UpdateInputMaps(DescriptorWorkspace* workspace, Element* input, const Conv3dProblem& problem,
+                       int multi_processor_count, cudaStream_t stream) {
+  auto const& opts = problem;
+  struct {
+    int multiProcessorCount;
+  } device_prop{multi_processor_count};
+
+  using namespace kernel;
+#include "select_policy.inl"
+
+  uint32_t input_map_mask = 0;
+  if (m128_tiles > 0) input_map_mask |= kInputM128;
+  if (use_hybrid_c64_c32 || use_hybrid_compact_c96) input_map_mask |= kInputHybridC32;
+  if (use_compact_spatial) input_map_mask |= kInputCompactP32 | kInputCompactQ8;
+  if (use_compact_qtail_q2_single_launch) input_map_mask |= kInputCompactQ4;
+  if (use_hybrid_compact_c96) input_map_mask |= kInputCompactQ3;
+  if (use_hybrid_compact_p1_c96) input_map_mask |= kInputCompactP1C64;
+  if (use_m256_cluster_b_c64_exact_id40) {
+    input_map_mask |= kInputId40PTailC64 | kInputId40QTailC64;
+  }
+  if (m64_tiles > 0) input_map_mask |= kInputM64;
+  if (use_m64n128_d1_c32_micro) input_map_mask |= kInputM64CompactQ4;
+  UpdateInputMapAddresses<<<1, 1, 0, stream>>>(workspace, input, input_map_mask);
+  return Status::Cuda(cudaGetLastError());
+}
+
 Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
-              const Conv3dProblem& problem, int multi_processor_count, cudaStream_t stream) {
+              const Conv3dProblem& problem, int multi_processor_count, cudaStream_t stream,
+              LaunchPart part) {
   auto const& opts = problem;
   struct {
     int multiProcessorCount;
@@ -108,19 +155,7 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
   TensorMap* d_input_map_m64_compact_q4 = &workspace->input_m64_compact_q4;
   TensorMap* d_weight_map_m64 = &workspace->weight_m64;
   Element* d_output = output;
-
-  uint32_t input_map_mask = 0;
-  if (m128_tiles > 0) input_map_mask |= kInputM128;
-  if (use_hybrid_c64_c32 || use_hybrid_compact_c96) input_map_mask |= kInputHybridC32;
-  if (use_compact_spatial) input_map_mask |= kInputCompactP32 | kInputCompactQ8;
-  if (use_compact_qtail_q2_single_launch) input_map_mask |= kInputCompactQ4;
-  if (use_hybrid_compact_c96) input_map_mask |= kInputCompactQ3;
-  if (use_hybrid_compact_p1_c96) input_map_mask |= kInputCompactP1C64;
-  if (use_m256_cluster_b_c64_exact_id40) input_map_mask |= kInputId40PTailC64 | kInputId40QTailC64;
-  if (m64_tiles > 0) input_map_mask |= kInputM64;
-  if (use_m64n128_d1_c32_micro) input_map_mask |= kInputM64CompactQ4;
-  UpdateInputMapAddresses<<<1, 1, 0, stream>>>(workspace, input, input_map_mask);
-  RETURN_IF_CUDA_ERROR(cudaGetLastError());
+  (void)input;
 
   int q_tiles = use_hybrid_exact_w31 ? 1 : (opts.w + kOutQ - 1) / kOutQ;
   int p_tiles_m128 = (opts.h + kMainOutP - 1) / kMainOutP;
@@ -158,7 +193,7 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
   dim3 grid_m64(q_tiles, p_tiles_m64, opts.n * opts.d * m64_tiles);
   dim3 grid_m32_shallow_cluster4(4 * q_tiles, p_tiles_m64, 1);
   dim3 grid_m64_cluster_b(2 * q_tiles, p_tiles_m64, opts.n * opts.d * (m64_tiles / 2));
-  if (m128_tiles > 0) {
+  if (m128_tiles > 0 && part != LaunchPart::kAuxiliary) {
     if (use_hybrid_cluster_a4_exact_p15) {
       RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_hybrid_c96_exact_p15_cluster_a4_kernel,
                                                 cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -329,7 +364,7 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
       }
     }
   }
-  if (m64_tiles > 0 && !use_c16_path) {
+  if (m64_tiles > 0 && !use_c16_path && part != LaunchPart::kAuxiliary) {
     if (use_m64n128_d1_c32_micro) {
       RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_m64n128_d1_c32_micro_kernel,
                                                 cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -760,12 +795,16 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
     return Status::Cuda(cudaGetLastError());
   };
 
-  Status status = launch_main(stream);
-  if (!status.ok()) return status;
-  status = launch_tail(stream);
-  if (!status.ok()) return status;
-  status = launch_spatial_edge(stream);
-  if (!status.ok()) return status;
+  if (part != LaunchPart::kAuxiliary) {
+    Status status = launch_main(stream);
+    if (!status.ok()) return status;
+  }
+  if (part != LaunchPart::kMain) {
+    Status status = launch_tail(stream);
+    if (!status.ok()) return status;
+    status = launch_spatial_edge(stream);
+    if (!status.ok()) return status;
+  }
 
 #undef RETURN_IF_CUDA_ERROR
   return Status::Success();

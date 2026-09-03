@@ -66,6 +66,10 @@ struct alignas(128) DescriptorWorkspace {
 static_assert(sizeof(TensorMap) == 128);
 static_assert(sizeof(DescriptorWorkspace) == 13 * sizeof(TensorMap));
 
+enum class LaunchPart : int { kAll = 0, kMain = 1, kAuxiliary = 2 };
+
+enum class ConcurrencyMode : int { kSequential = 0, kDisjointMainAuxiliary = 1 };
+
 Status PackWeights(const Element* weight, Element* packed_m128, Element* packed_m64,
                    Element* packed_m32, const Conv3dProblem& problem, int64_t stride_k,
                    int64_t stride_c, int64_t stride_t, int64_t stride_r, int64_t stride_s,
@@ -75,7 +79,13 @@ Status PrepareDescriptors(DescriptorWorkspace* workspace, Element* input, Elemen
                           Element* packed_m64, Element* packed_m32, const Conv3dProblem& problem,
                           int multi_processor_count, cudaStream_t stream);
 
+ConcurrencyMode GetConcurrencyMode(const Conv3dProblem& problem, int multi_processor_count);
+
+Status UpdateInputMaps(DescriptorWorkspace* workspace, Element* input, const Conv3dProblem& problem,
+                       int multi_processor_count, cudaStream_t stream);
+
 Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
-              const Conv3dProblem& problem, int multi_processor_count, cudaStream_t stream);
+              const Conv3dProblem& problem, int multi_processor_count, cudaStream_t stream,
+              LaunchPart part = LaunchPart::kAll);
 
 }  // namespace flashinfer::conv3d::patchshift::host

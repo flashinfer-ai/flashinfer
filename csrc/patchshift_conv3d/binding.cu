@@ -22,6 +22,7 @@
 namespace flashinfer::conv3d::patchshift::binding {
 
 using host::DescriptorWorkspace;
+using host::LaunchPart;
 using host::Status;
 using host::StatusDomain;
 
@@ -88,6 +89,38 @@ void CheckWorkspace(TensorView workspace, TensorView reference) {
       << "descriptor workspace must be 128-byte aligned";
 }
 
+patchshift::Conv3dProblem CheckRunArguments(TensorView workspace, TensorView input,
+                                            TensorView packed_weight, TensorView output) {
+  CHECK_INPUT_AND_TYPE(input, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
+  CHECK_DIM(5, input);
+  CHECK_DIM(5, output);
+  CHECK_DEVICE(input, output);
+  TVM_FFI_ICHECK_EQ(input.size(0), output.size(0));
+  TVM_FFI_ICHECK_EQ(input.size(1), output.size(1));
+  TVM_FFI_ICHECK_EQ(input.size(2), output.size(2));
+  TVM_FFI_ICHECK_EQ(input.size(3), output.size(3));
+  TVM_FFI_ICHECK_NE(input.data_ptr(), output.data_ptr()) << "output must not alias input";
+  int n = static_cast<int>(input.size(0));
+  int d = static_cast<int>(input.size(1));
+  int h = static_cast<int>(input.size(2));
+  int w = static_cast<int>(input.size(3));
+  int c = static_cast<int>(input.size(4));
+  int k = static_cast<int>(output.size(4));
+  patchshift::Conv3dProblem problem{n, d, h, w, c, k};
+  TVM_FFI_ICHECK(patchshift::IsSupportedProblem(problem));
+  CheckWorkspace(workspace, input);
+  CheckPackedWeight(packed_weight, input, c, k);
+  CheckSm100a(input);
+  return problem;
+}
+
+int MultiProcessorCount(TensorView tensor) {
+  cudaDeviceProp properties{};
+  TVM_FFI_ICHECK_EQ(cudaGetDeviceProperties(&properties, tensor.device().device_id), cudaSuccess);
+  return properties.multiProcessorCount;
+}
+
 }  // namespace
 
 int64_t packed_weight_numel(int64_t c, int64_t k) {
@@ -97,6 +130,19 @@ int64_t packed_weight_numel(int64_t c, int64_t k) {
 }
 
 int64_t descriptor_workspace_size() { return sizeof(DescriptorWorkspace); }
+
+int64_t concurrency_mode(TensorView input, int64_t k) {
+  CHECK_INPUT_AND_TYPE(input, dl_bfloat16);
+  CHECK_DIM(5, input);
+  patchshift::Conv3dProblem problem{
+      static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
+      static_cast<int>(input.size(2)), static_cast<int>(input.size(3)),
+      static_cast<int>(input.size(4)), static_cast<int>(k)};
+  TVM_FFI_ICHECK(patchshift::IsSupportedProblem(problem));
+  CheckSm100a(input);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  return static_cast<int64_t>(host::GetConcurrencyMode(problem, MultiProcessorCount(input)));
+}
 
 void pack_weight(TensorView weight, TensorView packed_weight) {
   CHECK_CUDA(weight);
@@ -155,36 +201,51 @@ void prepare(TensorView workspace, TensorView input, TensorView packed_weight, i
 }
 
 void run(TensorView workspace, TensorView input, TensorView packed_weight, TensorView output) {
-  CHECK_INPUT_AND_TYPE(input, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
-  CHECK_DIM(5, input);
-  CHECK_DIM(5, output);
-  CHECK_DEVICE(input, output);
-  TVM_FFI_ICHECK_EQ(input.size(0), output.size(0));
-  TVM_FFI_ICHECK_EQ(input.size(1), output.size(1));
-  TVM_FFI_ICHECK_EQ(input.size(2), output.size(2));
-  TVM_FFI_ICHECK_EQ(input.size(3), output.size(3));
-  TVM_FFI_ICHECK_NE(input.data_ptr(), output.data_ptr()) << "output must not alias input";
-  int n = static_cast<int>(input.size(0));
-  int d = static_cast<int>(input.size(1));
-  int h = static_cast<int>(input.size(2));
-  int w = static_cast<int>(input.size(3));
-  int c = static_cast<int>(input.size(4));
-  int k = static_cast<int>(output.size(4));
-  patchshift::Conv3dProblem problem{n, d, h, w, c, k};
-  TVM_FFI_ICHECK(patchshift::IsSupportedProblem(problem));
-  CheckWorkspace(workspace, input);
-  CheckPackedWeight(packed_weight, input, c, k);
-  CheckSm100a(input);
-
+  patchshift::Conv3dProblem problem = CheckRunArguments(workspace, input, packed_weight, output);
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
-  cudaDeviceProp properties{};
-  TVM_FFI_ICHECK_EQ(cudaGetDeviceProperties(&properties, input.device().device_id), cudaSuccess);
+  int multi_processor_count = MultiProcessorCount(input);
+  CheckStatus(host::UpdateInputMaps(static_cast<DescriptorWorkspace*>(workspace.data_ptr()),
+                                    static_cast<patchshift::Element*>(input.data_ptr()), problem,
+                                    multi_processor_count, get_stream(input.device())),
+              "patchshift_conv3d input-map update");
   CheckStatus(host::Launch(static_cast<DescriptorWorkspace*>(workspace.data_ptr()),
                            static_cast<patchshift::Element*>(input.data_ptr()),
                            static_cast<patchshift::Element*>(output.data_ptr()), problem,
-                           properties.multiProcessorCount, get_stream(input.device())),
+                           multi_processor_count, get_stream(input.device())),
               "patchshift_conv3d launch");
+}
+
+void update_input_maps(TensorView workspace, TensorView input, TensorView packed_weight,
+                       TensorView output) {
+  patchshift::Conv3dProblem problem = CheckRunArguments(workspace, input, packed_weight, output);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  CheckStatus(host::UpdateInputMaps(static_cast<DescriptorWorkspace*>(workspace.data_ptr()),
+                                    static_cast<patchshift::Element*>(input.data_ptr()), problem,
+                                    MultiProcessorCount(input), get_stream(input.device())),
+              "patchshift_conv3d input-map update");
+}
+
+void run_main(TensorView workspace, TensorView input, TensorView packed_weight, TensorView output) {
+  patchshift::Conv3dProblem problem = CheckRunArguments(workspace, input, packed_weight, output);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  CheckStatus(
+      host::Launch(static_cast<DescriptorWorkspace*>(workspace.data_ptr()),
+                   static_cast<patchshift::Element*>(input.data_ptr()),
+                   static_cast<patchshift::Element*>(output.data_ptr()), problem,
+                   MultiProcessorCount(input), get_stream(input.device()), LaunchPart::kMain),
+      "patchshift_conv3d main launch");
+}
+
+void run_auxiliary(TensorView workspace, TensorView input, TensorView packed_weight,
+                   TensorView output) {
+  patchshift::Conv3dProblem problem = CheckRunArguments(workspace, input, packed_weight, output);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  CheckStatus(
+      host::Launch(static_cast<DescriptorWorkspace*>(workspace.data_ptr()),
+                   static_cast<patchshift::Element*>(input.data_ptr()),
+                   static_cast<patchshift::Element*>(output.data_ptr()), problem,
+                   MultiProcessorCount(input), get_stream(input.device()), LaunchPart::kAuxiliary),
+      "patchshift_conv3d auxiliary launch");
 }
 
 }  // namespace flashinfer::conv3d::patchshift::binding
@@ -193,6 +254,13 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(packed_weight_numel,
                               flashinfer::conv3d::patchshift::binding::packed_weight_numel);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(descriptor_workspace_size,
                               flashinfer::conv3d::patchshift::binding::descriptor_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(concurrency_mode,
+                              flashinfer::conv3d::patchshift::binding::concurrency_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pack_weight, flashinfer::conv3d::patchshift::binding::pack_weight);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare, flashinfer::conv3d::patchshift::binding::prepare);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::conv3d::patchshift::binding::run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(update_input_maps,
+                              flashinfer::conv3d::patchshift::binding::update_input_maps);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_main, flashinfer::conv3d::patchshift::binding::run_main);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_auxiliary,
+                              flashinfer::conv3d::patchshift::binding::run_auxiliary);

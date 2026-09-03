@@ -43,13 +43,26 @@ its process. A library API must instead make these lifetimes explicit:
 2. allocate descriptor workspace owned by the caller or an explicit plan;
 3. rebuild pointer-dependent input/weight TensorMaps when tensor addresses
    change;
-4. launch every kernel on the caller's current CUDA stream;
+4. preserve caller-stream ordering for every launch, including routes whose
+   disjoint main and auxiliary tiles execute on plan-owned internal streams;
 5. perform no hidden synchronization or process termination in the hot launch.
 
 Descriptor preparation explicitly synchronizes its caller stream because it
 copies stack-built CUDA TensorMap descriptors to device storage. It is a cold
 setup operation and must be called before CUDA graph capture. The subsequent
-launch updates input addresses and runs entirely on the current stream.
+launch updates input addresses on the current stream. For exact M32/M64 output
+tails and the measured C96 P-tail route, it then records a fork on that stream,
+runs the disjoint main and auxiliary intervals on two nonblocking streams owned
+by the prepared workspace, and joins both completion events back into the
+caller's stream. The streams and events are materialized during preparation, so
+the same topology is legal inside an outer CUDA Graph capture. Other routes run
+entirely on the current stream.
+
+One prepared workspace must not be submitted concurrently by independent host
+threads or caller streams. Prepare a separate workspace for each concurrent
+call site or separately captured graph. The ID18 cluster-A spatial-edge route
+remains sequential in the library because its standalone overlap relies on a
+CUDA Graph launch-completion dependency rather than an ordinary stream event.
 
 This separation keeps weight transformation outside the measured compute path
 and makes CUDA graph behavior reviewable.
