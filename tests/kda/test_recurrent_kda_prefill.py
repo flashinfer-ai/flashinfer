@@ -1439,7 +1439,6 @@ def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_c
     [
         (True, (2048,), 6, False, "compact_fp32_compat_m128"),
         (True, (4096,), 6, True, "small_bh_owner_helper_m128"),
-        (False, (4096,), 6, True, "direct_m128"),
         (True, (512,), 12, False, "compact_fp32_compat_m128"),
         (False, (17, 33), 6, False, "compact_fp32_compat_m128"),
         (False, (17, 33), 12, False, "compact_fp32_compat_m128"),
@@ -1447,7 +1446,6 @@ def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_c
     ids=[
         "h6-small-bh",
         "h6-indexed-small-before-bt16",
-        "h6-packed-indexed-bypasses-fixed-small-bh",
         "h12-bt16",
         "h6-compat",
         "h12-compat",
@@ -2945,27 +2943,24 @@ def test_variant_selector_exposes_specialized_routes_only_when_requested():
     (
         "compute_capability",
         "sm_count",
-        "fixed_layout",
         "num_sequences",
         "num_heads",
         "sequence_length",
         "expected",
     ),
     [
-        ((10, 0), 148, True, 1, 8, 2048, True),
-        ((10, 3), 152, True, 2, 4, 65536, True),
-        ((10, 3), 64, True, 8, 1, 131072, True),
-        ((10, 3), 152, False, 2, 4, 65536, False),
-        ((10, 0), 63, True, 8, 1, 2048, False),
-        ((10, 0), 148, True, 1, 8, 2047, False),
-        ((10, 0), 148, True, 3, 3, 2048, False),
-        ((10, 0), 148, True, 1, 9, 2048, False),
+        ((10, 0), 148, 1, 8, 2048, True),
+        ((10, 3), 152, 2, 4, 65536, True),
+        ((10, 3), 64, 8, 1, 131072, True),
+        ((10, 0), 63, 8, 1, 2048, False),
+        ((10, 0), 148, 1, 8, 2047, False),
+        ((10, 0), 148, 3, 3, 2048, False),
+        ((10, 0), 148, 1, 9, 2048, False),
     ],
 )
 def test_small_bh_owner_helper_policy_matches_residency_contract(
     compute_capability,
     sm_count,
-    fixed_layout,
     num_sequences,
     num_heads,
     sequence_length,
@@ -2975,7 +2970,6 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         kda_prefill_api._should_use_small_bh_owner_helper(
             compute_capability=compute_capability,
             sm_count=sm_count,
-            fixed_layout=fixed_layout,
             num_sequences=num_sequences,
             num_heads=num_heads,
             sequence_length=sequence_length,
