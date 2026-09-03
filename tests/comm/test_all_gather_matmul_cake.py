@@ -198,7 +198,7 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     assert manifest["constraints"]["n_by_world_size"] == {
         "2": [2048],
         "4": [2048],
-        "8": [1280, 2048],
+        "8": [2048],
     }
     assert manifest["constraints"]["prepared_packed_qkv"] == {
         "dtypes": ["bfloat16"],
@@ -207,6 +207,10 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     assert manifest["launch"]["main"]["grid_x"] == ("(min(M, 2432) / 128) * (N / 256)")
     rendered = backend._render_host_source("test_module", manifest)
     assert "kPackedQkvExperimentSupported =\n    true;" in rendered
+    assert (
+        "kPackedQkvExperimentSupported && world_size == 8 &&\n"
+        "                      dtype_code == 0" in rendered
+    )
 
     sm100_source, sm100_manifest = backend._program_source("sm_100a")
     assert sm100_source.read_bytes() == source_path.read_bytes()
@@ -853,8 +857,7 @@ def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):
     assert seen_groups == [subgroup, subgroup]
 
 
-@pytest.mark.parametrize("n", [1280, 2048])
-def test_validate_inputs_accepts_exact_tp8_widths(monkeypatch, n):
+def test_validate_inputs_accepts_exact_tp8_width(monkeypatch):
     backend = _backend()
     subgroup = SimpleNamespace(group_name="tp8-group")
     device = torch.device("cuda:7")
@@ -869,7 +872,7 @@ def test_validate_inputs_accepts_exact_tp8_widths(monkeypatch, n):
         device=device,
         dtype=torch.bfloat16,
         ndim=2,
-        shape=(8192, n),
+        shape=(8192, 2048),
         is_contiguous=lambda: True,
     )
     monkeypatch.setattr(backend.dist, "is_available", lambda: True)
@@ -920,16 +923,10 @@ def test_validate_inputs_keeps_packed_qkv_routes_private(
     monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
 
-    if world_size == 4:
-        with pytest.raises(ValueError, match="an N supported by world_size=4"):
-            backend._validate_inputs(inp, weight, subgroup)
-    else:
-        assert backend._validate_inputs(inp, weight, subgroup) == (
-            3,
-            rank,
-            world_size,
-            "tp-group",
-        )
+    with pytest.raises(
+        ValueError, match=f"an N supported by world_size={world_size}"
+    ):
+        backend._validate_inputs(inp, weight, subgroup)
     assert backend._validate_inputs(
         inp, weight, subgroup, packed_qkv_experiment=True
     ) == (3, rank, world_size, "tp-group")

@@ -77,7 +77,7 @@ _COMMON_CONSTRAINTS: dict[str, Any] = {
     "n_by_world_size": {
         "2": [2048],
         "4": [2048],
-        "8": [1280, 2048],
+        "8": [2048],
     },
     "world_sizes": [2, 4, 8],
 }
@@ -332,8 +332,10 @@ inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
         << "the packed-QKV experiment requires SM103, world_size=4, and bfloat16";
   }
   if (n == 1280) {
-    TVM_FFI_CHECK(world_size == 8, ValueError)
-        << "N=1280 requires world_size=8";
+    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 8 &&
+                      dtype_code == 0,
+                  ValueError)
+        << "N=1280 requires the SM103, world_size=8, bfloat16 packed-QKV route";
   }
   static auto bf16_ws2 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
@@ -998,7 +1000,7 @@ def _validate_inputs(
         allowed_n = {
             2: frozenset((_N,)),
             4: frozenset((_N,)),
-            8: frozenset((_TP8_PACKED_QKV_N, _N)),
+            8: frozenset((_N,)),
         }[world_size]
         if k != _K or int(w.shape[0]) != _K or int(w.shape[1]) not in allowed_n:
             raise ValueError(
