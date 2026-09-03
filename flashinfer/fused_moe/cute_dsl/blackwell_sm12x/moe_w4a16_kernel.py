@@ -15,9 +15,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
 from .moe_w4a16_compiler import (
-    KernelCompileSpec,
     clear_compile_cache,
-    compile as cached_compile,
 )
 from .moe_w4a16_fp4_helpers import (
     atomic_add_global_i32,
@@ -5157,11 +5155,14 @@ def compile_w4a16_gemm(
         )
 
     compile_size_m = _fake_m_for_specialization(size_m)
-    compile_route_blocks = 1
-    compile_route_slots = compile_route_blocks * int(moe_block_size)
+    # Extent policy (see compile_w4a16_fused_moe): only m-independent tensors
+    # with real size contracts bake true extents; every m-, route- or
+    # scratch-capacity tensor bakes (1,) barrier-style, since extents are
+    # exact-checked by TVM-FFI but never bound a device-side access, and an
+    # extent varying with an unkeyed fact would poison artifact reuse.
     a_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_size_m * size_k,),
+        (1,),
         assumed_align=16,
     )
     b_fake = cute.runtime.make_fake_compact_tensor(
@@ -5171,7 +5172,7 @@ def compile_w4a16_gemm(
     )
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_size_m * top_k * size_n,),
+        (1,),
         assumed_align=16,
     )
     scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -5193,12 +5194,12 @@ def compile_w4a16_gemm(
     )
     packed_routes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_slots,),
+        (1,),
         assumed_align=16,
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_blocks,),
+        (1,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -5208,49 +5209,53 @@ def compile_w4a16_gemm(
     )
     topk_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (compile_size_m * top_k,),
+        (1,),
         assumed_align=4,
     )
     c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (
-            max(
-                size_n * compile_route_slots,
-                4 * 256 * moe_block_size * 256,
-            ),
-        ),
+        (1,),
         assumed_align=16,
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256,),
+        (1,),
         assumed_align=16,
     )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        a_fake,
-        b_fake,
-        c_fake,
-        scales_fake,
-        global_scale_fake,
-        packed_routes_fake,
-        block_experts_fake,
-        route_count_fake,
-        topk_fake,
-        c_tmp_fake,
-        locks_fake,
-        Int32(compile_size_m),
-        Int32(1),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.gemm",
-            1,
-            cache_key,
-        ),
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            a_fake,
+            b_fake,
+            c_fake,
+            scales_fake,
+            global_scale_fake,
+            packed_routes_fake,
+            block_experts_fake,
+            route_count_fake,
+            topk_fake,
+            c_tmp_fake,
+            locks_fake,
+            Int32(compile_size_m),
+            Int32(1),
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    key_digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        f"gemm_{element_dtype}_e{num_experts}_n{size_n}"
+        f"_k{size_k}_t{top_k}_b{moe_block_size}_{key_digest}",
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16GemmCompileResult(
         compiled=compiled,
