@@ -969,6 +969,110 @@ def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
         assert torch.equal(got, ref), "selected value multiset differs from torch.topk"
 
 
+@requires_gvr2
+@pytest.mark.parametrize(
+    "kv", [200, 256, 100000], ids=["in_range", "equal_width", "oversized"]
+)
+def test_gvr2_width_below_k(kv):
+    """Logits narrower than top_k + 1: every row is short and must come back
+    as identity + -1 tail whatever seq_lens says. The launcher used to hand
+    the register families max(N, top_k + 1) as the row-read bound, so an
+    oversized kv length made them read top_k + 1 elements at a 256-element
+    row stride (into the next row, then past the tensor) and rank the
+    garbage; row 2 is poisoned so a cross-row read from row 1 shows up."""
+    rows, n, top_k = 3, 256, 512
+    gen = torch.Generator(device=_DEV).manual_seed(7)
+    logits = torch.randn(rows, n, generator=gen, device=_DEV)
+    logits[2] = 3e38
+    seq_lens = torch.full((rows,), kv, dtype=torch.int32, device=_DEV)
+    pre_idx = torch.full((rows, top_k), -1, dtype=torch.int32, device=_DEV)
+    indices, values = _run_gvr2(logits, seq_lens, top_k, pre_idx, return_values=True)
+    _check_varlen_rows(logits, indices, [min(kv, n)] * rows, top_k, values=values)
+
+
+@requires_gvr2
+def test_gvr2_sequential_warmup_populates_exact_launchers():
+    """warmup_varlen keyed its completion on the per-engine representative
+    rows, so a second call adding a row count that maps to an already-warmed
+    engine returned before that row count's launcher existed, and a CUDA-graph
+    capture at that row count failed with the launcher-cache-miss error."""
+    top_k, msl = 512, 8192
+    npad = _round64(msl)
+    rows = 61  # a row count no other test warms, so the precondition below holds
+
+    def has_launcher(r):
+        return any(
+            k[0] == r and k[1] == npad and k[2] == top_k for k in _host._VARLEN_CACHE
+        )
+
+    _host.warmup_varlen(top_k, msl, num_rows_list=[64])
+    assert not has_launcher(rows), (
+        "precondition: the 61-row launcher must not exist yet"
+    )
+    _host.warmup_varlen(top_k, msl, num_rows_list=[rows, 64])
+    assert has_launcher(rows), "61-row launcher missing after sequential warmup"
+    logits = torch.zeros(rows, npad, device=_DEV)
+    kv_lens = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
+    pre_idx = torch.zeros(rows, top_k, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            _host.run_varlen(logits, pre_idx, kv_lens, out, max_seq_len=msl)
+    torch.cuda.synchronize()
+
+
+@requires_gvr2
+def test_gvr2_rejects_overlapping_rows():
+    """stride(0) < shape[1] (an expand view) is not a row-major layout the
+    kernel can address; the checker used to derive npad = 0 from it and
+    auto ranked gvr_2 first for the call."""
+    from flashinfer.topk_varlen import topk_varlen as tv
+    from flashinfer.utils import BackendSupportedError
+
+    base = torch.randn(1, 8192, device=_DEV)
+    x = base.expand(2, -1)
+    seq_lens = torch.full((2,), 8192, dtype=torch.int32, device=_DEV)
+    pre_idx = torch.full((2, 1024), -1, dtype=torch.int32, device=_DEV)
+    assert not tv._gvr2_top_k_varlen_check(x, seq_lens, 1024, pre_idx=pre_idx)
+    # a failed explicit-backend check surfaces as the decorator's
+    # ValueError("Problem size is not supported ...")
+    with pytest.raises((BackendSupportedError, ValueError), match="not supported"):
+        _run_gvr2(x, seq_lens, 1024, pre_idx)
+    out = torch.empty(2, 1024, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="overlap"):
+        _host.run_varlen(x, pre_idx, seq_lens, out, max_seq_len=8192)
+    # auto skips gvr_2 and radix (both gated) and lands on a backend that
+    # handles the view (gvr or radix_filter): the result is exact
+    indices, _ = flashinfer.top_k_varlen(x, seq_lens, 1024, pre_idx=pre_idx)
+    ref = torch.sort(torch.topk(base[0], 1024).values).values
+    for r in range(2):
+        assert torch.equal(torch.sort(base[0][indices[r].long()]).values, ref)
+
+
+@requires_gvr2
+def test_gvr2_workspace_must_be_16_byte_aligned():
+    """The compiled workspace ABI assumes 16-byte alignment; the host check
+    used to accept 8 and let the DSL refuse the launch."""
+    logits = torch.zeros(1, 4096, device=_DEV)
+    buf = torch.zeros(_host.WS_BYTES + 16, dtype=torch.uint8, device=_DEV)
+    _host.validate_run_ws(buf[16 : 16 + _host.WS_BYTES], logits)
+    with pytest.raises(RuntimeError, match="16-byte"):
+        _host.validate_run_ws(buf[8 : 8 + _host.WS_BYTES], logits)
+    # pre_idx / indices declare the same 16-byte ABI: a shifted contiguous view
+    # is refused by the host with a FlashInfer message (was a DSL error)
+    seq_lens = torch.full((1,), 4096, dtype=torch.int32, device=_DEV)
+    good = torch.zeros(1, 1024, dtype=torch.int32, device=_DEV)
+    shifted = torch.zeros(1024 + 4, dtype=torch.int32, device=_DEV)[1:1025].view(
+        1, 1024
+    )
+    with pytest.raises(RuntimeError, match="16-byte"):
+        _host.run_varlen(logits, shifted, seq_lens, good.clone(), max_seq_len=4096)
+    with pytest.raises(RuntimeError, match="16-byte"):
+        _host.run_varlen(logits, good, seq_lens, shifted, max_seq_len=4096)
+
+
 # ---------------------------------------------------------------------------
 # route dispatch: pure-Python fuzz (CPU-only, no GPU required)
 # ---------------------------------------------------------------------------

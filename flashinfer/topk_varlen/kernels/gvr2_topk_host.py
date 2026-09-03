@@ -17,7 +17,13 @@
 Provenance: ported near-verbatim from TensorRT-LLM
 ``tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling_host.py``
 (PR NVIDIA/TensorRT-LLM#17821, commit ed94d4cfbf). FlashInfer-local changes:
-module rename and this note. FlashInfer's ``top_k_varlen(backend="gvr_2")``
+module rename and this note; ``_varlen_launcher`` keeps the kernels' row-read
+bound at the physical width and inflates only the routing value (DKG #60);
+``warmup_varlen`` populates the exact-row launchers on every call (DKG #60);
+``validate_run_ws`` enforces the 16-byte alignment the compiled workspace
+declares; ``run_varlen`` rejects overlapping row layouts; ``run``/``run_ws``/
+``run_varlen`` re-enter under the logits device and every compile passes an
+explicit ``--gpu-arch``. FlashInfer's ``top_k_varlen(backend="gvr_2")``
 calls ``run_varlen`` below; the batch-uniform ``run``/``run_ws`` entries are
 kept for parity tests and benchmarking. Keep future diffs against upstream
 mechanical.
@@ -732,7 +738,16 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
-    n_eff = max(min(n_env, npad), k + 1)
+    # Two envelopes (FlashInfer-local split, reported upstream as DKG #60):
+    # `n_kernel` is what the kernels get as their per-row clamp bound and must
+    # never exceed the physical row width, else a request whose kv length
+    # exceeds k makes the register families read k + 1 elements at the row
+    # stride (into the next row, then past the tensor) when N <= k; `n_route`
+    # is the routing-only value, inflated to k + 1 so route() sees a
+    # non-degenerate problem. With n_kernel <= k every row takes the
+    # in-kernel short path (identity + -1 tail).
+    n_kernel = min(n_env, npad)
+    n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
@@ -740,12 +755,12 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_eff, npad, k)
+    plan_free = route(num_rows, n_route, npad, k)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
         )
-        lc = ("reg_clus", fn, n_eff)
+        lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
         return lc
     # ---- route() parity, family tier 2: register-resident (+img flavor) ----
@@ -763,7 +778,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
         lc = (
             "reg",
             fn,
-            (rt_f["n"], rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -787,11 +802,11 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
         lc = (
             "clus",
             fn,
-            (n_eff, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
+            (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
@@ -819,7 +834,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     # slot 0 (`n`) carries the envelope: the varlen prologue clamps each row's
     # kv-derived length to it, never to the row stride npad (arena tails)
-    pre = (n_env, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+    pre = (n_kernel, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
     lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
@@ -924,13 +939,15 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
 def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
     """run_ws() workspace hardening, in a fixed predicate order:
     CUDA + same device as logits; numel*element_size >= workspace_bytes();
-    base 8-byte aligned."""
+    base 16-byte aligned (the compiled ABI's assumed_align)."""
     if not (workspace.is_cuda and workspace.get_device() == logits.get_device()):
         raise RuntimeError("workspace must be a CUDA tensor on the same device")
     if workspace.numel() * workspace.element_size() < WS_BYTES:
         raise RuntimeError(f"workspace too small: need {WS_BYTES} bytes")
-    if workspace.data_ptr() & 7:
-        raise RuntimeError("workspace must be 8-byte aligned")
+    if workspace.data_ptr() & 15:
+        # the compiled ws_fake declares assumed_align=16 (FlashInfer-local
+        # tightening from 8; an 8-but-not-16 pointer used to fail at launch)
+        raise RuntimeError("workspace must be 16-byte aligned")
 
 
 def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
@@ -938,10 +955,9 @@ def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
     bytes at the tensor's data_ptr() as int32[WS_BYTES/4], ignoring
     dtype/shape.
 
-    NOTE: the DSL-side fake tensor declares assumed_align=16; a workspace at
-    8-but-not-16-byte alignment passes the validate_run_ws check but is
-    rejected by the DSL at conversion -- surfaced as a launch failure with
-    shape context."""
+    NOTE: the DSL-side fake tensor declares assumed_align=16, which
+    validate_run_ws enforces up front (an 8-but-not-16-byte pointer used to
+    pass the host check and be rejected by the DSL at conversion)."""
     if (
         workspace.dtype is torch.int32
         and workspace.dim() == 1
@@ -1409,6 +1425,13 @@ def run_varlen(
             raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
         if not (pre_idx.is_contiguous() and indices.is_contiguous() and kv_lens.is_contiguous()):
             raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
+        if (pre_idx.data_ptr() | indices.data_ptr()) & 15:
+            # the compiled fakes declare assumed_align=16 for pre_idx/indices
+            # (FlashInfer-local check; the DSL used to refuse at conversion)
+            raise RuntimeError(
+                "pre_idx/indices base must be 16-byte aligned (shifted views are "
+                "not supported)"
+            )
         # logits: accept row-major views with a wider row stride (the DSL
         # paged-MQA logits arena is 256-aligned and column-sliced — a legal
         # NON-contiguous view). The kernel only needs (base, row stride):
@@ -1416,6 +1439,14 @@ def run_varlen(
         # the tail columns are never classified (per-row n gates all reads).
         if logits.stride(1) != 1:
             raise RuntimeError("logits inner stride must be 1")
+        if num_rows > 1 and logits.stride(0) < logits.shape[1]:
+            # the row pitch is derived from stride(0); overlapping rows (an
+            # expand view, stride 0) would shrink the search domain and drive
+            # reads past the storage (FlashInfer-local check)
+            raise RuntimeError(
+                "logits rows overlap (stride(0) < shape[1]); pass a row-major "
+                "view with stride(0) >= shape[1]"
+            )
         npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
         lg = logits
         if not logits.is_contiguous():
@@ -1627,9 +1658,19 @@ def warmup_varlen(
                 f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
             )
     key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
+    n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     with _VARLEN_WARMUP_LOCK:
-        if key in _VARLEN_WARMUP_DONE:
-            return
+        bands_done = key in _VARLEN_WARMUP_DONE
+    if bands_done:
+        # FlashInfer-local (DKG #60): the done key covers the ENGINE band
+        # launches only (they depend on the representative rows, not on the
+        # exact request), so the pure-host exact-row launcher population must
+        # still run for a later warmup that adds a row count mapping to an
+        # already-warmed engine — otherwise a CUDA-graph capture at that row
+        # count misses the launcher cache.
+        for r in req_rows:
+            _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
+        return
     rows_max = rows_list[-1]
     # one allocation at the largest geometry; smaller row counts run on
     # contiguous prefix views (compile keys depend on shapes only)
@@ -1654,7 +1695,6 @@ def warmup_varlen(
     # LAUNCHER cache entries for the exact requested row counts (pure host
     # work, zero allocation/launch — engines hit the compile cache), so a
     # CUDA-graph capture at any requested geometry finds its key immediately.
-    n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
         _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
     with _VARLEN_WARMUP_LOCK:
