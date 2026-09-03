@@ -300,6 +300,24 @@ def _make_paged_context_case(
     )
 
 
+def _poison_invalid_paged_v_tails(case: _PagedContextCase) -> None:
+    """Fill only unused final-page V rows with NaNs."""
+
+    case.k_cache.nan_to_num_(nan=0.0)
+    case.v_cache.nan_to_num_(nan=0.0)
+    expected_nan = torch.zeros_like(case.v_cache, dtype=torch.bool)
+    page_indptr = case.paged_kv_indptr.tolist()
+    page_indices = case.paged_kv_indices.tolist()
+    last_page_lens = case.paged_kv_last_page_len.tolist()
+    for batch_idx, last_page_len in enumerate(last_page_lens):
+        physical_page = page_indices[page_indptr[batch_idx + 1] - 1]
+        expected_nan[physical_page, :, last_page_len:, :] = True
+
+    case.v_cache.masked_fill_(expected_nan, float("nan"))
+    assert torch.isfinite(case.k_cache).all()
+    assert torch.equal(torch.isnan(case.v_cache), expected_nan)
+
+
 def _request_slice(
     tensor: torch.Tensor,
     lengths: tuple[int, ...],
@@ -1811,6 +1829,34 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
     _assert_context_correct(out, case.reference)
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_zero_fills_nan_v_tail():
+    """Unused V rows must not poison PV after the score mask makes P zero."""
+
+    case = _make_paged_context_case(
+        q_lengths=(65, 37),
+        k_lengths=(65, 37),
+        num_qo_heads=28,
+        num_kv_heads=4,
+        head_dim=128,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        page_size=32,
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026090301,
+    )
+    _poison_invalid_paged_v_tails(case)
+    wrapper = BatchPrefillPagedTSWrapper()
+    metadata = _plan_paged_wrapper(wrapper, case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    output = torch.full_like(case.reference.q, float("inf"))
+    assert _run_paged_wrapper(wrapper, case, metadata, out=output) is output
+    _assert_context_correct(output, case.reference)
+
+
 @pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
@@ -2803,7 +2849,12 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
     ("qkv_dtype", "output_dtype", "kv_length"),
     (
         pytest.param(torch.bfloat16, torch.bfloat16, 256, id="bf16-full-ring"),
-        pytest.param(torch.bfloat16, torch.bfloat16, 1024, id="bf16-split-rings"),
+        pytest.param(
+            torch.bfloat16,
+            torch.bfloat16,
+            993,
+            id="bf16-split-rings-partial-tail",
+        ),
         pytest.param(_FP8, torch.bfloat16, 256, id="fp8-full-ring"),
         pytest.param(_FP8, torch.bfloat16, 1024, id="fp8-split-rings"),
     ),
@@ -2828,10 +2879,27 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
         seed=2026071826,
     )
     case = replace(case, reference=replace(case.reference, output_dtype=output_dtype))
+    if kv_length % case.page_size:
+        # A 993-token domain still occupies 32 pages, selecting the reused
+        # page-window schedule while leaving the final V page tail invalid.
+        _poison_invalid_paged_v_tails(case)
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
     assert wrapper._plan_state is not None
     assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
+    if kv_length == 993:
+        assert wrapper._plan_state.geometry.max_num_pages_per_seq_kv == 32
+        cfg = FmhaTs(
+            in_dtype=BFloat16,
+            out_dtype=BFloat16,
+            d=256,
+            is_persistent=True,
+            is_causal=False,
+            use_paged_kv=True,
+            num_tokens_per_page=case.page_size,
+            max_num_pages_per_seq_kv=32,
+        ).cfg
+        assert cfg.reuses_page_table_windows
     output = _run_paged_wrapper(wrapper, case, metadata)
     _assert_context_correct(output, case.reference)
 
@@ -2985,7 +3053,9 @@ def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
 def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
     case = _make_paged_context_case(
         q_lengths=(17, 65),
-        k_lengths=(49, 97),
+        # Cross the 128-token KV tile boundary so poisoned V tails also
+        # exercise nonzero logical tile/page coordinates.
+        k_lengths=(177, 193),
         num_qo_heads=8,
         num_kv_heads=4,
         head_dim=256,
@@ -2993,7 +3063,8 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
         mask_type="causal",
         seed=2026071520,
     )
-    output = torch.full_like(case.reference.q, float("nan"))
+    _poison_invalid_paged_v_tails(case)
+    output = torch.full_like(case.reference.q, float("inf"))
     returned = batch_prefill_with_paged_kv_cache(
         case.reference.q,
         case.k_cache,
