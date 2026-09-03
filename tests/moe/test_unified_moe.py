@@ -915,7 +915,12 @@ class TestExpressiveness:
         assert cfg.quant.variant == QuantVariant.NVFP4
         assert cfg.activation.is_gated
 
-    def test_nvfp4_rejects_incompatible_activation_pack_candidates(self):
+    @pytest.mark.parametrize(
+        "packed_input_candidate", (TrtllmFp4Config(), CuteDslConfig())
+    )
+    def test_nvfp4_rejects_incompatible_activation_pack_candidates(
+        self, packed_input_candidate
+    ):
         """Autotune has one activation pack, not one pack per backend."""
         with pytest.raises(ValueError, match="incompatible MoEActivationPack"):
             MoEConfig(
@@ -923,7 +928,7 @@ class TestExpressiveness:
                 quant=QuantConfig(variant=QuantVariant.NVFP4),
                 experts=ExpertConfig(intermediate_size=128),
                 backend=BackendOptions(
-                    candidates=(TrtllmFp4Config(), CutlassNvfp4Config())
+                    candidates=(packed_input_candidate, CutlassNvfp4Config())
                 ),
             )
 
@@ -1000,9 +1005,10 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=SwiGLU(),
-            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassNvfp4Config())),
+            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
+        assert any(isinstance(c, TrtllmFp4Config) for c in cfg.backend)
 
     def test_expert_parallel(self):
         """Config with expert parallelism (EP)."""

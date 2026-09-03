@@ -50,7 +50,7 @@ backends = MoELayer.find_backends(**config)
 # this contains {"trtllm_fp4":TrtllmFp4Config()}
 # or {"trtllm_fp4":"unsupported reason..."}
 # more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...)]
+backends = {"trtllm_fp4": TrtllmFp4Config()}
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
@@ -673,12 +673,12 @@ weights.prepare_for("trtllm_fp4_routed",
     TrtllmFp4Config.prepare_weights(w1_bf16, w2_bf16, num_local_experts=32,
                                     hidden_size=1024, intermediate_size=512))
 
-# 3. Per-call activations: pre-routed (selected_experts/final_scales supplied).
+# 3. Per-call activations: pre-routed (topk_ids/topk_weights supplied).
 act = MoEActivationPack(
     hidden_states_q=x_q,             # [M, H//2] uint8 packed NVFP4
     hidden_states_scale=x_sf,        # [M, H//16] float8_e4m3fn (or uint8 bytes)
-    selected_experts=topk_ids,       # [M, top_k] int32
-    final_scales=topk_weights,       # [M, top_k] float32
+    topk_ids=topk_ids,               # [M, top_k] int32
+    topk_weights=topk_weights,       # [M, top_k] float32
 )
 
 # 4. Dispatch. First call per token-bucket runs cross-backend selection.
