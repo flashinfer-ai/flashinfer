@@ -514,6 +514,22 @@ def _cached_max_smem_per_block(device_index: int) -> int:
 _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 
+@functools.cache
+def _cached_dsl_targets_device(device_index: int) -> bool:
+    """Whether the installed CuTe DSL can natively target this device's arch.
+
+    Cached per device index: the answer is a property of (installed DSL,
+    device), both fixed for the process lifetime, and this sits on the eager
+    hot path of a host-launch-bound API -- the uncached probe chain
+    (get_device_capability -> Arch lookup) costs a few microseconds per call,
+    a measurable slice of the ~50 us eager dispatch.
+    """
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda", device_index))
+    from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+    return is_cute_dsl_arch_supported(major, minor, native_only=True)
+
+
 def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
     """Raise unless the installed CuTe DSL can generate code for ``device``.
 
@@ -533,10 +549,8 @@ def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
     if not _CUTE_DSL_AVAILABLE:
         raise RuntimeError(f"{fn_name} requires nvidia-cutlass-dsl")
 
-    from ..cute_dsl.utils import is_cute_dsl_arch_supported
-
-    major, minor = torch.cuda.get_device_capability(device)
-    if not is_cute_dsl_arch_supported(major, minor, native_only=True):
+    if not _cached_dsl_targets_device(get_device_index(device)):
+        major, minor = torch.cuda.get_device_capability(device)
         raise RuntimeError(
             f"{fn_name}: the installed nvidia-cutlass-dsl cannot target "
             f"sm_{major}{minor}a. FlashInfer ships kernels for this device, but "
