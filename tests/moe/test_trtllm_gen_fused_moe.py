@@ -2492,6 +2492,71 @@ def test_fused_shared_experts_replay_width_is_routed_topk():
         )
 
 
+def test_routing_replay_out_rejects_undersized_dim0():
+    """An undersized replay buffer must be rejected, not written out of bounds.
+
+    Routing launches one block per token and writes row ``blockIdx.x``
+    unconditionally, so ``dim0 < num_tokens`` is a device-side buffer overflow
+    rather than a truncated result. Oversized buffers stay legal for CUDA-graph
+    pre-allocation, hence the ``>=`` bound. Host-side check, so no GPU needed.
+    """
+    num_experts = 4
+    num_tokens = 4
+    top_k = 1
+    fp8_kwargs = {
+        "routing_logits": torch.empty((num_tokens, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((num_tokens, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+    }
+    fp4_kwargs = {
+        "routing_logits": torch.empty((num_tokens, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((num_tokens, 2), dtype=torch.bfloat16),
+        "hidden_states_scale": None,
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.uint8),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.uint8),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm2_bias": None,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+    }
+    common_kwargs = {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "local_expert_offset": 0,
+        "local_num_experts": num_experts,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+    }
+
+    for op, op_kwargs in (
+        (trtllm_fp8_block_scale_moe, fp8_kwargs),
+        (trtllm_fp4_block_scale_moe, fp4_kwargs),
+    ):
+        with pytest.raises(ValueError, match=r"dim0 must be >= num_tokens"):
+            op(
+                **op_kwargs,
+                **common_kwargs,
+                routing_replay_out=torch.empty(
+                    (num_tokens - 1, top_k), dtype=torch.int16
+                ),
+            )
+
+
 def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
     """Routed-only expert-major tensors must fail host-side, not OOB on the GPU.
 

@@ -860,9 +860,10 @@ void cast_fp32_to_bf16(void* output, void const* input, int64_t num_elements, cu
 
 // Validate routing_replay_out tensor properties.
 // dim1 is the routed top_k even when fused shared experts are enabled; those
-// extra slots are not written. dim0 >= num_tokens is intentionally NOT checked
-// — with CUDA graphs the buffer is pre-allocated at maximum batch size and
-// reused across steps with varying num_tokens.
+// extra slots are not written. dim0 may exceed num_tokens — CUDA-graph callers
+// pre-allocate at the maximum batch size and reuse the buffer across steps —
+// but must not be smaller: routing launches one block per token and writes row
+// blockIdx.x unconditionally, so an undersized buffer writes out of bounds.
 static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
                                         int64_t top_k) {
   TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
@@ -871,6 +872,8 @@ static void validate_routing_replay_out(TensorView const& replay, TensorView con
       << "routing_replay_out must be on the same device as hidden_states";
   TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
   TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+  TVM_FFI_ICHECK(replay.size(0) >= hidden_states.size(0))
+      << "routing_replay_out dim0 must be >= num_tokens";
   TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
       << "routing_replay_out must be int16 dtype";
   TVM_FFI_ICHECK(replay.IsContiguous())
