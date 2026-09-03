@@ -16,9 +16,9 @@ namespace flashinfer::sparse_mla_sm120 {
 using bf16 = __nv_bfloat16;
 
 void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView indices,
-                                  TensorView output, TensorView out_lse, double sm_scale,
-                                  int64_t model_type, Optional<TensorView> topk_length,
-                                  Optional<TensorView> attn_sink,
+                                  TensorView output, TensorView out_lse, double lse_scale,
+                                  double sm_scale, int64_t model_type,
+                                  Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                   Optional<TensorView> extra_kv_cache,
                                   Optional<TensorView> extra_indices,
                                   Optional<TensorView> extra_topk_length);
@@ -26,7 +26,7 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
 bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
                                    int num_tokens, int num_splits, const bf16* Q,
                                    const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
-                                   float* mid_lse, bf16* output, float* out_lse,
+                                   float* mid_lse, bf16* output, float* out_lse, float lse_scale,
                                    const int* topk_length, const float* attn_sink,
                                    const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                    const int* extra_topk_length, int extra_topk, int pbs_extra,
@@ -36,9 +36,10 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
-                                     bf16* output, float* out_lse, const int* topk_length,
-                                     const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream);
+                                     bf16* output, float* out_lse, float lse_scale,
+                                     const int* topk_length, const float* attn_sink,
+                                     int chunks_per_block_override, float sm_scale,
+                                     size_t stride_kv_block, cudaStream_t stream);
 
 namespace {
 
@@ -86,9 +87,9 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
 // instantiation grid in sparse_mla_sm120_decode_dsv4.cu.
 void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indices,
                               TensorView mid_out, TensorView mid_lse, TensorView output,
-                              TensorView out_lse, int64_t num_splits, double sm_scale,
-                              Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
-                              Optional<TensorView> extra_kv_cache,
+                              TensorView out_lse, double lse_scale, int64_t num_splits,
+                              double sm_scale, Optional<TensorView> topk_length,
+                              Optional<TensorView> attn_sink, Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
                               Optional<TensorView> extra_topk_length,
                               int64_t chunks_per_block_override) {
@@ -150,10 +151,10 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       static_cast<const bf16*>(q.data_ptr()), static_cast<const uint8_t*>(kv_cache.data_ptr()),
       static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()),
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
-      static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr, extra_kv_ptr,
-      extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
-      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
-      kv_layout.stride_kv_block, stream);
+      static_cast<float*>(out_lse.data_ptr()), static_cast<float>(lse_scale), topk_len_ptr,
+      attn_sink_ptr, extra_kv_ptr, extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg,
+      pbs_extra_arg, stride_extra_kv_block, static_cast<int>(chunks_per_block_override),
+      static_cast<float>(sm_scale), kv_layout.stride_kv_block, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv4 launch failed (unsupported shape or kernel error)";
 }
 
@@ -163,9 +164,10 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
 // warp-spec + per-buffer mbarrier pipeline.
 void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView indices,
                                 TensorView mid_out, TensorView mid_lse, TensorView output,
-                                TensorView out_lse, int64_t num_splits, double sm_scale,
-                                Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
-                                int64_t model_type, int64_t chunks_per_block_override) {
+                                TensorView out_lse, double lse_scale, int64_t num_splits,
+                                double sm_scale, Optional<TensorView> topk_length,
+                                Optional<TensorView> attn_sink, int64_t model_type,
+                                int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
   TVM_FFI_ICHECK_GE(indices.ndim(), 2);
@@ -197,8 +199,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       static_cast<const bf16*>(q.data_ptr()), static_cast<const uint8_t*>(kv_cache.data_ptr()),
       static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()),
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
-      static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr,
-      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
+      static_cast<float*>(out_lse.data_ptr()), static_cast<float>(lse_scale), topk_len_ptr,
+      attn_sink_ptr, static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
       kv_layout.stride_kv_block, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv3_2 launch failed (unsupported shape or kernel error)";
 }

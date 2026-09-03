@@ -3022,6 +3022,7 @@ class TrtllmGenDecodeModule:
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
@@ -3864,6 +3865,7 @@ def trtllm_batch_decode_with_kv_cache(
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
             enable_block_sparse_attention,

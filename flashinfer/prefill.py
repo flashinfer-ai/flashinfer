@@ -312,6 +312,7 @@ def get_trtllm_gen_prefill_module():
             uses_spcompress,
             is_causal,
             lse,
+            1.0,  # lse_scale
             lse_stride_tokens,
             lse_stride_heads,
         )
@@ -6044,6 +6045,7 @@ def trtllm_batch_context_with_kv_cache(
         uses_spcompress,
         causal,
         lse,
+        1.0,  # lse_scale
         lse_stride_tokens,
         lse_stride_heads,
     )
