@@ -4736,7 +4736,22 @@ def _run_generated_single_route(
         metadata, module = _get_flash_kda_generated_module(selector_key)
     except _GeneratedFlashKDASelectorNotFoundError:
         return False
-    signature_tensors = [q, k, v, g, beta_tma, out]
+    module_q = q
+    if route == _FLASH_KDA_ROUTE_SMALL_BH_M128 and not fixed_layout:
+        num_sequences = len(sequence_lengths)
+        total_tokens = q.numel() // (num_heads * _FLASH_KDA_HEAD_DIM)
+        if total_tokens % num_sequences != 0:
+            return False
+        storage_sequence_length = total_tokens // num_sequences
+        if storage_sequence_length < _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH:
+            return False
+        module_q = q.view(
+            num_sequences,
+            storage_sequence_length,
+            num_heads,
+            _FLASH_KDA_HEAD_DIM,
+        )
+    signature_tensors = [module_q, k, v, g, beta_tma, out]
     if route == _FLASH_KDA_ROUTE_SMALL_BH_M128:
         assert packet_workspace is not None
         signature_tensors.append(packet_workspace)
@@ -5042,7 +5057,7 @@ def _run_generated_single_route(
             assert packet_consumed is not None
             assert helper_done is not None
             module.run(
-                q,
+                module_q,
                 k,
                 v,
                 g,
