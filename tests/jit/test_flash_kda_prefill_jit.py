@@ -146,6 +146,21 @@ def test_piece_persistent_prefill_variant_is_in_the_aot_inventory():
 
 
 @pytest.mark.parametrize(
+    ("target", "expected_arch", "uses_sm103_schedule"),
+    [
+        ("sm100a", "compute_100a", False),
+        ("sm103a", "compute_103a", True),
+    ],
+)
+def test_vibecuda_prefill_uses_exact_arch_schedule(
+    target, expected_arch, uses_sm103_schedule
+):
+    spec = flash_kda.gen_vibecuda_flash_kda_module(target)
+    assert any(expected_arch in flag for flag in spec.extra_cuda_cflags)
+    assert ("-DKDA_SM103" in spec.extra_cuda_cflags) is uses_sm103_schedule
+
+
+@pytest.mark.parametrize(
     ("target", "target_define"),
     (
         ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),

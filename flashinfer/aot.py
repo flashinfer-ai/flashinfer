@@ -94,6 +94,7 @@ from .jit.flash_kda import (
     gen_flash_kda_piece_persistent_m128_module,
     gen_flash_kda_persistent_m128_module,
     gen_flash_kda_small_bh_m128_module,
+    gen_vibecuda_flash_kda_module,
 )
 from .jit.flash_kda_backward import gen_flash_kda_backward_module
 from .jit.flash_kda_training import gen_flash_kda_training_module
@@ -541,6 +542,12 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100f = sm_capabilities.get(
         "flash_kda_prefill_sm100f", False
     )
+    has_vibecuda_flash_kda_sm100a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm100a", False
+    )
+    has_vibecuda_flash_kda_sm103a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm103a", False
+    )
     has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
     has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
@@ -633,6 +640,10 @@ def gen_all_modules(
                 ]
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
+    if has_vibecuda_flash_kda_sm100a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm100a"))
+    if has_vibecuda_flash_kda_sm103a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm103a"))
 
     # The Cake-owned unbounded-softplus export remains an exact-architecture
     # artifact on B200 and B300.
@@ -1209,6 +1220,14 @@ def detect_sm_capabilities():
         ),
         "flash_kda_prefill_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "vibecuda_flash_kda_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "vibecuda_flash_kda_sm103a": (
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "cake_kda_prefill_sm100a": (
