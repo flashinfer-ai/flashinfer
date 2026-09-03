@@ -5142,6 +5142,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    assume_all_rows_active: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5231,6 +5232,10 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
+    assume_all_rows_active : bool
+        Skip empty-row detection when the caller guarantees that every row has
+        positive query and KV lengths. Mutually exclusive with CPU length
+        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5399,7 +5404,12 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if assume_all_rows_active:
+            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+                raise ValueError(
+                    "assume_all_rows_active cannot be combined with CPU length mirrors"
+                )
+        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
