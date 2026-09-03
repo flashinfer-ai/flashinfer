@@ -200,13 +200,13 @@ void ulysses_lowp_k_sum_v_amax(TensorView k, TensorView v, TensorView k_sum, Ten
   dim3 grid(heads, batch, chunks);
   dim3 block(HEAD_DIM * TOKEN_LANES);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
-    launch_kernel("KSumVAmaxPartialKernel", enable_pdl,
-                  lowp::KSumVAmaxPartialKernel<c_type, HEAD_DIM, CHUNK_TOKENS>, grid, block, stream,
-                  static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(v.data_ptr()),
-                  static_cast<float*>(k_partial.data_ptr()), static_cast<float*>(v_partial.data_ptr()),
-                  static_cast<uint32_t>(tokens), static_cast<uint32_t>(heads),
-                  static_cast<uint32_t>(chunks), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
-                  v.stride(1), v.stride(2));
+    launch_kernel(
+        "KSumVAmaxPartialKernel", enable_pdl,
+        lowp::KSumVAmaxPartialKernel<c_type, HEAD_DIM, CHUNK_TOKENS>, grid, block, stream,
+        static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(v.data_ptr()),
+        static_cast<float*>(k_partial.data_ptr()), static_cast<float*>(v_partial.data_ptr()),
+        static_cast<uint32_t>(tokens), static_cast<uint32_t>(heads), static_cast<uint32_t>(chunks),
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2));
     return true;
   });
   // Stage 2 combines the chunk partials in FIXED ascending chunk order, so
@@ -217,9 +217,9 @@ void ulysses_lowp_k_sum_v_amax(TensorView k, TensorView v, TensorView k_sum, Ten
   dim3 block2(HEAD_DIM);
   launch_kernel("KSumVAmaxCombineKernel", enable_pdl, lowp::KSumVAmaxCombineKernel<HEAD_DIM>, grid2,
                 block2, stream, static_cast<const float*>(k_partial.data_ptr()),
-                static_cast<const float*>(v_partial.data_ptr()), static_cast<float*>(k_sum.data_ptr()),
-                static_cast<float*>(v_amax.data_ptr()), static_cast<uint32_t>(heads),
-                static_cast<uint32_t>(chunks));
+                static_cast<const float*>(v_partial.data_ptr()),
+                static_cast<float*>(k_sum.data_ptr()), static_cast<float*>(v_amax.data_ptr()),
+                static_cast<uint32_t>(heads), static_cast<uint32_t>(chunks));
 }
 
 // Per-touched-group partial Q amax on this rank's shard, on the GLOBAL
@@ -252,8 +252,8 @@ void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank
                   static_cast<const c_type*>(q.data_ptr()), static_cast<const c_type*>(nullptr),
                   static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
                   static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(q.size(2)),
-                  static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), q.stride(0),
-                  q.stride(1), q.stride(2));
+                  static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first),
+                  q.stride(0), q.stride(1), q.stride(2));
     return true;
   });
 }
@@ -289,13 +289,13 @@ void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView ama
     constexpr uint32_t GROUP = 64;
     dim3 grid(touched, k.size(2), k.size(0));
     dim3 block(GROUP * (HEAD_DIM / 8));
-    launch_kernel("GroupedAmaxKernel(K)", enable_pdl,
-                  lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, true, c_type>, grid, block, stream,
-                  static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
-                  static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
-                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(k.size(2)),
-                  static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), k.stride(0),
-                  k.stride(1), k.stride(2));
+    launch_kernel(
+        "GroupedAmaxKernel(K)", enable_pdl, lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, true, c_type>,
+        grid, block, stream, static_cast<const c_type*>(k.data_ptr()),
+        static_cast<const c_type*>(k_mean.data_ptr()), static_cast<float*>(amax_out.data_ptr()),
+        static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(rank * local_sequence),
+        static_cast<uint32_t>(k.size(2)), static_cast<uint32_t>(slots_alloc),
+        static_cast<uint32_t>(group_first), k.stride(0), k.stride(1), k.stride(2));
     return true;
   });
 }
@@ -470,16 +470,16 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
     constexpr uint32_t GROUP = 32;
     dim3 grid(touched, num_heads, batch_size);
     dim3 block(GROUP * (HEAD_DIM / 8));
-    launch_kernel("QuantInt8FusedAmaxPackKernel(Q)", enable_pdl,
-                  lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block,
-                  stream, static_cast<const c_type*>(q.data_ptr()),
-                  static_cast<const c_type*>(nullptr), static_cast<uint8_t*>(output.data_ptr()),
-                  static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(rank * local_sequence),
-                  static_cast<uint32_t>(num_heads), static_cast<uint32_t>(local_heads),
-                  static_cast<uint32_t>(batch_size), static_cast<uint64_t>(spec.chunk_bytes),
-                  static_cast<uint64_t>(0), static_cast<uint64_t>(3 * spec.main_bytes),
-                  static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(group_first),
-                  0xFFFFFFFFu, 0u, q.stride(0), q.stride(1), q.stride(2));
+    launch_kernel(
+        "QuantInt8FusedAmaxPackKernel(Q)", enable_pdl,
+        lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block, stream,
+        static_cast<const c_type*>(q.data_ptr()), static_cast<const c_type*>(nullptr),
+        static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+        static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+        static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+        static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(0),
+        static_cast<uint64_t>(3 * spec.main_bytes), static_cast<uint32_t>(spec.q_slots),
+        static_cast<uint32_t>(group_first), 0xFFFFFFFFu, 0u, q.stride(0), q.stride(1), q.stride(2));
     return true;
   });
 }
@@ -487,9 +487,9 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
 // Fused K (with in-kernel used_sequence tail repair) + packed V.
 // used_sequence <= 0 means "no padding".
 void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, TensorView k_mean,
-                                               TensorView v_scale, TensorView output,
-                                               int64_t rank, int64_t world_size,
-                                               int64_t used_sequence, bool enable_pdl) {
+                                               TensorView v_scale, TensorView output, int64_t rank,
+                                               int64_t world_size, int64_t used_sequence,
+                                               bool enable_pdl) {
   check_v2g_shard(k, "k");
   check_v2g_shard(v, "v");
   check_v2g_rank(rank, world_size);
@@ -548,8 +548,8 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(GROUP * (HEAD_DIM / 8));
     launch_kernel("QuantInt8FusedAmaxPackKernel(K)", enable_pdl,
-                  lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid, k_block,
-                  stream, static_cast<const c_type*>(k.data_ptr()),
+                  lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid,
+                  k_block, stream, static_cast<const c_type*>(k.data_ptr()),
                   static_cast<const c_type*>(k_mean.data_ptr()),
                   static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
                   static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
@@ -669,10 +669,9 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
 // chunks and unused scale tail slots are deterministically zeroed by the
 // kernel itself.
 void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, TensorView k,
-                                            TensorView v, TensorView q_scale,
-                                            TensorView k_scale, int64_t local_sequence,
-                                            int64_t world_size, int64_t scale_sequence,
-                                            bool enable_pdl) {
+                                            TensorView v, TensorView q_scale, TensorView k_scale,
+                                            int64_t local_sequence, int64_t world_size,
+                                            int64_t scale_sequence, bool enable_pdl) {
   CHECK_CUDA(input);
   CHECK_CUDA(q);
   CHECK_CUDA(k);
@@ -744,12 +743,13 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
                 lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE>, grid, block, stream,
                 static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
                 static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
-                static_cast<uint8_t*>(q_scale.data_ptr()), static_cast<uint8_t*>(k_scale.data_ptr()),
-                static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
-                static_cast<uint32_t>(batch_size), static_cast<uint32_t>(local_sequence),
-                static_cast<uint32_t>(logical_sequence), static_cast<uint32_t>(padded_sequence),
-                static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(spec.k_slots),
-                static_cast<uint32_t>(q_scale_alloc), static_cast<uint32_t>(k_scale_alloc));
+                static_cast<uint8_t*>(q_scale.data_ptr()),
+                static_cast<uint8_t*>(k_scale.data_ptr()), static_cast<uint64_t>(spec.main_bytes),
+                static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint32_t>(batch_size),
+                static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(logical_sequence),
+                static_cast<uint32_t>(padded_sequence), static_cast<uint32_t>(spec.q_slots),
+                static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(q_scale_alloc),
+                static_cast<uint32_t>(k_scale_alloc));
 }
 
 // Payload ABI version consumed by the Python capability handshake
