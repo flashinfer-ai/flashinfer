@@ -263,16 +263,6 @@ inline void RunDirectM128(
     args.state_checkpoints_tma =
         descriptor_bytes + 6 * sizeof(CUtensorMap);
     if (prepare_descriptors != 0) {
-      const CUtensorMap value_map = EncodeGeneratedCheckpointValueTma(v);
-      GeneratedCheckpointMapWords value_words{};
-      std::memcpy(value_words.words, &value_map, sizeof(value_map));
-      PublishGeneratedCheckpointMap<<<
-          1, sizeof(CUtensorMap) / sizeof(uint64_t), 0, prepared.stream>>>(
-          reinterpret_cast<uint64_t*>(descriptor_bytes +
-                                      2 * sizeof(CUtensorMap)),
-          value_words);
-      CheckCuda(cudaGetLastError(),
-                "PublishGeneratedCheckpointValueMap launch");
       const CUtensorMap checkpoint_map =
           EncodeGeneratedCheckpointTma(state_checkpoints);
       GeneratedCheckpointMapWords checkpoint_words{};

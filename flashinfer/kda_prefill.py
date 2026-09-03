@@ -680,6 +680,75 @@ def _flash_kda_compact_fp32_compat_contract(
     )
 
 
+def _flash_kda_prefill_gqa_group_size(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+) -> Optional[int]:
+    """Return the value-heads-per-query-head ratio for a valid GQA layout."""
+
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v, g, beta)):
+        return None
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4 or g.shape != v.shape:
+        return None
+    if q.shape[:2] != v.shape[:2] or q.shape[3] != v.shape[3]:
+        return None
+    if beta.shape != v.shape[:3]:
+        return None
+    query_heads = q.shape[2]
+    value_heads = v.shape[2]
+    if query_heads <= 0 or value_heads <= query_heads or value_heads % query_heads:
+        return None
+    if not isinstance(A_log, torch.Tensor) or A_log.numel() != query_heads:
+        return None
+    if (
+        not isinstance(dt_bias, torch.Tensor)
+        or dt_bias.numel() != query_heads * q.shape[-1]
+    ):
+        return None
+    return value_heads // query_heads
+
+
+def _expand_flash_kda_prefill_gqa_inputs(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand query-head inputs to the value-head layout when GQA is active."""
+
+    group_size = _flash_kda_prefill_gqa_group_size(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    if group_size is None:
+        return q, k, A_log, dt_bias
+    query_heads = q.shape[2]
+    head_dim = q.shape[3]
+    return (
+        q.repeat_interleave(group_size, dim=2).contiguous(),
+        k.repeat_interleave(group_size, dim=2).contiguous(),
+        A_log.reshape(query_heads).repeat_interleave(group_size).contiguous(),
+        dt_bias.reshape(query_heads, head_dim)
+        .repeat_interleave(group_size, dim=0)
+        .contiguous(),
+    )
+
+
 def _flash_kda_prefill_is_eligible(
     *,
     q: torch.Tensor,
@@ -761,20 +830,36 @@ def _flash_kda_prefill_is_eligible(
         return False
     if q.ndim != 4:
         return False
-    batch_size, total_or_fixed_tokens, num_heads, head_dim = q.shape
+    batch_size, total_or_fixed_tokens, query_heads, head_dim = q.shape
+    gqa_group_size = _flash_kda_prefill_gqa_group_size(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    num_heads = v.shape[2] if gqa_group_size is not None else query_heads
     if (
         batch_size <= 0
         or total_or_fixed_tokens <= 1
-        or num_heads <= 0
+        or query_heads <= 0
         or head_dim != _FLASH_KDA_HEAD_DIM
     ):
         return False
-    for tensor in (k, v, g):
+    expected_qk_shape = q.shape
+    expected_vg_shape = (batch_size, total_or_fixed_tokens, num_heads, head_dim)
+    for tensor, expected_shape in (
+        (k, expected_qk_shape),
+        (v, expected_vg_shape),
+        (g, expected_vg_shape),
+    ):
         if (
             not _is_contiguous_cuda_tensor(
                 tensor, dtype=torch.bfloat16, device=q.device
             )
-            or tensor.shape != q.shape
+            or tensor.shape != expected_shape
         ):
             return False
     if not _is_token_row_strided_cuda_tensor(
@@ -785,13 +870,19 @@ def _flash_kda_prefill_is_eligible(
         return False
     if not _is_contiguous_cuda_tensor(
         A_log, dtype=torch.float32, device=q.device
-    ) or A_log.shape != (num_heads,):
+    ) or A_log.shape != (query_heads,):
         return False
     if not _is_contiguous_cuda_tensor(dt_bias, dtype=torch.float32, device=q.device):
         return False
-    if dt_bias.numel() != num_heads * _FLASH_KDA_HEAD_DIM or dt_bias.ndim not in (1, 2):
+    if (
+        dt_bias.numel() != query_heads * _FLASH_KDA_HEAD_DIM
+        or dt_bias.ndim not in (1, 2)
+    ):
         return False
-    if dt_bias.ndim == 2 and dt_bias.shape != (num_heads, _FLASH_KDA_HEAD_DIM):
+    if dt_bias.ndim == 2 and dt_bias.shape != (
+        query_heads,
+        _FLASH_KDA_HEAD_DIM,
+    ):
         return False
 
     if cu_seqlens is None:
@@ -859,7 +950,7 @@ def _flash_kda_prefill_is_eligible(
             not _is_contiguous_cuda_tensor(
                 output, dtype=torch.bfloat16, device=q.device
             )
-            or output.shape != q.shape
+            or output.shape != expected_vg_shape
         ):
             return False
     return True
@@ -5822,6 +5913,15 @@ def _run_flash_kda_prefill(
 ):
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
+    q, k, A_log, dt_bias = _expand_flash_kda_prefill_gqa_inputs(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(
@@ -6002,6 +6102,28 @@ def _run_flash_kda_prefill(
             num_heads=num_heads,
             indexed_state=state_indices is not None,
         )
+        if (
+            route == _FLASH_KDA_ROUTE_SMALL_BH_M128
+            and not fixed_layout
+            and (
+                batch_size * seq_len % num_sequences != 0
+                or batch_size * seq_len // num_sequences
+                < _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH
+            )
+        ):
+            # The source-exact small-BH binding accepts only a fixed-layout
+            # TensorView.  Packed storage can be viewed that way without a
+            # copy only when it divides into sufficiently long physical rows.
+            # Preserve the indexed-state ABI on direct M128; compact state can
+            # use the separately sealed FP32 compatibility closure.
+            route = (
+                _FLASH_KDA_ROUTE_FP32_COMPAT_M128
+                if state_indices is None
+                else _direct_m128_route(
+                    num_heads=num_heads,
+                    max_sequence_length=max_sequence_length,
+                )
+            )
         if route == _FLASH_KDA_ROUTE_FP32_COMPAT_M128:
             persistent_plan = None
     elif compact_fp32_compat:
@@ -6650,6 +6772,19 @@ def _run_flash_kda_prefill(
                 assert state_checkpoints is not None
                 return (*result, state_checkpoints)
             return result
+
+        if (
+            (variant == "small_bh_m128" and not fixed_layout)
+            or (
+                variant == "persistent_m128"
+                and compute_capability == (10, 3)
+            )
+        ):
+            # The frozen legacy small-BH ABI is fixed-layout-only, and its
+            # persistent ABI is CC 10.0-only.  Exact generated selectors cover
+            # the measured routes; on a selector miss retain correctness with
+            # the generic packed SM100-family ABI.
+            variant = "m128"
 
         if variant == "m64" and num_heads != 64:
             # The legacy M64 ABI is specialized for exactly 64 heads. If an

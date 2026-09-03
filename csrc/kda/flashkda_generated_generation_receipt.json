@@ -46,7 +46,7 @@
     "csrc/kda/flashkda_generated_bt16_chain_binding.cuh": "77e74e3e7132d66790900ccdc6a56a48a092a2208339d27ac6b40e75131900f9",
     "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh": "425151978987ef03cc4aa987853bfc97b3b4941ad54d24098c980cdff30ddf99",
     "csrc/kda/flashkda_generated_bt16_prepare_binding.cuh": "4df486885ae39e828020f0f24e3cf4f12eb7dcab9dd52a88aa530d8f9d9bd861",
-    "csrc/kda/flashkda_generated_direct_m128_binding.cuh": "02924d48fc98dfc1d03302431b6e5f654b63d3bb0914eed097f65a66ee745136",
+    "csrc/kda/flashkda_generated_direct_m128_binding.cuh": "bf1ba63da606f19a787148a2487f51e72aecd0145b25961f79aed368a20081e8",
     "csrc/kda/flashkda_generated_m64_binding.cuh": "20456ad21d5c7941373802df99a5cc4833b8451775ce3fb77bd74b239f58dd40",
     "csrc/kda/flashkda_generated_scalar_lpt_m128_binding.cuh": "b7573eb05ad3c4c4792beb3175827adb9ba79ca9987ef50edf141235d9b59117",
     "csrc/kda/flashkda_generated_small_bh_m128_binding.cuh": "50d8343ad48e26b0b4cd3743dcf67a79317d6ea775e844372e328d590d576947",
@@ -61,7 +61,7 @@
   "runtime_source_contract_sha256": "a93f9be48d541435088e69f9e248fa05e1b2a3ef0c30bcea979f8b8c2c65e549",
   "schema_version": 1,
   "source_closure_status": "passed",
-  "source_closure_table_sha256": "58ebc17f4f9893e58143be6ab0f074748cfde78674d7a556b1a3961d8db3a72e",
+  "source_closure_table_sha256": "1bb015c38935d090b691a78c460f5f25ebc4e4ff3b28991500418f72ea729572",
   "source_exact_identity_table_sha256": "5861597ad8d0f68fa009a2109253f88f0a5ba0b8ad332514b5176d562fb56aae",
   "status": "passed",
   "total_file_count": 183,
@@ -71,5 +71,5 @@
     "sm100a": 49,
     "sm103a": 59
   },
-  "variant_metadata_sha256": "f177d3c8416ca155ac57114957ecec4ccda98660da4089b78e23fcbc6d99f48e"
+  "variant_metadata_sha256": "7f672d0308fe5df0c6abe69d65e3d2822309385b9169b72b02f00933dd519be8"
 }

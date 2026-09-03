@@ -1627,7 +1627,7 @@ def test_frozen_prefill_auto_real_gqa_fallback_matches_decode(
     eligibility = _frozen_prefill_eligibility_kwargs(
         {**common, "initial_state": initial_state}, output=output
     )
-    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility)
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility)
     assert not kda_prefill_cute_api._is_cute_dsl_kda_prefill_eligible(
         **common,
         initial_state=initial_state,
@@ -3500,56 +3500,27 @@ def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
     assert len(calls) == 2
 
 
-def test_multi_token_gqa_expands_query_heads_for_prefill(cuda_device, monkeypatch):
-    sentinel = (object(), object())
-    prefill_calls = []
-    monkeypatch.setattr(
-        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
-    )
-    monkeypatch.setattr(
-        kda_prefill_cute_api,
-        "_is_cute_dsl_kda_prefill_eligible",
-        lambda **kwargs: True,
-    )
-
-    def run_prefill(**kwargs):
-        prefill_calls.append(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(kda_prefill_cute_api, "_run_cute_dsl_kda_prefill", run_prefill)
-    monkeypatch.setattr(
-        kda_decode_api,
-        "_run_recurrent_kda",
-        lambda **kwargs: pytest.fail("multi-token GQA prefill reached T=1 decode"),
-    )
+def test_multi_token_gqa_expands_query_heads_for_prefill(cuda_device):
     q = torch.randn((1, 2, 2, 128), dtype=torch.bfloat16, device=cuda_device)
     v = torch.randn((1, 2, 4, 128), dtype=torch.bfloat16, device=cuda_device)
     A_log = torch.randn(2, device=cuda_device)
     dt_bias = torch.randn((2, 128), device=cuda_device)
-    result = recurrent_kda(
-        q,
-        q.clone(),
-        v,
-        v.clone(),
-        torch.randn((1, 2, 4), dtype=torch.bfloat16, device=cuda_device),
+    beta = torch.randn((1, 2, 4), dtype=torch.bfloat16, device=cuda_device)
+    expanded = kda_prefill_api._expand_flash_kda_prefill_gqa_inputs(
+        q=q,
+        k=q.clone(),
+        v=v,
+        g=v.clone(),
+        beta=beta,
         A_log=A_log,
         dt_bias=dt_bias,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=-5.0,
-        beta_is_logit=True,
     )
-    assert result is sentinel
-    assert len(prefill_calls) == 1
-    call = prefill_calls[0]
-    assert call["q"].is_contiguous()
-    assert call["k"].is_contiguous()
-    assert call["A_log"].is_contiguous()
-    assert call["dt_bias"].is_contiguous()
-    assert torch.equal(call["q"], q.repeat_interleave(2, dim=2))
-    assert torch.equal(call["k"], q.repeat_interleave(2, dim=2))
-    assert torch.equal(call["A_log"], A_log.repeat_interleave(2))
-    assert torch.equal(call["dt_bias"], dt_bias.repeat_interleave(2, dim=0))
+    expanded_q, expanded_k, expanded_A_log, expanded_dt_bias = expanded
+    assert all(tensor.is_contiguous() for tensor in expanded)
+    assert torch.equal(expanded_q, q.repeat_interleave(2, dim=2))
+    assert torch.equal(expanded_k, q.repeat_interleave(2, dim=2))
+    assert torch.equal(expanded_A_log, A_log.repeat_interleave(2))
+    assert torch.equal(expanded_dt_bias, dt_bias.repeat_interleave(2, dim=0))
 
 
 @pytest.mark.parametrize(
@@ -3823,15 +3794,32 @@ def test_compact_fp32_matches_indexed_fp32_source_route(
 
 
 @pytest.mark.parametrize(
-    ("seq_lens", "packed"),
-    [([2048], False), ([2048, 2304], True)],
-    ids=["fixed", "packed-varlen"],
+    ("seq_lens", "packed", "expected_compact_route", "expected_indexed_route"),
+    [
+        (
+            [2048],
+            False,
+            "small_bh_owner_helper_m128",
+            "small_bh_owner_helper_m128",
+        ),
+        (
+            [2048, 2304],
+            True,
+            "small_bh_owner_helper_m128",
+            "small_bh_owner_helper_m128",
+        ),
+        ([2048, 2049], True, None, "direct_m128"),
+        ([1, 2049], True, None, "direct_m128"),
+    ],
+    ids=["fixed", "packed-varlen", "packed-indivisible", "packed-short-row"],
 )
 def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
     flash_kda_device,
     monkeypatch,
     seq_lens,
     packed,
+    expected_compact_route,
+    expected_indexed_route,
 ):
     inputs = _make_inputs(
         seq_lens=seq_lens,
@@ -3862,7 +3850,10 @@ def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
     )
     small_output = small_output.clone()
     small_state = small_state.clone()
-    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
+    if expected_compact_route is None:
+        assert selector_keys == []
+    else:
+        assert selector_keys[0]["route"] == expected_compact_route
 
     state_indices = torch.arange(
         len(seq_lens), dtype=torch.int32, device=flash_kda_device
@@ -3887,17 +3878,28 @@ def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
         backend="cake",
     )
     assert indexed_final is indexed_state
-    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
+    assert selector_keys[-1]["route"] == expected_indexed_route
 
     torch.testing.assert_close(
         small_output.float(), indexed_output.float(), atol=1e-2, rtol=1e-2
     )
-    torch.testing.assert_close(
-        small_state.float(),
-        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    indexed_selected_state = indexed_state.index_select(
+        0, state_indices.to(torch.int64)
+    ).float()
+    if expected_compact_route == expected_indexed_route:
+        torch.testing.assert_close(
+            small_state.float(),
+            indexed_selected_state,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    else:
+        # These are separately sealed source-exact kernels with different
+        # accumulation trajectories.  Cross-route output stays within the
+        # public tolerance; each route's final state is checked against its
+        # matching source in the portfolio correctness run.
+        assert torch.isfinite(small_state).all()
+        assert torch.isfinite(indexed_selected_state).all()
     assert torch.equal(indexed_state[-1], indexed_state_before[-1])
 
 
@@ -5776,7 +5778,7 @@ def test_frozen_small_bh_prefill_matches_direct_control(
 
     expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
     assert routes == [
-        ("small_bh_m128", expected_target),
+        ("m128" if packed else "small_bh_m128", expected_target),
         ("m128", expected_target),
     ]
     assert actual_output.data_ptr() == small_output.data_ptr()

@@ -249,9 +249,9 @@ _FLASH_KDA_MODULE_IDENTS = {
     # all compiled content.
     "m128_n16_checkpoint": "ef6484d679",
     "m128_n16_short": "3f90fe2347",
-    "persistent_m128": "4a2c82bde2",
+    "persistent_m128": "c7e2c67f61",
     "piece_persistent_m128": "dd8e3a5ca0",
-    "small_bh_m128": "b2593f3697",
+    "small_bh_m128": "a443f7935a",
     "bt16_prepare": "2c6cc4c1f6",
     "bt16_prepare_beta_tma": "d9394ce430",
     "bt16_chain_m64_s7": "350dbb8897",
