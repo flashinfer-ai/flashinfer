@@ -983,6 +983,34 @@ def _read_paged_kv_plan_values(
     )
 
 
+def _validate_planned_seq_lens(
+    seq_lens: torch.Tensor,
+    seq_lens_host: tuple[int, ...],
+    *,
+    expected_device: torch.device,
+) -> None:
+    if not isinstance(seq_lens, torch.Tensor):
+        raise TypeError("seq_lens must be a torch.Tensor")
+    if seq_lens.dtype != torch.int32:
+        raise TypeError(f"seq_lens must have dtype torch.int32, got {seq_lens.dtype}")
+    if seq_lens.dim() != 1 or seq_lens.numel() != len(seq_lens_host):
+        raise ValueError(
+            f"seq_lens must be a 1-D tensor with one entry per request "
+            f"({len(seq_lens_host)}), got shape {tuple(seq_lens.shape)}"
+        )
+    if seq_lens.device != expected_device:
+        raise ValueError(
+            f"seq_lens must be on {expected_device}, got {seq_lens.device}"
+        )
+    if not seq_lens.is_contiguous():
+        raise ValueError("seq_lens must be contiguous")
+    if tuple(int(value) for value in seq_lens.tolist()) != seq_lens_host:
+        raise ValueError(
+            "seq_lens values must equal the K/V lengths derived from "
+            "(paged_kv_indptr, paged_kv_last_page_len, page_size)"
+        )
+
+
 def _decode_output_shape(
     *,
     batch_size: int,
@@ -2166,6 +2194,7 @@ class BatchDecodePagedTSWrapper:
         _validate_layout(kv_layout)
         self._kv_layout = kv_layout
         self._planned = False
+        self._owned_workspace_buffer: Optional[torch.Tensor] = None
 
     @flashinfer_api
     def plan(
@@ -2187,6 +2216,8 @@ class BatchDecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
         max_kv_len: Optional[int] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Prepare native CSR metadata, policy, compiled callables, and scratch.
 
@@ -2225,6 +2256,9 @@ class BatchDecodePagedTSWrapper:
         be mutated concurrently with a run or replay that reads it. One wrapper
         instance supports only one in-flight run or captured-graph replay because
         it owns mutable scratch; use separate wrappers for concurrent execution.
+        Scratch is rebound and reinitialized in place by every plan, so a graph
+        captured against an earlier plan of this wrapper must not be replayed
+        after a re-plan.
 
         Parameters
         ----------
@@ -2246,6 +2280,18 @@ class BatchDecodePagedTSWrapper:
             Left sliding-window extent, or ``-1`` to disable the window.
         max_kv_len : int, optional
             Static K/V length bound; defaults to the metadata maximum.
+        seq_lens : torch.Tensor, optional
+            Caller-owned contiguous int32 device tensor of shape
+            ``[batch_size]`` holding the per-request K/V lengths. The values
+            must equal the lengths derived from ``(paged_kv_indptr,
+            paged_kv_last_page_len, page_size)``; planning validates that once
+            on the host. When omitted, the plan derives and owns the tensor.
+        workspace_buffer : torch.Tensor, optional
+            Caller-owned contiguous ``torch.int8``/``torch.uint8`` CUDA buffer
+            the plan binds its scratch into, holding at least the plan's
+            required bytes and exclusive to this wrapper. When omitted, the
+            wrapper owns one buffer and grows it as needed instead of
+            allocating per plan.
         """
 
         _validate_mask(mask_type)
@@ -2325,10 +2371,19 @@ class BatchDecodePagedTSWrapper:
                         "no greater than its K/V length; request "
                         f"{request_idx} has Q={q_len} and K/V={kv_len}"
                     )
-        # This is the only metadata-derived device tensor needed by the raw
-        # native path. It remains stable across every run of this plan.
-        num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        seq_lens = ((num_pages - 1) * page_size + paged_kv_last_page_len).contiguous()
+        if seq_lens is None:
+            # This is the only metadata-derived device tensor needed by the
+            # raw native path. It remains stable across every run of this plan.
+            num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+            seq_lens = (
+                (num_pages - 1) * page_size + paged_kv_last_page_len
+            ).contiguous()
+        else:
+            _validate_planned_seq_lens(
+                seq_lens,
+                seq_lens_host,
+                expected_device=device,
+            )
         metadata_max_kv_len = max(seq_lens_host)
         if max_kv_len is None:
             exact_max_kv_len = metadata_max_kv_len
@@ -2403,9 +2458,24 @@ class BatchDecodePagedTSWrapper:
             o_data_type,
             use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         )
-        workspace_buffer = torch.empty(
-            workspace_layout.total_bytes, device=device, dtype=torch.int8
-        )
+        if workspace_buffer is not None:
+            _validate_workspace_buffer(
+                workspace_buffer,
+                device=device,
+                required_bytes=workspace_layout.total_bytes,
+            )
+        else:
+            owned = self._owned_workspace_buffer
+            if (
+                owned is None
+                or owned.device != device
+                or owned.numel() < workspace_layout.total_bytes
+            ):
+                owned = torch.empty(
+                    workspace_layout.total_bytes, device=device, dtype=torch.int8
+                )
+                self._owned_workspace_buffer = owned
+            workspace_buffer = owned
         workspace = _bind_decode_workspace(workspace_buffer, workspace_layout)
         workspace.split_kv_counter.zero_()
         workspace.cu_seqlens_q.zero_()

@@ -876,10 +876,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``prims-ts`` backend uses the task-scheduled decode kernel on SM100a/SM103a.
             It is the only backend that accepts ``is_causal=False`` with
-            ``q_len_per_req > 1`` and requires ``kv_layout="HND"``. Under
-            ``use_cuda_graph`` it runs the dynamic kernel variant, bounded by the
-            kv-token capacity of ``paged_kv_indices_buffer``, with scratch carved
-            from ``float_workspace_buffer``.
+            ``q_len_per_req > 1`` and requires ``kv_layout="HND"``. Both modes
+            carve scratch from ``float_workspace_buffer`` and stage the planned
+            KV lengths in a reusable device buffer. Under ``use_cuda_graph`` it
+            runs the dynamic kernel variant, bounded by the kv-token capacity of
+            ``paged_kv_indices_buffer``.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1703,6 +1704,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     non_blocking=non_blocking,
                 )
             else:
+                required_size = len(kv_lens_arr_host)
+                if required_size > self._kv_lens_buffer.shape[0]:
+                    self._kv_lens_buffer = torch.empty(
+                        (required_size,), dtype=torch.int32, device=self.device
+                    )
+                self._kv_lens_buffer[:required_size].copy_(
+                    kv_lens_arr_host, non_blocking=non_blocking
+                )
                 self._prims_ts_wrapper.plan(
                     self._paged_kv_indptr_buf,
                     self._paged_kv_indices_buf,
@@ -1718,6 +1727,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     mask_type=mask_type,
                     window_left=window_left,
                     max_kv_len=self._max_kv_len,
+                    seq_lens=self._kv_lens_buffer[:required_size],
+                    workspace_buffer=self._float_workspace_buffer,
                 )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0

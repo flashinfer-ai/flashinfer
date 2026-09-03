@@ -177,6 +177,75 @@ def test_graph_plan_rejects_small_workspace():
         wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
 
 
+@requires_prims_ts_gpu
+def test_eager_plan_binds_caller_buffers():
+    kv_lens = [64, 96]
+    workspace = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="prims-ts"
+    )
+    wrapper.plan(*_plan_args(kv_lens, "cuda"), q_data_type=torch.bfloat16)
+    delegate = wrapper._prims_ts_wrapper
+    assert delegate._workspace_buffer.data_ptr() == workspace.data_ptr()
+    assert delegate._seq_lens.data_ptr() == wrapper._kv_lens_buffer.data_ptr()
+
+    torch.manual_seed(0)
+    k_cache, v_cache = _make_cache(kv_lens, torch.bfloat16, "cuda")
+    q = torch.randn(2, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    out = wrapper.run(q, (k_cache, v_cache))
+    torch.testing.assert_close(
+        out.float(),
+        _reference_decode(q, k_cache, v_cache, kv_lens, 1, False, PAGE_SIZE),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+    wrapper.plan(*_plan_args([48, 96], "cuda"), q_data_type=torch.bfloat16)
+    assert delegate._workspace_buffer.data_ptr() == workspace.data_ptr()
+
+
+@requires_prims_ts_gpu
+def test_eager_plan_rejects_small_workspace():
+    workspace = torch.zeros(16, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="prims-ts"
+    )
+    with pytest.raises(ValueError, match="workspace_buffer is too small"):
+        wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
+
+
+@requires_prims_ts_gpu
+def test_delegate_plan_rejects_mismatched_seq_lens():
+    from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
+
+    indptr, indices, last_page_len = _make_page_table([32, 48], PAGE_SIZE, "cuda")
+    wrong = torch.tensor([32, 40], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="seq_lens values must equal"):
+        BatchDecodePagedTSWrapper().plan(
+            indptr,
+            indices,
+            last_page_len,
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            q_data_type=torch.bfloat16,
+            seq_lens=wrong,
+        )
+
+
+@requires_prims_ts_gpu
+def test_delegate_plan_reuses_owned_workspace():
+    from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
+
+    wrapper = BatchDecodePagedTSWrapper()
+    args = _plan_args([32, 48], "cuda")
+    wrapper.plan(*args, q_data_type=torch.bfloat16)
+    first = wrapper._workspace_buffer.data_ptr()
+    wrapper.plan(*args, q_data_type=torch.bfloat16)
+    assert wrapper._workspace_buffer.data_ptr() == first
+
+
 @requires_cuda
 def test_rejects_fast_decode_plan():
     wrapper = _make_wrapper("prims-ts")
