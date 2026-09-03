@@ -574,14 +574,16 @@ def _build_decode_gen_schedule(
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
-    smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=cfg.kv_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        advance_on_wait=True,
-    )
+    smem_kv_cfg = None
+    if not use_per_inst_kv_resources:
+        smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+            num_stages=cfg.kv_stages,
+            num_bytes=cfg.smem_kv_tile_bytes,
+            producer_group=tma_producer,
+            consumer_group=umma_hw,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
     smem_k0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=split_k0_stages,
         num_bytes=cfg.smem_k_tile_bytes,
@@ -2707,9 +2709,16 @@ def fmha_decode_launch(
     tma_box0_q = min(128 // cfg.q_dtype_bytes, cfg.headdim)
     tma_box0_k = min(128 // cfg.k_dtype_bytes, cfg.headdim)
     tma_box0_v = min(128 // cfg.v_dtype_bytes, cfg.headdim)
-    tma_swizzle = cuda.TensorMapSwizzle.s128b
-    if cutlass.const_expr(cfg.use_fp8_qkv and cfg.headdim == 64):
-        tma_swizzle = cuda.TensorMapSwizzle.s64b
+    tma_swizzle_qk = cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(
+        (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) and cfg.headdim == 64
+    ):
+        tma_swizzle_qk = cuda.TensorMapSwizzle.s64b
+    tma_swizzle_v = cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(
+        (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1) and cfg.headdim == 64
+    ):
+        tma_swizzle_v = cuda.TensorMapSwizzle.s64b
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
         # A KV64 TensorMap atom lets the shared load resource place each
@@ -2757,7 +2766,7 @@ def fmha_decode_launch(
             box_dims=q_box_dims,
             ragged_dim=2,
             stride_order=(0, 1, 2),
-            swizzle=tma_swizzle,
+            swizzle=tma_swizzle_qk,
         )
     else:
         q_tma = cute.make_tensor(
@@ -2787,19 +2796,19 @@ def fmha_decode_launch(
             q_tma,
             box_dims=q_box_dims,
             stride_order=(0, 1, 2, 3, 4),
-            swizzle=tma_swizzle,
+            swizzle=tma_swizzle_qk,
         )
     tma_desc_k = create_tensor_map_tiled_from_view(
         k_tma,
         box_dims=(tma_box0_k, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),
-        swizzle=tma_swizzle,
+        swizzle=tma_swizzle_qk,
     )
     tma_desc_v = create_tensor_map_tiled_from_view(
         v_tma,
         box_dims=(tma_box0_v, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),
-        swizzle=tma_swizzle,
+        swizzle=tma_swizzle_v,
     )
 
     grid_x = q_groups

@@ -4153,6 +4153,111 @@ def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
     assert implicit.tile_size_kv == explicit.tile_size_kv == 128
 
 
+def _make_mixed_kv_dtype_config(
+    *,
+    tile_size_q: int = 64,
+    v_dtype: type = Float8E4M3FN,
+    config_args: dict[str, object] | None = None,
+):
+    """qk=BF16 and v=FP8 config for exercising the mixed-dtype profile gate."""
+
+    args = {
+        "use_keeps_mma_ab": True,
+        "tile_size_kv": 128,
+        "tile_size_q": tile_size_q,
+        "num_insts_kv": 2,
+        "groups_tokens_heads_q": False,
+    }
+    if config_args is not None:
+        args.update(config_args)
+    return make_decode_config(
+        headdim=128,
+        args=args,
+        seq_len_q=1,
+        seq_len_kv=1024,
+        batch_size=1,
+        num_heads_q=tile_size_q,
+        num_heads_kv=1,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=v_dtype,
+        o_dtype=BFloat16,
+        qkv_layout="contiguousKv",
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "config_args", "via_static_path", "expected_error"),
+    (
+        pytest.param(64, None, False, None, id="keeps-kv128-q64"),
+        pytest.param(128, None, False, None, id="keeps-kv128-q128"),
+        pytest.param(
+            64,
+            {"use_keeps_mma_ab": False},
+            False,
+            "k_dtype != v_dtype requires",
+            id="swaps",
+        ),
+        pytest.param(
+            64,
+            {"tile_size_kv": 256},
+            False,
+            "k_dtype != v_dtype requires",
+            id="kv256",
+        ),
+        pytest.param(
+            64,
+            {"use_block_sparse": True},
+            False,
+            "k_dtype != v_dtype requires",
+            id="block-sparse",
+        ),
+        pytest.param(
+            64,
+            {"use_keeps_mma_ab": False},
+            True,
+            "k_dtype != v_dtype requires",
+            id="swaps-no-shape-args",
+        ),
+    ),
+)
+def test_attention_ts_decode_config_mixed_kv_dtype_profile_gate(
+    tile_size_q: int,
+    config_args: dict[str, object] | None,
+    via_static_path: bool,
+    expected_error: str | None,
+) -> None:
+    """k_dtype != v_dtype only builds on KeepsMmaAb + KV128 + non-block-sparse."""
+
+    if via_static_path:
+        with pytest.raises(ValueError, match=expected_error):
+            make_decode_config(
+                headdim=128,
+                args={
+                    "q_dtype": BFloat16,
+                    "k_dtype": BFloat16,
+                    "v_dtype": Float8E4M3FN,
+                    "out_dtype": BFloat16,
+                    **config_args,
+                },
+            )
+        return
+
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
+        return
+
+    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
+    assert cfg.k_dtype != cfg.v_dtype
+    assert cfg.use_fp8_qkv is False
+
+    bf16_cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, v_dtype=BFloat16)
+    assert cfg.smem_p_tile_bytes == bf16_cfg.smem_p_tile_bytes // 2
+
+
 @pytest.mark.parametrize(
     "overrides",
     (

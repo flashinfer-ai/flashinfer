@@ -819,7 +819,7 @@ class FmhaDecodeConfig:
     @property
     def smem_p_tile_bytes(self) -> int:
         """P stored in SMEM for the SwapsMmaAb BMM2 B operand."""
-        return self.tile_size_kv * self.tile_size_q * self.q_dtype_bytes
+        return self.tile_size_kv * self.tile_size_q * self.v_dtype_bytes
 
     @property
     def tmem_total_cols(self) -> int:
@@ -2510,6 +2510,7 @@ def _make_static_decode_config(
         explicit_fields=explicit_fields,
     )
     _finalize_static_decode_config(cfg, explicit_fields)
+    _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
     return cfg
@@ -3602,6 +3603,20 @@ def _select_auto_split_kv_reduction_mode(
     return _config_with_split_kv_mode(cfg, "gmem_reduction"), "gmem_reduction"
 
 
+def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
+    """Reject k_dtype != v_dtype profiles outside the supported combination."""
+    if cfg.k_dtype == cfg.v_dtype:
+        return
+    if cfg.use_block_sparse or not cfg.use_keeps_mma_ab or cfg.tile_size_kv == 256:
+        raise ValueError(
+            "k_dtype != v_dtype requires use_block_sparse=False, "
+            "use_keeps_mma_ab=True, and tile_size_kv=128; got "
+            f"use_block_sparse={cfg.use_block_sparse}, "
+            f"use_keeps_mma_ab={cfg.use_keeps_mma_ab}, "
+            f"tile_size_kv={cfg.tile_size_kv}"
+        )
+
+
 def _validate_profile_support(
     *,
     cfg: FmhaDecodeConfig,
@@ -3617,6 +3632,7 @@ def _validate_profile_support(
     use_groups_tokens_heads_q = cfg.groups_tokens_heads_q
     tile_size_q = cfg.tile_size_q
     cfg.validate_boolean_fields()
+    _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
@@ -4192,6 +4208,7 @@ def make_decode_config(
             ),
         )
 
+    _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
 

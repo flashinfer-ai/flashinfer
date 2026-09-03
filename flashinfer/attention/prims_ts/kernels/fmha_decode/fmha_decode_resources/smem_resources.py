@@ -138,6 +138,11 @@ def _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
     )
 
 
+def _kv_dtype_bytes_for_kind(cfg: Constexpr[FmhaDecodeConfig], kv_kind: Constexpr[int]) -> int:
+    """Return K's or V's byte width, selected by kv_kind."""
+    return cfg.v_dtype_bytes if kv_kind == KV_KIND_V else cfg.k_dtype_bytes
+
+
 @cute.jit
 def _local_kv_tile_idx_for_section(
     cfg: Constexpr[FmhaDecodeConfig],
@@ -566,11 +571,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 if self.pipeline_config is not None
                 else 1
             )
-            inst_dtype_bytes = (
-                self.cfg.v_dtype_bytes
-                if self.kv_kind == KV_KIND_V
-                else self.cfg.k_dtype_bytes
-            )
+            inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
@@ -593,21 +594,26 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 * inst_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_fp8_qkv or inst_dtype_bytes == 1):
                 leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(inst_dtype_bytes, self.cfg.head_dim_kv_stage)
                 )
             if cutlass.const_expr(
                 self.kv_kind == KV_KIND_V
-                and (self.cfg.use_fp8_qkv or self.cfg.headdim == 64)
+                and (self.cfg.use_fp8_qkv or inst_dtype_bytes == 1 or self.cfg.headdim == 64)
             ):
                 leading_byte_offset = Int32(0)
+            inst_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_128B
+            if cutlass.const_expr(
+                (self.cfg.use_fp8_qkv or inst_dtype_bytes == 1) and self.cfg.headdim == 64
+            ):
+                inst_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_64B
             self._desc_base = prims.Tcgen05SmemDesc.build(
                 self._smem_base_kv,
                 leading_byte_offset=leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                layout=_qkv_smem_swizzle(self.cfg),
+                layout=inst_swizzle,
             )
         return {"kv_desc": cutlass.Int64(0), "v_desc": cutlass.Int64(0)}
 
@@ -978,7 +984,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
+            if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
                 if prims.elect_sync():
                     # FP8 pages are copied as one contiguous head-dim stage per
                     # page fragment.
@@ -1039,7 +1046,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
+            if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
                 if prims.elect_sync():
                     # FP8 dense K/V needs one tensor copy for the active
                     # head-dim stage.
@@ -1346,10 +1354,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         )
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
 
+        inst_dtype_bytes = _kv_dtype_bytes_for_kind(cfg, kv_kind)
         # BF16 TMA is issued only by the elected lane, so only that lane needs
         # the register cache. FP8's predicated helper builds coordinates in
         # every lane and therefore keeps the existing all-lane semantics.
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
             fp8_page_ids = self.page_ids(tile_idx)
             for page_frag in cutlass.range_constexpr(pages_per_tile):
                 cached_page_ids[page_frag] = Int32(fp8_page_ids[page_frag])
