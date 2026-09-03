@@ -261,6 +261,37 @@ class FullOpMeasurementCache:
         self._timings[key] = observed
         return observed
 
+    def measure_counterbalanced_pair(
+        self,
+        first_key: tuple[Any, ...],
+        first_measure: Callable[[], float],
+        second_key: tuple[Any, ...],
+        second_measure: Callable[[], float],
+    ) -> tuple[float, float]:
+        """Measure two full operations in ABBA order and cache their means."""
+        if first_key == second_key:
+            raise ValueError("Counterbalanced measurements require distinct keys")
+        first_cached = self._timings.get(first_key)
+        second_cached = self._timings.get(second_key)
+        if first_cached is not None and second_cached is not None:
+            return first_cached, second_cached
+        if first_cached is not None or second_cached is not None:
+            raise RuntimeError(
+                "Counterbalanced measurement cache is partially populated"
+            )
+
+        first_before = float(first_measure())
+        second_observations = (float(second_measure()), float(second_measure()))
+        first_observations = (first_before, float(first_measure()))
+        for key, observations in (
+            (first_key, first_observations),
+            (second_key, second_observations),
+        ):
+            if not all(math.isfinite(value) for value in observations):
+                raise RuntimeError(f"Non-finite full MoE timing for {key!r}")
+            self._timings[key] = sum(observations) / len(observations)
+        return self._timings[first_key], self._timings[second_key]
+
 
 def factorized_tactic_to_body(tactic: FactorizedTactic) -> DABody:
     """Decode one backend-complete tactic into the native DA body identity."""

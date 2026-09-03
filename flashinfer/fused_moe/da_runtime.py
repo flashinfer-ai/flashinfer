@@ -773,15 +773,38 @@ class DaMoeOperationState:
                     ):
                         baseline_latency = candidate_latency
                     else:
-                        baseline_latency = self._measurements.measure(
-                            (realization_key, "noda", normalized_baseline),
-                            lambda: tuner.profile_tactic(
+                        selected_identity = tuple(
+                            int(value) for value in selected.tactic
+                        )
+
+                        def profile_selected_for_guard() -> float:
+                            return tuner.profile_tactic(
+                                profile_runner,
+                                profile_inputs,
+                                list(selected_identity),
+                                effective_config,
+                                profile_batches,
+                            )
+
+                        def profile_baseline_for_guard() -> float:
+                            return tuner.profile_tactic(
                                 baseline_profile_runner,
                                 baseline_profile_inputs,
                                 list(normalized_baseline),
                                 baseline_config,
                                 baseline_batches,
-                            ),
+                            )
+
+                        # Candidate selection can contain many tactics. Retime only the winner and
+                        # its matched ordinary baseline in ABBA order so guard admission is not
+                        # determined by which path happened to occupy the earlier timing position.
+                        candidate_latency, baseline_latency = (
+                            self._measurements.measure_counterbalanced_pair(
+                                (realization_key, "guard_da", selected_identity),
+                                profile_selected_for_guard,
+                                (realization_key, "guard_noda", normalized_baseline),
+                                profile_baseline_for_guard,
+                            )
                         )
                     selections.append(
                         DAProfileSelection(

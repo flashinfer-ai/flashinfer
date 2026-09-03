@@ -583,30 +583,51 @@ def _cold_l2_buffers() -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def _time_graph(
-    graph: torch.cuda.CUDAGraph,
+def _time_graphs_counterbalanced(
+    no_da_graph: torch.cuda.CUDAGraph,
+    da_graph: torch.cuda.CUDAGraph,
     flush_buffers: tuple[torch.Tensor, torch.Tensor],
     warmup: int,
     iterations: int,
-) -> float:
-    """Measure graph replays after alternating independent cold-L2 flushes."""
-    # Warm the executable graph separately; warmups do not contribute to requested iterations.
-    for _ in range(warmup):
-        graph.replay()
+) -> tuple[float, float]:
+    """Measure matched graph replays with counterbalanced cold-L2 ordering."""
+    if iterations <= 0 or iterations % 2 != 0:
+        raise ValueError(
+            "counterbalanced timing requires a positive, even iteration count"
+        )
+
+    # Warm both executable graphs in alternating order; warmups do not contribute to timing.
+    for iteration in range(warmup):
+        ordered_graphs = (
+            (no_da_graph, da_graph) if iteration % 2 == 0 else (da_graph, no_da_graph)
+        )
+        for graph in ordered_graphs:
+            graph.replay()
     torch.cuda.synchronize()
-    elapsed = 0.0
+    no_da_elapsed = 0.0
+    da_elapsed = 0.0
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    # Alternate two buffers that each exceed twice L2, and time exactly one replay per iteration.
+    # ABBA ordering gives each graph every measurement position and eviction buffer equally often.
     for iteration in range(iterations):
-        flush_buffers[iteration % 2].zero_()
-        torch.cuda.synchronize()
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        elapsed += start.elapsed_time(end)
-    return elapsed / iterations
+        ordered_graphs = (
+            (("noda", no_da_graph), ("da", da_graph))
+            if iteration % 2 == 0
+            else (("da", da_graph), ("noda", no_da_graph))
+        )
+        for position, (label, graph) in enumerate(ordered_graphs):
+            flush_buffers[(2 * iteration + position) % 2].zero_()
+            torch.cuda.synchronize()
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end)
+            if label == "noda":
+                no_da_elapsed += elapsed
+            else:
+                da_elapsed += elapsed
+    return no_da_elapsed / iterations, da_elapsed / iterations
 
 
 def _matching_diagnostic(
@@ -782,8 +803,13 @@ def _benchmark_precision(
                 torch.cuda.synchronize()
             da_output = prepared.output.clone()
             torch.testing.assert_close(da_output, no_da_output, rtol=3e-2, atol=3e-2)
-            no_da_ms = _time_graph(no_da_graph, flush_buffers, warmup, iterations)
-            da_ms = _time_graph(da_graph, flush_buffers, warmup, iterations)
+            no_da_ms, da_ms = _time_graphs_counterbalanced(
+                no_da_graph,
+                da_graph,
+                flush_buffers,
+                warmup,
+                iterations,
+            )
             diagnostic = _matching_diagnostic(precision, shape, distributions, backend)
             topology = diagnostic.get("topology") or {}
             selected_body = diagnostic.get("selected_body")
@@ -800,6 +826,7 @@ def _benchmark_precision(
                 "hidden_size": shape.hidden_size,
                 "intermediate_size": shape.intermediate_size,
                 "execution_mode": "graph",
+                "timing_protocol": "counterbalanced_cold_l2",
                 "routing_input_mode": routing_input_mode,
                 "noda_ms": no_da_ms,
                 "da_ms": da_ms,
@@ -876,7 +903,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--topk-group", type=int, default=4)
     parser.add_argument("--tune-max-num-tokens", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=10,
+        help="Positive even sample count per graph for counterbalanced timing",
+    )
     # This benchmark measures replay; eager fallback has its own API contract tests.
     parser.add_argument("--execution-mode", choices=("graph",), default="graph")
     parser.add_argument("--cache", "--tuning-cache", "--bundle-output", dest="cache")
@@ -927,6 +959,8 @@ def main() -> int:
         raise SystemExit("PrimsTS does not yet provide an ordinary MXINT4 MoE body")
     if args.skip_autotune and not args.cache:
         raise SystemExit("--skip-autotune requires --cache/--tuning-cache")
+    if args.iters <= 0 or args.iters % 2 != 0:
+        raise SystemExit("--iters must be a positive, even number")
     if args.local_num_experts > args.num_experts:
         raise SystemExit("--local-num-experts cannot exceed --num-experts")
     if args.local_expert_offset + args.local_num_experts > args.num_experts:

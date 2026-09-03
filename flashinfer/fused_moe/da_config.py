@@ -14,6 +14,7 @@ from flashinfer.fused_moe.da_tuner import (
 
 
 _FALSE_VALUES = {"", "0", "false", "no", "off", "none"}
+_GUARD_PROFILE_ORDER = "abba"
 
 
 def is_da_moe_enabled(*, default: bool = False) -> bool:
@@ -112,6 +113,8 @@ class DaMoeConfig:
             "baseline_guard_enabled": self.baseline_guard_enabled,
             "baseline_guard_margin": self.baseline_guard_margin,
             "control_overhead_us": self.control_overhead_us,
+            # Guard order can change plan admission, so it participates in persisted identity.
+            "guard_profile_order": _GUARD_PROFILE_ORDER,
         }
 
 
