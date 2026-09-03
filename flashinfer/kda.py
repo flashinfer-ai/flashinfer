@@ -456,6 +456,18 @@ def recurrent_kda(
         )
 
     if backend == "cake" and is_plain_prefill:
+        if (
+            isinstance(initial_state, torch.Tensor)
+            and initial_state.dtype == torch.float32
+            and (
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            )
+        ):
+            raise ValueError(
+                "backend='cake' does not support FP32 state checkpoints"
+            )
         raise ValueError(
             "backend='cake' does not support this recurrent_kda prefill contract"
         )
