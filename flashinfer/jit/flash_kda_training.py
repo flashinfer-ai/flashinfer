@@ -31,7 +31,7 @@ FlashKDATrainingTarget = Literal["sm100a", "sm103a"]
 
 # First ten hex digits of SHA256 over the target's complete source list and the
 # shared binding header, separated by NUL bytes without a trailing separator.
-_FLASH_KDA_TRAINING_MODULE_IDENT = "7b6efaf324"
+_FLASH_KDA_TRAINING_MODULE_IDENT = "c901445156"
 _TARGET_FLAGS: dict[FlashKDATrainingTarget, list[str]] = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,

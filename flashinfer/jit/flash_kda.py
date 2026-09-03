@@ -247,7 +247,7 @@ _FLASH_KDA_MODULE_IDENTS = {
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
-    "m128_n16_checkpoint": "ef6484d679",
+    "m128_n16_checkpoint": "926841ec5a",
     "m128_n16_short": "3f90fe2347",
     "persistent_m128": "c7e2c67f61",
     "piece_persistent_m128": "dd8e3a5ca0",
