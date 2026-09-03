@@ -42,6 +42,7 @@ from .sm120_mma import (
     make_swapab_m64n8k128_tiled_mma,
     shift_fp4_fragment_for_mxf8f6f4,
 )
+from .sm120_ptx_helpers import clamp_gate_upper_f32, clamp_symmetric_f32
 from .split_timestamp import (
     FIELD_FIRST_WORK,
     FIELD_FIRST_TILE_ID,
@@ -2077,6 +2078,8 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     sf_cols = cutlass.Int32(fc1_output_sf.shape[1])
                     sf_k_atoms = (sf_cols + cutlass.Int32(3)) // cutlass.Int32(4)
                     rAmax = cute.make_rmem_tensor((4,), cutlass.Float32)
+                    if cutlass.const_expr(self.gate_up_clamp is not None):
+                        gate_up_limit = cutlass.Float32(self.gate_up_clamp)
 
                     for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
                         acc0 = accs[ng_pair * 2]
@@ -2091,19 +2094,32 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         gate1 = acc0[1]
                         gate2 = acc1[0]
                         gate3 = acc1[1]
-                        val0 = acc0[2] * gate0 * cute.arch.rcp_approx(
+                        up0 = acc0[2]
+                        up1 = acc0[3]
+                        up2 = acc1[2]
+                        up3 = acc1[3]
+                        if cutlass.const_expr(self.gate_up_clamp is not None):
+                            gate0 = clamp_gate_upper_f32(gate0, gate_up_limit)
+                            gate1 = clamp_gate_upper_f32(gate1, gate_up_limit)
+                            gate2 = clamp_gate_upper_f32(gate2, gate_up_limit)
+                            gate3 = clamp_gate_upper_f32(gate3, gate_up_limit)
+                            up0 = clamp_symmetric_f32(up0, gate_up_limit)
+                            up1 = clamp_symmetric_f32(up1, gate_up_limit)
+                            up2 = clamp_symmetric_f32(up2, gate_up_limit)
+                            up3 = clamp_symmetric_f32(up3, gate_up_limit)
+                        val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val1 = acc0[3] * gate1 * cute.arch.rcp_approx(
+                        val1 = up1 * gate1 * cute.arch.rcp_approx(
                             cute.math.exp2(gate1 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val2 = acc1[2] * gate2 * cute.arch.rcp_approx(
+                        val2 = up2 * gate2 * cute.arch.rcp_approx(
                             cute.math.exp2(gate2 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val3 = acc1[3] * gate3 * cute.arch.rcp_approx(
+                        val3 = up3 * gate3 * cute.arch.rcp_approx(
                             cute.math.exp2(gate3 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
@@ -4771,6 +4787,8 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     if cutlass.const_expr(self.fc1_output_dtype == cutlass.Float8E5M2):
                         rcp_limit = Fp8E5M2RcpLimit
                     q_limit = cutlass.Float32(1.0 / rcp_limit)
+                    if cutlass.const_expr(self.gate_up_clamp is not None):
+                        gate_up_limit = cutlass.Float32(self.gate_up_clamp)
 
                     for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
                         acc0 = accumulators[None, None, ng_pair * 2]
@@ -4794,6 +4812,15 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         up1 = acc0[3]
                         up2 = acc1[2]
                         up3 = acc1[3]
+                        if cutlass.const_expr(self.gate_up_clamp is not None):
+                            gate0 = clamp_gate_upper_f32(gate0, gate_up_limit)
+                            gate1 = clamp_gate_upper_f32(gate1, gate_up_limit)
+                            gate2 = clamp_gate_upper_f32(gate2, gate_up_limit)
+                            gate3 = clamp_gate_upper_f32(gate3, gate_up_limit)
+                            up0 = clamp_symmetric_f32(up0, gate_up_limit)
+                            up1 = clamp_symmetric_f32(up1, gate_up_limit)
+                            up2 = clamp_symmetric_f32(up2, gate_up_limit)
+                            up3 = clamp_symmetric_f32(up3, gate_up_limit)
                         val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)

@@ -23,9 +23,9 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump for every generated-kernel code path or opaque workspace change. This
-# revision separates the restored N32/N64/N128 SFB fast selector and the exact
-# N16 slot-0/fallback lowering from previously cached graph/kernel bundles.
-KERNEL_CACHE_ABI = 6
+# revision applies gate_up_clamp in the SM120 K1 epilogue; older cached
+# kernels accepted the parameter but performed unclamped SwiGLU.
+KERNEL_CACHE_ABI = 7
 
 
 @dataclass(frozen=True)
