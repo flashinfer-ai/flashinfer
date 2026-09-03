@@ -32,12 +32,13 @@ collision symbols carry a ``__<family>`` suffix.
 Provenance: ported near-verbatim from TensorRT-LLM
 ``tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py``
 (PR NVIDIA/TensorRT-LLM#17821, commit ed94d4cfbf), plus two register-family
-fixes ported verbatim into ``GvrTopkRegKernel.kern``: PR
-NVIDIA/TensorRT-LLM#18501 (count-crossing enforcement when the histogram
-total never reaches k, radix-descent escape, -inf fill-lane bound) and PR
-NVIDIA/TensorRT-LLM#18625 (an infinite bracket width from an in-window +inf
-fails the collapse guard and takes the key-space escape instead of folding
-the row into bin 0 and dropping the +inf).  FlashInfer-local changes: module
+fixes ported verbatim: PR NVIDIA/TensorRT-LLM#18501 (``GvrTopkRegKernel.kern``:
+count-crossing enforcement when the histogram total never reaches k,
+radix-descent escape, -inf fill-lane bound) and PR NVIDIA/TensorRT-LLM#18625
+(an infinite bracket width from a sampled +inf fails the collapse guard;
+``GvrTopkRegKernel.kern`` then takes the key-space escape and
+``GvrRegClusKernel.kern`` the whole-row ``degen`` fallback, instead of the
+collapsed histogram dropping the +inf).  FlashInfer-local changes: module
 rename, this note, the ``_persist`` hook that routes the four
 ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
@@ -6198,10 +6199,13 @@ class GvrRegClusKernel:
             Tv = invkey(lmin)
             GMAX = invkey(lmax)
 
-            # ---- collapse guard, NaN-safe
+            # ---- collapse guard, NaN-safe. Reject infinite width as well:
+            # otherwise SC becomes zero and can collapse +inf into a finite
+            # histogram bin.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
-                if (GMAX - Tv) > cutlass.Float32(1e-30):
+                w_ = GMAX - Tv
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -6262,6 +6266,12 @@ class GvrRegClusKernel:
                 whole = cutlass.Int32(1)
             degen = cutlass.Int32(0)
             if m > cutlass.Int32(CS * CMPC):
+                degen = cutlass.Int32(1)
+            # The sentinel bracket also has infinite width. Bypass its
+            # collapsed histogram and enter the exact whole-row key-space
+            # fallback on rank 0, where fkey(+inf) is the maximum key.
+            if okc == cutlass.Int32(0):
+                whole = cutlass.Int32(0)
                 degen = cutlass.Int32(1)
             for z in cutlass.range_constexpr(NB__regclus // self.blk):
                 i = tid + cutlass.Int32(z * self.blk)

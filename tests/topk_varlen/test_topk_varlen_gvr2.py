@@ -737,8 +737,8 @@ def _adversarial_logits(pattern, rows, N, top_k, gen):
         return x
     if pattern == "huge_flood_gt_k":
         # near-FLT_MAX flood (3.1e38 > the kernel's 3e38 pad sentinel):
-        # more huge values than slots. Literal +inf is NOT used here — the
-        # upstream kernel drops +inf (see test_gvr2_plus_inf_upstream_caveat).
+        # more huge values than slots. Literal +inf is covered separately by
+        # test_gvr2_posinf_completeness / test_gvr2_posinf_reg_clus.
         x = torch.randn(rows, N, generator=gen, device=_DEV)
         n_huge = top_k + top_k // 2
         for r in range(rows):
@@ -900,29 +900,73 @@ def test_gvr2_posinf_completeness(n_valid, top_k, positions):
 
 
 @requires_gvr2
-@pytest.mark.xfail(
-    reason="UPSTREAM CAVEAT: the clustered-register family (GvrRegClusKernel) "
-    "still drops literal +inf logits. TRT-LLM PR #18625 fixed the register "
-    "family (ported here; see test_gvr2_posinf_completeness) but left reg_clus "
-    "with the same collapsing bracket; tracked in DKG issue #58. All finite "
-    "values — including 3.1e38 > the 3e38 pad sentinel — and -inf are "
-    "tie-aware exact (covered by test_gvr2_adversarial_patterns).",
-    strict=True,  # deterministic: fixed shape, seed and family on B100/B200/Rubin
+@pytest.mark.parametrize(
+    "batch,n_valid,mode",
+    [
+        (4, 32768, "in_sample"),  # +inf among the first K columns (hint-free sample)
+        (4, 32768, "out_of_sample"),  # +inf at column 30000
+        (4, 65536, "in_sample"),  # crossing bin > CS*CMPC: degen path already exact
+        (4, 32768, "quarter_random"),  # K/4 random +inf per row, random hint
+    ],
+    ids=["in_sample_32k", "out_of_sample_32k", "in_sample_64k", "quarter_random_32k"],
 )
-def test_gvr2_plus_inf_upstream_caveat():
-    n_valid, batch, top_k = 32768, 4, 1024
-    gen = torch.Generator(device=_DEV).manual_seed(1000)
-    logits = torch.randn(batch, n_valid, generator=gen, device=_DEV)
-    for r in range(batch):
-        pos = torch.randperm(n_valid, generator=gen, device=_DEV)[: top_k // 4]
-        logits[r, pos] = float("inf")
+def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
+    """Port of TRT-LLM PR #18625's second commit (clustered-register family,
+    DKG issue #58): a sampled +inf made the reg_clus bracket width infinite,
+    the pre-fix guard accepted it, the classify scale became 0, every finite
+    value landed in bin 1 and the +inf became NaN in the trash bin and was
+    never staged, so the output was the true top-K with the +inf replaced by
+    the (K+1)-th value (all slots valid). Rows above CS*CMPC = 32K columns took
+    the whole-row ``degen`` path and were already exact; the fix routes an
+    infinite-width bracket there too. With a hint the +inf is in the sample
+    (oracle) or the sentinel bracket is installed (-1), so every variant must
+    now be exact for both hints. 4 x 32K, K=1024 is the reg_clus route."""
+    top_k = 1024
+    gen = torch.Generator(device=_DEV).manual_seed(n_valid + batch)
+    logits = torch.randn(batch, n_valid, generator=gen, device=_DEV) * 2.0
+    if mode == "quarter_random":
+        for r in range(batch):
+            pos = torch.randperm(n_valid, generator=gen, device=_DEV)[: top_k // 4]
+            logits[r, pos] = float("inf")
+    else:
+        logits[:, 1000 if mode == "in_sample" else 30000] = float("inf")
+    n_inf = int(torch.isinf(logits[0]).sum())
     seq_lens = torch.full((batch,), n_valid, dtype=torch.int32, device=_DEV)
-    pre_idx = torch.randint(
-        0, n_valid, (batch, top_k), generator=gen, device=_DEV, dtype=torch.int32
-    )
-    indices, _ = _run_gvr2(logits, seq_lens, top_k, pre_idx)
-    got_inf = torch.isinf(logits.gather(1, indices.long().clamp_min(0)))
-    assert int(got_inf.sum()) == batch * (top_k // 4), "+inf logits were dropped"
+    ref = torch.sort(
+        torch.topk(logits, top_k, dim=1).values, dim=1, descending=True
+    ).values
+    hints = [
+        torch.topk(logits, top_k, dim=1).indices.int().contiguous(),
+        torch.full((batch, top_k), -1, dtype=torch.int32, device=_DEV),
+    ]
+    if mode == "quarter_random":
+        hints.append(
+            torch.randint(
+                0,
+                n_valid,
+                (batch, top_k),
+                generator=gen,
+                device=_DEV,
+                dtype=torch.int32,
+            )
+        )
+    for pre_idx in hints:
+        out = torch.full((batch, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        torch.cuda.synchronize()
+        assert int((out == -7).sum()) == 0, "unwritten output slots"
+        assert bool(((out >= 0) & (out < n_valid)).all()), "index out of range"
+        for r in range(batch):
+            assert torch.unique(out[r]).numel() == top_k, (
+                f"duplicate indices in row {r}"
+            )
+        sel = logits.gather(1, out.long())
+        assert torch.equal(
+            torch.isinf(sel).sum(dim=1),
+            torch.full((batch,), min(top_k, n_inf), device=_DEV),
+        ), "+inf dropped from the top-k"
+        got = torch.sort(sel, dim=1, descending=True).values
+        assert torch.equal(got, ref), "selected value multiset differs from torch.topk"
 
 
 # ---------------------------------------------------------------------------

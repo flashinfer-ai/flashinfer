@@ -1458,13 +1458,10 @@ def top_k_varlen(
                               geometry with one eager call before capture
                               (an uncompiled launcher raises loudly under
                               capture); replays may change ``seq_lens``
-                              CONTENTS freely in either direction. Upstream
-                              caveat (reproduced
-                              bit-identically by the TRT-LLM implementation):
-                              literal ``+inf`` logits may not be selected;
-                              all finite values and ``-inf`` are tie-aware
-                              exact, and NaN ordering is
-                              implementation-specific.
+                              CONTENTS freely in either direction. All finite
+                              values, ``+inf`` and ``-inf`` are tie-aware
+                              exact (TRT-LLM #18501/#18625 ported); NaN
+                              ordering is implementation-specific.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
                               ``pre_idx`` needed).
         ``"radix_filter"``  — DKG filtered-radix top-K (coarse histogram →
