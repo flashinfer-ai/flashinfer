@@ -123,5 +123,8 @@ Executed-volume cut on the shards: 1,398 → 201 (−86%).
 
 ## Follow-ups
 
+- `num_fused_shared_experts > 0` with routing replay is covered in the
+  fused-MoE tests, not here: the standalone harness would first need to build
+  fused-shared weight rows.
 - The from-logits grids could thin further once an fp8-per-tensor routed entry
   point exists; it currently has no pre-routed counterpart.
