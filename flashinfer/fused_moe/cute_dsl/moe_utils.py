@@ -544,8 +544,8 @@ def moe_sort(
     Sort tokens by expert assignment and generate mapping tensors.
 
     This function performs token sorting and index mapping computation required
-    for grouped GEMM operations in MoE. It uses the same algorithm as TRT-LLM's
-    moe_sort with DeepSeekV3 routing method.
+    for grouped GEMM operations in MoE. It uses TRT-LLM Gen's shared post-TopK
+    routing pipeline.
 
     Note: This function does NOT physically reorder data - use moe_permute() for that.
 
