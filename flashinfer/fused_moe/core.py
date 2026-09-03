@@ -410,6 +410,14 @@ def _round_up(value: int, alignment: int) -> int:
 def _infer_trtllm_moe_output_hidden_size(
     hidden_size: int, valid_hidden_size: Optional[int]
 ) -> int:
+    """GEMM2's N, i.e. the width of the rows GEMM2 computes.
+
+    This is *not* the width of the tensor handed back to the caller -- see
+    :func:`_trtllm_moe_output_width`. It mirrors ``args.output_hidden_size`` in
+    TensorRT-LLM's ``mxFp4BlockScaleMoe.cpp`` / ``fp4BlockScaleMoe.cpp`` and is
+    what the FC2 weights / biases / weight scales are sized against, so it is
+    still the value the tactic enumeration must key on.
+    """
     if valid_hidden_size is None:
         return hidden_size
     if valid_hidden_size <= 0:
@@ -425,22 +433,54 @@ def _infer_trtllm_moe_output_hidden_size(
     return output_hidden_size
 
 
+def _trtllm_moe_output_width(hidden_size: int, valid_hidden_size: Optional[int]) -> int:
+    """The caller-visible width of the finalized MoE output row.
+
+    Matches TensorRT-LLM exactly: the returned tensor is ``valid_hidden_size``
+    wide whenever the caller declares a valid (unpadded) hidden dimension, and
+    the padded ``hidden_size`` otherwise. GEMM2 still computes the wider
+    ``roundUp(valid_hidden_size, 128)`` columns (see
+    :func:`_infer_trtllm_moe_output_hidden_size`) because that is how the FC2
+    weights are laid out, but finalize writes only the leading
+    ``valid_hidden_size`` of them. Because the buffer is allocated exactly that
+    wide, the columns ``[valid_hidden_size, roundUp(valid_hidden_size, 128))``
+    that finalize does not write are never part of the returned tensor, so no
+    uninitialized memory can reach the caller.
+    """
+    return hidden_size if valid_hidden_size is None else valid_hidden_size
+
+
 def _check_valid_hidden_size_supports_finalize(
-    valid_hidden_size: Optional[int], do_finalize: bool
+    valid_hidden_size: Optional[int], do_finalize: bool, hidden_size: int
 ) -> None:
     """Reject the unsupported ``valid_hidden_size`` + ``do_finalize=False`` combo.
 
-    Without finalization there is no finalized output row to narrow, so the
-    launcher falls back to the padded hidden size and the C++ dimension check
-    would otherwise fail with a message about the output width being wrong.
+    With ``do_finalize=False`` the caller receives GEMM2's unfinalized rows
+    directly; there is no finalize pass to narrow them from GEMM2's N
+    (``roundUp(valid_hidden_size, 128)``) down to ``valid_hidden_size``, and the
+    launcher has no finalized output tensor to read the width from -- it falls
+    back to the padded ``hidden_size``. That is only self-consistent when the
+    round-up lands back on ``hidden_size``; then the unfinalized rows have
+    exactly the width they would have had without valid dims and the request is
+    honoured. Otherwise the widths disagree, so reject it.
     """
-    if valid_hidden_size is not None and not do_finalize:
-        raise ValueError(
-            "valid_hidden_size is not supported with do_finalize=False: the "
-            "unfinalized expert output keeps the padded hidden size, so the "
-            "valid (unpadded) hidden dimension cannot be applied. Pass "
-            "do_finalize=True or drop valid_hidden_size."
-        )
+    if valid_hidden_size is None or do_finalize:
+        return
+    output_hidden_size = _round_up(
+        valid_hidden_size, _TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT
+    )
+    if output_hidden_size == hidden_size:
+        return
+    raise ValueError(
+        "valid_hidden_size is not supported with do_finalize=False unless "
+        f"roundUp(valid_hidden_size, {_TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT}) "
+        f"== hidden_size: the unfinalized expert output keeps the padded "
+        f"hidden size, so the valid (unpadded) hidden dimension cannot be "
+        f"applied. Got roundUp({valid_hidden_size}, "
+        f"{_TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT})={output_hidden_size} vs "
+        f"hidden_size={hidden_size}. Pass do_finalize=True or drop "
+        "valid_hidden_size."
+    )
 
 
 @functools.cache
@@ -1761,6 +1801,7 @@ def _fake_trtllm_moe_output(
     hidden_states: torch.Tensor,
     *,
     hidden_size: int,
+    finalized_hidden_size: Optional[int] = None,
     intermediate_size: int,
     top_k: int,
     do_finalize: bool,
@@ -1769,14 +1810,22 @@ def _fake_trtllm_moe_output(
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     num_fused_shared_experts: int = 0,
 ) -> List[torch.Tensor]:
-    """Model the native TRTLLM MoE result contract for FakeTensor tracing."""
+    """Model the native TRTLLM MoE result contract for FakeTensor tracing.
+
+    ``hidden_size`` is GEMM2's N, i.e. the width of the unfinalized expert rows.
+    ``finalized_hidden_size`` is the narrower caller-visible width of the
+    finalized output (``valid_hidden_size`` when declared); it defaults to
+    ``hidden_size``, which is the case whenever no valid dims were supplied.
+    """
     num_tokens = hidden_states.shape[0]
+    if finalized_hidden_size is None:
+        finalized_hidden_size = hidden_size
     if do_finalize:
         finalized = (
             output
-            if output is not None and output.shape[1] == hidden_size
+            if output is not None and output.shape[1] == finalized_hidden_size
             else hidden_states.new_empty(
-                (num_tokens, hidden_size), dtype=torch.bfloat16
+                (num_tokens, finalized_hidden_size), dtype=torch.bfloat16
             )
         )
         if gemm1_lora_delta is None:
@@ -3760,14 +3809,20 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
+        # GEMM2's N (what the FC2 weights are sized for) and the narrower
+        # caller-visible output width. They differ exactly when valid_hidden_size
+        # is not 128-aligned; matching TRT-LLM, the caller sees valid_hidden_size.
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
-        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
+        output_width = _trtllm_moe_output_width(hidden_size, valid_hidden_size)
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
 
         if output is None:
             output = _alloc_trtllm_moe_output(
-                num_tokens, output_hidden_size, do_finalize, hidden_states.device
+                num_tokens, output_width, do_finalize, hidden_states.device
             )
         elif do_finalize:
             check_shape_dtype_device(
@@ -3783,11 +3838,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             assert output.shape[1] <= hidden_size, (
                 f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
             )
-            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+            if valid_hidden_size is not None and output.shape[1] != valid_hidden_size:
                 raise ValueError(
-                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
-                    f"when valid_hidden_size is provided, got {output.shape[1]} "
-                    f"vs {output_hidden_size}"
+                    "output.shape[1] must equal valid_hidden_size="
+                    f"{valid_hidden_size} when valid_hidden_size is provided, "
+                    f"got {output.shape[1]}"
                 )
 
         if routing_logits is not None:
@@ -4050,13 +4105,20 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
-        # The finalized row width is roundUp(valid_hidden_size, 128) when the caller
-        # declares a valid (unpadded) hidden dimension, and the padded hidden size
-        # otherwise.
+        # GEMM2 computes roundUp(valid_hidden_size, 128) columns, but finalize hands
+        # back only the leading valid_hidden_size of them -- mirror the eager op so
+        # torch.compile sees the same output shape.
+        hidden_size = hidden_states.shape[1]
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
         return _fake_trtllm_moe_output(
             hidden_states,
             hidden_size=_infer_trtllm_moe_output_hidden_size(
-                hidden_states.shape[1], valid_hidden_size
+                hidden_size, valid_hidden_size
+            ),
+            finalized_hidden_size=_trtllm_moe_output_width(
+                hidden_size, valid_hidden_size
             ),
             intermediate_size=intermediate_size,
             top_k=top_k,
@@ -4130,10 +4192,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
+        # GEMM2's N (what the FC2 weights are sized for) and the narrower
+        # caller-visible output width. They differ exactly when valid_hidden_size
+        # is not 128-aligned; matching TRT-LLM, the caller sees valid_hidden_size.
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
-        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
+        output_width = _trtllm_moe_output_width(hidden_size, valid_hidden_size)
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
 
         # workspace buffers required by trtllm-gen
         # For Mode 3 (UnpackedPrecomputed), topk_ids and topk_weights are user-provided INPUTS
@@ -4178,7 +4246,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
-                num_tokens, output_hidden_size, do_finalize, hidden_states.device
+                num_tokens, output_width, do_finalize, hidden_states.device
             )
         elif do_finalize:
             check_shape_dtype_device(
@@ -4190,11 +4258,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             assert output.shape[1] <= hidden_size, (
                 f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
             )
-            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+            if valid_hidden_size is not None and output.shape[1] != valid_hidden_size:
                 raise ValueError(
-                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
-                    f"when valid_hidden_size is provided, got {output.shape[1]} "
-                    f"vs {output_hidden_size}"
+                    "output.shape[1] must equal valid_hidden_size="
+                    f"{valid_hidden_size} when valid_hidden_size is provided, "
+                    f"got {output.shape[1]}"
                 )
 
         tuner = AutoTuner.get()
@@ -4440,13 +4508,23 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
-        # ``gemm2_weights.shape[1]`` is already the GEMM2 output width; when the caller
-        # declares a valid (unpadded) hidden dimension it must equal
-        # roundUp(valid_hidden_size, 128), which is what the launcher enforces.
+        # Derive the padded hidden size exactly as the eager op does (NVFP4
+        # activations arrive uint8-packed, two values per byte); GEMM2 then computes
+        # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
+        # leading valid_hidden_size, so torch.compile sees the eager output shape.
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
         return _fake_trtllm_moe_output(
             hidden_states,
             hidden_size=_infer_trtllm_moe_output_hidden_size(
-                gemm2_weights.shape[1], valid_hidden_size
+                hidden_size, valid_hidden_size
+            ),
+            finalized_hidden_size=_trtllm_moe_output_width(
+                hidden_size, valid_hidden_size
             ),
             intermediate_size=intermediate_size,
             top_k=top_k,
@@ -4500,10 +4578,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
+        # GEMM2's N (what the FC2 weights are sized for) and the narrower
+        # caller-visible output width. They differ exactly when valid_hidden_size
+        # is not 128-aligned; matching TRT-LLM, the caller sees valid_hidden_size.
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
-        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
+        output_width = _trtllm_moe_output_width(hidden_size, valid_hidden_size)
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
 
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
@@ -4527,7 +4611,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
-                num_tokens, output_hidden_size, do_finalize, hidden_states.device
+                num_tokens, output_width, do_finalize, hidden_states.device
             )
         else:
             check_shape_dtype_device(
@@ -4539,11 +4623,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             assert output.shape[1] <= hidden_size, (
                 f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
             )
-            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+            if (
+                do_finalize
+                and valid_hidden_size is not None
+                and output.shape[1] != valid_hidden_size
+            ):
                 raise ValueError(
-                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
-                    f"when valid_hidden_size is provided, got {output.shape[1]} "
-                    f"vs {output_hidden_size}"
+                    "output.shape[1] must equal valid_hidden_size="
+                    f"{valid_hidden_size} when valid_hidden_size is provided, "
+                    f"got {output.shape[1]}"
                 )
 
         tuner = AutoTuner.get()
@@ -4753,13 +4841,22 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out, valid_intermediate_size
-        # The finalized row width is roundUp(valid_hidden_size, 128) when the caller
-        # declares a valid (unpadded) hidden dimension, and the padded hidden size
-        # otherwise.
+        # Derive the padded hidden size exactly as the eager op does; GEMM2 then
+        # computes roundUp(valid_hidden_size, 128) columns while finalize hands back
+        # only the leading valid_hidden_size, so torch.compile sees the eager shape.
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, do_finalize, hidden_size
+        )
         return _fake_trtllm_moe_output(
             hidden_states,
             hidden_size=_infer_trtllm_moe_output_hidden_size(
-                hidden_states.shape[1], valid_hidden_size
+                hidden_size, valid_hidden_size
+            ),
+            finalized_hidden_size=_trtllm_moe_output_width(
+                hidden_size, valid_hidden_size
             ),
             intermediate_size=intermediate_size,
             top_k=top_k,
@@ -6501,8 +6598,12 @@ def trtllm_fp8_block_scale_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
@@ -6760,8 +6861,12 @@ def trtllm_fp8_block_scale_routed_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
@@ -7002,8 +7107,12 @@ def trtllm_fp4_block_scale_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
@@ -7246,8 +7355,12 @@ def trtllm_fp4_block_scale_routed_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
@@ -7444,8 +7557,12 @@ def trtllm_mxint4_block_scale_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
@@ -7606,8 +7723,12 @@ def trtllm_mxint4_block_scale_routed_moe(
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
-        region is contracted; the finalized output width is
-        ``roundUp(valid_hidden_size, 128)``.  Default ``None``
+        region is contracted.  Matching TensorRT-LLM, the returned tensor is
+        exactly ``valid_hidden_size`` wide: GEMM2 computes
+        ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
+        weights, weight scales and bias are sized for) and finalize writes only
+        the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
+        must therefore have ``valid_hidden_size`` columns.  Default ``None``
         (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,

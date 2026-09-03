@@ -73,21 +73,67 @@ int32_t checked_valid_dim(Optional<int64_t> dim, int32_t padded_dim, char const*
   return static_cast<int32_t>(value);
 }
 
-void set_valid_moe_dims(MoERunnerArgs& args, Optional<int64_t> valid_hidden_size,
+// Resolves args.hidden_size_output, i.e. GEMM2's N, matching TensorRT-LLM's
+// `args.output_hidden_size` (mxFp4BlockScaleMoe.cpp / fp4BlockScaleMoe.cpp):
+//
+//   output_hidden_size = valid_hidden_size ? roundUp(valid_hidden_size, 128) : hidden_size
+//
+// With valid dims the FC2 weights are laid out at roundUp(valid_hidden_size, 128), so GEMM2 must be
+// that wide no matter how narrow the caller-visible output is; finalize then writes only the first
+// valid_hidden_size of those columns into the caller's buffer. Deriving this from
+// valid_hidden_size rather than from the output width is what lets the output be exactly
+// valid_hidden_size wide (TRT-LLM's contract) instead of the rounded-up width.
+//
+// Without valid dims this keeps FlashInfer's pre-existing narrow-output behaviour:
+// hidden_size_output is the caller output width and finalize truncates the full-width GEMM2 result
+// down to it (see gemm2_output_hidden_size(), which keeps GEMM2's N at hidden_size in that case).
+//
+// `output_hidden_width` is output.size(1); it is 0 for the zero-width placeholder handed down with
+// do_finalize=false, in which case there is no finalized output and we fall back to the padded
+// hidden size.
+int32_t moe_hidden_size_output(int64_t output_hidden_width, int32_t hidden_size,
+                               Optional<int64_t> valid_hidden_size) {
+  if (valid_hidden_size.has_value()) {
+    auto const valid_hidden =
+        checked_valid_dim(valid_hidden_size, hidden_size, "valid_hidden_size");
+    return round_up_int32(valid_hidden, kTrtllmMoeOutputHiddenAlignment);
+  }
+  return output_hidden_width > 0 ? static_cast<int32_t>(output_hidden_width) : hidden_size;
+}
+
+// Validates the caller's valid_* dims and records them on `args`.
+//
+// Must run after args.hidden_size / args.intermediate_size are set. It does NOT read or write
+// args.hidden_size_output: that is resolved independently by moe_hidden_size_output() from the same
+// valid_hidden_size, so the two are order-independent.
+//
+// The contract matches TensorRT-LLM's (mxFp4BlockScaleMoe.cpp:454, :461): the caller-visible output
+// is exactly valid_hidden_size wide while GEMM2 computes roundUp(valid_hidden_size, 128) columns
+// into the internal gemm2_output buffer. Because the caller's buffer is only valid_hidden_size
+// wide, finalize fills all of it and the columns [valid_hidden_size, roundUp(valid_hidden_size,
+// 128)) stay inside the internal buffer -- they can never surface as uninitialized memory to the
+// caller.
+//
+// `output_hidden_width` is output.size(1), or 0 for the do_finalize=false placeholder, which has no
+// finalized width to check.
+void set_valid_moe_dims(MoERunnerArgs& args, int64_t output_hidden_width,
+                        Optional<int64_t> valid_hidden_size,
                         Optional<int64_t> valid_intermediate_size) {
   if (valid_hidden_size.has_value()) {
     auto const valid_hidden =
         checked_valid_dim(valid_hidden_size, args.hidden_size, "valid_hidden_size");
-    auto const hidden_size_output = args.hidden_size_output.value_or(args.hidden_size);
-    TVM_FFI_ICHECK(valid_hidden <= hidden_size_output)
-        << "valid_hidden_size=" << valid_hidden << " must be <= output hidden dimension "
-        << hidden_size_output;
-    auto const expected_hidden_size_output =
-        round_up_int32(valid_hidden, kTrtllmMoeOutputHiddenAlignment);
-    TVM_FFI_ICHECK_EQ(hidden_size_output, expected_hidden_size_output)
-        << "output hidden dimension must equal roundUp(valid_hidden_size, "
-        << kTrtllmMoeOutputHiddenAlignment << ") when valid_hidden_size is provided, got "
-        << hidden_size_output << " vs " << expected_hidden_size_output;
+    auto const gemm2_n = round_up_int32(valid_hidden, kTrtllmMoeOutputHiddenAlignment);
+    TVM_FFI_ICHECK(gemm2_n <= args.hidden_size)
+        << "roundUp(valid_hidden_size, " << kTrtllmMoeOutputHiddenAlignment << ")=" << gemm2_n
+        << " must be <= padded hidden_size " << args.hidden_size;
+    // Only the finalized output has the valid_hidden_size width. With do_finalize=false the caller
+    // receives GEMM2's unfinalized rows, whose width is GEMM2's N -- so constraining the buffer to
+    // valid_hidden_size there would reject calls the Python layer deliberately accepts.
+    if (args.do_finalize && output_hidden_width > 0) {
+      TVM_FFI_ICHECK_EQ(output_hidden_width, static_cast<int64_t>(valid_hidden))
+          << "output hidden dimension must equal valid_hidden_size when it is provided, got "
+          << output_hidden_width << " vs " << valid_hidden;
+    }
     args.valid_hidden_size = valid_hidden;
   }
   if (valid_intermediate_size.has_value()) {
@@ -1239,6 +1285,10 @@ class FusedMoeLauncher {
   // them a caller may hand in an `output` narrower than hidden_size (the pre-existing NVFP4
   // contract) while the FC2 weights still describe the full padded hidden_size, so GEMM2 keeps
   // the full N there and finalize truncates instead. Tactic selection must use the same value.
+  //
+  // With valid dims this is roundUp(valid_hidden_size, 128) -- see moe_hidden_size_output() -- and
+  // is deliberately WIDER than the caller-visible output (valid_hidden_size). GPT-OSS: 2944 here,
+  // 2880 output width.
   int32_t gemm2_output_hidden_size() const {
     return args->valid_hidden_size.has_value()
                ? args->hidden_size_output.value_or(args->hidden_size)
@@ -1260,10 +1310,19 @@ class FusedMoeLauncher {
     int64_t Mn = 0, K = 0;
     if (weight_layout == batchedGemm::gemm::MatrixLayout::MajorK) {
       // MajorK [num_experts, M, K]
+      // Check the rank before indexing: a mis-shaped tensor must raise this error rather than an
+      // out-of-range size() access.
+      TVM_FFI_ICHECK_EQ(weights.ndim(), 3)
+          << which_weights << " weights must be 3D [num_experts, M, K] for MajorK layout, got "
+          << weights.ndim() << "D.";
       Mn = weights.size(1);
       K = weights.size(2);
     } else if (weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK) {
       // BlockMajorK [num_experts, K/block_k, M, block_k]
+      TVM_FFI_ICHECK_EQ(weights.ndim(), 4)
+          << which_weights
+          << " weights must be 4D [num_experts, K/block_k, M, block_k] for BlockMajorK layout, got "
+          << weights.ndim() << "D.";
       Mn = weights.size(2);
       int64_t block_k = weights.size(3);
       K = weights.size(1) * block_k;
@@ -1286,8 +1345,10 @@ class FusedMoeLauncher {
             << which_weights << " weights K dimension must be equal to hidden_size.";
       }
     } else if (which_weights == "gemm2") {
-      // The FC2 weights are laid out for GEMM2's N, which is not always hidden_size_output;
-      // see gemm2_output_hidden_size().
+      // The FC2 weights are laid out for GEMM2's N -- roundUp(valid_hidden_size, 128) when valid
+      // dims are given -- NOT for the (narrower) caller output width; see
+      // gemm2_output_hidden_size(). Comparing against the output width instead would reject
+      // correctly shaped GPT-OSS weights (2944 vs 2880).
       TVM_FFI_ICHECK_EQ(Mn, gemm2_output_hidden_size())
           << which_weights << " weights M dimension must be equal to GEMM2's output hidden size.";
       // GEMM2 always consumes the post-activation hidden of size intermediate_size.
@@ -4226,9 +4287,11 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     args->num_experts = num_experts;
     args->num_fused_shared_experts = nFusedShared;
     args->hidden_size = hidden_size;
-    // With do_finalize=false the caller hands down a zero-width placeholder output, so fall
-    // back to the padded hidden size (same guard as trtllm_fp4_block_scale_moe).
-    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : args->hidden_size;
+    // GEMM2's N: roundUp(valid_hidden_size, 128) when valid dims are given (the caller-visible
+    // output is narrower), otherwise the caller output width, falling back to the padded hidden
+    // size for the zero-width do_finalize=false placeholder. See moe_hidden_size_output().
+    args->hidden_size_output =
+        moe_hidden_size_output(output.size(1), args->hidden_size, valid_hidden_size);
     args->top_k = top_k;
     args->n_group = n_group.value_or(0);
     args->topk_group = topk_group.value_or(0);
@@ -4239,7 +4302,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
-    set_valid_moe_dims(*args, valid_hidden_size, valid_intermediate_size);
+    set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
@@ -4417,10 +4480,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->num_experts = num_experts;
     // For E2m1, hidden_size is already multiplied by 2 above, so use it directly
     args->hidden_size = hidden_size;
-    // With do_finalize=false the caller hands down a zero-width placeholder output, so fall
-    // back to the padded hidden size. The output is bf16 (never fp4-packed), so the fallback
-    // must not be halved.
-    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : args->hidden_size;
+    // GEMM2's N: roundUp(valid_hidden_size, 128) when valid dims are given (the caller-visible
+    // output is narrower), otherwise the caller output width, falling back to the padded hidden
+    // size for the zero-width do_finalize=false placeholder. The output is bf16 (never fp4-packed),
+    // so that fallback must not be halved. See moe_hidden_size_output().
+    args->hidden_size_output =
+        moe_hidden_size_output(output.size(1), args->hidden_size, valid_hidden_size);
     args->top_k = top_k;
     args->num_fused_shared_experts = nFusedShared;
     args->n_group = n_group.value_or(0);
@@ -4432,7 +4497,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
-    set_valid_moe_dims(*args, valid_hidden_size, valid_intermediate_size);
+    set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
     // gemm1_bias and gemm1_lora_delta are mutually exclusive
     auto const& gemm1_bias_effective = gemm1_lora_delta.has_value() ? gemm1_lora_delta : gemm1_bias;
@@ -4555,9 +4620,11 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     args->num_experts = num_experts;
     // For E2m1, hidden_size is already multiplied by 2 above, so use it directly
     args->hidden_size = hidden_size;
-    // With do_finalize=false the caller hands down a zero-width placeholder output, so fall
-    // back to the padded hidden size (same guard as trtllm_fp4_block_scale_moe).
-    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : args->hidden_size;
+    // GEMM2's N: roundUp(valid_hidden_size, 128) when valid dims are given (the caller-visible
+    // output is narrower), otherwise the caller output width, falling back to the padded hidden
+    // size for the zero-width do_finalize=false placeholder. See moe_hidden_size_output().
+    args->hidden_size_output =
+        moe_hidden_size_output(output.size(1), args->hidden_size, valid_hidden_size);
     args->top_k = top_k;
     args->n_group = n_group.value_or(0);
     args->topk_group = topk_group.value_or(0);
@@ -4568,7 +4635,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
-    set_valid_moe_dims(*args, valid_hidden_size, valid_intermediate_size);
+    set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<MxInt4BlockScaleLauncher>(

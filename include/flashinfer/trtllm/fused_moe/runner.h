@@ -344,9 +344,20 @@ struct MoERunnerArgs {
   int32_t num_fused_shared_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
-  // Hidden dimension output of MoE block. This is the full GEMM2 N dimension and
-  // final output row width; it may differ from the padded input hidden size.
-  // If not provided, it is the same as hidden_size.
+  // Hidden dimension output of MoE block, i.e. GEMM2's N dimension and the row stride of the
+  // gemm2_output workspace. If not provided, it is the same as hidden_size.
+  //
+  // Once valid dims are in play there are three distinct hidden widths (GPT-OSS values in
+  // brackets), so do not conflate them:
+  //   - hidden_size [3072]: the padded *input* row width, i.e. GEMM1's K.
+  //   - hidden_size_output [2944]: GEMM2's N. With valid dims the caller must set it to
+  //     roundUp(valid_hidden_size, 128) -- the width the FC2 weights and biases are laid out for
+  //     (TRT-LLM's args.output_hidden_size). Without valid dims GEMM2 keeps the full hidden_size N
+  //     and hidden_size_output is instead the width finalize truncates its output rows to.
+  //     See getGemm2OutputHiddenSize() in csrc/trtllm_fused_moe_runner.cu.
+  //   - the `output` row width [2880]: valid_hidden_size when supplied, else hidden_size_output.
+  //     Only finalize sees it; it writes exactly that many of GEMM2's columns, so the caller never
+  //     receives uninitialized columns.
   std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};

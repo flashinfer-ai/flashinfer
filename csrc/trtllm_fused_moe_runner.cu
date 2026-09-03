@@ -401,6 +401,10 @@ namespace {
 // contract), while the weights still describe the full padded hidden_size. Shrinking N there would
 // reinterpret a row-shuffled weight matrix as having fewer rows -- a scrambled subset, not a
 // prefix -- so GEMM2 keeps the full N and finalize truncates the rows instead.
+//
+// With valid dims hidden_size_output is roundUp(valid_hidden_size, 128) (the launcher computes it,
+// matching TRT-LLM's args.output_hidden_size), which is *not* the caller-visible output row width:
+// that one is valid_hidden_size, and only finalize sees it. See setOpsData.
 int32_t getGemm2OutputHiddenSize(MoERunnerArgs const& args) {
   return args.valid_hidden_size.has_value() ? args.hidden_size_output.value_or(args.hidden_size)
                                             : args.hidden_size;
@@ -509,26 +513,48 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.numTokens = args.num_tokens;
     finalizeData.numExperts = totalNumExperts;
     finalizeData.topK = totalExpertsPerToken;
-    // Fuse unpadding into finalize: hiddenDim is the logical output width, while
-    // hiddenDimPadded remains the full GEMM2 output stride.
+    // Fuse unpadding into finalize: hiddenDim is the caller-visible `output` row width, while
+    // hiddenDimPadded is GEMM2's row stride, i.e. its N (see getGemm2OutputHiddenSize).
     //
-    // Use the *aligned* valid hidden size, matching what GEMM2 actually computed for its N
-    // dimension (see alignValidDim in Gemm2::Runner::run). The output buffer is allocated
-    // roundUp(valid_hidden_size, 128) wide -- both the Python API and set_valid_moe_dims
-    // enforce that -- so writing only the unaligned valid_hidden_size columns would leave
-    // [valid_hidden_size, roundUp(valid_hidden_size, 128)) as uninitialized torch.empty
-    // memory in the tensor handed back to the caller. GEMM2 produced real values for that
-    // span, so write the whole aligned width.
+    // With valid dims the output row is exactly valid_hidden_size wide, matching TRT-LLM's
+    // contract (mxFp4BlockScaleMoe.cpp allocates {num_tokens, valid_hidden_size}), while GEMM2
+    // computed roundUp(valid_hidden_size, 128) columns because that is the width the FC2 weights
+    // are laid out for. Finalize therefore writes *every* column of the output -- no
+    // uninitialized memory can reach the caller -- and the surplus computed columns
+    // [valid_hidden_size, roundUp(valid_hidden_size, 128)) simply stay behind in the
+    // gemm2_output workspace.
     //
     // Without valid dims GEMM2 keeps the full padded N (see getGemm2OutputHiddenSize), and this
     // is the only place a narrower hidden_size_output takes effect: finalize reads the full
     // hidden_size stride and writes just the leading hidden_size_output columns.
-    int32_t const gemm2HiddenSize = getGemm2OutputHiddenSize(args);
-    auto const validHiddenSize =
-        alignValidDim(args.valid_hidden_size.value_or(-1), gemm2HiddenSize);
+    //
+    // MoERunnerArgs carries no separate output-width field: the width is fully determined by the
+    // dims above, so derive it here rather than duplicating it into another field that could
+    // disagree with them.
     finalizeData.hiddenDim =
-        validHiddenSize >= 0 ? validHiddenSize : args.hidden_size_output.value_or(args.hidden_size);
-    finalizeData.hiddenDimPadded = gemm2HiddenSize;
+        args.valid_hidden_size.value_or(args.hidden_size_output.value_or(args.hidden_size));
+    finalizeData.hiddenDimPadded = getGemm2OutputHiddenSize(args);
+    FLASHINFER_CHECK(finalizeData.hiddenDim <= finalizeData.hiddenDimPadded,
+                     "Finalize output width ", finalizeData.hiddenDim,
+                     " exceeds the GEMM2 output row stride ", finalizeData.hiddenDimPadded, ".");
+    // finalizeKernelVecLoad reinterprets each output row as 128-bit vectors (its numElemsInCol is
+    // hiddenDim / eltsPer16B, and row `t` starts at t * hiddenDim), so a row width that is not a
+    // whole number of 16B chunks would drop the trailing columns and misalign the stores. The
+    // kernel only asserts this, which is a no-op in release builds; the aligned widths this path
+    // used to see made it unreachable, but the output width is now the caller's raw
+    // valid_hidden_size, so check it here.
+    //
+    // Scoped to the valid-dims path on purpose. Without valid dims a caller may still hand in a
+    // narrow `output` (the pre-existing #2217 contract) whose width was never constrained, and
+    // small problems there dispatch to the non-vectorized finalizeKernel, which handles any width.
+    // Applying the check unconditionally would reject widths that work today.
+    if (args.valid_hidden_size.has_value()) {
+      int32_t const outputEltBits = btg::dtypeGetNumBits(args.mDtypeOut);
+      FLASHINFER_CHECK(static_cast<int64_t>(finalizeData.hiddenDim) * outputEltBits % 128 == 0,
+                       "MoE output row width ", finalizeData.hiddenDim,
+                       " is not 16B-aligned for a ", outputEltBits,
+                       "-bit output dtype; it must be a multiple of ", 128 / outputEltBits, ".");
+    }
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }
 }

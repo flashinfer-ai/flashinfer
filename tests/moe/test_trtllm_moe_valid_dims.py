@@ -20,10 +20,60 @@ import torch
 from flashinfer import RoutingMethodType
 from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
 from flashinfer.fused_moe.core import (
+    _check_valid_hidden_size_supports_finalize,
     _infer_trtllm_moe_output_hidden_size,
     _round_up,
+    _trtllm_moe_output_width,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
+
+# The contract mirrored by this file (identical to TensorRT-LLM's
+# mxFp4BlockScaleMoe.cpp / fp4BlockScaleMoe.cpp), for a declared valid_hidden_size:
+#
+#   GEMM1 K              = hidden_size                    (padded, from the tensors)
+#   GEMM2 N              = roundUp(valid_hidden_size, 128) -- what the FC2 weights,
+#                                                             their scales and biases
+#                                                             are sized against
+#   finalized output row = valid_hidden_size               -- what the caller sees
+#
+# GPT-OSS: hidden_size 3072, GEMM2 N 2944, output 2880. The output is exactly
+# valid_hidden_size wide, so the columns [valid, roundUp(valid, 128)) that finalize
+# does not write are never part of the returned tensor and no uninitialized memory
+# can reach the caller.
+
+# Value written into every padded region the kernel must never read. Mirrors
+# TRT-LLM's own repro for this issue, which pads with 42 rather than 0: a zero-padded
+# test still passes when the kernel reads past the valid region or forgets to clamp,
+# which is precisely the bug class valid_hidden_size / valid_intermediate_size exist
+# to prevent.
+_CONTAM = 42.0
+
+
+def _fill_padding_(tensor, dim, valid_size, contam=_CONTAM):
+    """Fill the padded region of ``tensor`` along ``dim`` (everything past ``valid_size``).
+
+    Two regions with different contracts:
+
+    * ``[valid_size, roundUp(valid_size, 128))`` is **zeroed**. The runner rounds every
+      valid dim up to 128 before handing it to trtllm-gen (``alignValidDim`` in
+      ``csrc/trtllm_fused_moe_runner.cu``), so the kernel genuinely reads this stretch;
+      the round-up is only sound because it is zero. That is what TRT-LLM's weight
+      padding and FlashInfer's mxfp8 column padding guarantee in production.
+    * everything beyond it is filled with ``contam``. The kernel must never read it, and
+      a loud value makes a leak fail the accuracy check instead of hiding inside the
+      quantization noise the way small random padding does.
+
+    Both boundaries are 32-element aligned for every shape in this file, so contaminated
+    values never share an mxfp4 / mxint4 / mxfp8 32-element scaling block with valid data
+    and therefore cannot perturb the valid region's quantization.
+    """
+    size = tensor.shape[dim]
+    assert valid_size % 32 == 0, f"valid size {valid_size} must be 32-element aligned"
+    aligned = min(_round_up(valid_size, 128), size)
+    if aligned > valid_size:
+        tensor.narrow(dim, valid_size, aligned - valid_size).zero_()
+    if size > aligned:
+        tensor.narrow(dim, aligned, size - aligned).fill_(contam)
 
 
 @pytest.mark.parametrize(
@@ -35,6 +85,8 @@ from flashinfer.utils import device_support_pdl, get_compute_capability
     ],
 )
 def test_infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size, expected):
+    # GEMM2's N, i.e. the width the FC2 weights are laid out for -- not the width of
+    # the tensor returned to the caller (see test_trtllm_moe_output_width).
     assert (
         _infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size) == expected
     )
@@ -46,6 +98,57 @@ def test_infer_trtllm_moe_output_hidden_size_rejects_invalid(
 ):
     with pytest.raises(ValueError):
         _infer_trtllm_moe_output_hidden_size(128, valid_hidden_size)
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "valid_hidden_size", "expected"),
+    [
+        (3072, None, 3072),
+        # GPT-OSS: the caller gets 2880, not roundUp(2880, 128) == 2944. This is the
+        # single point on which FlashInfer used to disagree with TensorRT-LLM.
+        (3072, 2880, 2880),
+        (512, 64, 64),
+        # Already 128-aligned: output width and GEMM2's N coincide.
+        (1024, 512, 512),
+    ],
+)
+def test_trtllm_moe_output_width(hidden_size, valid_hidden_size, expected):
+    assert _trtllm_moe_output_width(hidden_size, valid_hidden_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "valid_hidden_size", "do_finalize"),
+    [
+        (3072, 2880, True),  # unaligned, but finalize narrows the rows
+        (1024, 960, False),  # roundUp(960, 128) == 1024 == hidden_size
+        (1024, 1024, False),
+        (1024, None, False),
+    ],
+)
+def test_check_valid_hidden_size_supports_finalize_accepts(
+    hidden_size, valid_hidden_size, do_finalize
+):
+    _check_valid_hidden_size_supports_finalize(
+        valid_hidden_size, do_finalize, hidden_size
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "valid_hidden_size"),
+    [
+        (3072, 2880),  # roundUp -> 2944 != 3072
+        (1024, 512),  # roundUp -> 512 != 1024
+    ],
+)
+def test_check_valid_hidden_size_supports_finalize_rejects(
+    hidden_size, valid_hidden_size
+):
+    # Without finalize there is no pass to narrow GEMM2's rows, so the unfinalized
+    # output keeps the padded width and the request is not expressible.
+    with pytest.raises(ValueError):
+        _check_valid_hidden_size_supports_finalize(
+            valid_hidden_size, False, hidden_size
+        )
 
 
 # Numerical test for valid_hidden_size.
@@ -101,8 +204,10 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
     top_k = 8
     padding = 8
 
-    # Float source tensors at the padded hidden size. GEMM2 output width equals the
-    # valid hidden size (== hidden_size_output, since valid_hidden_size % 128 == 0).
+    # Float source tensors at the padded hidden size. GEMM2's N is
+    # roundUp(valid_hidden_size, 128) == valid_hidden_size here (the arms keep it
+    # 256-aligned), and the finalized output the caller receives is valid_hidden_size
+    # wide.
     expert_logits = torch.randn(num_tokens, num_experts, device=device).to(
         torch.bfloat16
     )
@@ -123,6 +228,11 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
         device=device,
         dtype=torch.bfloat16,
     )
+    # Contaminate the hidden padding on both GEMM1 inputs: the activations and the
+    # GEMM1 contraction. Anything the kernel reads past valid_hidden_size shows up as
+    # a gross error rather than as extra quantization noise.
+    _fill_padding_(hidden_states, 1, valid_hidden_size)
+    _fill_padding_(gemm1_weights, 2, valid_hidden_size)
 
     # Quantize (mxint4) + shuffle into the layout the kernel expects for the padded K.
     # Quantize per-tensor (not via MxInt4BlockScaleMoe.quantize_weights) because the
@@ -292,6 +402,15 @@ def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
         device=device,
         dtype=torch.bfloat16,
     )
+    # Contaminate the intermediate padding everywhere it appears: GEMM1's gate rows,
+    # GEMM1's up rows, and GEMM2's contraction.
+    _fill_padding_(
+        gemm1_weights[:, :padded_intermediate_size, :], 1, valid_intermediate_size
+    )
+    _fill_padding_(
+        gemm1_weights[:, padded_intermediate_size:, :], 1, valid_intermediate_size
+    )
+    _fill_padding_(gemm2_weights, 2, valid_intermediate_size)
 
     sf_vec_size = 32
     gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights, sf_vec_size)
@@ -468,6 +587,11 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
     gemm2_weights = torch.randn(
         num_experts, hidden_size, pi, device=device, dtype=torch.bfloat16
     )
+    # Contaminate the intermediate padding: GEMM1's gate rows, GEMM1's up rows and
+    # GEMM2's contraction.
+    _fill_padding_(gemm1_weights[:, :pi, :], 1, vi)
+    _fill_padding_(gemm1_weights[:, pi:, :], 1, vi)
+    _fill_padding_(gemm2_weights, 2, vi)
 
     permute_info, _ = routing_reference_renormalize(
         expert_logits, top_k, num_experts, padding
@@ -580,12 +704,18 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
 #
 # The harness FP4 prepare_static_weights_for_kernel reshapes GEMM2 by a single
 # hidden_size and so assumes GEMM2-output == GEMM1-K. With valid_hidden_size those
-# differ (GEMM1 K = padded_hidden_size, GEMM2 output = hidden_size_output =
-# valid_hidden_size), so we inline an asymmetric shuffle that mirrors that helper
-# but reshapes GEMM1 at padded_hidden_size and GEMM2 at hidden_size_output. The
-# float reference re-quantizes the sliced valid sub-problem (valid because mxfp4
-# global scale is 1.0 and mxfp8 is per-32-block); GEMM1 is gated so its valid rows
-# are gate[0:valid_int] concatenated with up[0:valid_int].
+# differ (GEMM1 K = padded_hidden_size, GEMM2 N = roundUp(valid_hidden_size, 128)),
+# so we inline an asymmetric shuffle that mirrors that helper but reshapes GEMM1 at
+# padded_hidden_size and GEMM2 at GEMM2's N. The float reference re-quantizes the
+# sliced valid sub-problem (valid because mxfp4 global scale is 1.0 and mxfp8 is
+# per-32-block); GEMM1 is gated so its valid rows are gate[0:valid_int] concatenated
+# with up[0:valid_int].
+#
+# This is the test that pins the output contract: the returned tensor is exactly
+# valid_hidden_size wide, even though GEMM2 computes roundUp(valid_hidden_size, 128)
+# columns. GEMM2's extra output rows are filled with the contamination value, so any
+# regression that widened the output back to the aligned size (and thereby exposed
+# columns finalize never writes) fails here loudly instead of returning garbage.
 @pytest.mark.parametrize(
     (
         "padded_hidden_size",
@@ -601,12 +731,19 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
         # GPT-OSS 120B production geometry: hidden_size == intermediate_size == 2880,
         # input hidden padded to 512-alignment (3072), intermediate and w2-hidden padded
         # to 128-alignment (2944). valid_hidden_size 2880 is NOT 128-aligned
-        # (2880 % 128 == 64), so hidden_size_output == roundUp(2880,128) == 2944 differs
-        # from both the padded GEMM1 K (3072) and the valid hidden (2880). This is the
+        # (2880 % 128 == 64), so GEMM2's N == roundUp(2880,128) == 2944 differs from
+        # both the padded GEMM1 K (3072) and the returned width (2880). This is the
         # exact configuration that raised "Failed to initialize the TMA descriptor".
         # Expert count is reduced from 128 to 8 to keep the float reference tractable;
         # the TMA alignment behaviour depends on hidden/intermediate, not expert count.
         (3072, 2880, 2944, 2880, 8, 4),
+        # The geometry from issue #2372 itself, which had never been run through a
+        # kernel: hidden_size == intermediate_size == 64, activations padded to the
+        # 512-alignment W1/W3 use (w3_w1 is [2*128, 512] = 256x256 bytes in fp4) and
+        # w2 padded to the 128-alignment it uses ([128, 128] = 128x64 bytes in fp4).
+        # Every dimension is padded far past its valid extent, which is the harshest
+        # case for the clamping: 64 of 512 hidden and 64 of 128 intermediate are real.
+        (512, 64, 128, 64, 8, 4),
     ],
 )
 def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
@@ -648,9 +785,10 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     pi = padded_intermediate_size
     vi = valid_intermediate_size
     vh = valid_hidden_size
-    # GEMM2's output width is hidden_size_output = roundUp(valid_hidden_size, 128), which
-    # equals valid_hidden_size only when the latter is already 128-aligned. Keep them
-    # distinct so the unaligned (GPT-OSS) geometry is expressible.
+    # GEMM2's N is roundUp(valid_hidden_size, 128) -- the width the FC2 weights are laid
+    # out for -- which equals valid_hidden_size only when the latter is already
+    # 128-aligned. The finalized output is valid_hidden_size wide regardless. Keep the
+    # two distinct so the unaligned (GPT-OSS) geometry is expressible.
     ho = _round_up(vh, 128)
     sf_vec_size = 32  # mxfp4
 
@@ -663,7 +801,7 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     hidden_states = 2 * torch.randn(
         num_tokens, padded_hidden_size, device=device, dtype=torch.bfloat16
     )
-    # GEMM1 K = padded_hidden_size; GEMM2 output = ho = roundUp(valid_hidden_size, 128).
+    # GEMM1 K = padded_hidden_size; GEMM2 N = ho = roundUp(valid_hidden_size, 128).
     gemm1_weights = torch.randn(
         num_experts,
         2 * pi,
@@ -678,9 +816,20 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         device=device,
         dtype=torch.bfloat16,
     )
-    # Rows beyond the valid hidden size are padding: zero them so the reference (which
-    # only covers [0, vh)) and the kernel output agree there too.
-    gemm2_weights[:, vh:, :] = 0
+    # Contaminate every padded region: the hidden padding on GEMM1's activations and
+    # contraction, and the intermediate padding on GEMM1's gate/up rows and GEMM2's
+    # contraction.
+    _fill_padding_(hidden_states, 1, vh)
+    _fill_padding_(gemm1_weights, 2, vh)
+    _fill_padding_(gemm1_weights[:, :pi, :], 1, vi)
+    _fill_padding_(gemm1_weights[:, pi:, :], 1, vi)
+    _fill_padding_(gemm2_weights, 2, vi)
+    # GEMM2's output rows [vh, ho) are a different case: the kernel really does compute
+    # them (GEMM2's N is ho), but finalize writes only the leading vh columns and the
+    # output buffer is only vh wide, so nothing derived from these rows may reach the
+    # caller. Contaminate all of them -- no zeroed prefix -- so that any leak (a wider
+    # output, or a finalize that copies GEMM2's full row) is unmissable.
+    gemm2_weights[:, vh:, :] = _CONTAM
 
     permute_info, _ = routing_reference_renormalize(
         expert_logits, top_k, num_experts, padding
@@ -729,8 +878,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     reference_output, _ = run_moe_reference_fp4(args_valid, quant_mode)
     reference_output = reference_output.to(torch.float)
 
-    # Kernel weights: asymmetric shuffle (GEMM1 at padded_hidden, GEMM2 at
-    # hidden_size_output == ho). Mirrors FP4Moe.prepare_static_weights_for_kernel.
+    # Kernel weights: asymmetric shuffle (GEMM1 at padded_hidden, GEMM2 at its N == ho).
+    # Mirrors FP4Moe.prepare_static_weights_for_kernel.
     args_pad = build_args(
         gemm1_weights, gemm2_weights, hidden_states, padded_hidden_size, pi, True
     )
@@ -809,44 +958,48 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     kernel_inputs = moe.quantize_inputs(
         hidden_states, args_pad.hidden_states_scale_global, is_swizzling=False
     )
-    kernel_output = trtllm_fp4_block_scale_moe(
-        routing_logits=expert_logits,
-        routing_bias=None,
-        hidden_states=kernel_inputs["hidden_states"],
-        hidden_states_scale=kernel_inputs["hidden_states_scale"],
-        gemm1_weights=gemm1_weights_shuffled,
-        gemm1_weights_scale=gemm1_scales_shuffled,
-        gemm1_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
-        gemm2_weights=gemm2_weights_shuffled,
-        gemm2_weights_scale=gemm2_scales_shuffled,
-        gemm2_bias=None,
-        output1_scale_scalar=scale_c_fc1,
-        output1_scale_gate_scalar=scale_gate_fc1,
-        output2_scale_scalar=scale_c_fc2,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=pi,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=RoutingMethodType.Renormalize.value,
-        activation_type=activation,
-        do_finalize=True,
-        enable_pdl=device_support_pdl(device),
-        valid_hidden_size=valid_hidden_size,
-        valid_intermediate_size=vi,
-    )[0].to(torch.float)
 
-    # The kernel emits hidden_size_output (= ho) columns; the float reference only covers
-    # the valid [0, vh) region. Compare on that, which is what a caller consumes.
-    assert kernel_output.shape == (num_tokens, ho)
-    assert reference_output.shape == (num_tokens, vh)
-    kernel_output = kernel_output[:, :vh]
+    def run(output=None):
+        return trtllm_fp4_block_scale_moe(
+            routing_logits=expert_logits,
+            routing_bias=None,
+            hidden_states=kernel_inputs["hidden_states"],
+            hidden_states_scale=kernel_inputs["hidden_states_scale"],
+            gemm1_weights=gemm1_weights_shuffled,
+            gemm1_weights_scale=gemm1_scales_shuffled,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=gemm2_weights_shuffled,
+            gemm2_weights_scale=gemm2_scales_shuffled,
+            gemm2_bias=None,
+            output1_scale_scalar=scale_c_fc1,
+            output1_scale_gate_scalar=scale_gate_fc1,
+            output2_scale_scalar=scale_c_fc2,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=pi,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            activation_type=activation,
+            do_finalize=True,
+            enable_pdl=device_support_pdl(device),
+            output=output,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=vi,
+        )[0]
+
+    kernel_output = run().to(torch.float)
+
+    # The output contract: exactly valid_hidden_size wide, matching TensorRT-LLM. The
+    # aligned columns [vh, ho) that GEMM2 computes but finalize does not write are not
+    # part of the tensor at all, so no uninitialized memory can be observed.
+    assert kernel_output.shape == reference_output.shape == (num_tokens, vh)
     # FP4 tolerances mirror FP4Moe.get_tolerances().
     ok, pct_within, atol = check_accuracy(
         kernel_output, reference_output, percent_threshold=0.92
@@ -855,6 +1008,32 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         f"only {pct_within:.4f} of elements within tolerance (atol={atol:.4g}), "
         f"need >= 0.92"
     )
+
+    # A caller-supplied output must be accepted at exactly valid_hidden_size (the
+    # aligned width must not be), and every column of it must be written. Pre-filling
+    # with NaN turns "finalize skipped the tail" -- the bug that a roundUp-wide output
+    # buffer used to hide -- into a failure here.
+    out_buf = torch.full(
+        (num_tokens, vh), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    run(output=out_buf)
+    assert torch.isfinite(out_buf).all(), (
+        "finalize left part of the caller-supplied output unwritten"
+    )
+    ok, pct_within, atol = check_accuracy(
+        out_buf.to(torch.float), reference_output, percent_threshold=0.92
+    )
+    assert ok, (
+        f"caller-supplied output: only {pct_within:.4f} of elements within "
+        f"tolerance (atol={atol:.4g}), need >= 0.92"
+    )
+    if ho != vh:
+        with pytest.raises(ValueError):
+            run(
+                output=torch.empty(
+                    (num_tokens, ho), device=device, dtype=torch.bfloat16
+                )
+            )
 
 
 # Regression test for the GPT-OSS failure reported against this PR: a valid dim that is
@@ -876,6 +1055,12 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 # only sound if the skipped region is zero, so this test zeroes the padded region and
 # asserts the valid-dims run agrees with the same problem run with valid dims disabled --
 # which is the property the round-up relies on.
+#
+# Unlike the tests above, the padding here is NOT contaminated: the reference is a second
+# run of the very same weights with valid dims disabled, so a non-zero padded region would
+# change the reference as much as the run under test and the comparison would say nothing.
+# Contamination coverage for these dims lives in the tests above, which compare against an
+# independent float reference over the valid sub-problem.
 @pytest.mark.parametrize(
     ("which", "valid_size"),
     [
@@ -917,12 +1102,19 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     vi = valid_size if which == "intermediate" else pi
     vh = valid_size if which == "hidden" else hidden_size
 
-    # valid_hidden_size sets hidden_size_output = roundUp(vh, 128), and the caller must
-    # supply GEMM2 weights of exactly that width. This test builds a single set of GEMM2
-    # weights at hidden_size for both the with- and without-valid-dims runs, so the hidden
-    # arms are restricted to sizes whose round-up lands back on hidden_size. (An arm with
-    # roundUp(vh,128) < hidden_size would need its own narrower, separately shuffled GEMM2
-    # weights -- worth covering, but it is a different test.)
+    # The restriction below is about the GEMM2 *weights*, not the output: GEMM2's N is
+    # roundUp(vh, 128) and the caller must supply FC2 weights of exactly that width
+    # (checked in check_weights_shape). This test deliberately shares one set of GEMM2
+    # weights, at hidden_size, between the with- and without-valid-dims runs -- that
+    # sharing is what makes the two runs comparable -- so the hidden arms stay on sizes
+    # whose round-up lands back on hidden_size. An arm with roundUp(vh,128) < hidden_size
+    # would need its own narrower, separately shuffled GEMM2 weights and hence a separate
+    # reference; that case is covered by
+    # test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference, which builds GEMM2
+    # at roundUp(vh,128) and compares against a float reference.
+    #
+    # Keeping roundUp(vh, 128) == hidden_size also keeps do_finalize=False expressible
+    # for the hidden arms (see _check_valid_hidden_size_supports_finalize).
     assert _round_up(vh, 128) == hidden_size, (
         f"hidden arm requires roundUp(vh,128) == hidden_size, got {vh} -> "
         f"{_round_up(vh, 128)} vs {hidden_size}"
@@ -1000,7 +1192,7 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
         hidden_states, args_pad.hidden_states_scale_global, is_swizzling=False
     )
 
-    def run(**valid_kwargs):
+    def run(do_finalize=True, **valid_kwargs):
         return trtllm_fp4_block_scale_moe(
             routing_logits=expert_logits,
             routing_bias=None,
@@ -1028,10 +1220,10 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
             routed_scaling_factor=None,
             routing_method_type=RoutingMethodType.Renormalize.value,
             activation_type=activation,
-            do_finalize=True,
+            do_finalize=do_finalize,
             enable_pdl=device_support_pdl(device),
             **valid_kwargs,
-        )[0].to(torch.float)
+        )
 
     valid_kwargs = (
         {"valid_intermediate_size": vi}
@@ -1040,13 +1232,14 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     )
     # The regression itself: this call used to raise
     # "Failed to initialize the TMA descriptor" for the unaligned sizes.
-    with_valid = run(**valid_kwargs)
-    without_valid = run()
+    with_valid = run(**valid_kwargs)[0].to(torch.float)
+    without_valid = run()[0].to(torch.float)
 
-    # valid_hidden_size narrows the finalized output to roundUp(vh, 128), while the
+    # valid_hidden_size narrows the finalized output to exactly vh, while the
     # no-valid-dims run always emits the full hidden_size. Compare on the common prefix.
-    out_width = with_valid.shape[1]
-    assert out_width <= without_valid.shape[1]
+    out_width = vh if which == "hidden" else hidden_size
+    assert with_valid.shape == (num_tokens, out_width)
+    assert without_valid.shape == (num_tokens, hidden_size)
     without_valid = without_valid[:, :out_width]
     assert torch.isfinite(with_valid).all(), "valid-dims run produced non-finite values"
     # Same math: the skipped region is zero, so trimming it must not change the result.
@@ -1058,4 +1251,34 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     assert ok, (
         f"trimming a zero region changed the result: only {pct_within:.4f} of "
         f"elements within tolerance (atol={atol:.4g})"
+    )
+
+    # Same valid dims, but without the finalize pass. The caller then receives GEMM2's
+    # unfinalized rows, which keep the padded hidden width (there is no finalize step to
+    # narrow them), so recombining them on the host must reproduce the finalized run.
+    # valid_hidden_size is only expressible here because roundUp(vh, 128) == hidden_size
+    # for these arms -- the precondition asserted at the top of the test.
+    unfinalized = run(do_finalize=False, **valid_kwargs)
+    assert len(unfinalized) == 3, (
+        "do_finalize=False must return "
+        "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]"
+    )
+    gemm2_output, expert_weights, expanded_idx_to_permuted_idx = unfinalized
+    assert gemm2_output.shape[1] == hidden_size
+    assert tuple(expert_weights.shape) == (num_tokens, top_k)
+    permutation = expanded_idx_to_permuted_idx.to(torch.long).reshape(num_tokens, top_k)
+    assert (permutation >= 0).all()
+    assert permutation.max().item() < gemm2_output.shape[0]
+    recombined = (
+        gemm2_output[permutation]
+        .float()
+        .mul(expert_weights.float().unsqueeze(-1))
+        .sum(dim=1)[:, :out_width]
+    )
+    ok, pct_within, atol = check_accuracy(
+        recombined, with_valid, percent_threshold=0.99
+    )
+    assert ok, (
+        f"do_finalize=False disagrees with the finalized run: only {pct_within:.4f} "
+        f"of elements within tolerance (atol={atol:.4g})"
     )
