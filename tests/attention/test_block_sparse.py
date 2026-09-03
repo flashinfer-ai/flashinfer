@@ -812,3 +812,56 @@ def test_a_second_plan_still_takes_a_page_size_after_auto_resolved(monkeypatch):
     wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
     assert calls, "the flat plan reused the paged plan's backend"
     assert wrapper._requested_backend == "auto"
+
+
+@requires_cuda_sm80
+def test_a_caller_supplied_fp8_out_holds_the_scaled_result():
+    """`out=` is the caller's buffer, and folding `v_scale` into an 8-bit output
+    has to go through float32. Doing that by rebinding the local would return a
+    scaled tensor and leave the caller's holding the unscaled one.
+
+    An 8-bit output only exists on the cuda-core decode path -- the tensor-core
+    prefill generators refuse it -- so the plan here is what selects that path:
+    one head each side, a narrow route and no custom mask.
+    """
+    torch.manual_seed(3)
+    rows, width, entries, head_dim = 4, 8, 64, 128
+    k = torch.randn(entries, 1, head_dim, dtype=torch.float16, device=DEV)
+    v = torch.randn_like(k)
+    q = torch.randn(rows, 1, head_dim, dtype=torch.float16, device=DEV)
+    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=DEV)
+    indices = torch.randint(0, entries, (rows * width,), dtype=torch.int32, device=DEV)
+
+    def plan():
+        wrapper = flashinfer.BlockSparseAttentionWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            rows,
+            entries,
+            1,
+            1,
+            num_qo_heads=1,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float8_e4m3fn,
+        )
+        assert not wrapper._use_tensor_cores, "this case has to take the decode path"
+        return wrapper
+
+    scale = 2.0
+    buffer = torch.empty(rows, 1, head_dim, dtype=torch.float8_e4m3fn, device=DEV)
+    returned = plan().run(q, k, v, out=buffer, v_scale=scale)
+    unscaled = plan().run(q, k, v)
+    torch.cuda.synchronize()
+
+    # The caller's buffer is what came back, and it holds the scaled values --
+    # rebinding the local would leave it holding the unscaled ones.
+    assert returned.data_ptr() == buffer.data_ptr()
+    want = (unscaled.to(torch.float32) * scale).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(buffer.float(), want.float(), rtol=0, atol=0)
+    assert not torch.equal(buffer.float(), unscaled.float())
