@@ -45,6 +45,9 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
         self._autotune_pending = config.knobs == "auto"
+        # Only the in-kernel reduce leaves a finished (T, hidden) slice in the
+        # workspace; the explicit path's top-k sum needs its own destination.
+        self.supports_output_view = config.in_kernel_fc2_reduce
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_mxfp8_cutedsl_runtime_requirements(bootstrap)
@@ -133,6 +136,8 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
+        from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+
         stage_mega_moe_inputs(
             t.hidden_states,
             t.topk_weights,
@@ -141,18 +146,36 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.topk_idx,
             workspace.topk_weights,
         )
+        note_staged_tokens(workspace.topk_idx, t.hidden_states.shape[0])
 
     def compute(
         self,
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ) -> torch.Tensor:
         from ......kernel_src.cutedsl_megamoe import (
             autotune_bf16_mxfp8_mega_moe,
             bf16_mxfp8_mega_moe,
+            staged_tokens,
         )
+
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
 
         if self._autotune_pending:
             autotune_bf16_mxfp8_mega_moe(
@@ -160,20 +183,20 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 transformed_weights[0],
                 transformed_weights[1],
                 workspace,
-                num_tokens=output.shape[0],
+                num_tokens=num_tokens,
                 gate_up_clamp=_clamp(self._kernel_config),
             )
             self._autotune_pending = False
-        bf16_mxfp8_mega_moe(
+        view = bf16_mxfp8_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],
             workspace,
-            num_tokens=output.shape[0],
+            num_tokens=num_tokens,
             gate_up_clamp=_clamp(self._kernel_config),
             fast_math=self._kernel_config.fast_math,
         )
-        return output
+        return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
@@ -199,3 +222,17 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             config.token_back_mode,
             knobs_pool_key(config.knobs),
         )
+
+    def _forget_workspace_state(self, workspace) -> None:
+        # stage_inputs() memoizes the live-token count on topk_idx.data_ptr();
+        # the symmetric heap reuses freed addresses, so evict before the buffer
+        # dies. sys.modules lookup (not an import): if the shim was never
+        # loaded, no memo exists and the heavy import must not happen.
+        import sys
+
+        quant_stage = sys.modules.get(
+            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+        )
+        topk_idx = getattr(workspace, "topk_idx", None)
+        if quant_stage is not None and topk_idx is not None:
+            quant_stage.forget_staged_tokens(topk_idx)
