@@ -84,11 +84,10 @@ def test_mm_bf16(
         if not is_sm100a_supported(torch.device("cuda")):
             pytest.skip("CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+.")
 
-        if m <= 32:
-            from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
-            if not is_cute_dsl_available():
-                pytest.skip("nvidia-cutlass-dsl is not available.")
+        if not is_cute_dsl_available():
+            pytest.skip("nvidia-cutlass-dsl is not available.")
         if res_dtype != torch.bfloat16:
             pytest.skip("CuTeDSL low-M backend requires BF16 output.")
 
