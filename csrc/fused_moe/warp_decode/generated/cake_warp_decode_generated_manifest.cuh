@@ -49,7 +49,7 @@ inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
 inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 199040u;
-inline constexpr char kGeneratedSourceSha256[] = "9cfb7bfcd78fc4595dde0686e770aba37a9478fc3d199f770379ffbe3d559552";
+inline constexpr char kGeneratedSourceSha256[] = "9985afbe38c240b10a0e60280dabd6bc45483db3a28e0ae94fd48bc9428a2daf";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {

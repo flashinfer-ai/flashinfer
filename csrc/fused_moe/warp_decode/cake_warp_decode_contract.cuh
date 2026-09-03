@@ -110,7 +110,7 @@ constexpr Schedule SelectSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 512, 512, 10)) {
-    if (shape.num_tokens < 24) {
+    if (shape.num_tokens < 23) {
       return {true,
               Geometry::kH2048I512E512K10,
               RouteLayout::kDirect,
@@ -188,8 +188,8 @@ constexpr Shape E60Shape(int32_t tokens) { return {tokens, 2048, 1536, 60, 60, 4
 static_assert(!SelectSchedule(E512Shape(0)).supported);
 static_assert(SelectSchedule(E512Shape(1)).fc1 == Fc1Schedule::kStatic);
 static_assert(SelectSchedule(E512Shape(2)).fc1 == Fc1Schedule::kPersistent);
-static_assert(SelectSchedule(E512Shape(23)).route_layout == RouteLayout::kDirect);
-static_assert(SelectSchedule(E512Shape(24)).route_packer == RoutePacker::kGeneral);
+static_assert(SelectSchedule(E512Shape(22)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSchedule(E512Shape(23)).route_packer == RoutePacker::kGeneral);
 static_assert(SelectSchedule(E512Shape(32)).fc2 == Fc2Schedule::kRouteParallelK512DeviceWorkfeed);
 static_assert(!SelectSchedule(E512Shape(33)).supported);
 static_assert(SelectSchedule(E60Shape(7)).fc2 == Fc2Schedule::kRouteParallelK768K96);

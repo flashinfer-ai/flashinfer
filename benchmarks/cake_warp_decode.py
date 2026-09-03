@@ -125,7 +125,7 @@ class Geometry:
 
 
 GEOMETRIES = (
-    Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 23, 24, 32)),
+    Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
 )
 
@@ -135,7 +135,7 @@ def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     if geometry.num_experts == 512:
         if num_tokens == 1:
             return "static_direct"
-        if num_tokens <= 23:
+        if num_tokens <= 22:
             return "persistent_direct"
         return "persistent_general_route_packer"
 

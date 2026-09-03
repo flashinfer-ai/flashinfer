@@ -102,7 +102,7 @@ depending on a nondeterministic allocator choice.
 CUDA Graph capture and post-capture mutation are additionally exercised at all
 selector transitions:
 
-- E512: T=1, 2, 23, 24, 32.
+- E512: T=1, 2, 22, 23, 32.
 - E60: T=1, 7, 8, 10, 11, 12, 16, 17, 32.
 
 Workspace preparation occurs on stream A before capture on distinct stream B.
@@ -133,8 +133,8 @@ routing-validation receipts.
 
 The selector boundary labels in the JSON receipt distinguish E60 `_e64_scan1`
 at T=11, `_e64_scan2` at T=12..16, and the general route packer at T=17..32.
-They distinguish E512 direct routing through T=23 from the general route packer
-at T=24..32.
+They distinguish E512 direct routing through T=22 from the general route packer
+at T=23..32.
 
 ## CUPTI benchmark gate
 

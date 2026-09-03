@@ -17,8 +17,22 @@
 // Bundle: Adaptive NVFP4 Warp Decode.
 // Target: sm_103a; compile flags: --use_fast_math; tensor-map ABI: grid_constant.
 // Generated file; do not edit manually.
-#include <stdint.h>
-#include <cuda.h>
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+
+typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+
 #include <cuda_bf16.h>
 
 #include <math_constants.h>
@@ -1013,6 +1027,7 @@ kernel_cake_flashinfer_trtllm_warp_decode_route_pack_e64_scan2(int* __restrict__
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -1784,6 +1799,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_static_nvfp4(const __grid_constant__ CUte
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -1832,6 +1848,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_static_nvfp4(const __grid_constant__ CUte
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -3159,6 +3176,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4(const __grid_constant__ 
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -3213,6 +3231,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4(const __grid_constant__ 
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -4257,6 +4276,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_device_workfeed_nvfp4(const __grid_consta
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -4311,6 +4331,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_device_workfeed_nvfp4(const __grid_consta
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -5355,6 +5376,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_padded_sfc_device_workfeed_nvfp4(const __
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -5478,6 +5500,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc1_padded_sfc_device_workfeed_nvfp4(const __
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 256
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -6855,6 +6878,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_refined_sm103_nvfp4(const __grid_constant
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -7001,6 +7025,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_refined_sm103_nvfp4(const __grid_constant
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -8242,6 +8267,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_k512_device_workfeed_sm103_nvfp4(const __
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_empty_addr
 #undef a_full_addr
 #undef b_empty_addr
@@ -8391,6 +8417,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_k512_device_workfeed_sm103_nvfp4(const __
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 768
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -10034,6 +10061,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_k768_k96_sm103_nvfp4(const __grid_constan
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
@@ -10180,6 +10208,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_k768_k96_sm103_nvfp4(const __grid_constan
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 768
+#define WEIGHTS_SHUFFLED 1
 
 extern "C" {
 
@@ -11611,6 +11640,7 @@ kernel_cake_trtllm_moe_bmm_tile_n8_fc2_k768_k96_padded_sfb_cp_sm103_nvfp4(const 
 #undef TMEM_NCOLS
 #undef TMEM_SFA_OFFSET
 #undef TMEM_SFB_OFFSET
+#undef WEIGHTS_SHUFFLED
 #undef a_full_addr
 #undef b_full_addr
 #undef epi_staging_addr
