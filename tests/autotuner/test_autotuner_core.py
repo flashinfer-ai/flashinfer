@@ -417,6 +417,58 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch):
+    class PreparationMemoryErrorRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationMemoryErrorRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    profile = MagicMock(return_value=1.0)
+    empty_cache = MagicMock()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "preparation_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    profile.assert_not_called()
+    empty_cache.assert_called_once_with()
+
+
+def test_choose_one_recovers_from_memory_error_during_profiling(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        MagicMock(side_effect=MemoryError("CUDA out of memory")),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "profiling_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    empty_cache.assert_called_once_with()
+
+
 def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     """rank_tactics should return best-first shortlist and cache the winner."""
     tuner = reset_autotuner()

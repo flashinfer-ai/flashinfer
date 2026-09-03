@@ -1069,9 +1069,9 @@ def set_autotune_process_group(
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
     reduces); and ``profiling_cache`` / loaded ``autotune(cache=...)`` at entry
     (a cache hit skips that profile's reduce) -- so set the group from the first
-    ``choose_one`` with identical (ideally empty) starting caches. Residual: a
-    per-rank OOM *outside* ``_profile_single_kernel`` (input synthesis /
-    ``do_preparation``) can still early-return and desync.
+    ``choose_one`` with identical (ideally empty) starting caches. Input
+    synthesis and ``do_preparation`` OOMs are reduced across the group before
+    tactic profiling, giving every rank the same fallback decision.
 
     Example::
 
@@ -1089,6 +1089,20 @@ def set_autotune_process_group(
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
+
+
+def _sync_oom_across_tune_group(local_oom: bool) -> bool:
+    """Return whether any rank in the tuning group observed an OOM."""
+    if _tune_process_group is None:
+        return local_oom
+
+    import torch.distributed as dist
+
+    backend = str(dist.get_backend(_tune_process_group)).lower()
+    device = "cuda" if backend == "nccl" else "cpu"
+    oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
+    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
+    return bool(oom_flag.item())
 
 
 @dataclass(frozen=True)
@@ -1742,24 +1756,36 @@ class AutoTuner:
                         inputs=inputs,
                     )
                     if not is_cache_hit:
-                        # Active capture is safe for skipped operations and warm cache hits, but
-                        # input synthesis or profiling would mutate the caller's outer graph.
-                        if torch.cuda.is_current_stream_capturing():
-                            raise RuntimeError(
-                                "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                        input_preparation_oom = False
+                        try:
+                            # Active capture is safe for skipped operations and warm cache hits, but
+                            # input synthesis or profiling would mutate the caller's outer graph.
+                            if torch.cuda.is_current_stream_capturing():
+                                raise RuntimeError(
+                                    "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                                )
+                            # Synthesize inputs only on the profiling path.
+                            tensors = self._prepare_input_tensors(p, inputs)
+                            # Apply the optional inputs_pre_hook to inject a
+                            # deterministic / realistic distribution before
+                            # the per-tactic profile loop.
+                            if tuning_config.inputs_pre_hook is not None:
+                                tensors = list(tuning_config.inputs_pre_hook(tensors))
+                            prepared_input_batches = (
+                                self._prepare_input_tensors_with_batches(
+                                    tensors, tuning_config
+                                )
                             )
-                        # Synthesize inputs only on the profiling path.
-                        tensors = self._prepare_input_tensors(p, inputs)
-                        # Apply the optional inputs_pre_hook to inject a
-                        # deterministic / realistic distribution before
-                        # the per-tactic profile loop.
-                        if tuning_config.inputs_pre_hook is not None:
-                            tensors = list(tuning_config.inputs_pre_hook(tensors))
-                        prepared_input_batches = (
-                            self._prepare_input_tensors_with_batches(
-                                tensors, tuning_config
+                        except (torch.cuda.OutOfMemoryError, MemoryError):
+                            input_preparation_oom = True
+
+                        if _sync_oom_across_tune_group(input_preparation_oom):
+                            torch.cuda.empty_cache()
+                            logger.warning(
+                                "[Autotuner]: OOM detected, falling back to default tactic"
                             )
-                        )
+                            return runners[0], -1
+
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -1773,16 +1799,33 @@ class AutoTuner:
                         runner_id, tactic = None, None
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
-                            valid_tactics = r.get_valid_tactics(tensors, p)
-                            valid_tactics = self._blocklist.filter(
-                                custom_op, r, valid_tactics
-                            )
-                            runner_arg_names = runner_arg_names_map[r]
-                            if (
-                                "do_preparation" in runner_arg_names
-                                and len(valid_tactics) > 0
-                            ):
-                                r(tensors, tactic=-1, do_preparation=True, **kwargs)
+                            runner_preparation_oom = False
+                            try:
+                                valid_tactics = r.get_valid_tactics(tensors, p)
+                                valid_tactics = self._blocklist.filter(
+                                    custom_op, r, valid_tactics
+                                )
+                                runner_arg_names = runner_arg_names_map[r]
+                                if (
+                                    "do_preparation" in runner_arg_names
+                                    and len(valid_tactics) > 0
+                                ):
+                                    r(
+                                        tensors,
+                                        tactic=-1,
+                                        do_preparation=True,
+                                        **kwargs,
+                                    )
+                            except (torch.cuda.OutOfMemoryError, MemoryError):
+                                runner_preparation_oom = True
+
+                            if _sync_oom_across_tune_group(runner_preparation_oom):
+                                torch.cuda.empty_cache()
+                                logger.warning(
+                                    "[Autotuner]: OOM detected, falling back to default tactic"
+                                )
+                                return runners[0], -1
+
                             for tac in valid_tactics:
                                 try:
                                     time_measured = self._profile_single_kernel(
@@ -1793,7 +1836,7 @@ class AutoTuner:
                                         input_tensor_batches=prepared_input_batches,
                                         **kwargs,
                                     )
-                                except torch.cuda.OutOfMemoryError:
+                                except (torch.cuda.OutOfMemoryError, MemoryError):
                                     # Distributed autotuning: the per-tactic
                                     # all-reduce must run the same number of
                                     # times on every rank. Bubbling OOM up to
@@ -1891,7 +1934,7 @@ class AutoTuner:
                                 f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                             )
 
-                except torch.cuda.OutOfMemoryError:
+                except (torch.cuda.OutOfMemoryError, MemoryError):
                     torch.cuda.empty_cache()
                     logger.warning(
                         "[Autotuner]: OOM detected, falling back to default tactic"

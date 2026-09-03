@@ -2,7 +2,7 @@
 
 Covers the real risks introduced by ``set_autotune_process_group``. Because the
 production ``_profile_single_kernel`` needs CUDA (and NCCL) it cannot run under
-CI, so the coverage is split into two complementary, GPU-free checks:
+CI, so the coverage is split into three complementary, GPU-free checks:
 
 1. **Source-level (AST) guards on the production code** — assert that the real
    ``AutoTuner._profile_single_kernel`` keeps its all-reduce on every path
@@ -14,6 +14,9 @@ CI, so the coverage is split into two complementary, GPU-free checks:
    confirming that one rank failing does not block peers on the collective.
    This validates gloo's behavior for the pattern, not the production call path
    (which #1 guards).
+3. **Runtime (gloo) check of preparation OOM** — two processes call the real
+   ``AutoTuner.choose_one`` control flow and confirm that one rank's preparation
+   OOM produces the same fallback on every rank.
 
 Uses ``gloo`` (CPU) to avoid depending on CUDA or NCCL. No GPU required.
 """
@@ -314,5 +317,101 @@ def test_exception_path_does_not_deadlock_the_reduce(tmp_path):
     # the reduce (else the peer would have hung and hit the timeout above).
     for rank in range(world_size):
         assert "OK reduced=inf" in outputs[rank], (
+            f"rank {rank} unexpected output:\n{outputs[rank]}"
+        )
+
+
+_PREPARATION_OOM_WORKER_SRC = r"""
+import datetime, os, sys
+import torch
+import torch.distributed as dist
+
+from flashinfer.autotuner import (
+    AutoTuner,
+    TunableRunner,
+    TuningConfig,
+    autotune,
+    set_autotune_process_group,
+)
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+store_file = os.environ["GLOO_STORE_FILE"]
+
+
+class PreparationRunner(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        return (0,)
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        if do_preparation and rank == 0:
+            raise MemoryError("simulated workspace allocation failure")
+        return inputs[0]
+
+
+dist.init_process_group(
+    backend="gloo",
+    init_method="file://" + store_file,
+    rank=rank,
+    world_size=world_size,
+    timeout=datetime.timedelta(seconds=60),
+)
+try:
+    torch.cuda.is_current_stream_capturing = lambda: False
+    torch.cuda.empty_cache = lambda: None
+    AutoTuner._profile_single_kernel = lambda self, *args, **kwargs: 1.0
+    set_autotune_process_group(dist.group.WORLD)
+
+    with autotune(True):
+        _, tactic = AutoTuner.get().choose_one(
+            "distributed_preparation_oom",
+            [PreparationRunner()],
+            TuningConfig(),
+            [torch.empty((8, 8))],
+        )
+
+    if tactic != -1:
+        sys.exit("rank %d: tactic=%r" % (rank, tactic))
+    print("rank %d: fallback" % rank)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
+def test_preparation_memory_error_falls_back_on_every_rank(tmp_path):
+    """A rank-local preparation OOM produces one group-wide fallback."""
+    store_file = str(tmp_path / "preparation_oom_rendezvous")
+    procs = []
+    for rank in range(2):
+        env = dict(os.environ)
+        env.update(RANK=str(rank), WORLD_SIZE="2", GLOO_STORE_FILE=store_file)
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", _PREPARATION_OOM_WORKER_SRC],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
+
+    outputs = {}
+    for rank, process in enumerate(procs):
+        try:
+            output, _ = process.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, _ = process.communicate()
+            raise AssertionError(
+                f"rank {rank} timed out during preparation OOM synchronization:\n{output}"
+            ) from None
+        outputs[rank] = output
+        assert process.returncode == 0, (
+            f"rank {rank} worker failed (exit {process.returncode}):\n{output}"
+        )
+
+    for rank in range(2):
+        assert f"rank {rank}: fallback" in outputs[rank], (
             f"rank {rank} unexpected output:\n{outputs[rank]}"
         )
