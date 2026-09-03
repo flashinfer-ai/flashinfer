@@ -14,6 +14,7 @@ import flashinfer
 from flashinfer import ActivationType, fp4_quantize
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
+    ActivationConfig,
     BackendOptions,
     CutlassBf16Config,
     CutlassNvfp4Config,
@@ -21,6 +22,10 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -28,9 +33,13 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU,
     ReLU2,
     RoutingConfig,
+    SiLU,
+    SiTU,
     SwiGLU,
+    SwiGLUStep,
 )
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
@@ -57,7 +66,15 @@ _BACKEND_CONFIGS = {
 
 _ACTIVATIONS = {
     ActivationType.Swiglu: SwiGLU,
+    ActivationType.SwigluStep: SwiGLUStep,
+    ActivationType.Geglu: GeGLU,
+    ActivationType.GegluTanh: GeGLUTanh,
+    ActivationType.Situ: SiTU,
     ActivationType.Relu2: ReLU2,
+    ActivationType.Identity: Identity,
+    ActivationType.Gelu: GELU,
+    ActivationType.Relu: ReLU,
+    ActivationType.Silu: SiLU,
 }
 
 
@@ -230,17 +247,71 @@ def _reference_moe(
         gemm1 = (hidden_states[token_ids].float() @ w1[expert].float().T).to(
             torch.bfloat16
         )
-        if isinstance(activation, SwiGLU):
-            up, gate = gemm1.split(intermediate_size, dim=-1)
-            intermediate = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
-        else:
-            intermediate = F.relu(gemm1.float()).square().to(torch.bfloat16)
+        intermediate = _reference_activation(gemm1, activation, intermediate_size)
         expert_output = intermediate.float() @ w2[expert].float().T
         result.index_add_(
             0,
             token_ids,
             expert_output * topk_weights[token_ids, slots, None],
         )
+    return result.to(torch.bfloat16)
+
+
+def _reference_activation(
+    values: torch.Tensor,
+    activation: ActivationConfig,
+    intermediate_size: int,
+) -> torch.Tensor:
+    """Apply a unified MoE activation at the BF16 GEMM precision boundary."""
+    if activation.is_gated:
+        up, gate = values.split(intermediate_size, dim=-1)
+        gate = gate.float()
+        up = up.float()
+        if isinstance(activation, SwiGLU):
+            gate = gate.clamp(max=activation.limit)
+            up = up.clamp(min=-activation.limit, max=activation.limit)
+            result = (
+                gate * torch.sigmoid(activation.alpha * gate) * (up + activation.beta)
+            )
+        elif isinstance(activation, SwiGLUStep):
+            result = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                min=-activation.limit, max=activation.limit
+            )
+        elif isinstance(activation, GeGLU):
+            result = F.gelu(gate, approximate="none") * up
+        elif isinstance(activation, GeGLUTanh):
+            result = F.gelu(gate, approximate="tanh") * up
+        elif isinstance(activation, SiTU):
+            if activation.clamp_limit is not None:
+                gate = gate.clamp(max=activation.clamp_limit)
+                up = up.clamp(
+                    min=-activation.clamp_limit,
+                    max=activation.clamp_limit,
+                )
+            gate = (
+                activation.gate_scale
+                * torch.tanh(gate / activation.gate_scale)
+                * torch.sigmoid(gate)
+            )
+            if activation.linear_scale is not None:
+                up = activation.linear_scale * torch.tanh(up / activation.linear_scale)
+            result = gate * up
+        else:
+            raise ValueError(f"unsupported gated activation {activation!r}")
+    else:
+        values = values.float()
+        if isinstance(activation, ReLU2):
+            result = F.relu(values).square()
+        elif isinstance(activation, Identity):
+            result = values
+        elif isinstance(activation, GELU):
+            result = F.gelu(values, approximate="none")
+        elif isinstance(activation, ReLU):
+            result = F.relu(values)
+        elif isinstance(activation, SiLU):
+            result = F.silu(values)
+        else:
+            raise ValueError(f"unsupported non-gated activation {activation!r}")
     return result.to(torch.bfloat16)
 
 

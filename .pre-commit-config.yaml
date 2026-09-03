@@ -16,14 +16,15 @@
 
 # The kernel_src */src trees and blackwell_msa CUDA snapshots are generated or
 # upstream kernel drops that are re-synced periodically
-# (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
+# (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel,
+# sm120/swapab_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs or alter
 # the source-distributed kernel payload.
 # The shim/ layers next to them are ours and stay checked.
 # The Cake selective-state and Mamba CUDA/host trees, along with frozen KDA
 # fallback and generated-dispatch sources, are byte-faithful exports. Their
 # SHA-256 digests are checked by JIT manifests and must not be rewritten.
-exclude: ^(?:csrc/(?:kda/flashkda_generated_.*|blackwell_msa/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/(?:cake_flashkda_blackwell_evolution_.*|training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a))\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+exclude: ^(?:csrc/(?:kda/flashkda_generated_.*|blackwell_msa/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/(?:cake_flashkda_blackwell_evolution_.*|training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a))\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
@@ -63,7 +64,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py))
+          exclude: ^(flashinfer-cubin/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

@@ -565,6 +565,55 @@ def test_sm90():
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
+def test_collection_isolates_sm120_swapab_multirank_modules(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    for backend in ("sm100", "sm90", "sm120"):
+        tree = suite / backend
+        tree.mkdir()
+        (tree / "common.py").write_text(f"BACKEND = {backend!r}\n", encoding="utf-8")
+
+    def _write(name: str, backend: str, test_name: str) -> Path:
+        path = suite / name
+        path.write_text(
+            f"""\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "{backend}"))
+import common
+
+if common.BACKEND != "{backend}":
+    raise RuntimeError("vendored common modules cannot share one process")
+
+def {test_name}():
+    pass
+""",
+            encoding="utf-8",
+        )
+        return path
+
+    _write("test_aaa_sm100.py", "sm100", "test_sm100")
+    sm90 = _write("test_moe_ep_sm90_pull_fp8_mega_multirank.py", "sm90", "test_sm90")
+    sm120 = _write(
+        "test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py", "sm120", "test_sm120"
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 20, 0)
+
+    assert [node["nodeid"] for node in nodes] == [
+        "test_aaa_sm100.py::test_sm100",
+        f"{sm90.name}::test_sm90",
+        f"{sm120.name}::test_sm120",
+    ]
+    assert [node["order"] for node in nodes] == [0, 1, 2]
+
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, sm120, 15, 0)
+
+    assert [node["nodeid"] for node in isolated_nodes] == [f"{sm120.name}::test_sm120"]
+    assert [node["order"] for node in isolated_nodes] == [0]
+
+
 def test_pytest_root_is_stable_for_repository_and_external_scopes(
     tmp_path: Path,
 ) -> None:
