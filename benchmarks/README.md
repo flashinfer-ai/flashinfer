@@ -37,7 +37,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
     - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
-    - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
+    - All four wrapper attention routines above accept `--backends prims-ts` (`prims_ts` is an alias) on SM100/SM103 to benchmark the experimental task-scheduled attention implementation. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -539,7 +539,7 @@ Legend:
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM (generic wrapper)
 - trtllm-native: TensorRT-LLM (native API)
-- prims-ts: Experimental task-scheduled attention (SM100/SM103)
+- prims-ts: Task-scheduled attention (SM100/SM103)
 -->
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
@@ -615,7 +615,7 @@ Backend Legend:
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
-- prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
+- prims-ts: Task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use

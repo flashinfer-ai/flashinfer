@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -563,7 +563,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "num_page_indices": Var(
                 description=(
                     "Capacity of the runtime physical-page ID tensor; the final "
-                    "live page-table offset may be smaller."
+                    "active page-table offset may be smaller."
                 )
             ),
         }
@@ -608,16 +608,14 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "paged_kv_indptr": Tensor(
                 ["num_page_offsets"],
                 dtype="int32",
-                description=(
-                    "Live request offsets into paged_kv_indices, read for this call."
-                ),
+                description=("Per-run request offsets into paged_kv_indices."),
             ),
             "paged_kv_indices": Tensor(
                 ["num_page_indices"],
                 dtype="int32",
                 description=(
                     "Runtime physical-page ID capacity; only the prefix ending at "
-                    "paged_kv_indptr[-1] is live."
+                    "paged_kv_indptr[-1] is active."
                 ),
             ),
             "max_seq_len_kv": Scalar(
@@ -627,9 +625,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "seq_lens_kv": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description=(
-                    "Live per-request logical K/V lengths read for this call."
-                ),
+                description=("Per-run logical K/V lengths read for this call."),
             ),
         }
     )
@@ -640,7 +636,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
         description=(
             "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
             f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
-            "and live request page tables, K/V lengths, and per-KV-head BSR "
+            "and per-run request page tables, K/V lengths, and per-KV-head BSR "
             "metadata."
         ),
         axes=axes,
@@ -798,7 +794,7 @@ def _require_prims_ts_block_sparse_wrapper_state(
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            f"Tracing {wrapper_name}.run requires the live wrapper's plan state. "
+            f"Tracing {wrapper_name}.run requires the bound wrapper's plan state. "
             "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
@@ -841,7 +837,7 @@ def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceT
         description=(
             "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
             f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
-            "and live page tables, K/V lengths, and per-KV-head BSR metadata. "
+            "and per-run page tables, K/V lengths, and per-KV-head BSR metadata. "
             "Static K/V capacity, block geometry, and mask type are retained "
             "by plan() and represented as optional trace context."
         ),
@@ -1054,7 +1050,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
             )
         },
         constraints=constraints,
-        tags=["stage:decode", "backend:prims-ts", "status:experimental"],
+        tags=["stage:decode", "backend:prims-ts"],
     )
 
 
@@ -1172,7 +1168,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
             )
         },
         constraints=constraints,
-        tags=["stage:decode", "backend:prims-ts", "status:experimental"],
+        tags=["stage:decode", "backend:prims-ts"],
     )
 
 
@@ -1210,7 +1206,7 @@ def _make_prims_ts_decode_wrapper_trace(
     kv_prefix_mode: str,
     kv_lengths_mode: str,
 ):
-    """Describe ``BatchDecodePagedTSWrapper.run`` and its live metadata."""
+    """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
     cache_form = "combined" if combined else "tuple"
     output_suffix = "_fp16_output" if fp16_output else ""
@@ -1252,8 +1248,8 @@ def _make_prims_ts_decode_wrapper_trace(
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_indptr": Var(description="Length of the live native CSR indptr."),
-        "num_kv_indices": Var(description="Number of live page IDs."),
+        "len_indptr": Var(description="Length of the per-run native CSR indptr."),
+        "num_kv_indices": Var(description="Number of active page IDs."),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
@@ -1265,17 +1261,17 @@ def _make_prims_ts_decode_wrapper_trace(
             "paged_kv_indptr": Tensor(
                 ["len_indptr"],
                 dtype="int32",
-                description="Required native CSR offsets supplied live to run().",
+                description="Required native CSR offsets supplied to run().",
             ),
             "paged_kv_indices": Tensor(
                 ["num_kv_indices"],
                 dtype="int32",
-                description="Required physical page IDs supplied live to run().",
+                description="Required physical page IDs supplied to run().",
             ),
             "seq_lens": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description="Required per-request KV lengths supplied live to run().",
+                description="Required per-request KV lengths supplied to run().",
             ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
@@ -1288,7 +1284,7 @@ def _make_prims_ts_decode_wrapper_trace(
             "validate": Scalar(
                 "bool",
                 optional=True,
-                description="Whether to validate live tensors and metadata values.",
+                description="Whether to validate per-run tensors and metadata values.",
             ),
         }
     )
@@ -1335,7 +1331,6 @@ def _make_prims_ts_decode_wrapper_trace(
         tags=[
             "stage:decode",
             "backend:prims-ts",
-            "status:experimental",
             f"mask:{mask_type}",
             f"kv-prefix-mode:{kv_prefix_mode}",
             f"kv-lengths-mode:{kv_lengths_mode}",
@@ -1343,7 +1338,9 @@ def _make_prims_ts_decode_wrapper_trace(
     )
 
 
-_PRIMS_TS_DECODE_WRAPPER_TRACES = {
+# Finite examples support trace discovery and schema-consistency tests. Bound
+# dispatch below synthesizes the exact template from the wrapper's plan state.
+_PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
     (combined, fp16_output, q_mode): _make_prims_ts_decode_wrapper_trace(
         combined=combined,
         fp16_output=fp16_output,
@@ -1399,18 +1396,18 @@ def _require_bound_trace_tensors(
     missing = [name for name in names if not isinstance(kwargs.get(name), torch.Tensor)]
     if missing:
         raise ValueError(
-            f"Tracing {wrapper_name}.run requires live tensor argument(s): "
+            f"Tracing {wrapper_name}.run requires per-run tensor argument(s): "
             f"{', '.join(missing)}"
         )
 
 
 def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
-    """Select the wrapper schema, using plan state to disambiguate rank-3 Q."""
+    """Synthesize the exact wrapper schema from its bound plan state."""
 
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            "Tracing BatchDecodePagedTSWrapper.run requires the live wrapper's "
+            "Tracing BatchDecodePagedTSWrapper.run requires the bound wrapper's "
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
@@ -1454,7 +1451,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
 
 
 prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_WRAPPER_TRACES.values()
+    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values()
 )
 
 
@@ -1548,7 +1545,7 @@ def _make_prims_ts_decode_mla_trace(*, rank4_cache: bool, packed_query: bool):
                 else ["seq_len_q >= 1"]
             ),
         ],
-        tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
+        tags=["stage:decode", "backend:prims-ts", "mla"],
     )
 
 
@@ -1651,7 +1648,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
                 else ["seq_len_q >= 1"]
             ),
         ],
-        tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
+        tags=["stage:decode", "backend:prims-ts", "mla"],
     )
 
 
@@ -1721,7 +1718,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         ),
         "num_pages": Var(description="Physical MLA cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "max_pages_per_seq": Var(description="Live block-table column capacity."),
+        "max_pages_per_seq": Var(description="Per-run block-table column capacity."),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     if packed_query:
@@ -1758,12 +1755,12 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "block_tables": Tensor(
                 ["batch_size", "max_pages_per_seq"],
                 dtype="int32",
-                description="Required physical page table supplied live to run().",
+                description="Required physical page table supplied to run().",
             ),
             "seq_lens": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description="Required per-request KV lengths supplied live to run().",
+                description="Required per-request KV lengths supplied to run().",
             ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
@@ -1776,7 +1773,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "validate": Scalar(
                 "bool",
                 optional=True,
-                description="Whether to validate live tensors and metadata values.",
+                description="Whether to validate per-run tensors and metadata values.",
             ),
         },
         outputs={"output": Tensor(output_dims, dtype="bfloat16", param="out")},
@@ -1798,14 +1795,15 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         tags=[
             "stage:decode",
             "backend:prims-ts",
-            "status:experimental",
             "mla",
             f"mask:{mask_type}",
         ],
     )
 
 
-_PRIMS_TS_DECODE_MLA_WRAPPER_TRACES = {
+# Finite examples support trace discovery and schema-consistency tests. Bound
+# dispatch below synthesizes the exact template from the wrapper's plan state.
+_PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
@@ -1847,10 +1845,12 @@ def _get_prims_ts_decode_mla_wrapper_trace(
 
 
 def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
+    """Synthesize the exact MLA wrapper schema from its bound plan state."""
+
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            "Tracing BatchMLADecodePagedTSWrapper.run requires the live wrapper's "
+            "Tracing BatchMLADecodePagedTSWrapper.run requires the bound wrapper's "
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
@@ -1881,7 +1881,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
 
 
 prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACES.values()
+    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values()
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────

@@ -4,19 +4,14 @@ FlashInfer Attention Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-Experimental Task-Scheduled Attention
-=====================================
+Task-Scheduled Attention
+========================
 
-The experimental Blackwell task-scheduled FMHA context, FMHA decode,
-block-sparse FMHA, and MLA decode APIs are imported from
+The Blackwell task-scheduled FMHA context, FMHA decode, block-sparse FMHA, and
+MLA decode APIs are imported from
 ``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
 reduction are automatic implementation details; there are no public tuning
 knobs.
-
-.. warning::
-
-    All PrimTS wrappers are experimental. Their signatures and plan/run
-    lifecycle may change incompatibly while this API family is stabilized.
 
 See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
 for the public entry points, supported contracts, and examples. Current accuracy

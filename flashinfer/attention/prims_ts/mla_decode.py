@@ -22,10 +22,18 @@ from typing import Any, Literal, Optional, cast
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import (
-    prims_ts_decode_mla_one_shot_trace_dispatch,
-    prims_ts_decode_mla_trace_dispatch,
-    prims_ts_decode_mla_wrapper_trace_dispatch,
+
+from ._trace import _get_attention_trace_template
+
+
+prims_ts_decode_mla_one_shot_trace_dispatch = _get_attention_trace_template(
+    "prims_ts_decode_mla_one_shot_trace_dispatch"
+)
+prims_ts_decode_mla_trace_dispatch = _get_attention_trace_template(
+    "prims_ts_decode_mla_trace_dispatch"
+)
+prims_ts_decode_mla_wrapper_trace_dispatch = _get_attention_trace_template(
+    "prims_ts_decode_mla_wrapper_trace_dispatch"
 )
 
 from ._tensor_aliasing import (
@@ -377,7 +385,7 @@ def _validate_mla_run_metadata(
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
 ) -> None:
-    """Validate live request metadata against one static MLA plan.
+    """Validate per-run request metadata against one static MLA plan.
 
     Value checks synchronize CUDA metadata with the host. ``run(validate=False)``
     is the synchronization-free path for compilation and graph capture.
@@ -446,7 +454,7 @@ def _validate_mla_run_metadata(
             for page_id in row[:required_pages]
         ):
             raise ValueError(
-                "block_tables values for live pages must index the physical "
+                "block_tables values for active pages must index the physical "
                 f"K/V cache in [0, {runtime.num_physical_pages}); request "
                 f"{request_idx} contains an invalid page ID"
             )
@@ -1327,7 +1335,7 @@ def _validate_mla_output_aliasing(
     qo_indptr: Optional[torch.Tensor],
     workspace_buffer: torch.Tensor,
 ) -> None:
-    """Keep output disjoint from every live MLA decode allocation."""
+    """Keep output disjoint from every MLA decode input allocation."""
 
     _validate_out_does_not_overlap_inputs(
         runtime.out,
@@ -1454,7 +1462,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     block_tables : torch.Tensor
         Dense physical-page table for each request.
     seq_lens : torch.Tensor
-        Live K/V sequence lengths.
+        Per-run K/V sequence lengths.
     max_seq_len : int
         Static maximum K/V length used for policy selection and JIT caching.
     qo_indptr : torch.Tensor, optional
@@ -1607,12 +1615,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
 
 
 class BatchMLADecodePagedTSWrapper:
-    """Compile and reuse task-scheduled paged MLA decode launches.
-
-    .. warning::
-        This wrapper is experimental. Its plan/run contract may change without
-        a compatibility shim.
-    """
+    """Compile and reuse task-scheduled paged MLA decode launches."""
 
     @flashinfer_api
     def __init__(self) -> None:
@@ -1648,7 +1651,7 @@ class BatchMLADecodePagedTSWrapper:
 
         ``packed_query=False`` selects fixed ``[B, SQ, H, 576]`` query storage,
         where ``SQ`` is exactly ``max_seq_len_q``. ``packed_query=True`` selects
-        ``[total_q, H, 576]`` storage with live cumulative offsets supplied to
+        ``[total_q, H, 576]`` storage with per-run cumulative offsets supplied to
         every run. ``max_seq_len_q`` is then the per-request capacity.
         Individual packed requests may be empty; an all-empty run returns its
         empty output without dispatching a GPU kernel.
@@ -1785,7 +1788,7 @@ class BatchMLADecodePagedTSWrapper:
     ) -> torch.Tensor:
         """Launch the most recently planned MLA decode on the current stream.
 
-        ``block_tables`` and ``seq_lens`` are required live bindings.
+        ``block_tables`` and ``seq_lens`` are required per-run bindings.
         ``qo_indptr`` is required by a packed-query plan and rejected by a
         fixed-query plan. With validation enabled, tensor structure, metadata
         values, scales, aliases, and every static capacity are checked before
@@ -1911,7 +1914,7 @@ def batch_decode_mla_with_paged_kv_cache(
     block_tables : torch.Tensor
         Dense physical-page table for each request.
     seq_lens : torch.Tensor
-        Live K/V sequence lengths.
+        Per-run K/V sequence lengths.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_seq_len_q : int, optional

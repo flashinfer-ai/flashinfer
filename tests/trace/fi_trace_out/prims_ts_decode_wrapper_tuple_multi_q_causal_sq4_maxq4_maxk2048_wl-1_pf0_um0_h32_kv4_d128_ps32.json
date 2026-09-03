@@ -6,7 +6,6 @@
     "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
-    "status:experimental",
     "mask:causal",
     "kv-prefix-mode:dynamic",
     "kv-lengths-mode:dynamic"
@@ -73,11 +72,11 @@
     },
     "len_indptr": {
       "type": "var",
-      "description": "Length of the live native CSR indptr."
+      "description": "Length of the per-run native CSR indptr."
     },
     "num_kv_indices": {
       "type": "var",
-      "description": "Number of live page IDs."
+      "description": "Number of active page IDs."
     },
     "len_qo_indptr": {
       "type": "var",
@@ -125,21 +124,21 @@
         "len_indptr"
       ],
       "dtype": "int32",
-      "description": "Required native CSR offsets supplied live to run()."
+      "description": "Required native CSR offsets supplied to run()."
     },
     "paged_kv_indices": {
       "shape": [
         "num_kv_indices"
       ],
       "dtype": "int32",
-      "description": "Required physical page IDs supplied live to run()."
+      "description": "Required physical page IDs supplied to run()."
     },
     "seq_lens": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Required per-request KV lengths supplied live to run()."
+      "description": "Required per-request KV lengths supplied to run()."
     },
     "qo_indptr": {
       "shape": [
@@ -163,7 +162,7 @@
       "shape": null,
       "dtype": "bool",
       "optional": true,
-      "description": "Whether to validate live tensors and metadata values."
+      "description": "Whether to validate per-run tensors and metadata values."
     }
   },
   "outputs": {

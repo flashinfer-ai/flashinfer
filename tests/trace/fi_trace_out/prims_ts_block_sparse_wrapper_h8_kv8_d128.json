@@ -1,12 +1,11 @@
 {
   "name": "prims_ts_block_sparse_wrapper_h8_kv8_d128",
-  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and mask type are retained by plan() and represented as optional trace context.",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and per-run per-KV-head BSR metadata. Block geometry and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparseTSWrapper.run",
     "backend:prims-ts",
-    "sparse:block",
-    "status:experimental"
+    "sparse:block"
   ],
   "axes": {
     "batch_size": {
@@ -92,14 +91,14 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into live block_indices for this wrapper run."
+      "description": "Absolute offsets into active block_indices for this wrapper run."
     },
     "block_indices": {
       "shape": [
         "num_block_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are live."
+      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are active."
     },
     "kv_valid_bits": {
       "shape": [

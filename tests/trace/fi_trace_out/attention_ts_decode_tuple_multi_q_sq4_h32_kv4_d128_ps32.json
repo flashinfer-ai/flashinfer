@@ -5,8 +5,7 @@
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
     "stage:decode",
-    "backend:prims-ts",
-    "status:experimental"
+    "backend:prims-ts"
   ],
   "axes": {
     "batch_size": {

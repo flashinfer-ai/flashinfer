@@ -1181,7 +1181,6 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "block_tables",
         "seq_lens",
         "qo_indptr",
-        "live_metadata",
     ):
         assert request_metadata not in plan_parameters
 
@@ -1324,7 +1323,7 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
 
     with pytest.raises(
         ValueError,
-        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+        match=r"requires the bound wrapper's plan state.*flashinfer\.fi_trace",
     ):
         wrapper.run.fi_trace(**kwargs)
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
@@ -1760,8 +1759,8 @@ def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_run_rejects_invalid_live_page_id():
-    """Validate every live page reference against runtime cache storage."""
+def test_attention_ts_mla_run_rejects_invalid_active_page_id():
+    """Validate every active page reference against runtime cache storage."""
 
     case = _make_mla_case(
         batch_size=1,
@@ -2185,7 +2184,7 @@ def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
+def test_attention_ts_mla_decode_graph_reloads_all_per_run_metadata():
     """One replay reloads packed Q offsets, K lengths, and every page-table row."""
 
     q_lens = tuple(0 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
