@@ -30,6 +30,14 @@ check; rows whose built-in cake-vs-cute self-gate fails are tolerated as
 long as the candidate-side checks pass (cake and cute are bitwise-matched
 twins on this workload family, so that gate measures graph identity, not
 accuracy).
+
+From a clean checkout with CUDA 13.0 or newer and Python 3.10 or newer:
+
+``pip install -v .``
+
+Then run the complete direct comparison against the in-tree CAKE backend:
+
+``python benchmarks/bench_cake_mamba_ssd_combined_matrix.py --fresh``
 """
 
 import argparse
@@ -48,7 +56,7 @@ ROW_BENCH = REPO_ROOT / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "vibecuda_ssd_combined"
 CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v1"
 
-# Exact rows from PR 4576 commit 261d59d6f03f659c9f575240241712a8396507c8,
+# Exact rows from merged PR 4576 head edc312de23f81e8ca38cc0e05be87c654c4b438c,
 # tests/mamba/test_cake_ssd_combined.py::test_cake_ssd_combined_route_matrix.
 MATRIX = [
     (
