@@ -2966,7 +2966,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
+    r"""Decode MLA with Blackwell, TRTLLM-GEN, CuteDSL, XQA, or sparse kernels.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
     when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
@@ -3033,14 +3033,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+        Blackwell, CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
     bmm2_scale : Union[float, torch.Tensor]
         Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
-        CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires
-        ``1.0``.
+        Blackwell, CuteDSL, and XQA require a float. SM120/SM121 sparse v32/GLM
+        requires ``1.0``.
     sinks : Optional[List[torch.Tensor]]
         Additional value per head in the denominator of the softmax.
-        Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``.
+        Supported by ``trtllm-mla-blackwell``, ``trtllm-gen``, ``cute-dsl``, and ``sparse``.
         On ``cute-dsl`` this requires the modular implementation;
         ``cute_dsl_impl="auto"`` (the default) promotes to modular
         automatically, and ``cute_dsl_impl="monolithic"`` with sinks set raises
@@ -3056,7 +3056,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
         backends; ignored by ``cute-dsl``.
     backend : str = "auto"
         Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
-        ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``. ``"auto"``
+        ``"trtllm-mla-blackwell"``, ``"trtllm-gen"``, ``"cute-dsl"``, and
+        ``"sparse"``.
+        ``"trtllm-mla-blackwell"`` explicitly selects the source-level Blackwell semantic
+        dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
+        sink, LSE, and caller-owned-output envelope and is never selected
+        automatically. ``"auto"``
         chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
         ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
         SM120/SM121 dense decode uses ``"xqa"``.
@@ -3085,8 +3090,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         passing ``True`` to other backends raises ``ValueError``.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
-        ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
-        dtype ``torch.float32``. Accepted shapes:
+        ``trtllm-mla-blackwell``, ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must
+        have dtype ``torch.float32``. Accepted shapes:
 
         * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
           native; accepted by sparse), or
@@ -3098,7 +3103,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If ``return_lse`` is True and this is None, a buffer will be
         allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Supported by ``trtllm-gen``,
+        Whether to return LSE values. Supported by ``trtllm-mla-blackwell``, ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
@@ -3125,9 +3130,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         shape ``[batch_size + 1]``, dtype ``torch.int32``. Must be a 1D tensor
         with at least two entries. When ``max_q_len`` is not provided, this
         function validates that it starts with 0, ends at ``query.size(0)``,
-        and is monotonically non-decreasing. Supported by TRTLLM-GEN and the
-        monolithic CuTeDSL implementation. When provided, ``query`` must have
-        shape ``[total_q, num_heads, head_dim_qk]``.
+        and is monotonically non-decreasing. Supported by Blackwell, TRTLLM-GEN,
+        and the monolithic CuTeDSL implementation. When provided, ``query``
+        must have shape ``[total_q, num_heads, head_dim_qk]``.
         For best performance, provide ``max_q_len`` together with
         ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
@@ -3264,6 +3269,36 @@ def trtllm_batch_decode_with_kv_cache_mla(
     check_trtllm_gen_sm107_only_feature(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
+
+    if backend == "trtllm-mla-blackwell":
+        from .trtllm_mla_blackwell import trtllm_mla_blackwell_decode
+
+        return trtllm_mla_blackwell_decode(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            lse=lse,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            enable_dcp=enable_dcp,
+            backend="trtllm-mla-blackwell",
+        )
 
     if backend == "auto":
         cc = get_compute_capability(query.device)
