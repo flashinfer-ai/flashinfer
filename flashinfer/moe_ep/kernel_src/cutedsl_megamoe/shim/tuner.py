@@ -161,7 +161,6 @@ _BF16_TOKEN_KNOBS: Dict[str, Any] = {
     "use_2cta_instrs": True,
     "flag_batch": 1,
     "epi_flag_batch": (1, 1),
-    "token_back_mode": "epi_warps",
     "load_balance_mode": "static",
 }
 
@@ -173,7 +172,6 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "cluster_shape_mnk": (2, 1, 1),
     "flag_batch": 1,
     "epi_flag_batch": (1, 1),
-    "token_back_mode": "epi_warps",
     "load_balance_mode": "static",
 }
 
