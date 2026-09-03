@@ -163,6 +163,40 @@ __device__ __forceinline__ T convert_from_float(float val)
   }
 }
 
+template <typename T>
+struct packed_type;
+template <>
+struct packed_type<half>
+{
+  using type = half2;
+};
+template <>
+struct packed_type<nv_bfloat16>
+{
+  using type = nv_bfloat162;
+};
+
+// |x| max over 8 storage-type values in packed pairs (HMNMX2 + HABS2).  It
+// yields the same fp32 amax as the per-element fabsf/fmaxf loop over the
+// converted values: |x| is exact in T, maxNum picks the same element (a NaN
+// operand yields the other one, as fmaxf does), the T->fp32 convert of the
+// winner is exact, and a bf16 subnormal winner is flushed by the very next
+// fp32 max exactly as the fp32 loop flushes it.  Only legal when the amax is
+// over the raw values (Q); K reduces |x - mean| in fp32 and keeps the loop.
+template <typename T>
+__device__ __forceinline__ float packed_abs_max8(const T (&x)[8])
+{
+  using T2 = typename packed_type<T>::type;
+  const T2 *pairs = reinterpret_cast<const T2 *>(&x[0]);
+  T2 acc = __habs2(pairs[0]);
+#pragma unroll
+  for (uint32_t j = 1; j < 4; ++j)
+  {
+    acc = __hmax2(acc, __habs2(pairs[j]));
+  }
+  return fmaxf(convert_to_float<T>(acc.x), convert_to_float<T>(acc.y));
+}
+
 }  // namespace detail
 
 // ============================================================================
@@ -764,10 +798,17 @@ __global__ void QuantInt8FusedAmaxPackKernel(
         !(group_id == amax_exclude_group && global_token >= used_sequence);
     if (amax_valid)
     {
-#pragma unroll
-      for (uint32_t j = 0; j < pack_size; ++j)
+      if constexpr (sub_mean)
       {
-        amax_val = fmaxf(amax_val, fabsf(x_val_float[j]));
+#pragma unroll
+        for (uint32_t j = 0; j < pack_size; ++j)
+        {
+          amax_val = fmaxf(amax_val, fabsf(x_val_float[j]));
+        }
+      }
+      else
+      {
+        amax_val = fmaxf(amax_val, detail::packed_abs_max8<T>(x_val));
       }
     }
   }

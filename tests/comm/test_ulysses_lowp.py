@@ -825,3 +825,46 @@ def test_pdl_launches_capture_into_a_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(send, eager)
+
+
+# ---------------------------------------------------------------------------
+# 11. Packed (HMNMX2) Q amax must equal the fp32 fabsf/fmaxf loop on the
+#     special values where the two could conceivably diverge
+# ---------------------------------------------------------------------------
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_packed_q_amax_matches_split_path_on_special_values(dtype):
+    world, L = 4, 256
+    q, k, v = _global_inputs(dtype, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    finfo = torch.finfo(dtype)
+    specials = {
+        "all_subnormal": finfo.smallest_normal / 4,
+        "signed_zero": -0.0,
+        "inf": float("inf"),
+        "nan": float("nan"),
+        "max": finfo.max,
+        "below_floor": 1e-8,
+    }
+    # One 32-token Q group per case, each on a different rank/head, plus a
+    # NaN-only group and a group mixing NaN with finite values.
+    for gi, (name, value) in enumerate(specials.items()):
+        r, h = gi % world, gi
+        rows = slice(r * L + gi * 32, r * L + (gi + 1) * 32)
+        q[:, rows, h] = value
+    q[:, 2 * L : 2 * L + 32, 20] = float("nan")
+    q[:, 2 * L + 32 : 2 * L + 64, 21, ::2] = float("nan")
+    q[:, 3 * L : 3 * L + 32, 22] = finfo.smallest_normal / 8  # subnormal group
+    q[:, 3 * L + 5 : 3 * L + 6, 22] = 3.0  # ... with one normal winner
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+        q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
+        k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
+        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale,
+                                    rank=r, world_size=world)
+        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=r,
+                                          world_size=world)
+        assert torch.equal(split, fused), f"rank {r}"
