@@ -658,7 +658,7 @@ def _make_autotune_key_inputs():
     return inputs, dynamic_inputs
 
 
-def _make_autotune_runner(inputs):
+def _make_autotune_runner(inputs, heads_per_group=16):
     optional_input_indices = (
         12,  # D
         13,  # z
@@ -675,7 +675,7 @@ def _make_autotune_runner(inputs):
         requested_algorithm=0,
         requested_d_split=0,
         precompute_heads_per_cta=0,
-        heads_per_group=16,
+        heads_per_group=heads_per_group,
         optional_tensor_presence=tuple(
             inputs[index] is not None for index in optional_input_indices
         ),
@@ -805,7 +805,7 @@ def test_autotune_tactics_deduplicate_identical_small_batch_grids():
     assert {tactic[-1] for tactic in tactics} == {1, 2}
 
     non_power_of_two_tactics = _make_tactics(14, 32, 14, 148, (1, 2))
-    assert {tactic[2] for tactic in non_power_of_two_tactics[2:]} == {14, 7, 1}
+    assert {tactic[2] for tactic in non_power_of_two_tactics[2:]} == {14, 7, 3, 1}
 
 
 def test_autotune_tactics_sweep_every_cta_per_sm_candidate():
@@ -839,6 +839,13 @@ def test_autotune_tactics_sweep_d_split(monkeypatch):
         _CTA_PER_SM_CANDIDATES,
         (16, 8, 4, 2, 1),
         (1, 2),
+    )
+    non_power_of_two_runner = _make_autotune_runner(inputs, heads_per_group=14)
+    assert non_power_of_two_runner.get_cache_key_extras(inputs)[-2][1][2] == (
+        14,
+        7,
+        3,
+        1,
     )
 
 

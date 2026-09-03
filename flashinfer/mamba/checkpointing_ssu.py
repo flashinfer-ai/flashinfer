@@ -100,9 +100,7 @@ def _make_tactics(
 ) -> tuple[_CheckpointingSSUTactic, ...]:
     """Build distinct ReplaySSM launches for one optimization profile."""
     heads_per_cta_candidates = tuple(
-        heads_per_group >> shift
-        for shift in range(heads_per_group.bit_length())
-        if heads_per_group % (heads_per_group >> shift) == 0
+        heads_per_group >> shift for shift in range(heads_per_group.bit_length())
     )
     tactics = [(0, 0, 0, d_split) for d_split in d_splits]
     seen_launches: set[tuple[int, int, int, int]] = set()
@@ -418,7 +416,6 @@ class CheckpointingSSURunner(TunableRunner):
             heads_per_cta = tuple(
                 heads_per_group >> shift
                 for shift in range(heads_per_group.bit_length())
-                if heads_per_group % (heads_per_group >> shift) == 0
             )
             # Describe the concrete tuning axes rather than the batch-specific
             # deduplicated launches. Runtime batches in the same optimization
@@ -849,8 +846,8 @@ def checkpointing_ssu(
         ``cu_seqlens`` is not provided.
     precompute_heads_per_cta : int
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
-        launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
-        snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
+        launcher's co-residency heuristic; >0 overrides it and must be on the
+        ``HEADS_PER_GROUP >> k`` halving chain.  Tuning knob — two-kernel path only.
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
         With the scratch trio and no explicit tuning knobs, ``"auto"`` uses

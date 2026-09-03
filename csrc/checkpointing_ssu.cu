@@ -454,14 +454,18 @@ void checkpointing_ssu(
                    " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
   // ── Validate precompute_heads_per_cta (two-kernel PRECOMPUTE head-tiling, host knob) ──
-  // 0 = use the launcher's co-residency heuristic; >0 overrides (must divide HEADS_PER_GROUP).
+  // 0 = use the launcher's co-residency heuristic; >0 overrides and must match
+  // the HEADS_PER_GROUP>>k chain instantiated by dispatch_heads_per_cta.
   {
     int64_t const hpg = nheads / ngroups;
-    FLASHINFER_CHECK(precompute_heads_per_cta >= 0 &&
-                         (precompute_heads_per_cta == 0 || hpg % precompute_heads_per_cta == 0),
-                     "precompute_heads_per_cta=", precompute_heads_per_cta,
-                     " must be 0 (heuristic) or a positive divisor of HEADS_PER_GROUP "
-                     "(nheads/ngroups=",
+    bool valid_heads_per_cta = precompute_heads_per_cta == 0;
+    for (int64_t candidate = hpg; candidate >= 1; candidate >>= 1) {
+      valid_heads_per_cta |= precompute_heads_per_cta == candidate;
+      if (candidate == 1) break;
+    }
+    FLASHINFER_CHECK(valid_heads_per_cta, "precompute_heads_per_cta=", precompute_heads_per_cta,
+                     " must be 0 (heuristic) or a value on the HEADS_PER_GROUP>>k chain "
+                     "(HEADS_PER_GROUP=",
                      hpg, ")");
   }
 
