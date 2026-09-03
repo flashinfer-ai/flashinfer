@@ -153,6 +153,7 @@ from .jit.mhc import gen_mhc_module
 from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
+from .jit.patchshift_conv3d import gen_patchshift_conv3d_module
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
@@ -573,6 +574,9 @@ def gen_all_modules(
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
+
+    if sm_capabilities.get("sm100a_exact", False):
+        jit_specs.append(gen_patchshift_conv3d_module())
 
     jit_specs += list(
         gen_attention(
