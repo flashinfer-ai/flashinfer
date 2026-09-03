@@ -40,9 +40,9 @@ from tests.attn_scores.test_attn_scores import (
 DEVICE = "cuda"
 
 
-def _skip_if_not_sm100():
+def _skip_if_no_paged_mqa_support():
     if not is_sm100a_supported(torch.device(DEVICE)):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ def _cmp_fp8(
 def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     """The on-GPU schedule kernel must be BIT-EXACT vs the CPU reference for every
     batch size (incl. non-multiples of 32) and adversarial context distributions."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer.attn_scores.attn_scores import (
         _cached_num_sms,
         _compute_schedule_metadata,
@@ -170,7 +170,7 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
 )
 def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
     """Boundary context lengths (block/128/256 multiples and ±1) must stay correct."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     if ctx < next_n:
         pytest.skip("ctx must be >= next_n for a valid causal window")
     cl = torch.full((4,), ctx, dtype=torch.int32, device=DEVICE)
@@ -188,7 +188,7 @@ def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
 @pytest.mark.parametrize("next_n", [1, 2])
 def test_adv_skewed_varlen_fp8(next_n):
     """One very long sequence + many short ones (schedule stress)."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     B, block_size = 16, 64
     cl = torch.full((B,), 128, dtype=torch.int32, device=DEVICE)
     cl[0] = 32768
@@ -209,7 +209,7 @@ def test_adv_skewed_varlen_fp8(next_n):
 )
 def test_adv_degenerate_values_fp8(mode):
     """Degenerate inputs must not NaN and must match the reference."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(3)
@@ -264,7 +264,7 @@ def test_adv_degenerate_values_fp8(mode):
 
 def test_adv_determinism_fp8():
     """Identical inputs must yield bitwise-identical output across calls."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     cl = torch.randint(500, 4096, (8,), dtype=torch.int32, device=DEVICE)
@@ -288,7 +288,7 @@ def test_adv_determinism_fp8():
 @pytest.mark.parametrize("ctx", [128, 129, 256, 257, 1024])
 def test_adv_fp4_boundaries(block_size, next_n, ctx):
     """FP4: boundary contexts across all block_size (SF layout correctness)."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
     if ctx < next_n:
@@ -343,7 +343,7 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
 @pytest.mark.parametrize("ctx", [8, 64, 128, 129, 256, 257])
 def test_adv_fp4_max_next_n_small_ctx(ctx):
     """FP4 at the largest supported next_n with small/boundary contexts."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
     torch.manual_seed(ctx)
@@ -392,7 +392,7 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
 
 def test_adv_shared_physical_blocks_fp8():
     """All rows point at the SAME physical blocks (KV sharing) — must be correct."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(5)
@@ -430,7 +430,7 @@ def test_adv_shared_physical_blocks_fp8():
 
 def test_adv_guards_raise():
     """Adversarial malformed inputs on the guarded paths must raise ValueError."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import padded_context_len, fp8_paged_mqa_logits
 
     B, next_n, block_size = 2, 1, 64
@@ -460,7 +460,7 @@ def test_adv_guards_raise():
 
 def test_adv_new_guards_raise():
     """Guards added after the adversarial review must raise ValueError (not OOB/crash)."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import (
         compute_paged_mqa_logits_schedule,
         fp4_paged_mqa_logits,
@@ -538,7 +538,7 @@ def test_adv_zero_length_row_not_executed(variant):
     An all-zero batch cannot show this: its schedule has start == end, so the
     iterator is never entered. Regression for PR #4365 review r3824813393.
     """
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import (
         fp4_paged_mqa_logits,
         fp8_paged_mqa_logits,
@@ -613,7 +613,7 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
     Per-row weights differ, so consuming the wrong row's W is unmissable.
     Regression for PR #4365 review r3824800923 / r3824808841.
     """
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import _cached_num_sms
     from flashinfer.utils import get_device_index
@@ -741,7 +741,7 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows():
     this exercises the 2-atom split (the only split that can execute) and on
     Rubin the direct path, where zero-work atoms coincide with zero rows.
     """
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import _cached_num_sms
     from flashinfer.utils import get_device_index
