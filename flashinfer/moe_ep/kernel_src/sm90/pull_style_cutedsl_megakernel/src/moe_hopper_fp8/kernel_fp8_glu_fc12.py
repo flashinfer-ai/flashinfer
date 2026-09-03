@@ -348,6 +348,11 @@ class Sm90SwigluFp8Fc12Kernel:
         # ``_setup_attributes()`` reads it inside ``__call__`` to expand the
         # warp topology to the MegaMoE layout.
         self.enable_token_comm: bool = False
+        # MegaMoE-only: when True (requires active_dispatch_warps == 1) the
+        # TMA-A / TMA-B / scheduler roles are folded into the three idle
+        # dispatch-warpgroup slots and the separate producer warpgroup
+        # (incl. the epi_aux warp) is dropped -- see _apply_mega_warp_layout.
+        self.fold_producer_warps: bool = False
         self.dispatch_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
@@ -438,29 +443,7 @@ class Sm90SwigluFp8Fc12Kernel:
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
         if self.enable_token_comm:
-            dispatch_warp_start = self.epi_aux_warp_id + 1
-            self.dispatch_warp_id = tuple(
-                range(dispatch_warp_start, dispatch_warp_start + 4)
-            )
-            if self.token_back_standalone:
-                token_back_warp_start = dispatch_warp_start + 4
-                self.token_back_warp_id = tuple(
-                    range(token_back_warp_start, token_back_warp_start + 4)
-                )
-            token_back_warp_ids = (
-                self.token_back_warp_id if self.token_back_standalone else ()
-            )
-            self.threads_per_cta = 32 * len(
-                (
-                    *self.epilogue_warp_id,
-                    self.tma_a_warp_id,
-                    self.tma_b_warp_id,
-                    self.sched_warp_id,
-                    self.epi_aux_warp_id,
-                    *self.dispatch_warp_id,
-                    *token_back_warp_ids,
-                )
-            )
+            self._apply_mega_warp_layout()
 
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
 
@@ -654,6 +637,69 @@ class Sm90SwigluFp8Fc12Kernel:
         ) // ab_bytes_per_stage
         return num_acc_stage, num_ab_stage, num_sched_stages
 
+    def _apply_mega_warp_layout(self) -> None:
+        """Derive the MegaMoE warp topology (single source of truth).
+
+        Called from the Mega ctor and again from ``_setup_attributes`` at
+        ``__call__`` time; idempotent.  Two layouts:
+
+        default (producer warpgroup kept)::
+
+            [epi x 4*wgs][tma_a][tma_b][sched][epi_aux][disp0..disp3][tb?]
+
+        ``fold_producer_warps`` (needs active_dispatch_warps == 1)::
+
+            [epi x 4*wgs][disp0][tma_a][tma_b][sched][tb?]
+
+        With one active dispatch warp the other three dispatch slots are
+        idle, so TMA-A / TMA-B / scheduler move into them and the whole
+        producer warpgroup (128 threads + its register file) disappears.
+        ``dispatch_warp_id`` stays a 4-tuple so every TokenComm count that
+        keys on the physical dispatch warpgroup (num_dispatch_warps, the
+        128-thread nvlink barrier, the kernel-tail range) is unchanged; the
+        repurposed warps simply idle through the dispatch hook like the
+        reserved slots did.  There is no epi_aux warp in this layout, so the
+        FC1 store offload is unavailable and early publication is forced.
+        """
+        n_epi = len(self.epilogue_warp_id)
+        if self.fold_producer_warps:
+            dispatch_warp_start = n_epi
+            self.tma_a_warp_id = dispatch_warp_start + 1
+            self.tma_b_warp_id = dispatch_warp_start + 2
+            self.sched_warp_id = dispatch_warp_start + 3
+            # Sentinel: never matches a real warp index, so the epi_aux
+            # role branch is dead and the offload server hook is const-off.
+            self.epi_aux_warp_id = -1
+            producer_ids = ()
+        else:
+            dispatch_warp_start = self.epi_aux_warp_id + 1
+            producer_ids = (
+                self.tma_a_warp_id,
+                self.tma_b_warp_id,
+                self.sched_warp_id,
+                self.epi_aux_warp_id,
+            )
+        self.dispatch_warp_id = tuple(
+            range(dispatch_warp_start, dispatch_warp_start + 4)
+        )
+        # ``standalone_warps`` dedicates four token-back warps after dispatch;
+        # ``reuse_dispatch_warps`` runs the push inline on the dispatch warps.
+        token_back_warp_start = dispatch_warp_start + 4
+        self.token_back_warp_id = (
+            tuple(range(token_back_warp_start, token_back_warp_start + 4))
+            if self.token_back_standalone
+            else None
+        )
+        token_back_warp_ids = self.token_back_warp_id or ()
+        self.threads_per_cta = 32 * len(
+            (
+                *self.epilogue_warp_id,
+                *producer_ids,
+                *self.dispatch_warp_id,
+                *token_back_warp_ids,
+            )
+        )
+
     def estimated_register_budget(self) -> int:
         """Return the CTA register target implied by the current warp roles."""
         dispatch_warps = len(self.dispatch_warp_id) if self.dispatch_warp_id else 0
@@ -662,16 +708,51 @@ class Sm90SwigluFp8Fc12Kernel:
             if self.token_back_standalone and self.token_back_warp_id
             else 0
         )
+        if self.fold_producer_warps:
+            # Merged warpgroup: disp0 + tma_a + tma_b + sched share the four
+            # dispatch slots; no separate producer group, no epi_aux warp.
+            producer_regs = (
+                self.dispatch_reg_cnt
+                + self.tma_a_reg_cnt
+                + self.tma_b_reg_cnt
+                + self.sched_reg_cnt
+            )
+        else:
+            producer_regs = (
+                self.tma_a_reg_cnt
+                + self.tma_b_reg_cnt
+                + self.sched_reg_cnt
+                + self.epi_aux_reg_cnt
+                + dispatch_warps * self.dispatch_reg_cnt
+            )
         regs_per_warp = (
             len(self.epilogue_warp_id) * self.epi_reg_cnt
-            + self.tma_a_reg_cnt
-            + self.tma_b_reg_cnt
-            + self.sched_reg_cnt
-            + self.epi_aux_reg_cnt
-            + dispatch_warps * self.dispatch_reg_cnt
+            + producer_regs
             + token_back_warps * self.token_back_reg_cnt
         )
         return 32 * regs_per_warp
+
+    def fit_epi_registers(self) -> None:
+        """Grow the epilogue register file into the budget freed by folding.
+
+        Only under ``fold_producer_warps``: the dropped producer warpgroup
+        returns ~5.4K registers on the 2-WG (N256 / swap M256) kernels and
+        lifts the standalone-token-back N128 epilogue off its 200-reg floor.
+        Rounds down to the setmaxnreg granularity and never lowers a count.
+        ``MEGA_FOLD_EPI_FIT=0`` disables it (A/B probe).
+        """
+        if not self.fold_producer_warps:
+            return
+        if os.environ.get("MEGA_FOLD_EPI_FIT", "1") != "1":
+            return
+        n_epi = len(self.epilogue_warp_id)
+        other_regs = (
+            self.estimated_register_budget() // 32 - n_epi * self.epi_reg_cnt
+        )
+        per_epi_warp = (self._sm90_cta_register_budget // 32 - other_regs) // n_epi
+        fit = min(self._setmaxnreg_max, (per_epi_warp // 8) * 8)
+        if fit > self.epi_reg_cnt:
+            self.epi_reg_cnt = fit
 
     def fit_fc1_offload_registers(self) -> None:
         """Size the store server's register file to the CTA's remaining budget.

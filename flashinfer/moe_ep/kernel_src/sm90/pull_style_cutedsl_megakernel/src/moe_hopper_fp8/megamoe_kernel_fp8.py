@@ -144,7 +144,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         active_dispatch_warps: int = 1,
         fc1_store_offload: bool = True,
         fc1_early_done_publish: bool = False,
+        fold_producer_warps: bool = True,
     ) -> None:
+        # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
+        # only possible with a single active dispatch warp.  Without the
+        # epi_aux warp there is no FC1 store server, so the offload is
+        # replaced by in-epilogue early fc1_done publication.
+        _fold = bool(fold_producer_warps) and active_dispatch_warps == 1
+        if _fold:
+            fc1_store_offload = False
+            fc1_early_done_publish = True
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm90MegaMoEFp8Kernel requires "
@@ -198,19 +207,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
 
         self.enable_token_comm = True
-        dispatch_warp_start = self.epi_aux_warp_id + 1
-        self.dispatch_warp_id = tuple(
-            range(dispatch_warp_start, dispatch_warp_start + 4)
-        )
-        # ``standalone_warps`` dedicates four token-back warps after dispatch;
-        # ``reuse_dispatch_warps`` runs the push inline on the dispatch warps.
+        self.fold_producer_warps = _fold
         self.token_back_standalone = token_back_mode == "standalone_warps"
-        token_back_warp_start = dispatch_warp_start + 4
-        self.token_back_warp_id = (
-            tuple(range(token_back_warp_start, token_back_warp_start + 4))
-            if self.token_back_standalone
-            else None
-        )
+        self._apply_mega_warp_layout()
         # Keep the established swap-AB and non-swap N=256 budgets. Non-swap
         # N=128 has one epilogue warpgroup and can use the architectural
         # setmaxnreg maximum without approaching the CTA budget.
@@ -222,20 +221,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         ):
             self.epi_reg_cnt = 256
         self.token_back_reg_cnt = 32
-        token_back_warp_ids = (
-            self.token_back_warp_id if self.token_back_standalone else ()
-        )
-        self.threads_per_cta = 32 * len(
-            (
-                *self.epilogue_warp_id,
-                self.tma_a_warp_id,
-                self.tma_b_warp_id,
-                self.sched_warp_id,
-                self.epi_aux_warp_id,
-                *self.dispatch_warp_id,
-                *token_back_warp_ids,
-            )
-        )
+        self.fit_epi_registers()
         self.fit_fc1_offload_registers()
         self.validate_register_policy()
 
@@ -330,14 +316,11 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # Cohabiting warps before the dispatch group: one or two
         # epilogue/WGMMA warpgroups plus TMA-A/TMA-B/scheduler and the empty
         # old-MMA warp.
-        num_other_warps = len(
-            (
-                *self.epilogue_warp_id,
-                self.tma_a_warp_id,
-                self.tma_b_warp_id,
-                self.sched_warp_id,
-                self.epi_aux_warp_id,
-            )
+        # Non-dispatch, non-token-back warps.  When the producer roles are
+        # folded into the dispatch warpgroup they are already counted by
+        # TokenComm's num_dispatch_warps, so only the epilogue remains.
+        num_other_warps = len(self.epilogue_warp_id) + (
+            0 if self.fold_producer_warps else 4
         )
 
         # For token_back_by_dispatch, the dispatch warp pushes fc2 results

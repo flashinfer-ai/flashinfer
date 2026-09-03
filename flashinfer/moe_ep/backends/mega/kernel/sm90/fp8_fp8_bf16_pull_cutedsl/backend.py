@@ -186,6 +186,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             active_dispatch_warps=k.active_dispatch_warps,
             fc1_store_offload=k.fc1_store_offload,
             fc1_early_done_publish=k.fc1_early_done_publish,
+            fold_producer_warps=k.fold_producer_warps,
         )
 
     def validate_forward(
@@ -374,5 +375,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.active_dispatch_warps,
             k.fc1_store_offload,
             k.fc1_early_done_publish,
+            k.fold_producer_warps,
             knobs_pool_key(k.knobs),
         )

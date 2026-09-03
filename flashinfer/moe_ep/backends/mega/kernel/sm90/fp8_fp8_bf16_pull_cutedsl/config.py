@@ -103,6 +103,10 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # with register headroom; falls back to early fc1_done publication).
     fc1_store_offload: bool = True
     fc1_early_done_publish: bool = False
+    # Fold TMA-A/TMA-B/scheduler into the three idle dispatch-warpgroup slots
+    # and drop the producer warpgroup (needs active_dispatch_warps == 1; no
+    # epi_aux warp, so the FC1 store offload is replaced by early publish).
+    fold_producer_warps: bool = True
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

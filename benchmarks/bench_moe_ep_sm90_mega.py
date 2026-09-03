@@ -268,6 +268,33 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
     )
     p.add_argument(
+        "--fold-producer-warps",
+        dest="fold_producer_warps",
+        action="store_true",
+        default=True,
+        help="fold TMA-A/TMA-B/sched into the idle dispatch-WG slots and "
+        "drop the producer warpgroup (active_dispatch_warps=1 only; "
+        "forces early fc1_done publish, no store offload)",
+    )
+    p.add_argument(
+        "--no-fold-producer-warps",
+        dest="fold_producer_warps",
+        action="store_false",
+    )
+    p.add_argument(
+        "--epi-mode",
+        choices=["auto", "basic", "pingpong", "cooperative"],
+        default="auto",
+        help="heuristic-order only: force every bucket's epilogue mode, "
+        "deriving the tile from the bucket's heuristic entry. basic = ONE "
+        "epilogue WG owning a per-WG-size task tile (non-swap N128 / swap "
+        "M128); pingpong = TWO epilogue WGs, each owning its own per-WG-size "
+        "tile, alternating; cooperative = TWO epilogue WGs splitting one "
+        "doubled tile (N256 / M256, no pingpong). Cluster "
+        "shape / accum / token-back stay the bucket's; buckets already in "
+        "the requested mode run unchanged (that no-op is the A/B sanity gate).",
+    )
+    p.add_argument(
         "--pingpong",
         choices=["auto", "on", "off"],
         default="auto",
@@ -446,12 +473,16 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
     pingpong = None if args.pingpong == "auto" else args.pingpong == "on"
+    cluster_shape_mnk = None
+    accum_override = None
+    token_back_override = None
     if operand_order == "heuristic":
         # All geometry knobs None -> the shim resolves the drop's token-bucket
         # heuristic per point (keyed on scale mode and max tokens per rank).
         swap_ab = None
         mma_tiler_mnk = None
-        if pingpong is not None and tokens is not None:
+        epi_mode = getattr(args, "epi_mode", "auto")
+        if (pingpong is not None or epi_mode != "auto") and tokens is not None:
             # A pingpong override alone would flip the shim into its
             # manual-geometry branch (default tiles).  Resolve the bucket's
             # heuristic config here and pass the full geometry with only
@@ -466,7 +497,34 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
             c = select_heuristic_config(scale_mode, tokens).config
             swap_ab = c.swap_ab
             mma_tiler_mnk = tuple(c.mma_tiler_mnk)
-            if pingpong and not c.pingpong and not _pingpong_tile_ok(c):
+            # Explicit geometry flips the shim into manual mode, which fills
+            # every UNSET knob from the drop driver's manual defaults -- not
+            # the bucket.  Forward the bucket's cluster shape, accum mode and
+            # token-back too, so the only difference really is pingpong.
+            cluster_shape_mnk = tuple(c.cluster_shape_mnk)
+            accum_override = c.accum_mode
+            token_back_override = c.token_back_mode
+            if epi_mode != "auto":
+                m, n, k = mma_tiler_mnk
+                # Epilogue modes differ in warpgroup count AND task-tile size:
+                #   basic       1 WG,  per-WG tile (N128 non-swap / M128 swap)
+                #   pingpong    2 WGs, per-WG tile each, alternating tiles
+                #   cooperative 2 WGs, one doubled tile (N256 / M256) split
+                # The tile dim that encodes this is N for non-swap, M for swap.
+                per_wg_tile, doubled_tile = 128, 256
+                if epi_mode == "cooperative":
+                    mma_tiler_mnk = (
+                        (doubled_tile, n, k) if c.swap_ab else (m, doubled_tile, k)
+                    )
+                    pingpong = False
+                else:  # basic and pingpong share the per-WG tile size
+                    mma_tiler_mnk = (
+                        (per_wg_tile, n, k) if c.swap_ab else (m, per_wg_tile, k)
+                    )
+                    pingpong = epi_mode == "pingpong"
+            if pingpong and not c.pingpong and not _pingpong_tile_ok(
+                type("T", (), {"mma_tiler_mnk": mma_tiler_mnk, "swap_ab": c.swap_ab})
+            ):
                 pingpong = c.pingpong  # bucket tile can't run ping-pong
     else:
         swap_ab = operand_order == "swap_ab"
@@ -476,16 +534,25 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         top_k=args.top_k,
         kind=args.kind,
         fp8_scale_mode=scale_mode,
-        fp8_accum_mode=args.fp8_accum_mode,
+        fp8_accum_mode=(
+            args.fp8_accum_mode
+            if args.fp8_accum_mode is not None
+            else accum_override
+        ),
         swap_ab=swap_ab,
         mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
         in_kernel_fc2_reduce=False,
         token_back_mode=(
             "reuse_dispatch_warps"
             if args.grouped_token_back
-            else (None if args.token_back == "heuristic" else args.token_back)
+            else (
+                token_back_override
+                if args.token_back == "heuristic"
+                else args.token_back
+            )
         ),
         pingpong=pingpong,
         dedup_dispatch=args.dedup_dispatch,
@@ -494,6 +561,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         active_dispatch_warps=args.active_dispatch_warps,
         fc1_store_offload=args.fc1_store_offload,
         fc1_early_done_publish=args.fc1_early_done_publish,
+        fold_producer_warps=args.fold_producer_warps,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

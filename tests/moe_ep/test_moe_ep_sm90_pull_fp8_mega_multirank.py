@@ -377,6 +377,10 @@ def _megakernel_config(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
+    fold_producer_warps: bool = False,
+    mma_tiler_mnk=None,
+    pingpong=None,
+    cluster_shape_mnk=None,
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
@@ -396,6 +400,10 @@ def _megakernel_config(
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
+        fold_producer_warps=fold_producer_warps,
+        mma_tiler_mnk=mma_tiler_mnk,
+        pingpong=pingpong,
+        cluster_shape_mnk=cluster_shape_mnk,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -416,6 +424,10 @@ def _run_mega_layer(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
+    fold_producer_warps: bool = False,
+    mma_tiler_mnk=None,
+    pingpong=None,
+    cluster_shape_mnk=None,
     num_experts: int = 8,
     topk: int = 4,
 ):
@@ -461,6 +473,10 @@ def _run_mega_layer(
             grouped_token_back=grouped_token_back,
             combine_format=combine_format,
             active_dispatch_warps=active_dispatch_warps,
+            fold_producer_warps=fold_producer_warps,
+            mma_tiler_mnk=mma_tiler_mnk,
+            pingpong=pingpong,
+            cluster_shape_mnk=cluster_shape_mnk,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -511,6 +527,10 @@ def _run_mega_layer(
                     grouped_token_back=grouped_token_back,
                     combine_format=combine_format,
                     active_dispatch_warps=active_dispatch_warps,
+                    fold_producer_warps=fold_producer_warps,
+                    mma_tiler_mnk=mma_tiler_mnk,
+                    pingpong=pingpong,
+                    cluster_shape_mnk=cluster_shape_mnk,
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -750,6 +770,115 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(active_dispatch_w
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"(active_dispatch_warps={active_dispatch_warps}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [("per_tensor", False), ("blockwise", False), ("per_tensor", True)],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_fold_producer_warps(fp8_scale_mode, swap_ab):
+    """TMA-A/TMA-B/sched folded into the dispatch warpgroup (no epi_aux warp).
+
+    Exercises the merged warp layout with early fc1_done publication across
+    the 1-WG / 2-WG non-swap kernels and the swap-AB kernel.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        fold_producer_warps=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(fold_producer_warps, {fp8_scale_mode}, swap_ab={swap_ab}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("cluster_shape_mnk", [(1, 1, 1), (2, 2, 1)])
+def test_moe_ep_sm90_pull_fp8_mega_layer_blockwise_coop_n256(cluster_shape_mnk):
+    """Blockwise non-swap cooperative M64N256 (2 epilogue WGs, no ping-pong).
+
+    The heuristic table never selected N256 for blockwise, so this geometry
+    (blockwise scale staging across two WGMMA fragments) was untested.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="blockwise",
+        swap_ab=False,
+        num_tokens=512,
+        max_tokens=512,
+        mma_tiler_mnk=(64, 256, 128),
+        pingpong=False,
+        cluster_shape_mnk=cluster_shape_mnk,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(blockwise coop M64N256, cga={cluster_shape_mnk}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        # (scale, swap_ab, tile, pingpong, cga, token_back, num_tokens) -- the exact
+        # heuristic rows re-calibrated on 2026-09-02/03 (see TUNING.md).
+        ("per_tensor", True, (256, 16, 128), False, (2, 1, 1), "epi_warps", 8),
+        ("per_tensor", True, (128, 64, 128), False, (1, 2, 1), "epi_warps", 64),
+        ("blockwise", False, (64, 256, 128), False, (2, 2, 1), "reuse_dispatch_warps", 2048),
+        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "reuse_dispatch_warps", 2048),
+        ("blockwise", False, (64, 256, 128), False, (1, 2, 1), "reuse_dispatch_warps", 2048),
+    ],
+    ids=["pt8_coop_M256N16", "pt64_basic_M128N64", "bw_coop_N256_cga22_reuse",
+         "bw_coop_N256_cga21_reuse", "bw_coop_N256_cga12_reuse"],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
+    """Bit-exact check of every heuristic row changed by the fold re-calibration.
+
+    The multirank tests otherwise pass explicit geometry (manual mode), so the
+    table's new rows are pinned here with their exact tile / ping-pong /
+    cluster shape / token-back.
+    """
+    scale, swap_ab, tile, pingpong, cga, token_back, num_tokens = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=swap_ab,
+        num_tokens=num_tokens,
+        max_tokens=max(num_tokens, 64),
+        token_back_mode=token_back,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(recalibrated row {scale} swap={swap_ab} tile={tile} pp={pingpong} "
+        f"cga={cga} tb={token_back} tokens={num_tokens}) matches reference"
     )
 
 

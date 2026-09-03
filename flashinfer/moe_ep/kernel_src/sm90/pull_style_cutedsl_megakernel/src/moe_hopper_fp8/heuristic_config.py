@@ -61,10 +61,10 @@ def _config(
 
 HEURISTIC_CONFIGS = {
     "per_tensor": {
-        8: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(2, 1, 1)),
+        8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
         16: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1)),
         32: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(1, 1, 1)),
-        64: _config(swap_ab=True, pingpong=True, tile=(128, 64, 128), cga=(1, 2, 1)),
+        64: _config(swap_ab=True, pingpong=False, tile=(128, 64, 128), cga=(1, 2, 1)),
         128: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1)),
         256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1)),
         512: _config(swap_ab=True, pingpong=False, tile=(256, 64, 128), cga=(1, 1, 1)),
@@ -87,6 +87,17 @@ HEURISTIC_CONFIGS = {
             token_back="reuse_dispatch_warps",
         ),
     },
+    # per_tensor 8 -> cooperative swap M256N16 and 64 -> basic swap M128N64
+    # (2026-09-02, fold layout): each +3..+4% over the ping-pong twin the
+    # 2026-08-19 table selected, consistent across three interleaved runs on
+    # two H200 nodes.
+    # blockwise non-swap 512-32768: cooperative M64N256 (two epilogue WGs on
+    # one tile), 2026-09-02 4x H200 under the fold_producer_warps layout:
+    # +11..+30% over both the basic M64N128 tile and its ping-pong twin at the
+    # same cluster shape / token-back (geomean +15.8%).  Under the old
+    # producer-warpgroup layout the same cooperative tile ran 14% BEHIND
+    # basic, which is why it was never selected before; the layout, not the
+    # register refit, is what makes the 2-WG modes viable here.
     "blockwise": {
         8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
         16: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(1, 1, 1)),
@@ -94,46 +105,46 @@ HEURISTIC_CONFIGS = {
         64: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1)),
         128: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
         256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1)),
-        512: _config(swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(1, 1, 1)),
+        512: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(1, 1, 1)),
         1024: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(2, 2, 1),
             token_back="reuse_dispatch_warps",
         ),
         2048: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(2, 2, 1),
             token_back="reuse_dispatch_warps",
         ),
         4096: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(1, 1, 1),
             token_back="reuse_dispatch_warps",
         ),
         8192: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(2, 1, 1),
             token_back="reuse_dispatch_warps",
         ),
         16384: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(1, 2, 1),
             token_back="reuse_dispatch_warps",
         ),
         32768: _config(
             swap_ab=False,
             pingpong=False,
-            tile=(64, 128, 128),
+            tile=(64, 256, 128),
             cga=(2, 1, 1),
             token_back="reuse_dispatch_warps",
         ),

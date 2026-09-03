@@ -371,29 +371,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
         if self.enable_token_comm:
-            dispatch_warp_start = self.epi_aux_warp_id + 1
-            self.dispatch_warp_id = tuple(
-                range(dispatch_warp_start, dispatch_warp_start + 4)
-            )
-            if self.token_back_standalone:
-                token_back_warp_start = dispatch_warp_start + 4
-                self.token_back_warp_id = tuple(
-                    range(token_back_warp_start, token_back_warp_start + 4)
-                )
-            token_back_warp_ids = (
-                self.token_back_warp_id if self.token_back_standalone else ()
-            )
-            self.threads_per_cta = 32 * len(
-                (
-                    *self.epilogue_warp_id,
-                    self.tma_a_warp_id,
-                    self.tma_b_warp_id,
-                    self.sched_warp_id,
-                    self.epi_aux_warp_id,
-                    *self.dispatch_warp_id,
-                    *token_back_warp_ids,
-                )
-            )
+            self._apply_mega_warp_layout()
 
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
 

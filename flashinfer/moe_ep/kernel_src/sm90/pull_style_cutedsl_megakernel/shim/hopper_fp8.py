@@ -183,6 +183,11 @@ class MegaMoEHopperFp8Config:
     # OFF; the offload supersedes it where active and auto-enables it as
     # its register-fit fallback.  Output-invariant tuner knob.
     fc1_early_done_publish: bool = False
+    # Fold TMA-A / TMA-B / scheduler into the idle dispatch-warpgroup slots
+    # (active_dispatch_warps == 1 only) and drop the producer warpgroup.
+    # Frees 128 threads + their registers; forces fc1_early_done_publish
+    # since the epi_aux store-server warp no longer exists.
+    fold_producer_warps: bool = True
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -744,6 +749,7 @@ class MegaMoEHopperFp8Frontend:
             active_dispatch_warps=c.active_dispatch_warps,
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
+            fold_producer_warps=c.fold_producer_warps,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1289,6 +1295,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     active_dispatch_warps: int = 1,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
+    fold_producer_warps: bool = True,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1428,6 +1435,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         active_dispatch_warps=active_dispatch_warps,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
+        fold_producer_warps=fold_producer_warps,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

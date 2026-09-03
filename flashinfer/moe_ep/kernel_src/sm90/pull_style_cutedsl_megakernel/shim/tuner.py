@@ -66,6 +66,7 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     # support and fall back to the baseline store elsewhere).
     "fc1_store_offload": (False, True),
     "fc1_early_done_publish": (False, True),
+    "fold_producer_warps": (False, True),
     "mma_tiler_mnk": _NONSWAP_TILES + _SWAPAB_TILES,
     "cluster_shape_mnk": _CLUSTER_SHAPES,
     "fp8_accum_mode": ("1xacc", "2xacc"),

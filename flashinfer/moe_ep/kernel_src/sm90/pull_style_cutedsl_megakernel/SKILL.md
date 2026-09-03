@@ -40,11 +40,30 @@ not picked them up):
   rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
   (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
   rank-masked reduce -- keep NVFP4-compatible when re-syncing).
-- FC1 store offload + early fc1_done publish (2026-09-01):
-  `fc1_store_offload` (default True) / `fc1_early_done_publish` knobs in
-  `moe_hopper_fp8/kernel_fp8_glu_fc12.py` + `epilogue_fp8.py` (mailbox
-  FIFO + empty-warp store server + register fit; swap-AB base only takes
-  the ctor params for parity).  The drop tree has neither.
+- FC1 store offload + early fc1_done publish (2026-09-01/02):
+  `fc1_store_offload` / `fc1_early_done_publish` knobs in
+  `moe_hopper_fp8/kernel_fp8_glu_fc12{,_swapab}.py` +
+  `epilogue_fp8{,_swapab}.py` (mailbox FIFO + epi_aux-warp store server +
+  register fit, dual-FIFO on the 2-WG kernels).  Synced to the drop tree
+  on 2026-09-02 (5 `src/` files, commit-only diff).
+- `fold_producer_warps` (2026-09-02, default True): `_apply_mega_warp_layout()`
+  in `kernel_fp8_glu_fc12.py` (single source of truth, also called from
+  both kernels' `_setup_attributes`) folds TMA-A/TMA-B/sched into the idle
+  dispatch slots when `active_dispatch_warps == 1` and drops the producer
+  warpgroup; `fit_epi_registers()` returns the freed budget to the
+  epilogue; `megamoe_kernel_fp8.py` gates it and forces early-pub;
+  `heuristic_config.py` blockwise non-swap 512-32768 switched to cooperative
+  M64N256, per_tensor 8 to cooperative swap M256N16 and per_tensor 64 to
+  basic swap M128N64 on the strength of it.  New multirank tests
+  `test_..._fold_producer_warps` and `test_..._blockwise_coop_n256` (the test
+  helpers now take mma_tiler_mnk / pingpong / cluster_shape_mnk).
+  `benchmarks/bench_moe_ep_sm90_mega.py` `--pingpong on/off` now forwards
+  the bucket's full heuristic config (cga / accum / token-back) so the
+  override flips only ping-pong — earlier it leaked drop-driver manual
+  defaults — and `--epi-mode {basic,pingpong,cooperative}` forces every
+  bucket's epilogue mode for twin sweeps (basic: one WG, per-WG-size tile;
+  pingpong: two WGs, per-WG-size tiles alternating; cooperative: two WGs,
+  one doubled tile — the tile is derived from the bucket's entry).  The drop tree has none of this yet.
 - `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
   (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
   barrier / pull / reuse token-back all follow it; barrier and grid-sync
