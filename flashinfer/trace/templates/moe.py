@@ -3728,6 +3728,11 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             optional=True,
             description="Weight QuantVariant.",
         ),
+        "weight_interleave": Scalar(
+            "int32",
+            optional=True,
+            description="Physical GEMM1 up/gate weight interleave (16 or 64).",
+        ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
         "local_expert_offset": Scalar(
@@ -3824,6 +3829,11 @@ _cute_dsl_wrapper_inputs["weight_format"] = Scalar(
     "int32",
     optional=True,
     description="Weight QuantVariant set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["weight_interleave"] = Scalar(
+    "int32",
+    optional=True,
+    description="Prepared-weight layout tag, optionally checked at wrapper __init__.",
 )
 _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
     "float32",
@@ -4219,6 +4229,7 @@ def _cute_dsl_fused_moe_reference(
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
     activation_format=None,
     weight_format=None,
+    weight_interleave=64,
     situ_beta=None,
     situ_linear_beta=None,
     per_token_scale=None,
@@ -4284,6 +4295,15 @@ def _cute_dsl_fused_moe_reference(
     W2 = _dequantize_fp4_tensor(
         w2_weight, w2_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4
     )
+    if normalize_activation_type(activation_type).is_gated:
+        experts, rows, hidden = W1.shape
+        W1 = (
+            W1.view(
+                experts, rows // (2 * weight_interleave), 2, weight_interleave, hidden
+            )
+            .transpose(1, 2)
+            .reshape_as(W1)
+        )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     if w1_alpha is not None:

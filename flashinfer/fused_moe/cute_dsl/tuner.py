@@ -78,11 +78,14 @@ def _seeded_activation(shapes, dtype, device):
 # Blackwell (SM100) Tactics
 # =============================================================================
 
+AUTO_PDL_COUNT = "auto"
+AUTO_PDL_COUNTS: Tuple[Optional[int], ...] = (None, -1, 0, 1)
+
 
 def get_blackwell_gemm1_valid_tactics(
     tile_size: int,
     swap_ab: bool = False,
-    pdl_count: Optional[int] = 1,
+    pdl_count: Optional[int] = -1,
     gated: bool = True,
     split_k: Optional[int] = 1,
     weight_interleave: Optional[int] = None,
@@ -149,7 +152,7 @@ def get_blackwell_gemm1_valid_tactics(
 def get_blackwell_gemm2_valid_tactics(
     tile_size: int,
     swap_ab: bool = False,
-    pdl_count: Optional[int] = 1,
+    pdl_count: Optional[int] = -1,
 ) -> List[Tuple]:
     """Get valid Blackwell tactics for GEMM2 (Finalize Fusion).
 
@@ -204,55 +207,61 @@ def get_blackwell_gemm2_valid_tactics(
 
 def get_blackwell_moe_valid_tactics(
     swap_ab: bool = False,
-    w1_pdl_count: Optional[int] = 1,
-    w2_pdl_count: Optional[int] = 1,
+    w1_pdl_count: Any = -1,
+    w2_pdl_count: Any = -1,
     gated: bool = True,
     w1_split_k: Optional[int] = 1,
     weight_interleave: Optional[int] = None,
-    autotune_swap_ab: bool = False,
 ) -> List[Tuple]:
     """Get all valid Blackwell MoE tactic combinations.
 
-    Returns: List of (tile_size, gemm1_tactic, gemm2_tactic)
-    """
-    if autotune_swap_ab:
-        return [
-            (*tactic, tactic_swap_ab)
-            for tactic_swap_ab in (False, True)
-            for tactic in get_blackwell_moe_valid_tactics(
-                swap_ab=tactic_swap_ab,
-                w1_pdl_count=w1_pdl_count,
-                w2_pdl_count=w2_pdl_count,
-                gated=gated,
-                w1_split_k=w1_split_k,
-                weight_interleave=weight_interleave,
-            )
-        ]
+    Only the 16-row interleave layout can feed both the swapped and unswapped
+    kernels, so swap_ab is tuned only in that case.
 
-    tactics = []
+    Returns: List of (tile_size, gemm1_tactic, gemm2_tactic[, swap_ab])
+    """
+    autotune_swap_ab = weight_interleave == 16
     # tile_size=256 (2-CTA) is enabled: the gemm1(2-CTA)/gemm2(1-CTA) layout
     # mismatch that caused incorrect results (#3067) is fixed by parameterizing
     # get_blackwell_gemm2_valid_tactics on tile_size (#3171). Mirrors main's
     # get_moe_valid_tactics over VALID_TILE_SIZES.
-    for tile_size in VALID_TILE_SIZES:
+    if w1_pdl_count == w2_pdl_count == AUTO_PDL_COUNT:
+        pdl_count_pairs = [(count, count) for count in AUTO_PDL_COUNTS]
+    else:
+        pdl_count_pairs = list(
+            itertools.product(
+                *(
+                    AUTO_PDL_COUNTS if count == AUTO_PDL_COUNT else (count,)
+                    for count in (w1_pdl_count, w2_pdl_count)
+                )
+            )
+        )
+
+    tactics = []
+    for tactic_swap_ab, (w1_pdl, w2_pdl), tile_size in itertools.product(
+        (False, True) if autotune_swap_ab else (swap_ab,),
+        pdl_count_pairs,
+        VALID_TILE_SIZES,
+    ):
         gemm1_tactics = get_blackwell_gemm1_valid_tactics(
             tile_size,
-            swap_ab=swap_ab,
-            pdl_count=w1_pdl_count,
+            swap_ab=tactic_swap_ab,
+            pdl_count=w1_pdl,
             split_k=w1_split_k,
             gated=gated,
             weight_interleave=weight_interleave,
         )
         gemm2_tactics = get_blackwell_gemm2_valid_tactics(
-            tile_size if swap_ab else max(tile_size, 128),
-            swap_ab=swap_ab,
-            pdl_count=w2_pdl_count,
+            tile_size if tactic_swap_ab else max(tile_size, 128),
+            swap_ab=tactic_swap_ab,
+            pdl_count=w2_pdl,
         )
 
         for gemm1_tactic, gemm2_tactic in itertools.product(
             gemm1_tactics, gemm2_tactics
         ):
-            tactics.append((tile_size, gemm1_tactic, gemm2_tactic))
+            tactic = (tile_size, gemm1_tactic, gemm2_tactic)
+            tactics.append((*tactic, tactic_swap_ab) if autotune_swap_ab else tactic)
     return tactics
 
 
@@ -498,14 +507,14 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "gemm1_mma_tiler_mn": gemm1_mma_tiler_mn,
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
             "w1_raster_along_m": w1_raster_along_m,
-            "w1_pdl_count": gemm1_tactic[3] if len(gemm1_tactic) >= 4 else 1,
+            "w1_pdl_count": gemm1_tactic[3] if len(gemm1_tactic) >= 4 else -1,
             "w1_split_k": gemm1_tactic[4] if len(gemm1_tactic) >= 5 else 1,
             "gemm1_mma_tiler": None,
             "gemm1_mma_inst_shape": None,
             "gemm2_mma_tiler_mn": gemm2_mma_tiler_mn,
             "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
             "w2_raster_along_m": w2_raster_along_m,
-            "w2_pdl_count": gemm2_tactic[3] if len(gemm2_tactic) >= 4 else 1,
+            "w2_pdl_count": gemm2_tactic[3] if len(gemm2_tactic) >= 4 else -1,
             "gemm2_mma_tiler": None,
             "gemm2_mma_inst_shape": None,
             "swap_ab": swap_ab,
@@ -587,8 +596,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         w2_raster_along_m: Override GEMM2 rasterization, or None to let the
             tactic decide.
         fixed_tile_size: Force the routing tile size, or None to tune it.
-        w1_pdl_count: Fixed GEMM1 dependent-launch count, or None to disable PDL.
-        w2_pdl_count: Fixed GEMM2 dependent-launch count, or None to disable PDL.
+        w1_pdl_count: Fixed GEMM1 dependent-launch count, None to disable PDL,
+            or "auto" to tune it over AUTO_PDL_COUNTS.
+        w2_pdl_count: Fixed GEMM2 dependent-launch count, None to disable PDL,
+            or "auto" to tune it over AUTO_PDL_COUNTS.
         w1_split_k: None to tune GEMM1 split-K over 1, 2, and 4, or an
             integer to use one fixed factor.
         activation_format: Activation quantization format.
@@ -619,8 +630,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         w1_raster_along_m: Optional[bool] = None,
         w2_raster_along_m: Optional[bool] = None,
         fixed_tile_size: Optional[int] = None,
-        w1_pdl_count: Optional[int] = 1,
-        w2_pdl_count: Optional[int] = 1,
+        w1_pdl_count: Any = AUTO_PDL_COUNT,
+        w2_pdl_count: Any = AUTO_PDL_COUNT,
         w1_split_k: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         activation_format: Optional[QuantVariant] = None,
@@ -1051,7 +1062,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         else:
             candidate_tactics = get_blackwell_moe_valid_tactics(
                 swap_ab=self.swap_ab,
-                autotune_swap_ab=self.weight_interleave == 16,
                 w1_pdl_count=self.w1_pdl_count,
                 w2_pdl_count=self.w2_pdl_count,
                 w1_split_k=self.w1_split_k,

@@ -84,7 +84,9 @@ from .moe_utils import (
     moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
+    normalize_cute_dsl_moe_weight_interleave,
     validate_cute_dsl_moe_situ_config,
+    warn_deprecated_cute_dsl_moe_weight_interleave,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     blockscaled_contiguous_gather_grouped_gemm_act_fusion,
@@ -104,6 +106,12 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+_QUANT_MODE_FORMATS = {
+    "w4a4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
+    "nvfp4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
+    "w4a8": (QuantVariant.MXFP8, QuantVariant.MXFP4),
+    "w4a16": (QuantVariant.BF16, QuantVariant.MXFP4),
+}
 
 
 def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
@@ -215,19 +223,20 @@ def _moe_core_impl(
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: Optional[torch.Tensor],
-    w1_bias: Optional[torch.Tensor],
     # GEMM2 intermediate scale
     fc2_input_scale: Optional[torch.Tensor],
     # GEMM2 weights
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: Optional[torch.Tensor],
-    w2_bias: Optional[torch.Tensor],
     # MoE config
     num_experts: int,
     top_k: int,
     num_local_experts: int,
     local_expert_offset: int = 0,
+    # Optional per-expert biases
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     # Tactic parameters (Blackwell)
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
@@ -621,6 +630,7 @@ class CuteDslMoEWrapper:
             deterministic two-stage finalize.
         activation_format: Activation quantization format.
         weight_format: Weight quantization format.
+        weight_interleave: Optional expected GEMM1 up/gate weight interleave.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -674,6 +684,7 @@ class CuteDslMoEWrapper:
         quant_mode: Optional[str] = None,
         activation_format: QuantVariant = QuantVariant.NVFP4,
         weight_format: QuantVariant = QuantVariant.NVFP4,
+        weight_interleave: Optional[int] = None,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
@@ -731,16 +742,15 @@ class CuteDslMoEWrapper:
             Activation quantization format. Defaults to ``QuantVariant.NVFP4``.
         weight_format : QuantVariant
             Weight quantization format. Defaults to ``QuantVariant.NVFP4``.
+        weight_interleave : Optional[int]
+            Expected GEMM1 up/gate weight interleave. Set it in
+            :func:`CuteDslConfig.prepare_weights`; this argument checks that
+            the prepared view matches. Untagged weights default to ``64``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         if quant_mode is not None:
             try:
-                format_pair = {
-                    "w4a4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
-                    "nvfp4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
-                    "w4a8": (QuantVariant.MXFP8, QuantVariant.MXFP4),
-                    "w4a16": (QuantVariant.BF16, QuantVariant.MXFP4),
-                }[quant_mode.lower()]
+                format_pair = _QUANT_MODE_FORMATS[quant_mode.lower()]
             except (AttributeError, KeyError):
                 raise ValueError(
                     "quant_mode must be 'w4a4', 'w4a8', or 'w4a16' "
@@ -771,6 +781,20 @@ class CuteDslMoEWrapper:
                 "unsupported CuTe-DSL MoE format pair "
                 f"({activation_format!r}, {weight_format!r})"
             )
+        explicit_weight_interleave = weight_interleave
+        weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+            weight_interleave, swap_ab=False
+        )
+        if activation_format is QuantVariant.BF16 and weight_interleave != 64:
+            raise ValueError("W4A16 requires weight_interleave=64")
+        device_obj = torch.device(device)
+        if (
+            weight_interleave == 16
+            and device_obj.type == "cuda"
+            and torch.cuda.is_available()
+            and get_compute_capability(device_obj) == (10, 7)
+        ):
+            raise ValueError("weight_interleave=16 is not supported on SM107")
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.num_experts = num_experts
         self.top_k = top_k
@@ -794,6 +818,9 @@ class CuteDslMoEWrapper:
         self.use_fused_finalize = use_fused_finalize
         self.activation_format = activation_format
         self.weight_format = weight_format
+        self._explicit_weight_interleave = explicit_weight_interleave
+        self._weight_interleave_bound = False
+        self.weight_interleave = weight_interleave
         if activation_format is QuantVariant.MXFP8:
             if output_dtype is not torch.bfloat16:
                 raise ValueError("W4A8 supports only bfloat16 output")
@@ -801,7 +828,6 @@ class CuteDslMoEWrapper:
                 raise ValueError("W4A8 requires fused finalize")
             if situ_beta is not None or situ_linear_beta is not None:
                 raise ValueError("SiTU is not supported for W4A8")
-            device_obj = torch.device(device)
             if (
                 device_obj.type == "cuda"
                 and torch.cuda.is_available()
@@ -852,6 +878,7 @@ class CuteDslMoEWrapper:
                 use_per_token_activation=False,
                 activation_format=activation_format,
                 weight_format=weight_format,
+                weight_interleave=weight_interleave,
             )
             if activation_format is QuantVariant.NVFP4:
                 self._per_token_runner = CuteDslFusedMoERunner(
@@ -872,6 +899,7 @@ class CuteDslMoEWrapper:
                     use_per_token_activation=True,
                     activation_format=activation_format,
                     weight_format=weight_format,
+                    weight_interleave=weight_interleave,
                 )
 
             if use_cuda_graph:
@@ -993,6 +1021,46 @@ class CuteDslMoEWrapper:
             situ_linear_beta=self.situ_linear_beta,
         )
 
+    def _bind_weight_interleave(self, weight_interleave: Optional[int]) -> None:
+        if weight_interleave is None and self._explicit_weight_interleave is not None:
+            weight_interleave = self.weight_interleave
+        weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+            weight_interleave, swap_ab=False
+        )
+        if (
+            self._explicit_weight_interleave is not None
+            and weight_interleave != self._explicit_weight_interleave
+        ):
+            raise ValueError(
+                f"explicit weight_interleave={self._explicit_weight_interleave} contradicts "
+                f"the prepared weight view tag ({weight_interleave})"
+            )
+        if (
+            self._weight_interleave_bound
+            and weight_interleave != self.weight_interleave
+        ):
+            raise ValueError(
+                f"CuteDslMoEWrapper is already bound to weight_interleave="
+                f"{self.weight_interleave}; got {weight_interleave}"
+            )
+        if self.activation_format is QuantVariant.BF16 and weight_interleave != 64:
+            raise ValueError("W4A16 requires weight_interleave=64")
+        device = torch.device(self.device)
+        if (
+            weight_interleave == 16
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+            and get_compute_capability(device) == (10, 7)
+        ):
+            raise ValueError("weight_interleave=16 is not supported on SM107")
+        if self.activation_format is not QuantVariant.BF16:
+            warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, device)
+        self.weight_interleave = weight_interleave
+        for runner in (self._runner, self._per_token_runner):
+            if runner is not None:
+                runner.weight_interleave = weight_interleave
+        self._weight_interleave_bound = True
+
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
     def run(
         self,
@@ -1012,6 +1080,7 @@ class CuteDslMoEWrapper:
         per_token_scale: Optional[torch.Tensor] = None,
         w1_bias: Optional[torch.Tensor] = None,
         w2_bias: Optional[torch.Tensor] = None,
+        weight_interleave: Optional[int] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL fused-MoE forward pass.
 
@@ -1057,12 +1126,17 @@ class CuteDslMoEWrapper:
         w2_bias : Optional[torch.Tensor]
             Optional per-expert FC2 bias of shape
             ``[num_local_experts, hidden_size]``.
+        weight_interleave : Optional[int]
+            Physical GEMM1 up/gate weight interleave recorded by
+            :func:`CuteDslConfig.prepare_weights`. Untagged weights use the
+            wrapper constructor's configured value, or ``64`` by default.
 
         Returns
         -------
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
+        self._bind_weight_interleave(weight_interleave)
         num_tokens = token_selected_experts.size(0)
 
         if (
@@ -1342,6 +1416,7 @@ def cute_dsl_fused_moe(
     quant_mode: Optional[str] = None,
     activation_format: QuantVariant = QuantVariant.NVFP4,
     weight_format: QuantVariant = QuantVariant.NVFP4,
+    weight_interleave: Optional[int] = None,
     per_token_scale: Optional[torch.Tensor] = None,
     tactic: Optional[Tuple] = None,
 ) -> torch.Tensor:
@@ -1417,6 +1492,10 @@ def cute_dsl_fused_moe(
         Activation quantization format. Defaults to ``QuantVariant.NVFP4``.
     weight_format : QuantVariant
         Weight quantization format. Defaults to ``QuantVariant.NVFP4``.
+    weight_interleave : Optional[int]
+        Physical GEMM1 up/gate weight interleave recorded by
+        :func:`CuteDslConfig.prepare_weights`. Untagged weights default to
+        ``64``.
     situ_beta : Optional[float]
         When set with ``ActivationType.Swiglu``, use the SiTU gate
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
@@ -1442,12 +1521,7 @@ def cute_dsl_fused_moe(
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     if quant_mode is not None:
         try:
-            format_pair = {
-                "w4a4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
-                "nvfp4": (QuantVariant.NVFP4, QuantVariant.NVFP4),
-                "w4a8": (QuantVariant.MXFP8, QuantVariant.MXFP4),
-                "w4a16": (QuantVariant.BF16, QuantVariant.MXFP4),
-            }[quant_mode.lower()]
+            format_pair = _QUANT_MODE_FORMATS[quant_mode.lower()]
         except (AttributeError, KeyError):
             raise ValueError(
                 f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
@@ -1477,6 +1551,19 @@ def cute_dsl_fused_moe(
             "unsupported CuTe-DSL MoE format pair "
             f"({activation_format!r}, {weight_format!r})"
         )
+    weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+        weight_interleave, swap_ab=False
+    )
+    if activation_format is QuantVariant.BF16 and weight_interleave != 64:
+        raise ValueError("W4A16 requires weight_interleave=64")
+    if (
+        weight_interleave == 16
+        and x.device.type == "cuda"
+        and get_compute_capability(x.device) == (10, 7)
+    ):
+        raise ValueError("weight_interleave=16 is not supported on SM107")
+    if activation_format is not QuantVariant.BF16:
+        warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, x.device)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     if activation_format is QuantVariant.MXFP8:
@@ -1554,6 +1641,7 @@ def cute_dsl_fused_moe(
             use_per_token_activation=use_per_token_activation,
             activation_format=activation_format,
             weight_format=weight_format,
+            weight_interleave=weight_interleave,
         )
 
         inputs = [

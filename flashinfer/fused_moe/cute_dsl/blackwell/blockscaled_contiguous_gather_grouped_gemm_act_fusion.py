@@ -28,8 +28,6 @@
 
 
 import argparse
-from enum import IntEnum
-from math import isfinite
 from typing import Optional, Tuple, Type, Union
 
 
@@ -59,6 +57,18 @@ from cutlass.pipeline import (
 )
 from cutlass.utils import blackwell_helpers, blockscaled_layout
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
+
+from ..moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    normalize_cute_dsl_moe_weight_interleave,
+    validate_cute_dsl_moe_situ_config,
+)
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     DeviceBoundPersistentTileScheduler,
@@ -75,67 +85,6 @@ from .utils import (
 )
 
 FP32_MAX = torch.finfo(torch.float32).max
-DEFAULT_SWIGLU_ALPHA = 1.0
-DEFAULT_SWIGLU_BETA = 0.0
-DEFAULT_SWIGLU_LIMIT = FP32_MAX
-
-
-class ActivationType(IntEnum):
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Relu2 = 6
-    SwigluStep = 7
-    GegluTanh = 8
-    Identity = 9
-    Situ = 10
-    InvalidType = 11
-
-
-_SUPPORTED_ACTIVATIONS: tuple[ActivationType, ...] = (
-    ActivationType.Swiglu,
-    ActivationType.GegluTanh,
-    ActivationType.Relu2,
-)
-
-
-def normalize_cute_dsl_moe_activation_type(
-    activation_type: int | ActivationType,
-) -> tuple[ActivationType, bool]:
-    try:
-        activation_type = ActivationType(activation_type)
-    except ValueError as err:
-        raise ValueError(f"Unsupported activation_type {activation_type!r}") from err
-    if activation_type not in _SUPPORTED_ACTIVATIONS:
-        expected = " or ".join(repr(value) for value in _SUPPORTED_ACTIVATIONS)
-        raise ValueError(
-            f"Unsupported activation_type {activation_type!r}; expected {expected}"
-        )
-    return activation_type, activation_type is not ActivationType.Relu2
-
-
-def validate_cute_dsl_moe_situ_config(
-    activation_type: ActivationType,
-    situ_beta: float | None,
-    situ_linear_beta: float | None,
-) -> None:
-    if situ_beta is None:
-        if situ_linear_beta is not None:
-            raise ValueError("situ_linear_beta requires situ_beta")
-        return
-    if activation_type is not ActivationType.Swiglu:
-        raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not isfinite(situ_beta) or situ_beta <= 0:
-        raise ValueError("situ_beta must be positive and finite")
-    if situ_linear_beta is not None and (
-        not isfinite(situ_linear_beta) or situ_linear_beta <= 0
-    ):
-        raise ValueError("situ_linear_beta must be positive and finite when set")
-
-
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM with gather
 and FC1 activation fusion for the NVIDIA Blackwell architecture using CUTE DSL.
@@ -600,18 +549,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.gated = gated
         self.acc_dtype = cutlass.Float32
         self.swap_ab = swap_ab
-        if weight_interleave is None:
-            weight_interleave = 16 if swap_ab else 64
-        valid_interleaves = (16,) if swap_ab else (16, 64)
-        if (
-            isinstance(weight_interleave, bool)
-            or not isinstance(weight_interleave, int)
-            or weight_interleave not in valid_interleaves
-        ):
-            raise ValueError(
-                f"weight_interleave must be one of {valid_interleaves} "
-                f"when swap_ab={swap_ab}, got {weight_interleave!r}"
-            )
+        weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+            weight_interleave, swap_ab
+        )
         self.weight_interleave = weight_interleave
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
@@ -2553,7 +2493,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 for j in cutlass.range_constexpr(cute.size(tAsA_slice)):
                                     tAsA_slice[j] = tAsA_slice.element_type(0)
 
-                        # Scale partitions also alias; only row owners initialize them.
+                        # Scale partitions alias: row owners initialize them, while
+                        # full-tile copies below populate both token halves.
                         if token_ml_tile_offset_local < async_copy_token_tile:
                             for i in cutlass.range_constexpr(n_sfa_blocks, unroll=1):
                                 swizzled_iterator = (
@@ -4089,7 +4030,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         tCompute[i] = up * gelu_tanh_f32(
                                             gate, fastmath=True
                                         )
-                                elif cutlass.const_expr(self.vectorized_f32):
+                                # 2CTA packed-FP4 bias fragments require scalar indexing.
+                                elif cutlass.const_expr(
+                                    self.vectorized_f32
+                                    and not (
+                                        self.fp4_swap
+                                        and self.use_2cta_instrs
+                                        and self.use_bias
+                                    )
+                                ):
                                     # Generalized scaled/clamped SwiGLU family.
                                     #   out = (up_c + offset) * gate_c * sigmoid(swiglu_alpha * gate_c)
                                     for i in cutlass.range_constexpr(0, n_eff, 2):
@@ -6118,14 +6067,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         can_implement = True
         if c_major != "n":
             can_implement = False
-        if weight_interleave is None:
-            weight_interleave = 16 if swap_ab else 64
-        valid_interleaves = (16,) if swap_ab else (16, 64)
-        if (
-            isinstance(weight_interleave, bool)
-            or not isinstance(weight_interleave, int)
-            or weight_interleave not in valid_interleaves
-        ):
+        try:
+            weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+                weight_interleave, swap_ab
+            )
+        except ValueError:
             return False
         if gated and n % (2 * weight_interleave) != 0:
             can_implement = False
@@ -6958,18 +6904,9 @@ def run(
     device = torch.device("cuda")
     n = intermediate_dim * (2 if gated else 1)
     k = hidden_dim
-    if weight_interleave is None:
-        weight_interleave = 16 if swap_ab else 64
-    valid_interleaves = (16,) if swap_ab else (16, 64)
-    if (
-        isinstance(weight_interleave, bool)
-        or not isinstance(weight_interleave, int)
-        or weight_interleave not in valid_interleaves
-    ):
-        raise ValueError(
-            f"weight_interleave must be one of {valid_interleaves} "
-            f"when swap_ab={swap_ab}, got {weight_interleave!r}"
-        )
+    weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+        weight_interleave, swap_ab
+    )
     if k % sf_vec_size or (k // sf_vec_size) % 4:
         raise ValueError(
             f"hidden_dim={k} must provide a multiple of four {sf_vec_size}-value "

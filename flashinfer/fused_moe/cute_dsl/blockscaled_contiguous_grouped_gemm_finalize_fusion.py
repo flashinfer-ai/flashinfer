@@ -617,6 +617,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 b_major="k",
                 out_major="n",
                 swap_ab=swap_ab,
+                use_compact_sfb=use_compact_sf,
             )
         )
     if not can_impl:

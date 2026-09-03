@@ -1189,7 +1189,10 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="GEMM1 rows"):
             runner.pack_inputs(act, weights)
 
-    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
+    @pytest.mark.parametrize("weight_interleave", [16, 64])
+    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(
+        self, weight_interleave
+    ):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.MXFP4)
@@ -1207,6 +1210,7 @@ class TestMoERunnerSupport:
                 "w2_weight": torch.empty(32, 128, intermediate // 2, dtype=torch.uint8),
                 "w2_weight_sf": torch.empty(1, dtype=torch.uint8),
                 "w2_alpha": torch.ones(32),
+                "weight_interleave": weight_interleave,
             },
         )
         act = MoEActivationPack(
@@ -1220,6 +1224,12 @@ class TestMoERunnerSupport:
         assert packed[1].shape == (4, 4)
         assert packed[7] is None
         assert packed[-1].shape == (4, 128)
+        assert runner._inner.weight_interleave == weight_interleave
+        weights.get_view("cute_dsl")["weight_interleave"] = (
+            64 if weight_interleave == 16 else 16
+        )
+        with pytest.raises(ValueError, match="already bound"):
+            runner.pack_inputs(act, weights)
 
     def test_cute_dsl_mxfp4_pack_rejects_unaligned_geometry(self):
         w1 = torch.zeros(2, 2 * 96, 256, dtype=torch.bfloat16)
@@ -3642,7 +3652,7 @@ def test_cute_dsl_cache_key_extends_unified_fields():
     runner._inner = Inner()
 
     shared = MoERunner._cache_key_extras(runner)
-    assert runner.get_cache_key_extras([]) == shared + (False, True)
+    assert runner.get_cache_key_extras([]) == shared + (False, True, 64)
 
 
 @pytest.mark.parametrize(

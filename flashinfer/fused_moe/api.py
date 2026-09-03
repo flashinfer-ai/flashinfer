@@ -29,7 +29,7 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -1225,12 +1225,14 @@ class CuteDslConfig:
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
+        weight_interleave: int = 64,
         device=None,
         w1_bias=None,
         w2_bias=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
+        The view records ``weight_interleave`` for validation by the runner.
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         """
         from .prepare import prepare_cute_dsl_weights
@@ -1243,6 +1245,7 @@ class CuteDslConfig:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
+            weight_interleave=weight_interleave,
             device=device,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
@@ -1748,14 +1751,14 @@ class MoEWeightPack:
     dict that runner's ``forward`` expects for weight-side arguments.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

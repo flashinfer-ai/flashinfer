@@ -29,6 +29,8 @@ def _finalize_ok(
     sf_vec_size=16,
     k=512,
     out_major="n",
+    swap_ab=False,
+    use_compact_sfb=True,
 ):
     return Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
         a_dtype=a_dtype,
@@ -46,6 +48,8 @@ def _finalize_ok(
         a_major="k",
         b_major="k",
         out_major=out_major,
+        swap_ab=swap_ab,
+        use_compact_sfb=use_compact_sfb,
     )
 
 
@@ -89,46 +93,80 @@ def _gemm1_ok(
 
 
 @pytest.mark.parametrize(
-    "n,mma,cluster,expect",
+    "n,mma,cluster,kwargs,expect",
     [
         # A padding CTA has no remaining columns and skips its row transfer.
-        (256, (128, 256), (1, 2), True),
+        (256, (128, 256), (1, 2), {}, True),
         # 2 exact tiles / cluster_n=2 -> exact cluster tiling: fine.
-        (512, (128, 256), (1, 2), True),
+        (512, (128, 256), (1, 2), {}, True),
         # A partial tile transfers only columns 256..383.
-        (384, (128, 256), (1, 2), True),
+        (384, (128, 256), (1, 2), {}, True),
         # The same tail handling applies without an N cluster.
-        (384, (128, 256), (1, 1), True),
+        (384, (128, 256), (1, 1), {}, True),
         # 3 exact 128-tiles, no cluster: fine.
-        (384, (128, 128), (1, 1), True),
-        (384, (128, 192), (1, 1), True),
-        (256, (128, 192), (1, 1), True),
-        (128, (128, 256), (1, 1), True),
+        (384, (128, 128), (1, 1), {}, True),
+        (384, (128, 192), (1, 1), {}, True),
+        (256, (128, 192), (1, 1), {}, True),
+        (128, (128, 256), (1, 1), {}, True),
         # Invalid cluster shapes are rejected without dividing by zero.
-        (256, (128, 128), (0, 1), False),
+        (256, (128, 128), (0, 1), {}, False),
+        # The epilogue only stores N-major output.
+        (256, (128, 128), (1, 1), {"out_major": "m"}, False),
+        # Swapped SFB requires the compact scale layout.
+        (128, (256, 128), (1, 1), {"swap_ab": True, "use_compact_sfb": False}, False),
     ],
 )
-def test_finalize_n_tiling(n, mma, cluster, expect):
-    assert _finalize_ok(n, mma, cluster) is expect
-
-
-def test_finalize_output_layout():
-    assert not _finalize_ok(256, (128, 128), (1, 1), out_major="m")
+def test_finalize_can_implement(n, mma, cluster, kwargs, expect):
+    assert _finalize_ok(n, mma, cluster, **kwargs) is expect
 
 
 @pytest.mark.parametrize(
-    "n,mma,expect",
+    "n,mma,cluster,kwargs,expect",
     [
         # The partial tile writes only into the compact SFC tensor's padding.
-        (384, (128, 256), True),
+        (384, (128, 256), (1, 1), {}, True),
         # Exact tiling: fine.
-        (512, (128, 256), True),
-        (384, (128, 128), True),
+        (512, (128, 256), (1, 1), {}, True),
+        (384, (128, 128), (1, 1), {}, True),
+        # N=192 tiles only exist for the 16-row up/gate interleave.
+        (384, (128, 192), (1, 1), {"weight_interleave": 16}, True),
+        (384, (128, 192), (1, 1), {"weight_interleave": 64}, False),
+        # Swapped tiling: MMA M is the weight tile, MMA N the token tile.
+        (256, (8, 128), (1, 1), {"swap_ab": True, "gated": True}, True),
+        (256, (16, 128), (1, 1), {"swap_ab": True, "gated": True}, True),
+        (256, (8, 256), (1, 1), {"swap_ab": True, "gated": True}, False),
+        (256, (16, 256), (1, 1), {"swap_ab": True, "gated": True}, False),
+        (256, (8, 256), (2, 1), {"swap_ab": True, "gated": True}, False),
+        (256, (16, 256), (2, 1), {"swap_ab": True, "gated": True}, True),
+        (256, (8, 128), (1, 1), {"swap_ab": True, "gated": False}, True),
+        (256, (16, 128), (1, 1), {"swap_ab": True, "gated": False}, True),
+        (256, (32, 128), (1, 1), {"swap_ab": True, "gated": True}, True),
+        (256, (64, 128), (1, 1), {"swap_ab": True, "gated": True}, True),
+        (256, (128, 128), (1, 1), {"swap_ab": True, "gated": True}, True),
+        # Swapped split-K, NVFP4 and MXFP8 x MXFP4 operands.
+        (256, (256, 256), (2, 1), {"swap_ab": True, "split_k": 2}, True),
+        (
+            256,
+            (256, 256),
+            (2, 1),
+            {
+                "swap_ab": True,
+                "split_k": 2,
+                "a_dtype": cutlass.Float8E4M3FN,
+                "sf_dtype": cutlass.Float8E8M0FNU,
+                "sf_vec_size": 32,
+                "c_dtype": cutlass.Float8E4M3FN,
+            },
+            True,
+        ),
+        # Invalid cluster shapes and non-N-major output are rejected.
+        (256, (128, 128), (0, 1), {}, False),
+        (256, (128, 128), (1, 1), {"c_major": "m"}, False),
     ],
 )
-def test_gemm1_n_tiling_guard(n, mma, expect):
+def test_gemm1_can_implement(n, mma, cluster, kwargs, expect):
     # gemm1 requires cluster_n == 1 (enforced independently).
-    assert _gemm1_ok(n, mma, (1, 1)) is expect
+    assert _gemm1_ok(n, mma, cluster, **kwargs) is expect
 
 
 @pytest.mark.parametrize("op", [_gemm1_ok, _finalize_ok])
@@ -186,53 +224,3 @@ def test_w4a8_finalize_n_tiling(mma, n, expect):
         )
         is expect
     )
-
-
-@pytest.mark.parametrize("interleave,expect", [(16, True), (64, False)])
-def test_gemm1_n192_weight_interleave(interleave, expect):
-    assert _gemm1_ok(384, (128, 192), (1, 1), weight_interleave=interleave) is expect
-
-
-@pytest.mark.parametrize(
-    "mma,cluster,gated,expect",
-    [
-        ((8, 128), (1, 1), True, True),
-        ((16, 128), (1, 1), True, True),
-        ((8, 256), (1, 1), True, False),
-        ((16, 256), (1, 1), True, False),
-        ((8, 256), (2, 1), True, False),
-        ((16, 256), (2, 1), True, True),
-        ((8, 128), (1, 1), False, True),
-        ((16, 128), (1, 1), False, True),
-        ((32, 128), (1, 1), True, True),
-        ((64, 128), (1, 1), True, True),
-        ((128, 128), (1, 1), True, True),
-    ],
-)
-def test_gemm1_swapped_tiling(mma, cluster, gated, expect):
-    assert _gemm1_ok(256, mma, cluster, swap_ab=True, gated=gated) is expect
-
-
-@pytest.mark.parametrize("a_dtype", [cutlass.Float4E2M1FN, cutlass.Float8E4M3FN])
-def test_gemm1_swapped_split_k(a_dtype):
-    kwargs = {}
-    if a_dtype is cutlass.Float8E4M3FN:
-        kwargs = dict(
-            sf_dtype=cutlass.Float8E8M0FNU,
-            sf_vec_size=32,
-            c_dtype=cutlass.Float8E4M3FN,
-        )
-    assert _gemm1_ok(
-        256,
-        (256, 256),
-        (2, 1),
-        a_dtype=a_dtype,
-        swap_ab=True,
-        split_k=2,
-        **kwargs,
-    )
-
-
-def test_gemm1_rejects_invalid_cluster_and_output_layout():
-    assert not _gemm1_ok(256, (128, 128), (0, 1))
-    assert not _gemm1_ok(256, (128, 128), (1, 1), c_major="m")

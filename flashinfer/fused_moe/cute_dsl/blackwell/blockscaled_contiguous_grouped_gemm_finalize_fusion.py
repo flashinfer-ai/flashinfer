@@ -3605,6 +3605,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         b_major: str,
         out_major: str,
         swap_ab: bool = False,
+        use_compact_sfb: bool = True,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -3641,6 +3642,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type out_major: str
         :param swap_ab: Whether A/B (and MN) roles are swapped.
         :type swap_ab: bool
+        :param use_compact_sfb: Whether swapped activation scales use compact storage.
+        :type use_compact_sfb: bool
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
         """
@@ -3659,6 +3662,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         if swap_ab and out_dtype is cutlass.Float32 and mma_tiler_mn[0] == 256:
             # Two ping-pong FP32 C stages for a 256-row token tile consume the
             # SM100 shared-memory budget before any positive A/B stage fits.
+            can_implement = False
+        if swap_ab and not use_compact_sfb and mma_tiler_mn[0] == 256:
             can_implement = False
 
         # Skip unsupported layouts
@@ -4147,6 +4152,7 @@ def run(
         b_major,
         out_major,
         swap_ab=swap_ab,
+        use_compact_sfb=use_compact_sfb,
     ):
         raise testing.CantImplementError(
             f"Unsupported testcase {a_dtype}, {b_dtype}, {sf_dtype}, "
