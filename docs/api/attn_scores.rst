@@ -26,12 +26,14 @@ Two things about that expression are easy to get wrong:
 
 .. note::
 
-  Within a request's context the kernels write every position unconditionally
-  and apply no causal or context mask, so callers must mask positions beyond
-  each request's context length themselves. A request with
-  ``context_lens[b] == 0`` is skipped entirely and its output row is never
-  written -- when passing ``out=``, initialise it if you intend to read those
-  rows.
+  The kernels write every position unconditionally and apply no causal or
+  context mask.  Output row ``b*next_n + t`` is meaningful only for KV
+  positions ``0 .. context_lens[b] - next_n + t`` inclusive (the newest slot
+  ``t = next_n - 1`` sees the whole context, each earlier slot one position
+  fewer); callers must mask or slice past that per-slot limit themselves.  A
+  request with ``context_lens[b] == 0`` is skipped entirely and its output
+  rows are never written -- when passing ``out=``, initialise it if you
+  intend to read those rows.
 
 .. currentmodule:: flashinfer
 

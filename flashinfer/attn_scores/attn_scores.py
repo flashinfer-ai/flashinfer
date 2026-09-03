@@ -33,7 +33,20 @@ Two variants, differing in how their scale factors enter:
                          trailing scale factor
 
 Both run on datacentre Blackwell (SM100/SM103) and Rubin (SM107); consumer
-Blackwell (SM120/121) is deliberately unsupported (see ``_PAGED_MQA_CCS``).
+Blackwell (SM120/121) is deliberately unsupported (the kernels' block-scaled
+tensor-core path and on-chip accumulator budget are sized for the datacentre
+parts).
+
+Typical call (the DeepSeek indexer shape)::
+
+    # q [B, next_n, 64, 128] e4m3fn; kv_fused [num_blocks, 64, 1, 132] uint8;
+    # weights [B*next_n, 64] f32; context_lens/block_table int32 on q's device
+    logits = flashinfer.fp8_paged_mqa_logits(
+        q, kv_fused, weights, context_lens, block_table, max_context_len
+    )  # -> [B*next_n, max_context_len]; mask each row past its causal limit
+
+See each function's docstring for a runnable example, the fused-KV byte
+layout, and the CUDA-graph recipe.
 """
 
 import contextlib
@@ -1004,8 +1017,11 @@ def _gpu_schedule(
 def padded_context_len(max_context_len: int) -> int:
     """Return the minimum allocated context dimension for paged MQA logits output.
 
-    The kernel may write unconditionally into SPLIT_KV-padded trailing positions,
-    so the output tensor must be allocated with at least this many columns.
+    Rounds ``max_context_len`` up to a multiple of 256: the kernels store
+    output in 256-column chunks and may write unconditionally into the padded
+    trailing positions, so the output tensor must be allocated with at least
+    this many columns (a narrower ``out`` is an out-of-bounds write).  The
+    padding columns hold unspecified scratch -- never consume them.
 
     Use this to pre-allocate the ``out`` parameter:
         out = torch.empty((B * next_n, padded_context_len(max_ctx)), dtype=..., device="cuda")
@@ -1032,12 +1048,14 @@ def compute_paged_mqa_logits_schedule(
 
     Args:
         context_lens:   [B] int32, on CPU or CUDA.
-        device:         target CUDA device. Defaults to context_lens.device
-                        (or cuda:0 if CPU).
+        device:         target CUDA device.  Defaults to context_lens.device,
+                        or the current CUDA device when context_lens is on CPU.
         use_gpu_kernel: if True (default), compute entirely on-GPU via
                         :class:`PagedMQALogitsScheduleKernel` — no D2H copy,
-                        CUDA-graph-capturable.  Falls back to CPU numpy if
-                        CuTe DSL is unavailable.
+                        CUDA-graph-capturable.  Falls back to CPU numpy (not
+                        graph-capturable) when the CuTe DSL is unavailable,
+                        cannot target the device's architecture, or
+                        context_lens is on CPU.
         out:            optional pre-allocated [num_sms+1, 2] int32 on CUDA.
                         Required for CUDA-graph capture (static buffer).
                         If None, a new tensor is allocated each call.
@@ -1191,20 +1209,90 @@ def fp8_paged_mqa_logits(
 ) -> torch.Tensor:
     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
+    Computes weighted per-head ReLU attention scores against a paged FP8 KV
+    cache -- the DeepSeek-style sparse-attention indexer::
+
+        logits[b*next_n + t, pos] =
+            scale[pos] * sum_h weights[b*next_n + t, h] * relu(q[b,t,h,:] @ k[pos,:])
+
+    ReLU is applied per head, BEFORE the weighted sum, so negative weights can
+    make the output negative.  ``next_n = q.shape[1]`` is the number of query
+    positions scored per request (speculative/MTP draft depth; use 1 for plain
+    decode) -- a dimension of ``q``, not an argument; the kernel specializes on
+    it automatically.  Slot ``t = 0`` is the oldest draft position and
+    ``t = next_n - 1`` the newest; ``context_lens[b]`` is the KV length visible
+    to the newest slot.
+
+    Example:
+        Two requests, two draft positions each, 64-token pages::
+
+            B, next_n, num_heads, head_dim = 2, 2, 64, 128
+            block_size, max_context_len = 64, 4096
+            device = "cuda"
+
+            # Per-request KV lengths and a page table into the shared KV pool.
+            context_lens = torch.tensor([3000, 4096], dtype=torch.int32, device=device)
+            pages_per_seq = -(-max_context_len // block_size)  # 64
+            block_table = torch.arange(
+                B * pages_per_seq, dtype=torch.int32, device=device
+            ).view(B, pages_per_seq)
+
+            # Pack the fused KV pool: per block, ALL fp8 values first, then the
+            # per-token float32 scales (two contiguous regions, not per-token rows).
+            num_blocks = B * pages_per_seq
+            kv = torch.randn(num_blocks, block_size, head_dim, device=device).to(
+                torch.float8_e4m3fn
+            )
+            kv_scales = torch.ones(num_blocks, block_size, device=device)
+            kv_fused = torch.cat(
+                [kv.view(torch.uint8).flatten(1), kv_scales.view(torch.uint8).flatten(1)],
+                dim=1,
+            ).view(num_blocks, block_size, 1, head_dim + 4)
+
+            q = torch.randn(B, next_n, num_heads, head_dim, device=device).to(
+                torch.float8_e4m3fn
+            )
+            weights = torch.rand(B * next_n, num_heads, device=device)
+
+            logits = flashinfer.fp8_paged_mqa_logits(
+                q, kv_fused, weights, context_lens, block_table, max_context_len
+            )
+            # logits: [B*next_n, max_context_len] float32.  Row b*next_n + t is
+            # valid for positions 0 .. context_lens[b] - next_n + t; mask the
+            # rest before use.
+
     Args:
         q:               [batch_size, next_n, num_heads, head_dim]  float8_e4m3fn
-        kv_fused:        [num_blocks, block_size, 1, kv_row_bytes]  uint8
-                         kv_row_bytes = head_dim + 4: the FP8 values of one
-                         token, then that token's single float32 scale (4
-                         bytes -- per-token scaling, not block scaling as in
-                         FP4).  Within a block the two regions are contiguous,
-                         not interleaved per token:
-                           [KV data: block_size * head_dim bytes]
-                           [KV SF  : block_size * 4        bytes, one float32/token]
-        weights:         [batch_size*next_n, num_heads]  float32  per-head weights
-        context_lens:    [batch_size]  int32  (CUDA)
+        kv_fused:        [num_blocks, block_size, 1, head_dim + 4]  uint8
+                         The paged KV pool; "fused" means each block stores its
+                         quantized values and their scale factors together in
+                         one uint8 buffer.  The 4-D shape is a size contract
+                         only -- the kernel reads each block's flattened
+                         block_size*(head_dim+4) bytes as two contiguous
+                         regions, NOT as per-token rows:
+                           bytes [0, block_size*head_dim): the FP8 values,
+                             token-major (token i at offset i*head_dim);
+                           bytes [block_size*head_dim, end): block_size
+                             little-endian float32 per-token scales (token i's
+                             scale at block_size*head_dim + 4*i).
+                         Built in one expression from value/scale tensors --
+                         see the Example above.  (Per-token scaling; FP4 uses
+                         block scaling folded into dequantization instead.)
+        weights:         [batch_size*next_n, num_heads]  float32
+                         Per-head mixing weights, not model parameters:
+                         output[row, pos] = sum_h weights[row, h] * relu(score_h).
+                         Row b*next_n + t pairs with q[b, t] -- rows are
+                         ordered exactly like the output rows; pass a
+                         [batch_size, next_n, num_heads] tensor as
+                         w.view(batch_size * next_n, num_heads).  Cast
+                         internally when epi_dtype is float16.
+        context_lens:    [batch_size]  int32, on q's device.  Per-request KV
+                         length -- the quantity other flashinfer APIs call
+                         ``seq_lens`` (names here follow the DeepGEMM paged-MQA
+                         API this module ports).
                          No entry may exceed max_context_len.
-        block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
+        block_table:     [batch_size, max_blocks_per_seq]  int32, on q's device
+                         (elsewhere in flashinfer: ``block_tables``).
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
                          max_b round_up(context_lens[b], 128) // block_size --
@@ -1216,11 +1304,12 @@ def fp8_paged_mqa_logits(
                          is a device-side out-of-bounds READ, i.e. undefined
                          behaviour -- it may return corrupt logits, or fault and
                          poison the CUDA context.
-        max_context_len: int  maximum KV sequence length; must be >=
-                         max(context_lens).  The output row is sized from this
-                         while the schedule follows context_lens, so a smaller
-                         value is a device-side out-of-bounds WRITE, likewise
-                         undefined behaviour.
+        max_context_len: int  maximum KV sequence length (elsewhere:
+                         ``max_seq_len``); must be >= max(context_lens).  The
+                         output row is sized from this while the schedule
+                         follows context_lens, so a smaller value is a
+                         device-side out-of-bounds WRITE, likewise undefined
+                         behaviour.
 
                          Both preconditions above are the caller's to satisfy.
                          FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
@@ -1229,13 +1318,24 @@ def fp8_paged_mqa_logits(
                          because the device-to-host copy it needs is illegal
                          there.  Neither setting makes the kernel itself safe
                          against a violated contract.
-        output_dtype:    output tensor dtype (float32 or float16)
+        output_dtype:    float32 (default) or float16.  bfloat16 is
+                         deliberately unsupported: the FP8 epilogue has no bf16
+                         branch and would silently miscompute.  Note that
+                         fp4_paged_mqa_logits defaults to bfloat16 -- pass
+                         output_dtype explicitly in code that uses both.
         epi_dtype:       epilogue accumulation dtype (float32 or float16)
         acc_dtype:       MMA accumulator dtype (float32 or float16)
-        num_epi_subtiles: epilogue subtile count (perf knob, default 1)
+        num_epi_subtiles: performance knob; numerics unchanged for any legal
+                         value.  Leave at 1: measured on SM100 at num_heads=64,
+                         1/2/4 tie and 8 is 5-11% slower.  Exists for parity
+                         with TensorRT-LLM's op.  Must divide num_heads with
+                         the quotient a multiple of 4.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
-                         on CUDA.  If None, computed from context_lens each call.
-                         Reusable only while the entire
+                         on q's device.  Omit it (None, recommended) unless
+                         profiling shows the per-call schedule computation (one
+                         small GPU kernel, a few microseconds) matters in your
+                         eager hot loop.  A caller-managed schedule is reusable
+                         only while the entire
                          ceil(context_lens / 256) vector and the target device's
                          SM count are unchanged -- a fixed batch size is not
                          sufficient, since one sequence crossing a 256-token
@@ -1256,22 +1356,38 @@ def fp8_paged_mqa_logits(
 
     Returns:
         logits: [batch_size*next_n, max_context_len]  output_dtype
-                (a view of ``out`` when provided)
+                (a view of ``out`` when provided).  Row ``b*next_n + t`` holds
+                scores for KV positions ``0 .. context_lens[b] - next_n + t``
+                inclusive -- the newest slot sees the whole context, each
+                earlier slot one position fewer.  Columns past that limit, and
+                the padding columns of ``out`` beyond max_context_len, are
+                UNSPECIFIED: slice or mask by the limit before consuming (e.g.
+                before a top-k).  Rows of a request with context_lens[b] == 0
+                are never written.
+
+    CUDA graph capture:
+        Pass a pre-allocated, address-stable ``out`` sized with
+        padded_context_len(); keep q / kv_fused / context_lens / block_table at
+        static addresses; leave ``schedule_meta=None`` -- the schedule is then
+        computed by a small GPU kernel inside the capture and re-derives itself
+        from context_lens' current contents on every replay.  If you manage the
+        schedule yourself, recompute it into the same buffer before every
+        replay in which any ceil(context_lens / 256) changed; a stale schedule
+        can hang the kernel.
 
     Restrictions of the current kernel:
         The signature above is the general form.  This kernel is parametric in
         num_heads and head_dim; the constraints below are enforced here, and a
         future kernel may widen them without changing this signature.
 
-        head_dim         must be a multiple of _FP8_MMA_INST_K.
-        next_n*num_heads must lie in [_MMA_N_MIN, _MMA_N_MAX] and be a multiple
-                         of _MMA_N_MULTIPLE.
-        block_size       must divide _COMPUTE_BLOCK_KV, with the quotient at
-                         most _MAX_BLOCKS_PER_MMA.
+        head_dim         must be a multiple of 32.
+        next_n*num_heads must be a multiple of 8 in [8, 256].
+        block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
         num_epi_subtiles must divide num_heads, with the quotient a multiple of
-                         _EPI_SUBTILE_UNROLL.
-        head_dim, num_heads and next_n together must fit the shared memory
-                         available per block on the device.
+                         4 (at num_heads=64: 1, 2, 4, 8, or 16).
+        head_dim, num_heads and next_n together must fit per-CTA shared
+                         memory: on SM100, head_dim <= 192 fits at num_heads=64,
+                         next_n=1; 256 does not.
     """
     _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
 
@@ -1496,23 +1612,90 @@ def fp4_paged_mqa_logits(
 ) -> torch.Tensor:
     """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
+    Computes weighted per-head ReLU attention scores against a paged MXFP4 KV
+    cache -- the DeepSeek-style sparse-attention indexer::
+
+        logits[b*next_n + t, pos] =
+            sum_h weights[b*next_n + t, h] * relu(q[b,t,h,:] @ k[pos,:])
+
+    The UE8M0 block scales are folded into dequantizing q and k, so unlike the
+    FP8 variant there is no trailing per-token scale.  ReLU is applied per
+    head, BEFORE the weighted sum, so negative weights can make the output
+    negative.  ``next_n = q.shape[1]`` is the number of query positions scored
+    per request (speculative/MTP draft depth; use 1 for plain decode) -- a
+    dimension of ``q``, not an argument.  Slot ``t = 0`` is the oldest draft
+    position, ``t = next_n - 1`` the newest.  next_n may be 1..4: on Rubin
+    (SM107+) every next_n runs as a single pass over the KV; on SM100/SM103,
+    next_n=4 executes as two internal passes that each read the whole KV --
+    numerics identical, roughly 2x the KV-bandwidth cost (~1.3x measured
+    runtime at 16K context versus next_n=3), and a caller-supplied
+    schedule_meta is rejected there (see schedule_meta below).
+
+    Example:
+        Same batch/paging setup as the fp8_paged_mqa_logits example; only the
+        quantized tensors differ.  Zero-filled tensors are valid placeholders
+        for a shape or latency check -- real callers produce them with their
+        MXFP4 quantizer (see tests/attn_scores/test_attn_scores.py::
+        _per_token_cast_to_fp4 for a reference implementation)::
+
+            q_fp4 = torch.zeros(
+                B, next_n, num_heads, head_dim // 2, dtype=torch.uint8, device=device
+            )
+            sf_q = torch.zeros(B, next_n, num_heads, dtype=torch.int32, device=device)
+            kv_fused = torch.zeros(
+                num_blocks, block_size, 1, head_dim // 2 + 4,
+                dtype=torch.uint8, device=device,
+            )
+            logits = flashinfer.fp4_paged_mqa_logits(
+                q_fp4, sf_q, kv_fused, weights, context_lens, block_table,
+                max_context_len,
+            )
+            # logits: [B*next_n, max_context_len] bfloat16 (fp4's default).
+
     Args:
         q:               [batch_size, next_n, num_heads, head_dim/2]  uint8
-                         Two FP4 (E2M1) values packed per byte.
+                         Two FP4 (E2M1) values packed per byte: byte j of a
+                         head's row holds element 2j in the LOW nibble and
+                         element 2j+1 in the HIGH nibble.
         sf_q:            [batch_size, next_n, num_heads]  int32
                          Packed UE8M0 scale factors for each (token, head):
-                         head_dim/sf_vec_size scales of one byte each.
-        kv_fused:        [num_blocks, block_size, 1, kv_row_bytes]  uint8
-                         kv_row_bytes = head_dim/2 + head_dim/sf_vec_size:
-                         the packed FP4 values of one token, then that token's
-                         UE8M0 scale factors.  Within a block the two regions
-                         are contiguous, not interleaved per token:
-                           [KV data: block_size * head_dim/2          bytes]
-                           [KV SF  : block_size * head_dim/sf_vec_size bytes]
-        weights:         [batch_size*next_n, num_heads]  float32  per-head weights
-        context_lens:    [batch_size]  int32  (CUDA)
+                         head_dim/sf_vec_size = 4 one-byte scales per int32.
+                         Byte k of each int32 (k-th least significant,
+                         little-endian) is the UE8M0 scale -- the raw float32
+                         exponent byte -- of that (token, head)'s elements
+                         [k*sf_vec_size, (k+1)*sf_vec_size).  Equivalent to a
+                         uint8 [batch_size, next_n, num_heads, 4] tensor viewed
+                         with .view(torch.int32).  (Other flashinfer fp4 APIs
+                         call this tensor ``q_sf``.)
+        kv_fused:        [num_blocks, block_size, 1, head_dim/2 + 4]  uint8
+                         The paged KV pool; "fused" means each block stores its
+                         packed FP4 values and their UE8M0 scale factors
+                         together in one uint8 buffer.  The 4-D shape is a size
+                         contract only -- the kernel reads each block's
+                         flattened bytes as two contiguous regions, NOT as
+                         per-token rows:
+                           bytes [0, block_size*head_dim/2): the packed FP4
+                             values, token-major, same nibble rule as q;
+                           bytes [block_size*head_dim/2, end): the UE8M0
+                             scales, head_dim/sf_vec_size = 4 bytes per token,
+                             token-major by default (see is_kv_sf_interleaved).
+                         Build it like the fp8 example's torch.cat recipe, with
+                         the value/scale regions sized as above.
+        weights:         [batch_size*next_n, num_heads]  float32
+                         Per-head mixing weights, not model parameters:
+                         output[row, pos] = sum_h weights[row, h] * relu(score_h).
+                         Row b*next_n + t pairs with q[b, t] -- rows are
+                         ordered exactly like the output rows; pass a
+                         [batch_size, next_n, num_heads] tensor as
+                         w.view(batch_size * next_n, num_heads).  Cast
+                         internally when epi_dtype is float16/bfloat16.
+        context_lens:    [batch_size]  int32, on q's device.  Per-request KV
+                         length -- the quantity other flashinfer APIs call
+                         ``seq_lens`` (names here follow the DeepGEMM paged-MQA
+                         API this module ports).
                          No entry may exceed max_context_len.
-        block_table:     [batch_size, max_blocks_per_seq]  int32  (CUDA)
+        block_table:     [batch_size, max_blocks_per_seq]  int32, on q's device
+                         (elsewhere in flashinfer: ``block_tables``).
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
                          max_b round_up(context_lens[b], 128) // block_size --
@@ -1524,11 +1707,12 @@ def fp4_paged_mqa_logits(
                          is a device-side out-of-bounds READ, i.e. undefined
                          behaviour -- it may return corrupt logits, or fault and
                          poison the CUDA context.
-        max_context_len: int  maximum KV sequence length; must be >=
-                         max(context_lens).  The output row is sized from this
-                         while the schedule follows context_lens, so a smaller
-                         value is a device-side out-of-bounds WRITE, likewise
-                         undefined behaviour.
+        max_context_len: int  maximum KV sequence length (elsewhere:
+                         ``max_seq_len``); must be >= max(context_lens).  The
+                         output row is sized from this while the schedule
+                         follows context_lens, so a smaller value is a
+                         device-side out-of-bounds WRITE, likewise undefined
+                         behaviour.
 
                          Both preconditions above are the caller's to satisfy.
                          FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
@@ -1537,74 +1721,105 @@ def fp4_paged_mqa_logits(
                          because the device-to-host copy it needs is illegal
                          there.  Neither setting makes the kernel itself safe
                          against a violated contract.
-        sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor.
-                         Determines both sf_q's packing and the scale-factor
-                         bytes of each fused KV row (head_dim/sf_vec_size).
-        output_dtype:    output tensor dtype (float32, float16, or bfloat16)
-        epi_dtype:       epilogue dtype (float32, float16, or bfloat16)
-        num_epi_subtiles: epilogue subtile count (perf knob, default 1)
+        sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor
+                         (32).  Determines both sf_q's packing and the
+                         scale-factor bytes of each fused KV row.
+        output_dtype:    bfloat16 (default), float32, or float16.  The default
+                         differs from fp8_paged_mqa_logits (float32) -- it
+                         mirrors what the upstream TensorRT-LLM integration
+                         binds for each variant; pass output_dtype explicitly
+                         in code that uses both.
+        epi_dtype:       epilogue dtype (float32, float16, or bfloat16).  There
+                         is no acc_dtype knob: block-scaled FP4 MMA always
+                         accumulates in float32.
+        num_epi_subtiles: performance knob; numerics unchanged for any legal
+                         value.  Leave at 1: measured on SM100 at num_heads=64,
+                         1/2/4 tie and 8 is 5-11% slower.  Exists for parity
+                         with TensorRT-LLM's op.  Must divide num_heads with
+                         the quotient a multiple of 4.
         is_kv_sf_interleaved: declares how the scale-factor tail of each
                          kv_fused block is ordered.  False (the default) means
                          token order.  True means the block's scale factors are
-                         split into _SF_PER_INT32 equal runs which are then
-                         round-robin interleaved, so slot k holds the scale
-                         factor of token
-                         (k % _SF_PER_INT32) * (block_size // _SF_PER_INT32)
-                         + k // _SF_PER_INT32.  This describes the KV cache you
-                         pass in, so set it to match how that cache was
-                         written; supplying the interleaved order can be
-                         faster.
+                         split into 4 equal runs which are then round-robin
+                         interleaved, so slot k holds the scale factor of token
+                         (k % 4) * (block_size // 4) + k // 4.  This describes
+                         the KV cache you pass in, so set it to match how that
+                         cache was written; supplying the interleaved order can
+                         be faster.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
-                         on CUDA.  If None, computed from context_lens each call.
-                         Reusable only while the entire
-                         ceil(context_lens / 256) vector and the target device's
-                         SM count are unchanged -- a fixed batch size is not
-                         sufficient, since one sequence crossing a 256-token
-                         boundary changes it with every shape identical.  Under
-                         CUDA-graph replay with changing lengths, recompute into
-                         the same buffer before launching.  A stale schedule can
-                         hang the kernel.
+                         on q's device.  Omit it (None, recommended) unless
+                         profiling shows the per-call schedule computation (one
+                         small GPU kernel, a few microseconds) matters in your
+                         eager hot loop.
+                         Must be omitted (None) for next_n=4 on SM100/SM103.
+                         Fix: omit it -- the internally computed schedule is
+                         correct and CUDA-graph-capturable.  Reason: the kernel
+                         runs next_n=4 there as two internal passes and
+                         schedules 2*batch_size rows, not the batch_size rows a
+                         caller-built schedule describes; the mismatch can hang
+                         the persistent kernel, so it is rejected with
+                         ValueError.  (Mechanism: the accumulator tile for four
+                         positions exceeds the SM100/SM103 on-chip budget; on
+                         Rubin it fits in one pass and caller schedules work for
+                         every next_n.)
+                         A caller-managed schedule is reusable only while the
+                         entire ceil(context_lens / 256) vector and the target
+                         device's SM count are unchanged -- a fixed batch size
+                         is not sufficient, since one sequence crossing a
+                         256-token boundary changes it with every shape
+                         identical.  Under CUDA-graph replay with changing
+                         lengths, recompute into the same buffer before
+                         launching.  A stale schedule can hang the kernel.
                          Use compute_paged_mqa_logits_schedule() to generate it.
-                         Must be omitted (None) for next_n=4 on SM100/SM103:
-                         the TMEM there cannot hold four positions in one MMA
-                         tile, so the kernel runs an internal two-atom split
-                         (numerics unchanged) and the scheduler describes
-                         2*batch_size rows while a caller-built schedule
-                         describes batch_size -- a mismatch that can hang the
-                         persistent kernel, so it is rejected with ValueError.
-                         The internally computed schedule is
-                         CUDA-graph-capturable and replays correctly, so under
-                         capture simply omit this argument there.
         out:             optional pre-allocated output
-                         [batch_size*next_n, padded_ctx_len].  Use
-                         padded_context_len() to size it.  Required for CUDA
-                         graph capture.  May have more rows than
-                         batch_size*next_n, so one address-stable max-batch
-                         buffer can be shared across captures; only the first
-                         batch_size*next_n rows are written and returned.
+                         [batch_size*next_n, padded_ctx_len], where padded_ctx_len
+                         >= max_context_len and is a multiple of SPLIT_KV=256.
+                         If None, allocated each call.  Use padded_context_len()
+                         to size it.  Required for CUDA graph capture.
+                         May have more rows than batch_size*next_n, so one
+                         address-stable max-batch buffer can be shared across
+                         captures; only the first batch_size*next_n rows are
+                         written and returned.
 
     Returns:
         logits: [batch_size*next_n, max_context_len]  output_dtype
+                (a view of ``out`` when provided).  Row ``b*next_n + t`` holds
+                scores for KV positions ``0 .. context_lens[b] - next_n + t``
+                inclusive -- the newest slot sees the whole context, each
+                earlier slot one position fewer.  Columns past that limit, and
+                the padding columns of ``out`` beyond max_context_len, are
+                UNSPECIFIED: slice or mask by the limit before consuming (e.g.
+                before a top-k).  Rows of a request with context_lens[b] == 0
+                are never written.
+
+    CUDA graph capture:
+        Pass a pre-allocated, address-stable ``out`` sized with
+        padded_context_len(); keep q / sf_q / kv_fused / context_lens /
+        block_table at static addresses; leave ``schedule_meta=None`` -- the
+        schedule is then computed by a small GPU kernel inside the capture and
+        re-derives itself from context_lens' current contents on every replay
+        (including for the internal next_n=4 split on SM100/SM103).  If you
+        manage the schedule yourself (single-pass shapes only), recompute it
+        into the same buffer before every replay in which any
+        ceil(context_lens / 256) changed; a stale schedule can hang the kernel.
 
     Restrictions of the current kernel:
         The signature above is the general form.  This kernel is specialised for
         a single problem shape; the constraints below are enforced here, and a
         future kernel may widen them without changing this signature.
 
-        num_heads        must equal _FP4_REQUIRED_NUM_HEADS.
-        head_dim         must equal _FP4_REQUIRED_HEAD_DIM.
-        next_n           must be in 1.._FP4_MAX_NEXT_N.
+        num_heads        must equal 64.
+        head_dim         must equal 128.
+        next_n           must be in 1..4.
         schedule_meta    must be None for next_n=4 on SM100/SM103, where the
-                         kernel runs an internal two-atom split (see
+                         kernel runs the internal two-pass split (see
                          schedule_meta above).
-        sf_vec_size      must equal _FP4_SF_VEC_SIZE, and head_dim/sf_vec_size
-                         must equal _SF_PER_INT32.
-        block_size       must divide _COMPUTE_BLOCK_KV, with the quotient at
-                         most _MAX_BLOCKS_PER_MMA.
+        sf_vec_size      must equal 32 (so head_dim/sf_vec_size = 4 scales per
+                         token -- exactly one int32 in sf_q).
+        block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
         num_epi_subtiles must divide num_heads, with the quotient a multiple of
-                         _EPI_SUBTILE_UNROLL.
-        is_kv_sf_interleaved may be True only when
-                         block_size == _FP4_SF_INTERLEAVE_BLOCK_SIZE.
+                         4 (at num_heads=64: 1, 2, 4, 8, or 16).
+        is_kv_sf_interleaved may be True only when block_size == 128.
     """
     _require_cute_dsl(q.device, "fp4_paged_mqa_logits")
 
@@ -1758,12 +1973,15 @@ def precompile_paged_mqa_logits(
     compilation on first use.  Call once during deployment setup or as part
     of a package-build step.
 
-    Only the configs listed below are covered; anything else (fp16 epilogue,
-    other head_dim / num_heads, num_epi_subtiles != 1) still compiles on first
-    use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s per output dtype
-    for the 12 fp4.  The fp4 next_n=4 entry compiles the decomposition the
-    default policy picks on the target device (direct on Rubin, two atoms of 2
-    on Blackwell).
+    The warmed set is exactly: fp8 -- num_heads=64, head_dim=128, block_size
+    in {64, 128}, next_n 1..4, fp32 epilogue/accumulator (8 kernels); fp4 --
+    num_heads=64, head_dim=128, block_size in {32, 64, 128}, next_n 1..4, fp32
+    epilogue (12 kernels per output dtype).  Anything else (fp16 epilogue,
+    fp8 with block_size=32, other head geometry, num_epi_subtiles != 1) still
+    compiles on first use.  Measured on sm_100a: ~9s for the 8 fp8 kernels,
+    ~3s per output dtype for the 12 fp4.  The fp4 next_n=4 entry compiles the
+    decomposition the fixed policy picks on the target device (direct on
+    Rubin, two internal passes on Blackwell).
 
     Args:
         device:        CUDA device to target.  Defaults to the current CUDA
