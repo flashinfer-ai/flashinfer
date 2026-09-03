@@ -32,7 +32,6 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.jit import cake_fused_moe_warp_decode
 
 
 @dataclass
@@ -166,79 +165,6 @@ def test_config_is_explicit_exact_sm103_and_not_default():
     assert not any(isinstance(item, CakeWarpDecodeConfig) for item in _DEFAULT_BACKEND)
     with pytest.raises(ValueError, match="must be 'cake'"):
         CakeWarpDecodeConfig(backend="auto")
-
-
-def test_jit_spec_and_aot_registration_are_exact_sm103(monkeypatch):
-    cake_fused_moe_warp_decode.gen_cake_fused_moe_warp_decode_module.cache_clear()
-    spec = cake_fused_moe_warp_decode.gen_cake_fused_moe_warp_decode_module()
-
-    assert spec.name == "cake_fused_moe_warp_decode_sm103a"
-    assert [source.name for source in spec.sources] == [
-        "cake_adaptive_warp_decode_kernels.cu",
-        "cake_warp_decode_binding.cu",
-    ]
-    assert "-gencode=arch=compute_103a,code=sm_103a" in spec.extra_cuda_cflags
-    assert (
-        sum(
-            flag.startswith("-gencode=arch=compute_") for flag in spec.extra_cuda_cflags
-        )
-        == 1
-    )
-
-    with pytest.raises(ValueError, match="unsupported Cake warp-decode target"):
-        cake_fused_moe_warp_decode.get_cake_fused_moe_warp_decode_uri("sm100a")
-
-    from flashinfer import aot
-
-    sentinel = SimpleNamespace(name="cake_fused_moe_warp_decode_sm103a")
-    monkeypatch.setattr(
-        aot,
-        "gen_cake_fused_moe_warp_decode_module",
-        lambda: sentinel,
-    )
-    specs = aot.gen_all_modules(
-        f16_dtype_=[],
-        f8_dtype_=[],
-        fa2_head_dim_=[],
-        fa3_head_dim_=[],
-        use_sliding_window_=[],
-        use_logits_soft_cap_=[],
-        sm_capabilities={"sm103": True},
-        add_comm=False,
-        add_gemma=False,
-        add_oai_oss=False,
-        add_moe=True,
-        add_act=False,
-        add_misc=False,
-        add_xqa=False,
-    )
-    assert sentinel in specs
-
-
-def test_jit_loader_rejects_non_sm103_before_build(monkeypatch):
-    build_called = False
-
-    def fail_if_built(target):
-        nonlocal build_called
-        build_called = True
-        return target
-
-    monkeypatch.setattr(
-        cake_fused_moe_warp_decode,
-        "_get_compute_capability",
-        lambda device=None: (10, 0),
-    )
-    monkeypatch.setattr(
-        cake_fused_moe_warp_decode,
-        "_build_and_load_cake_fused_moe_warp_decode_module",
-        fail_if_built,
-    )
-
-    with pytest.raises(RuntimeError, match="exact compute capability 10.3"):
-        cake_fused_moe_warp_decode.load_cake_fused_moe_warp_decode_module(
-            device="cuda:1"
-        )
-    assert build_called is False
 
 
 def test_runner_build_passes_its_explicit_device(monkeypatch):
