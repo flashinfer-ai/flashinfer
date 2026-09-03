@@ -6534,6 +6534,8 @@ def _run_flash_kda_prefill(
             else _empty_cuda_tensor(q.device, torch.int64)
         )
         generated_route_launched = (
+            route != _FLASH_KDA_ROUTE_SMALL_BH_M128 or fixed_layout
+        ) and (
             _run_generated_single_route(
                 workspace=workspace,
                 target=flash_target,
