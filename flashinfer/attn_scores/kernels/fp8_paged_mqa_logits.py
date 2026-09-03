@@ -342,11 +342,15 @@ class FP8MQALogitsKernel:
         # columns per UMMA stage, so max_umma_stages = TMEM_COLS // (2 * N).
         #
         # Queried per-arch rather than hardcoded to SM100's 512 because Rubin
-        # (sm_107) exposes 576. Note this currently changes nothing in practice:
-        # the two disagree only for N in (128, 144], and N = next_n * num_heads
-        # is always a multiple of 32, so no reachable configuration lands in
-        # that band. It is written this way so the constant stops being wrong on
-        # a 576-column part, not because it buys a stage today.
+        # (sm_107) exposes 576. Note this changes nothing through the public
+        # API: max_umma_pipeline is never enabled there, so num_umma_stages is
+        # pinned to 1 and TMEM_COLS goes unused. Even with the knob forced on
+        # in a vendored-code experiment, 512 and 576 disagree only for N in
+        # (128, 144]; the deployed num_heads=64 shapes (N in {64, 128, 192,
+        # 256}) never land in that band, though checker-legal off-shapes
+        # (e.g. num_heads=68, next_n=2 -> N=136) could. It is written this way
+        # so the constant stops being wrong on a 576-column part, not because
+        # it buys a stage today.
         _major, _minor = _arch_major_minor(arch)
         TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{_major}{_minor}")
         if max_umma_pipeline:
