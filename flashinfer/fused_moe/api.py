@@ -406,7 +406,18 @@ _CUTLASS_W4A16_ARCHS = (90,)
 
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
-_CUTILE_SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
+_CUTILE_SUPPORTED_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.SwigluStep,
+    ActivationType.Geglu,
+    ActivationType.GegluTanh,
+    ActivationType.Situ,
+    ActivationType.Relu2,
+    ActivationType.Identity,
+    ActivationType.Gelu,
+    ActivationType.Relu,
+    ActivationType.Silu,
+)
 
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
 # Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.

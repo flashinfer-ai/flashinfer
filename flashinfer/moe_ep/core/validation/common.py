@@ -217,6 +217,36 @@ def validate_arch_for_backend(backend: str) -> None:
             )
 
 
+# nccl_ep instantiates its low-latency kernels only for these hidden sizes
+# (contrib/nccl_ep/device/macros.cuh, SWITCH_HIDDEN). Anything else reaches
+# EP_HOST_ASSERT(false and "Unsupported hidden") in device/low_latency.cu, which
+# aborts the process from C++ with no Python traceback -- under a test harness
+# that surfaces only as the worker dying on a signal.
+_NCCL_EP_LL_HIDDEN_SIZES = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
+    """Reject hidden sizes the LL kernels were never instantiated for.
+
+    LL only; HT is not hidden-size specialized. Raises rather than letting the
+    device-side host assert abort the process.
+    """
+    if backend != "nccl_ep" or params.algorithm is not EpAlgorithm.LOW_LATENCY:
+        return
+    hidden = params.token_hidden_size
+    if hidden in _NCCL_EP_LL_HIDDEN_SIZES:
+        return
+    supported = ", ".join(str(h) for h in _NCCL_EP_LL_HIDDEN_SIZES)
+    raise MoEEpConfigError(
+        f"nccl_ep low-latency does not support token_hidden_size={hidden}. "
+        f"Its kernels are instantiated only for: {supported} "
+        "(contrib/nccl_ep/device/macros.cuh SWITCH_HIDDEN); any other value "
+        "aborts the process in device/low_latency.cu. Round the layer's hidden "
+        "size up to one of the supported values, or use "
+        "EpAlgorithm.HIGH_THROUGHPUT, which is not hidden-size specialized."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 
@@ -245,6 +275,25 @@ def validate_mega_arch_sm90() -> None:
         raise MoEEpArchError(
             f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
+        )
+
+
+def validate_mega_arch_sm120() -> None:
+    """Arch gate for the SM120 (Blackwell-consumer) mega kernels.
+
+    The SM120 swap-AB MXFP8 CuTeDSL mega kernel uses the warp-level MMA path
+    compiled for the consumer Blackwell family (sm_120 / sm_121). Datacenter
+    Blackwell (sm_100/sm_103) hosts use the sm_100 tree's kernels instead.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc[0] != 12:
+        raise MoEEpArchError(
+            f"sm120_mxfp8_mxfp8_bf16_cutedsl mega kernel requires sm_120/sm_121 "
+            f"(Blackwell-consumer); host has sm_{cc[0]}{cc[1]}"
         )
 
 

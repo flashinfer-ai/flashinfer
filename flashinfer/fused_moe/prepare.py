@@ -1417,12 +1417,11 @@ def prepare_cutile_nvfp4_weights(
     logical dimensions while their scaled-MMA layout pads outer scale rows to
     a multiple of 128.
     """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
     activation_type = ActivationType(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
-        raise ValueError(
-            f"unsupported cuTile NVFP4 activation {activation_type!r}; expected "
-            "Swiglu or Relu2."
-        )
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile NVFP4 activation {activation_type!r}.")
     if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
         raise ValueError(
             "cuTile W4A4 requires hidden_size and intermediate_size divisible by 64."
@@ -1533,6 +1532,8 @@ def prepare_cutile_bf16_weights(
     Non-gated weights use ``[E, I, H]`` and need only the transpose. GEMM2
     changes from ``[E, H, I]`` to ``[E, I, H]`` for both activation families.
     """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
     if device is None:
         device = w1_bf16.device
     device = torch.device(device)
@@ -1542,11 +1543,8 @@ def prepare_cutile_bf16_weights(
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
     activation_type = ActivationType(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
-        raise ValueError(
-            f"unsupported cuTile BF16 activation {activation_type!r}; expected "
-            "Swiglu or Relu2."
-        )
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile BF16 activation {activation_type!r}.")
     expected_w1 = (
         num_local_experts,
         intermediate_size * (2 if activation_type.is_gated else 1),

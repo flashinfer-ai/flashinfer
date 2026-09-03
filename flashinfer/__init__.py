@@ -125,6 +125,8 @@ with contextlib.suppress(ImportError):
         CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 

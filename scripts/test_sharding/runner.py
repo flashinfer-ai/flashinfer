@@ -69,15 +69,20 @@ _LEASE_HEARTBEAT_SECONDS = 10.0
 _LEASE_CLOSE_SECONDS = 2.0
 _CONTROLLER_PROGRESS_SECONDS = 60.0
 
-# The SM90 pull-style and SM100 MegaMoE drops both import vendored modules such
-# as ``common`` as top-level packages, so they cannot be imported by one pytest
-# collection process. Keep the smaller SM90 family isolated for now. Long term,
-# namespace both vendored trees and use package-relative imports; once they can
-# coexist in ``sys.modules``, remove this collection partition.
+# The SM90 pull-style, SM120 swap-AB, and SM100 MegaMoE drops all import
+# vendored modules such as ``common`` as top-level packages, so no two of them
+# can be imported by one pytest collection process. Keep the SM100 family in
+# the primary scope and give each smaller arch family its own partition. Long
+# term, namespace the vendored trees and use package-relative imports; once
+# they can coexist in ``sys.modules``, remove these collection partitions.
 _COLLECTION_ISOLATION_GROUPS = (
     (
         "sm90-pull-style-cutedsl-megakernel",
         ("test_moe_ep_sm90_pull_*_mega_multirank.py",),
+    ),
+    (
+        "sm120-swapab-cutedsl-megakernel",
+        ("test_moe_ep_sm120_*_mega_multirank.py",),
     ),
 )
 
