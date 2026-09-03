@@ -307,11 +307,15 @@ def bench_sparse_mla_sm120_dsv4_dual(
     return ms * 1e3, kv_bw_gbps, tflops
 
 
-def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0):
+def bench_sparse_mla_sm120_dsv3_2(
+    num_heads, num_tokens, with_sink=False, seed=0, kv_scale_format="arbitrary_fp32"
+):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2.
 
     Fixed: topk=2048, page_block_size=64 (= _DECODE_DSV3_2_PAGE_BLOCK_SIZE),
-    d_qk=576, d_v=512.
+    d_qk=576, d_v=512. ``kv_scale_format`` picks the power-of-2 inline-scale
+    path (``"auto"``) or the GLM arbitrary-FP32 path (software fold with
+    dual-limb weights).
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -351,7 +355,7 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
     runner = _SparseMLAPagedAttentionRunner(
         max_num_tokens=num_tokens,
         max_num_heads=num_heads,
-        kv_scale_format="arbitrary_fp32",
+        kv_scale_format=kv_scale_format,
         device=device,
     )
 
@@ -513,3 +517,18 @@ if __name__ == "__main__":
         print(
             f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
         )
+
+    # DSv3.2 prefill: topk fixed at 2048, num_tokens > 64. Sweep is num_heads x
+    # num_tokens x kv_scale_format; 64/128 heads run the swapAB kernel.
+    dsv3_2_prefill_configs = [(h, t) for t in (128, 512) for h in (64, 128)]
+
+    for fmt in ("auto", "arbitrary_fp32"):
+        print()
+        print(f"DSv3.2 prefill path (num_tokens > 64, kv_scale_format={fmt}):")
+        print(header)
+        print("-" * len(header))
+        for h, t in dsv3_2_prefill_configs:
+            lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t, kv_scale_format=fmt)
+            print(
+                f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
+            )
