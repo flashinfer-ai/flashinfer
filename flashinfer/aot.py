@@ -123,7 +123,10 @@ from .jit.fused_moe import (
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
 )
-from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.bgmv_moe import (
+    BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
+    gen_bgmv_moe_module,
+)
 from .jit.blackwell_bgmv_moe import (
     BLACKWELL_BGMV_MOE_DTYPES,
     BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
@@ -530,6 +533,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
@@ -733,7 +737,8 @@ def gen_all_modules(
     if add_moe:
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
-        jit_specs.append(gen_bgmv_moe_module())
+        if has_bgmv_moe:
+            jit_specs.append(gen_bgmv_moe_module())
         if sm_capabilities.get("sm100a_exact", False):
             jit_specs.extend(
                 gen_blackwell_bgmv_moe_module(hidden_size, dtype)
@@ -1190,6 +1195,10 @@ def detect_sm_capabilities():
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
+        "bgmv_moe": any(
+            major in BGMV_MOE_SUPPORTED_MAJOR_VERSIONS
+            for major, _ in compilation_context.TARGET_CUDA_ARCHS
+        ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
