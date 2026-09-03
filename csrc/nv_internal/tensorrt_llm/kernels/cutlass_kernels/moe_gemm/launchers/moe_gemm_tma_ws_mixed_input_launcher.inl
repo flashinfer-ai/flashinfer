@@ -98,7 +98,7 @@ struct EpilogueSelector<false, TileShape, ClusterShape, ElementAccumulator, Elem
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
           ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
           typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
-          FusionOperation, true>::CollectiveOp;
+          FusionOperation, detail::kUsePrebuiltDDescriptor>::CollectiveOp;
 };
 
 template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,

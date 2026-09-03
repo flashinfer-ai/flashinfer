@@ -41,6 +41,11 @@ using PrecomputedWorkTileCodec = cutlass::gemm::kernel::detail::PrecomputedGroup
 static constexpr int kPrecomputedSchedulerThreads = 128;
 static constexpr int kPrecomputedSchedulerMaxSwizzle = 2;
 static constexpr uint64_t kPrecomputedSchedulerSentinelTiles = 4096;
+#if defined(FLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR)
+static constexpr bool kUsePrebuiltDDescriptor = true;
+#else
+static constexpr bool kUsePrebuiltDDescriptor = false;
+#endif
 
 CUTLASS_HOST_DEVICE uint64_t div_round_up(uint64_t value, uint64_t divisor) {
   return (value + divisor - 1) / divisor;
@@ -114,8 +119,10 @@ inline size_t precomputed_scheduler_workspace_size(int num_experts, int64_t tota
   bytes += align_bytes(sizeof(cute::TmaDescriptor), 128);
   bytes +=
       align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
-  bytes +=
-      align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
+  if constexpr (kUsePrebuiltDDescriptor) {
+    bytes +=
+        align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
+  }
   return bytes;
 }
 
@@ -134,6 +141,7 @@ template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
 inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
     TmaWarpSpecializedGroupedGemmInput const& hopper_inputs, int num_experts,
     int64_t total_routed_tokens, int64_t channels, int sm_count) {
+  constexpr bool build_prebuilt_d_descriptor = kUsePrebuiltDDescriptor && !ChunkMajorWorkMap;
   using ProblemShape = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt;
   using Scheduler =
       cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8,
@@ -180,7 +188,10 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   size_t const prebuilt_b_bytes =
       align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
   size_t const prebuilt_d_bytes =
-      align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
+      build_prebuilt_d_descriptor
+          ? align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor),
+                        128)
+          : 0;
   size_t const required_bytes =
       work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes + prebuilt_d_bytes;
 
@@ -199,8 +210,10 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   workspace.prebuilt_tma_desc_A = reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes);
   workspace.prebuilt_tma_desc_B =
       reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes + prebuilt_a_bytes);
-  workspace.prebuilt_tma_desc_D = reinterpret_cast<cute::TmaDescriptor*>(
-      base + work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes);
+  if constexpr (build_prebuilt_d_descriptor) {
+    workspace.prebuilt_tma_desc_D = reinterpret_cast<cute::TmaDescriptor*>(
+        base + work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes);
+  }
   workspace.required_bytes = required_bytes;
   workspace.gemm_grid_shape = gemm_grid_shape;
   workspace.work_tiles_per_worker = work_tiles_per_worker;
@@ -540,7 +553,8 @@ __global__ void build_precomputed_work_tile_map_kernel(
 }
 
 template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
-          bool ChunkMajorWorkMap = false, bool BuildPrebuiltDDescriptor = !ChunkMajorWorkMap,
+          bool ChunkMajorWorkMap = false,
+          bool BuildPrebuiltDDescriptor = kUsePrebuiltDDescriptor && !ChunkMajorWorkMap,
           class Problem, class MainloopParams, class EpilogueParams>
 inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const& workspace,
                                             Problem const* problem_shapes, int groups,
