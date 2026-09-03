@@ -1659,7 +1659,7 @@ def test_attention_ts_decode_planned_kv_domain_detects_unpaired_tail(
         (128, 128, False, 32, (None, None, None)),
         (128, 128, True, 1, (184, 88, 56)),
         (64, 256, True, 31, (None, None, None)),
-        (64, 256, True, 32, (176, 104, 56)),
+        (64, 256, True, 32, (152, 152, 56)),
     ),
 )
 def test_attention_ts_decode_register_reallocation_follows_task_graph(
@@ -2298,7 +2298,6 @@ def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
     assert cfg.kv_stages == 2
     assert cfg.use_persistent_scheduler is persistent
     assert cfg.use_attention_sinks is use_attention_sinks
-    assert not cfg.uses_rotating_kv256_exchange
 
     if not persistent:
         resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
@@ -2306,24 +2305,17 @@ def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
         _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
-    """Direct persistent KV256 carries its drained-stage alias in one credit."""
+@pytest.mark.parametrize("persistent", (False, True))
+def test_attention_ts_decode_kv256_uses_dedicated_fragment_exchange(
+    persistent: bool,
+) -> None:
+    """Direct KV256 correction owns a compact exchange outside the K/V ring."""
 
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_corr import (
         TmemCorrResource,
     )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_tasks import (
-        SmemKvReuseCreditResource,
-    )
 
-    cfg = _make_contiguous_kv256_config(persistent=True)
-    assert cfg.uses_rotating_kv256_exchange
-    reuse_credit = SmemKvReuseCreditResource(
-        cfg=cfg,
-        pipeline_config=None,
-        name="smem_kv_reuse_credit",
-    )
-    credit_alloc = reuse_credit.get_smem_requirements()[0]
+    cfg = _make_contiguous_kv256_config(persistent=persistent)
     tmem_corr1 = TmemCorrResource(
         cfg=cfg,
         inst_id=1,
@@ -2332,57 +2324,15 @@ def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
     )
     exchange_alloc = tmem_corr1.get_smem_requirements()[-1]
 
-    # Direct output exchanges 128 float4 stats plus 64 rows of 132 floats.
-    # The live 35,840-byte view dynamically selects one stage inside a
-    # full-ring allocation envelope that aliases, but does not enlarge, KV.
-    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 35_840
-    assert exchange_alloc.size_bytes == 3 * 65_536
-    assert credit_alloc.size_bytes == 4
+    # The tail exchanges 128 float4 stats plus one padded D32 fragment per
+    # logical output row, so the buffer no longer has to alias the K/V ring
+    # and the load warp can stream the next tile while correction finishes.
+    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 11_264
+    assert exchange_alloc.size_bytes == 11_264
 
-
-def test_attention_ts_decode_kv256_reuse_credit_requires_three_stage_ring(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The reuse-credit cursor arithmetic is specialized to three stages."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_tasks
-
-    cfg = _make_contiguous_kv256_config(persistent=True)
-    assert cfg.uses_rotating_kv256_exchange
-    monkeypatch.setattr(fmha_decode_tasks, "KV_TILE_256_SHARED_FIFO_STAGES", 4)
-
-    with pytest.raises(AssertionError, match="exactly three shared FIFO stages"):
-        fmha_decode_tasks.SmemKvReuseCreditResource(
-            cfg=cfg,
-            pipeline_config=None,
-            name="smem_kv_reuse_credit",
-        )
-
-
-def test_attention_ts_decode_rejects_reuse_credit_before_schedule_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A rotating reuse credit is invalid without a persistent work queue."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_tasks
-
-    def unexpected_schedule_capture(_fn):
-        pytest.fail("invalid reuse-credit topology reached schedule capture")
-
-    monkeypatch.setattr(fmha_decode_tasks, "schedule", unexpected_schedule_capture)
-
-    with pytest.raises(ValueError, match="reuse credit requires a work queue"):
-        fmha_decode_tasks.create_correction_task(
-            object(),
-            object(),
-            object(),
-            object(),
-            object(),
-            None,
-            object(),
-            object(),
-            domain=0,
-        )
+    if not persistent:
+        _resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -2423,49 +2373,8 @@ def test_attention_ts_decode_kv256_split_uses_compact_exchange(
     )
     exchange_alloc = tmem_corr1.get_smem_requirements()[-1]
 
-    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 35_840
-    assert exchange_alloc.size_bytes == 35_840
-
-
-def test_attention_ts_decode_rotating_exchange_is_a_storage_agnostic_capability() -> (
-    None
-):
-    """Select rotation by physical topology, not contiguous versus paged K/V."""
-
-    contiguous = _make_contiguous_kv256_config(persistent=True)
-    paged = make_decode_config(
-        headdim=128,
-        args={
-            "use_keeps_mma_ab": True,
-            "tile_size_q": 64,
-            "tile_size_kv": 256,
-            "groups_tokens_heads_q": True,
-            "use_persistent_scheduler": True,
-        },
-        seq_len_q=64,
-        seq_len_kv=4096,
-        batch_size=1,
-        num_heads_q=32,
-        num_heads_kv=32,
-        qkv_dtype=BFloat16,
-        o_dtype=BFloat16,
-        qkv_layout="pagedKv",
-        num_tokens_per_page=64,
-        split_kv_mode="disabled",
-        splits_kv=1,
-        mask_type="dense",
-        auto_tuner=False,
-    )
-
-    assert contiguous.uses_rotating_kv256_exchange
-    assert paged.uses_rotating_kv256_exchange
-    assert not replace(
-        contiguous, use_persistent_scheduler=False
-    ).uses_rotating_kv256_exchange
-    assert not replace(contiguous, use_split_kv=True).uses_rotating_kv256_exchange
-    assert not replace(
-        contiguous, use_attention_sinks=True
-    ).uses_rotating_kv256_exchange
+    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 11_264
+    assert exchange_alloc.size_bytes == 11_264
 
 
 def test_attention_ts_decode_kv256_register_launch_bound_is_amortized() -> None:
@@ -2512,7 +2421,7 @@ def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> Non
         long_cfg.softmax_task_num_registers,
         long_cfg.correction_task_num_registers,
         long_cfg.mma_load_task_num_registers,
-    ) == (176, 104, 56)
+    ) == (152, 152, 56)
     assert cfg.tmem_s_cols == 128
     assert cfg.mma_tile_n_bmm1 == 256
 
@@ -3060,8 +2969,8 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
     assert cfg.groups_tokens_heads_q is True
     assert cfg.q_tokens_per_cta == 2
     register_cfg = replace(cfg, total_kv_tiles=32)
-    assert register_cfg.softmax_task_num_registers == 176
-    assert register_cfg.correction_task_num_registers == 104
+    assert register_cfg.softmax_task_num_registers == 152
+    assert register_cfg.correction_task_num_registers == 152
     assert cfg == explicit_reference
 
 

@@ -95,7 +95,6 @@ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
-    SmemKvReuseCreditResource,
     _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
@@ -747,7 +746,6 @@ def _build_decode_gen_schedule(
     # ------------------------------------------------------------------
     work_queue = None
     schedule_token_throttle = None
-    smem_kv_reuse_credit = None
     # CLC remains the single persistent policy for every supported topology.
     # The stock static WorkQueue advances and decodes coordinates separately
     # in every task, which regresses multi-wave decode workloads. CLC computes
@@ -805,17 +803,6 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
-        if cfg.uses_rotating_kv256_exchange:
-            smem_kv_reuse_credit = SmemKvReuseCreditResource(
-                cfg=cfg,
-                pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
-                    num_stages=1,
-                    producer_group=load_grp,
-                    consumer_group=correction_grp,
-                    cta_layout_vmnk=cta_layout,
-                ),
-                name="smem_kv_reuse_credit",
-            )
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -1313,7 +1300,6 @@ def _build_decode_gen_schedule(
                 smem_kv,
                 work_queue,
                 schedule_token_throttle,
-                smem_kv_reuse_credit,
                 cfg,
                 domain=load_domain,
                 domain_bias=0,
@@ -1457,7 +1443,6 @@ def _build_decode_gen_schedule(
             tmem_corr0,
             tmem_corr1,
             work_queue,
-            smem_kv_reuse_credit,
             cfg,
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
@@ -1633,10 +1618,6 @@ def _build_decode_gen_schedule(
         )
     if schedule_token_throttle is not None:
         resource_dependency_graph[schedule_token_throttle] = [work_queue]
-    if smem_kv_reuse_credit is not None:
-        # A self-edge models the one-slot ownership token: Load produces it
-        # for the current tile and Correction consumes it before the next Load.
-        resource_dependency_graph[smem_kv_reuse_credit] = [smem_kv_reuse_credit]
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
@@ -1688,8 +1669,6 @@ def _build_decode_gen_schedule(
         smem_allocator.add_resource(work_queue)
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
-    if smem_kv_reuse_credit is not None:
-        smem_allocator.add_resource(smem_kv_reuse_credit)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -1727,18 +1706,6 @@ def _build_decode_gen_schedule(
     smem_allocator.add_resource(tmem_corr0)
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
-    if cfg.tile_size_kv == 256:
-        # KV256 direct-output correction rotates one compact 35,840-byte
-        # payload through the shared 192-KiB K/V ring. Split-KV retains the
-        # fixed full exchange. Neither path increases the CTA SMEM footprint.
-        correction_exchange_requirements = tmem_corr1.get_smem_requirements()
-        if correction_exchange_requirements:
-            smem_allocator.add_alias_group(
-                [
-                    smem_kv.get_smem_requirements(),
-                    correction_exchange_requirements,
-                ]
-            )
     smem_allocator.add_tmem_ptr(
         SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
     )
@@ -1862,10 +1829,6 @@ def _build_decode_gen_schedule(
     eager_init_resources = (
         [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
     )
-    if smem_kv_reuse_credit is not None:
-        # Initialize the persistent ring cursor under the same CTA-wide fence
-        # and barrier used by other manually managed SMEM control state.
-        eager_init_resources.append(smem_kv_reuse_credit)
     if cfg.streams_tmem_p_fragments:
         # KV256's TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.

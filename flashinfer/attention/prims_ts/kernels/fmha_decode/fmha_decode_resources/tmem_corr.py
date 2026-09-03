@@ -91,7 +91,9 @@ from .tmem_softmax_stats import TmemSoftmaxLocalResource
 
 _KV_TILE_256_CORRECTION_THREADS = 128
 _KV_TILE_256_LOGICAL_OUTPUT_ROWS = 64
-_KV_TILE_256_EXCHANGE_ROW_STRIDE = 132
+# One D32 fragment per logical output row, padded by four floats so adjacent
+# rows fall on different bank groups.
+_KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE = 36
 _KV_TILE_256_STATS_PER_THREAD = 4
 
 
@@ -157,10 +159,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
 
     def _kv_tile_256_exchange_entries(self) -> int:
-        """Return 128 lane-local stats plus 64 logical output rows."""
+        """Return 128 lane-local stats plus one D32 fragment per output row."""
         return (
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
-            + _KV_TILE_256_LOGICAL_OUTPUT_ROWS * _KV_TILE_256_EXCHANGE_ROW_STRIDE
+            + _KV_TILE_256_LOGICAL_OUTPUT_ROWS * _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
         )
 
     def _init_placeholder_state(self) -> None:
@@ -306,22 +308,14 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
         if self.cfg.tile_size_kv == 256 and self._kv_tile_256_exchange_alloc is None:
             # Tail correction exchanges all lane-local stats, then pipelines
-            # D32 fragments through 64 logical output rows. Upper lanes publish
-            # one spatial half while lower lanes retain the matching fragment
-            # in registers. The dependency graph places this scratch after the
-            # shared KV ring so it can reuse the dead storage.
-            payload_bytes = self._kv_tile_256_exchange_entries() * 4
-            exchange_bytes = payload_bytes
-            if self.cfg.uses_rotating_kv256_exchange:
-                assert payload_bytes <= self.cfg.smem_kv_tile_bytes
-                # Runtime selects one compact payload inside this explicit
-                # full-ring alias envelope. The envelope keeps every dynamic
-                # pointer within a declared allocation while the actual live
-                # exchange remains only 35,840 B in one 64-KiB stage.
-                exchange_bytes = self.cfg.smem_kv_tile_bytes * self.cfg.kv_stages
+            # D32 fragments through 64 logical output rows one fragment at a
+            # time. Upper lanes publish one spatial half while lower lanes
+            # retain the matching fragment in registers. The buffer is
+            # dedicated, so the shared KV ring keeps streaming the next tile's
+            # routes while the tail runs.
             self._kv_tile_256_exchange_alloc = SmemAllocation(
                 name=f"{self.name}_kvTile256Exchange",
-                size_bytes=exchange_bytes,
+                size_bytes=self._kv_tile_256_exchange_entries() * 4,
                 alignment=16,
             )
         allocs = []
@@ -2356,24 +2350,6 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
 
     @cute.jit
-    def _kv_tile_256_exchange_for_stage(
-        self,
-        stage_info: StageInfo,
-        scratch_stage: Int32 | None,
-    ) -> cutlass.Array:
-        """Return the fixed exchange or its dynamically selected KV stage."""
-        if cutlass.const_expr(scratch_stage is None):
-            return self._kv_tile_256_exchange
-        return cutlass.Array(
-            stage_info.context.smem_base.data_ptr()
-            + self._kv_tile_256_exchange_alloc.offset
-            + scratch_stage * Int32(self.cfg.smem_kv_tile_bytes),
-            dtype=Float32,
-            shape=(self._kv_tile_256_exchange_entries(),),
-            addrspace=3,
-        )
-
-    @cute.jit
     def _kv_tile_256_temporal_fragment(
         self,
         *,
@@ -2449,7 +2425,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         output_lane = exchange_idx < Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS)
         exchange_row_idx = exchange_idx & Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS - 1)
         output_exchange_row_base = output_exchange_base + exchange_row_idx * Int32(
-            _KV_TILE_256_EXCHANGE_ROW_STRIDE
+            _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
         )
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row = cutlass.Boolean(False)
@@ -2503,10 +2479,17 @@ class TmemCorrResource(DecodeGenResourceBase):
                 weight00=weight00,
                 weight10=weight10,
             )
+            if cutlass.const_expr(fragment != 0):
+                # The single fragment buffer is reused: lower lanes must have
+                # consumed the previous peer fragment before it is overwritten.
+                prims.barrier_cta_sync(
+                    self.store_barrier_id,
+                    thread_count=cfg.correction_barrier_threads,
+                )
             if exchange_idx >= Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS):
-                (
-                    exchange.data_ptr() + output_exchange_row_base + Int32(fragment_col)
-                ).store(own_vals, alignment=16)
+                (exchange.data_ptr() + output_exchange_row_base).store(
+                    own_vals, alignment=16
+                )
 
             # Lower lanes keep ``own_vals`` live across the barrier. Once every
             # lane arrives, upper lanes may prepare the next fragment while
@@ -2517,9 +2500,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
 
             if output_lane:
-                peer_vals = (
-                    exchange.data_ptr() + output_exchange_row_base + Int32(fragment_col)
-                ).load(count=32, alignment=16)
+                peer_vals = (exchange.data_ptr() + output_exchange_row_base).load(
+                    count=32, alignment=16
+                )
                 if cutlass.const_expr(not cfg.use_split_kv):
                     # Direct output: merge and store 16 columns per instruction so
                     # each lane writes one full 32-byte sector. Adjacent lanes own
@@ -2627,7 +2610,6 @@ class TmemCorrResource(DecodeGenResourceBase):
         self,
         stage_info: StageInfo,
         *,
-        scratch_stage: Int32 | None,
         tail_o_stage_idx_0: Int32,
         tail_o_stage_idx_1: Int32,
         inst0_new_max_arr: cutlass.Array,
@@ -2642,15 +2624,13 @@ class TmemCorrResource(DecodeGenResourceBase):
 
         The standard decode schedule still owns the two temporal instances.
         KV256 adds one physical spatial split per instance. Correction exchanges
-        their stats, stages one spatial half in SMEM after the shared KV ring is
-        dead, then publishes the ordinary logical Q64xD128 output.
+        their stats, stages one spatial half through its dedicated SMEM
+        exchange one D32 fragment at a time, then publishes the ordinary
+        logical Q64xD128 output.
         """
         cfg = self.cfg
         assert cfg.headdim == 128
-        exchange = self._kv_tile_256_exchange_for_stage(
-            stage_info,
-            scratch_stage,
-        )
+        exchange = self._kv_tile_256_exchange
 
         exchange_idx = warp_grp_thread_idx
         peer_idx = exchange_idx ^ Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS)
@@ -4460,7 +4440,6 @@ class TmemCorrResource(DecodeGenResourceBase):
         self,
         stage_info: StageInfo,
         *,
-        scratch_stage: Int32 | None,
         o_stage_idx: Int32,
         tail_o_stage_idx_0: Int32,
         tail_o_stage_idx_1: Int32,
@@ -4506,7 +4485,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                 if cutlass.const_expr(cfg.tile_size_kv == 256):
                     self._kv_tile_256_tail_epilogue(
                         stage_info,
-                        scratch_stage=scratch_stage,
                         tail_o_stage_idx_0=tail_o_stage_idx_0,
                         tail_o_stage_idx_1=tail_o_stage_idx_1,
                         inst0_new_max_arr=inst0_new_max_arr,
@@ -4582,9 +4560,6 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         return
 
-    # Task Scheduling routes every non-constexpr work argument as a required
-    # data-flow token. Keep separate fixed/rotating entry points so only the
-    # latter consumes ``scratch_stage``; both still share the implementation.
     @producer_work
     @cute.jit
     def correction_tail_epilogue(
@@ -4601,42 +4576,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         inst1_new_max_arr: cutlass.Array,
         inst1_sum_arr: cutlass.Array,
     ) -> None:
-        """Run the ordinary fixed-exchange tail epilogue."""
+        """Normalize the final O stages and publish the output tile."""
         self._correction_tail_epilogue_impl(
             stage_info,
-            scratch_stage=None,
-            o_stage_idx=o_stage_idx,
-            tail_o_stage_idx_0=tail_o_stage_idx_0,
-            tail_o_stage_idx_1=tail_o_stage_idx_1,
-            old_max_arr=old_max_arr,
-            new_max_arr=new_max_arr,
-            inst0_new_max_arr=inst0_new_max_arr,
-            inst0_sum_arr=inst0_sum_arr,
-            inst1_new_max_arr=inst1_new_max_arr,
-            inst1_sum_arr=inst1_sum_arr,
-        )
-
-    @producer_work
-    @cute.jit
-    def correction_tail_epilogue_rotating_exchange(
-        self,
-        stage_info: StageInfo,
-        *,
-        scratch_stage: Int32,
-        o_stage_idx: Int32,
-        tail_o_stage_idx_0: Int32,
-        tail_o_stage_idx_1: Int32,
-        old_max_arr: cutlass.Array,
-        new_max_arr: cutlass.Array,
-        inst0_new_max_arr: cutlass.Array,
-        inst0_sum_arr: cutlass.Array,
-        inst1_new_max_arr: cutlass.Array,
-        inst1_sum_arr: cutlass.Array,
-    ) -> None:
-        """Run persistent direct output in the stage named by its credit."""
-        self._correction_tail_epilogue_impl(
-            stage_info,
-            scratch_stage=scratch_stage,
             o_stage_idx=o_stage_idx,
             tail_o_stage_idx_0=tail_o_stage_idx_0,
             tail_o_stage_idx_1=tail_o_stage_idx_1,

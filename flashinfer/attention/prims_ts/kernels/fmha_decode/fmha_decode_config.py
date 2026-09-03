@@ -102,6 +102,16 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float16, Float16, Float16, 256, 128, 1, 1),
 }
 
+# Per-thread register budgets for the Q64/KV256 warp groups once the launch
+# bound enables ``setmaxnreg``. The MMA, load, and scheduler warps keep 56, so
+# the two softmax groups and the correction group share the remainder:
+# 8 * softmax + 4 * correction = 65536 / 32 - 4 * 56. An even split measured
+# fastest on B200 for both the static grid and the persistent scheduler; the
+# correction group needs the extra room for its persistent bookkeeping and
+# the KV256 tail merge, while the rolled softmax fragment loop needs less.
+KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
+KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
+
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
     "tmem_stats_cols": 32,
@@ -648,13 +658,13 @@ class FmhaDecodeConfig:
     def softmax_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        return 176 if self.tile_size_kv == 256 else 184
+        return KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
 
     @property
     def correction_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        return 104 if self.tile_size_kv == 256 else 88
+        return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
@@ -1632,32 +1642,6 @@ class FmhaDecodeConfig:
             getattr(self, field) == expected
             for field, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items()
         )
-
-    @property
-    def uses_rotating_kv256_exchange(self) -> bool:
-        """Whether this profile selects KV-ring scratch for correction.
-
-        Persistent direct output can overlap the next work tile's first two
-        K loads with correction by placing its exchange in the third, drained
-        KV stage. Split-KV and attention sinks retain the fixed exchange because
-        their tail storage and lifetime differ from direct output.
-        """
-        selects_persistent_kv256 = (
-            self.streams_tmem_p_fragments
-            and self.tile_size_q == 64
-            and self.tile_size_kv == 256
-            and self.use_persistent_scheduler
-        )
-        if not selects_persistent_kv256:
-            return False
-
-        has_rotating_kv_ring = (
-            self.num_head_dim_stages_kv == 1
-            and self.kv_stages == KV_TILE_256_SHARED_FIFO_STAGES
-            and self.load_num_warps == 1
-        )
-        has_direct_output_lifetime = not (self.use_split_kv or self.use_attention_sinks)
-        return has_rotating_kv_ring and has_direct_output_lifetime
 
     @property
     def keeps_separates_tmem_s_and_stats(self) -> bool:
