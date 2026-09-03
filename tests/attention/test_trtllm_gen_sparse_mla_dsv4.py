@@ -1,14 +1,15 @@
 import dataclasses
+import math
 import random
 from typing import Literal
 
 import pytest
 import torch
 
+import flashinfer.mla._core as mla_core
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 from flashinfer.mla._core import get_trtllm_gen_fmha_module
 from flashinfer.utils import get_compute_capability
-
 
 WORKSPACE_SIZE = 128 * 1024 * 1024
 DSV4_HEAD_DIM = 512
@@ -930,6 +931,8 @@ def test_trtllm_gen_sparse_mla_rejects_remap_buffer_on_other_device() -> None:
             1,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -1196,3 +1199,259 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph(monkeypatch) -> Non
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
     out_ref = out_ref[testcase.valid_q]
     _assert_close(out_ans, out_ref, p.dtype)
+
+
+@pytest.mark.parametrize("num_tokens", (1, 3, 4, 5))
+def test_dsv4_rope_quant_output_layout(num_tokens):
+    out, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
+        num_tokens, 128, torch.device("cpu")
+    )
+    scale_buf_m = _round_up(num_tokens, 4)
+
+    assert out.shape == (num_tokens, 16, 4096)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.stride() == (4096, num_tokens * 4096, 1)
+    assert out_scale.shape == (num_tokens, 16, 8)
+    assert out_scale.dtype == torch.int32
+    assert out_scale.stride() == (1, 8 * scale_buf_m, scale_buf_m)
+    scale_storage = out_scale.as_strided(
+        (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
+    )
+    assert torch.all(scale_storage[..., num_tokens:] == 0)
+    mla_core._check_dsv4_rope_quant_outputs(
+        out,
+        out_scale,
+        num_tokens=num_tokens,
+        num_heads=128,
+        device=torch.device("cpu"),
+    )
+
+
+def test_dsv4_rope_quant_rejects_contiguous_output_layout():
+    out = torch.empty((3, 16, 4096), dtype=torch.float8_e4m3fn)
+    _, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
+        3, 128, torch.device("cpu")
+    )
+    with pytest.raises(ValueError, match="group-major strides"):
+        mla_core._check_dsv4_rope_quant_outputs(
+            out,
+            out_scale,
+            num_tokens=3,
+            num_heads=128,
+            device=torch.device("cpu"),
+        )
+
+
+def test_dsv4_output_scale_does_not_enable_rope_quant(monkeypatch):
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    with pytest.raises(ValueError, match="requires dsv4_inv_rope_cos_sin_cache"):
+        trtllm_batch_decode_sparse_mla_dsv4(
+            query=torch.empty((1, 1, 128, 512), dtype=torch.float8_e4m3fn),
+            swa_kv_cache=torch.empty((1, 1, 1, 512), dtype=torch.float8_e4m3fn),
+            workspace_buffer=torch.empty(1, dtype=torch.uint8),
+            backend="trtllm-gen",
+            dsv4_output_scale=torch.empty((1, 16, 8), dtype=torch.int32),
+        )
+
+
+def _dsv4_rope_quant_cpu_inputs(num_tokens=3, cache_rows=4):
+    out, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
+        num_tokens, 128, torch.device("cpu")
+    )
+    return {
+        "query": torch.empty((1, num_tokens, 128, 512), dtype=torch.float8_e4m3fn),
+        "swa_kv_cache": torch.empty((1, 1, 128, 512), dtype=torch.float8_e4m3fn),
+        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
+        "sparse_indices": torch.zeros((num_tokens, 128), dtype=torch.int32),
+        "compressed_kv_cache": torch.empty((1, 1, 1, 512), dtype=torch.float8_e4m3fn),
+        "sparse_topk_lens": torch.full((num_tokens,), 128, dtype=torch.int32),
+        "seq_lens": torch.tensor([num_tokens + 1], dtype=torch.int32),
+        "out": out,
+        "backend": "trtllm-gen",
+        "enable_pdl": False,
+        "dsv4_inv_rope_cos_sin_cache": torch.empty(
+            (cache_rows, 64), dtype=torch.float32
+        ),
+        "dsv4_output_scale": out_scale,
+    }
+
+
+def test_dsv4_rope_quant_validates_cos_sin_cache_bounds(monkeypatch):
+    args = _dsv4_rope_quant_cpu_inputs(cache_rows=3)
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(mla_core, "_validate_dsv4_sync_checks", lambda _device: True)
+    with pytest.raises(ValueError, match="does not cover all derived query positions"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
+
+def test_dsv4_rope_quant_validates_zero_scale_padding(monkeypatch):
+    args = _dsv4_rope_quant_cpu_inputs()
+    out_scale = args["dsv4_output_scale"]
+    scale_buf_m = out_scale.stride(2)
+    scale_storage = out_scale.as_strided(
+        (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
+    )
+    scale_storage[..., 3:].fill_(1)
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(mla_core, "_validate_dsv4_sync_checks", lambda _device: True)
+    with pytest.raises(ValueError, match="padded token rows must be zero-initialized"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
+
+def _unpack_ue8m0_scales(packed: torch.Tensor) -> torch.Tensor:
+    shifts = torch.arange(4, dtype=torch.int32, device=packed.device) * 8
+    exponent_bytes = (packed.unsqueeze(-1) >> shifts) & 0xFF
+    return torch.exp2(exponent_bytes.float() - 127.0)
+
+
+def _inverse_rope_reference(
+    output: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    reference = output.float().reshape(output.shape[0], 16, 8, 512).clone()
+    rope = reference[..., 448:].reshape(*reference.shape[:-1], 32, 2)
+    first = rope[..., 0].clone()
+    second = rope[..., 1].clone()
+    cos_sin = cos_sin_cache.index_select(0, positions)
+    cos = cos_sin[:, :32].reshape(output.shape[0], 1, 1, 32)
+    sin = cos_sin[:, 32:].reshape(output.shape[0], 1, 1, 32)
+    rope[..., 0] = first * cos + second * sin
+    rope[..., 1] = second * cos - first * sin
+    return reference
+
+
+@pytest.mark.arch_blackwell
+def test_trtllm_gen_dsv4_rope_quant_correctness():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("TRTLLM-GEN DSv4 RopeQuant requires SM100/SM103")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    batch_size, q_len, num_heads, head_dim = 2, 3, 128, 512
+    num_tokens = batch_size * q_len
+    page_size = 32
+    topk = 128
+
+    query = torch.randn((batch_size, q_len, num_heads, head_dim), device=device).clamp_(
+        -1.0, 1.0
+    )
+    query = query.to(torch.float8_e4m3fn)
+    swa_cache = torch.randn(
+        (topk // page_size, 1, page_size, head_dim), device=device
+    ).clamp_(-1.0, 1.0)
+    swa_cache = swa_cache.to(torch.float8_e4m3fn)
+    compressed_cache = torch.zeros(
+        (1, 1, 1, head_dim), dtype=torch.float8_e4m3fn, device=device
+    )
+    sparse_indices = torch.arange(topk, dtype=torch.int32, device=device).repeat(
+        num_tokens, 1
+    )
+    sparse_topk_lens = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([topk, topk - 8], dtype=torch.int32, device=device)
+    workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    baseline = trtllm_batch_decode_sparse_mla_dsv4(
+        query=query,
+        swa_kv_cache=swa_cache,
+        workspace_buffer=workspace,
+        sparse_indices=sparse_indices,
+        compressed_kv_cache=compressed_cache,
+        sparse_topk_lens=sparse_topk_lens,
+        seq_lens=seq_lens,
+        bmm1_scale=softmax_scale,
+        backend="trtllm-gen",
+        enable_pdl=False,
+    )
+
+    cache_positions = torch.arange(topk, dtype=torch.float32, device=device)[:, None]
+    rope_dims = torch.arange(32, dtype=torch.float32, device=device)[None, :]
+    angles = cache_positions * 0.07 + rope_dims * 0.03
+    cos_sin_cache = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
+    out, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
+        num_tokens, num_heads, device
+    )
+    scale_buf_m = out_scale.stride(2)
+    scale_storage = out_scale.as_strided(
+        (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
+    )
+    scale_storage.zero_()
+    out_scale.fill_(0x5A5A5A5A)
+
+    result = trtllm_batch_decode_sparse_mla_dsv4(
+        query=query,
+        swa_kv_cache=swa_cache,
+        workspace_buffer=workspace,
+        sparse_indices=sparse_indices,
+        compressed_kv_cache=compressed_cache,
+        sparse_topk_lens=sparse_topk_lens,
+        seq_lens=seq_lens,
+        out=out,
+        bmm1_scale=softmax_scale,
+        backend="trtllm-gen",
+        enable_pdl=False,
+        dsv4_inv_rope_cos_sin_cache=cos_sin_cache,
+        dsv4_output_scale=out_scale,
+    )
+    result_out, result_scale = result
+    torch.cuda.synchronize()
+
+    assert result_out is out
+    assert result_scale is out_scale
+    assert torch.all(scale_storage[..., num_tokens:] == 0)
+
+    scales = _unpack_ue8m0_scales(out_scale)
+    dequant = out.reshape(num_tokens, 16, 8, 4, 128).float()
+    dequant = dequant * scales.unsqueeze(-1)
+    positions = torch.cat(
+        tuple(
+            torch.arange(seq_len - q_len, seq_len, dtype=torch.int64, device=device)
+            for seq_len in seq_lens.tolist()
+        )
+    )
+    reference = _inverse_rope_reference(
+        baseline.reshape(num_tokens, 128, 512), cos_sin_cache, positions
+    )
+    reference_blocks = reference.reshape(num_tokens, 16, 8, 4, 128)
+
+    reference_amax = reference_blocks.abs().amax(dim=-1).clamp_min(1.0e-10)
+    reference_scales = torch.exp2(torch.ceil(torch.log2(reference_amax / 448.0)))
+    # The fused path quantizes the FP32 attention accumulator, whereas the
+    # comparison path first stores BF16. A block exactly at a power-of-two
+    # boundary may therefore select either neighboring exponent.
+    assert torch.all((torch.log2(scales) - torch.log2(reference_scales)).abs() <= 1)
+
+    # FP8 E4M3 contributes at most 16 * scale at the largest bin. Include a
+    # small allowance for the BF16 store in the non-fused attention reference.
+    error_bound = 16.0 * scales.unsqueeze(-1) + 2.0e-3
+    assert torch.all((dequant - reference_blocks).abs() <= error_bound)
+
+    expected_out = out.clone()
+    expected_scale = out_scale.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = trtllm_batch_decode_sparse_mla_dsv4(
+            query=query,
+            swa_kv_cache=swa_cache,
+            workspace_buffer=workspace,
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=compressed_cache,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            out=out,
+            bmm1_scale=softmax_scale,
+            backend="trtllm-gen",
+            enable_pdl=False,
+            dsv4_inv_rope_cos_sin_cache=cos_sin_cache,
+            dsv4_output_scale=out_scale,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert graph_result[0] is out
+    assert graph_result[1] is out_scale
+    torch.testing.assert_close(out, expected_out, atol=0, rtol=0)
+    torch.testing.assert_close(out_scale, expected_scale, atol=0, rtol=0)
+    assert torch.all(scale_storage[..., num_tokens:] == 0)

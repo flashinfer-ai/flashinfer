@@ -264,6 +264,9 @@ struct TllmGenFmhaRunnerParams {
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
+  // DSv4 fused inverse-RoPE + FP8 quantization inputs/outputs.
+  float const* dsv4InvRopeCosSinCachePtr;
+  float* dsv4OScalePtr;
 
   // The stride between different tokens for Q.
   int qStrideTokens;
@@ -346,8 +349,12 @@ struct TllmGenFmhaRunnerParams {
   TrtllmGenSparseMlaType mSparseMlaType;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Padded token dimension of the DSv4 packed UE8M0 output-scale tensor.
+  int mDsv4ScaleBufM;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
+  // Whether the fixed DSv4 inverse-RoPE + FP8 quant epilogue is selected.
+  bool mFusesDsv4InvRopeFp8Quant;
   // Transform mode for BF16 query + FP8 KV generation kernels.
   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
   // Whether the indices for K & V pages are shared as unified index.
