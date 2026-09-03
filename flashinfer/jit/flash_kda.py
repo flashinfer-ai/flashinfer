@@ -93,12 +93,8 @@ _FLASH_KDA_TARGET_DEFINE = {
 
 _FLASH_KDA_GENERATED_METADATA_NAME = "flashkda_generated_variant_metadata.json"
 _FLASH_KDA_GENERATED_RECEIPT_NAME = "flashkda_generated_generation_receipt.json"
-_FLASH_KDA_FP32_COMPAT_METADATA_NAME = (
-    "flashkda_generated_fp32_compat_metadata.json"
-)
-_FLASH_KDA_FP32_COMPAT_RECEIPT_NAME = (
-    "flashkda_generated_fp32_compat_receipt.json"
-)
+_FLASH_KDA_FP32_COMPAT_METADATA_NAME = "flashkda_generated_fp32_compat_metadata.json"
+_FLASH_KDA_FP32_COMPAT_RECEIPT_NAME = "flashkda_generated_fp32_compat_receipt.json"
 _FLASH_KDA_FP32_COMPAT_WRAPPER_RELPATH = (
     "csrc/kda/flashkda_generated_fp32_compat_binding.cuh"
 )
@@ -468,18 +464,17 @@ def get_flash_kda_fp32_compat_registry() -> Mapping[
     ):
         raise ValueError("compact-FP32 FlashKDA body sanitizer is not sealed")
     input_export_digests = receipt.get("input_export_manifest_sha256_by_arch")
-    if not isinstance(input_export_digests, dict) or tuple(
-        input_export_digests
-    ) != ("sm_100a", "sm_103a"):
+    if not isinstance(input_export_digests, dict) or tuple(input_export_digests) != (
+        "sm_100a",
+        "sm_103a",
+    ):
         raise ValueError("compact-FP32 FlashKDA export receipts are incomplete")
     for arch, digest in input_export_digests.items():
         _require_sha256(digest, f"compact-FP32 FlashKDA {arch} export receipt")
     if receipt.get("metadata_sha256") != _canonical_json_sha256(metadata):
         raise ValueError("compact-FP32 FlashKDA metadata digest mismatch")
     rows = metadata.get("variants")
-    if not isinstance(rows, list) or len(rows) != len(
-        _FLASH_KDA_GENERATED_NVCC_FLAGS
-    ):
+    if not isinstance(rows, list) or len(rows) != len(_FLASH_KDA_GENERATED_NVCC_FLAGS):
         raise ValueError("compact-FP32 FlashKDA must contain two exact targets")
     if receipt.get("variant_count") != len(rows):
         raise ValueError("compact-FP32 FlashKDA variant count differs")
@@ -521,9 +516,7 @@ def get_flash_kda_fp32_compat_registry() -> Mapping[
                 f"{label} generated/standalone cubins are not byte-identical"
             )
         if source_generated_runtime_cubin_sha256 != source_runtime_cubin_sha256:
-            raise ValueError(
-                f"{label} generated/standalone cubin digests differ"
-            )
+            raise ValueError(f"{label} generated/standalone cubin digests differ")
         source_body_sha256 = _require_sha256(
             row.get("source_body_sha256"), f"{label} source body"
         )
@@ -1241,9 +1234,7 @@ def gen_flash_kda_fp32_compat_module(
             source_name="kernel.cu",
         ),
     )
-    logger.info(
-        "Generated FlashKDA compact-FP32 %s JIT spec: %s", target, spec.name
-    )
+    logger.info("Generated FlashKDA compact-FP32 %s JIT spec: %s", target, spec.name)
     return spec
 
 

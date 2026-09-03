@@ -599,9 +599,7 @@ def gen_all_modules(
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
     # The checkpoint route remains as the only legacy fallback because it is
     # intentionally outside the generated portfolio.
-    flash_kda_targets: tuple[
-        tuple[GeneratedFlashKDATarget, bool, bool], ...
-    ] = (
+    flash_kda_targets: tuple[tuple[GeneratedFlashKDATarget, bool, bool], ...] = (
         (
             "sm100a",
             has_flash_kda_prefill_sm100a,

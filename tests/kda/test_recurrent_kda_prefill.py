@@ -814,9 +814,9 @@ def _interpolate_kimi_k3_quantiles(anchors, *, count, device):
         dtype=torch.float32,
         device=device,
     )
-    upper = torch.searchsorted(
-        anchor_probabilities, probabilities, right=True
-    ).clamp_(1, len(anchors) - 1)
+    upper = torch.searchsorted(anchor_probabilities, probabilities, right=True).clamp_(
+        1, len(anchors) - 1
+    )
     lower = upper - 1
     fraction = (probabilities - anchor_probabilities[lower]) / (
         anchor_probabilities[upper] - anchor_probabilities[lower]
@@ -834,9 +834,7 @@ def _make_kimi_k3_trained_gate_parameters(*, num_heads, generator, device):
         count=num_heads,
         device=device,
     )
-    A_log = A_log[
-        torch.randperm(num_heads, generator=generator, device=device)
-    ]
+    A_log = A_log[torch.randperm(num_heads, generator=generator, device=device)]
     dt_bias = _interpolate_kimi_k3_quantiles(
         _KIMI_K3_DT_BIAS_QUANTILES,
         count=num_heads * 128,
@@ -867,9 +865,9 @@ def _make_kimi_k3_bt16_inputs(*, device, seed=4845):
     g = (torch.randn(shape, generator=generator, device=device) * 0.25).to(
         torch.bfloat16
     )
-    beta = (
-        torch.randn((1, 4096, 6), generator=generator, device=device) * 0.25
-    ).to(torch.bfloat16)
+    beta = (torch.randn((1, 4096, 6), generator=generator, device=device) * 0.25).to(
+        torch.bfloat16
+    )
     A_log, dt_bias = _make_kimi_k3_trained_gate_parameters(
         num_heads=6,
         generator=generator,
@@ -1333,9 +1331,7 @@ def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_outside_sour
         output=torch.empty_like(inputs["q"]),
     )
     eligibility_kwargs["lower_bound"] = lower_bound
-    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
-        **eligibility_kwargs
-    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, -1.0, 0.0])
@@ -1397,9 +1393,7 @@ def test_frozen_prefill_state_pool_eligibility_rejects_indexed_fp32_outside_sour
         state_indices=state_indices,
     )
     eligibility_kwargs["lower_bound"] = lower_bound
-    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
-        **eligibility_kwargs
-    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
 
 
 @pytest.mark.parametrize("contract", ["beta_layout", "dt_bias_rank", "checkpoint"])
@@ -1431,9 +1425,7 @@ def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_c
         eligibility_kwargs["dt_bias"] = inputs["dt_bias"].reshape(-1)
     else:
         eligibility_kwargs["checkpoint_every_n_tokens"] = 16
-    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
-        **eligibility_kwargs
-    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1656,12 +1648,8 @@ def test_compact_fp32_missing_selected_module_is_fail_closed(
         flash_kda_jit_api,
         "get_flash_kda_fp32_compat_registry",
         lambda: {
-            "sm100a": SimpleNamespace(
-                variant_id="sm_100a:compact_fp32_compat_ui1_sf1"
-            ),
-            "sm103a": SimpleNamespace(
-                variant_id="sm_103a:compact_fp32_compat_ui1_sf1"
-            ),
+            "sm100a": SimpleNamespace(variant_id="sm_100a:compact_fp32_compat_ui1_sf1"),
+            "sm103a": SimpleNamespace(variant_id="sm_103a:compact_fp32_compat_ui1_sf1"),
         },
     )
 
@@ -3622,7 +3610,10 @@ def test_compact_fp32_source_exact_route_and_ffi_abi(
         inputs["dt_bias"],
         inputs["cu_seqlens"],
     )
-    assert all(actual is expected for actual, expected in zip(args, expected_inputs))
+    assert all(
+        actual is expected
+        for actual, expected in zip(args, expected_inputs, strict=False)
+    )
     assert args[8].dtype == torch.int32
     assert args[9] is padded_state
     assert args[10] is output
@@ -3800,8 +3791,7 @@ def test_compact_fp32_zero_bound_bt16_matches_compat_control(
     bt16_output = bt16_output.clone()
     bt16_state = bt16_state.clone()
     assert [
-        (selector["route"], selector["route_role"])
-        for selector in selector_keys
+        (selector["route"], selector["route_role"]) for selector in selector_keys
     ] == [
         ("bt16_prepare_chain_m64", "bt16_prepare"),
         ("bt16_prepare_chain_m64", "main"),
@@ -3927,9 +3917,7 @@ def test_indexed_fp32_cuda_graph_replay_matches_eager_control(
         seed=25_402,
     )
     compact_state = inputs.pop("initial_state")
-    state_indices = torch.tensor(
-        [3, 1], dtype=torch.int32, device=flash_kda_device
-    )
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
     state_pool = _make_padded_state_pool(
         slots=5,
         num_heads=6,
@@ -5858,8 +5846,7 @@ def test_frozen_bt16_trained_kimi_gate_fp32_indexed_numerics(
     )
     assert bt16_pool is state_pool
     assert [
-        (selector["route"], selector["route_role"])
-        for selector in resolved_selectors
+        (selector["route"], selector["route_role"]) for selector in resolved_selectors
     ] == [
         ("bt16_prepare_chain_m64", "bt16_prepare"),
         ("bt16_prepare_chain_m64", "main"),
@@ -5887,8 +5874,7 @@ def test_frozen_bt16_trained_kimi_gate_fp32_indexed_numerics(
     assert direct_pool is state_pool
     assert resolved_selectors
     assert all(
-        selector["route"] != "bt16_prepare_chain_m64"
-        for selector in resolved_selectors
+        selector["route"] != "bt16_prepare_chain_m64" for selector in resolved_selectors
     )
     direct_selected_state = state_pool.index_select(0, selected_indices_i64)
     assert bool(torch.isfinite(direct_output).all())
@@ -5912,9 +5898,10 @@ def test_frozen_bt16_trained_kimi_gate_fp32_indexed_numerics(
     head_reference_rms = torch.sqrt(
         torch.mean(direct_output.float().square(), dim=(0, 1, 3))
     ).clamp_min(torch.finfo(torch.float32).tiny)
-    head_rrmse = torch.sqrt(
-        torch.mean(output_error.square(), dim=(0, 1, 3))
-    ) / head_reference_rms
+    head_rrmse = (
+        torch.sqrt(torch.mean(output_error.square(), dim=(0, 1, 3)))
+        / head_reference_rms
+    )
     assert float(output_rrmse) < 0.1
     assert float(head_rrmse.max()) < 0.1
 

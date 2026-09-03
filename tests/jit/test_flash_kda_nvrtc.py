@@ -58,9 +58,7 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
         "--use_fast_math",
     ]
     assert receipt["inputs"]["optimization_level_one_absent"] is True
-    assert receipt["inputs"]["expected_cubin_sha256"] == kwargs[
-        "expected_cubin_sha256"
-    ]
+    assert receipt["inputs"]["expected_cubin_sha256"] == kwargs["expected_cubin_sha256"]
 
     cubin.write_bytes(b"tampered")
     flash_kda_nvrtc.prepare_generated_flash_kda_cubin(
@@ -70,9 +68,7 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
     assert cubin.read_bytes() == b"exact-cubin"
 
 
-def test_prepare_generated_cubin_rejects_nonexact_runtime_cubin(
-    monkeypatch, tmp_path
-):
+def test_prepare_generated_cubin_rejects_nonexact_runtime_cubin(monkeypatch, tmp_path):
     selector = tmp_path / "selector.cu"
     body = tmp_path / "body.cu"
     selector.write_text(_selector(body.name))

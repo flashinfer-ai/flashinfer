@@ -208,10 +208,10 @@ inline int64_t CheckCommonInputs(
       << "store_final_state must be 0 or 1, got " << store_final_state;
   TVM_FFI_ICHECK(std::isfinite(scale) && std::isfinite(static_cast<float>(scale)))
       << "scale must be finite and representable as float32, got " << scale;
-  TVM_FFI_ICHECK(std::isfinite(lower_bound) &&
-                 (lower_bound < 0.0 ||
-                  (lower_bound == 0.0 && IsServingStateFloat32(state_dtype))) &&
-                 std::isfinite(static_cast<float>(lower_bound)))
+  TVM_FFI_ICHECK(
+      std::isfinite(lower_bound) &&
+      (lower_bound < 0.0 || (lower_bound == 0.0 && IsServingStateFloat32(state_dtype))) &&
+      std::isfinite(static_cast<float>(lower_bound)))
       << "lower_bound must be finite, negative (or zero for FP32 state), "
          "and representable as float32, got "
       << lower_bound;

@@ -38,6 +38,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    cast,
 )
 
 import torch
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from .jit.flash_kda import (
         FlashKDATarget,
         FlashKDAVariant,
+        GeneratedFlashKDATarget,
         GeneratedFlashKDAModule,
     )
 
@@ -706,8 +708,7 @@ def _flash_kda_prefill_is_eligible(
     """Return whether the call exactly matches the frozen FlashKDA contract."""
 
     fp32_state = (
-        isinstance(initial_state, torch.Tensor)
-        and initial_state.dtype == torch.float32
+        isinstance(initial_state, torch.Tensor) and initial_state.dtype == torch.float32
     )
     compact_fp32 = fp32_state and ssm_state_indices is None
     compact_fp32_compat = _flash_kda_compact_fp32_compat_contract(
@@ -3872,8 +3873,9 @@ def _run_generated_fp32_compat_route(
 
     if target not in ("sm100a", "sm103a"):
         raise ValueError(f"unsupported compact-FP32 FlashKDA target: {target}")
-    metadata = get_flash_kda_fp32_compat_registry()[target]
-    module = load_flash_kda_fp32_compat_module(target)
+    generated_target = cast("GeneratedFlashKDATarget", target)
+    metadata = get_flash_kda_fp32_compat_registry()[generated_target]
+    module = load_flash_kda_fp32_compat_module(generated_target)
     signature = tuple(
         _tensor_descriptor_signature(tensor) for tensor in (q, k, v, g, out)
     )
@@ -3889,9 +3891,7 @@ def _run_generated_fp32_compat_route(
         device=q.device,
         bytes_required=_FLASH_KDA_FP32_COMPAT_DESCRIPTOR_STORAGE_BYTES,
     )
-    grid_x = min(
-        _FLASH_KDA_FP32_COMPAT_MAX_GRID_CTAS, num_sequences * num_heads
-    )
+    grid_x = min(_FLASH_KDA_FP32_COMPAT_MAX_GRID_CTAS, num_sequences * num_heads)
     tensormap_workspace = _workspace_buffer(
         workspace=workspace,
         attribute="_fp32_compat_tensormap_workspace",

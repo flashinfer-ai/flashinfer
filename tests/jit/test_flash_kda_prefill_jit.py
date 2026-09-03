@@ -219,19 +219,13 @@ def test_aot_compact_fp32_registration_requires_export_cuda_release(
             ]
 
     monkeypatch.setattr(aot_api, "CompilationContext", FakeCompilationContext)
-    monkeypatch.setattr(
-        aot_api, "get_cuda_version", lambda: Version(cuda_version)
-    )
+    monkeypatch.setattr(aot_api, "get_cuda_version", lambda: Version(cuda_version))
 
     capabilities = aot_api.detect_sm_capabilities()
     assert capabilities["flash_kda_prefill_sm100a"] is True
     assert capabilities["flash_kda_prefill_sm103a"] is True
-    assert (
-        capabilities["flash_kda_fp32_compat_sm100a"] is expected_fp32_compat
-    )
-    assert (
-        capabilities["flash_kda_fp32_compat_sm103a"] is expected_fp32_compat
-    )
+    assert capabilities["flash_kda_fp32_compat_sm100a"] is expected_fp32_compat
+    assert capabilities["flash_kda_fp32_compat_sm103a"] is expected_fp32_compat
 
 
 def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
@@ -449,9 +443,7 @@ def test_generated_compact_fp32_registry_is_source_exact_and_aot_registered():
 def test_generated_compact_fp32_uri_changes_with_exact_cubin(monkeypatch):
     module = flash_kda.get_flash_kda_fp32_compat_registry()["sm100a"]
     changed_digest = (
-        "0" * 64
-        if module.source_runtime_cubin_sha256 != "0" * 64
-        else "1" * 64
+        "0" * 64 if module.source_runtime_cubin_sha256 != "0" * 64 else "1" * 64
     )
     monkeypatch.setattr(
         flash_kda,
