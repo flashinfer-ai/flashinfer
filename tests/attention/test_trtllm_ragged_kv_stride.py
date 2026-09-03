@@ -48,7 +48,7 @@ def _run_trtllm_ragged(
     lse: torch.Tensor | None = None,
     q_lens_cpu: torch.Tensor | None = None,
     kv_lens_cpu: torch.Tensor | None = None,
-    assume_all_rows_active: bool = False,
+    skip_all_rows_active_check: bool = False,
 ):
     head_dim_qk = q.shape[2]
     return flashinfer.prefill.trtllm_ragged_attention_deepseek(
@@ -79,7 +79,7 @@ def _run_trtllm_ragged(
         lse=lse,
         q_seq_lens_cpu=q_lens_cpu,
         kv_seq_lens_cpu=kv_lens_cpu,
-        assume_all_rows_active=assume_all_rows_active,
+        skip_all_rows_active_check=skip_all_rows_active_check,
     )
 
 
@@ -361,7 +361,7 @@ def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_assumed_active_matches_checked_path(monkeypatch):
+def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -389,7 +389,7 @@ def test_trtllm_ragged_assumed_active_matches_checked_path(monkeypatch):
         q_indptr,
         kv_indptr,
         kv_lens,
-        assume_all_rows_active=True,
+        skip_all_rows_active_check=True,
     )
     checked_output, checked_lse = _run_trtllm_ragged(
         q,
@@ -407,7 +407,7 @@ def test_trtllm_ragged_assumed_active_matches_checked_path(monkeypatch):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_assumed_active_rejects_cpu_mirrors():
+def test_trtllm_ragged_skipped_active_check_rejects_cpu_mirrors():
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
@@ -422,7 +422,7 @@ def test_trtllm_ragged_assumed_active_rejects_cpu_mirrors():
             kv_lens,
             q_lens_cpu=q_lens.cpu(),
             kv_lens_cpu=kv_lens.cpu(),
-            assume_all_rows_active=True,
+            skip_all_rows_active_check=True,
         )
 
 
@@ -636,7 +636,7 @@ def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
     row_activity_kwargs = (
         {"q_lens_cpu": q_lens_cpu, "kv_lens_cpu": kv_lens_cpu}
         if row_activity_mode == "cpu_mirrors"
-        else {"assume_all_rows_active": True}
+        else {"skip_all_rows_active_check": True}
     )
 
     def _call():
