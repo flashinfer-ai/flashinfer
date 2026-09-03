@@ -1836,8 +1836,7 @@ class FmhaDecodeConfig:
 
         if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
             fixed_q1 = (
-                self.max_seq_len_q == 1
-                and 1 <= self.heads_q_per_kv <= self.tile_size_q
+                self.max_seq_len_q == 1 and 1 <= self.heads_q_per_kv <= self.tile_size_q
             )
             fixed_grouped_q = self.max_seq_len_q > 1
             return (

@@ -1504,11 +1504,13 @@ def test_attention_ts_decode_public_query_geometry_guards() -> None:
         (128, "keeps_mma_ab", 128),
     ),
 )
-def test_attention_ts_decode_fp8_d256_head_ratio_buckets(
+@pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
+def test_attention_ts_decode_fp8_head_ratio_buckets(
     monkeypatch: pytest.MonkeyPatch,
     head_ratio: int,
     expected_mma: str,
     expected_tile_q: int,
+    head_dim: int,
 ) -> None:
     """Dispatch each supported ratio range to its smallest qualified Q tile."""
 
@@ -1529,7 +1531,7 @@ def test_attention_ts_decode_fp8_d256_head_ratio_buckets(
             256,
             head_ratio,
             1,
-            256,
+            head_dim,
             32,
             4096,
             1,
@@ -4413,6 +4415,37 @@ def test_attention_ts_decode_head_dim_gqa_product(
         max_kv_len=max_kv_len,
         exercise_all_paths=False,
     )
+
+
+@pytest.mark.parametrize("head_dim", (64, 128), ids=lambda value: f"d{value}")
+@pytest.mark.parametrize("head_ratio", (33, 65), ids=lambda value: f"gqa{value}")
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_wide_fp8_gqa_accuracy(
+    head_dim: int,
+    head_ratio: int,
+):
+    """Check partial Q64/Q128 Keeps tiles against the FP8 reference."""
+
+    case = _make_decode_case(
+        kv_lens=(257, 193),
+        num_qo_heads=head_ratio,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=33500 + head_dim + head_ratio,
+    )
+    policy = _exercise_auto_case(case)
+
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["tile_size_q"] == (64 if head_ratio <= 64 else 128)
+    assert policy["groups_tokens_heads_q"] is True
 
 
 @pytest.mark.parametrize(
