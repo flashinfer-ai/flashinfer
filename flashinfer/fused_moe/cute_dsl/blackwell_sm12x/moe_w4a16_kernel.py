@@ -5939,8 +5939,9 @@ def compile_w4a16_activation(
 
     # The on-disk artifact name must be injective over every compile fact.
     # ``cache_key`` also carries the swiglu scalars, fast-math and gating
-    # flags, and the row-specialization bucket, so the readable facts are
-    # suffixed with a digest of the full key.
+    # flags; the row bucket is deliberately excluded so one artifact can
+    # be reused across rows. The readable facts are suffixed with a digest
+    # of the full key.
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         _w4a16_disk_kernel_name(

@@ -194,7 +194,7 @@ def test_topk_sum_warm_artifact_numerics_and_graph_capture():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_activation_row_buckets_share_one_artifact():
+def test_activation_row_buckets_share_one_artifact(tmp_path, monkeypatch):
     """Both row-specialization buckets must resolve to one disk artifact.
 
     The activation cache key deliberately excludes the row bucket -- the
@@ -203,6 +203,14 @@ def test_activation_row_buckets_share_one_artifact():
     m-varying fake extents bake (1,) and a single artifact serves every
     rows value, warm-launchable at any row count.
     """
+    from flashinfer.jit import env as jit_env
+
+    # Isolate this test's artifacts from whatever the persistent JIT
+    # directory has accumulated: the builder and the artifact scanner both
+    # read jit_env.FLASHINFER_JIT_DIR dynamically, so patching it redirects
+    # real .o writes, not just the scan.
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+
     inter = 768
     clear_w4a16_kernel_cache()
     compile_w4a16_activation(rows=1, intermediate_size=inter, activation="silu")
