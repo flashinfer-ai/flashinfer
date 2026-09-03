@@ -677,3 +677,78 @@ def test_split_fused_halves_reject_unaligned():
     with pytest.raises(ValueError, match="ALIGN-128"):
         lowp.quant_kv_into_payload_fused(q, q.clone(), km, vs, send, rank=0,
                                          world_size=4)
+
+
+# ---------------------------------------------------------------------------
+# 9. unpack_for_sage(scale_sequence=) emits consumer-width scale tensors
+# ---------------------------------------------------------------------------
+
+
+def test_scale_widths_match_sage_per_warp_contract():
+    assert lowp.scale_widths(1024) == (32, 16)
+    assert lowp.scale_widths(1023) == (32, 16)
+    assert lowp.scale_widths(1025) == (36, 17)
+    assert lowp.scale_widths(1) == (4, 1)
+    with pytest.raises(ValueError):
+        lowp.scale_widths(0)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    ("world", "local_sequence", "aligned"),
+    [(4, 256, True), (8, 128, True), (4, 1056, False), (2, 96, False)],
+)
+def test_scale_sequence_is_the_prefix_of_the_full_width(world, local_sequence, aligned):
+    """Unpack moves bytes, so any payload exercises the width contract; the
+    narrow scale tensors must equal the leading slots of the full-width ones
+    and Q/K/V must be untouched by the option."""
+    local_heads = _HEADS // world
+    spec = lowp.payload_spec(batch_size=1, local_sequence=local_sequence,
+                             num_heads=_HEADS, head_dim=_HEAD_DIM, world_size=world)
+    S = spec["logical_sequence"]
+    torch.manual_seed(1)
+    recv = torch.randint(0, 256, (world, spec["chunk_bytes"]), dtype=torch.uint8,
+                         device="cuda")
+    kwargs = dict(batch_size=1, local_sequence=local_sequence, local_heads=local_heads,
+                  head_dim=_HEAD_DIM, world_size=world, aligned=aligned)
+    q_full, k_full, v_full, qs_full, ks_full = lowp.unpack_for_sage(recv, **kwargs)
+    assert qs_full.shape[-1] == spec["q_scale_alloc"]
+    assert ks_full.shape[-1] == spec["k_scale_alloc"]
+    for used in (S, S - 1, S - 64, S - 129, 1):
+        if used <= 0:
+            continue
+        q_w, k_w = lowp.scale_widths(used)
+        q, k, v, qs, ks = lowp.unpack_for_sage(recv, scale_sequence=used, **kwargs)
+        assert qs.shape == (1, local_heads, q_w) and ks.shape == (1, local_heads, k_w)
+        assert qs.is_contiguous() and ks.is_contiguous()
+        # Random bytes decode to NaN in fp32/fp8 slots, so compare bit patterns.
+        assert _same_bits(qs, qs_full[..., :q_w]), f"used={used}"
+        assert _same_bits(ks, ks_full[..., :k_w]), f"used={used}"
+        assert torch.equal(q, q_full) and torch.equal(k, k_full)
+        assert _same_bits(v, v_full)
+        # out= must be sized with scale_widths(used)
+        outs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v),
+                torch.empty_like(qs), torch.empty_like(ks))
+        lowp.unpack_for_sage(recv, scale_sequence=used, out=outs, **kwargs)
+        assert _same_bits(outs[3], qs) and _same_bits(outs[4], ks)
+
+
+def _same_bits(a, b):
+    return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+
+
+@requires_sm120
+def test_scale_sequence_rejects_out_of_range_and_mismatched_out():
+    world, local_sequence = 4, 256
+    spec = lowp.payload_spec(batch_size=1, local_sequence=local_sequence,
+                             num_heads=_HEADS, head_dim=_HEAD_DIM, world_size=world)
+    S = spec["logical_sequence"]
+    recv = torch.zeros((world, spec["chunk_bytes"]), dtype=torch.uint8, device="cuda")
+    kwargs = dict(batch_size=1, local_sequence=local_sequence, local_heads=_HEADS // world,
+                  head_dim=_HEAD_DIM, world_size=world)
+    for bad in (0, S + 1):
+        with pytest.raises(ValueError, match="scale_sequence"):
+            lowp.unpack_for_sage(recv, scale_sequence=bad, **kwargs)
+    full = lowp.unpack_for_sage(recv, **kwargs)
+    with pytest.raises(Exception):  # FFI shape check: full-width scale buffers
+        lowp.unpack_for_sage(recv, scale_sequence=S - 130, out=full, **kwargs)

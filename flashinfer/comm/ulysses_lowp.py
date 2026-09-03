@@ -220,9 +220,10 @@ def get_ulysses_lowp_module():
         k_scale: torch.Tensor,
         local_sequence: int,
         world_size: int,
+        scale_sequence: int,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size
+            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence
         )
 
     @register_custom_op(
@@ -238,9 +239,10 @@ def get_ulysses_lowp_module():
         k_scale: torch.Tensor,
         local_sequence: int,
         world_size: int,
+        scale_sequence: int,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage_unaligned(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size
+            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence
         )
 
     @register_custom_op(
@@ -1185,6 +1187,17 @@ def quant_qkv_pack_fused(
 # ---------------------------------------------------------------------------
 
 
+def scale_widths(sequence: int) -> Tuple[int, int]:
+    """Per-head Q/K scale slot counts the SageAttention per-warp consumer
+    derives from ``sequence`` rows: ``ceil(sequence/128)*4`` Q slots (32-token
+    warps inside 128-token CTAs) and ``ceil(sequence/64)`` K slots.  Size
+    ``unpack_for_sage(..., out=)`` scale buffers with this for the
+    ``scale_sequence`` you will pass."""
+
+    sequence = _positive_int("sequence", sequence)
+    return (sequence + 127) // 128 * 4, (sequence + 63) // 64
+
+
 @flashinfer_api
 def unpack_for_sage(
     recv_u8: torch.Tensor,
@@ -1195,6 +1208,7 @@ def unpack_for_sage(
     head_dim: int,
     world_size: int,
     aligned: bool = True,
+    scale_sequence: Optional[int] = None,
     out: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
@@ -1204,6 +1218,15 @@ def unpack_for_sage(
     Returns contiguous logical Q/K ``[B,S,h,128]``, globally packed V
     ``[B,128,h,ceil(S/64)*64]`` with a zero global tail, and global-grid Q/K
     scale tensors whose unused tail slots are deterministically zero.
+
+    The Sage kernel derives its per-head scale stride from the rows it is
+    given, so a caller attending over a live prefix ``used < S`` must hand it
+    scales of exactly ``scale_widths(used)`` slots.  Pass
+    ``scale_sequence=used`` and the kernel emits the scale tensors at that
+    width directly (byte-identical to the full-width tensors' leading slots),
+    instead of the caller narrowing them with a copy per layer.  ``None``
+    keeps the full logical width.  Q/K/V are always emitted for the full
+    logical sequence.
     """
 
     batch_size = _positive_int("batch_size", batch_size)
@@ -1239,6 +1262,11 @@ def unpack_for_sage(
 
     logical_sequence = int(spec["logical_sequence"])
     padded_sequence = int(spec["padded_sequence"])
+    if scale_sequence is None:
+        scale_sequence = logical_sequence
+    elif not 0 < int(scale_sequence) <= logical_sequence:
+        raise ValueError("scale_sequence must lie in (0, local_sequence * world_size]")
+    q_scale_width, k_scale_width = scale_widths(int(scale_sequence))
     if out is None:
         q_logical = torch.empty(
             (batch_size, logical_sequence, local_heads, head_dim),
@@ -1252,12 +1280,12 @@ def unpack_for_sage(
             device=recv_u8.device,
         )
         q_scale = torch.empty(
-            (batch_size, local_heads, int(spec["q_scale_alloc"])),
+            (batch_size, local_heads, q_scale_width),
             dtype=torch.float32,
             device=recv_u8.device,
         )
         k_scale = torch.empty(
-            (batch_size, local_heads, int(spec["k_scale_alloc"])),
+            (batch_size, local_heads, k_scale_width),
             dtype=torch.float32,
             device=recv_u8.device,
         )
@@ -1279,6 +1307,7 @@ def unpack_for_sage(
         k_scale,
         local_sequence,
         world_size,
+        int(scale_sequence),
     )
     return q_logical, k_logical, v_packed, q_scale, k_scale
 
@@ -1439,6 +1468,7 @@ __all__ = [
     "quant_qkv_pack",
     "quant_qkv_pack_fused",
     "quant_v_fp8_with_scale",
+    "scale_widths",
     "slots",
     "touched",
     "unpack_for_sage",

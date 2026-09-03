@@ -577,7 +577,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
 // writes; unused tail slots are deterministically zeroed).
 void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, TensorView v,
                                   TensorView q_scale, TensorView k_scale, int64_t local_sequence,
-                                  int64_t world_size) {
+                                  int64_t world_size, int64_t scale_sequence) {
   CHECK_CUDA(input);
   CHECK_CUDA(q);
   CHECK_CUDA(k);
@@ -621,8 +621,15 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   const int64_t local_heads = q.size(2);
   const int64_t head_dim = q.size(3);
   const int64_t padded_sequence = (logical_sequence + 63) / 64 * 64;
-  const int64_t q_scale_alloc = (logical_sequence + 127) / 128 * 4;
-  const int64_t k_scale_alloc = (logical_sequence + 63) / 64;
+  // Scale tensors are emitted at the width the Sage consumer derives from the
+  // rows it is given (ceil(rows/128)*4 Q slots, ceil(rows/64) K slots); a
+  // caller that attends over a live prefix passes that prefix so no
+  // narrowing copy is needed.  0 keeps the full logical width.
+  const int64_t scale_rows = scale_sequence == 0 ? logical_sequence : scale_sequence;
+  TVM_FFI_ICHECK(scale_rows > 0 && scale_rows <= logical_sequence)
+      << "scale_sequence must lie in (0, local_sequence * world_size]";
+  const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
+  const int64_t k_scale_alloc = (scale_rows + 63) / 64;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
@@ -662,7 +669,7 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
 void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, TensorView k,
                                             TensorView v, TensorView q_scale,
                                             TensorView k_scale, int64_t local_sequence,
-                                            int64_t world_size) {
+                                            int64_t world_size, int64_t scale_sequence) {
   CHECK_CUDA(input);
   CHECK_CUDA(q);
   CHECK_CUDA(k);
@@ -704,8 +711,15 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   const int64_t local_heads = q.size(2);
   const int64_t head_dim = q.size(3);
   const int64_t padded_sequence = (logical_sequence + 63) / 64 * 64;
-  const int64_t q_scale_alloc = (logical_sequence + 127) / 128 * 4;
-  const int64_t k_scale_alloc = (logical_sequence + 63) / 64;
+  // Scale tensors are emitted at the width the Sage consumer derives from the
+  // rows it is given (ceil(rows/128)*4 Q slots, ceil(rows/64) K slots); a
+  // caller that attends over a live prefix passes that prefix so no
+  // narrowing copy is needed.  0 keeps the full logical width.
+  const int64_t scale_rows = scale_sequence == 0 ? logical_sequence : scale_sequence;
+  TVM_FFI_ICHECK(scale_rows > 0 && scale_rows <= logical_sequence)
+      << "scale_sequence must lie in (0, local_sequence * world_size]";
+  const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
+  const int64_t k_scale_alloc = (scale_rows + 63) / 64;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
