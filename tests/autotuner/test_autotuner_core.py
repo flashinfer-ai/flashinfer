@@ -1,5 +1,7 @@
+import gc
 import random
 import tracemalloc
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -444,6 +446,61 @@ def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch):
     assert tactic == -1
     profile.assert_not_called()
     empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_phase", ("input_batches", "runner"))
+def test_choose_one_releases_synthetic_inputs_before_emptying_cache(
+    monkeypatch, failure_phase
+):
+    class SyntheticInput:
+        pass
+
+    class PreparationRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if failure_phase == "runner" and do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    synthetic_ref = None
+
+    def prepare_input_tensors(_self, *_args):
+        nonlocal synthetic_ref
+        synthetic_input = SyntheticInput()
+        synthetic_ref = weakref.ref(synthetic_input)
+        return [synthetic_input]
+
+    def prepare_batches(_self, tensors, *_args):
+        if failure_phase == "input_batches":
+            raise MemoryError("CUDA out of memory")
+        return [list(tensors)]
+
+    def empty_cache():
+        gc.collect()
+        assert synthetic_ref is not None
+        assert synthetic_ref() is None
+
+    monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_input_tensors)
+    monkeypatch.setattr(
+        AutoTuner, "_prepare_input_tensors_with_batches", prepare_batches
+    )
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", lambda *_args, **_kwargs: 1.0
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "input_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
 
 
 def test_choose_one_recovers_from_memory_error_during_profiling(monkeypatch):

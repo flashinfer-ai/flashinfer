@@ -1729,6 +1729,8 @@ class AutoTuner:
 
             pbar = None
             for _step, p in enumerate(profiles):
+                tensors = None
+                prepared_input_batches = None
                 try:
                     # Check the cache before synthesizing profile inputs.
                     # `_prepare_input_tensors` launches a GPU kernel per
@@ -1780,12 +1782,16 @@ class AutoTuner:
                             input_preparation_oom = True
 
                         if _sync_oom_across_tune_group(input_preparation_oom):
+                            tensors = None
+                            prepared_input_batches = None
                             torch.cuda.empty_cache()
                             logger.warning(
                                 "[Autotuner]: OOM detected, falling back to default tactic"
                             )
                             return runners[0], -1
 
+                        assert tensors is not None
+                        assert prepared_input_batches is not None
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -1820,6 +1826,8 @@ class AutoTuner:
                                 runner_preparation_oom = True
 
                             if _sync_oom_across_tune_group(runner_preparation_oom):
+                                tensors = None
+                                prepared_input_batches = None
                                 torch.cuda.empty_cache()
                                 logger.warning(
                                     "[Autotuner]: OOM detected, falling back to default tactic"
