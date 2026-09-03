@@ -791,3 +791,17 @@ def test_a_second_plan_still_takes_a_page_size_after_auto_resolved():
     # Then a paged one on the same wrapper. Gating on the resolved backend
     # refuses this for an fa3 the caller never named.
     wrapper.plan(indptr, indices, rows, 64, 1, 1, kv_cache_page_size=1, **common)
+    assert wrapper._backend == "fa2"
+    # And back to a flat one. The paged plan left fa2 behind, which is not
+    # "auto", so a plan that does not reset first never resolves again -- it
+    # keeps every later flat route on whatever the paged one settled on.
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
+    assert wrapper._requested_backend == "auto"
+    assert wrapper._backend == flashinfer.utils.determine_attention_backend(
+        wrapper.device,
+        0,
+        False,
+        True,
+        torch.float16,
+        torch.float16,
+    ), wrapper._backend
