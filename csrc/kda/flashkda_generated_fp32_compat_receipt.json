@@ -11,7 +11,7 @@
     "sm_100a": "df23bb10209b07f85c4ad477e202a5af10efff4f3789050f80410f97377d6686",
     "sm_103a": "d948b4ee303bb5c25c473529f55d224f130c386d5e579bd4316d352ebf308dcc"
   },
-  "metadata_sha256": "b81beb1713e01c6bd4e92cf95647c0dfb39ee24bc08a75f7cf2a2849a5825248",
+  "metadata_sha256": "5d68f69839773d04672eb1e35a34fd67643874c6d2f7271e2a5a22cd88a13b09",
   "optimization_level_one_absent": true,
   "public_confidentiality_scan": "passed",
   "schema_version": 1,

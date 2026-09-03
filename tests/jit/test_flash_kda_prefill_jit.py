@@ -28,7 +28,7 @@ from flashinfer.jit import flash_kda
 _H12_CASES = (
     (
         "m128_h12_short",
-        "47c46019cc",
+        "9b65def512",
         "d25044154d",
         "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
         "cake_flashkda_bf16_fused_m128_h12_short.cu",
@@ -36,13 +36,54 @@ _H12_CASES = (
     ),
     (
         "m128_h12_long",
-        "b813a7edd3",
+        "814f18caf5",
         "88cedfb168",
         "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
         "cake_flashkda_bf16_fused_m128_h12_long.cu",
         "edc4085329fa659498b0a790407579afc0aeab48bac08b6b57e5de462e7754f7",
     ),
 )
+
+_COMMON_HEADER_VARIANT_BODIES = (
+    ("m64", "flashkda_bf16_fused_m64.cu"),
+    ("m128", "flashkda_bf16_fused_m128.cu"),
+    (
+        "m128_tensor_state_decay",
+        "cake_flashkda_bf16_fused_m128_tensor_state_decay.cu",
+    ),
+    ("m128_h12_short", "cake_flashkda_bf16_fused_m128_h12_short.cu"),
+    ("m128_h12_long", "cake_flashkda_bf16_fused_m128_h12_long.cu"),
+    ("m128_n16", "cake_flashkda_bf16_fused_m128_n16.cu"),
+    (
+        "m128_n16_checkpoint",
+        "flashkda_bf16_fused_m128_n16_checkpoint.cu",
+    ),
+    ("m128_n16_short", "cake_flashkda_bf16_fused_m128_n16_short.cu"),
+    ("persistent_m128", "cake_flashkda_bf16_persistent_m128.cu"),
+    (
+        "piece_persistent_m128",
+        "cake_flashkda_bf16_piece_persistent_m128.cu",
+    ),
+    ("small_bh_m128", "cake_flashkda_bf16_small_bh_m128.cu"),
+)
+
+
+@pytest.mark.parametrize(("variant", "body_name"), _COMMON_HEADER_VARIANT_BODIES)
+def test_common_header_prefill_variant_cache_key(variant, body_name):
+    csrc_dir = flash_kda._get_flash_kda_csrc_dir()
+    spec = flash_kda.gen_flash_kda_module(variant, "sm100f")
+    assert len(spec.sources) == 1
+    digest = hashlib.sha256(
+        b"\0".join(
+            source.read_bytes()
+            for source in (
+                csrc_dir / body_name,
+                spec.sources[0],
+                csrc_dir / "flashkda_binding_common.cuh",
+            )
+        )
+    ).hexdigest()[:10]
+    assert flash_kda._FLASH_KDA_MODULE_IDENTS[variant] == digest
 
 
 @pytest.mark.parametrize(
@@ -518,7 +559,7 @@ def test_short_n16_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_n16_short", target)
 
-    assert spec.name == f"flash_kda_bf16_m128_n16_short_3f90fe2347_{target}"
+    assert spec.name == f"flash_kda_bf16_m128_n16_short_467f935f0b_{target}"
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir()
         / "cake_flashkda_bf16_fused_m128_n16_binding.cu"
@@ -554,7 +595,7 @@ def test_tensor_state_decay_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_tensor_state_decay", target)
 
-    assert spec.name == (f"flash_kda_bf16_m128_tensor_state_decay_9614ba2d29_{target}")
+    assert spec.name == (f"flash_kda_bf16_m128_tensor_state_decay_2afad4040d_{target}")
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_binding.cu"
     ]
