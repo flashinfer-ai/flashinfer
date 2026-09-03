@@ -101,6 +101,9 @@ top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
+ulysses_exchange_chunks_ws1_c128.json
+ulysses_gather_heads_ws1_d128.json
+ulysses_scatter_heads_ws1_d128.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -126,8 +129,10 @@ os.environ.setdefault("FLASHINFER_TRACE_DUMP", "1")
 SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
 
 import torch
+import torch.distributed as dist
 
 import flashinfer
+import flashinfer.comm
 import flashinfer.norm
 import flashinfer.sampling
 import flashinfer.gemm
@@ -2302,3 +2307,43 @@ with contextlib.suppress(Exception):
             _fp4_in["block_table"],
             _fp4_in["max_context_len"],
         )
+
+# ── Ulysses layout transforms (single-rank trace reference) ──────────────────
+# The trace template intentionally models world_size=1. Multi-rank data movement
+# is covered by tests/comm and cannot be represented by a single-process
+# flashinfer-bench reference function.
+_ulysses_owns_process_group = False
+try:
+    # Only the process-group bring-up is allowed to fail quietly: it is the one
+    # step this script cannot assume (no NCCL, no CUDA). A communicator or
+    # collective that fails after that is a real defect, and suppressing it
+    # would let this script exit 0 having silently skipped the Ulysses traces.
+    if not dist.is_initialized():
+        with contextlib.suppress(Exception):
+            dist.init_process_group(
+                "nccl", store=dist.HashStore(), rank=0, world_size=1
+            )
+            _ulysses_owns_process_group = True
+    if dist.is_initialized() and dist.get_world_size() == 1:
+        _ulysses_x = torch.randn(1, 128, 8, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_x.nbytes,
+            dtype=_ulysses_x.dtype,
+            backend="nccl",
+            device=_ulysses_x.device,
+        ) as _ulysses_comm:
+            _ulysses_comm.scatter_heads(_ulysses_x)
+            _ulysses_comm.gather_heads(_ulysses_x)
+        # Chunk exchange takes [1, 1, world_size, chunk], so it needs its own
+        # operand rather than a view of the head-major one above.
+        _ulysses_chunks = torch.randn(1, 1, 1, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_chunks.nbytes,
+            dtype=_ulysses_chunks.dtype,
+            backend="nccl",
+            device=_ulysses_chunks.device,
+        ) as _ulysses_chunk_comm:
+            _ulysses_chunk_comm.exchange_chunks(_ulysses_chunks)
+finally:
+    if _ulysses_owns_process_group:
+        dist.destroy_process_group()

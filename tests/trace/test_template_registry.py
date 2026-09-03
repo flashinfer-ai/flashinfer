@@ -79,7 +79,11 @@ def test_registered_template_discovery_is_import_order_independent():
 
 def test_formerly_order_dependent_templates_are_discovered():
     labels = {label for _, _, label in collect_registered_trace_templates()}
-    assert "concat_mla_k" in labels
+    assert {
+        "concat_mla_k",
+        "ulysses_scatter_heads",
+        "ulysses_gather_heads",
+    } <= labels
 
     optional_labels = {
         "flashinfer.comm.allreduce": "allreduce_fusion",

@@ -27,7 +27,7 @@ MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 # These tests create their own distributed workers with torch.multiprocessing.spawn.
 # Running them under mpirun would start multiple pytest parents and can collide on
 # TCPStore ports.
-SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py"
+SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_ulysses_a2a.py tests/comm/test_ulysses_communicator.py"
 
 # Tests that require torchrun instead of mpirun
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py"

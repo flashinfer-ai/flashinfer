@@ -238,7 +238,18 @@ output through ``gather_heads``):
   the inverse, returning all heads of this rank's sequence shard,
 
 with ``H_local = H // world_size`` and ``S_global = S_local * world_size``.
-Both backends produce bit-identical results.
+All backends produce bit-identical results.
+
+A third entry point, ``exchange_chunks``, takes ``[1, 1, world_size, chunk]``
+to the same shape: chunk ``r`` goes to peer ``r`` and lands in slot ``rank``
+there, which is ``dist.all_to_all_single`` over an already-packed payload. It
+interleaves nothing, so it is for operands a preceding pack (a quantizer, say)
+already laid out destination-major — the head-axis transforms would make such a
+producer emit head-major and repack. On the ``"pcie"`` RDMA routes it is also
+the cheaper descriptor: each peer's bytes are contiguous on both ends, so the
+NIC addresses them with the plain memory region and a linear offset instead of
+an interleaved MKey, which is what exempts it from the 65535-byte stride limit
+that bounds ``H*D*element_size`` for the other two.
 
 **Backend policy.** :class:`UlyssesCommunicator` selects its backend in the
 constructor, strictly before any IPC allocation or JIT compilation:
@@ -253,6 +264,15 @@ constructor, strictly before any IPC allocation or JIT compilation:
                ``.topology_decision``.
 ``"nvlink"``   force the fused kernel; raises on every rank (before IPC/JIT for
                topology failures) when it cannot be used.
+``"pcie"``     force the experimental single-node PCIe transport at world size
+               1/2/4/8. Size 1 is an identity path and does not JIT-compile or
+               arm a native transport. Size 2 uses CUDA P2P. Sizes 4/8 prefer
+               an all-RDMA route (per-rank mlx5 to every peer) and fall
+               back to all-P2P; ``FLASHINFER_ULYSSES_PCIE_ROUTE`` can force
+               all-P2P, all-RDMA at any multi-rank world size, or the
+               eight-rank 4+4 NUMA P2P/mlx5 hybrid. Every route requires
+               full-group CUDA P2P access for the epoch signal barrier.
+               ``auto`` never selects this backend.
 ``"nccl"``     force ``dist.all_to_all_single`` + permute; skips the
                topology/NVML probe and all IPC/JIT (the constructor still
                resolves/guards the CUDA device and performs CUDA-backed
@@ -269,25 +289,46 @@ inconsistent per-rank decisions, or a runtime NVLink initialization failure
 after a positive topology decision.
 
 **Constraints.** The constructor is always collective (all ranks together);
-:meth:`UlyssesCommunicator.close` is collective only when the NVLink backend
+:meth:`UlyssesCommunicator.close` is collective when the NVLink or PCIe backend
 was armed — for the pure NCCL backend, ``world_size == 1``, or an auto
 fallback whose NVLink cleanup already completed, ``close`` is local and
-idempotent. Rank-local failures inside the NVLink initialization or a
+idempotent. Rank-local failures inside backend initialization or a
 collective ``close`` are exchanged as group outcomes so all ranks jointly
 clean up and raise (or fall back) instead of deadlocking, and a failed
 ``close`` may be retried. All ranks must request the same ``backend`` and
-agree on ``max_elems`` and ``dtype``; each rank may bind a different CUDA
+agree on ``max_bytes`` and ``dtype``; each rank may bind a different CUDA
 device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
 e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
 fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
 process group), checked at construction. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, at most ``max_elems``
-(≤ 2^31 − 1) elements; ``scatter_heads`` requires ``H % world_size == 0``
+only) on the construction device, every dim positive, and ``nbytes`` at most
+``max_bytes``; the element count of any one operand must additionally stay
+within the int32 kernel index range. ``scatter_heads`` requires
+``H % world_size == 0``
 and ``gather_heads`` requires ``S_global % world_size == 0``. Collectives
 run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
 time.
+
+**PCIe backend (experimental).** It additionally accepts the 1-, 2- and
+4-byte element types float16 / bfloat16 / float32, int8 / uint8 and
+float8_e4m3fn / float8_e5m2; its mlx5 routes — the eight-rank 4+4 NUMA
+hybrid and the ``FLASHINFER_ULYSSES_PCIE_ROUTE=rdma`` all-RDMA route —
+require batch size 1 and a head-row pitch ``H * D * element_size <= 65,535``
+bytes and refuse CUDA graph capture, while the all-P2P route takes any batch
+size and can be captured when every output comes from
+:meth:`UlyssesCommunicator.allocate_output`. The JIT module links
+libibverbs, libmlx5 and the CUDA driver library even when topology selects
+the all-P2P route, so the rdma-core development packages must be present;
+it is the only FlashInfer JIT module that links them. Multi-rank PCIe calls require ``out=``
+from :meth:`UlyssesCommunicator.allocate_output`, and a transport failure is
+unrecoverable: the communicator enters a BROKEN state that permits only a
+collective ``close``.
+See the `PCIe Ulysses design note
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/ulysses_pcie.md>`_
+for the support matrix, output-lifetime rules, teardown protocol, routing
+controls, and benchmark.
 
 **Known limitations.**
 
@@ -310,8 +351,10 @@ time.
 `wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
 for the full integration)::
 
-    with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
-                             dtype=torch.bfloat16) as comm:
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    with UlyssesCommunicator(group, max_bytes=q.nbytes,
+                             dtype=torch.bfloat16, device=device) as comm:
         q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
         k_ = comm.scatter_heads(k)
         v_ = comm.scatter_heads(v)
@@ -332,7 +375,12 @@ Topology Probing and Backend Selection
 
     UlyssesBackendDecision
     UlyssesRankTopology
+    UlyssesPciePlan
     UlyssesBackendError
+
+The communicator exposes ``.backend`` (the effective backend), ``.transport``
+(``"p2p"``, ``"hybrid"`` or ``"rdma"``, PCIe only), ``.decision`` /
+``.topology_decision`` and ``.fallback_reason``.
 
 .. autofunction:: resolve_ulysses_backend
 
