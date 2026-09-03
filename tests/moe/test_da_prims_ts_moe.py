@@ -78,7 +78,7 @@ def test_nvfp4_da_public_graph_lifecycle(monkeypatch, routing_input_mode):
         cache=None,
         tune=True,
         warmup=1,
-        iterations=1,
+        iterations=2,
         backend="prims_ts",
         routing_input_mode=routing_input_mode,
     )
@@ -127,7 +127,7 @@ def test_prims_ts_supported_dtype_da_graph_lifecycle(monkeypatch, precision):
         cache=None,
         tune=True,
         warmup=1,
-        iterations=1,
+        iterations=2,
         backend="prims_ts",
     )
 
