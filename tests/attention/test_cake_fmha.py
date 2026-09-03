@@ -66,7 +66,7 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    assert len(manifest["artifacts"]) == 135
+    assert len(manifest["artifacts"]) == 141
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
