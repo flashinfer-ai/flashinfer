@@ -72,9 +72,9 @@ inline int64_t CheckBt16PrepareInputs(
                  prepare_total_ctas <= num_heads * total_chunks &&
                  prepare_total_ctas <= std::numeric_limits<uint32_t>::max())
       << "prepare_total_ctas must be in [H, H * total_chunks]";
-  TVM_FFI_ICHECK(std::isfinite(gate_lower_bound) && gate_lower_bound < 0.0 &&
+  TVM_FFI_ICHECK(std::isfinite(gate_lower_bound) && gate_lower_bound <= 0.0 &&
                  std::isfinite(static_cast<float>(gate_lower_bound)))
-      << "gate_lower_bound must be finite, negative, and representable as float32";
+      << "gate_lower_bound must be finite, non-positive, and representable as float32";
 
   CheckBt16DenseTensor(q, "q", device_id, dl_bfloat16);
   TVM_FFI_ICHECK(q.ndim() >= 3 && q.size(q.ndim() - 2) == num_heads &&

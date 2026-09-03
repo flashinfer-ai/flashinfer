@@ -33,6 +33,7 @@ kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
 cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
+flash_kda_jit_api = importlib.import_module("flashinfer.jit.flash_kda")
 
 
 @pytest.fixture(autouse=True)
@@ -779,6 +780,114 @@ def _make_inputs(
     }
 
 
+_KIMI_K3_A_LOG_QUANTILES = (
+    (0.00, -0.7530547380),
+    (0.01, -0.7376189800),
+    (0.10, -0.5749673800),
+    (0.50, -0.3276140000),
+    (0.90, 0.1934419700),
+    (0.99, 0.9079557000),
+    (1.00, 2.4661004500),
+)
+_KIMI_K3_DT_BIAS_QUANTILES = (
+    (0.000, -7.8938117000),
+    (0.001, -7.2427702000),
+    (0.010, -6.9628277000),
+    (0.100, -6.4912496000),
+    (0.500, -4.6220312000),
+    (0.900, -2.5689726000),
+    (0.990, -1.8953739000),
+    (0.999, -1.3891678000),
+    (1.000, 0.1792312000),
+)
+
+
+def _interpolate_kimi_k3_quantiles(anchors, *, count, device):
+    probabilities = torch.linspace(0.0, 1.0, count, device=device)
+    anchor_probabilities = torch.tensor(
+        [probability for probability, _ in anchors],
+        dtype=torch.float32,
+        device=device,
+    )
+    anchor_values = torch.tensor(
+        [value for _, value in anchors],
+        dtype=torch.float32,
+        device=device,
+    )
+    upper = torch.searchsorted(
+        anchor_probabilities, probabilities, right=True
+    ).clamp_(1, len(anchors) - 1)
+    lower = upper - 1
+    fraction = (probabilities - anchor_probabilities[lower]) / (
+        anchor_probabilities[upper] - anchor_probabilities[lower]
+    )
+    return anchor_values[lower] + fraction * (
+        anchor_values[upper] - anchor_values[lower]
+    )
+
+
+def _make_kimi_k3_trained_gate_parameters(*, num_heads, generator, device):
+    """Build a public checkpoint-statistics fixture without raw weights."""
+
+    A_log = _interpolate_kimi_k3_quantiles(
+        _KIMI_K3_A_LOG_QUANTILES,
+        count=num_heads,
+        device=device,
+    )
+    A_log = A_log[
+        torch.randperm(num_heads, generator=generator, device=device)
+    ]
+    dt_bias = _interpolate_kimi_k3_quantiles(
+        _KIMI_K3_DT_BIAS_QUANTILES,
+        count=num_heads * 128,
+        device=device,
+    )
+    dt_bias = dt_bias[
+        torch.randperm(
+            num_heads * 128,
+            generator=generator,
+            device=device,
+        )
+    ].reshape(num_heads, 128)
+    return A_log.contiguous(), dt_bias.contiguous()
+
+
+def _make_kimi_k3_bt16_inputs(*, device, seed=4845):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    shape = (1, 4096, 6, 128)
+    q = (torch.randn(shape, generator=generator, device=device) * 0.25).to(
+        torch.bfloat16
+    )
+    k = (torch.randn(shape, generator=generator, device=device) * 0.25).to(
+        torch.bfloat16
+    )
+    v = (torch.randn(shape, generator=generator, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    g = (torch.randn(shape, generator=generator, device=device) * 0.25).to(
+        torch.bfloat16
+    )
+    beta = (
+        torch.randn((1, 4096, 6), generator=generator, device=device) * 0.25
+    ).to(torch.bfloat16)
+    A_log, dt_bias = _make_kimi_k3_trained_gate_parameters(
+        num_heads=6,
+        generator=generator,
+        device=device,
+    )
+    return {
+        "q": q.contiguous(),
+        "k": k.contiguous(),
+        "v": v.contiguous(),
+        "g": g.contiguous(),
+        "beta": beta.contiguous(),
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "initial_state": None,
+        "cu_seqlens": None,
+    }
+
+
 @pytest.mark.parametrize(
     "field",
     (
@@ -1132,6 +1241,7 @@ def _frozen_prefill_eligibility_kwargs(inputs, *, output, state_indices=None):
     [
         (torch.bfloat16, "compact"),
         (torch.bfloat16, "indexed"),
+        (torch.float32, "compact"),
         (torch.float32, "indexed"),
     ],
 )
@@ -1183,8 +1293,10 @@ def test_frozen_prefill_state_pool_eligibility_accepts_supported_contracts(
     )
 
 
-def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_state(
+@pytest.mark.parametrize("lower_bound", [-5.0, -1.0, 0.0])
+def test_frozen_prefill_state_pool_eligibility_accepts_compact_fp32_source_bounds(
     flash_kda_device,
+    lower_bound,
 ):
     inputs = _make_inputs(
         seq_lens=[17, 33],
@@ -1199,14 +1311,172 @@ def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_state(
         inputs,
         output=torch.empty_like(inputs["q"]),
     )
-    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
-    with pytest.raises(ValueError, match="backend='cake' does not support"):
-        recurrent_kda(
-            **_strict_prefill_kwargs(inputs),
-            output=eligibility_kwargs["output"],
-            output_final_state=True,
-            backend="cake",
+    eligibility_kwargs["lower_bound"] = lower_bound
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+
+
+@pytest.mark.parametrize("lower_bound", [None, -5.01, 0.01])
+def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_outside_source_bounds(
+    flash_kda_device,
+    lower_bound,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_059,
+    )
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+    )
+    eligibility_kwargs["lower_bound"] = lower_bound
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
+        **eligibility_kwargs
+    )
+
+
+@pytest.mark.parametrize("lower_bound", [-5.0, -1.0, 0.0])
+def test_frozen_prefill_state_pool_eligibility_accepts_indexed_fp32_source_bounds(
+    flash_kda_device,
+    lower_bound,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_061,
+    )
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    state_pool = _make_padded_state_pool(
+        slots=5,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    state_pool.index_copy_(0, state_indices.to(torch.int64), inputs["initial_state"])
+    inputs["initial_state"] = state_pool
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+        state_indices=state_indices,
+    )
+    eligibility_kwargs["lower_bound"] = lower_bound
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+
+
+@pytest.mark.parametrize("lower_bound", [None, -5.01, 0.01])
+def test_frozen_prefill_state_pool_eligibility_rejects_indexed_fp32_outside_source_bounds(
+    flash_kda_device,
+    lower_bound,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_062,
+    )
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    state_pool = _make_padded_state_pool(
+        slots=5,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    state_pool.index_copy_(0, state_indices.to(torch.int64), inputs["initial_state"])
+    inputs["initial_state"] = state_pool
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+        state_indices=state_indices,
+    )
+    eligibility_kwargs["lower_bound"] = lower_bound
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
+        **eligibility_kwargs
+    )
+
+
+@pytest.mark.parametrize("contract", ["beta_layout", "dt_bias_rank", "checkpoint"])
+def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_contracts(
+    flash_kda_device,
+    contract,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_060,
+    )
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+    )
+    if contract == "beta_layout":
+        padded = torch.empty(
+            (*inputs["beta"].shape[:-1], inputs["beta"].shape[-1] + 1),
+            dtype=inputs["beta"].dtype,
+            device=inputs["beta"].device,
         )
+        padded[..., : inputs["beta"].shape[-1]].copy_(inputs["beta"])
+        eligibility_kwargs["beta"] = padded[..., : inputs["beta"].shape[-1]]
+    elif contract == "dt_bias_rank":
+        eligibility_kwargs["dt_bias"] = inputs["dt_bias"].reshape(-1)
+    else:
+        eligibility_kwargs["checkpoint_every_n_tokens"] = 16
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(
+        **eligibility_kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "fixed_layout",
+        "sequence_lengths",
+        "num_heads",
+        "indexed_state",
+        "expected_route",
+    ),
+    [
+        (True, (2048,), 6, False, "small_bh_owner_helper_m128"),
+        (True, (4096,), 6, True, "small_bh_owner_helper_m128"),
+        (True, (512,), 12, False, "bt16_prepare_chain_m64"),
+        (False, (17, 33), 6, False, "compact_fp32_compat_m128"),
+        (False, (17, 33), 12, False, "compact_fp32_compat_m128"),
+    ],
+    ids=[
+        "h6-small-bh",
+        "h6-indexed-small-before-bt16",
+        "h12-bt16",
+        "h6-compat",
+        "h12-compat",
+    ],
+)
+def test_fp32_schedule_preserves_source_dispatch_order(
+    fixed_layout,
+    sequence_lengths,
+    num_heads,
+    indexed_state,
+    expected_route,
+):
+    assert (
+        kda_prefill_api._select_fp32_schedule_route(
+            compute_capability=(10, 0),
+            sm_count=148,
+            fixed_layout=fixed_layout,
+            sequence_lengths=sequence_lengths,
+            num_heads=num_heads,
+            indexed_state=indexed_state,
+        )
+        == expected_route
+    )
 
 
 @pytest.mark.parametrize(
@@ -1348,6 +1618,67 @@ def test_frozen_prefill_missing_selected_module_is_fail_closed(
     )
 
     with pytest.raises(FileNotFoundError, match="not materialized"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            backend=backend,
+        )
+
+
+@pytest.mark.parametrize("backend", ["auto", "cake"])
+def test_compact_fp32_missing_selected_module_is_fail_closed(
+    flash_kda_device,
+    monkeypatch,
+    backend,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_307,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_decode_api,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail(
+            "an eligible compact-FP32 route must not fall back"
+        ),
+    )
+    monkeypatch.setattr(
+        flash_kda_jit_api,
+        "get_flash_kda_fp32_compat_registry",
+        lambda: {
+            "sm100a": SimpleNamespace(
+                variant_id="sm_100a:compact_fp32_compat_ui1_sf1"
+            ),
+            "sm103a": SimpleNamespace(
+                variant_id="sm_103a:compact_fp32_compat_ui1_sf1"
+            ),
+        },
+    )
+
+    def missing_module(target):
+        raise FileNotFoundError(
+            f"selected compact-FP32 module is not materialized: {target}"
+        )
+
+    monkeypatch.setattr(
+        flash_kda_jit_api,
+        "load_flash_kda_fp32_compat_module",
+        missing_module,
+    )
+
+    with pytest.raises(
+        FileNotFoundError, match="compact-FP32 module is not materialized"
+    ):
         recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             output=torch.empty_like(inputs["q"]),
@@ -3219,6 +3550,626 @@ def test_frozen_route_and_ffi_abi(
 
 
 @pytest.mark.parametrize(
+    ("compute_capability", "expected_target"),
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+)
+def test_compact_fp32_source_exact_route_and_ffi_abi(
+    cuda_device,
+    monkeypatch,
+    compute_capability,
+    expected_target,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: compute_capability,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    metadata = SimpleNamespace(
+        variant_id=f"sm_{compute_capability[0]}{compute_capability[1]}a:"
+        "compact_fp32_compat_ui1_sf1"
+    )
+    monkeypatch.setattr(
+        flash_kda_jit_api,
+        "get_flash_kda_fp32_compat_registry",
+        lambda: {expected_target: metadata},
+    )
+    monkeypatch.setattr(
+        flash_kda_jit_api,
+        "load_flash_kda_fp32_compat_module",
+        lambda target: module,
+    )
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_200 + compute_capability[1],
+    )
+    padded_state = _make_padded_state_pool(
+        slots=2,
+        num_heads=6,
+        dtype=torch.float32,
+        device=cuda_device,
+    )
+    padded_state.copy_(inputs["initial_state"])
+    inputs["initial_state"] = padded_state
+    output = torch.empty_like(inputs["q"])
+
+    actual, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert actual is output
+    assert state is padded_state
+    (args,) = module.calls
+    assert len(args) == 24
+    expected_inputs = (
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["cu_seqlens"],
+    )
+    assert all(actual is expected for actual, expected in zip(args, expected_inputs))
+    assert args[8].dtype == torch.int32
+    assert args[9] is padded_state
+    assert args[10] is output
+    assert args[11] is padded_state
+    assert args[12].dtype == torch.float32
+    assert args[13].dtype == torch.int32
+    assert args[14].dtype == torch.uint8
+    assert args[14].numel() == 2 * 6 * 10 * 128
+    assert args[15].dtype == torch.uint8
+    assert args[15].numel() == 5 * 128
+    assert args[16] == 1
+    assert args[17] == padded_state.stride(0)
+    assert args[18:21] == (0, 1, 1)
+    assert math.isclose(args[21], 128**-0.5)
+    assert args[22] == -5.0
+    assert args[23] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [6, 12], ids=["h6", "h12"])
+def test_compact_fp32_matches_indexed_fp32_source_route(
+    flash_kda_device,
+    packed,
+    num_heads,
+):
+    """The new compact compatibility route matches the sealed indexed route."""
+
+    seq_lens = [17, 33] if packed else [33, 33]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_300 + 10 * num_heads + int(packed),
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = _make_padded_state_pool(
+        slots=2,
+        num_heads=num_heads,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    compact_state.copy_(state_seed)
+    compact_output, compact_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = _make_padded_state_pool(
+        slots=5,
+        num_heads=num_heads,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    indexed_state.normal_(mean=0.0, std=0.1)
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    indexed_state_before = indexed_state.clone()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": indexed_state}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert compact_final is compact_state
+    assert indexed_final is indexed_state
+    torch.testing.assert_close(
+        compact_output.float(), indexed_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        compact_final.float(),
+        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    unselected = torch.tensor([0, 2, 4], dtype=torch.int64, device=flash_kda_device)
+    assert torch.equal(
+        indexed_state.index_select(0, unselected),
+        indexed_state_before.index_select(0, unselected),
+    )
+
+
+def test_compact_fp32_zero_bound_small_bh_matches_compat_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[2048],
+        num_heads=1,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_401,
+    )
+    state_seed = inputs["initial_state"].clone()
+    selector_keys = []
+    get_generated_module = kda_prefill_api._get_flash_kda_generated_module
+
+    def recording_get_generated_module(selector_key):
+        selector_keys.append(dict(selector_key))
+        return get_generated_module(selector_key)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        recording_get_generated_module,
+    )
+    small_output, small_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=0.0),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    small_output = small_output.clone()
+    small_state = small_state.clone()
+    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
+
+    control_inputs = {**inputs, "initial_state": state_seed.clone()}
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_small_bh_owner_helper",
+        lambda **kwargs: False,
+    )
+    compat_output, compat_state = recurrent_kda(
+        **_strict_prefill_kwargs(control_inputs, lower_bound=0.0),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    torch.testing.assert_close(
+        small_output.float(), compat_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        small_state.float(), compat_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_compact_fp32_zero_bound_bt16_matches_compat_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[512],
+        num_heads=12,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_412,
+    )
+    state_seed = inputs["initial_state"].clone()
+    selector_keys = []
+    get_generated_module = kda_prefill_api._get_flash_kda_generated_module
+
+    def recording_get_generated_module(selector_key):
+        selector_keys.append(dict(selector_key))
+        return get_generated_module(selector_key)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        recording_get_generated_module,
+    )
+    bt16_output, bt16_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=0.0),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    bt16_output = bt16_output.clone()
+    bt16_state = bt16_state.clone()
+    assert [
+        (selector["route"], selector["route_role"])
+        for selector in selector_keys
+    ] == [
+        ("bt16_prepare_chain_m64", "bt16_prepare"),
+        ("bt16_prepare_chain_m64", "main"),
+    ]
+
+    control_inputs = {**inputs, "initial_state": state_seed.clone()}
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_dense_wavefront",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    compat_output, compat_state = recurrent_kda(
+        **_strict_prefill_kwargs(control_inputs, lower_bound=0.0),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    torch.testing.assert_close(
+        bt16_output.float(), compat_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        bt16_state.float(), compat_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_compact_fp32_cuda_graph_replay_matches_indexed_fp32_control(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_401,
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = _make_padded_state_pool(
+        slots=2,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    compact_state.copy_(state_seed)
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+    with torch.cuda.stream(capture_stream):
+        compact_state.copy_(state_seed)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        compact_state.copy_(state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = _make_padded_state_pool(
+        slots=5,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    indexed_state.zero_()
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    control_output, control_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": indexed_state}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert workspace._captured
+    assert captured_output is output
+    assert captured_state is compact_state
+    torch.testing.assert_close(
+        replay_output.float(), control_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(),
+        control_state.index_select(0, state_indices.to(torch.int64)).float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_indexed_fp32_cuda_graph_replay_matches_eager_control(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=25_402,
+    )
+    compact_state = inputs.pop("initial_state")
+    state_indices = torch.tensor(
+        [3, 1], dtype=torch.int32, device=flash_kda_device
+    )
+    state_pool = _make_padded_state_pool(
+        slots=5,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    state_pool.normal_(mean=0.0, std=0.1)
+    state_pool.index_copy_(0, state_indices.to(torch.int64), compact_state)
+    state_seed = state_pool.clone()
+    inputs["initial_state"] = state_pool
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "ssm_state_indices": state_indices,
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        state_pool.copy_(state_seed)
+        output.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        state_pool.copy_(state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    eager_inputs = {
+        name: value.clone() if value is not None else None
+        for name, value in inputs.items()
+    }
+    eager_inputs["initial_state"] = state_seed.clone()
+    eager_indices = state_indices.clone()
+    eager_output, eager_state = recurrent_kda(
+        **_strict_prefill_kwargs(eager_inputs),
+        ssm_state_indices=eager_indices,
+        output=torch.empty_like(output),
+        output_final_state=True,
+        prefill_workspace=RecurrentKDAPrefillWorkspace(flash_kda_device),
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is state_pool
+    assert eager_state is eager_inputs["initial_state"]
+    torch.testing.assert_close(
+        replay_output.float(), eager_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), eager_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_unbounded_softplus_cuda_graph_replay_matches_eager_control(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=8,
+        packed=True,
+        initial_state=True,
+        seed=25_403,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    eager_inputs = {
+        name: value.clone() if value is not None else None
+        for name, value in inputs.items()
+    }
+    eager_inputs["initial_state"] = initial_state_seed.clone()
+    eager_output, eager_state = recurrent_kda(
+        **_strict_prefill_kwargs(eager_inputs, lower_bound=None),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        prefill_workspace=RecurrentKDAPrefillWorkspace(flash_kda_device),
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    assert eager_state is eager_inputs["initial_state"]
+    torch.testing.assert_close(
+        replay_output.float(), eager_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), eager_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_checkpoint_producing_cuda_graph_replay_matches_eager_control(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[33, 65],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        seed=25_404,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    checkpoint_every_n_tokens = 16
+    checkpoint_cu_starts = torch.tensor(
+        [0, 3, 8], dtype=torch.int64, device=flash_kda_device
+    )
+    state_checkpoints = torch.empty(
+        (8, 6, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+    )
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "state_checkpoints": state_checkpoints,
+        "checkpoint_cu_starts": checkpoint_cu_starts,
+        "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.zero_()
+        state_checkpoints.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state, captured_checkpoints = recurrent_kda(
+            **call_kwargs
+        )
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+        state_checkpoints.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+    replay_checkpoints = captured_checkpoints.clone()
+
+    eager_inputs = {
+        name: value.clone() if value is not None else None
+        for name, value in inputs.items()
+    }
+    eager_inputs["initial_state"] = initial_state_seed.clone()
+    eager_checkpoints = torch.empty_like(state_checkpoints)
+    eager_output, eager_state, returned_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(eager_inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        state_checkpoints=eager_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts.clone(),
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        prefill_workspace=RecurrentKDAPrefillWorkspace(flash_kda_device),
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    assert captured_checkpoints is state_checkpoints
+    assert eager_state is eager_inputs["initial_state"]
+    assert returned_checkpoints is eager_checkpoints
+    torch.testing.assert_close(
+        replay_output.float(), eager_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), eager_state.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_checkpoints.float(),
+        eager_checkpoints.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
     ("seq_lens", "expected_variant", "expected_beta_tma_shape", "expect_alias"),
     [
         ([128] * 8, "m128_h12_short", (1024, 16), False),
@@ -4819,6 +5770,153 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
     torch.testing.assert_close(
         actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize(
+    "nonzero_initial_state",
+    [False, True],
+    ids=["fresh", "nonzero-state"],
+)
+def test_frozen_bt16_trained_kimi_gate_fp32_indexed_numerics(
+    flash_kda_device,
+    monkeypatch,
+    nonzero_initial_state,
+):
+    """Keep the FP32 BT16 solve stable in the trained Kimi gate domain."""
+
+    inputs = _make_kimi_k3_bt16_inputs(device=flash_kda_device)
+    pool_capacity = 257
+    selected_slot = (4845 * 17 + 11) % pool_capacity
+    state_indices = torch.tensor(
+        [selected_slot],
+        dtype=torch.int32,
+        device=flash_kda_device,
+    )
+    assert state_indices.unique().numel() == state_indices.numel()
+    assert 0 <= int(state_indices.min()) <= int(state_indices.max()) < pool_capacity
+
+    state_pool = _make_padded_state_pool(
+        slots=pool_capacity,
+        num_heads=6,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    state_pool.fill_(0.125)
+    selected_state = torch.zeros(
+        (1, 6, 128, 128),
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    if nonzero_initial_state:
+        selected_state.normal_(mean=0.0, std=0.25)
+    selected_indices_i64 = state_indices.to(torch.int64)
+    state_pool.index_copy_(0, selected_indices_i64, selected_state)
+    state_pool_before = state_pool.clone()
+    inputs["initial_state"] = state_pool
+
+    def assert_unselected_slots_unchanged():
+        assert torch.equal(
+            state_pool[:selected_slot], state_pool_before[:selected_slot]
+        )
+        assert torch.equal(
+            state_pool[selected_slot + 1 :], state_pool_before[selected_slot + 1 :]
+        )
+
+    resolved_selectors = []
+    get_generated_module = kda_prefill_api._get_flash_kda_generated_module
+
+    def recording_get_generated_module(selector_key):
+        resolved_selectors.append(dict(selector_key))
+        return get_generated_module(selector_key)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        recording_get_generated_module,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_affine_token_offsets",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_small_bh_owner_helper",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    bt16_output, bt16_pool = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    assert bt16_pool is state_pool
+    assert [
+        (selector["route"], selector["route_role"])
+        for selector in resolved_selectors
+    ] == [
+        ("bt16_prepare_chain_m64", "bt16_prepare"),
+        ("bt16_prepare_chain_m64", "main"),
+    ]
+    bt16_output = bt16_output.clone()
+    bt16_selected_state = state_pool.index_select(0, selected_indices_i64).clone()
+    assert bool(torch.isfinite(bt16_output).all())
+    assert bool(torch.isfinite(bt16_selected_state).all())
+    assert_unselected_slots_unchanged()
+
+    state_pool.copy_(state_pool_before)
+    resolved_selectors.clear()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_pool = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    assert direct_pool is state_pool
+    assert resolved_selectors
+    assert all(
+        selector["route"] != "bt16_prepare_chain_m64"
+        for selector in resolved_selectors
+    )
+    direct_selected_state = state_pool.index_select(0, selected_indices_i64)
+    assert bool(torch.isfinite(direct_output).all())
+    assert bool(torch.isfinite(direct_selected_state).all())
+    assert_unselected_slots_unchanged()
+
+    torch.testing.assert_close(
+        bt16_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        bt16_selected_state.float(),
+        direct_selected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    output_error = bt16_output.float() - direct_output.float()
+    reference_rms = torch.sqrt(torch.mean(direct_output.float().square())).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    output_rrmse = torch.sqrt(torch.mean(output_error.square())) / reference_rms
+    head_reference_rms = torch.sqrt(
+        torch.mean(direct_output.float().square(), dim=(0, 1, 3))
+    ).clamp_min(torch.finfo(torch.float32).tiny)
+    head_rrmse = torch.sqrt(
+        torch.mean(output_error.square(), dim=(0, 1, 3))
+    ) / head_reference_rms
+    assert float(output_rrmse) < 0.1
+    assert float(head_rrmse.max()) < 0.1
 
 
 def test_frozen_bt16_combined_h12_fixed512_matches_cute(flash_kda_device):

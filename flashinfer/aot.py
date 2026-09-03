@@ -69,6 +69,7 @@ from .jit.cake_kda import (
     CakeKDATarget,
     cake_kda_affine_is_available,
     gen_cake_kda_affine_module,
+    gen_cake_kda_m128_bt64_unbounded_softplus_module,
     gen_cake_kda_m128_unbounded_softplus_module,
 )
 from .jit.cake_kda_decode import (
@@ -77,6 +78,7 @@ from .jit.cake_kda_decode import (
 )
 from .jit.flash_kda import (
     GeneratedFlashKDATarget,
+    gen_flash_kda_fp32_compat_module,
     gen_flash_kda_generated_module,
     gen_flash_kda_m128_n16_checkpoint_module,
     get_flash_kda_generated_variant_ids,
@@ -524,6 +526,12 @@ def gen_all_modules(
     has_flash_kda_prefill_sm103a = sm_capabilities.get(
         "flash_kda_prefill_sm103a", False
     )
+    has_flash_kda_fp32_compat_sm100a = sm_capabilities.get(
+        "flash_kda_fp32_compat_sm100a", False
+    )
+    has_flash_kda_fp32_compat_sm103a = sm_capabilities.get(
+        "flash_kda_fp32_compat_sm103a", False
+    )
     has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
     has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
@@ -591,16 +599,28 @@ def gen_all_modules(
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
     # The checkpoint route remains as the only legacy fallback because it is
     # intentionally outside the generated portfolio.
-    flash_kda_targets: tuple[tuple[GeneratedFlashKDATarget, bool], ...] = (
-        ("sm100a", has_flash_kda_prefill_sm100a),
-        ("sm103a", has_flash_kda_prefill_sm103a),
+    flash_kda_targets: tuple[
+        tuple[GeneratedFlashKDATarget, bool, bool], ...
+    ] = (
+        (
+            "sm100a",
+            has_flash_kda_prefill_sm100a,
+            has_flash_kda_fp32_compat_sm100a,
+        ),
+        (
+            "sm103a",
+            has_flash_kda_prefill_sm103a,
+            has_flash_kda_fp32_compat_sm103a,
+        ),
     )
-    for flash_kda_target, enabled in flash_kda_targets:
+    for flash_kda_target, enabled, fp32_compat_enabled in flash_kda_targets:
         if enabled:
             jit_specs.extend(
                 gen_flash_kda_generated_module(variant_id)
                 for variant_id in get_flash_kda_generated_variant_ids(flash_kda_target)
             )
+            if fp32_compat_enabled:
+                jit_specs.append(gen_flash_kda_fp32_compat_module(flash_kda_target))
             jit_specs.append(gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target))
 
     # The Cake-owned unbounded-softplus export remains an exact-architecture
@@ -613,6 +633,9 @@ def gen_all_modules(
         if enabled:
             jit_specs.append(
                 gen_cake_kda_m128_unbounded_softplus_module(cake_kda_target)
+            )
+            jit_specs.append(
+                gen_cake_kda_m128_bt64_unbounded_softplus_module(cake_kda_target)
             )
             if cake_kda_affine_is_available():
                 jit_specs.extend(
@@ -1150,6 +1173,10 @@ def detect_sm_capabilities():
     # all support cp.async, which the SSU MTP-simple kernel requires.
     has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     cuda_version = get_cuda_version()
+    # The compact-FP32 embedded cubin is byte-sealed to CUDA 13.2.86.  Keep it
+    # out of other AOT toolchain inventories; the cubin digest remains the
+    # patch-level fail-close check within the 13.2 release.
+    flash_kda_fp32_compat_cuda = cuda_version == Version("13.2")
     flash_kda_family_arches = {
         (10, "0a"),
         (10, "0f"),
@@ -1178,6 +1205,14 @@ def detect_sm_capabilities():
         "flash_kda_prefill_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
+        ),
+        "flash_kda_fp32_compat_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and flash_kda_fp32_compat_cuda
+        ),
+        "flash_kda_fp32_compat_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and flash_kda_fp32_compat_cuda
         ),
         "cake_kda_prefill_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS

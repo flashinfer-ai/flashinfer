@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "variants": [
+    {
+      "arch": "sm_100a",
+      "binding_relpath": "csrc/kda/flashkda_generated_fp32_compat_sm_100a_ui1_sf1_03e35715dd_binding.cu",
+      "body_relpath": "csrc/kda/flashkda_generated_fp32_compat_sm_100a_ui1_sf1_a757764a13.cu",
+      "cache_ident": "3f6217d89b",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "generated_standalone_cubin_byte_identical": true,
+      "kernel_name": "kernel_flashkda_blackwell_prefill_fp32_state_initial",
+      "module_ident": "flashkda_fp32_compat_sm100a_a757764a13",
+      "normalized_equivalence_sha256": "6678cdfd983a2be52fabd9fe6a1c7264d9a1788865c1068879048561d3d0fc21",
+      "optimization_level_one_absent": true,
+      "sanitized_body_sha256": "a757764a13b01dd4f9028875a0cb03d195da827e077011959b6379452d941efb",
+      "sanitizer_replacement_count": 10,
+      "smem_bytes": 226048,
+      "source_body_sha256": "ed9c82609f5848673f82dad516730b242ced34c03ecdb81bac18ccd8d7f19a27",
+      "source_closure": [
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_sm_100a_ui1_sf1_03e35715dd_binding.cu",
+          "role": "selector_binding",
+          "sha256": "03e35715dd2e8843693f525afc3b01a9a030c661e6de298c4db5563100f27861"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_sm_100a_ui1_sf1_a757764a13.cu",
+          "role": "sanitized_body",
+          "sha256": "a757764a13b01dd4f9028875a0cb03d195da827e077011959b6379452d941efb"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_binding.cuh",
+          "role": "fp32_compat_abi_wrapper",
+          "sha256": "1dc192820f6e81882e432a417f6dc2b35bdecde70c3816379678a8f72340fdcc"
+        },
+        {
+          "path": "csrc/kda/flashkda_binding_common.cuh",
+          "role": "public_common_include",
+          "sha256": "434c0203a68fd9761b8da212c0d636d19f61498de49839bb1882c3867b33158e"
+        }
+      ],
+      "source_closure_sha256": "3f6217d89b8acdab98f1456e3a01c47fa8a92f345a21603fce6c036883aa46a9",
+      "source_generated_runtime_cubin_sha256": "80652b4d2a2503d2ac40decbec520a3dae54d8704ffa2b1f4f2368f53d0abdcf",
+      "source_generated_sha256": "1d15553fe5936832ae3097ff9ba65fc0e2c3176019716497e4defb346dd858cf",
+      "source_runtime_cubin_sha256": "80652b4d2a2503d2ac40decbec520a3dae54d8704ffa2b1f4f2368f53d0abdcf",
+      "store_final_state": true,
+      "target": "sm100a",
+      "threads": 384,
+      "use_initial_state": true,
+      "variant_id": "sm_100a:compact_fp32_compat_ui1_sf1"
+    },
+    {
+      "arch": "sm_103a",
+      "binding_relpath": "csrc/kda/flashkda_generated_fp32_compat_sm_103a_ui1_sf1_7f086f211e_binding.cu",
+      "body_relpath": "csrc/kda/flashkda_generated_fp32_compat_sm_103a_ui1_sf1_a757764a13.cu",
+      "cache_ident": "5ade59af21",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "generated_standalone_cubin_byte_identical": true,
+      "kernel_name": "kernel_flashkda_blackwell_prefill_fp32_state_initial",
+      "module_ident": "flashkda_fp32_compat_sm103a_a757764a13",
+      "normalized_equivalence_sha256": "6678cdfd983a2be52fabd9fe6a1c7264d9a1788865c1068879048561d3d0fc21",
+      "optimization_level_one_absent": true,
+      "sanitized_body_sha256": "a757764a13b01dd4f9028875a0cb03d195da827e077011959b6379452d941efb",
+      "sanitizer_replacement_count": 10,
+      "smem_bytes": 226048,
+      "source_body_sha256": "ed9c82609f5848673f82dad516730b242ced34c03ecdb81bac18ccd8d7f19a27",
+      "source_closure": [
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_sm_103a_ui1_sf1_7f086f211e_binding.cu",
+          "role": "selector_binding",
+          "sha256": "7f086f211e63be5f6a629a2dd43f2d9861edaeca6265541f3cc1145b7916853f"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_sm_103a_ui1_sf1_a757764a13.cu",
+          "role": "sanitized_body",
+          "sha256": "a757764a13b01dd4f9028875a0cb03d195da827e077011959b6379452d941efb"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_fp32_compat_binding.cuh",
+          "role": "fp32_compat_abi_wrapper",
+          "sha256": "1dc192820f6e81882e432a417f6dc2b35bdecde70c3816379678a8f72340fdcc"
+        },
+        {
+          "path": "csrc/kda/flashkda_binding_common.cuh",
+          "role": "public_common_include",
+          "sha256": "434c0203a68fd9761b8da212c0d636d19f61498de49839bb1882c3867b33158e"
+        }
+      ],
+      "source_closure_sha256": "5ade59af21caeb2cb18de7b6f08ce431f7c0d4e5eabe1c4ba2fdf874dc6d3b4e",
+      "source_generated_runtime_cubin_sha256": "4fa84273b834e94d92f34abffe21aeff64595562383e6de4ec0a274af8667b4f",
+      "source_generated_sha256": "1d15553fe5936832ae3097ff9ba65fc0e2c3176019716497e4defb346dd858cf",
+      "source_runtime_cubin_sha256": "4fa84273b834e94d92f34abffe21aeff64595562383e6de4ec0a274af8667b4f",
+      "store_final_state": true,
+      "target": "sm103a",
+      "threads": 384,
+      "use_initial_state": true,
+      "variant_id": "sm_103a:compact_fp32_compat_ui1_sf1"
+    }
+  ]
+}

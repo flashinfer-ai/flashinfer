@@ -23,6 +23,7 @@ _KERNEL_DEFINE = re.compile(
 _C_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _SCHEMA_VERSION = 1
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _canonical_json(value: object) -> bytes:
@@ -121,6 +122,8 @@ def prepare_generated_flash_kda_cubin(
     body_path: Path,
     module_ident: str,
     target: str,
+    expected_cubin_sha256: str | None = None,
+    source_name: str | None = None,
 ) -> Mapping[str, Path]:
     """Compile and return one content-addressed cubin for Ninja embedding."""
 
@@ -128,6 +131,13 @@ def prepare_generated_flash_kda_cubin(
         raise ValueError(
             f"invalid generated FlashKDA module identifier: {module_ident!r}"
         )
+    if (
+        expected_cubin_sha256 is not None
+        and _SHA256.fullmatch(expected_cubin_sha256) is None
+    ):
+        raise ValueError("expected generated FlashKDA cubin SHA256 is invalid")
+    if source_name is not None and Path(source_name).name != source_name:
+        raise ValueError("generated FlashKDA source name must be a basename")
     try:
         arch = _TARGET_ARCH[target]
     except KeyError as error:
@@ -161,9 +171,10 @@ def prepare_generated_flash_kda_cubin(
         raise RuntimeError(
             f"forbidden O1 option in generated FlashKDA NVRTC flags: {options}"
         )
+    nvrtc_source_name = body_path.name if source_name is None else source_name
     inputs = {
         "schema_version": _SCHEMA_VERSION,
-        "source_name": body_path.name,
+        "source_name": nvrtc_source_name,
         "source_sha256": _sha256(source),
         "module_ident": module_ident,
         "kernel_name": kernel_match.group(1),
@@ -172,6 +183,8 @@ def prepare_generated_flash_kda_cubin(
         "compile_options": list(options),
         "optimization_level_one_absent": True,
     }
+    if expected_cubin_sha256 is not None:
+        inputs["expected_cubin_sha256"] = expected_cubin_sha256
     cache_ident = _sha256(_canonical_json(inputs))[:20]
     cache_dir = build_dir.parent / "_flash_kda_nvrtc_cubins"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -186,15 +199,30 @@ def prepare_generated_flash_kda_cubin(
                     receipt.get("inputs") == inputs
                     and receipt.get("cubin_sha256") == _sha256(cubin_path.read_bytes())
                     and receipt.get("cubin_size") == cubin_path.stat().st_size
+                    and (
+                        expected_cubin_sha256 is None
+                        or receipt.get("cubin_sha256") == expected_cubin_sha256
+                    )
                 )
             except (OSError, TypeError, ValueError):
                 reusable = False
         if not reusable:
-            cubin = _compile_cubin(source, source_name=body_path.name, options=options)
+            cubin = _compile_cubin(
+                source, source_name=nvrtc_source_name, options=options
+            )
+            cubin_sha256 = _sha256(cubin)
+            if (
+                expected_cubin_sha256 is not None
+                and cubin_sha256 != expected_cubin_sha256
+            ):
+                raise RuntimeError(
+                    "generated FlashKDA cubin differs from the exact source-runtime "
+                    f"cubin: {cubin_sha256} != {expected_cubin_sha256}"
+                )
             receipt = {
                 "schema_version": _SCHEMA_VERSION,
                 "inputs": inputs,
-                "cubin_sha256": _sha256(cubin),
+                "cubin_sha256": cubin_sha256,
                 "cubin_size": len(cubin),
             }
             _write_atomic(cubin_path, cubin)

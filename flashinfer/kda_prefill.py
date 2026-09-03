@@ -58,6 +58,9 @@ _FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
 _FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES = 7 * 128
+_FLASH_KDA_FP32_COMPAT_DESCRIPTOR_STORAGE_BYTES = 5 * 128
+_FLASH_KDA_FP32_COMPAT_TMAP_WORKSPACE_BYTES_PER_CTA = 10 * 128
+_FLASH_KDA_FP32_COMPAT_MAX_GRID_CTAS = 148
 _FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS = 128
 _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR = 21
 _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
@@ -110,6 +113,7 @@ _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 _FLASH_KDA_ROUTE_AFFINE_M128 = "affine_split_m128"
+_FLASH_KDA_ROUTE_FP32_COMPAT_M128 = "compact_fp32_compat_m128"
 _CAKE_KDA_ROUTE_AFFINE_M128 = "cake_affine_split_m128"
 
 _FLASH_KDA_GENERATED_ROUTE_ABI_FAMILY = {
@@ -501,6 +505,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         # therefore the module id) is resolved from the runtime shape and
         # exact architecture, not from a coarse route name.
         self._generated_descriptor_storages: dict[str, torch.Tensor] = {}
+        self._fp32_compat_tensormap_workspace: Optional[torch.Tensor] = None
         self._descriptor_signatures: dict[str, tuple] = {}
         self._generated_scalar_schedules: dict[
             tuple, tuple[torch.Tensor, torch.Tensor, int]
@@ -643,6 +648,36 @@ def _is_state_pool_tensor(
     )
 
 
+def _flash_kda_compact_fp32_compat_contract(
+    *,
+    initial_state: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    lower_bound: Optional[float],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> bool:
+    """Match only the source runtime's compact FP32 compatibility ABI."""
+
+    return (
+        isinstance(initial_state, torch.Tensor)
+        and initial_state.dtype == torch.float32
+        and state_indices is None
+        and isinstance(beta, torch.Tensor)
+        and beta.is_contiguous()
+        and isinstance(dt_bias, torch.Tensor)
+        and dt_bias.ndim == 2
+        and lower_bound is not None
+        and math.isfinite(float(lower_bound))
+        and -5.0 <= float(lower_bound) <= 0.0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+        and checkpoint_every_n_tokens == 0
+    )
+
+
 def _flash_kda_prefill_is_eligible(
     *,
     q: torch.Tensor,
@@ -670,6 +705,21 @@ def _flash_kda_prefill_is_eligible(
 ) -> bool:
     """Return whether the call exactly matches the frozen FlashKDA contract."""
 
+    fp32_state = (
+        isinstance(initial_state, torch.Tensor)
+        and initial_state.dtype == torch.float32
+    )
+    compact_fp32 = fp32_state and ssm_state_indices is None
+    compact_fp32_compat = _flash_kda_compact_fp32_compat_contract(
+        initial_state=initial_state,
+        state_indices=ssm_state_indices,
+        beta=beta,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
     if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
         return False
     if (
@@ -683,8 +733,20 @@ def _flash_kda_prefill_is_eligible(
         and use_gate_in_kernel
         and beta_is_logit
         and (
-            lower_bound is None
-            or (math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0)
+            (
+                compact_fp32_compat
+                if compact_fp32
+                else (
+                    lower_bound is not None
+                    and math.isfinite(float(lower_bound))
+                    and -5.0 <= float(lower_bound) <= 0.0
+                )
+            )
+            if fp32_state
+            else (
+                lower_bound is None
+                or (math.isfinite(float(lower_bound)) and float(lower_bound) < 0.0)
+            )
         )
     ):
         return False
@@ -763,11 +825,6 @@ def _flash_kda_prefill_is_eligible(
             device=q.device,
             num_heads=num_heads,
         ):
-            return False
-        # The exported FP32-state portfolio is the indexed state-pool API.
-        # Compact FP32 state has no receipt-backed product route, so accepting
-        # it here would let dispatch invent an unobserved physical contract.
-        if initial_state.dtype == torch.float32 and ssm_state_indices is None:
             return False
         if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
             return False
@@ -2383,6 +2440,40 @@ def select_bf16_schedule_route(
     )
 
 
+def _select_fp32_schedule_route(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    indexed_state: bool,
+) -> str:
+    """Mirror the source dispatch order for bounded FP32 state."""
+
+    max_sequence_length = max(sequence_lengths)
+    if _should_use_small_bh_owner_helper(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        num_sequences=len(sequence_lengths),
+        num_heads=num_heads,
+        sequence_length=max_sequence_length,
+    ):
+        return _FLASH_KDA_ROUTE_SMALL_BH_M128
+    source_route = select_bf16_schedule_route(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        sequence_lengths=sequence_lengths,
+        num_heads=num_heads,
+        use_initial_state=True,
+        store_final_state=True,
+    )
+    if indexed_state or source_route == _FLASH_KDA_ROUTE_BT16_M64:
+        return source_route
+    return _FLASH_KDA_ROUTE_FP32_COMPAT_M128
+
+
 def _persistent_task_plan(
     sequence_lengths: tuple[int, ...],
     *,
@@ -3747,6 +3838,111 @@ def _generated_descriptor_prepare(
             )
         return 0
     return int(warmed_signature != signature)
+
+
+def _run_generated_fp32_compat_route(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    target: "FlashKDATarget",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    num_sequences: int,
+    num_heads: int,
+    state_slot_stride: int,
+    scale: float,
+    lower_bound: float,
+    stream_ptr: int,
+    capturing: bool,
+) -> None:
+    """Launch the source-exact compact FP32 compatibility specialization."""
+
+    from .jit.flash_kda import (
+        get_flash_kda_fp32_compat_registry,
+        load_flash_kda_fp32_compat_module,
+    )
+
+    if target not in ("sm100a", "sm103a"):
+        raise ValueError(f"unsupported compact-FP32 FlashKDA target: {target}")
+    metadata = get_flash_kda_fp32_compat_registry()[target]
+    module = load_flash_kda_fp32_compat_module(target)
+    signature = tuple(
+        _tensor_descriptor_signature(tensor) for tensor in (q, k, v, g, out)
+    )
+    prepare_descriptors = _generated_descriptor_prepare(
+        workspace=workspace,
+        variant_id=metadata.variant_id,
+        signature=signature,
+        capturing=capturing,
+    )
+    descriptor_storage = _generated_descriptor_storage(
+        workspace=workspace,
+        variant_id=metadata.variant_id,
+        device=q.device,
+        bytes_required=_FLASH_KDA_FP32_COMPAT_DESCRIPTOR_STORAGE_BYTES,
+    )
+    grid_x = min(
+        _FLASH_KDA_FP32_COMPAT_MAX_GRID_CTAS, num_sequences * num_heads
+    )
+    tensormap_workspace = _workspace_buffer(
+        workspace=workspace,
+        attribute="_fp32_compat_tensormap_workspace",
+        device=q.device,
+        numel=grid_x * _FLASH_KDA_FP32_COMPAT_TMAP_WORKSPACE_BYTES_PER_CTA,
+        capture_error=(
+            "compact-FP32 FlashKDA TensorMap workspace is not warmed for CUDA "
+            "graph capture; invoke the same or larger grid before capture"
+        ),
+        dtype=torch.uint8,
+    )
+    try:
+        module.run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            cu_seqlens,
+            _dummy_i32(q.device),
+            initial_state,
+            out,
+            final_state,
+            _dummy_f32(q.device),
+            _dummy_i32(q.device),
+            tensormap_workspace,
+            descriptor_storage,
+            prepare_descriptors,
+            state_slot_stride,
+            0,
+            1,
+            1,
+            scale,
+            lower_bound,
+            stream_ptr,
+        )
+    except Exception:
+        _clear_generated_descriptor_signature(
+            workspace=workspace,
+            variant_id=metadata.variant_id,
+            prepared=prepare_descriptors,
+        )
+        raise
+    _record_generated_descriptor_signature(
+        workspace=workspace,
+        variant_id=metadata.variant_id,
+        signature=signature,
+        prepared=prepare_descriptors,
+    )
 
 
 def _record_generated_descriptor_signature(
@@ -5702,6 +5898,26 @@ def _run_flash_kda_prefill(
             sm_count=sm_count,
         )
     max_sequence_length = max(sequence_lengths)
+    compact_fp32_compat = _flash_kda_compact_fp32_compat_contract(
+        initial_state=initial_state,
+        state_indices=state_indices,
+        beta=beta,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+    fp32_shared_schedule_candidate = (
+        initial_state is not None
+        and initial_state.dtype == torch.float32
+        and (state_indices is not None or compact_fp32_compat)
+        and lower_bound is not None
+        and beta.is_contiguous()
+        and checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+    )
     affine_token_offsets = None
     if (
         lower_bound is not None
@@ -5761,6 +5977,20 @@ def _run_flash_kda_prefill(
         persistent_plan = None
     elif affine_plan is not None:
         route = _CAKE_KDA_ROUTE_AFFINE_M128
+        persistent_plan = None
+    elif fp32_shared_schedule_candidate:
+        route = _select_fp32_schedule_route(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            sequence_lengths=sequence_lengths,
+            num_heads=num_heads,
+            indexed_state=state_indices is not None,
+        )
+        if route == _FLASH_KDA_ROUTE_FP32_COMPAT_M128:
+            persistent_plan = None
+    elif compact_fp32_compat:
+        route = _FLASH_KDA_ROUTE_FP32_COMPAT_M128
         persistent_plan = None
     elif needs_direct_m128:
         route = (
@@ -5853,8 +6083,11 @@ def _run_flash_kda_prefill(
         "cake_affine_m128",
         "m128_unbounded_softplus",
         "m128_bt64_unbounded_softplus",
+        "fp32_compat_m128",
     ]
-    if affine_plan is not None:
+    if route == _FLASH_KDA_ROUTE_FP32_COMPAT_M128:
+        variant = "fp32_compat_m128"
+    elif affine_plan is not None:
         variant = "cake_affine_m128"
     elif use_bt16:
         variant = "bt16"
@@ -6156,6 +6389,37 @@ def _run_flash_kda_prefill(
             cu_seqlens_i64 = _fixed_cu_seqlens(
                 device=q.device, batch_size=batch_size, seq_len=seq_len
             )
+        if variant == "fp32_compat_m128":
+            assert flash_target is not None
+            assert initial_state is not None
+            assert initial_state.dtype == torch.float32
+            assert state_indices is None
+            assert lower_bound is not None
+            _run_generated_fp32_compat_route(
+                workspace=workspace,
+                target=flash_target,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens_i64,
+                initial_state=initial_state_arg,
+                out=out_buf,
+                final_state=final_state_arg,
+                num_sequences=num_sequences,
+                num_heads=num_heads,
+                state_slot_stride=state_slot_stride,
+                scale=scale_value,
+                lower_bound=float(lower_bound),
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+            )
+            if capturing and explicit_workspace:
+                workspace._captured = True
+            return (out_buf, returned_state if output_final_state else None)
         assert seq_order_i32 is not None
         assert dummy_state is not None
         if variant == "m128_h12_long":

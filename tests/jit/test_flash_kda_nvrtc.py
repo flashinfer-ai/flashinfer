@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -34,6 +35,7 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
         "body_path": body,
         "module_ident": "flashkda_test_0123456789",
         "target": "sm103a",
+        "expected_cubin_sha256": hashlib.sha256(b"exact-cubin").hexdigest(),
     }
 
     first = flash_kda_nvrtc.prepare_generated_flash_kda_cubin(
@@ -56,6 +58,9 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
         "--use_fast_math",
     ]
     assert receipt["inputs"]["optimization_level_one_absent"] is True
+    assert receipt["inputs"]["expected_cubin_sha256"] == kwargs[
+        "expected_cubin_sha256"
+    ]
 
     cubin.write_bytes(b"tampered")
     flash_kda_nvrtc.prepare_generated_flash_kda_cubin(
@@ -63,6 +68,33 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
     )
     assert len(calls) == 2
     assert cubin.read_bytes() == b"exact-cubin"
+
+
+def test_prepare_generated_cubin_rejects_nonexact_runtime_cubin(
+    monkeypatch, tmp_path
+):
+    selector = tmp_path / "selector.cu"
+    body = tmp_path / "body.cu"
+    selector.write_text(_selector(body.name))
+    body.write_text('extern "C" __global__ void kernel_flashkda_test() {}\n')
+    cuda_include = tmp_path / "cuda" / "include"
+    cuda_include.mkdir(parents=True)
+    monkeypatch.setattr(flash_kda_nvrtc, "_cuda_include_dirs", lambda: (cuda_include,))
+    monkeypatch.setattr(
+        flash_kda_nvrtc,
+        "_compile_cubin",
+        lambda source, *, source_name, options: b"different-cubin",
+    )
+
+    with pytest.raises(RuntimeError, match="differs from the exact source-runtime"):
+        flash_kda_nvrtc.prepare_generated_flash_kda_cubin(
+            tmp_path / "jit" / "module",
+            selector_path=selector,
+            body_path=body,
+            module_ident="flashkda_test_0123456789",
+            target="sm100a",
+            expected_cubin_sha256=hashlib.sha256(b"exact-cubin").hexdigest(),
+        )
 
 
 def test_prepare_generated_cubin_rejects_selector_body_mismatch(tmp_path):

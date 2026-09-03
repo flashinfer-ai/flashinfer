@@ -137,13 +137,16 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
+            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16, or
+            float32 for an eligible bounded FlashKDA prefill. If ``None``,
+            zero-initialized. Updated in-place. For batched spec
             decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
             count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
             omitted. For eligible frozen prefill with ``ssm_state_indices``,
-            this is a state pool ``[N_pool, H, 128, 128]`` whose inner slots
-            are contiguous; padding between pool slots is allowed.
+            this is a caller-sized state pool ``[P, H, 128, 128]``, where
+            ``P = initial_state.shape[0]`` is the deployment's explicit pool
+            capacity. Inner slots must be contiguous; padding between pool
+            slots is allowed.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -155,7 +158,8 @@ def recurrent_kda(
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
             gate formula. If ``None``, uses
             ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
-            negative.
+            negative except that eligible bounded float32-state FlashKDA
+            prefill accepts the source contract's closed interval ``[-5, 0]``.
         cu_seqlens (Optional[torch.Tensor]):
             Contiguous CUDA cumulative sequence lengths of shape ``[N+1]``.
             May be int32 or int64. Frozen prefill converts int32 offsets to
@@ -175,7 +179,9 @@ def recurrent_kda(
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
             be set). Eligible frozen packed prefill accepts contiguous CUDA
             int32 ``[N_seq]`` indices and updates the selected
-            ``initial_state`` pool slots directly.
+            ``initial_state`` pool slots directly. Those indices must be
+            unique and lie in ``[0, P)``, where
+            ``P = initial_state.shape[0]``.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.

@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 
 from ._kda_jit_common import (
     gen_kda_jit_spec,
@@ -93,12 +93,31 @@ _FLASH_KDA_TARGET_DEFINE = {
 
 _FLASH_KDA_GENERATED_METADATA_NAME = "flashkda_generated_variant_metadata.json"
 _FLASH_KDA_GENERATED_RECEIPT_NAME = "flashkda_generated_generation_receipt.json"
+_FLASH_KDA_FP32_COMPAT_METADATA_NAME = (
+    "flashkda_generated_fp32_compat_metadata.json"
+)
+_FLASH_KDA_FP32_COMPAT_RECEIPT_NAME = (
+    "flashkda_generated_fp32_compat_receipt.json"
+)
+_FLASH_KDA_FP32_COMPAT_WRAPPER_RELPATH = (
+    "csrc/kda/flashkda_generated_fp32_compat_binding.cuh"
+)
+_FLASH_KDA_FP32_COMPAT_COMMON_RELPATH = "csrc/kda/flashkda_binding_common.cuh"
+_FLASH_KDA_FP32_COMPAT_SOURCE_CONTRACT_SHA256 = (
+    "e158118c7845faa4cebf522f8f391eeccc60e84f185dc0cebbee264616f49fe3"
+)
 _FLASH_KDA_GENERATED_CLOSURE_ROLES = (
     "selector_binding",
     "sanitized_body",
     "abi_wrapper",
     "generated_common_wrapper",
     "bt16_descriptor_common",
+    "public_common_include",
+)
+_FLASH_KDA_FP32_COMPAT_CLOSURE_ROLES = (
+    "selector_binding",
+    "sanitized_body",
+    "fp32_compat_abi_wrapper",
     "public_common_include",
 )
 _FLASH_KDA_GENERATED_ARCH_TARGETS: Mapping[str, GeneratedFlashKDATarget] = {
@@ -180,11 +199,43 @@ class GeneratedFlashKDAModule:
     binding_relpath: str
     body_relpath: str
     abi_wrapper_relpath: str
+    kernel_name: str
+    threads: int
+    smem_bytes: int
+    use_pdl: bool
+    tma_abi: str
+    arg_plan_sha256: str
     launch_contract_sha256: str
+    source_generated_sha256: str
+    source_standalone_sha256: str
+    source_runtime_cubin_sha256: str
+    source_runtime_cubin_bytes: int
+    original_body_sha256: str
+    sanitized_body_sha256: str
+    normalized_equivalence_sha256: str
     source_closure_sha256: str
     cache_ident: str
     source_closure: tuple[GeneratedFlashKDASource, ...]
     physical_selectors: tuple[GeneratedFlashKDAPhysicalSelector, ...]
+
+
+@dataclass(frozen=True)
+class GeneratedFlashKDAFP32CompatModule:
+    """One source-exact compact-FP32 compatibility module."""
+
+    variant_id: str
+    arch: str
+    target: GeneratedFlashKDATarget
+    module_ident: str
+    binding_relpath: str
+    body_relpath: str
+    kernel_name: str
+    threads: int
+    smem_bytes: int
+    cache_ident: str
+    source_generated_runtime_cubin_sha256: str
+    source_runtime_cubin_sha256: str
+    source_closure: tuple[GeneratedFlashKDASource, ...]
 
 
 # Keep every frozen cache key tied to its complete generated-plus-integration
@@ -375,6 +426,227 @@ def _parse_generated_physical_selector(
 
 
 @functools.cache
+def get_flash_kda_fp32_compat_registry() -> Mapping[
+    GeneratedFlashKDATarget, GeneratedFlashKDAFP32CompatModule
+]:
+    """Load the separately sealed compact-FP32 compatibility family."""
+
+    csrc_dir = _get_flash_kda_csrc_dir()
+    metadata_path = csrc_dir / _FLASH_KDA_FP32_COMPAT_METADATA_NAME
+    receipt_path = csrc_dir / _FLASH_KDA_FP32_COMPAT_RECEIPT_NAME
+    missing = [path for path in (metadata_path, receipt_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "compact-FP32 FlashKDA registry is not materialized; missing "
+            + ", ".join(str(path) for path in missing)
+        )
+    metadata = json.loads(metadata_path.read_text())
+    receipt = json.loads(receipt_path.read_text())
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
+        raise ValueError("unsupported compact-FP32 FlashKDA metadata schema")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        raise ValueError("unsupported compact-FP32 FlashKDA receipt schema")
+    if receipt.get("status") != "passed":
+        raise ValueError("compact-FP32 FlashKDA receipt status is not passed")
+    if (
+        receipt.get("source_contract_sha256")
+        != _FLASH_KDA_FP32_COMPAT_SOURCE_CONTRACT_SHA256
+    ):
+        raise ValueError("compact-FP32 FlashKDA source contract is not exact")
+    if receipt.get("cuda_toolkit_version") != "13.2.86":
+        raise ValueError("compact-FP32 FlashKDA was not generated with CUDA 13.2.86")
+    if receipt.get("optimization_level_one_absent") is not True:
+        raise ValueError("compact-FP32 FlashKDA receipt does not prove O1 absence")
+    if receipt.get("public_confidentiality_scan") != "passed":
+        raise ValueError("compact-FP32 FlashKDA public scan is not passed")
+    body_sanitizer = receipt.get("body_sanitizer")
+    if (
+        not isinstance(body_sanitizer, dict)
+        or body_sanitizer.get("schema_version") != 1
+        or body_sanitizer.get("status") != "passed"
+        or body_sanitizer.get("normalized_equivalence") != "passed"
+    ):
+        raise ValueError("compact-FP32 FlashKDA body sanitizer is not sealed")
+    input_export_digests = receipt.get("input_export_manifest_sha256_by_arch")
+    if not isinstance(input_export_digests, dict) or tuple(
+        input_export_digests
+    ) != ("sm_100a", "sm_103a"):
+        raise ValueError("compact-FP32 FlashKDA export receipts are incomplete")
+    for arch, digest in input_export_digests.items():
+        _require_sha256(digest, f"compact-FP32 FlashKDA {arch} export receipt")
+    if receipt.get("metadata_sha256") != _canonical_json_sha256(metadata):
+        raise ValueError("compact-FP32 FlashKDA metadata digest mismatch")
+    rows = metadata.get("variants")
+    if not isinstance(rows, list) or len(rows) != len(
+        _FLASH_KDA_GENERATED_NVCC_FLAGS
+    ):
+        raise ValueError("compact-FP32 FlashKDA must contain two exact targets")
+    if receipt.get("variant_count") != len(rows):
+        raise ValueError("compact-FP32 FlashKDA variant count differs")
+
+    modules: dict[GeneratedFlashKDATarget, GeneratedFlashKDAFP32CompatModule] = {}
+    sanitizer_receipts: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        label = f"compact-FP32 FlashKDA variant {index}"
+        if not isinstance(row, dict):
+            raise ValueError(f"{label} is not an object")
+        arch = row.get("arch")
+        if arch not in _FLASH_KDA_GENERATED_ARCH_TARGETS:
+            raise ValueError(f"{label} has unsupported exact architecture")
+        target = _FLASH_KDA_GENERATED_ARCH_TARGETS[arch]
+        if target in modules:
+            raise ValueError(f"duplicate compact-FP32 FlashKDA target: {target}")
+        if row.get("use_initial_state") is not True:
+            raise ValueError(f"{label} does not specialize initial-state load")
+        if row.get("store_final_state") is not True:
+            raise ValueError(f"{label} does not specialize final-state store")
+        if row.get("compile_options") != ["--use_fast_math"]:
+            raise ValueError(f"{label} does not preserve source compile options")
+        if row.get("optimization_level_one_absent") is not True:
+            raise ValueError(f"{label} does not prove O1 absence")
+        _require_sha256(
+            row.get("source_generated_sha256"),
+            f"{label} source generated program",
+        )
+        source_generated_runtime_cubin_sha256 = _require_sha256(
+            row.get("source_generated_runtime_cubin_sha256"),
+            f"{label} source generated-program cubin",
+        )
+        source_runtime_cubin_sha256 = _require_sha256(
+            row.get("source_runtime_cubin_sha256"),
+            f"{label} source standalone-program cubin",
+        )
+        if row.get("generated_standalone_cubin_byte_identical") is not True:
+            raise ValueError(
+                f"{label} generated/standalone cubins are not byte-identical"
+            )
+        if source_generated_runtime_cubin_sha256 != source_runtime_cubin_sha256:
+            raise ValueError(
+                f"{label} generated/standalone cubin digests differ"
+            )
+        source_body_sha256 = _require_sha256(
+            row.get("source_body_sha256"), f"{label} source body"
+        )
+        sanitized_body_sha256 = _require_sha256(
+            row.get("sanitized_body_sha256"), f"{label} sanitized body"
+        )
+        normalized_equivalence_sha256 = _require_sha256(
+            row.get("normalized_equivalence_sha256"),
+            f"{label} normalized body equivalence",
+        )
+        sanitizer_replacement_count = row.get("sanitizer_replacement_count")
+        if (
+            isinstance(sanitizer_replacement_count, bool)
+            or not isinstance(sanitizer_replacement_count, int)
+            or sanitizer_replacement_count < 0
+        ):
+            raise ValueError(f"{label} has an invalid sanitizer replacement count")
+        variant_id = row.get("variant_id")
+        module_ident = row.get("module_ident")
+        binding_relpath = row.get("binding_relpath")
+        body_relpath = row.get("body_relpath")
+        kernel_name = row.get("kernel_name")
+        cache_ident = row.get("cache_ident")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                variant_id,
+                module_ident,
+                binding_relpath,
+                body_relpath,
+                kernel_name,
+                cache_ident,
+            )
+        ):
+            raise ValueError(f"{label} has missing identity fields")
+        if variant_id != f"{arch}:compact_fp32_compat_ui1_sf1":
+            raise ValueError(f"{label} has an unexpected semantic identity")
+        if _FLASH_KDA_CACHE_IDENT_RE.fullmatch(cache_ident) is None:
+            raise ValueError(f"{label} has invalid source-closure cache_ident")
+        threads = row.get("threads")
+        smem_bytes = row.get("smem_bytes")
+        if threads != 384 or smem_bytes != 226048:
+            raise ValueError(f"{label} does not preserve source launch bounds")
+        closure_rows = row.get("source_closure")
+        if not isinstance(closure_rows, list) or [
+            source.get("role") if isinstance(source, dict) else None
+            for source in closure_rows
+        ] != list(_FLASH_KDA_FP32_COMPAT_CLOSURE_ROLES):
+            raise ValueError(f"{label} does not contain the ordered source closure")
+        closure: list[GeneratedFlashKDASource] = []
+        closure_bytes: list[bytes] = []
+        for source_row in closure_rows:
+            role = source_row.get("role")
+            relpath = source_row.get("path")
+            digest = _require_sha256(source_row.get("sha256"), f"{label} {role}")
+            if not isinstance(role, str) or not isinstance(relpath, str):
+                raise ValueError(f"{label} has an invalid source-closure member")
+            source_path = _resolve_generated_source(csrc_dir, relpath)
+            source_bytes = source_path.read_bytes()
+            if hashlib.sha256(source_bytes).hexdigest() != digest:
+                raise ValueError(f"{label} source digest mismatch: {relpath}")
+            closure.append(GeneratedFlashKDASource(role, relpath, digest))
+            closure_bytes.append(source_bytes)
+        expected_closure_paths = (
+            binding_relpath,
+            body_relpath,
+            _FLASH_KDA_FP32_COMPAT_WRAPPER_RELPATH,
+            _FLASH_KDA_FP32_COMPAT_COMMON_RELPATH,
+        )
+        if tuple(source.path for source in closure) != expected_closure_paths:
+            raise ValueError(f"{label} compiled source closure paths differ")
+        if closure[1].sha256 != sanitized_body_sha256:
+            raise ValueError(f"{label} sanitized body digest differs from its closure")
+        source_closure_sha256 = hashlib.sha256(b"\0".join(closure_bytes)).hexdigest()
+        if row.get("source_closure_sha256") != source_closure_sha256:
+            raise ValueError(f"{label} source closure digest mismatch")
+        if cache_ident != source_closure_sha256[:10]:
+            raise ValueError(f"{label} cache key does not seal its source closure")
+        if any(
+            "o1" in value.lower()
+            for value in (variant_id, module_ident, binding_relpath, body_relpath)
+        ):
+            raise ValueError(f"{label} contains a forbidden O1 identity")
+        sanitizer_receipts.append(
+            {
+                "arch": arch,
+                "source_body_sha256": source_body_sha256,
+                "sanitized_body_sha256": sanitized_body_sha256,
+                "sanitizer_replacement_count": sanitizer_replacement_count,
+                "normalized_equivalence_sha256": normalized_equivalence_sha256,
+            }
+        )
+        modules[target] = GeneratedFlashKDAFP32CompatModule(
+            variant_id=variant_id,
+            arch=arch,
+            target=target,
+            module_ident=module_ident,
+            binding_relpath=binding_relpath,
+            body_relpath=body_relpath,
+            kernel_name=kernel_name,
+            threads=threads,
+            smem_bytes=smem_bytes,
+            cache_ident=cache_ident,
+            source_generated_runtime_cubin_sha256=(
+                source_generated_runtime_cubin_sha256
+            ),
+            source_runtime_cubin_sha256=source_runtime_cubin_sha256,
+            source_closure=tuple(closure),
+        )
+    if body_sanitizer.get("replacement_count") != sum(
+        row["sanitizer_replacement_count"] for row in sanitizer_receipts
+    ):
+        raise ValueError("compact-FP32 FlashKDA sanitizer replacement count differs")
+    if body_sanitizer.get("receipts_sha256") != _canonical_json_sha256(
+        sanitizer_receipts
+    ):
+        raise ValueError("compact-FP32 FlashKDA sanitizer receipt digest differs")
+    if tuple(modules) != ("sm100a", "sm103a"):
+        raise ValueError("compact-FP32 FlashKDA exact targets are not canonical-order")
+    return MappingProxyType(modules)
+
+
+@functools.cache
 def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
     """Load and verify the source-closed generated physical-module registry.
 
@@ -452,12 +724,16 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 
     modules: dict[str, GeneratedFlashKDAModule] = {}
     arches: set[str] = set()
+    variant_count_by_target: dict[str, int] = {
+        target: 0 for target in _FLASH_KDA_GENERATED_ARCH_TARGETS.values()
+    }
     body_paths: set[str] = set()
     abi_wrapper_relpaths: set[str] = set()
     closure_table: list[dict[str, str]] = []
     module_order: list[tuple[str, str]] = []
     selector_index: list[dict[str, object]] = []
     selector_owners: dict[str, str] = {}
+    source_exact_identity_table: list[dict[str, object]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError(f"generated FlashKDA variant {index} is not an object")
@@ -467,6 +743,7 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             raise ValueError(f"{label} has unsupported exact architecture: {arch!r}")
         target = _FLASH_KDA_GENERATED_ARCH_TARGETS[arch]
         arches.add(arch)
+        variant_count_by_target[target] += 1
 
         variant_id = row.get("variant_id")
         module_ident = row.get("module_ident")
@@ -476,6 +753,11 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         abi_family = row.get("abi_family")
         abi_variant = row.get("abi_variant")
         state_mode = row.get("state_mode")
+        kernel_name = row.get("kernel_name")
+        threads = row.get("threads")
+        smem_bytes = row.get("smem_bytes")
+        use_pdl = row.get("use_pdl")
+        tma_abi = row.get("tma_abi")
         launch_contract = row.get("launch_contract")
         if (
             not isinstance(launch_contract, dict)
@@ -507,6 +789,8 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
                 abi_variant,
                 state_mode,
                 route_role,
+                kernel_name,
+                tma_abi,
             )
         ):
             raise ValueError(f"{label} has missing identity or source fields")
@@ -526,6 +810,50 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             raise ValueError(f"{label} launch-contract digest mismatch")
         if state_mode not in ("bf16", "bf16_f32_dependency", "fp32", "none"):
             raise ValueError(f"{label} has unsupported state mode")
+        if (
+            isinstance(threads, bool)
+            or not isinstance(threads, int)
+            or threads <= 0
+            or isinstance(smem_bytes, bool)
+            or not isinstance(smem_bytes, int)
+            or smem_bytes < 0
+            or not isinstance(use_pdl, bool)
+        ):
+            raise ValueError(f"{label} has invalid source launch bounds")
+        arg_plan_sha256 = _require_sha256(
+            row.get("arg_plan_sha256"), f"{label} arg_plan_sha256"
+        )
+        source_generated_sha256 = _require_sha256(
+            row.get("source_generated_sha256"),
+            f"{label} source_generated_sha256",
+        )
+        source_standalone_sha256 = _require_sha256(
+            row.get("source_standalone_sha256"),
+            f"{label} source_standalone_sha256",
+        )
+        source_runtime_cubin_sha256 = _require_sha256(
+            row.get("source_runtime_cubin_sha256"),
+            f"{label} source_runtime_cubin_sha256",
+        )
+        source_runtime_cubin_bytes = row.get("source_runtime_cubin_bytes")
+        if (
+            isinstance(source_runtime_cubin_bytes, bool)
+            or not isinstance(source_runtime_cubin_bytes, int)
+            or source_runtime_cubin_bytes <= 0
+        ):
+            raise ValueError(f"{label} has invalid source runtime cubin size")
+        original_body_sha256 = _require_sha256(
+            row.get("original_body_sha256"), f"{label} original_body_sha256"
+        )
+        sanitized_body_sha256 = _require_sha256(
+            row.get("sanitized_body_sha256"), f"{label} sanitized_body_sha256"
+        )
+        normalized_equivalence_sha256 = _require_sha256(
+            row.get("normalized_equivalence_sha256"),
+            f"{label} normalized_equivalence_sha256",
+        )
+        if original_body_sha256 != source_standalone_sha256:
+            raise ValueError(f"{label} original body is not the source standalone body")
 
         physical_selector_rows = row.get("physical_selectors")
         if not isinstance(physical_selector_rows, list) or not physical_selector_rows:
@@ -627,6 +955,8 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             raise ValueError(f"{label} binding digest is not source-closed")
         if row.get("body_sha256") != closure[1].sha256:
             raise ValueError(f"{label} body digest is not source-closed")
+        if sanitized_body_sha256 != closure[1].sha256:
+            raise ValueError(f"{label} sanitized body digest is not source-closed")
         calculated_closure_sha256 = hashlib.sha256(
             b"\0".join(closure_bytes)
         ).hexdigest()
@@ -649,6 +979,18 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
                 "source_closure_sha256": calculated_closure_sha256,
             }
         )
+        source_exact_identity_table.append(
+            {
+                "variant_id": variant_id,
+                "arch": arch,
+                "module_ident": module_ident,
+                "source_generated_sha256": source_generated_sha256,
+                "source_standalone_sha256": source_standalone_sha256,
+                "source_runtime_cubin_sha256": source_runtime_cubin_sha256,
+                "source_runtime_cubin_bytes": source_runtime_cubin_bytes,
+                "original_body_sha256": original_body_sha256,
+            }
+        )
         modules[variant_id] = GeneratedFlashKDAModule(
             variant_id=variant_id,
             arch=arch,
@@ -661,7 +1003,20 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             binding_relpath=binding_relpath,
             body_relpath=body_relpath,
             abi_wrapper_relpath=abi_wrapper_relpath,
+            kernel_name=kernel_name,
+            threads=threads,
+            smem_bytes=smem_bytes,
+            use_pdl=use_pdl,
+            tma_abi=tma_abi,
+            arg_plan_sha256=arg_plan_sha256,
             launch_contract_sha256=launch_contract_sha256,
+            source_generated_sha256=source_generated_sha256,
+            source_standalone_sha256=source_standalone_sha256,
+            source_runtime_cubin_sha256=source_runtime_cubin_sha256,
+            source_runtime_cubin_bytes=source_runtime_cubin_bytes,
+            original_body_sha256=original_body_sha256,
+            sanitized_body_sha256=sanitized_body_sha256,
+            normalized_equivalence_sha256=normalized_equivalence_sha256,
             source_closure_sha256=calculated_closure_sha256,
             cache_ident=cache_ident,
             source_closure=tuple(closure),
@@ -670,12 +1025,20 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 
     if arches != set(_FLASH_KDA_GENERATED_ARCH_TARGETS):
         raise ValueError("generated FlashKDA registry is missing an exact architecture")
+    if receipt.get("variant_count_by_target") != variant_count_by_target:
+        raise ValueError(
+            "generated FlashKDA per-target variant counts do not match receipt"
+        )
     if module_order != sorted(module_order):
         raise ValueError(
             "generated FlashKDA variants are not ordered by (arch, module_ident)"
         )
     if receipt.get("unique_body_count") != len(body_paths):
         raise ValueError("generated FlashKDA unique body count does not match receipt")
+    if receipt.get("source_exact_identity_table_sha256") != _canonical_json_sha256(
+        source_exact_identity_table
+    ):
+        raise ValueError("generated FlashKDA source-exact identity table differs")
     if receipt.get("abi_wrapper_count") != len(abi_wrapper_relpaths):
         raise ValueError("generated FlashKDA ABI wrapper count does not match receipt")
     if receipt.get("abi_wrapper_count") != 8:
@@ -770,7 +1133,7 @@ def get_flash_kda_generated_uri(variant_id: str) -> str:
         ) from error
     return (
         f"flash_kda_generated_{module.target}_{module.module_ident}_"
-        f"{module.cache_ident}"
+        f"{module.cache_ident}_{module.source_runtime_cubin_sha256}"
     )
 
 
@@ -806,6 +1169,8 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
             module_ident=module.module_ident,
             target=module.target,
+            expected_cubin_sha256=module.source_runtime_cubin_sha256,
+            source_name="kernel.cu",
         ),
     )
     logger.info(
@@ -821,6 +1186,72 @@ def load_flash_kda_generated_module(variant_id: str):
     """Build and load exactly one receipt-selected physical module."""
 
     return gen_flash_kda_generated_module(variant_id).build_and_load()
+
+
+def get_flash_kda_fp32_compat_uri(target: GeneratedFlashKDATarget) -> str:
+    """Return the source-closure and exact-cubin key for one FP32 module."""
+
+    try:
+        module = get_flash_kda_fp32_compat_registry()[target]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported compact-FP32 FlashKDA target: {target}"
+        ) from error
+    return (
+        f"flash_kda_fp32_compat_{target}_{module.module_ident}_"
+        f"{module.cache_ident}_{module.source_runtime_cubin_sha256}"
+    )
+
+
+@functools.cache
+def gen_flash_kda_fp32_compat_module(
+    target: GeneratedFlashKDATarget,
+) -> JitSpec:
+    """Create the exact-target JIT spec for compact FP32 recurrent state."""
+
+    try:
+        module = get_flash_kda_fp32_compat_registry()[target]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported compact-FP32 FlashKDA target: {target}"
+        ) from error
+    csrc_dir = _get_flash_kda_csrc_dir()
+    spec = gen_jit_spec(
+        name=get_flash_kda_fp32_compat_uri(target),
+        sources=[_resolve_generated_source(csrc_dir, module.binding_relpath)],
+        extra_cuda_cflags=[
+            *_FLASH_KDA_GENERATED_NVCC_FLAGS[target],
+            _FLASH_KDA_GENERATED_TARGET_DEFINE[target],
+            "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1",
+            "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1",
+            f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}",
+        ],
+        extra_include_paths=[
+            csrc_dir,
+            csrc_dir.parent,
+            _get_flash_kda_include_dir(),
+        ],
+        embedded_cubin_factory=functools.partial(
+            prepare_generated_flash_kda_cubin,
+            selector_path=_resolve_generated_source(csrc_dir, module.binding_relpath),
+            body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
+            module_ident=module.module_ident,
+            target=module.target,
+            expected_cubin_sha256=module.source_runtime_cubin_sha256,
+            source_name="kernel.cu",
+        ),
+    )
+    logger.info(
+        "Generated FlashKDA compact-FP32 %s JIT spec: %s", target, spec.name
+    )
+    return spec
+
+
+@functools.cache
+def load_flash_kda_fp32_compat_module(target: GeneratedFlashKDATarget):
+    """Build and load the source-exact compact-FP32 module for one target."""
+
+    return gen_flash_kda_fp32_compat_module(target).build_and_load()
 
 
 def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:

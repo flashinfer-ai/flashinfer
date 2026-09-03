@@ -18,6 +18,7 @@ import json
 from dataclasses import replace
 
 import pytest
+from packaging.version import Version
 
 import flashinfer.aot as aot_api
 import flashinfer.kda_prefill as kda_prefill_api
@@ -177,6 +178,7 @@ def test_prefill_jit_route_inventory_is_source_complete_and_aot_registered(
     for name, value in vars(flash_kda).items():
         if (
             name == "gen_flash_kda_module"
+            or name == "gen_flash_kda_fp32_compat_module"
             or not name.startswith("gen_flash_kda_")
             or not name.endswith("_module")
             or not callable(value)
@@ -191,8 +193,45 @@ def test_prefill_jit_route_inventory_is_source_complete_and_aot_registered(
     aot_source = inspect.getsource(aot_api)
     assert "get_flash_kda_generated_variant_ids" in aot_source
     assert "gen_flash_kda_generated_module" in aot_source
+    assert "gen_flash_kda_fp32_compat_module" in aot_source
+    assert "has_flash_kda_fp32_compat_sm100a" in aot_source
+    assert "has_flash_kda_fp32_compat_sm103a" in aot_source
     assert "gen_flash_kda_m128_n16_checkpoint_module" in aot_source
+    assert aot_source.count("gen_cake_kda_m128_bt64_unbounded_softplus_module") == 2
     assert "gen_flash_kda_m128_module" not in aot_source
+
+
+@pytest.mark.parametrize(
+    ("cuda_version", "expected_fp32_compat"),
+    (("12.9", False), ("13.0", False), ("13.2", True), ("13.4", False)),
+)
+def test_aot_compact_fp32_registration_requires_export_cuda_release(
+    monkeypatch, cuda_version, expected_fp32_compat
+):
+    class FakeCompilationContext:
+        TARGET_CUDA_ARCHS = {(10, "0a"), (10, "3a")}
+
+        def get_nvcc_flags_list(self, supported_major_versions=None):
+            del supported_major_versions
+            return [
+                f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+                for major, minor in sorted(self.TARGET_CUDA_ARCHS)
+            ]
+
+    monkeypatch.setattr(aot_api, "CompilationContext", FakeCompilationContext)
+    monkeypatch.setattr(
+        aot_api, "get_cuda_version", lambda: Version(cuda_version)
+    )
+
+    capabilities = aot_api.detect_sm_capabilities()
+    assert capabilities["flash_kda_prefill_sm100a"] is True
+    assert capabilities["flash_kda_prefill_sm103a"] is True
+    assert (
+        capabilities["flash_kda_fp32_compat_sm100a"] is expected_fp32_compat
+    )
+    assert (
+        capabilities["flash_kda_fp32_compat_sm103a"] is expected_fp32_compat
+    )
 
 
 def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
@@ -215,6 +254,12 @@ def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
         "sm100a",
         "sm103a",
     }
+    variant_count_by_target = {
+        target: sum(module.target == target for module in registry.values())
+        for target in ("sm100a", "sm103a")
+    }
+    assert receipt["variant_count_by_target"] == variant_count_by_target
+    assert sum(variant_count_by_target.values()) == len(registry)
     assert "bf16_f32_dependency" in {module.state_mode for module in registry.values()}
     selector_registry = flash_kda.get_flash_kda_generated_selector_registry()
     assert receipt["physical_selector_count"] == len(selector_registry)
@@ -303,6 +348,131 @@ def test_generated_embedded_kernel_cache_is_translation_unit_local():
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_generated_binding_common.cuh"
     ).read_text()
     assert "static inline void ConfigureAndLaunch(" in common_header
+
+
+def test_generated_compact_fp32_registry_is_source_exact_and_aot_registered():
+    registry = flash_kda.get_flash_kda_fp32_compat_registry()
+    csrc_dir = flash_kda._get_flash_kda_csrc_dir()
+    receipt = json.loads(
+        (csrc_dir / flash_kda._FLASH_KDA_FP32_COMPAT_RECEIPT_NAME).read_text()
+    )
+    metadata = json.loads(
+        (csrc_dir / flash_kda._FLASH_KDA_FP32_COMPAT_METADATA_NAME).read_text()
+    )
+
+    assert tuple(registry) == ("sm100a", "sm103a")
+    assert receipt["status"] == "passed"
+    assert receipt["source_contract_sha256"] == (
+        "e158118c7845faa4cebf522f8f391eeccc60e84f185dc0cebbee264616f49fe3"
+    )
+    assert "source_commit" not in receipt
+    assert "source_blobs" not in receipt
+    assert receipt["cuda_toolkit_version"] == "13.2.86"
+    assert receipt["optimization_level_one_absent"] is True
+    assert receipt["variant_count"] == 2
+    sanitizer = receipt["body_sanitizer"]
+    assert sanitizer["schema_version"] == 1
+    assert sanitizer["status"] == "passed"
+    assert sanitizer["normalized_equivalence"] == "passed"
+    sanitizer_receipts = [
+        {
+            "arch": row["arch"],
+            "source_body_sha256": row["source_body_sha256"],
+            "sanitized_body_sha256": row["sanitized_body_sha256"],
+            "sanitizer_replacement_count": row["sanitizer_replacement_count"],
+            "normalized_equivalence_sha256": row["normalized_equivalence_sha256"],
+        }
+        for row in metadata["variants"]
+    ]
+    assert sanitizer["replacement_count"] == sum(
+        row["sanitizer_replacement_count"] for row in sanitizer_receipts
+    )
+    assert sanitizer["receipts_sha256"] == flash_kda._canonical_json_sha256(
+        sanitizer_receipts
+    )
+    assert all(
+        row["generated_standalone_cubin_byte_identical"] is True
+        for row in metadata["variants"]
+    )
+    for target, target_define, gencode in (
+        (
+            "sm100a",
+            "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
+            "-gencode=arch=compute_100a,code=sm_100a",
+        ),
+        (
+            "sm103a",
+            "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
+            "-gencode=arch=compute_103a,code=sm_103a",
+        ),
+    ):
+        module = registry[target]
+        assert module.threads == 384
+        assert module.smem_bytes == 226048
+        assert module.source_generated_runtime_cubin_sha256 == (
+            module.source_runtime_cubin_sha256
+        )
+        assert [source.role for source in module.source_closure] == [
+            "selector_binding",
+            "sanitized_body",
+            "fp32_compat_abi_wrapper",
+            "public_common_include",
+        ]
+        assert module.source_closure[2].path == (
+            flash_kda._FLASH_KDA_FP32_COMPAT_WRAPPER_RELPATH
+        )
+        assert module.source_closure[3].path == (
+            flash_kda._FLASH_KDA_FP32_COMPAT_COMMON_RELPATH
+        )
+        spec = flash_kda.gen_flash_kda_fp32_compat_module(target)
+        assert spec.name == flash_kda.get_flash_kda_fp32_compat_uri(target)
+        assert spec.name.endswith(module.source_runtime_cubin_sha256)
+        assert spec.sources == [
+            flash_kda._resolve_generated_source(csrc_dir, module.binding_relpath)
+        ]
+        assert target_define in spec.extra_cuda_cflags
+        assert gencode in spec.extra_cuda_cflags
+        assert "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1" in spec.extra_cuda_cflags
+        assert spec.embedded_cubin_factory is not None
+        assert spec.embedded_cubin_factory.keywords["expected_cubin_sha256"] == (
+            module.source_runtime_cubin_sha256
+        )
+        assert spec.embedded_cubin_factory.keywords["source_name"] == "kernel.cu"
+        assert all("o1" not in flag.lower() for flag in spec.extra_cuda_cflags)
+
+    wrapper = (csrc_dir / "flashkda_generated_fp32_compat_binding.cuh").read_text()
+    assert "flashkda_generated_binding_common.cuh" not in wrapper
+    assert "flashkda_generated_bt16_descriptor_common.cuh" not in wrapper
+    assert "CheckArgumentCount<24>(kernel_args)" in wrapper
+
+
+def test_generated_compact_fp32_uri_changes_with_exact_cubin(monkeypatch):
+    module = flash_kda.get_flash_kda_fp32_compat_registry()["sm100a"]
+    changed_digest = (
+        "0" * 64
+        if module.source_runtime_cubin_sha256 != "0" * 64
+        else "1" * 64
+    )
+    monkeypatch.setattr(
+        flash_kda,
+        "get_flash_kda_fp32_compat_registry",
+        lambda: {"sm100a": module},
+    )
+    original_uri = flash_kda.get_flash_kda_fp32_compat_uri("sm100a")
+    monkeypatch.setattr(
+        flash_kda,
+        "get_flash_kda_fp32_compat_registry",
+        lambda: {
+            "sm100a": replace(
+                module,
+                source_runtime_cubin_sha256=changed_digest,
+            )
+        },
+    )
+    changed_uri = flash_kda.get_flash_kda_fp32_compat_uri("sm100a")
+
+    assert changed_uri != original_uri
+    assert changed_uri.endswith(changed_digest)
 
 
 def test_generated_prefill_selector_parser_rejects_unknown_and_incomplete_keys():
