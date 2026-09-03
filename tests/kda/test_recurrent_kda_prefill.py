@@ -1437,9 +1437,9 @@ def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_c
         "expected_route",
     ),
     [
-        (True, (2048,), 6, False, "compact_fp32_compat_m128"),
+        (True, (2048,), 6, False, "small_bh_owner_helper_m128"),
         (True, (4096,), 6, True, "small_bh_owner_helper_m128"),
-        (True, (512,), 12, False, "compact_fp32_compat_m128"),
+        (True, (512,), 12, False, "bt16_prepare_chain_m64"),
         (False, (17, 33), 6, False, "compact_fp32_compat_m128"),
         (False, (17, 33), 12, False, "compact_fp32_compat_m128"),
     ],
@@ -3822,7 +3822,7 @@ def test_compact_fp32_matches_indexed_fp32_source_route(
     )
 
 
-def test_compact_fp32_zero_bound_small_bh_matches_compat_control(
+def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
     flash_kda_device,
     monkeypatch,
 ):
@@ -3855,30 +3855,47 @@ def test_compact_fp32_zero_bound_small_bh_matches_compat_control(
     )
     small_output = small_output.clone()
     small_state = small_state.clone()
-    assert selector_keys == []
+    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
 
-    control_inputs = {**inputs, "initial_state": state_seed.clone()}
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_should_use_small_bh_owner_helper",
-        lambda **kwargs: False,
+    state_indices = torch.tensor([2], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = _make_padded_state_pool(
+        slots=3,
+        num_heads=1,
+        dtype=torch.float32,
+        device=flash_kda_device,
     )
-    compat_output, compat_state = recurrent_kda(
-        **_strict_prefill_kwargs(control_inputs, lower_bound=0.0),
+    indexed_state.normal_(mean=0.0, std=0.1)
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    indexed_state_before = indexed_state.clone()
+    selector_keys.clear()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs(
+            {**inputs, "initial_state": indexed_state}, lower_bound=0.0
+        ),
+        ssm_state_indices=state_indices,
         output=torch.empty_like(inputs["q"]),
         output_final_state=True,
         backend="cake",
     )
+    assert indexed_final is indexed_state
+    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
 
     torch.testing.assert_close(
-        small_output.float(), compat_output.float(), atol=1e-2, rtol=1e-2
+        small_output.float(), indexed_output.float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
-        small_state.float(), compat_state.float(), atol=1e-2, rtol=1e-2
+        small_state.float(),
+        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.equal(
+        indexed_state[:2],
+        indexed_state_before[:2],
     )
 
 
-def test_compact_fp32_zero_bound_bt16_matches_compat_control(
+def test_compact_fp32_zero_bound_bt16_matches_indexed_source_route(
     flash_kda_device,
     monkeypatch,
 ):
@@ -3911,31 +3928,53 @@ def test_compact_fp32_zero_bound_bt16_matches_compat_control(
     )
     bt16_output = bt16_output.clone()
     bt16_state = bt16_state.clone()
-    assert selector_keys == []
+    assert [
+        (selector["route"], selector["route_role"]) for selector in selector_keys
+    ] == [
+        ("bt16_prepare_chain_m64", "bt16_prepare"),
+        ("bt16_prepare_chain_m64", "main"),
+    ]
 
-    control_inputs = {**inputs, "initial_state": state_seed.clone()}
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_should_use_bt16_dense_wavefront",
-        lambda **kwargs: False,
+    state_indices = torch.tensor([2], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = _make_padded_state_pool(
+        slots=3,
+        num_heads=12,
+        dtype=torch.float32,
+        device=flash_kda_device,
     )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_should_use_bt16_prepare_chain",
-        lambda **kwargs: False,
-    )
-    compat_output, compat_state = recurrent_kda(
-        **_strict_prefill_kwargs(control_inputs, lower_bound=0.0),
+    indexed_state.normal_(mean=0.0, std=0.1)
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    indexed_state_before = indexed_state.clone()
+    selector_keys.clear()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs(
+            {**inputs, "initial_state": indexed_state}, lower_bound=0.0
+        ),
+        ssm_state_indices=state_indices,
         output=torch.empty_like(inputs["q"]),
         output_final_state=True,
         backend="cake",
     )
+    assert indexed_final is indexed_state
+    assert [
+        (selector["route"], selector["route_role"]) for selector in selector_keys
+    ] == [
+        ("bt16_prepare_chain_m64", "bt16_prepare"),
+        ("bt16_prepare_chain_m64", "main"),
+    ]
 
     torch.testing.assert_close(
-        bt16_output.float(), compat_output.float(), atol=1e-2, rtol=1e-2
+        bt16_output.float(), indexed_output.float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
-        bt16_state.float(), compat_state.float(), atol=1e-2, rtol=1e-2
+        bt16_state.float(),
+        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.equal(
+        indexed_state[:2],
+        indexed_state_before[:2],
     )
 
 

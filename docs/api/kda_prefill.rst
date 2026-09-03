@@ -69,10 +69,11 @@ every condition below holds:
   adapter described above. Plain int32 ``ssm_state_indices`` and native prefill
   checkpoints are supported by direct M128.
 
-Compact FP32 state uses the separately sealed source-exact raw compatibility
-closure on every supported shape. Indexed FP32 state continues through the
-normal generated source dispatch, so its explicit pool and slot-stride ABI are
-preserved.
+Bounded FP32 state mirrors the source dispatch order. Compact state uses the
+normal source-exact small-BH or BT16 family when those shape guards select it,
+and otherwise uses the separately sealed source-exact raw compatibility
+closure. Indexed FP32 state continues through the normal generated source
+dispatch so its explicit pool and slot-stride ABI are preserved.
 
 T=1 decode and speculative decode are not handled by either prefill backend.
 
