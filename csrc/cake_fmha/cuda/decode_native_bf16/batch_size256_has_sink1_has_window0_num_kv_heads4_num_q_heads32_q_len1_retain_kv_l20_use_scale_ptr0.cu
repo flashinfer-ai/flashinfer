@@ -1209,6 +1209,13 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     mbarrier_arrive(o_empty_1_addr);
                     mbarrier_arrive(p_full_1_addr);
                 }
+                float sink_b2_lane = 0.0f;
+                {
+                    if (group_ratio_rt > lane) {
+                        int sink_head_lane = kv_head_idx_1 * group_ratio_rt + lane;
+                        sink_b2_lane = sinks_ptr[sink_head_lane] * 1.4426950408889634f;
+                    }
+                }
                 mbarrier_wait(corr_scale_addr, _phase_corr_scale_0);
                 _phase_corr_scale_0 ^= 1;
                 mbarrier_wait(corr_scale_addr + 8, _phase_corr_scale_1);
@@ -1272,8 +1279,8 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             merged_n = merged_pair_vals[h];
                         }
                         if (group_ratio_rt > h) {
-                            int q_head_s = kv_head_idx_1 * group_ratio_rt + h;
-                            float sink_b2 = sinks_ptr[q_head_s] * 1.4426950408889634f;
+                            float _shfl_0 = __shfl_sync(0xFFFFFFFF, sink_b2_lane, h);
+                            float sink_b2 = _shfl_0;
                             float m2 = local_max[h] * smx_scale_c;
                             float _max_10 = max_noftz(m2, sink_b2);
                             float big2 = _max_10;
