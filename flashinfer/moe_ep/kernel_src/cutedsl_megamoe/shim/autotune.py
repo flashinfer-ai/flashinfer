@@ -34,7 +34,7 @@ import math
 import statistics
 import time
 import warnings
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -138,15 +138,26 @@ def bf16_candidates(
     return [knobs] if is_valid_bf16(knobs) else []
 
 
+def _bf16_mxfp8_epi_flag_batches(token_back: str) -> Tuple[Tuple[int, int], ...]:
+    """``epi_flag_batch`` values worth timing for a token-back mode.
+    Emperically we found that epi_flag_batch shouldnt matter much for epi_warps mode.
+    """
+    if token_back == "epi_warps":
+        return ((2, 4),)
+    return ((1, 1), (2, 4))
+
+
 def bf16_mxfp8_candidates(
     *,
     in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Default BF16×MXFP8 candidate knob dicts (impl tuple × flag_batch × token-back).
+    """Default BF16/MXFP8 candidate knob dicts (impl tuple x flag_batch x token-back).
 
-    Twelve candidates: three legal implementation tuples (N128/tmem,
-    N256/smem, N256/tmem-overlap) × ``flag_batch`` {1, 4} ×
-    ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}.
+    Eighteen candidates: three legal implementation tuples (N128/tmem,
+    N256/smem, N256/tmem-overlap) x ``flag_batch`` {1, 4} x
+    ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}, with the
+    dispatch-warp half also timing ``epi_flag_batch=(1, 1)`` (see
+    :func:`_bf16_mxfp8_epi_flag_batches`).
     ``standalone_warps`` is unsupported.  ikr stays config-owned (the symm
     buffer's combine plane is shaped for it), so pass the session's value to
     stamp it on every candidate; unlike pure MXFP8 the mixed kernel runs ikr
@@ -177,21 +188,22 @@ def bf16_mxfp8_candidates(
         "cluster_shape_mnk": (2, 1, 1),
         "use_2cta_instrs": True,
         "group_hint": 512,
-        "epi_flag_batch": (2, 4),
         "load_balance_mode": "static",
     }
     for impl in impl_specs:
         for flag_batch in (1, 4):
             for token_back in ("epi_warps", "reuse_dispatch_warps"):
-                knobs = dict(
-                    base,
-                    **impl,
-                    flag_batch=flag_batch,
-                    token_back_mode=token_back,
-                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-                )
-                if is_valid_bf16_mxfp8(knobs):
-                    out.append(knobs)
+                for epi_flag_batch in _bf16_mxfp8_epi_flag_batches(token_back):
+                    knobs = dict(
+                        base,
+                        **impl,
+                        flag_batch=flag_batch,
+                        epi_flag_batch=epi_flag_batch,
+                        token_back_mode=token_back,
+                        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    )
+                    if is_valid_bf16_mxfp8(knobs):
+                        out.append(knobs)
     return out
 
 

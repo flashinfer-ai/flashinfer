@@ -79,7 +79,7 @@ def test_mixed_knobs_and_candidates():
         )
 
     candidates = bf16_mxfp8_candidates()
-    assert len(candidates) == 12
+    assert len(candidates) == 18
     assert all(is_valid_bf16_mxfp8(c) for c in candidates)
     assert {_impl_key(c) for c in candidates} == _LEGAL_IMPLS
     assert {c["token_back_mode"] for c in candidates} == {
@@ -90,7 +90,7 @@ def test_mixed_knobs_and_candidates():
     # ikr must not shrink the token-back axis: a session that asked for
     # dispatch-warp token-back still gets it timed.
     ikr = bf16_mxfp8_candidates(in_kernel_fc2_reduce=True)
-    assert len(ikr) == 12
+    assert len(ikr) == 18
     assert all(c["in_kernel_fc2_reduce"] for c in ikr)
     assert {c["token_back_mode"] for c in ikr} == {
         "epi_warps",
