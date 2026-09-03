@@ -811,6 +811,12 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # plan() resolves the backend and writes the answer back, so a second
+        # plan has to start from the request again -- otherwise a paged plan
+        # that settled on fa2 keeps every later flat plan on fa2 too, and the
+        # resolution never runs a second time.
+        self._backend = self._requested_backend
+
         if kv_cache_page_size is not None and self._requested_backend not in (
             "auto",
             "fa2",
@@ -1934,7 +1940,15 @@ class BlockSparseAttentionWrapper:
             # the multiply in float32 because torch has no in-place float
             # multiply for it.
             if is_float8(out):
-                out = (out.to(torch.float32) * v_scale).to(out.dtype)
+                # In place, because `out` may be the caller's buffer: rebinding
+                # the name would return a scaled tensor and leave theirs holding
+                # the unscaled one.
+                #
+                # No test drives this: plan() takes the dtype but
+                # gen_batch_prefill_module refuses an 8-bit output for fa2 and
+                # fa3, so nothing reaches here today. It is written the safe way
+                # rather than left to be found when that changes.
+                out.copy_((out.to(torch.float32) * v_scale).to(out.dtype))
             else:
                 out *= v_scale
 
