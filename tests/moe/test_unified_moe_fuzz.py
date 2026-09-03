@@ -1286,7 +1286,7 @@ _CONTRACT_HANDLERS = {
     ),
     "cutlass_mxfp8": _contract_handler(
         CutlassMxfp8Config,
-        QuantVariant.MxFp8,
+        QuantVariant.MXFP8,
         activation_pack=_contract_fp8_act_pack(CutlassMxfp8Config),
         reference=_cutlass_post_reference("cutlass_mxfp8"),
         atol_frac=0.1,
@@ -2854,7 +2854,7 @@ def test_unified_moe_fuzz(cfg):
             device=dev,
             activation=_activation_for(cfg),
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = handler.variant
@@ -3250,7 +3250,7 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = variant
