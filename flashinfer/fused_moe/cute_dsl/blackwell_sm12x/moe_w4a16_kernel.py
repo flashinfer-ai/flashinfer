@@ -75,6 +75,7 @@ from .moe_w4a16_fp4_helpers import (
     warp_reduce,
 )
 from flashinfer.cute_dsl.utils import current_cuda_stream, make_ptr
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .moe_w4a16_route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
@@ -4942,10 +4943,19 @@ class W4A16TopKSumKernel:
     def __call__(
         self,
         fc2_ptr: cute.Pointer,
-        output_ptr: cute.Pointer,
+        output_anchor: cute.Tensor,
         active_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        # ``output`` travels as a shape-[1] DLTensor rather than a typed
+        # pointer: it is the only device-carrying param in the TVM-FFI
+        # signature, and the env-stream lookup anchors on it (raw pointers
+        # carry no device, and the builder raises at compile time without
+        # one -- see the direct-micro barrier notes in #4701). Only the
+        # base address is taken from the anchor; the full output buffer is
+        # addressed through the dynamically-shaped tensor rebuilt below, so
+        # the baked [1] shape never bounds a device-side access.
+        output_ptr = output_anchor.iterator
         fc2_flat = cute.make_tensor(
             fc2_ptr,
             layout=cute.make_layout(
@@ -4992,6 +5002,49 @@ _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+
+
+# ---------------------------------------------------------------------------
+# On-disk kernel cache
+#
+# The W4A16 kernels adopt the shared on-disk CuTe-DSL cache (#3874, #4029;
+# docs/design_docs/cute_dsl_kernel_cache.md) the same way the b12x MMA
+# kernels (#4331) and the direct-micro kernel (#4701) do: TVM-FFI compiles
+# are exported as ``.o`` and a fresh process JITLinks them instead of
+# re-running the MLIR pipeline. The in-process caches above stay as the
+# first lookup layer.
+#
+# Deliberately a *separate* module directory from ``b12x_moe`` and
+# ``b12x_moe_direct_micro``: a module's ``meta.json`` carries one
+# ``source_sha256`` for every kernel in its directory and a mismatch wipes
+# the whole directory, so sharing a module across adopters with different
+# source lists would make them alternately invalidate each other.
+_CUTE_DSL_MODULE = "b12x_moe_w4a16"
+
+
+def _w4a16_kernel_source_files() -> tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache.
+
+    Every module contributing device code to the W4A16 kernels: this file,
+    the shared W4A16 device helpers, and the CuTe-DSL utilities the host
+    entries are built from. The list is shared by all kernels of the
+    module; a change wipes and lazily rebuilds the whole module directory.
+    """
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from . import (
+        moe_w4a16_activations,
+        moe_w4a16_fp4_helpers,
+        moe_w4a16_route_pack,
+    )
+
+    return (
+        __file__,
+        moe_w4a16_activations.__file__,
+        moe_w4a16_fp4_helpers.__file__,
+        moe_w4a16_route_pack.__file__,
+        cute_dsl_utils.__file__,
+    )
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -5858,7 +5911,11 @@ def compile_w4a16_topk_sum(
         return cached
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    output_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    output_anchor_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        (1,),
+        assumed_align=16,
+    )
     kernel = W4A16TopKSumKernel(
         topk=topk,
         hidden_size=hidden_size,
@@ -5867,17 +5924,30 @@ def compile_w4a16_topk_sum(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        fc2_fake,
-        output_fake,
-        1,
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.topk_sum",
+
+    # A fake stream rather than ``current_cuda_stream()``: a live stream
+    # handle baked into an exported ``.o`` is meaningless to the process
+    # that reloads it. ``--enable-tvm-ffi`` is mandatory, not a tuning
+    # choice: JitSpecCuteDsl exports with ``export_to_c()`` and reloads
+    # with ``load_module(..., enable_tvm_ffi=True)``, so a kernel compiled
+    # without it cannot round-trip through the disk cache.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            fc2_fake,
+            output_anchor_fake,
             1,
-            cache_key,
-        ),
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        f"topk_sum_{element_dtype}_t{topk}_h{hidden_size}",
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16TopKSumCompileResult(
         compiled=compiled,
@@ -6432,21 +6502,24 @@ def _w4a16_topk_sum_launch_flat(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
     )
+    # TVM-FFI ABI (see ``compile_w4a16_topk_sum``): the fc2 pointer travels
+    # as a raw ``data_ptr()`` int, ``output`` as a length-1 view of the real
+    # output buffer (the DLTensor anchor the env-stream lookup needs; the
+    # kernel takes only the base address from it), and there is no stream
+    # argument -- the kernel compiled against
+    # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
+    # the caller's current stream and the parameter is absent from the
+    # compiled signature. ``.view(-1)`` never copies (it raises instead), so
+    # the anchor is guaranteed to alias the real output storage.
+    if stream_int != int(current_cuda_stream()):
+        raise ValueError(
+            "W4A16 top-k sum launch requires the current CUDA stream: the "
+            "TVM-FFI env-stream ABI cannot target another stream"
+        )
     sum_kernel.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            fc2_out.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
+        fc2_out.data_ptr(),
+        output.view(-1)[:1],
         m,
-        cuda.CUstream(stream_int),
     )
 
 
