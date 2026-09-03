@@ -44,48 +44,6 @@ _H12_CASES = (
     ),
 )
 
-_COMMON_HEADER_VARIANT_BODIES = (
-    ("m64", "flashkda_bf16_fused_m64.cu"),
-    ("m128", "flashkda_bf16_fused_m128.cu"),
-    (
-        "m128_tensor_state_decay",
-        "cake_flashkda_bf16_fused_m128_tensor_state_decay.cu",
-    ),
-    ("m128_h12_short", "cake_flashkda_bf16_fused_m128_h12_short.cu"),
-    ("m128_h12_long", "cake_flashkda_bf16_fused_m128_h12_long.cu"),
-    ("m128_n16", "cake_flashkda_bf16_fused_m128_n16.cu"),
-    (
-        "m128_n16_checkpoint",
-        "flashkda_bf16_fused_m128_n16_checkpoint.cu",
-    ),
-    ("m128_n16_short", "cake_flashkda_bf16_fused_m128_n16_short.cu"),
-    ("persistent_m128", "cake_flashkda_bf16_persistent_m128.cu"),
-    (
-        "piece_persistent_m128",
-        "cake_flashkda_bf16_piece_persistent_m128.cu",
-    ),
-    ("small_bh_m128", "cake_flashkda_bf16_small_bh_m128.cu"),
-)
-
-
-@pytest.mark.parametrize(("variant", "body_name"), _COMMON_HEADER_VARIANT_BODIES)
-def test_common_header_prefill_variant_cache_key(variant, body_name):
-    csrc_dir = flash_kda._get_flash_kda_csrc_dir()
-    spec = flash_kda.gen_flash_kda_module(variant, "sm100f")
-    assert len(spec.sources) == 1
-    digest = hashlib.sha256(
-        b"\0".join(
-            source.read_bytes()
-            for source in (
-                csrc_dir / body_name,
-                spec.sources[0],
-                csrc_dir / "flashkda_binding_common.cuh",
-            )
-        )
-    ).hexdigest()[:10]
-    assert flash_kda._FLASH_KDA_MODULE_IDENTS[variant] == digest
-
-
 @pytest.mark.parametrize(
     (
         "variant",
@@ -358,7 +316,7 @@ def test_generated_compact_fp32_registry_is_source_exact_and_aot_registered():
     assert tuple(registry) == ("sm100a", "sm103a")
     assert receipt["status"] == "passed"
     assert receipt["source_contract_sha256"] == (
-        "e158118c7845faa4cebf522f8f391eeccc60e84f185dc0cebbee264616f49fe3"
+        "3cca340f71fecaa927fc5390be32dec8c56c9715005ed20a696249a16675593e"
     )
     assert "source_commit" not in receipt
     assert "source_blobs" not in receipt

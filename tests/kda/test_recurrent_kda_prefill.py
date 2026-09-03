@@ -5950,6 +5950,11 @@ def test_frozen_bt16_trained_kimi_gate_fp32_indexed_numerics(
         "_should_use_bt16_prepare_chain",
         lambda **kwargs: True,
     )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_generated_bt16_stage_count",
+        lambda **kwargs: 8,
+    )
     bt16_output, bt16_pool = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
         ssm_state_indices=state_indices,
