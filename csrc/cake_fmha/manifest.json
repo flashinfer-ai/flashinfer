@@ -1071,8 +1071,8 @@
       "sha256": "74e21c56e576b2a6d4d12c967211e50b424dedb4b195af9e697a5b4f26751d62"
     },
     "cuda/decode_native_bf16/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu": {
-      "bytes": 127852,
-      "sha256": "5d563e0b0a169cbc640af85535e74800844ed220959ccda011063460caa2b007"
+      "bytes": 128066,
+      "sha256": "9a1265873801a52af1812941f187807cd5d3caabb26f15db93c6d65d8ca4d63d"
     },
     "cuda/decode_native_bf16/batch_size4_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu": {
       "bytes": 107812,
@@ -3288,8 +3288,8 @@
             "USE_SCALE_PTR": 0
           },
           "sha256": {
-            "sm_100a": "5d563e0b0a169cbc640af85535e74800844ed220959ccda011063460caa2b007",
-            "sm_103a": "5d563e0b0a169cbc640af85535e74800844ed220959ccda011063460caa2b007"
+            "sm_100a": "9a1265873801a52af1812941f187807cd5d3caabb26f15db93c6d65d8ca4d63d",
+            "sm_103a": "9a1265873801a52af1812941f187807cd5d3caabb26f15db93c6d65d8ca4d63d"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu",
