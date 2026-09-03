@@ -20,9 +20,9 @@ def _stride_table(tensors: list[torch.Tensor]) -> torch.Tensor:
     )
 
 
-def _active_request_indices(flush_count: torch.Tensor) -> torch.Tensor:
-    indices = torch.full_like(flush_count, -1)
-    active = torch.nonzero(flush_count >= 0, as_tuple=False).flatten()
+def _active_request_indices(replay_prefix_len: torch.Tensor) -> torch.Tensor:
+    indices = torch.full_like(replay_prefix_len, -1)
+    active = torch.nonzero(replay_prefix_len >= 0, as_tuple=False).flatten()
     indices[: active.numel()] = active
     return indices
 
@@ -36,10 +36,11 @@ def _materialize(
     src_slots: torch.Tensor,
     dst_slots: torch.Tensor,
     ring_start: torch.Tensor,
-    flush_count: torch.Tensor,
+    replay_prefix_len: torch.Tensor,
     ring_buffer_len: int,
     heads_per_group: int = 1,
     active_request_indices: torch.Tensor | None = None,
+    pad_slot_id: int = -1,
     state_dtype: torch.dtype = torch.bfloat16,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 0,
@@ -61,10 +62,10 @@ def _materialize(
         src_slots,
         dst_slots,
         ring_start,
-        flush_count,
+        replay_prefix_len,
         active_request_indices
         if active_request_indices is not None
-        else _active_request_indices(flush_count),
+        else _active_request_indices(replay_prefix_len),
         state_dtype=state_dtype,
         input_dtype=torch.bfloat16,
         matrixA_dtype=torch.float32,
@@ -74,6 +75,7 @@ def _materialize(
         heads_per_group=heads_per_group,
         max_window=8,
         ring_buffer_len=ring_buffer_len,
+        pad_slot_id=pad_slot_id,
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
     )
@@ -82,7 +84,7 @@ def _materialize(
 def test_replayssm_materialize_bf16_replay_and_copy() -> None:
     """Positive replay, zero exact-copy, and source immutability in one launch."""
     torch.manual_seed(0)
-    layers, slots, ring_buffer_len = 2, 4, 12
+    layers, slots, ring_buffer_len = 2, 8, 12
     state = [
         torch.randn(slots, 1, 64, 64, dtype=torch.bfloat16, device="cuda")
         for _ in range(layers)
@@ -99,16 +101,17 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         torch.rand(slots, 1, ring_buffer_len, device="cuda") for _ in range(layers)
     ]
     a = [-torch.rand(1, device="cuda") for _ in range(layers)]
-    src_slots = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32, device="cuda")
-    dst_slots = torch.tensor([[2, 3], [1, 3]], dtype=torch.int32, device="cuda")
-    ring_start = torch.tensor([10, 3], dtype=torch.int32, device="cuda")
-    flush_count = torch.tensor([3, 0], dtype=torch.int32, device="cuda")
+    src_slots = torch.tensor(
+        [[0, 1, 2, 3], [2, 0, 4, 5]], dtype=torch.int32, device="cuda"
+    )
+    dst_slots = torch.tensor(
+        [[4, 5, 6, 7], [1, 3, 6, 7]], dtype=torch.int32, device="cuda"
+    )
+    ring_start = torch.tensor([10, 3, 0, 0], dtype=torch.int32, device="cuda")
+    replay_prefix_len = torch.tensor([3, 0, -1, -1], dtype=torch.int32, device="cuda")
 
     before = [tensor.clone() for tensor in state]
-    # Deliberately reverse the active requests: virtual request 0 is the
-    # physical zero-copy request, while virtual request 1 replays three rows.
-    # This verifies the client-provided indirection for every layer's slots,
-    # ring metadata, and state destination.
+    # Deliberately reverse the active prefix and follow it with sentinels.
     _materialize(
         state,
         x_cache,
@@ -118,9 +121,11 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         src_slots,
         dst_slots,
         ring_start,
-        flush_count,
+        replay_prefix_len,
         ring_buffer_len,
-        active_request_indices=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
+        active_request_indices=torch.tensor(
+            [1, 0, -1, -1], dtype=torch.int32, device="cuda"
+        ),
     )
     torch.cuda.synchronize()
 
@@ -137,7 +142,7 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         expected = before[layer][src_slots[layer, 0]].float()
         source_slot = int(src_slots[layer, 0].cpu())
         start = int(ring_start[0].cpu())
-        for token in range(int(flush_count[0].cpu())):
+        for token in range(int(replay_prefix_len[0].cpu())):
             row = (start + token) % ring_buffer_len
             expected = expected * torch.exp(
                 a[layer][0] * dt_cache[layer][source_slot, 0, row]
@@ -156,10 +161,49 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         assert torch.equal(
             state[layer][src_slots[layer, 0]], before[layer][src_slots[layer, 0]]
         )
+        for request in (2, 3):
+            assert torch.equal(
+                state[layer][dst_slots[layer, request]],
+                before[layer][dst_slots[layer, request]],
+            )
 
 
-def test_replayssm_materialize_negative_count_is_noop() -> None:
-    """A negative count does not touch either source or destination state."""
+def test_replayssm_materialize_persistent_grid_stride_zero_copy() -> None:
+    """A large active batch exercises a second persistent grid-stride item."""
+    batch = 8192
+    state = torch.zeros(batch + 1, 1, 64, 64, dtype=torch.bfloat16, device="cuda")
+    state[0].normal_()
+    source = state[0].clone()
+    x_cache = [torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")]
+    b_cache = [torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")]
+    dt_cache = [torch.empty(1, 1, 1, device="cuda")]
+    a = [torch.empty(1, device="cuda")]
+    src_slots = torch.zeros((1, batch), dtype=torch.int32, device="cuda")
+    dst_slots = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda").unsqueeze(
+        0
+    )
+    ring_start = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    replay_prefix_len = torch.zeros(batch, dtype=torch.int32, device="cuda")
+
+    _materialize(
+        [state],
+        x_cache,
+        b_cache,
+        dt_cache,
+        a,
+        src_slots,
+        dst_slots,
+        ring_start,
+        replay_prefix_len,
+        ring_buffer_len=1,
+        active_request_indices=torch.arange(batch, dtype=torch.int32, device="cuda"),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(state[1:], source.expand_as(state[1:]))
+
+
+def test_replayssm_materialize_negative_prefix_len_is_noop() -> None:
+    """A negative replay prefix length does not touch source or destination state."""
     torch.manual_seed(1)
     ring_buffer_len = 12
     state = [torch.randn(2, 1, 64, 64, dtype=torch.bfloat16, device="cuda")]
@@ -174,7 +218,7 @@ def test_replayssm_materialize_negative_count_is_noop() -> None:
     src_slots = torch.tensor([[0]], dtype=torch.int32, device="cuda")
     dst_slots = torch.tensor([[1]], dtype=torch.int32, device="cuda")
     ring_start = torch.tensor([0], dtype=torch.int32, device="cuda")
-    flush_count = torch.tensor([-1], dtype=torch.int32, device="cuda")
+    replay_prefix_len = torch.tensor([-1], dtype=torch.int32, device="cuda")
     before = state[0].clone()
 
     _materialize(
@@ -186,9 +230,9 @@ def test_replayssm_materialize_negative_count_is_noop() -> None:
         src_slots,
         dst_slots,
         ring_start,
-        flush_count,
-        _active_request_indices(flush_count),
+        replay_prefix_len,
         ring_buffer_len,
+        active_request_indices=_active_request_indices(replay_prefix_len),
     )
     torch.cuda.synchronize()
     assert torch.equal(state[0], before)
@@ -219,7 +263,7 @@ def test_replayssm_materialize_multilayer_multhead_grouped_b() -> None:
     src_slots = torch.tensor([[0], [1]], dtype=torch.int32, device="cuda")
     dst_slots = torch.tensor([[1], [0]], dtype=torch.int32, device="cuda")
     ring_start = torch.tensor([10], dtype=torch.int32, device="cuda")
-    flush_count = torch.tensor([3], dtype=torch.int32, device="cuda")
+    replay_prefix_len = torch.tensor([3], dtype=torch.int32, device="cuda")
     before = [tensor.clone() for tensor in state]
 
     _materialize(
@@ -231,7 +275,7 @@ def test_replayssm_materialize_multilayer_multhead_grouped_b() -> None:
         src_slots,
         dst_slots,
         ring_start,
-        flush_count,
+        replay_prefix_len,
         ring_buffer_len,
         heads_per_group=2,
     )
@@ -240,7 +284,7 @@ def test_replayssm_materialize_multilayer_multhead_grouped_b() -> None:
     for layer in range(layers):
         for head in range(heads):
             expected = before[layer][src_slots[layer, 0], head].float()
-            for token in range(int(flush_count[0].cpu())):
+            for token in range(int(replay_prefix_len[0].cpu())):
                 row = (int(ring_start[0].cpu()) + token) % ring_buffer_len
                 expected = expected * torch.exp(
                     a[layer][head] * dt_cache[layer][src_slots[layer, 0], head, row]
@@ -270,7 +314,7 @@ def test_replayssm_materialize_multilayer_multhead_grouped_b() -> None:
 def test_replayssm_materialize_matches_checkpointing_ssu_replay(
     state_dtype: torch.dtype, philox_rounds: int
 ) -> None:
-    """The shared replay helper produces bitwise-identical BF16 state."""
+    """Replay matches checkpointing_ssu for deterministic and Philox stores."""
     torch.manual_seed(2)
     cache_size, ring_buffer_len, predicted = 2, 12, 4
     if philox_rounds and not is_cvt_rs_supported():
@@ -297,7 +341,11 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay(
     out = torch.empty_like(x)
 
     expected = state.clone()
-    rand_seed = torch.tensor([12345], device="cuda", dtype=torch.int64) if philox_rounds else None
+    rand_seed = (
+        torch.tensor([12345], device="cuda", dtype=torch.int64)
+        if philox_rounds
+        else None
+    )
     checkpointing_ssu(
         expected,
         x_cache.clone(),
@@ -339,8 +387,18 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay(
         actual_value = actual[1]
         assert torch.all(
             (actual_value == expected_value)
-            | (actual_value == torch.nextafter(expected_value, torch.full_like(expected_value, float("inf"))))
-            | (actual_value == torch.nextafter(expected_value, torch.full_like(expected_value, float("-inf"))))
+            | (
+                actual_value
+                == torch.nextafter(
+                    expected_value, torch.full_like(expected_value, float("inf"))
+                )
+            )
+            | (
+                actual_value
+                == torch.nextafter(
+                    expected_value, torch.full_like(expected_value, float("-inf"))
+                )
+            )
         )
     else:
         assert torch.equal(actual[1], expected[0])
@@ -415,6 +473,39 @@ def test_replayssm_materialize_8bit_matches_checkpointing_ssu_replay(
     assert torch.equal(actual_scales[1], expected_scales[0])
 
 
+@pytest.mark.parametrize(
+    "state_dtype", [torch.int8, torch.float8_e4m3fn], ids=["int8", "fp8_e4m3fn"]
+)
+def test_replayssm_materialize_8bit_zero_count_copies_state_and_scale(
+    state_dtype: torch.dtype,
+) -> None:
+    """Zero count preserves the raw one-byte state and its per-row scales."""
+    if state_dtype == torch.int8:
+        state = torch.randint(
+            -50, 50, (2, 1, 64, 128), dtype=state_dtype, device="cuda"
+        )
+    else:
+        state = torch.randn(2, 1, 64, 128, device="cuda").to(state_dtype)
+    scales = torch.rand(2, 1, 64, device="cuda") + 0.01
+    state_before, scales_before = state.clone(), scales.clone()
+    _materialize_int8(
+        state,
+        scales,
+        torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda"),
+        torch.empty(1, 1, 1, 128, dtype=torch.bfloat16, device="cuda"),
+        torch.empty(1, 1, 1, device="cuda"),
+        torch.empty(1, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        ring_buffer_len=1,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(state[0], state_before[0])
+    assert torch.equal(state[1], state_before[0])
+    assert torch.equal(scales[0], scales_before[0])
+    assert torch.equal(scales[1], scales_before[0])
+
+
 def _materialize_int8(
     state: torch.Tensor,
     scales: torch.Tensor,
@@ -423,7 +514,7 @@ def _materialize_int8(
     dt_cache: torch.Tensor,
     a: torch.Tensor,
     ring_start: torch.Tensor,
-    flush_count: torch.Tensor,
+    replay_prefix_len: torch.Tensor,
     ring_buffer_len: int,
 ) -> None:
     replayssm_materialize(
@@ -441,8 +532,8 @@ def _materialize_int8(
         torch.tensor([[0]], dtype=torch.int32, device="cuda"),
         torch.tensor([[1]], dtype=torch.int32, device="cuda"),
         ring_start,
-        flush_count,
-        _active_request_indices(flush_count),
+        replay_prefix_len,
+        _active_request_indices(replay_prefix_len),
         state_dtype=state.dtype,
         input_dtype=torch.bfloat16,
         matrixA_dtype=torch.float32,

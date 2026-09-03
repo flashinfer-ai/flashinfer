@@ -14,3 +14,4 @@ state-update primitives used in SSM blocks.
     selective_state_update
     checkpointing_ssu
     ssd_combined_fwd
+    replayssm_materialize

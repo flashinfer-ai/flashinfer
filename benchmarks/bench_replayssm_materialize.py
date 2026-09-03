@@ -4,8 +4,8 @@
 
 The materializer uses a fixed CTA pool which grid-strides over the logical
 ``(request, layer, head)`` grid. The caller supplies a compact active-request
-map, so the kernel traverses only flushing requests while preserving their
-physical batch indices. This benchmark constructs that map directly.
+map, so only mapped requests execute replay while preserving their physical
+batch indices. This benchmark constructs that map directly.
 
 The default shape is the proposed Nemotron-v4 full-model shape:
 ``batch=256, layers=48, heads=256, dim=64, dstate=128``.  It is 3,145,728
@@ -75,11 +75,15 @@ def _active_indices(
     if requested_indices is None:
         # Spread flushes across the decode batch. This deliberately avoids
         # rewarding an implementation that happens to front- or back-load work.
-        return [(2 * i + 1) * batch // (2 * active_requests) for i in range(active_requests)]
+        return [
+            (2 * i + 1) * batch // (2 * active_requests) for i in range(active_requests)
+        ]
     if len(requested_indices) < active_requests:
         raise ValueError("active-request-indices needs one entry per active request")
     indices = requested_indices[:active_requests]
-    if len(set(indices)) != len(indices) or any(index < 0 or index >= batch for index in indices):
+    if len(set(indices)) != len(indices) or any(
+        index < 0 or index >= batch for index in indices
+    ):
         raise ValueError("active-request-indices must be unique indices in [0, batch)")
     return indices
 
@@ -93,22 +97,21 @@ def _build_call(
     dstate: int,
     heads_per_group: int,
     max_window: int,
-    flush_count: int,
+    replay_prefix_len: int,
     active_requests: int,
     requested_indices: list[int] | None,
     alias_layers: bool,
 ):
     if not 0 <= active_requests <= batch:
         raise ValueError("active_requests must be in [0, batch]")
-    if not 0 <= flush_count <= max_window:
-        raise ValueError("flush_count must be in [0, max_window]")
+    if not 0 <= replay_prefix_len <= max_window:
+        raise ValueError("replay_prefix_len must be in [0, max_window]")
     if heads % heads_per_group:
         raise ValueError("heads must be divisible by heads_per_group")
     active_indices = _active_indices(batch, active_requests, requested_indices)
 
-    # One source slot plus one unique destination per active request.  An
-    # inactive request never reads these buffers, because the CUDA kernel
-    # tests flush_count before slot, pointer, or state accesses.
+    # One source slot plus one unique destination per active request. Requests
+    # outside the active-map prefix return before any cache or state access.
     state_slots = max(1, active_requests + 1)
     ring_buffer_len = max_window + 1
     groups = heads // heads_per_group
@@ -159,7 +162,7 @@ def _build_call(
     ring_start = torch.zeros(batch, device="cuda", dtype=torch.int32)
     counts = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
     if active_requests:
-        counts[active_indices_tensor] = flush_count
+        counts[active_indices_tensor] = replay_prefix_len
     active_request_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
     if active_requests:
         active_request_indices[:active_requests] = torch.tensor(
@@ -217,7 +220,7 @@ def _timing_kwargs(args: argparse.Namespace) -> dict[str, object]:
     common: dict[str, object] = {
         "dry_run_iters": args.warmup,
         "repeat_iters": args.iters,
-        # The no-op path reads only a 1 KiB count vector.  Cold-L2 flushing
+        # The empty-map path reads only 1 KiB of active-map entries. Cold-L2 flushing
         # measures an artificial cache-flush kernel, not the steady-state
         # graph/launch behavior under study.
         "cold_l2_cache": False,
@@ -239,7 +242,7 @@ def main() -> None:
     parser.add_argument("--dstate", type=int, default=128)
     parser.add_argument("--heads-per-group", type=int, default=1)
     parser.add_argument("--max-window", type=int, default=16)
-    parser.add_argument("--flush-count", type=int, default=1)
+    parser.add_argument("--replay-prefix-len", type=int, default=1)
     parser.add_argument(
         "--alias-layers",
         action="store_true",
@@ -250,7 +253,7 @@ def main() -> None:
         type=int,
         nargs="+",
         default=[0, 1, 2],
-        help="number of requests with non-negative flush count (default: 0 1 2)",
+        help="number of requests with non-negative replay prefix length (default: 0 1 2)",
     )
     parser.add_argument(
         "--active-request-indices",
@@ -287,7 +290,7 @@ def main() -> None:
             dstate=args.dstate,
             heads_per_group=args.heads_per_group,
             max_window=args.max_window,
-            flush_count=args.flush_count,
+            replay_prefix_len=args.replay_prefix_len,
             active_requests=active_requests,
             requested_indices=args.active_request_indices,
             alias_layers=args.alias_layers,
@@ -298,7 +301,7 @@ def main() -> None:
         print(
             f"active_requests={active_requests:3d}, "
             f"indices={active_indices}, "
-            f"flush_count={args.flush_count if active_requests else -1:2d}: "
+            f"replay_prefix_len={args.replay_prefix_len if active_requests else -1:2d}: "
             f"median {median_us:9.2f} us, std {stdev_us:7.2f} us"
         )
 
