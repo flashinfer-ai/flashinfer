@@ -1156,10 +1156,12 @@ def _exercise_public_paths(
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
     if case.q.dtype == _FP8:
+        policy = dict(wrapper._policy)
         case = _with_reference(
             case,
             qo_indptr=qo_indptr,
-            splits_kv=int(dict(wrapper._policy)["splits_kv"]),
+            splits_kv=int(policy["splits_kv"]),
+            num_insts_kv=int(policy["num_insts_kv"]),
         )
     eager = _run_case(wrapper, case)
     _assert_case_correct(eager, case)
@@ -1195,6 +1197,7 @@ def _with_reference(
     q: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     splits_kv: int = 1,
+    num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
 ):
     """Return a case whose oracle reflects its current mutable Q/K/V data."""
 
@@ -1215,6 +1218,7 @@ def _with_reference(
             window_left=case.window_left,
             qo_indptr=qo_indptr,
             splits_kv=splits_kv,
+            num_insts_kv=num_insts_kv,
         )
     else:
         reference = _decode_reference(
@@ -4417,7 +4421,7 @@ def test_attention_ts_decode_head_dim_gqa_product(
     )
 
 
-@pytest.mark.parametrize("head_dim", (64, 128), ids=lambda value: f"d{value}")
+@pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
 @pytest.mark.parametrize("head_ratio", (33, 65), ids=lambda value: f"gqa{value}")
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU

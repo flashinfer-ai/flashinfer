@@ -170,6 +170,7 @@ def _decode_policy_from_config(
         ),
         ("tile_size_q", int(config.tile_size_q)),
         ("tile_size_kv", int(config.tile_size_kv)),
+        ("num_insts_kv", int(config.num_insts_kv)),
         ("use_split_kv", bool(config.use_split_kv)),
         ("splits_kv", int(config.splits_kv)),
         ("max_splits_kv", int(config.max_splits_kv)),
