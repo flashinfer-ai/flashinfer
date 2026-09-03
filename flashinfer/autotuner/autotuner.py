@@ -4,6 +4,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import logging
 import itertools
 import json
 import os
@@ -1639,12 +1640,20 @@ class AutoTuner:
                 # Record the cache miss config.
                 # Expect no cache miss in inference. Thus, any cache miss should be recorded.
                 if not is_cache_hit:
-                    logger.debug(
-                        f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
-                    )
-                    logger.debug(
-                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[AutoTuner]: Using fallback tactic for %s with input "
+                            "shapes %s; generated key %s",
+                            custom_op,
+                            input_shapes,
+                            AutoTuner._get_cache_key(
+                                custom_op,
+                                runners[0],
+                                input_shapes,
+                                tuning_config,
+                                runners[0].get_cache_key_extras(inputs),
+                            ),
+                        )
 
                     # If the user has loaded an autotune cache (via
                     # ``autotune(cache=...)``) or warmed up profiling
@@ -1667,14 +1676,17 @@ class AutoTuner:
                     # ``ProfilingCacheKey`` instances and ``_file_configs``
                     # keys are ``str((custom_op, runner_class_name, profile))``,
                     # so we filter by ``custom_op`` on each.
-                    op_has_profiling = any(
+                    # Both probes are O(cache size); `or` short-circuits, and the
+                    # file scan is skipped entirely when no config file is loaded.
+                    has_tune_data = any(
                         k.custom_op == custom_op for k in self.profiling_cache
+                    ) or (
+                        bool(self._file_configs)
+                        and any(
+                            k.startswith(f"({custom_op!r}, ")
+                            for k in self._file_configs
+                        )
                     )
-                    file_key_op_prefix = f"({repr(custom_op)}, "
-                    op_has_file = any(
-                        k.startswith(file_key_op_prefix) for k in self._file_configs
-                    )
-                    has_tune_data = op_has_profiling or op_has_file
                     if has_tune_data:
                         try:
                             signature = self._find_nearest_profile(
