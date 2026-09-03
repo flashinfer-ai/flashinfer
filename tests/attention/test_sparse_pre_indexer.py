@@ -813,3 +813,23 @@ def test_rejects_a_tensor_with_no_axes(which):
     case[key] = case[key].flatten()[0].clone()  # rank zero
     match = "at least one axis" if which == "cos_sin_cache" else "one axis or three"
     _expect_rejected(case, match)
+
+
+def test_rejects_a_rotary_table_with_no_rows():
+    """A table of no rows passes the width check and leaves nothing to read.
+    The kernel holds a coordinate at the last row, and an empty table has
+    none."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8)
+    case["table"] = case["table"][:0].contiguous()
+    _expect_rejected(case, "at least one row")
+
+
+def test_rejects_a_compress_ratio_that_is_not_an_int32():
+    """The kernel takes the ratio as int32 while the reciprocal it scales by is
+    formed from the original, so a value past int32 pools by one ratio and
+    scales by another."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8)
+    case["compress_ratio"] = 4294967297
+    _expect_rejected(case, "fit in 32 bits")
