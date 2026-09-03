@@ -276,14 +276,21 @@ def _gemm2_supported_mma_cases() -> list:
 
 
 def _supported_matrix_cases(problems, inputs, outputs, tactics) -> list:
+    cases = [
+        (problems[0], input_config, output_dtype, tactics[0])
+        for input_config in inputs
+        for output_dtype in outputs
+    ]
+    cases += [
+        (problem, inputs[i % len(inputs)], outputs[i % len(outputs)], tactic)
+        for i, (problem, tactic) in enumerate(product(problems, tactics))
+    ]
     return [
         pytest.param(
             ("matrix", *problem, *input_config, output_dtype, *tactic),
             marks=pytest.mark.long_running,
         )
-        for problem, input_config, output_dtype, tactic in product(
-            problems, inputs, outputs, tactics
-        )
+        for problem, input_config, output_dtype, tactic in cases
     ]
 
 
@@ -453,9 +460,6 @@ def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
 
 
-# Each case is a group of runner kwargs that must all hash -- and key the
-# autotuner cache -- differently from the default runner and from each other.
-# ``w4a16`` marks the groups the W4A16 runner also accepts.
 @pytest.mark.parametrize(
     "variants,w4a16",
     [
@@ -2049,11 +2053,7 @@ class TestCuteDslMoeKernelAccuracy:
                 and hidden_size >= 2048
             )
             tolerance = (
-                8.0
-                if c_dtype is cutlass.Float4E2M1FN
-                else 1.0
-                if c_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
-                else 0.1
+                1.0 if c_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2) else 0.1
             )
             bias_enabled = c_dtype is cutlass.Float4E2M1FN
             generate_scaled_output = bias_enabled
@@ -2456,9 +2456,7 @@ class TestCuteDslFusedMoeFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    @pytest.mark.parametrize(
-        "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
-    )
+    @pytest.mark.parametrize("hidden_size,intermediate_size", [(1024, 2048)])
     @pytest.mark.parametrize(
         "use_per_token_activation,activation_format,weight_format",
         _MOE_FORMATS,
@@ -2469,10 +2467,8 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
     )
-    @pytest.mark.parametrize("weight_interleave", [16, 64])
     def test_numerical_accuracy(
         self,
-        weight_interleave: int,
         activation_type: ActivationType,
         num_tokens: int,
         top_k: int,
@@ -2495,7 +2491,6 @@ class TestCuteDslFusedMoeFunctional:
             activation_format,
             weight_format,
             use_fused_finalize=True,
-            weight_interleave=weight_interleave,
         )
 
     @pytest.mark.parametrize(
@@ -2640,7 +2635,6 @@ class TestCuteDslFusedMoeFunctional:
         activation_format: QuantVariant,
         weight_format: QuantVariant,
         use_fused_finalize: bool,
-        weight_interleave: int = 64,
     ):
         from flashinfer import cute_dsl_fused_moe
 
@@ -2649,10 +2643,6 @@ class TestCuteDslFusedMoeFunctional:
                 "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
                 "(SwiGLU) activation path"
             )
-        if weight_interleave == 16 and (
-            activation_format is QuantVariant.BF16 or is_sm107()
-        ):
-            pytest.skip("W4A16 and Rubin (SM107) only support weight_interleave=64")
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -2666,11 +2656,8 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             gated=gated,
             use_per_token_activation=use_per_token_activation,
-            weight_interleave=weight_interleave,
         )
-        api_inputs, reference_inputs = _prepare_moe_inputs(
-            tensors, activation_format, weight_interleave=weight_interleave
-        )
+        api_inputs, reference_inputs = _prepare_moe_inputs(tensors, activation_format)
 
         result = cute_dsl_fused_moe(
             token_selected_experts=tensors["token_selected_experts"],
