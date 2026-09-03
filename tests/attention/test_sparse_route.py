@@ -761,7 +761,12 @@ def test_a_route_covers_more_rows_than_one_grid_can_hold(path):
     """Rows go on the grid's y dimension, which stops at 65535 on every compute
     capability, and a row is a query token. A long-context step goes past that,
     so the rows a grid cannot cover are walked by a stride rather than dropped
-    or refused."""
+    or refused.
+
+    Every output each entry point writes is compared against the reference, not
+    just the first: a stride that loses rows in the physical route or in the
+    packed mask would not show in the logical one.
+    """
     rows, ratio, topk = 70000, 4, 2
     assert rows > 65535
     blocks = torch.zeros(rows, topk, dtype=torch.int32, device=DEV)
@@ -770,44 +775,60 @@ def test_a_route_covers_more_rows_than_one_grid_can_hold(path):
     token_to_req = torch.zeros(rows, dtype=torch.int32, device=DEV)
     width = topk * ratio + ratio - 1
     page_size, pages = 8, 8
+    num_slots = pages * page_size
     table = torch.arange(pages, dtype=torch.int32, device=DEV).reshape(1, pages)
-    logical = flashinfer.expand_block_route(
-        blocks, positions, lengths, token_to_req, ratio
+
+    want_logical = _expand_reference(blocks, positions, lengths, token_to_req, ratio)
+    want_route, want_mask = _route_reference(
+        want_logical, token_to_req, table, page_size, num_slots, rows
     )
+
     if path == "expand":
-        out = logical
+        got = flashinfer.expand_block_route(
+            blocks, positions, lengths, token_to_req, ratio
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(got, want_logical, rtol=0, atol=0)
+        # A row that the stride skipped would be left as -1 rather than routed.
+        assert int((got[-1] >= 0).sum()) > 0, got[-1].tolist()
+        return
+
+    route = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+    mask = torch.empty(rows * (-(-width // 8)), dtype=torch.uint8, device=DEV)
+    if path == "blocks":
+        logical = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            logical,
+            route,
+            mask,
+            ratio,
+            page_size,
+            num_slots,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(logical, want_logical, rtol=0, atol=0)
     else:
-        route = torch.empty(rows, width, dtype=torch.int32, device=DEV)
-        mask = torch.empty(rows * (-(-width // 8)), dtype=torch.uint8, device=DEV)
-        if path == "blocks":
-            fused = torch.empty(rows, width, dtype=torch.int32, device=DEV)
-            flashinfer.qsa_route_from_blocks(
-                blocks,
-                positions,
-                lengths,
-                token_to_req,
-                table,
-                fused,
-                route,
-                mask,
-                ratio,
-                page_size,
-                pages * page_size,
-            )
-            out = fused
-        else:
-            flashinfer.qsa_route_from_logical(
-                logical,
-                token_to_req,
-                table,
-                route,
-                mask,
-                rows,
-                page_size,
-                pages * page_size,
-            )
-            out = route
-    torch.cuda.synchronize()
-    # Every row is the same query, so every row comes out the same.
-    assert bool((out == out[0]).all()), out[-1].tolist()
-    assert int((out[-1] >= 0).sum()) > 0, out[-1].tolist()
+        flashinfer.qsa_route_from_logical(
+            want_logical,
+            token_to_req,
+            table,
+            route,
+            mask,
+            rows,
+            page_size,
+            num_slots,
+        )
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(route, want_route, rtol=0, atol=0)
+    torch.testing.assert_close(mask, want_mask, rtol=0, atol=0)
+    # The last row really was written: its first mask byte carries the columns
+    # the expansion filled. The byte after it covers columns 8 to 10, which this
+    # selection leaves empty, so it is zero for every row.
+    nbytes = -(-width // 8)
+    assert int(mask[(rows - 1) * nbytes]) != 0, mask[(rows - 1) * nbytes].item()
