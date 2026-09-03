@@ -81,6 +81,10 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   TVM_FFI_ICHECK(head_dim == 128 || head_dim == 256)
       << "qsa_pre_indexer builds a head dimension of 128 or 256, got " << head_dim;
   TVM_FFI_ICHECK_GT(compress_ratio, 0) << "compress_ratio must be positive";
+  // Narrowed to int32 for the kernel while the reciprocal is formed from the
+  // original, so a value past int32 would pool by one ratio and scale by
+  // another.
+  TVM_FFI_ICHECK_LE(compress_ratio, 2147483647LL) << "compress_ratio must fit in 32 bits";
   TVM_FFI_ICHECK_EQ(q.size(1), num_q_heads * head_dim) << "q must hold every head of a token";
   TVM_FFI_ICHECK_EQ(k.size(1), head_dim) << "k and q_out head_dim must match";
   TVM_FFI_ICHECK_EQ(q_out.size(0), num_tokens);
@@ -99,6 +103,9 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   // dimension; a row of any other width silently shifts every position.
   TVM_FFI_ICHECK_EQ(cos_sin_cache.size(cos_sin_cache.ndim() - 1), head_dim / 2)
       << "the rotary table is pair-major, so a row is head_dim / 2 wide";
+  // A table of no rows passes the width check and leaves nothing to read: the
+  // kernel holds a coordinate at the last row, and an empty table has none.
+  TVM_FFI_ICHECK_GT(cos_sin_cache.numel(), 0) << "the rotary table holds at least one row";
   // Three int64 coordinates sit after the row, in units of the row's own type.
   const int64_t coord_width =
       cache_has_rope_pos ? 3 * static_cast<int64_t>(sizeof(int64_t)) / get_element_size(state_cache)
