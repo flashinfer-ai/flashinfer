@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -5872,17 +5873,35 @@ def compile_w4a16_activation(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        fc1_fake,
-        activated_fake,
-        Int32(compile_rows),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.activation",
-            1,
-            cache_key,
-        ),
+
+    # TVM-FFI env-stream compile through the on-disk cache (see the topk-sum
+    # entry for the full rationale). fc1/activated are already DLTensor
+    # params, so they double as the env-stream anchors; their baked fake
+    # shapes never bound a device-side access (the kernel indexes by
+    # ``active_rows``), so launches pass views of the real buffers cut to
+    # the baked shapes.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            fc1_fake,
+            activated_fake,
+            Int32(compile_rows),
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    # The on-disk artifact name must be injective over every compile fact.
+    # ``cache_key`` also carries the swiglu scalars, fast-math and gating
+    # flags, and the row-specialization bucket, so the readable facts are
+    # suffixed with a digest of the full key.
+    key_digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        f"activation_{element_dtype}_i{intermediate_size}_{activation}_{key_digest}",
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16ActivationCompileResult(
         compiled=compiled,
