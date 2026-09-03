@@ -29,7 +29,7 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Tuple, Union
+from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -404,6 +404,21 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
+_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+_CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_SUPPORTED_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.SwigluStep,
+    ActivationType.Geglu,
+    ActivationType.GegluTanh,
+    ActivationType.Situ,
+    ActivationType.Relu2,
+    ActivationType.Identity,
+    ActivationType.Gelu,
+    ActivationType.Relu,
+    ActivationType.Silu,
+)
+
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
 # Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
 _CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
@@ -500,6 +515,101 @@ class TrtllmFp4Config:
 
     def __repr__(self) -> str:
         return "TrtllmFp4Config()"
+
+
+@dataclass(frozen=True)
+class CakeWarpDecodeConfig:
+    """Explicit Cake NVFP4 warp-decode backend for exact SM103.
+
+    This backend is intentionally narrow: it accepts only the two calibrated
+    expert geometries documented by :class:`CakeWarpDecodeRunner`, 1--32
+    tokens, unpacked precomputed routing, and the default SwiGLU semantics.
+    It is never part of the default backend list; users opt in with
+    ``CakeWarpDecodeConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for ``QuantVariant.NVFP4``. This keeps one
+    quantized representation usable by both runners.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeWarpDecodeConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 103
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        variant: QuantVariant = QuantVariant.NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM NVFP4 physical weight view.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
+        also be registered for ``"trtllm_fp4_routed"`` without copying.
+        """
+        if variant is not QuantVariant.NVFP4:
+            raise ValueError(
+                "Cake warp decode weight preparation requires "
+                f"QuantVariant.NVFP4, got {variant!r}."
+            )
+        if activation is not None and activation != SwiGLU():
+            raise ValueError(
+                "Cake warp decode weight preparation supports only default SwiGLU()."
+            )
+        geometry = (hidden_size, intermediate_size, num_local_experts)
+        if geometry not in ((2048, 512, 512), (2048, 1536, 60)):
+            raise ValueError(
+                "Cake warp decode supports only (hidden_size, intermediate_size, "
+                "num_local_experts) = (2048, 512, 512) or (2048, 1536, 60); "
+                f"got {geometry}."
+            )
+        return TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            variant=QuantVariant.NVFP4,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=SwiGLU(),
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        variant: QuantVariant = QuantVariant.NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if variant is not QuantVariant.NVFP4:
+            raise ValueError(
+                "Cake warp decode activation preparation requires "
+                f"QuantVariant.NVFP4, got {variant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            variant=QuantVariant.NVFP4,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeWarpDecodeConfig(backend='cake')"
 
 
 @dataclass(frozen=True)
@@ -739,6 +849,94 @@ class CutlassBf16Config:
 
     def __repr__(self) -> str:
         return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileBf16Config:
+    """cuTile BF16 backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
+        from .prepare import prepare_cutile_bf16_weights
+
+        return prepare_cutile_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Config:
+    """cuTile NVFP4-weight x NVFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        from .prepare import prepare_cutile_nvfp4_weights
+
+        return prepare_cutile_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Config()"
 
 
 @dataclass(frozen=True)
@@ -1113,7 +1311,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
+    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -1128,22 +1326,23 @@ class CuteDslConfig:
         w1_bf16,
         w2_bf16,
         *,
+        variant: QuantVariant = QuantVariant.NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
+        """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
-        Register the result with ``MoEWeightPack.prepare_for("cute_dsl_nvfp4", ...)``.
-        See :func:`flashinfer.fused_moe.prepare.prepare_cute_dsl_nvfp4_weights`.
+        Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         """
-        from .prepare import prepare_cute_dsl_nvfp4_weights
+        from .prepare import prepare_cute_dsl_weights
 
-        return prepare_cute_dsl_nvfp4_weights(
+        return prepare_cute_dsl_weights(
             w1_bf16,
             w2_bf16,
+            variant=variant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1241,12 +1440,15 @@ class B12xW4A16Config:
 
 # Union type for backend config
 BackendConfigType = Union[
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
@@ -1261,12 +1463,15 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,

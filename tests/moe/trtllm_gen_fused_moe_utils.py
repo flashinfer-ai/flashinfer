@@ -684,6 +684,7 @@ class FP4Moe(Moe):
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm2_weights_fp4_shuffled.append(
                 gemm2_weights_fp4[i]
@@ -696,6 +697,7 @@ class FP4Moe(Moe):
                 gemm2_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm2_scales_fp4_shuffled.append(
                 block_scale_interleave(
@@ -712,6 +714,7 @@ class FP4Moe(Moe):
                     self._cache_permute_indices,
                     gemm2_bias_for_kernel[i].reshape(-1, 1),
                     epilogue_tile_m,
+                    is_gated_act_gemm=is_gated_activation(args.activation_type),
                 )
                 gemm2_bias_shuffled.append(
                     gemm2_bias_for_kernel[i]
@@ -1087,6 +1090,7 @@ class MxInt4BlockScaleMoe(Moe):
                 self._cache_permute_indices,
                 args.gemm2_weights[i].view(torch.uint8),
                 epilogue_tile_m,
+                is_gated_act_gemm=True,
             )
             gemm2_weights_shuffled = (
                 args.gemm2_weights[i]
@@ -1099,6 +1103,7 @@ class MxInt4BlockScaleMoe(Moe):
                 args.gemm2_scales[i].view(torch.bfloat16),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
+                is_gated_act_gemm=True,
             )
             gemm2_scales_shuffled.append(
                 block_scale_interleave(
@@ -2120,6 +2125,7 @@ class BF16Moe(Moe):
                     self._cache_permute_indices,
                     args.gemm2_weights[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=is_gated_activation(args.activation_type),
                 )
                 tmp_weights2 = (
                     args.gemm2_weights[i]

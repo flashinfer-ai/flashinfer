@@ -36,7 +36,6 @@ Both are SM100 (B200-class Blackwell) only.
 
 import contextlib
 import functools
-import importlib.util
 import os
 from typing import Sequence, Tuple
 
@@ -44,6 +43,7 @@ import numpy as np
 import torch
 
 from ..api_logging import flashinfer_api
+from ..cute_dsl.availability import is_cute_dsl_available
 from ..trace.templates.attn_scores import (
     fp4_paged_mqa_logits_trace,
     fp8_paged_mqa_logits_trace,
@@ -504,10 +504,7 @@ def _cached_max_smem_per_block(device_index: int) -> int:
     return 232448  # sm_100a fallback
 
 
-_CUTE_DSL_AVAILABLE = (
-    importlib.util.find_spec("cutlass") is not None
-    and importlib.util.find_spec("cutlass.cute") is not None
-)
+_CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 # SM100 / SM103 only (B200-class Blackwell)
 _SM100_CCS = [100, 103]

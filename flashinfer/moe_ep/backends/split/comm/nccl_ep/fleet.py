@@ -17,6 +17,7 @@ from ..... import _require_built
 from .....errors import MoEEpFaultToleranceUnsupportedError, MoEEpNotBuiltError
 from .....core.validation.common import (
     validate_arch_for_backend,
+    validate_ll_hidden_size,
     validate_bootstrap_world_size,
     validate_fleet_params,
 )
@@ -160,6 +161,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     ) -> None:
         _require_built("nccl_ep")
         validate_arch_for_backend("nccl_ep")
+        validate_ll_hidden_size(params, "nccl_ep")
         validate_bootstrap_world_size(bootstrap)
 
         # HT: clamp the per-rank dispatch budget to the library's build-time cap so
