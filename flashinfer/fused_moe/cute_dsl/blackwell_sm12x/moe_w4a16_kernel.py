@@ -10,7 +10,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 

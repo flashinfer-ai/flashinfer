@@ -88,7 +88,9 @@ def test_disk_name_digest_sensitivity():
     seen = {base}
     for perturbed_key in _perturbations(_BASE_KEY):
         name = _w4a16_disk_kernel_name("activation", "bf16_i768_silu", perturbed_key)
-        assert name != base, f"key perturbation did not change the name: {perturbed_key}"
+        assert name != base, (
+            f"key perturbation did not change the name: {perturbed_key}"
+        )
         assert name not in seen, f"two distinct keys collided on {name}"
         seen.add(name)
 
@@ -138,9 +140,9 @@ def test_topk_sum_disk_round_trip():
     clear_w4a16_kernel_cache()
     compile_w4a16_topk_sum(m=m, topk=topk, hidden_size=hidden, element_dtype="bf16")
     after_cold = _w4a16_module_artifacts()
-    assert any(
-        name.startswith("topk_sum_") for name in after_cold
-    ), "cold compile did not persist a topk_sum artifact"
+    assert any(name.startswith("topk_sum_") for name in after_cold), (
+        "cold compile did not persist a topk_sum artifact"
+    )
 
     # A cleared in-process cache forces the next compile through the disk
     # layer; the artifact set (names and mtimes) must be served unchanged.
