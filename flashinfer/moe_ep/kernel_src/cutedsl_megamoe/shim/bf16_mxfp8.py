@@ -477,7 +477,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
 
 
 def bf16_mxfp8_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16Mxfp8SymmBuffer,
@@ -486,12 +486,22 @@ def bf16_mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    if y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
+    in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
+    if y is None and not in_kernel_reduce:
+        # Without the in-kernel reduce the kernel emits per-topk partials, so
+        # the top-k sum needs its own destination outside the workspace.
+        raise ValueError(
+            "y=None requires in_kernel_fc2_reduce=True; the explicit top-k sum "
+            "cannot be returned as a workspace view."
+        )
+    if y is not None and (
+        y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
+    ):
         raise ValueError(f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden}).")
     if (
         gate_up_clamp is not None
@@ -512,11 +522,16 @@ def bf16_mxfp8_mega_moe(
         num_tokens=n,
         sync=sync,
     )
-    y.copy_(
-        result[:, 0]
-        if symm_buffer._frontend.config.in_kernel_fc2_reduce
-        else result.sum(dim=1)
-    )
+    if not in_kernel_reduce:
+        y.copy_(result.sum(dim=1))
+        return None
+    reduced = result[:, 0]
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        return reduced
+    y.copy_(reduced)
+    return None
 
 
 def bf16_mxfp8_mega_launch_thunk(
