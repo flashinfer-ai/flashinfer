@@ -52,7 +52,8 @@ layout, and the CUDA-graph recipe.
 import contextlib
 import functools
 import os
-from typing import Sequence, Tuple
+import warnings
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -120,7 +121,9 @@ def _validate_num_epi_subtiles(
     in production.
     """
     if num_epi_subtiles < 1:
-        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
+        raise ValueError(
+            f"{fn_name}: num_epi_subtiles must be >= 1, got {num_epi_subtiles}"
+        )
     if (
         num_heads % num_epi_subtiles != 0
         or (num_heads // num_epi_subtiles) % _EPI_SUBTILE_UNROLL != 0
@@ -145,7 +148,8 @@ def _validate_weights(
     if weights.dim() != 2 or tuple(weights.shape) != expected:
         raise ValueError(
             f"{fn_name}: weights must be {list(expected)} "
-            f"(batch_size*next_n, num_heads); got {list(weights.shape)}."
+            f"(batch_size*next_n, num_heads; batch_size={batch_size} and "
+            f"next_n={next_n} inferred from q.shape); got {list(weights.shape)}."
         )
     if weights.dtype != torch.float32:
         raise ValueError(
@@ -255,10 +259,25 @@ def _cached_num_sms(device_index: int) -> int:
     return get_device_sm_count(torch.device("cuda", device_index))
 
 
+def _validate_on_device(device: torch.device, fn_name: str, **tensors) -> None:
+    """Every tensor argument must live on q's exact device.
+
+    ``is_cuda`` alone admits a tensor on another GPU; the kernel launched on
+    q's device would then dereference peer pointers -- working or faulting
+    depending on peer access, silently either way."""
+    for name, t in tensors.items():
+        if t.device != device:
+            raise ValueError(
+                f"{fn_name}: {name} is on {t.device} but q is on {device}; "
+                f"all tensor arguments must be on q's device."
+            )
+
+
 def _validate_paged_inputs(
     context_lens: torch.Tensor,
     block_table: torch.Tensor,
     batch_size: int,
+    fn_name: str,
 ) -> None:
     """Validate context_lens / block_table (cheap host-side checks; no device sync).
 
@@ -276,23 +295,38 @@ def _validate_paged_inputs(
     ``FLASHINFER_VALIDATE_INPUTS`` is set."""
     if not (context_lens.is_cuda and context_lens.dtype == torch.int32):
         raise ValueError(
-            f"context_lens must be an int32 CUDA tensor, got "
+            f"{fn_name}: context_lens must be an int32 CUDA tensor, got "
             f"dtype={context_lens.dtype}, device={context_lens.device}"
         )
     if not (block_table.is_cuda and block_table.dtype == torch.int32):
         raise ValueError(
-            f"block_table must be an int32 CUDA tensor, got "
+            f"{fn_name}: block_table must be an int32 CUDA tensor, got "
             f"dtype={block_table.dtype}, device={block_table.device}"
         )
     if context_lens.dim() != 1 or context_lens.shape[0] != batch_size:
         raise ValueError(
-            f"context_lens must be 1-D with shape[0] == batch_size ({batch_size}) "
-            f"inferred from q.shape[0]; got shape {tuple(context_lens.shape)}"
+            f"{fn_name}: context_lens must be 1-D with shape[0] == batch_size "
+            f"({batch_size}) inferred from q.shape[0]; got shape "
+            f"{tuple(context_lens.shape)}"
         )
     if block_table.dim() != 2 or block_table.shape[0] != batch_size:
         raise ValueError(
-            f"block_table must be 2-D with shape[0] == batch_size ({batch_size}) "
-            f"inferred from q.shape[0]; got shape {tuple(block_table.shape)}"
+            f"{fn_name}: block_table must be 2-D with shape[0] == batch_size "
+            f"({batch_size}) inferred from q.shape[0]; got shape "
+            f"{tuple(block_table.shape)}"
+        )
+    # The kernels are compiled against compact (contiguous) index tensors; a
+    # strided view reaches the FFI binding with a bare layout error otherwise.
+    if not context_lens.is_contiguous():
+        raise ValueError(
+            f"{fn_name}: context_lens must be contiguous; got stride "
+            f"{tuple(context_lens.stride())}. Call .contiguous() first."
+        )
+    if not block_table.is_contiguous():
+        raise ValueError(
+            f"{fn_name}: block_table must be contiguous (the kernel is compiled "
+            f"against a compact row-major table); got stride "
+            f"{tuple(block_table.stride())}. Call .contiguous() first."
         )
 
 
@@ -341,24 +375,33 @@ def _validate_schedule_meta_fresh(
         )
 
 
-def _validate_schedule_meta(schedule_meta: torch.Tensor, num_sms: int, device) -> None:
+def _validate_schedule_meta(
+    schedule_meta: torch.Tensor, num_sms: int, device, fn_name: str
+) -> None:
     """A caller-supplied schedule_meta must be an int32 CUDA [num_sms+1, 2] tensor;
     a smaller one causes an out-of-bounds schedule read in the kernel."""
     if not (schedule_meta.is_cuda and schedule_meta.dtype == torch.int32):
         raise ValueError(
-            f"schedule_meta must be an int32 CUDA tensor, got "
+            f"{fn_name}: schedule_meta must be an int32 CUDA tensor, got "
             f"dtype={schedule_meta.dtype}, device={schedule_meta.device}"
         )
     if tuple(schedule_meta.shape) != (num_sms + 1, 2):
         raise ValueError(
-            f"schedule_meta must have shape ({num_sms + 1}, 2) for this device; "
-            f"got {tuple(schedule_meta.shape)}. Use compute_paged_mqa_logits_schedule()."
+            f"{fn_name}: schedule_meta must have shape ({num_sms + 1}, 2) for this "
+            f"device; got {tuple(schedule_meta.shape)}. "
+            f"Use compute_paged_mqa_logits_schedule()."
+        )
+    if not schedule_meta.is_contiguous():
+        raise ValueError(
+            f"{fn_name}: schedule_meta must be contiguous; got stride "
+            f"{tuple(schedule_meta.stride())}. "
+            f"Use compute_paged_mqa_logits_schedule() or pass a contiguous buffer."
         )
     # is_cuda above only says "some CUDA device"; without this a schedule built
     # on another GPU reaches the FFI binding before anything complains.
     if schedule_meta.device != torch.device(device):
         raise ValueError(
-            f"schedule_meta.device ({schedule_meta.device}) must match "
+            f"{fn_name}: schedule_meta.device ({schedule_meta.device}) must match "
             f"q.device ({device})"
         )
 
@@ -369,6 +412,7 @@ def _validate_out(
     padded_ctx_len: int,
     device: torch.device,
     out_dtype: torch.dtype,
+    fn_name: str,
 ) -> None:
     """Validate a caller-provided ``out=`` buffer.
 
@@ -377,17 +421,28 @@ def _validate_out(
     :func:`padded_context_len`) and ``rows`` rows — otherwise the store spills
     past each row / past the buffer (silent corruption or illegal address)."""
     if out.device != device:
-        raise ValueError(f"out.device ({out.device}) must match q.device ({device})")
+        raise ValueError(
+            f"{fn_name}: out.device ({out.device}) must match q.device ({device})"
+        )
     if out.dtype != out_dtype:
         raise ValueError(
-            f"out.dtype ({out.dtype}) must match output_dtype ({out_dtype})"
+            f"{fn_name}: out.dtype ({out.dtype}) must match output_dtype ({out_dtype})"
         )
     if out.dim() != 2 or out.shape[0] < rows or out.shape[1] < padded_ctx_len:
         raise ValueError(
-            f"out must be at least ({rows}, {padded_ctx_len}); the kernel writes into "
-            f"the SPLIT_KV=256-padded trailing region. Use "
+            f"{fn_name}: out must be at least ({rows}, {padded_ctx_len}); the "
+            f"kernel writes into the SPLIT_KV=256-padded trailing region. Use "
             f"padded_context_len(max_context_len) for the column count. "
             f"Got shape {tuple(out.shape)}."
+        )
+    # The kernel is compiled against a row-major output with unit inner stride;
+    # a column-strided view would reach the FFI binding with a bare layout
+    # error (or worse), so reject it here with the allocation recipe.
+    if out.stride(1) != 1:
+        raise ValueError(
+            f"{fn_name}: out's innermost stride must be 1 (row-contiguous); got "
+            f"strides {tuple(out.stride())}. Allocate with torch.empty((rows, "
+            f"padded_context_len(max_context_len)), ...)."
         )
 
 
@@ -401,6 +456,7 @@ def _validate_paged_bounds(
     context_lens: torch.Tensor,
     max_context_len: int,
     block_size: int,
+    num_blocks: int,
     fn_name: str,
 ) -> None:
     """Debug-mode bounds checks that need the per-row ``context_lens``.
@@ -462,6 +518,29 @@ def _validate_paged_bounds(
             f"sequence's real pages are read but masked, so they may hold any "
             f"valid pool index (0 works)."
         )
+    # 3. Every block-table entry the kernel can READ must be a valid pool
+    #    index -- the classic stale-page bug. Per row r the kernel reads
+    #    columns [0, ceil(ctx_r/128)*pages_per_tile); entries beyond a row's
+    #    own read region are unconstrained. This path already paid the D2H
+    #    sync, so the value check rides along.
+    bt = block_table.cpu()
+    per_row_need = torch.tensor(
+        [-(-c // _COMPUTE_BLOCK_KV) * pages_per_tile for c in lens],
+        dtype=torch.int64,
+    )
+    read_mask = (
+        torch.arange(bt.shape[1], dtype=torch.int64)[None, :] < per_row_need[:, None]
+    )
+    used = bt[read_mask]
+    if used.numel():
+        lo, hi = int(used.min()), int(used.max())
+        if lo < 0 or hi >= num_blocks:
+            raise ValueError(
+                f"{fn_name}: block_table entries the kernel reads span "
+                f"[{lo}, {hi}] but kv_fused has only {num_blocks} blocks "
+                f"(valid indices 0..{num_blocks - 1}); a stale or out-of-pool "
+                f"page index is a device-side out-of-bounds READ."
+            )
 
 
 def _validate_phys_block_kv(block_size: int, fn_name: str) -> None:
@@ -560,7 +639,9 @@ def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
     this is not.
     """
     if not _CUTE_DSL_AVAILABLE:
-        raise RuntimeError(f"{fn_name} requires nvidia-cutlass-dsl")
+        raise RuntimeError(
+            f"{fn_name} requires nvidia-cutlass-dsl (pip install nvidia-cutlass-dsl)."
+        )
 
     if not _cached_dsl_targets_device(get_device_index(device)):
         major, minor = torch.cuda.get_device_capability(device)
@@ -731,7 +812,9 @@ if _CUTE_DSL_AVAILABLE:
             return _TORCH_TO_CUTLASS[dtype]
         except KeyError:
             raise ValueError(
-                f"Unsupported dtype for paged_mqa_logits: {dtype}"
+                f"Unsupported dtype for paged_mqa_logits: {dtype}; supported: "
+                f"{', '.join(str(k) for k in _TORCH_TO_CUTLASS)} (fp8 output/"
+                f"epi/acc additionally exclude bfloat16)."
             ) from None
 
 
@@ -1032,10 +1115,10 @@ def padded_context_len(max_context_len: int) -> int:
 
 def compute_paged_mqa_logits_schedule(
     context_lens: torch.Tensor,
-    device: torch.device = None,
+    device: Optional[torch.device] = None,
     *,
     use_gpu_kernel: bool = True,
-    out: torch.Tensor = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute the CTA schedule tensor for paged MQA logits kernels.
 
@@ -1068,12 +1151,33 @@ def compute_paged_mqa_logits_schedule(
     Returns:
         schedule_meta: [num_sms+1, 2] int32 on CUDA (``out`` if provided).
     """
+    if context_lens.dtype != torch.int32:
+        raise ValueError(
+            f"compute_paged_mqa_logits_schedule: context_lens must be int32 "
+            f"(matching fp8/fp4_paged_mqa_logits); got {context_lens.dtype}"
+        )
     if device is None:
         device = context_lens.device if context_lens.is_cuda else torch.device("cuda")
     device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # Normalize an index-less "cuda" to the current device so the out=
+        # device-equality check below compares like with like.
+        device = torch.device("cuda", torch.cuda.current_device())
     num_sms = _cached_num_sms(get_device_index(device))
+    if out is not None:
+        _validate_schedule_meta(
+            out, num_sms, device, "compute_paged_mqa_logits_schedule"
+        )
 
-    if use_gpu_kernel and _CUTE_DSL_AVAILABLE and context_lens.is_cuda:
+    # The GPU path additionally requires a DSL release that can target this
+    # device's architecture; otherwise fall back to CPU rather than fail deep
+    # inside cute.compile with a KeyError.
+    if (
+        use_gpu_kernel
+        and _CUTE_DSL_AVAILABLE
+        and context_lens.is_cuda
+        and _cached_dsl_targets_device(get_device_index(device))
+    ):
         if out is None:
             out = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
         _gpu_schedule(context_lens, out, num_sms)
@@ -1099,8 +1203,8 @@ def _check_fp8_paged_mqa_logits_supported(
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
-    schedule_meta: torch.Tensor = None,
-    out: torch.Tensor = None,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> bool:
     """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
 
@@ -1119,6 +1223,32 @@ def _check_fp8_paged_mqa_logits_supported(
     stay enforced even under ``skip_check=True`` because a too-small buffer is a
     silent out-of-bounds write.
     """
+    if q.dim() != 4:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: q must be 4-D [batch_size, next_n, num_heads, "
+            f"head_dim]; got {q.dim()}-D {tuple(q.shape)}. next_n is a separate "
+            f"dimension even for plain decode -- pass q.unsqueeze(1) for next_n=1."
+        )
+    if kv_fused.dim() != 4:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: kv_fused must be 4-D "
+            f"[num_blocks, block_size, 1, head_dim+4]; got {kv_fused.dim()}-D "
+            f"{tuple(kv_fused.shape)}."
+        )
+    if kv_fused.dtype != torch.uint8:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: kv_fused must be uint8 (fused bytes: values "
+            f"then per-token float32 scales); view your cache with "
+            f".view(torch.uint8) if it is stored as {kv_fused.dtype}."
+        )
+    _validate_on_device(
+        q.device,
+        "fp8_paged_mqa_logits",
+        kv_fused=kv_fused,
+        weights=weights,
+        context_lens=context_lens,
+        block_table=block_table,
+    )
     B, next_n, H, D = q.shape
     N = next_n * H
     block_size = kv_fused.shape[1]
@@ -1186,7 +1316,7 @@ def _check_fp8_paged_mqa_logits_supported(
             f"kv_fused must be [num_blocks, block_size, 1, head_dim+4={D + 4}] "
             f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
         )
-    _validate_paged_inputs(context_lens, block_table, B)
+    _validate_paged_inputs(context_lens, block_table, B, "fp8_paged_mqa_logits")
     return True
 
 
@@ -1204,8 +1334,8 @@ def fp8_paged_mqa_logits(
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
-    schedule_meta: torch.Tensor = None,
-    out: torch.Tensor = None,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -1408,11 +1538,23 @@ def fp8_paged_mqa_logits(
     kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
 
     _validate_paged_bounds(
-        block_table, context_lens, max_context_len, block_size, "fp8_paged_mqa_logits"
+        block_table,
+        context_lens,
+        max_context_len,
+        block_size,
+        num_blocks,
+        "fp8_paged_mqa_logits",
     )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
-        _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
+        _validate_out(
+            out,
+            B * next_n,
+            padded_ctx_len,
+            q.device,
+            output_dtype,
+            "fp8_paged_mqa_logits",
+        )
         logits = out[: B * next_n, :max_context_len]
     else:
         logits_full = torch.empty(
@@ -1420,16 +1562,23 @@ def fp8_paged_mqa_logits(
         )
         logits = logits_full[:, :max_context_len]
 
+    # Caller-supplied buffers are validated even for an empty batch, for the
+    # same reason as out= above: a malformed buffer is the caller's bug
+    # regardless of today's batch size.
+    if schedule_meta is not None:
+        _validate_schedule_meta(
+            schedule_meta, num_sms, q.device, "fp8_paged_mqa_logits"
+        )
+
     # Not just an optimization: the persistent kernel launches num_sms CTAs
     # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
-    # here. After the out= branch so a bad buffer still raises.
+    # here. After the buffer validation so a bad out/schedule still raises.
     if B == 0:
         return logits
 
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
     else:
-        _validate_schedule_meta(schedule_meta, num_sms, q.device)
         _validate_schedule_meta_fresh(
             schedule_meta, context_lens, "fp8_paged_mqa_logits"
         )
@@ -1482,8 +1631,8 @@ def _check_fp4_paged_mqa_logits_supported(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
-    schedule_meta: torch.Tensor = None,
-    out: torch.Tensor = None,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> bool:
     """Return True when the FP4 kernel supports this problem, else raise ``ValueError``.
 
@@ -1500,6 +1649,34 @@ def _check_fp4_paged_mqa_logits_supported(
     :func:`_check_fp8_paged_mqa_logits_supported` for why ``schedule_meta`` and
     ``out`` are validated in the API body rather than here.
     """
+    if q.dim() != 4:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: q must be 4-D [batch_size, next_n, num_heads, "
+            f"head_dim/2 packed]; got {q.dim()}-D {tuple(q.shape)}. next_n is a "
+            f"separate dimension even for plain decode -- pass q.unsqueeze(1) for "
+            f"next_n=1."
+        )
+    if kv_fused.dim() != 4:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: kv_fused must be 4-D "
+            f"[num_blocks, block_size, 1, head_dim/2 + 4]; got {kv_fused.dim()}-D "
+            f"{tuple(kv_fused.shape)}."
+        )
+    if kv_fused.dtype != torch.uint8:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: kv_fused must be uint8 (fused bytes: packed "
+            f"FP4 values then UE8M0 scales); view your cache with "
+            f".view(torch.uint8) if it is stored as {kv_fused.dtype}."
+        )
+    _validate_on_device(
+        q.device,
+        "fp4_paged_mqa_logits",
+        sf_q=sf_q,
+        kv_fused=kv_fused,
+        weights=weights,
+        context_lens=context_lens,
+        block_table=block_table,
+    )
     B, next_n, H, half_D = q.shape
     D = half_D * 2
     block_size = kv_fused.shape[1]
@@ -1587,7 +1764,7 @@ def _check_fp4_paged_mqa_logits_supported(
             f"{scales_per_token} scale-factor bytes (head_dim={D} from q, "
             f"sf_vec_size={sf_vec_size}); got shape {tuple(kv_fused.shape)}"
         )
-    _validate_paged_inputs(context_lens, block_table, B)
+    _validate_paged_inputs(context_lens, block_table, B, "fp4_paged_mqa_logits")
     return True
 
 
@@ -1607,8 +1784,8 @@ def fp4_paged_mqa_logits(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
-    schedule_meta: torch.Tensor = None,
-    out: torch.Tensor = None,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -1873,11 +2050,23 @@ def fp4_paged_mqa_logits(
     kv_flat = kv_fused.flatten(1)
 
     _validate_paged_bounds(
-        block_table, context_lens, max_context_len, block_size, "fp4_paged_mqa_logits"
+        block_table,
+        context_lens,
+        max_context_len,
+        block_size,
+        num_blocks,
+        "fp4_paged_mqa_logits",
     )
     padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
-        _validate_out(out, B * next_n, padded_ctx_len, q.device, output_dtype)
+        _validate_out(
+            out,
+            B * next_n,
+            padded_ctx_len,
+            q.device,
+            output_dtype,
+            "fp4_paged_mqa_logits",
+        )
         logits = out[: B * next_n, :max_context_len]
     else:
         logits_full = torch.empty(
@@ -1885,19 +2074,11 @@ def fp4_paged_mqa_logits(
         )
         logits = logits_full[:, :max_context_len]
 
-    # Not just an optimization: the persistent kernel launches num_sms CTAs
-    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
-    # here. After the out= branch so a bad buffer still raises.
-    if B == 0:
-        return logits
-
-    # The scheduler enumerates batch*num_atoms q_atom tasks, so it must be built
-    # from the per-atom context lengths. Identity when num_atoms == 1, which
-    # keeps the unsplit path (and any caller-supplied schedule) unchanged.
-    sched_ctx = _expand_context_lens(context_lens, num_atoms, atom)
-    if schedule_meta is None:
-        schedule_meta = compute_paged_mqa_logits_schedule(sched_ctx, device=q.device)
-    else:
+    # Caller-supplied buffers are validated even for an empty batch, for the
+    # same reason as out= above -- and the split rejection with them: a
+    # schedule that cannot be right at any batch size should not wait for the
+    # batch to fill before failing.
+    if schedule_meta is not None:
         if num_atoms > 1:
             # A split makes the scheduler describe batch*num_atoms rows, but the
             # schedule's shape ([num_sms+1, 2]) is unchanged, so a schedule built
@@ -1909,18 +2090,34 @@ def fp4_paged_mqa_logits(
             # what commit 29ca0629 measured when it removed the old caller-side
             # split). The freshness check that would catch it is opt-in and
             # skipped under CUDA-graph capture, so it cannot be relied on.
-            # Reject instead.
+            # Reject instead, leading with the fix.
             raise ValueError(
-                f"fp4_paged_mqa_logits: next_n={next_n} runs as {num_atoms} "
-                f"atoms of {atom} on this device (an atom of 4 needs Rubin "
-                f"SM107+), so the schedule must describe {exp_B} rows rather "
-                f"than {B}. A schedule_meta built from context_lens is silently "
-                f"wrong here and can hang the persistent kernel. Omit "
-                f"schedule_meta so it is computed correctly (this also holds "
-                f"under CUDA-graph capture), or run on a device whose TMEM "
-                f"holds next_n={next_n} in one atom (Rubin, SM107+)."
+                f"fp4_paged_mqa_logits: schedule_meta must be None for "
+                f"next_n={next_n} on this device (SM100/SM103). Fix: omit it -- "
+                f"the internally computed schedule is correct and "
+                f"CUDA-graph-capturable. Reason: the kernel runs next_n={next_n} "
+                f"here as {num_atoms} internal passes and schedules {exp_B} "
+                f"rows, not the {B} rows a caller-built schedule describes; the "
+                f"mismatch can hang the persistent kernel. On Rubin (SM107+) "
+                f"next_n={next_n} runs in one pass and caller schedules work."
             )
-        _validate_schedule_meta(schedule_meta, num_sms, q.device)
+        _validate_schedule_meta(
+            schedule_meta, num_sms, q.device, "fp4_paged_mqa_logits"
+        )
+
+    # Not just an optimization: the persistent kernel launches num_sms CTAs
+    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
+    # here. After the buffer validation so a bad out/schedule still raises.
+    if B == 0:
+        return logits
+
+    # The scheduler enumerates batch*num_atoms q_atom tasks, so it must be built
+    # from the per-atom context lengths. Identity when num_atoms == 1, which
+    # keeps the unsplit path (and any caller-supplied schedule) unchanged.
+    sched_ctx = _expand_context_lens(context_lens, num_atoms, atom)
+    if schedule_meta is None:
+        schedule_meta = compute_paged_mqa_logits_schedule(sched_ctx, device=q.device)
+    else:
         _validate_schedule_meta_fresh(schedule_meta, sched_ctx, "fp4_paged_mqa_logits")
 
     dev_index = get_device_index(q.device)
@@ -1961,10 +2158,10 @@ def fp4_paged_mqa_logits(
 
 
 def precompile_paged_mqa_logits(
-    device: torch.device = None,
+    device: Optional[torch.device] = None,
     variants: Tuple[str, ...] = ("fp8", "fp4"),
-    output_dtypes: Tuple[torch.dtype, ...] = None,
-    batch_sizes: Sequence[int] = None,
+    output_dtypes: Optional[Tuple[torch.dtype, ...]] = None,
+    batch_sizes: Optional[Sequence[int]] = None,
 ) -> None:
     """Pre-compile paged MQA logits kernels for common static configs.
 
@@ -2008,6 +2205,13 @@ def precompile_paged_mqa_logits(
                        of each bucket pays compilation.
     """
     if not _CUTE_DSL_AVAILABLE:
+        warnings.warn(
+            "precompile_paged_mqa_logits: nvidia-cutlass-dsl is not installed; "
+            "nothing was precompiled and the first fp8/fp4_paged_mqa_logits "
+            "call will fail. pip install nvidia-cutlass-dsl.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return
     unknown = set(variants) - {"fp8", "fp4"}
     if unknown:
@@ -2034,6 +2238,10 @@ def precompile_paged_mqa_logits(
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     device_index = get_device_index(device)
+    # Fail the build step with the runtime APIs' curated message rather than a
+    # KeyError from deep inside cute.compile when the installed DSL predates
+    # the target device's architecture.
+    _require_cute_dsl(device, "precompile_paged_mqa_logits")
     num_sms = _cached_num_sms(device_index)
     arch = _cached_gpu_arch(device_index)
     num_heads, head_dim = 64, 128
