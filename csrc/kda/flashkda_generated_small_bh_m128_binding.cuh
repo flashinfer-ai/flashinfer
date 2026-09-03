@@ -117,10 +117,13 @@ inline void RunSmallBhM128(
       initial_state,out,final_state,descriptor_storage,prepare_descriptors,
       num_heads,beta_token_stride,state_slot_stride,use_state_indices,
       use_initial_state,store_final_state,scale,lower_bound,cuda_stream);
-  TVM_FFI_ICHECK(q.ndim() == 4 && q.size(0) == p.num_sequences)
-      << "small-BH FlashKDA requires fixed [B, T, H, 128] layout";
+  TVM_FFI_ICHECK(
+      q.ndim() == 4 &&
+      (q.size(0) == p.num_sequences || q.size(0) == 1))
+      << "small-BH FlashKDA requires canonical fixed or packed "
+         "[B, T, H, 128] storage";
   TVM_FFI_ICHECK(q.size(1) >= kGeneratedSmallBhMinSequenceLength)
-      << "small-BH FlashKDA requires at least 2048 tokens per fixed sequence";
+      << "small-BH FlashKDA requires at least 2048 physical tokens";
   const int64_t total_tasks = p.num_sequences * num_heads;
   TVM_FFI_ICHECK(total_tasks > 0 &&
                  total_tasks <= kGeneratedSmallBhMaxTasks &&

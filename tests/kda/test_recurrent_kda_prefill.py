@@ -3822,17 +3822,24 @@ def test_compact_fp32_matches_indexed_fp32_source_route(
     )
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "packed"),
+    [([2048], False), ([2048, 2304], True)],
+    ids=["fixed", "packed-varlen"],
+)
 def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
     flash_kda_device,
     monkeypatch,
+    seq_lens,
+    packed,
 ):
     inputs = _make_inputs(
-        seq_lens=[2048],
+        seq_lens=seq_lens,
         num_heads=1,
-        packed=False,
+        packed=packed,
         initial_state=True,
         state_dtype=torch.float32,
-        seed=25_401,
+        seed=25_401 + int(packed),
     )
     state_seed = inputs["initial_state"].clone()
     selector_keys = []
@@ -3857,9 +3864,11 @@ def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
     small_state = small_state.clone()
     assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
 
-    state_indices = torch.tensor([2], dtype=torch.int32, device=flash_kda_device)
+    state_indices = torch.arange(
+        len(seq_lens), dtype=torch.int32, device=flash_kda_device
+    ).flip(0)
     indexed_state = _make_padded_state_pool(
-        slots=3,
+        slots=len(seq_lens) + 1,
         num_heads=1,
         dtype=torch.float32,
         device=flash_kda_device,
@@ -3889,10 +3898,7 @@ def test_compact_fp32_zero_bound_small_bh_matches_indexed_source_route(
         atol=1e-2,
         rtol=1e-2,
     )
-    assert torch.equal(
-        indexed_state[:2],
-        indexed_state_before[:2],
-    )
+    assert torch.equal(indexed_state[-1], indexed_state_before[-1])
 
 
 def test_compact_fp32_zero_bound_bt16_matches_indexed_source_route(
