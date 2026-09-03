@@ -181,7 +181,8 @@ void trtllm_paged_attention_launcher(
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
-    bool uses_spcompress, cudaStream_t stream) {
+    bool uses_spcompress, float const* dsv4_inv_rope_cos_sin_cache, void* dsv4_o_scale,
+    int64_t dsv4_scale_buf_m, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -370,8 +371,20 @@ void trtllm_paged_attention_launcher(
   // Cubin-variant selectors (FP16 softmax accumulator, sparse compression).
   runner_params.mUseFp16Softmax = use_fp16_softmax;
   runner_params.mUsesSpcompress = uses_spcompress;
+  runner_params.mUsesDsv4Ue8m0ScaleO =
+      dsv4_o_scale != nullptr && o_data_type == Data_type::DATA_TYPE_E4M3;
+  runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
+  runner_params.dsv4OScalePtr = dsv4_o_scale;
+  runner_params.mDsv4ScaleBufM = dsv4_scale_buf_m;
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
+  if (!foundKernels && runner_params.mUsesDsv4Ue8m0ScaleO) {
+    // No fused kernel: run the BF16 split-KV pair and quantize in its reduction kernel.
+    fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type,
+                                              Data_type::DATA_TYPE_BF16);
+    runner_params.mUsesDsv4Ue8m0ScaleO = false;
+    std::tie(foundKernels, kinfo) = fmha_runner->isSupportedWithInfo(runner_params);
+  }
   if (!foundKernels) {
     std::ostringstream err_msg;
     err_msg << "Missing TRTLLM-GEN kernel ("
@@ -592,7 +605,8 @@ void trtllm_paged_attention_decode(
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
       lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      uses_spcompress_value, /*dsv4_inv_rope_cos_sin_cache=*/nullptr, /*dsv4_o_scale=*/nullptr,
+      /*dsv4_scale_buf_m=*/0, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -736,7 +750,8 @@ void trtllm_paged_attention_context(
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
       lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      uses_spcompress_value, /*dsv4_inv_rope_cos_sin_cache=*/nullptr, /*dsv4_o_scale=*/nullptr,
+      /*dsv4_scale_buf_m=*/0, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -973,7 +988,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<TensorView> cum_seq_lens_q) {
+    Optional<TensorView> cum_seq_lens_q, Optional<TensorView> dsv4_o_scales,
+    Optional<TensorView> dsv4_cos_sin_cache) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(primary_kv_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -996,11 +1012,45 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   TVM_FFI_ICHECK_EQ(kv_data_type, q_data_type) << "primary_kv_cache dtype must match query dtype";
   TVM_FFI_ICHECK_EQ(dl_dtype_to_tllm_data_type(sliding_window_kv_cache.dtype()), q_data_type)
       << "sliding_window_kv_cache dtype must match query dtype";
-  TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
-      << "DeepSeek V4 sparse MLA output must be BF16";
 
   int const sum_seq_q = query.size(0);
   int const num_qo_heads = query.size(1);
+  float const* dsv4_cos_sin_cache_ptr = nullptr;
+  void* dsv4_o_scale_ptr = nullptr;
+  int64_t dsv4_scale_buf_m = 0;
+  if (dsv4_o_scales.has_value()) {
+    // Fused DSv4 output epilogue: E4M3 values and packed UE8M0 block-128 scales.
+    auto const& o_scales = dsv4_o_scales.value();
+    TVM_FFI_ICHECK(dsv4_cos_sin_cache.has_value()) << "dsv4_o_scales requires dsv4_cos_sin_cache";
+    auto const& cos_sin_cache = dsv4_cos_sin_cache.value();
+    dsv4_scale_buf_m = round_up(static_cast<int64_t>(sum_seq_q), int64_t{4});
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_E4M3)
+        << "out must be float8_e4m3fn when dsv4_o_scales is given";
+    // Fused cubins and the split-KV reduction kernels both exist for this schedule only.
+    TVM_FFI_ICHECK_EQ(num_qo_heads, 128) << "the fused epilogue needs all 128 query heads";
+    TVM_FFI_ICHECK(out.ndim() == 4 && out.size(0) == num_qo_heads / 8 && out.size(1) == sum_seq_q &&
+                   out.size(2) == 8 && out.IsContiguous())
+        << "out must be contiguous [num_qo_heads / 8, sum_seq_q, 8, 512]";
+    TVM_FFI_ICHECK_EQ(o_scales.dtype(), dl_int32) << "dsv4_o_scales must be int32";
+    TVM_FFI_ICHECK(o_scales.ndim() == 3 && o_scales.size(0) == num_qo_heads / 8 &&
+                   o_scales.size(1) == 8 && o_scales.size(2) == dsv4_scale_buf_m &&
+                   o_scales.IsContiguous())
+        << "dsv4_o_scales must be contiguous [num_qo_heads / 8, 8, round_up(sum_seq_q, 4)]";
+    TVM_FFI_ICHECK_EQ(cos_sin_cache.dtype(), dl_float32) << "dsv4_cos_sin_cache must be float32";
+    TVM_FFI_ICHECK(cos_sin_cache.ndim() == 2 && cos_sin_cache.size(1) == 64 &&
+                   cos_sin_cache.IsContiguous())
+        << "dsv4_cos_sin_cache must be contiguous [max_position, 64]";
+    for (auto const& t : {out, o_scales, cos_sin_cache}) {
+      TVM_FFI_ICHECK(t.device().device_type == query.device().device_type &&
+                     t.device().device_id == query.device().device_id)
+          << "out, dsv4_o_scales and dsv4_cos_sin_cache must be on the same device as query";
+    }
+    dsv4_cos_sin_cache_ptr = static_cast<float const*>(cos_sin_cache.data_ptr());
+    dsv4_o_scale_ptr = o_scales.data_ptr();
+  } else {
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
+        << "DeepSeek V4 sparse MLA output must be BF16";
+  }
   int const num_kv_heads = primary_kv_cache.size(-3);
   bool const is_varlen_q = cum_seq_lens_q.has_value();
   int* cum_seq_lens_q_ptr =
@@ -1155,7 +1205,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
       /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, /*use_fp16_softmax=*/false,
-      /*uses_spcompress=*/false, stream);
+      /*uses_spcompress=*/false, dsv4_cos_sin_cache_ptr, dsv4_o_scale_ptr, dsv4_scale_buf_m,
+      stream);
 }
 
 namespace trtllm_cubin_loader {

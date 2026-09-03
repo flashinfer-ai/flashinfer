@@ -265,6 +265,14 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  // DSv4 inverse-RoPE + UE8M0 FP8 output epilogue: E4M3 O as [numHeadsQ / 8, sumSeqLensQ, 8,
+  // headDimV]; packed UE8M0 exponents as [numHeadsQ / 8, 8, mDsv4ScaleBufM = align(sumSeqLensQ,
+  // 4)].
+  bool mUsesDsv4Ue8m0ScaleO{false};
+  float const* dsv4InvRopeCosSinCachePtr{nullptr};
+  void* dsv4OScalePtr{nullptr};
+  int64_t mDsv4ScaleBufM{0};
+
   // The stride between different tokens for Q.
   int qStrideTokens;
   // The stride between different heads for Q.
@@ -445,8 +453,11 @@ struct TllmGenSelectKernelParams {
         mHeadDimPerCtaV(params.mHeadDimV)
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         ,
-        mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction
-                                                 : MultiCtasKvMode::Disabled),
+        // The fused DSv4 epilogue kernels are built without split KV; Disabled pairs with
+        // Persistent.
+        mMultiCtasKvMode((params.mMultiCtasKvMode && !params.mUsesDsv4Ue8m0ScaleO)
+                             ? MultiCtasKvMode::GmemReduction
+                             : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
@@ -456,7 +467,8 @@ struct TllmGenSelectKernelParams {
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
-        mTileScheduler(params.mTileScheduler),
+        mTileScheduler(params.mUsesDsv4Ue8m0ScaleO ? TileScheduler::Persistent
+                                                   : params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),

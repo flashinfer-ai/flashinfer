@@ -246,7 +246,7 @@ class TllmGenFmhaKernel {
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
                          int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel,
-                         bool fp16Softmax, bool usesSpcompress) const {
+                         bool fp16Softmax, bool usesSpcompress, bool usesDsv4Ue8m0ScaleO) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -303,7 +303,8 @@ class TllmGenFmhaKernel {
     // Bit 54 - 54: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
     // Bit 55 - 55: fp16Softmax.
     // Bit 56 - 56: usesSpcompress.
-    // Bit 57 - 63: unused.
+    // Bit 57 - 57: usesDsv4Ue8m0ScaleO.
+    // Bit 58 - 63: unused.
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 2) |
            (static_cast<uint64_t>(kernelType) << 5) | (static_cast<uint64_t>(scheduler) << 8) |
            (static_cast<uint64_t>(multiCtasKvMode) << 10) |
@@ -321,7 +322,8 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(groupsTokensHeadsQ) << 53) |
            (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 54) |
            (static_cast<uint64_t>(fp16Softmax) << 55) |
-           (static_cast<uint64_t>(usesSpcompress) << 56);
+           (static_cast<uint64_t>(usesSpcompress) << 56) |
+           (static_cast<uint64_t>(usesDsv4Ue8m0ScaleO) << 57);
   }
 
   inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
@@ -335,16 +337,17 @@ class TllmGenFmhaKernel {
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
-    return hashID(
-        kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
-        kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV,
-        kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV, kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv,
-        kernelMeta.mNumTokensPerPage, isDynamicNumTokensPerPageKernel(kernelMeta),
-        kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ,
-        kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
-        getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
-                                   kernelMeta.mSeparateTransformedKv),
-        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
+    return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
+                  kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
+                  kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
+                  kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
+                  isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
+                  kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
+                  kernelMeta.mSkipsSoftmaxWhenPossible,
+                  getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
+                                             kernelMeta.mSeparateTransformedKv),
+                  is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax,
+                  kernelMeta.mUsesSpcompress, kernelMeta.mUsesDsv4Ue8m0ScaleO);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -656,6 +659,11 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // The DSv4 fused epilogue without a fused cubin runs in the separate reduction kernel,
+      // so the KV must be split.
+      if (params.dsv4OScalePtr != nullptr && !params.mUsesDsv4Ue8m0ScaleO) {
+        numCtasPerSeqKv = std::max(numCtasPerSeqKv, 2);
+      }
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
@@ -1228,7 +1236,8 @@ class TllmGenFmhaKernel {
         ", bf16QFp8KvTransformMode=" +
         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
-        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
+        ", usesDsv4Ue8m0ScaleO=" + std::to_string(params.mUsesDsv4Ue8m0ScaleO);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1247,7 +1256,7 @@ class TllmGenFmhaKernel {
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
                /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
-               selectKernelParams.mUsesSpcompress),
+               selectKernelParams.mUsesSpcompress, params.mUsesDsv4Ue8m0ScaleO),
         info);
   }
 

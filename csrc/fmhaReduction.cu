@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <float.h>
 
@@ -31,8 +32,67 @@ namespace kernels {
 
 #define NumThreadsPerCta 512
 
+// DSv4 fused output epilogue: inverse RoPE, UE8M0 block scales, E4M3 values (matches the fused
+// cubin).
+namespace dsv4 {
+
+static constexpr int kHeadDim = 512;
+static constexpr int kRopeDim = 64;  // trailing interleaved pairs
+static constexpr int kQuantBlock = 128;
+static constexpr int kHeadsPerGroup = 8;
+static constexpr int kCosSinRowWidth = 64;  // cos(32) || sin(32)
+static constexpr float kE4m3Max = 448.f;
+static constexpr float kAmaxFloor = 1e-10f;
+
+// Plain multiply-add so nvcc contracts to FMA.
+__device__ __forceinline__ void inverseRopePair(float& even, float& odd, float cosVal,
+                                                float sinVal) {
+  float const e = even;
+  float const o = odd;
+  even = e * cosVal + o * sinVal;
+  odd = o * cosVal - e * sinVal;
+}
+
+// ceil(log2(max(amax, floor) / 448)) + 127. Not ceilf(log2f(amax * (1/448))): 1/448 is inexact
+// in binary32, so exact power-of-two quotients (e.g. amax 3.5) would round one exponent high.
+__device__ __forceinline__ int32_t ue8m0ExponentFromAmax(float amax) {
+  amax = fmaxf(amax, kAmaxFloor);
+  int32_t e = ilogbf(amax) - 8;  // 448 = 1.75 * 2^8: never high, at most one low
+  if (ldexpf(kE4m3Max, e) < amax) {
+    ++e;
+  }
+  return min(max(e + 127, 0), 255);
+}
+
+__device__ __forceinline__ float reciprocalScaleFromExponent(int32_t biasedExp) {
+  return __frcp_rn(__int_as_float(biasedExp << 23));
+}
+
+__device__ __forceinline__ __nv_fp8_e4m3 quantizeToE4m3(float scaled) {
+  return static_cast<__nv_fp8_e4m3>(fminf(fmaxf(scaled, -kE4m3Max), kE4m3Max));
+}
+
+// Element offset into E4M3 values [numGroups, numTokens, 8, kHeadDim].
+__device__ __forceinline__ int64_t valueOffset(int32_t group, int32_t token, int32_t headInGroup,
+                                               int32_t dim, int32_t numTokens) {
+  return (((static_cast<int64_t>(group) * numTokens + token) * kHeadsPerGroup) + headInGroup) *
+             kHeadDim +
+         dim;
+}
+
+// Byte offset of a block's exponent in INT32 scales [numGroups, 8, scaleBufM]; block 0 is the LSB.
+__device__ __forceinline__ int64_t scaleByteOffset(int32_t group, int32_t headInGroup,
+                                                   int32_t token, int32_t block,
+                                                   int64_t scaleBufM) {
+  return ((static_cast<int64_t>(group) * kHeadsPerGroup + headInGroup) * scaleBufM + token) *
+             sizeof(int32_t) +
+         block;
+}
+
+}  // namespace dsv4
+
 template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
-          typename DtypePartialO>
+          typename DtypePartialO, bool Dsv4FusedEpilogue = false>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
@@ -284,6 +344,69 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
       mul(f2, f2, normalizedScale2);
     }
 
+    // DSv4 fused epilogue: quantize the merged FP32 values, as the fused cubin does.
+    if constexpr (Dsv4FusedEpilogue) {
+      static_assert(
+          HeadDimPerCta % dsv4::kQuantBlock == 0 && dsv4::kQuantBlock % NumEltsPer16BVec == 0,
+          "A quant block must be owned by whole lanes of one CTA");
+      static_assert(NumEltsPer16BVec * sizeof(__nv_fp8_e4m3) == sizeof(uint2),
+                    "The E4M3 vector store assumes 8 elements");
+
+      // softmaxStats rows are a flat [token, headQ] index over all tokens.
+      int64_t const absRowIdx{softmaxStatsOffset + softmaxStatsRowIdx};
+      int32_t const tokenIdx{static_cast<int32_t>(absRowIdx / params.mNumHeadsQ)};
+      int32_t const headIdx{static_cast<int32_t>(absRowIdx % params.mNumHeadsQ)};
+      int32_t const dimIdx{headDimCtaIdxV * HeadDimPerCta + headDimIdx};
+
+      // Interleaved RoPE partners share this thread's vector; no shuffle needed.
+      int32_t constexpr RopeStart{dsv4::kHeadDim - dsv4::kRopeDim};
+      if (dimIdx >= RopeStart) {
+        int32_t const position{params.ptrSeqLensKv[batchIdx] - seqLenQ + tokenIdx - seqOffsetQ};
+        float const* cosSin{params.ptrDsv4InvRopeCosSinCache +
+                            static_cast<int64_t>(position) * dsv4::kCosSinRowWidth};
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ii += 2) {
+          int32_t const pairIdx{(dimIdx + ii - RopeStart) >> 1};
+          dsv4::inverseRopePair(outputVals[ii], outputVals[ii + 1], cosSin[pairIdx],
+                                cosSin[dsv4::kRopeDim / 2 + pairIdx]);
+        }
+      }
+
+      // A quant block is a warp-aligned lane group of one row.
+      float amax{0.f};
+#pragma unroll
+      for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+        amax = fmaxf(amax, fabsf(outputVals[ii]));
+      }
+#pragma unroll
+      for (int32_t offset = 1; offset < dsv4::kQuantBlock / NumEltsPer16BVec; offset <<= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+      }
+      int32_t const biasedExp{dsv4::ue8m0ExponentFromAmax(amax)};
+
+      if (isValidRow) {
+        int32_t const group{headIdx / dsv4::kHeadsPerGroup};
+        int32_t const headInGroup{headIdx % dsv4::kHeadsPerGroup};
+        float const invScale{dsv4::reciprocalScaleFromExponent(biasedExp)};
+        __nv_fp8_e4m3 quantized[NumEltsPer16BVec];
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+          quantized[ii] = dsv4::quantizeToE4m3(outputVals[ii] * invScale);
+        }
+        *reinterpret_cast<uint2*>(
+            reinterpret_cast<__nv_fp8_e4m3*>(params.ptrO) +
+            dsv4::valueOffset(group, tokenIdx, headInGroup, dimIdx, params.mSumOfSeqLensQ)) =
+            *reinterpret_cast<uint2 const*>(quantized);
+        // One byte per block: a head's four blocks may live in four CTAs.
+        if (dimIdx % dsv4::kQuantBlock == 0) {
+          reinterpret_cast<uint8_t*>(params.ptrDsv4OScaleFp32)[dsv4::scaleByteOffset(
+              group, headInGroup, tokenIdx, dimIdx / dsv4::kQuantBlock, params.mDsv4ScaleBufM)] =
+              static_cast<uint8_t>(biasedExp);
+        }
+      }
+      continue;
+    }
+
     // Convert the float values to DtypeO, and Store it to global memory.
     if (isValidRow) {
       convertAndStoreToGmem<DtypeO>(reinterpret_cast<char*>(oPtr + gmemStoreOffset), outputVals);
@@ -340,6 +463,8 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
           static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))) {
     return;
   }
+
+  bool const dsv4FusedEpilogue = params.ptrDsv4OScaleFp32 != nullptr;
 
   // This should only be enabled when using keepsMmaAbForGeneration kernel.
   FLASHINFER_CHECK(
@@ -404,7 +529,21 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   // Select the kernel function pointer.
   void (*kernel)(KernelParams const, bool, bool, bool, int32_t, int32_t, int32_t, int32_t) =
       nullptr;
-  if (headDimPerCtaV == 64) {
+  if (dsv4FusedEpilogue) {
+    // The instantiations below: flat [token, headQ] rows, tileSizeQ 64, a whole quant block per
+    // CTA, whole head groups.
+    FLASHINFER_CHECK(kernelMeta.mGroupsHeadsQ && kernelMeta.mTileSizeQ == 64 &&
+                         headDimPerCtaV >= 128 &&
+                         numCtasForAllHeads * numHeadsPerCta == params.mNumHeadsQ,
+                     "Not implemented");
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, true>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, true>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, true>;
+    }
+  } else if (headDimPerCtaV == 64) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);
   } else if (headDimPerCtaV == 128) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(128);

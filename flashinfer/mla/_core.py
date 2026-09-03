@@ -1485,6 +1485,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_sparse_indices_format: Optional[Literal["compressed-page-aligned"]] = None,
     remapped_sparse_indices_buffer: Optional[torch.Tensor] = None,
     sparse_indices_are_storage_offsets: Optional[bool] = None,
+    out_scales: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1626,6 +1628,21 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``False`` for logical flattened token indices or ``True`` for indices
         already adjusted to storage-row offsets. Strided pools require an
         explicit value to prevent accidental double remapping.
+    out_scales : Optional[torch.Tensor]
+        Selects the TRTLLM-GEN fused DSv4 output epilogue (inverse RoPE of the
+        trailing 64 lanes, block-128 UE8M0 scales, FP8 E4M3 values). INT32
+        ``[num_heads // 8, 8, dsv4_fused_epilogue_scale_buf_m(sum_q)]``,
+        contiguous; each word packs one head's four exponents, block 0 in the
+        least significant byte, and a block dequantizes by ``2 ** (e - 127)``.
+        ``out`` is then required as contiguous float8_e4m3fn
+        ``[num_heads // 8, sum_q, 8, 512]``. Supported with all 128 query heads on
+        the calling rank (DP attention, no attention TP); every batch size, query
+        length and top-k is then served by the fused cubin or the split-KV
+        reduction kernel. Other head counts raise.
+    cos_sin_cache : Optional[torch.Tensor]
+        FP32 ``[max_position, 64]`` rows ``cos(32) || sin(32)`` for the inverse
+        RoPE at position ``seq_lens[b] - q_len[b] + i``. Required with
+        ``out_scales``.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
 
@@ -1637,6 +1654,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             f"backend={backend!r} does not accept remapped_sparse_indices_buffer "
             "or sparse_indices_are_storage_offsets"
         )
+    if out_scales is not None or cos_sin_cache is not None:
+        if backend != "trtllm-gen":
+            raise ValueError(
+                f"backend={backend!r} does not accept out_scales or cos_sin_cache"
+            )
+        if out is None or out_scales is None or cos_sin_cache is None:
+            raise ValueError(
+                "out_scales requires out (float8_e4m3fn values) and cos_sin_cache"
+            )
 
     if backend == "cute-dsl":
         if not hca_is_causal:
@@ -1850,6 +1876,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     if sparse_indices is None:
         raise ValueError("backend='trtllm-gen' requires sparse_indices")
 
+    # With out_scales, out holds FP8 values and is checked below instead of as BF16 here.
+    bf16_out = out if out_scales is None else None
     (
         swa_kv_cache,
         compressed_kv_cache,
@@ -1865,7 +1893,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         sparse_indices,
         compressed_kv_cache,
         sparse_topk_lens,
-        out,
+        bf16_out,
         sinks,
         kv_layout,
         cum_seq_lens_q,
@@ -1873,7 +1901,30 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         allow_sm120_packed_kv=False,
     )
 
-    if out is None:
+    if out_scales is not None:
+        sum_seq_q, num_heads = query_flat.size(0), query_flat.size(1)
+        check_shape_dtype_device(
+            out,
+            (num_heads // 8, sum_seq_q, 8, 512),
+            torch.float8_e4m3fn,
+            query.device,
+            "out",
+        )
+        check_shape_dtype_device(
+            out_scales,
+            (num_heads // 8, 8, dsv4_fused_epilogue_scale_buf_m(sum_seq_q)),
+            torch.int32,
+            query.device,
+            "out_scales",
+        )
+        check_shape_dtype_device(
+            cos_sin_cache,
+            (cos_sin_cache.size(0), 64),
+            torch.float32,
+            query.device,
+            "cos_sin_cache",
+        )
+    elif out is None:
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
 
     check_shape_dtype_device(
@@ -1961,8 +2012,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
         cum_seq_lens_q.contiguous() if cum_seq_lens_q is not None else None,
+        out_scales,
+        cos_sin_cache.contiguous() if cos_sin_cache is not None else None,
     )
     return out
+
+
+def dsv4_fused_epilogue_scale_buf_m(sum_seq_q: int) -> int:
+    """Token extent of the fused-epilogue scale layout: ``sum_seq_q`` rounded up to 4."""
+    return (sum_seq_q + 3) // 4 * 4
 
 
 # Keep the backend-neutral spelling as a compatibility alias, while the

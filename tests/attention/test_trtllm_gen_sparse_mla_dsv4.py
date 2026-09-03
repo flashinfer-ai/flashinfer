@@ -5,7 +5,10 @@ from typing import Literal
 import pytest
 import torch
 
-from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla import (
+    dsv4_fused_epilogue_scale_buf_m,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
 from flashinfer.mla._core import get_trtllm_gen_fmha_module
 from flashinfer.utils import get_compute_capability
 
@@ -13,6 +16,10 @@ from flashinfer.utils import get_compute_capability
 WORKSPACE_SIZE = 128 * 1024 * 1024
 DSV4_HEAD_DIM = 512
 DSV4_SWA_TOPK = 128
+# Fused-epilogue output: RoPE on the trailing lanes, one UE8M0 scale per block, 8 heads per group.
+DSV4_ROPE_DIM = 64
+DSV4_QUANT_BLOCK = 128
+DSV4_HEADS_PER_GROUP = 8
 TEST_SEED_BASE = 2026
 
 DECODE_BATCH_SIZE = 3
@@ -714,6 +721,8 @@ def run_flashinfer_decode(
     sparse_indices_are_storage_offsets: bool | None = None,
     remapped_sparse_indices_buffer: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    out_scales: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert t.decode is not None
     swa_indices = testcase.kv_scope.indices_in_kvcache[testcase.valid_q].contiguous()
@@ -790,6 +799,8 @@ def run_flashinfer_decode(
             out=out,
             remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
             sparse_indices_are_storage_offsets=sparse_indices_are_storage_offsets,
+            out_scales=out_scales,
+            cos_sin_cache=cos_sin_cache,
         )
     except RuntimeError as err:
         err_msg = str(err)
@@ -928,6 +939,8 @@ def test_trtllm_gen_sparse_mla_rejects_remap_buffer_on_other_device() -> None:
             1,
             False,
             1,
+            None,
+            None,
             None,
             None,
         )
@@ -1196,3 +1209,106 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph(monkeypatch) -> Non
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
     out_ref = out_ref[testcase.valid_q]
     _assert_close(out_ans, out_ref, p.dtype)
+
+
+def _dsv4_cos_sin_cache(max_position: int, device: torch.device) -> torch.Tensor:
+    half = DSV4_ROPE_DIM // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(half, device=device).float() / half))
+    freqs = torch.outer(torch.arange(max_position, device=device).float(), inv_freq)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
+
+
+def _dsv4_inverse_rope(
+    o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
+) -> torch.Tensor:
+    """[T, H, 512] -> float32 with the trailing 64 interleaved lanes un-rotated."""
+    x = o.float()
+    rope_start = DSV4_HEAD_DIM - DSV4_ROPE_DIM
+    rope = x[..., rope_start:]
+    cos, sin = cos_sin_cache.index_select(0, positions).unsqueeze(1).chunk(2, dim=-1)
+    even, odd = rope[..., 0::2], rope[..., 1::2]
+    rotated = torch.empty_like(rope)
+    rotated[..., 0::2] = even * cos + odd * sin
+    rotated[..., 1::2] = odd * cos - even * sin
+    return torch.cat((x[..., :rope_start], rotated), dim=-1)
+
+
+def _dsv4_dequant(
+    values: torch.Tensor, scales: torch.Tensor, sum_q: int
+) -> torch.Tensor:
+    """[G, T, 8, 512] + [G, 8, M] -> [T, G*8, 512] float32."""
+    n_groups = values.size(0)
+    h = n_groups * DSV4_HEADS_PER_GROUP
+    v = values[:, :sum_q].float().permute(1, 0, 2, 3).reshape(sum_q, h, DSV4_HEAD_DIM)
+    e = (
+        scales[..., :sum_q]
+        .contiguous()
+        .view(torch.uint8)
+        .view(n_groups, DSV4_HEADS_PER_GROUP, sum_q, DSV4_HEAD_DIM // DSV4_QUANT_BLOCK)
+        .permute(2, 0, 1, 3)
+        .reshape(sum_q, h, -1)
+        .to(torch.int32)
+    )
+    return v * torch.exp2((e - 127).float()).repeat_interleave(DSV4_QUANT_BLOCK, dim=-1)
+
+
+# Batch 1 and 4 resolve onto the split-KV reduction epilogue (head spans 128/256/512),
+# batch 16 onto the fused cubin. top_k 256 is the C128A width at short max_model_len, where
+# the KV split is forced rather than chosen.
+@pytest.mark.parametrize(
+    "batch,s_q,top_k",
+    [(1, 1, 2048), (4, 1, 2048), (16, 1, 2048), (16, 4, 2048), (4, 1, 256)],
+)
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(
+    batch: int, s_q: int, top_k: int
+) -> None:
+    _skip_unless_sm100_or_sm103()
+    p = RawTestParamForDecode(
+        b=batch,
+        h_q=128,
+        s_q=s_q,
+        h_kv=1,
+        s_kv=8192,
+        is_varlen=False,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=8192,
+        extra_topk=top_k - DSV4_SWA_TOPK,
+        extra_block_size=1,
+        have_extra_topk_length=True,
+        seed=TEST_SEED_BASE,
+        dtype=torch.float8_e4m3fn,
+        sparse_case="swa128+topk4x",
+    ).to_test_param()
+    testcase = generate_testcase_for_decode(p)
+    sum_q = batch * s_q
+    device = testcase.q.device
+    positions = torch.cat(
+        [
+            torch.arange(int(n) - s_q, int(n), device=device)
+            for n in testcase.kv_scope.cache_seqlens
+        ]
+    )
+    cos_sin_cache = _dsv4_cos_sin_cache(int(positions.max()) + 1, device)
+    n_groups = p.h_q // DSV4_HEADS_PER_GROUP
+    out = torch.empty(
+        (n_groups, sum_q, DSV4_HEADS_PER_GROUP, p.d_v),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    out_scales = torch.zeros(
+        (n_groups, DSV4_HEADS_PER_GROUP, dsv4_fused_epilogue_scale_buf_m(sum_q)),
+        dtype=torch.int32,
+        device=device,
+    )
+    run_flashinfer_decode(
+        p, testcase, out=out, out_scales=out_scales, cos_sin_cache=cos_sin_cache
+    )
+    out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    out_ref = _dsv4_inverse_rope(
+        out_ref.reshape(sum_q, p.h_q, p.d_v), positions, cos_sin_cache
+    )
+    assert (out_scales[..., :sum_q] != 0).all(), "scale columns left unwritten"
+    out_ans = _dsv4_dequant(out, out_scales, sum_q)
+    assert not torch.isnan(out_ans).any()
+    torch.testing.assert_close(out_ans, out_ref, rtol=1e-1, atol=1e-1)
