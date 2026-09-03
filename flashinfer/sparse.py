@@ -1944,10 +1944,10 @@ class BlockSparseAttentionWrapper:
                 # the name would return a scaled tensor and leave theirs holding
                 # the unscaled one.
                 #
-                # No test drives this: plan() takes the dtype but
-                # gen_batch_prefill_module refuses an 8-bit output for fa2 and
-                # fa3, so nothing reaches here today. It is written the safe way
-                # rather than left to be found when that changes.
+                # Reached through the cuda-core decode path, which is what a
+                # narrow flat route without a custom mask plans. The tensor-core
+                # prefill generators refuse an 8-bit output outright, so this
+                # never fires there.
                 out.copy_((out.to(torch.float32) * v_scale).to(out.dtype))
             else:
                 out *= v_scale
