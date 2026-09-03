@@ -94,10 +94,25 @@ class FlashInferJITLogger(logging.Logger):
 logger = FlashInferJITLogger("flashinfer.jit")
 
 
+def refresh_current_compilation_context() -> CompilationContext:
+    """Refresh the cached compilation context in place.
+
+    Many JIT modules import ``current_compilation_context`` directly from this
+    module, so mutating the shared object keeps those aliases in sync while
+    still allowing us to re-probe the currently visible CUDA devices.
+    """
+
+    refreshed = CompilationContext()
+    current_compilation_context.TARGET_CUDA_ARCHS.clear()
+    current_compilation_context.TARGET_CUDA_ARCHS.update(refreshed.TARGET_CUDA_ARCHS)
+    return current_compilation_context
+
+
 def check_cuda_arch():
+    compilation_context = refresh_current_compilation_context()
     # Collect all detected CUDA architectures
     eligible = False
-    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
+    for major, minor in compilation_context.TARGET_CUDA_ARCHS:
         if major >= 8:
             eligible = True
         elif major == 7 and minor.isdigit():
@@ -106,7 +121,10 @@ def check_cuda_arch():
 
     # Raise error only if all detected architectures are lower than sm75
     if not eligible:
-        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
+        raise RuntimeError(
+            "FlashInfer requires GPUs with sm75 or higher. "
+            f"Detected TARGET_CUDA_ARCHS={sorted(compilation_context.TARGET_CUDA_ARCHS)}."
+        )
 
 
 def clear_cache_dir():
