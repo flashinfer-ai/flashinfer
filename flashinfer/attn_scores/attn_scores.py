@@ -542,7 +542,7 @@ def _compute_schedule_metadata(
     cum = np.concatenate([[0], np.cumsum(splits)])  # [B+1]
 
     # For each CTA boundary i, compute the target = total splits before CTA i
-    i_vals = np.arange(num_ctas + 1, dtype=np.int64)
+    i_vals: np.ndarray = np.arange(num_ctas + 1, dtype=np.int64)
     targets = i_vals * q_div + np.minimum(i_vals, r_mod)  # [num_ctas+1]
 
     # seq_idx[i] = number of fully-assigned sequences before CTA i
