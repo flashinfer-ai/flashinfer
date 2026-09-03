@@ -1596,8 +1596,10 @@ class MoEActivationPack:
 
     Activation encoding depends on ``QuantConfig.variant``:
 
-    * NVFP4: packed ``uint8 [M, H/2]`` values with
-      ``float8_e4m3fn [M, H/16]`` block scales.
+    * NVFP4 with ``TrtllmFp4Config`` or ``CuteDslConfig``: packed
+      ``uint8 [M, H/2]`` values with ``float8_e4m3fn [M, H/16]`` block scales.
+    * NVFP4 with ``CutlassNvfp4Config``: raw ``bfloat16 [M, H]`` values
+      without an activation scale.
     * MXFP4 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
       ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
       the TRTLLM FP4 launcher ABI.
