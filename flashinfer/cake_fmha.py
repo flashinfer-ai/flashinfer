@@ -1387,7 +1387,7 @@ def cake_batch_decode_with_kv_cache(*args, **kwargs):
     """Run the FlashInfer TRTLLM paged-decode ABI through Cake FMHA.
 
     Parameters and return values match
-    :func:`flashinfer.trtllm_batch_decode_with_kv_cache`.  The Cake backend is
+    :func:`flashinfer.trtllm_batch_decode_with_kv_cache`.  The selection is
     explicit and never replaces FlashInfer's default backend selection.
     """
 
@@ -1403,7 +1403,7 @@ def cake_batch_context_with_kv_cache(*args, **kwargs):
     """Run the FlashInfer TRTLLM paged-context ABI through Cake FMHA.
 
     Parameters and return values match
-    :func:`flashinfer.trtllm_batch_context_with_kv_cache`.  The Cake backend is
+    :func:`flashinfer.trtllm_batch_context_with_kv_cache`.  The selection is
     explicit and never replaces FlashInfer's conventional default.
     """
 

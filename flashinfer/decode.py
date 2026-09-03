@@ -3473,7 +3473,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
         raise ValueError(
-            "bmm1_scale_log2 is only supported by the trtllm-gen and cake backends"
+            "bmm1_scale_log2 is only supported when backend is 'trtllm-gen' or 'cake'"
         )
     if enable_block_sparse_attention:
         if backend != "trtllm-gen":
