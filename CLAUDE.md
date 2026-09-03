@@ -172,10 +172,13 @@ python benchmarks/flashinfer_benchmark.py \
 ```python
 from flashinfer.testing import bench_gpu_time
 
-# CUPTI preferred, auto-fallback to CUDA events
-median_time, std_time = bench_gpu_time(
-    my_kernel, args=(x, y), enable_cupti=True, num_iters=30
+# CUPTI preferred, auto-fallback to CUDA events.
+# Returns per-iteration times in milliseconds (a list).
+times = bench_gpu_time(
+    my_kernel, input_args=(x, y), enable_cupti=True,
+    dry_run_iters=10, repeat_iters=30,
 )
+median_time_ms = statistics.median(times)
 ```
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
@@ -576,7 +579,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
-| `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
+| `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |

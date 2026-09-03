@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         CombineOutput,
         DispatchInputParams,
         DispatchOutput,
+        HandleParams,
     )
 
 
@@ -29,6 +30,27 @@ class Handle(ABC):
 
     def destroy(self) -> None:  # noqa: B027 - intentional no-op default
         """Release per-iteration native resources. Idempotent."""
+
+    def update(self, params: "HandleParams") -> None:
+        """Rebind this handle to a new step's routing, reusing its buffers.
+
+        Optional capability. A Handle is normally created per forward, but a
+        CUDA graph records the device pointers it sees at capture time, so a
+        handle that is destroyed at the end of the captured forward leaves the
+        replayed graph pointing at freed memory. Backends that implement
+        ``update`` let one long-lived handle serve many forwards: create it
+        once *outside* the capture, then call ``update`` per step so the
+        routing metadata is recomputed by a kernel recorded *inside* it.
+
+        This mirrors NCCL-EP's own graph recipe, where ``ncclEpInitHandle``
+        stays outside the capture and ``ncclEpUpdateHandle`` goes in
+        (``contrib/nccl_ep/ep_test.cu``, ``--use_cuda_graph``).
+
+        Buffers are NOT reallocated, so the routing shape must stay within
+        what the handle was created for; in particular ``top_k`` is fixed at
+        creation and cannot change here.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement update")
 
     def dispatch_send_only(self, params: "DispatchInputParams") -> "DispatchOutput":
         """Optional send-only dispatch for kSplitOperation; default raises."""

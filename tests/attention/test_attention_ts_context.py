@@ -1268,7 +1268,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
     )
     with pytest.raises(
         NotImplementedError,
-        match=r"requires an SM100a/B200 or SM103a/B300 GPU.*\(9, 0\)",
+        match=r"requires an SM100a/B200.*GPU.*\(9, 0\)",
     ):
         BatchPrefillTSWrapper().plan(q, k, v)
 

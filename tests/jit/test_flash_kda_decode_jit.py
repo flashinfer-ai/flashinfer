@@ -303,7 +303,7 @@ def test_flash_kda_decode_binding_contract():
     assert "kFlashKDADecodeTargetKind == kFlashKDADecodeFamilyTarget" in common
     assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM100aTarget" in common
     assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM103aTarget" in common
-    assert "major == 10 && (minor == 0 || minor == 3)" in common
+    assert "major == 10 && (minor == 0 || minor == 3 || minor == 7)" in common
     assert "major == 10 && minor == expected_minor" in common
     assert "CheckFlashKDADecodeTarget(device_id)" in common
     assert "struct VariantTraits" in common
