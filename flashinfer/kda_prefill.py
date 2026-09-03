@@ -874,9 +874,9 @@ def _flash_kda_prefill_is_eligible(
         return False
     if not _is_contiguous_cuda_tensor(dt_bias, dtype=torch.float32, device=q.device):
         return False
-    if (
-        dt_bias.numel() != query_heads * _FLASH_KDA_HEAD_DIM
-        or dt_bias.ndim not in (1, 2)
+    if dt_bias.numel() != query_heads * _FLASH_KDA_HEAD_DIM or dt_bias.ndim not in (
+        1,
+        2,
     ):
         return False
     if dt_bias.ndim == 2 and dt_bias.shape != (
@@ -6773,12 +6773,8 @@ def _run_flash_kda_prefill(
                 return (*result, state_checkpoints)
             return result
 
-        if (
-            (variant == "small_bh_m128" and not fixed_layout)
-            or (
-                variant == "persistent_m128"
-                and compute_capability == (10, 3)
-            )
+        if (variant == "small_bh_m128" and not fixed_layout) or (
+            variant == "persistent_m128" and compute_capability == (10, 3)
         ):
             # The frozen legacy small-BH ABI is fixed-layout-only, and its
             # persistent ABI is CC 10.0-only.  Exact generated selectors cover
