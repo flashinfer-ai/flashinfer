@@ -5046,6 +5046,21 @@ def _w4a16_kernel_source_files() -> tuple[str, ...]:
     )
 
 
+def _w4a16_disk_kernel_name(prefix: str, facts: str, cache_key: tuple) -> str:
+    """On-disk kernel name: readable facts plus a digest of the full cache key.
+
+    The kernel-name string is the sole per-kernel disk-cache key (the module
+    ``meta.json`` guards only arch / DSL version / source hashes), so the
+    name must be injective over every compile fact. The readable ``facts``
+    are for humans; injectivity is carried by the digest of ``cache_key`` --
+    the same key that already gates the in-process caches, so its coverage
+    of the codegen parameters is a pre-existing invariant rather than one
+    this naming layer introduces.
+    """
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
+    return f"{prefix}_{facts}_{digest}"
+
+
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
     if dtype == torch.bfloat16:
         return "bf16"
@@ -5249,11 +5264,14 @@ def compile_w4a16_gemm(
             options="--opt-level 2 --enable-tvm-ffi",
         )
 
-    key_digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        f"gemm_{element_dtype}_e{num_experts}_n{size_n}"
-        f"_k{size_k}_t{top_k}_b{moe_block_size}_{key_digest}",
+        _w4a16_disk_kernel_name(
+            "gemm",
+            f"{element_dtype}_e{num_experts}_n{size_n}"
+            f"_k{size_k}_t{top_k}_b{moe_block_size}",
+            cache_key,
+        ),
         compile_fn,
         extra_key_files=_w4a16_kernel_source_files(),
     )
@@ -5793,11 +5811,14 @@ def compile_w4a16_fused_moe(
     # ``cache_key`` carries the kernel's full ``__cache_key__`` (tiles,
     # flags, swiglu scalars, row bucket), so the readable facts are suffixed
     # with a digest of it.
-    key_digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        f"fused_{element_dtype}_e{num_experts}_t{top_k}"
-        f"_h{hidden_size}_i{intermediate_size}_b{moe_block_size}_{key_digest}",
+        _w4a16_disk_kernel_name(
+            "fused",
+            f"{element_dtype}_e{num_experts}_t{top_k}"
+            f"_h{hidden_size}_i{intermediate_size}_b{moe_block_size}",
+            cache_key,
+        ),
         compile_fn,
         extra_key_files=_w4a16_kernel_source_files(),
     )
@@ -5918,10 +5939,13 @@ def compile_w4a16_activation(
     # ``cache_key`` also carries the swiglu scalars, fast-math and gating
     # flags, and the row-specialization bucket, so the readable facts are
     # suffixed with a digest of the full key.
-    key_digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        f"activation_{element_dtype}_i{intermediate_size}_{activation}_{key_digest}",
+        _w4a16_disk_kernel_name(
+            "activation",
+            f"{element_dtype}_i{intermediate_size}_{activation}",
+            cache_key,
+        ),
         compile_fn,
         extra_key_files=_w4a16_kernel_source_files(),
     )
@@ -5986,7 +6010,9 @@ def compile_w4a16_topk_sum(
 
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        f"topk_sum_{element_dtype}_t{topk}_h{hidden_size}",
+        _w4a16_disk_kernel_name(
+            "topk_sum", f"{element_dtype}_t{topk}_h{hidden_size}", cache_key
+        ),
         compile_fn,
         extra_key_files=_w4a16_kernel_source_files(),
     )
