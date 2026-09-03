@@ -484,6 +484,29 @@ def test_prims_ts_trace_loader_reraises_nested_dependency_failure(monkeypatch):
         _trace._load_attention_trace_templates()
 
 
+def test_vendored_prims_ts_disables_only_its_local_trace_bindings(monkeypatch):
+    """A vendored PrimTS copy must not consume schemas from another release."""
+    from flashinfer.attention.prims_ts import _trace
+
+    trace_module = SimpleNamespace(existing=object())
+    monkeypatch.setattr(_trace, "__package__", "downstream.attention.prims_ts")
+    monkeypatch.setattr(_trace, "_ATTENTION_TRACE_TEMPLATES", trace_module)
+    monkeypatch.setattr(
+        _trace,
+        "import_module",
+        lambda _module_name: pytest.fail(
+            "vendored PrimTS must not import trace schemas"
+        ),
+    )
+
+    loaded = _trace._load_attention_trace_templates()
+    monkeypatch.setattr(_trace, "_ATTENTION_TRACE_TEMPLATES", loaded)
+
+    assert loaded is None
+    assert _trace._get_attention_trace_template("existing") is None
+    assert vars(trace_module) == {"existing": trace_module.existing}
+
+
 def test_prims_ts_missing_trace_symbol_is_local_and_optional(monkeypatch):
     """Absent template symbols resolve to None without mutating their module."""
     from flashinfer.attention.prims_ts import _trace
