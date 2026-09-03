@@ -857,14 +857,57 @@ def test_gvr2_neginf_tail_completeness():
 
 
 @requires_gvr2
+@pytest.mark.parametrize(
+    "n_valid,top_k,positions",
+    [
+        (4096, 1024, [1000]),  # in the register fold window (DKG issue #58 case A)
+        (4096, 1024, [3000]),  # outside the window
+        (4096, 512, [1000]),  # regimg flavor
+        (4096, 2048, [1000]),  # plain reg (no img)
+        (
+            4096,
+            1024,
+            list(range(0, 4096, 4))[:1029],
+        ),  # more +inf than K: every slot +inf
+    ],
+    ids=["in_window", "out_of_window", "k512", "k2048", "ties_gt_k"],
+)
+def test_gvr2_posinf_completeness(n_valid, top_k, positions):
+    """Port of TRT-LLM PR #18625's regression (register family, DKG issue #58):
+    a +inf inside the row drives the hint-free bracket maximum to +inf, the
+    bracket width becomes infinite, the classify scale rcp(width) becomes 0
+    and every value folds into bin 0, so the whole-bin emit dropped the +inf.
+    The infinite width must now fail the collapse guard and take the
+    key-space escape, where fkey(+inf) is the maximum key. In-window and
+    out-of-window +inf, the regimg / plain-reg flavors and a more-than-K-ties
+    row are pinned; N=4096 keeps the register families."""
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((1, n_valid), generator=gen, device=_DEV) * 2.0
+    logits[0, positions] = float("inf")
+    seq_lens = torch.full((1,), n_valid, dtype=torch.int32, device=_DEV)
+    ref_vals = torch.topk(logits, top_k, dim=1).values
+    for pre_idx in (
+        torch.topk(logits, top_k, dim=1).indices.int().contiguous(),
+        torch.full((1, top_k), -1, dtype=torch.int32, device=_DEV),
+    ):
+        out = torch.full((1, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
+        torch.cuda.synchronize()
+        assert int((out == -7).sum()) == 0, "unwritten output slots"
+        n_inf = int(torch.isinf(logits[0][out[0].long()]).sum())
+        assert n_inf == min(top_k, len(positions)), "+inf dropped from the top-k"
+        _check_exact(logits, out, n_valid, ref_vals)
+
+
+@requires_gvr2
 @pytest.mark.xfail(
-    reason="UPSTREAM CAVEAT (TRT-LLM #17821 kernels, reproduced bit-identically "
-    "by the upstream implementation on the same inputs): literal +inf logits "
-    "are not selected in at least the clustered-register family. All finite "
+    reason="UPSTREAM CAVEAT: the clustered-register family (GvrRegClusKernel) "
+    "still drops literal +inf logits. TRT-LLM PR #18625 fixed the register "
+    "family (ported here; see test_gvr2_posinf_completeness) but left reg_clus "
+    "with the same collapsing bracket; tracked in DKG issue #58. All finite "
     "values — including 3.1e38 > the 3e38 pad sentinel — and -inf are "
-    "tie-aware exact (covered by test_gvr2_adversarial_patterns). Same class "
-    "as the documented NaN implementation-specific ordering.",
-    strict=False,  # family-dependent: some shapes handle +inf correctly
+    "tie-aware exact (covered by test_gvr2_adversarial_patterns).",
+    strict=True,  # deterministic: fixed shape, seed and family on B100/B200/Rubin
 )
 def test_gvr2_plus_inf_upstream_caveat():
     n_valid, batch, top_k = 32768, 4, 1024

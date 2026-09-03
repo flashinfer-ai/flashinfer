@@ -31,13 +31,19 @@ collision symbols carry a ``__<family>`` suffix.
 
 Provenance: ported near-verbatim from TensorRT-LLM
 ``tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py``
-(PR NVIDIA/TensorRT-LLM#17821, commit ed94d4cfbf), plus the register-family
-escape fix from PR NVIDIA/TensorRT-LLM#18501 (count-crossing enforcement when
-the histogram total never reaches k, radix-descent escape, -inf fill-lane
-bound) ported verbatim into ``GvrTopkRegKernel.kern``.  FlashInfer-local
-changes: module rename, this note, and the ``_persist`` hook that routes the
-four ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
-cache.  Keep future diffs against upstream mechanical.
+(PR NVIDIA/TensorRT-LLM#17821, commit ed94d4cfbf), plus two register-family
+fixes ported verbatim into ``GvrTopkRegKernel.kern``: PR
+NVIDIA/TensorRT-LLM#18501 (count-crossing enforcement when the histogram
+total never reaches k, radix-descent escape, -inf fill-lane bound) and PR
+NVIDIA/TensorRT-LLM#18625 (an infinite bracket width from an in-window +inf
+fails the collapse guard and takes the key-space escape instead of folding
+the row into bin 0 and dropping the +inf).  FlashInfer-local changes: module
+rename, this note, the ``_persist`` hook that routes the four
+``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
+cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
+device), and the main-family varlen prologue clamping each row's length to
+the envelope in launch slot ``n`` instead of the row stride.  Keep future
+diffs against upstream mechanical.
 """
 
 import contextlib
@@ -3772,10 +3778,16 @@ class GvrTopkRegKernel:
             Tv = invkey(lmin)
             GMAX = invkey(lmax)
 
-            # ---- collapse guard, NaN-safe
+            # ---- collapse guard, NaN-safe. An infinite bracket width
+            # (GMAX=+inf from an in-window +inf, or Tv=-inf) makes SC=rcp(w)=0
+            # and folds every value into bin 0, dropping the +inf; reject it
+            # here (okc=0) and force the key-space escape below.
+            # (upstream TensorRT-LLM PR #18625, ported verbatim.)
             okc = cutlass.Int32(0)
             if Tv < GMAX:
-                if (GMAX - Tv) > cutlass.Float32(1e-30):
+                w_ = GMAX - Tv
+                # w_ < 3.5e38 (> FLT_MAX) rejects an infinite bracket width.
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -3864,6 +3876,13 @@ class GvrTopkRegKernel:
                 if m > cmp_:
                     esc = cutlass.Int32(1)
             if tot < k:
+                esc = cutlass.Int32(1)
+            # Degenerate bracket (okc==0: infinite/collapsed width, e.g. an
+            # in-window +inf) makes SC=0 and folds every value into bin 0, so
+            # the histogram cannot rank the row; take the bracket-independent
+            # key-space escape, where fkey(+inf) is the maximum key.
+            # (upstream TensorRT-LLM PR #18625, ported verbatim.)
+            if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
