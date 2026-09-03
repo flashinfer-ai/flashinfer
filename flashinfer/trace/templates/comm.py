@@ -14,6 +14,8 @@
 
 """TraceTemplates for distributed communication ops."""
 
+from typing import Any, cast
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -478,10 +480,18 @@ def _ulysses_lowp_q_grouped_amax_reference(q, rank, world_size, **_unused):
     return _ulysses_lowp_grouped_amax_reference(q, 32, rank, world_size)
 
 
+# The rendered reference source must be self-contained (see
+# _render_reference_source): declare the shared helper as a dependency.
+cast(Any, _ulysses_lowp_q_grouped_amax_reference)._trace_reference_dependencies = (
+    _ulysses_lowp_grouped_amax_reference,
+)
+
+
 def _ulysses_lowp_q_grouped_amax_init(
     *,
     batch: int = 1,
     local_sequence: int = 4736,
+    q_slots: int = 0,  # derived
     num_heads: int = 56,
     head_dim: int = _ULYSSES_LOWP_HEAD_DIM,
     rank: int = 0,
@@ -489,6 +499,7 @@ def _ulysses_lowp_q_grouped_amax_init(
     device: str = "cuda",
     seed: int = 0,
 ):
+    del q_slots  # derived from local_sequence: slots(L, 32)
     torch.manual_seed(seed)
     q = torch.randn(
         batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -520,6 +531,7 @@ ulysses_lowp_q_grouped_amax_trace = TraceTemplate(
     outputs={
         "amax": Tensor(["batch", "num_heads", "q_slots"], dtype="float32"),
     },
+    constraints=["q_slots == (local_sequence + 62) // 32"],
     tags=["status:verified", "stage:comm"],
     reference=_ulysses_lowp_q_grouped_amax_reference,
     check=_ulysses_lowp_amax_check,
@@ -531,16 +543,47 @@ ulysses_lowp_q_grouped_amax_trace = TraceTemplate(
 def _ulysses_lowp_k_grouped_amax_reference(
     k, k_mean_global, rank, world_size, used_sequence=None, **_unused
 ):
-    """Without ``used_sequence`` (the init's case) every row is live."""
-    return _ulysses_lowp_grouped_amax_reference(
+    """Grouped |K - k_mean| amax with the API's live-prefix repair: when the
+    packed sequence carries a zero tail in rows ``[used_sequence, S)``, the ONE
+    64-token group mixing live and padded rows is reduced over its live rows
+    only (a zero row would contribute |0 - k_mean|); fully padded groups keep
+    the plain value and are never consumed."""
+    out = _ulysses_lowp_grouped_amax_reference(
         k, 64, rank, world_size, mean=k_mean_global
     )
+    local_sequence = k.shape[1]
+    global_sequence = local_sequence * world_size
+    if (
+        used_sequence is None
+        or used_sequence >= global_sequence
+        or used_sequence % 64 == 0
+    ):
+        return out
+    tail_group = (used_sequence - 1) // 64
+    group_first = (rank * local_sequence) // 64
+    group_last = (rank * local_sequence + local_sequence - 1) // 64
+    if not group_first <= tail_group <= group_last:
+        return out
+    lo = max(tail_group * 64, rank * local_sequence) - rank * local_sequence
+    hi = min(used_sequence, (rank + 1) * local_sequence) - rank * local_sequence
+    if hi > lo:
+        kc = k[:, lo:hi].float() - k_mean_global.float().unsqueeze(1)
+        out[:, :, tail_group - group_first] = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+    else:
+        out[:, :, tail_group - group_first] = 1e-7
+    return out
+
+
+cast(Any, _ulysses_lowp_k_grouped_amax_reference)._trace_reference_dependencies = (
+    _ulysses_lowp_grouped_amax_reference,
+)
 
 
 def _ulysses_lowp_k_grouped_amax_init(
     *,
     batch: int = 1,
     local_sequence: int = 4736,
+    k_slots: int = 0,  # derived
     num_heads: int = 56,
     head_dim: int = _ULYSSES_LOWP_HEAD_DIM,
     rank: int = 0,
@@ -548,6 +591,7 @@ def _ulysses_lowp_k_grouped_amax_init(
     device: str = "cuda",
     seed: int = 0,
 ):
+    del k_slots  # derived from local_sequence: slots(L, 64)
     torch.manual_seed(seed)
     k = torch.randn(
         batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -591,6 +635,7 @@ ulysses_lowp_k_grouped_amax_trace = TraceTemplate(
     outputs={
         "amax": Tensor(["batch", "num_heads", "k_slots"], dtype="float32"),
     },
+    constraints=["k_slots == (local_sequence + 126) // 64"],
     tags=["status:verified", "stage:comm"],
     reference=_ulysses_lowp_k_grouped_amax_reference,
     check=_ulysses_lowp_amax_check,
@@ -602,6 +647,7 @@ def _ulysses_lowp_quant_qkv_pack_fused_init(
     *,
     batch: int = 1,
     local_sequence: int = 4736,
+    chunk_bytes: int = 0,  # derived
     num_heads: int = 56,
     head_dim: int = _ULYSSES_LOWP_HEAD_DIM,
     rank: int = 0,
@@ -611,6 +657,7 @@ def _ulysses_lowp_quant_qkv_pack_fused_init(
 ):
     """One rank's shard plus the AllGathered global statistics it would hold
     (mean / 2.25-scaled amax computed here as a single-rank stand-in)."""
+    del chunk_bytes  # derived: payload_spec(...)["chunk_bytes"]
     torch.manual_seed(seed)
     q = torch.randn(
         batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -667,6 +714,10 @@ ulysses_lowp_quant_qkv_pack_fused_trace = TraceTemplate(
             description="Destination-major payload; row d goes to rank d.",
         ),
     },
+    constraints=[
+        "local_sequence % 128 == 0",
+        # chunk_bytes = round_up(3*B*L*(H/P)*D + 4*B*(H/P)*(slots(L,32)+slots(L,64)), 128)
+    ],
     tags=["stage:comm", "quantization:float8_e4m3fn"],
     init=_ulysses_lowp_quant_qkv_pack_fused_init,
 )
@@ -706,6 +757,11 @@ ulysses_lowp_quant_qkv_pack_trace = TraceTemplate(
     outputs={
         "payload": Tensor(["world_size", "chunk_bytes"], dtype="uint8"),
     },
+    constraints=[
+        "q_slots == (local_sequence + 62) // 32",
+        "k_slots == (local_sequence + 126) // 64",
+        # chunk_bytes = round_up(3*B*L*(H/P)*D + 4*B*(H/P)*(q_slots+k_slots), 128)
+    ],
     tags=["stage:comm", "quantization:float8_e4m3fn"],
 )
 
@@ -766,5 +822,12 @@ ulysses_lowp_unpack_for_sage_trace = TraceTemplate(
             ["batch_size", "local_heads", "k_scale_width"], dtype="float32"
         ),
     },
+    constraints=[
+        "logical_sequence == local_sequence * world_size",
+        "padded_sequence == (logical_sequence + 63) // 64 * 64",
+        "q_scale_width == (logical_sequence + 127) // 128 * 4",
+        "k_scale_width == (logical_sequence + 63) // 64",
+        # chunk_bytes = round_up(3*B*L*local_heads*D + 4*B*local_heads*(slots(L,32)+slots(L,64)), 128)
+    ],
     tags=["stage:comm"],
 )
