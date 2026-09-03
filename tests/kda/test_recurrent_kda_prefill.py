@@ -5661,18 +5661,25 @@ def test_flash_kda_jit_getter_is_importable():
     assert flashinfer.RecurrentKDAPrefillWorkspace is RecurrentKDAPrefillWorkspace
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "packed"),
+    [([2048], False), ([2048, 2304], True)],
+    ids=["fixed", "packed-varlen"],
+)
 @pytest.mark.parametrize("non_default_stream", [False, True])
 def test_frozen_small_bh_prefill_matches_direct_control(
     flash_kda_device,
     monkeypatch,
     non_default_stream,
+    seq_lens,
+    packed,
 ):
     inputs = _make_inputs(
-        seq_lens=[2048],
+        seq_lens=seq_lens,
         num_heads=1,
-        packed=False,
+        packed=packed,
         initial_state=True,
-        seed=2048,
+        seed=2048 + int(packed),
     )
     direct_inputs = {
         **inputs,
