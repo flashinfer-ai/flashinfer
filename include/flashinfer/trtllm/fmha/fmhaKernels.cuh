@@ -535,6 +535,13 @@ class TllmGenFmhaKernel {
     }
   }
 
+  bool hasCgaSmemReductionKernel(RunnerParams const& params,
+                                 SelectKernelParams selectKernelParams) const {
+    selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
+    auto const hashId = hashFromRunnerParams(params, selectKernelParams).first;
+    return mKernelMetaMap.find(hashId) != mKernelMetaMap.end();
+  }
+
   // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
   void computeCtaAndClusterConfig(CtaLaunchParams& ctaLaunchParams, RunnerParams const& params,
                                   KernelMeta const& kernelMeta,
@@ -669,17 +676,25 @@ class TllmGenFmhaKernel {
         selectKernelParams.mSelectNewKernel = true;
       }
 
+      // The P32 cubin inventory contains an H576/V512 CGA kernel for the split-V
+      // headDimPerCtaV=128 form. Let the first selection pass split V, then use CGA for the
+      // exact one-token decode shape when the matching dtype-specific cubin is registered.
+      bool const useMlaH512Cga = isDsv3MinLatencyMode && params.mMaxSeqLenQ == 1 &&
+                                 selectKernelParams.mNumTokensPerPage == 32 &&
+                                 selectKernelParams.mHeadDimPerCtaV == 128 &&
+                                 selectKernelParams.mTileSizeQ == 16 &&
+                                 hasCgaSmemReductionKernel(params, selectKernelParams);
+      bool const useCgaSmemReduction =
+          (!isDsv3MinLatencyMode && params.mHeadDimV < 512) || useMlaH512Cga;
+
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
       // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-      // headDimV >= 512 is excluded: the current trtllm-gen cubin ships no SwapsMmaAb
-      // CgaSmemReduction kernels at headDimV >= 512 (covers both MLA headDimQk=576/V=512 and
-      // non-MLA H=512), and for tileSizeQ >= 32 the CGA variant also exceeds the device smem
-      // limit. This guard can be narrowed once trtllm-gen ships a cubin with the
-      // tileSizeQ>=32 + headDimPerCtaV>=512 skip predicate.
-      if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
+      // Other headDimV >= 512 shapes remain excluded because the cubin inventory is incomplete,
+      // and tileSizeQ >= 32 CGA variants can exceed the device shared-memory limit.
+      if (useCgaSmemReduction && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
-          !selectKernelParams.mForceGmemReduction && params.mHeadDimV < 512) {
+          !selectKernelParams.mForceGmemReduction) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;
@@ -779,10 +794,11 @@ class TllmGenFmhaKernel {
                                        SelectKernelParams& selectKernelParams) const {
     // numHeadsQ <= 32 : SwapsMmaAbForGeneration
     //   Non-power-of-two head counts use one padded Q8/Q16/Q32 tile. Power-of-two head counts use
-    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 or numHeadsQPerKv at batch>=2.
-    //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
-    //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
-    //     full tileSizeQ wins by 2-11% at batch>=2.
+    //   tileSizeQ = numHeadsQPerKv/2 for short queries at batch=1, otherwise numHeadsQPerKv.
+    //   Threshold: maxSeqLenQ <= 16 and batchSize * maxNumCtasPerSeqKv <= MP/8
+    //   (crossover at batch=1->2 on B200).
+    //   Short-query benchmarks (seqLenKv=8192, topK=2048): half tileSizeQ wins by 2-6% at
+    //     batch=1; full tileSizeQ wins by 2-11% at batch>=2.
     // numHeadsQ > 32 : KeepsMmaAbForGeneration, tileSizeQ = 64
     //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
     //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
@@ -799,8 +815,10 @@ class TllmGenFmhaKernel {
       // mMultiCtasKvMode defaults to GmemReduction from the constructor. computeCtaAndClusterConfig
       // may upgrade it to CgaSmemReduction; that update is preserved naturally across
       // re-selections. The base tileSizeQ is numHeadsQPerKv (one CTA covers all Q heads per token).
-      // At batch=1 the GPU is under-utilized, so we halve tileSizeQ to create 2x more
-      // head-splitting CTAs. Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8.
+      // At batch=1 short queries under-utilize the GPU, so halve tileSizeQ to create 2x more
+      // head-splitting CTAs. Long-query prefill already has Q-axis parallelism; halving the tile
+      // duplicates the KV loads for each token.
+      // Threshold: maxSeqLenQ <= 16 and batchSize * maxNumCtasPerSeqKv <= MP/8.
       //   effectiveSeqLenKv = min(seqLen, topK) = 2048 -> maxNumCtasPerSeqKv = 16.
       //   Condition: batchSize * 16 <= MP/8 -> batchSize <= 1 (crossover at batch=1->2).
       // Only halve when half tileSizeQ >= 8 (no valid SwapsMmaAb kernel below tileSizeQ=8).
@@ -809,8 +827,10 @@ class TllmGenFmhaKernel {
       int const effectiveSeqLenKv = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
       int const maxNumCtasPerSeqKv =
           flashinfer::ceil_div(effectiveSeqLenKv, selectKernelParams.mTileSizeKv);
-      bool const useHalfTileSizeQ = halfTileSizeQ >= 8 && params.mBatchSize * maxNumCtasPerSeqKv <=
-                                                              params.mMultiProcessorCount / 8;
+      bool const useHalfTileSizeQ =
+          halfTileSizeQ >= 8 &&
+          params.mBatchSize * maxNumCtasPerSeqKv <= params.mMultiProcessorCount / 8 &&
+          params.mMaxSeqLenQ <= 16;
       tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
     } else {
       // numHeadsQ > 32: use KeepsMmaAbForGeneration.
