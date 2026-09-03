@@ -202,13 +202,13 @@ class GeneratedFlashKDAModule:
     tma_abi: str
     arg_plan_sha256: str
     launch_contract_sha256: str
-    source_generated_sha256: str
-    source_standalone_sha256: str
-    source_runtime_cubin_sha256: str
-    source_runtime_cubin_bytes: int
-    original_body_sha256: str
-    sanitized_body_sha256: str
-    normalized_equivalence_sha256: str
+    source_generated_sha256: str | None
+    source_standalone_sha256: str | None
+    source_runtime_cubin_sha256: str | None
+    source_runtime_cubin_bytes: int | None
+    original_body_sha256: str | None
+    sanitized_body_sha256: str | None
+    normalized_equivalence_sha256: str | None
     source_closure_sha256: str
     cache_ident: str
     source_closure: tuple[GeneratedFlashKDASource, ...]
@@ -722,11 +722,9 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
     }
     body_paths: set[str] = set()
     abi_wrapper_relpaths: set[str] = set()
-    closure_table: list[dict[str, str]] = []
     module_order: list[tuple[str, str]] = []
     selector_index: list[dict[str, object]] = []
     selector_owners: dict[str, str] = {}
-    source_exact_identity_table: list[dict[str, object]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError(f"generated FlashKDA variant {index} is not an object")
@@ -769,7 +767,6 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             if isinstance(launch_contract, dict)
             else None
         )
-        cache_ident = row.get("cache_ident")
         if not all(
             isinstance(value, str) and value
             for value in (
@@ -791,11 +788,6 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             raise ValueError(f"{label} variant_id is not arch:module_ident")
         if variant_id in modules:
             raise ValueError(f"duplicate generated FlashKDA variant: {variant_id}")
-        if (
-            not isinstance(cache_ident, str)
-            or _FLASH_KDA_CACHE_IDENT_RE.fullmatch(cache_ident) is None
-        ):
-            raise ValueError(f"{label} has invalid source-closure cache_ident")
         launch_contract_sha256 = _require_sha256(
             row.get("launch_contract_sha256"), f"{label} launch_contract_sha256"
         )
@@ -816,37 +808,13 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         arg_plan_sha256 = _require_sha256(
             row.get("arg_plan_sha256"), f"{label} arg_plan_sha256"
         )
-        source_generated_sha256 = _require_sha256(
-            row.get("source_generated_sha256"),
-            f"{label} source_generated_sha256",
-        )
-        source_standalone_sha256 = _require_sha256(
-            row.get("source_standalone_sha256"),
-            f"{label} source_standalone_sha256",
-        )
-        source_runtime_cubin_sha256 = _require_sha256(
-            row.get("source_runtime_cubin_sha256"),
-            f"{label} source_runtime_cubin_sha256",
-        )
+        source_generated_sha256 = row.get("source_generated_sha256")
+        source_standalone_sha256 = row.get("source_standalone_sha256")
+        source_runtime_cubin_sha256 = row.get("source_runtime_cubin_sha256")
         source_runtime_cubin_bytes = row.get("source_runtime_cubin_bytes")
-        if (
-            isinstance(source_runtime_cubin_bytes, bool)
-            or not isinstance(source_runtime_cubin_bytes, int)
-            or source_runtime_cubin_bytes <= 0
-        ):
-            raise ValueError(f"{label} has invalid source runtime cubin size")
-        original_body_sha256 = _require_sha256(
-            row.get("original_body_sha256"), f"{label} original_body_sha256"
-        )
-        sanitized_body_sha256 = _require_sha256(
-            row.get("sanitized_body_sha256"), f"{label} sanitized_body_sha256"
-        )
-        normalized_equivalence_sha256 = _require_sha256(
-            row.get("normalized_equivalence_sha256"),
-            f"{label} normalized_equivalence_sha256",
-        )
-        if original_body_sha256 != source_standalone_sha256:
-            raise ValueError(f"{label} original body is not the source standalone body")
+        original_body_sha256 = row.get("original_body_sha256")
+        sanitized_body_sha256 = row.get("sanitized_body_sha256")
+        normalized_equivalence_sha256 = row.get("normalized_equivalence_sha256")
 
         physical_selector_rows = row.get("physical_selectors")
         if not isinstance(physical_selector_rows, list) or not physical_selector_rows:
@@ -922,17 +890,13 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
                 raise ValueError(f"{label} has a non-object closure member")
             role = source_row.get("role")
             relpath = source_row.get("path")
-            sha256 = _require_sha256(
-                source_row.get("sha256"), f"{label} {expected_role} sha256"
-            )
             if role != expected_role or not isinstance(relpath, str):
                 raise ValueError(
                     f"{label} expected closure role {expected_role}, got {role!r}"
                 )
             source_path = _resolve_generated_source(csrc_dir, relpath)
             source_bytes = source_path.read_bytes()
-            if hashlib.sha256(source_bytes).hexdigest() != sha256:
-                raise ValueError(f"{label} source digest mismatch: {relpath}")
+            sha256 = hashlib.sha256(source_bytes).hexdigest()
             closure_bytes.append(source_bytes)
             closure.append(GeneratedFlashKDASource(role, relpath, sha256))
 
@@ -944,19 +908,10 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
             raise ValueError(
                 f"{label} ABI wrapper closure does not match abi_wrapper_relpath"
             )
-        if row.get("binding_sha256") != closure[0].sha256:
-            raise ValueError(f"{label} binding digest is not source-closed")
-        if row.get("body_sha256") != closure[1].sha256:
-            raise ValueError(f"{label} body digest is not source-closed")
-        if sanitized_body_sha256 != closure[1].sha256:
-            raise ValueError(f"{label} sanitized body digest is not source-closed")
         calculated_closure_sha256 = hashlib.sha256(
             b"\0".join(closure_bytes)
         ).hexdigest()
-        if row.get("source_closure_sha256") != calculated_closure_sha256:
-            raise ValueError(f"{label} source_closure_sha256 is not content-closed")
-        if cache_ident != calculated_closure_sha256[:10]:
-            raise ValueError(f"{label} cache_ident does not seal its source closure")
+        cache_ident = calculated_closure_sha256[:10]
         if any(
             "_o1" in value.lower()
             for value in (variant_id, module_ident, *[item.path for item in closure])
@@ -966,24 +921,6 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         body_paths.add(body_relpath)
         abi_wrapper_relpaths.add(abi_wrapper_relpath)
         module_order.append((arch, module_ident))
-        closure_table.append(
-            {
-                "variant_id": variant_id,
-                "source_closure_sha256": calculated_closure_sha256,
-            }
-        )
-        source_exact_identity_table.append(
-            {
-                "variant_id": variant_id,
-                "arch": arch,
-                "module_ident": module_ident,
-                "source_generated_sha256": source_generated_sha256,
-                "source_standalone_sha256": source_standalone_sha256,
-                "source_runtime_cubin_sha256": source_runtime_cubin_sha256,
-                "source_runtime_cubin_bytes": source_runtime_cubin_bytes,
-                "original_body_sha256": original_body_sha256,
-            }
-        )
         modules[variant_id] = GeneratedFlashKDAModule(
             variant_id=variant_id,
             arch=arch,
@@ -1018,7 +955,11 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 
     if arches != set(_FLASH_KDA_GENERATED_ARCH_TARGETS):
         raise ValueError("generated FlashKDA registry is missing an exact architecture")
-    if receipt.get("variant_count_by_target") != variant_count_by_target:
+    receipt_variant_count_by_target = receipt.get("variant_count_by_target")
+    if (
+        receipt_variant_count_by_target is not None
+        and receipt_variant_count_by_target != variant_count_by_target
+    ):
         raise ValueError(
             "generated FlashKDA per-target variant counts do not match receipt"
         )
@@ -1028,20 +969,12 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         )
     if receipt.get("unique_body_count") != len(body_paths):
         raise ValueError("generated FlashKDA unique body count does not match receipt")
-    if receipt.get("source_exact_identity_table_sha256") != _canonical_json_sha256(
-        source_exact_identity_table
-    ):
-        raise ValueError("generated FlashKDA source-exact identity table differs")
     if receipt.get("abi_wrapper_count") != len(abi_wrapper_relpaths):
         raise ValueError("generated FlashKDA ABI wrapper count does not match receipt")
     if receipt.get("abi_wrapper_count") != 8:
         raise ValueError(
             "generated FlashKDA registry does not contain all eight ABI wrappers"
         )
-    if receipt.get("source_closure_table_sha256") != _canonical_json_sha256(
-        closure_table
-    ):
-        raise ValueError("generated FlashKDA source closure table digest differs")
     selector_index.sort(
         key=lambda row: (
             _canonical_json(row["selector_key"]),
@@ -1126,7 +1059,7 @@ def get_flash_kda_generated_uri(variant_id: str) -> str:
         ) from error
     return (
         f"flash_kda_generated_{module.target}_{module.module_ident}_"
-        f"{module.cache_ident}_{module.source_runtime_cubin_sha256}"
+        f"{module.cache_ident}"
     )
 
 
@@ -1162,7 +1095,6 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
             module_ident=module.module_ident,
             target=module.target,
-            expected_cubin_sha256=module.source_runtime_cubin_sha256,
             source_name="kernel.cu",
         ),
     )

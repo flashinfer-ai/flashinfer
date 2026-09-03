@@ -1574,6 +1574,119 @@ def test_frozen_prefill_auto_falls_back_only_when_state_contract_is_ineligible(
     assert recurrent_kda(**_strict_prefill_kwargs(inputs)) is sentinel
 
 
+def test_frozen_prefill_auto_real_gqa_fallback_matches_decode(
+    flash_kda_device,
+    monkeypatch,
+):
+    torch.manual_seed(23_207)
+    total_tokens, query_heads, value_heads, head_dim = 2, 2, 4, 128
+    q = torch.randn(
+        (1, total_tokens, query_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        (1, total_tokens, value_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    g = torch.randn_like(v)
+    beta = torch.randn(
+        (1, total_tokens, value_heads),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    A_log = torch.randn(query_heads, dtype=torch.float32, device=flash_kda_device)
+    dt_bias = torch.randn(
+        (query_heads, head_dim), dtype=torch.float32, device=flash_kda_device
+    )
+    cu_seqlens = torch.tensor(
+        [0, total_tokens], dtype=torch.int64, device=flash_kda_device
+    )
+    initial_state = torch.randn(
+        (1, value_heads, head_dim, head_dim),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    output = torch.empty_like(v)
+    common = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "cu_seqlens": cu_seqlens,
+        "beta_is_logit": True,
+    }
+    eligibility = _frozen_prefill_eligibility_kwargs(
+        {**common, "initial_state": initial_state}, output=output
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility)
+    assert not kda_prefill_cute_api._is_cute_dsl_kda_prefill_eligible(
+        **common,
+        initial_state=initial_state,
+        seq_order=None,
+        ssm_state_indices=None,
+        num_spec_tokens=None,
+        num_accepted_tokens=None,
+        output=output,
+        initial_state_source=None,
+        initial_state_indices=None,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+
+    real_decode = kda_decode_api._run_recurrent_kda
+    assert real_decode is not None
+    expected = real_decode(
+        **common,
+        initial_state=initial_state.clone(),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="auto",
+    )
+    decode_calls = []
+
+    def record_decode(**kwargs):
+        decode_calls.append(kwargs)
+        return real_decode(**kwargs)
+
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", record_decode)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        lambda selector: pytest.fail(
+            f"fallback loaded generated Cake module: {selector}"
+        ),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_cake_kda_prefill_module",
+        lambda variant, target: pytest.fail(
+            f"fallback loaded raw Cake module: {variant}/{target}"
+        ),
+    )
+    actual = recurrent_kda(
+        **common,
+        initial_state=initial_state.clone(),
+        output=torch.empty_like(output),
+        output_final_state=True,
+    )
+
+    assert len(decode_calls) == 1
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_value.float(), expected_value.float(), atol=1e-2, rtol=1e-2
+        )
+
+
 @pytest.mark.parametrize("backend", ["auto", "cake"])
 def test_frozen_prefill_missing_selected_module_is_fail_closed(
     flash_kda_device,
