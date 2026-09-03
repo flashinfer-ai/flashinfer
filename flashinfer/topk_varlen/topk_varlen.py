@@ -55,6 +55,7 @@ Backend choices
 
 import functools
 import math
+import warnings
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -68,6 +69,7 @@ from ..cute_dsl.availability import is_cute_dsl_available
 _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 from ..utils import (
+    BackendSupportedError,
     _get_cache_buf,
     backend_requirement,
     get_device_sm_count,
@@ -166,8 +168,44 @@ def _radix_cutlass_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):  # extra kwargs mirror the public signature; unused by the check
-    """Radix masked-fallback: runs on all supported SM tiers."""
-    return True
+    """Radix masked-fallback: runs on all supported SM tiers, on contiguous
+    logits (the CUDA launcher checks contiguity; gating here lets ``auto``
+    pick a backend that handles strided views instead)."""
+    return logits.is_contiguous()
+
+
+def _hint_problem(pre_idx, logits, seq_lens, top_k) -> Optional[str]:
+    """Describe what is wrong with a caller-provided ``pre_idx``, or None.
+
+    The hint contract shared by the ``gvr`` and ``gvr_2`` kernels (both
+    compile it as a compact, 16-byte-aligned ``int32[batch, top_k]`` fake
+    tensor on the logits device): a hint that breaks it is treated as absent
+    by the checkers (so ``auto`` routes hint-free) and is dropped with a
+    RuntimeWarning by the API body. Any of these would otherwise surface as a
+    kernel-side RuntimeError or a DSL conversion error from the default path.
+    """
+    if not isinstance(pre_idx, torch.Tensor):
+        return f"not a tensor ({type(pre_idx).__name__})"
+    if logits.dim() != 2 or seq_lens.dim() != 1:
+        # the API body rejects these with a ValueError; the checkers (which
+        # run first) must not trip over them here
+        return "logits/seq_lens malformed (validated by the API body)"
+    if pre_idx.dim() != 2:
+        return f"expected a 2-D tensor, got {pre_idx.dim()}-D"
+    if pre_idx.dtype != torch.int32:
+        return f"expected int32, got {pre_idx.dtype}"
+    if not pre_idx.is_cuda or pre_idx.device != logits.device:
+        return f"expected a CUDA tensor on {logits.device}, got {pre_idx.device}"
+    expected = (seq_lens.shape[0], top_k)
+    if tuple(pre_idx.shape) != expected:
+        # run_varlen derives k from pre_idx.shape[1]; a mismatched width would
+        # silently select pre_idx.shape[1] elements instead of top_k.
+        return f"expected shape {expected} (one row per request), got {tuple(pre_idx.shape)}"
+    if not pre_idx.is_contiguous():
+        return "not contiguous"
+    if pre_idx.data_ptr() & 15:
+        return "base pointer not 16-byte aligned (shifted view)"
+    return None
 
 
 @supported_compute_capability(_GVR_CCS)
@@ -190,7 +228,11 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    if not (_cute_dsl_ready(logits.device) and pre_idx is not None):
+    if not (
+        _cute_dsl_ready(logits.device)
+        and pre_idx is not None
+        and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    ):
         return False
     # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
     # raise inside the kernel's __init__ during compilation.
@@ -231,7 +273,11 @@ def _gvr2_top_k_varlen_check(
     Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
     explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
     """
-    if not (_cute_dsl_ready(logits.device) and pre_idx is not None):
+    if not (
+        _cute_dsl_ready(logits.device)
+        and pre_idx is not None
+        and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    ):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
     # follow-up (run_varlen raises on any other dtype).
@@ -240,16 +286,16 @@ def _gvr2_top_k_varlen_check(
     # Validated K domain (matches the upstream dispatch tuning + dsa.py gate).
     if top_k not in (512, 1024, 2048):
         return False
-    if pre_idx.shape[1] != top_k:
-        # run_varlen derives k from pre_idx; a mismatched hint width would
-        # silently select pre_idx.shape[1] elements instead of top_k.
-        return False
     if compress_ratio not in (1, 4):
         return False
     # float4 row loads: row stride must be a multiple of 4 and the base
     # 16-byte aligned (fresh torch allocations always are; sliced views may
-    # not be). Wider-than-N row strides are accepted (paged arenas).
-    if logits.stride(1) != 1:
+    # not be). Wider-than-N row strides are accepted (paged arenas); rows that
+    # overlap (stride(0) < shape[1], e.g. an expand view) are not a layout the
+    # kernel can address — it derives the row pitch from stride(0).
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        return False
+    if logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
         return False
     npad = logits.stride(0) if logits.shape[0] > 1 else logits.shape[1]
     if npad % 4 != 0:
@@ -1115,7 +1161,11 @@ def _radix_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):
-    """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required."""
+    """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
+    Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
+    contract, so they are gated here and ``auto`` falls through."""
+    if logits.dim() == 2 and logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
+        return False
     return _cute_dsl_ready(logits.device)
 
 
@@ -1408,7 +1458,10 @@ def top_k_varlen(
     seq_lens : torch.Tensor
         1-D ``int32`` tensor of shape ``(num_rows // next_n,)`` with the
         effective KV-cache length per request.  Logits at or beyond
-        ``seq_lens[i]`` are excluded from the search.
+        ``seq_lens[i]`` are excluded from the search. A row whose length
+        exceeds the logits width (the dynamic length has outgrown the static
+        buffer, e.g. under CUDA-graph replay) is clamped to the width by every
+        backend: only the scores present in the buffer are ranked.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1420,7 +1473,12 @@ def top_k_varlen(
         internally applies a ``+1`` offset (DSv3.2) so the previous step's
         indices land correctly in the current step's grown KV-cache space.
         ``pre_idx[:, 0]`` must be the argmax index.
-        Required by the ``"gvr"`` backend; ignored by ``"radix_cutlass"``.
+        Required by the ``"gvr"`` and ``"gvr_2"`` backends; ignored by the
+        radix backends. Must be a contiguous, 16-byte-aligned int32 CUDA
+        tensor on ``logits.device`` of shape ``[seq_lens.shape[0], top_k]``:
+        a hint that violates this is **discarded with a RuntimeWarning** and
+        the call runs hint-free (``auto`` picks a hint-free backend; an
+        explicit ``"gvr"`` / ``"gvr_2"`` request is refused).
     compress_ratio : int, optional
         KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4).
         Default ``1``.
@@ -1430,10 +1488,15 @@ def top_k_varlen(
         When ``True`` also return the selected logit values.
         Default ``False``.
     out_indices : torch.Tensor, optional
-        Pre-allocated ``int32[num_rows, top_k]`` output buffer.
+        Pre-allocated ``int32[num_rows, top_k]`` output buffer: contiguous,
+        16-byte aligned, on ``logits.device``, of that shape or a 1-D buffer
+        of exactly ``num_rows * top_k`` elements (viewed in place and returned
+        as its ``[num_rows, top_k]`` view over the same storage, not as the
+        caller's object); a wider, taller or otherwise shaped buffer raises
+        ``ValueError``.
     out_values : torch.Tensor, optional
-        Pre-allocated values buffer (same dtype as ``logits``).
-        Only used when ``return_values=True``.
+        Pre-allocated values buffer (same dtype as ``logits``, same layout
+        rules as ``out_indices``). Only used when ``return_values=True``.
     backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
@@ -1519,16 +1582,24 @@ def top_k_varlen(
         For the ``"gvr_2"`` backend the optional key ``"gvr2_workspace"``
         (CUDA tensor of at least
         ``flashinfer.topk_varlen.kernels.gvr2_topk_host.workspace_bytes()``
-        = 20,973,568 bytes, zero-initialized before first use, 8-byte
-        aligned) overrides the per-device cached slab — needed only when
-        concurrent streams on one device may both take the multi-CTA SPLIT
-        path.
+        = 20,973,568 bytes, zero-initialized before first use, 16-byte
+        aligned) overrides the per-device cached slab.
 
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
             streams — each stream must have its own workspace to avoid races
-            on the device tensors.  When ``workspace`` is ``None`` (default)
-            buffers are allocated locally and are safe for any concurrency.
+            on the device tensors.  For the ``"gvr"`` backend, ``workspace=None``
+            (default) allocates per call and is safe for any concurrency.
+            For ``"gvr_2"``, ``workspace=None`` resolves to **one slab per
+            device**, shared by every launch on that device: it holds the
+            cross-CTA counters, offsets and candidate buffer of the multi-CTA
+            streaming path (selected by the kernel's ``route()`` from row
+            count, envelope and ``top_k``; small batches with long rows), so
+            two such launches in flight at once — two eager streams, or two
+            CUDA graphs replayed concurrently — race on it. Every concurrently
+            active stream, and every CUDA graph that may replay concurrently
+            with another launch, must pass its own ``"gvr2_workspace"``;
+            stream-ordered use needs nothing.
 
     Returns
     -------
@@ -1540,8 +1611,19 @@ def top_k_varlen(
     Raises
     ------
     BackendSupportedError
-        If the requested backend is not supported on the current device or
-        the required inputs (e.g. ``pre_idx``) are missing.
+        If the requested backend is not supported on the current device, or
+        an explicit ``"gvr"`` / ``"gvr_2"`` request has no usable ``pre_idx``.
+    ValueError
+        If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
+        grouping contract, an ``out_indices`` / ``out_values`` buffer is
+        outside the contract above, or an explicit backend's checker rejects
+        the problem (reported as "Problem size is not supported").
+
+    Warns
+    -----
+    RuntimeWarning
+        ``pre_idx`` was malformed and has been discarded; the call ran
+        hint-free.
 
     Examples
     --------
@@ -1574,8 +1656,20 @@ def top_k_varlen(
     --------
     flashinfer.top_k : General-purpose radix/clusters top-K (uniform lengths).
     """
-    assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
-    assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    # Real exceptions (not asserts) so every contract below also holds under
+    # `python -O`; the API body still runs under skip_check=True.
+    if not (isinstance(logits, torch.Tensor) and logits.is_cuda and logits.dim() == 2):
+        raise ValueError("logits must be a 2-D CUDA tensor")
+    if not (
+        isinstance(seq_lens, torch.Tensor)
+        and seq_lens.is_cuda
+        and seq_lens.dim() == 1
+        and seq_lens.dtype == torch.int32
+    ):
+        raise ValueError(
+            "seq_lens must be a 1-D int32 CUDA tensor"
+            + (f", got {seq_lens.dtype}" if isinstance(seq_lens, torch.Tensor) else "")
+        )
     # Grouped-row ABI, shared by every backend: row r belongs to sequence
     # r // next_n, so seq_lens must hold exactly one entry per group. Validated
     # here (not in the per-backend checkers) because a violation is a silent
@@ -1593,11 +1687,81 @@ def top_k_varlen(
             f"row // next_n -> sequence; for per-row lengths pass next_n=1 "
             f"with one seq_lens entry per row."
         )
+    num_rows = logits.shape[0]
+
+    # A malformed hint is discarded, loudly: the call runs hint-free (the
+    # checkers above already treated it as absent, so `auto` never selected a
+    # hint-consuming backend for it) instead of failing inside a kernel. An
+    # explicit backend="gvr"/"gvr_2" request with a malformed hint is refused
+    # by its checker when checks run, and by the guard after backend
+    # resolution below under skip_check=True.
+    if pre_idx is not None:
+        problem = _hint_problem(pre_idx, logits, seq_lens, top_k)
+        if problem is not None:
+            tail = (
+                "Fix the caller: with a well-formed hint auto can use the gvr_2 / "
+                "gvr paths, which are several times faster on hinted fp32 shapes."
+                if backend == "auto"
+                else f"backend={backend!r} never consumes the hint; the result is "
+                "unaffected, but fix the caller."
+            )
+            warnings.warn(
+                f"top_k_varlen: pre_idx is malformed ({problem}); the hint is "
+                f"DISCARDED and this call runs hint-free (int32[{seq_lens.shape[0]}, "
+                f"{top_k}] contiguous CUDA tensor on {logits.device} expected). {tail}",
+                RuntimeWarning,
+                stacklevel=2,  # attributed to the decorator wrapper; the text names the fix
+            )
+            pre_idx = None
+
+    # Caller-provided output buffers: every DSL backend writes a compact,
+    # 16-byte-aligned [num_rows, top_k] block. Accepted: exactly that shape,
+    # or any contiguous buffer holding exactly num_rows * top_k elements
+    # (e.g. a flat one), which is viewed to [num_rows, top_k] in place — same
+    # storage, no copy, stable CUDA-graph destination. Anything else is a
+    # contract violation here rather than a silent re-layout (the gvr_2 host
+    # used to pack a wider buffer at stride top_k) or a DSL conversion error.
+    def _check_out(name, buf, dt):
+        if not (
+            isinstance(buf, torch.Tensor)
+            and buf.is_cuda
+            and buf.device == logits.device
+        ):
+            raise ValueError(f"{name} must be a CUDA tensor on {logits.device}")
+        if buf.dtype != dt:
+            raise ValueError(f"{name} must have dtype {dt}, got {buf.dtype}")
+        if not buf.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if buf.data_ptr() & 15:
+            raise ValueError(f"{name} must be 16-byte aligned (not a shifted view)")
+        if tuple(buf.shape) == (num_rows, top_k):
+            return buf
+        if buf.dim() != 1 or buf.numel() != num_rows * top_k:
+            # any other 2-D shape with the right element count (e.g. the
+            # transposed shape) would be a silent re-layout: refuse it
+            raise ValueError(
+                f"{name} must have shape ({num_rows}, {top_k}) or be a 1-D buffer "
+                f"of exactly {num_rows * top_k} elements, got {tuple(buf.shape)}"
+            )
+        return buf.view(num_rows, top_k)
+
+    if out_indices is not None:
+        out_indices = _check_out("out_indices", out_indices, torch.int32)
+    if return_values and out_values is not None:
+        out_values = _check_out("out_values", out_values, logits.dtype)
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
+    if pre_idx is None and backend in ("gvr", "gvr_2"):
+        # reachable under skip_check=True (the checkers did not run) with a
+        # missing or just-discarded hint: refuse here instead of handing None
+        # to a kernel host
+        raise BackendSupportedError(
+            f"backend={backend!r} requires a well-formed pre_idx hint "
+            f"(int32[{seq_lens.shape[0]}, {top_k}] contiguous CUDA tensor on "
+            f"{logits.device}); none is usable for this call"
+        )
 
-    num_rows = logits.shape[0]
     if out_indices is None:
         out_indices = torch.empty(
             (num_rows, top_k), dtype=torch.int32, device=logits.device

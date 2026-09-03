@@ -1379,16 +1379,161 @@ def test_unknown_backend_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_input_validation():
-    """1-D logits and non-int32 seq_lens are rejected by the up-front asserts."""
+    """1-D logits and non-int32 seq_lens are rejected with ValueErrors (real
+    exceptions with a message, so the checks also hold under ``python -O``)."""
     top_k = 512
     logits = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
     seq_lens = torch.full((4,), 4096, dtype=torch.int32, device="cuda")
     # logits must be 2-D
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="2-D CUDA"):
         flashinfer.top_k_varlen(logits[0], seq_lens[:1], top_k)
     # seq_lens must be int32
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="int32"):
         flashinfer.top_k_varlen(logits, seq_lens.long(), top_k)
+
+
+def _malformed_hints(batch, top_k):
+    dev = "cuda"
+    return {
+        "transposed": torch.zeros(top_k, batch, dtype=torch.int32, device=dev).t(),
+        "wrong_batch": torch.zeros(batch // 2, top_k, dtype=torch.int32, device=dev),
+        "wrong_width": torch.zeros(batch, top_k // 2, dtype=torch.int32, device=dev),
+        "int64": torch.zeros(batch, top_k, dtype=torch.int64, device=dev),
+        "cpu": torch.zeros(batch, top_k, dtype=torch.int32),
+        "misaligned": torch.zeros(batch * top_k + 4, dtype=torch.int32, device=dev)[
+            1 : 1 + batch * top_k
+        ].view(batch, top_k),
+        "three_d": torch.zeros(batch, top_k, 1, dtype=torch.int32, device=dev),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "transposed",
+        "wrong_batch",
+        "wrong_width",
+        "int64",
+        "cpu",
+        "misaligned",
+        "three_d",
+    ],
+)
+def test_malformed_hint_is_discarded_with_warning(kind):
+    """A malformed ``pre_idx`` (wrong shape, dtype, device, layout or
+    alignment) is dropped with a RuntimeWarning and the call runs hint-free
+    and exact, under ``auto`` and under an explicit hint-free backend. The
+    hint-consuming backends refuse the call up front instead of failing
+    inside the kernel (they cannot run without a hint)."""
+    from flashinfer.utils import BackendSupportedError
+
+    batch, n, top_k = 4, 8192, 1024
+    torch.manual_seed(11)
+    logits = torch.randn(batch, n, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((batch,), n, dtype=torch.int32, device="cuda")
+    bad = _malformed_hints(batch, top_k)[kind]
+    ref = torch.sort(torch.topk(logits, top_k, dim=1).values, dim=1).values
+    with pytest.warns(RuntimeWarning, match="pre_idx"):
+        indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=bad)
+    assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
+    assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
+    # explicit hint-free backend (radix on Blackwell+, radix_cutlass elsewhere):
+    # the hint is dropped with the same warning and the result stays exact
+    major, minor = torch.cuda.get_device_capability()
+    cc = major * 10 + minor
+    hint_free = (
+        "radix"
+        if flashinfer.top_k_varlen.is_backend_supported("radix", cc)
+        else "radix_cutlass"
+    )
+    with pytest.warns(RuntimeWarning, match="pre_idx"):
+        indices, _ = flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, pre_idx=bad, backend=hint_free
+        )
+    assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
+    assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
+    # explicit hint-consuming backends: refused by their checker up front
+    # (the @backend_requirement decorator reports a failed explicit-backend
+    # check as ValueError("Problem size is not supported ..."))
+    for backend in ("gvr", "gvr_2"):
+        if flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
+            with pytest.raises(
+                (BackendSupportedError, ValueError), match="not supported"
+            ):
+                flashinfer.top_k_varlen(
+                    logits, seq_lens, top_k, pre_idx=bad, backend=backend
+                )
+            # skip_check=True bypasses the checkers: the body must still refuse
+            # instead of handing the discarded hint (None) to the kernel host
+            with (
+                pytest.warns(RuntimeWarning, match="pre_idx"),
+                pytest.raises(BackendSupportedError, match="well-formed"),
+            ):
+                flashinfer.top_k_varlen(
+                    logits,
+                    seq_lens,
+                    top_k,
+                    pre_idx=bad,
+                    backend=backend,
+                    skip_check=True,
+                )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_output_buffer_contract():
+    """Caller-provided ``out_indices`` / ``out_values`` must be contiguous, on
+    the logits device, of the right dtype and exactly ``[num_rows, top_k]``;
+    anything else is a ValueError. The gvr_2 host used to accept a wider
+    buffer and pack the result into it at stride ``top_k``, so rows 0 and 1
+    of the caller's buffer held two result rows each and the rest stayed
+    untouched."""
+    batch, n, top_k = 4, 8192, 1024
+    logits = torch.randn(batch, n, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((batch,), n, dtype=torch.int32, device="cuda")
+    bad = {
+        "wider": torch.empty(batch, 2 * top_k, dtype=torch.int32, device="cuda"),
+        "taller": torch.empty(2 * batch, top_k, dtype=torch.int32, device="cuda"),
+        "short_flat": torch.empty(batch * top_k - 1, dtype=torch.int32, device="cuda"),
+        # right element count, wrong 2-D shape: would be a silent re-layout
+        "transposed_shape": torch.empty(top_k, batch, dtype=torch.int32, device="cuda"),
+        "misaligned": torch.empty(batch * top_k + 4, dtype=torch.int32, device="cuda")[
+            1 : 1 + batch * top_k
+        ].view(batch, top_k),
+        "int64": torch.empty(batch, top_k, dtype=torch.int64, device="cuda"),
+        "non_contiguous": torch.empty(
+            top_k, batch, dtype=torch.int32, device="cuda"
+        ).t(),
+        "cpu": torch.empty(batch, top_k, dtype=torch.int32),
+    }
+    for buf in bad.values():
+        with pytest.raises(ValueError, match="out_indices"):
+            flashinfer.top_k_varlen(logits, seq_lens, top_k, out_indices=buf)
+    with pytest.raises(ValueError, match="out_values"):
+        flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            return_values=True,
+            out_values=torch.empty(batch, top_k, dtype=torch.bfloat16, device="cuda"),
+        )
+    # a flat buffer with exactly num_rows * top_k elements is viewed in place
+    # (the contract the radix_filter in-place test relies on), for every backend
+    flat_i = torch.full((batch * top_k,), -7, dtype=torch.int32, device="cuda")
+    idx, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, out_indices=flat_i)
+    assert idx.data_ptr() == flat_i.data_ptr() and tuple(idx.shape) == (batch, top_k)
+    assert int((flat_i == -7).sum()) == 0
+    good_i = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    good_v = torch.empty(batch, top_k, dtype=torch.float32, device="cuda")
+    idx, vals = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        return_values=True,
+        out_indices=good_i,
+        out_values=good_v,
+    )
+    assert idx.data_ptr() == good_i.data_ptr() and vals.data_ptr() == good_v.data_ptr()
 
 
 # ---------------------------------------------------------------------------
