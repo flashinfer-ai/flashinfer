@@ -2276,7 +2276,7 @@ with contextlib.suppress(Exception):
         num_heads=64,
         head_dim=128,
         block_size=64,
-        max_context_len=4096,
+        max_seq_len=4096,
         device=device,
     )
 
@@ -2286,19 +2286,19 @@ with contextlib.suppress(Exception):
             _fp8_in["q"],
             _fp8_in["kv_fused"],
             _fp8_in["weights"],
-            _fp8_in["context_lens"],
-            _fp8_in["block_table"],
-            _fp8_in["max_context_len"],
+            _fp8_in["block_tables"],
+            _fp8_in["seq_lens"],
+            _fp8_in["max_seq_len"],
         )
 
     with contextlib.suppress(Exception):
         _fp4_in = _fp4_pmqa_trace.init(**_pmqa_kw)
         flashinfer.fp4_paged_mqa_logits(
             _fp4_in["q"],
-            _fp4_in["sf_q"],
+            _fp4_in["q_sf"],
             _fp4_in["kv_fused"],
             _fp4_in["weights"],
-            _fp4_in["context_lens"],
-            _fp4_in["block_table"],
-            _fp4_in["max_context_len"],
+            _fp4_in["block_tables"],
+            _fp4_in["seq_lens"],
+            _fp4_in["max_seq_len"],
         )

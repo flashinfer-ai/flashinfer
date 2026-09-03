@@ -46,14 +46,14 @@ def _skip_if_no_paged_mqa_support():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers to build valid packed inputs from given context_lens
+# Helpers to build valid packed inputs from given seq_lens
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _build_fp8(context_lens, next_n, block_size, seed=0, num_heads=64, head_dim=128):
+def _build_fp8(seq_lens, next_n, block_size, seed=0, num_heads=64, head_dim=128):
     torch.manual_seed(seed)
-    B = context_lens.shape[0]
-    block_table, ntb = _make_paged_kv(B, block_size, context_lens, DEVICE)
+    B = seq_lens.shape[0]
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, DEVICE)
     q = torch.randn(B, next_n, num_heads, head_dim, device=DEVICE).to(
         torch.float8_e4m3fn
     )
@@ -63,7 +63,7 @@ def _build_fp8(context_lens, next_n, block_size, seed=0, num_heads=64, head_dim=
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     weights = torch.randn(B * next_n, num_heads, device=DEVICE)
     kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, head_dim)
-    return q, kv_fp8, scale, weights, kv_fused, block_table
+    return q, kv_fp8, scale, weights, kv_fused, block_tables
 
 
 def _cmp_fp8(
@@ -82,7 +82,7 @@ def _cmp_fp8(
         kv_fused.shape[1],
         out_dtype=torch.float32,
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, bt, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, bt, cl, max_ml)
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
@@ -217,7 +217,7 @@ def test_adv_degenerate_values_fp8(mode):
     ctx = 2048
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = ctx + 8
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
 
     q_f = torch.randn(B, next_n, H, D, device=DEVICE)
     kv = torch.randn(ntb, block_size, D, device=DEVICE)
@@ -241,9 +241,9 @@ def test_adv_degenerate_values_fp8(mode):
     kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
 
     ref = _ref_fp8_paged_mqa_logits(
-        q, kv_fp8, scale, weights, cl, block_table, max_ml, block_size
+        q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, block_table, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
 
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     assert torch.isfinite(out.float()[valid]).all(), (
@@ -270,8 +270,8 @@ def test_adv_determinism_fp8():
     cl = torch.randint(500, 4096, (8,), dtype=torch.int32, device=DEVICE)
     max_ml = 4096
     q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, 2, 64, seed=11)
-    o1 = fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml).clone()
-    o2 = fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml).clone()
+    o1 = fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml).clone()
+    o2 = fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml).clone()
     valid = _valid_causal_mask(cl, 2, max_ml, DEVICE)
     assert torch.equal(o1[valid], o2[valid]), (
         "kernel is non-deterministic in the valid region"
@@ -297,13 +297,13 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     B, H, D = 4, 64, 128
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
     kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, H)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, H)
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
     q_sim = (
         _cast_back_from_fp4(q_pk, sf_qp, gran_k=32)
@@ -312,15 +312,15 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     )
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, cl, block_table, max_ml
+        q_sim.float(), kv_sim.float(), weights, cl, block_tables, max_ml
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
-        sf_q,
+        q_sf,
         kv_fused,
         weights,
+        block_tables,
         cl,
-        block_table,
         max_ml,
         output_dtype=torch.float32,
     )
@@ -350,13 +350,13 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
     B, next_n, H, D, block_size = 4, 3, 64, 128, 64
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
     kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, H)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, H)
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
     q_sim = (
         _cast_back_from_fp4(q_pk, sf_qp, gran_k=32)
@@ -365,15 +365,15 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
     )
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, cl, block_table, max_ml
+        q_sim.float(), kv_sim.float(), weights, cl, block_tables, max_ml
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
-        sf_q,
+        q_sf,
         kv_fused,
         weights,
+        block_tables,
         cl,
-        block_table,
         max_ml,
         output_dtype=torch.float32,
     )
@@ -386,7 +386,7 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# H) Shared physical blocks across rows (block_table reuse)
+# H) Shared physical blocks across rows (block_tables reuse)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -414,7 +414,7 @@ def test_adv_shared_physical_blocks_fp8():
     ref = _ref_fp8_paged_mqa_logits(
         q, kv_fp8, scale, weights, cl, bt, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, bt, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, bt, cl, max_ml)
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
@@ -431,7 +431,7 @@ def test_adv_shared_physical_blocks_fp8():
 def test_adv_guards_raise():
     """Adversarial malformed inputs on the guarded paths must raise ValueError."""
     _skip_if_no_paged_mqa_support()
-    from flashinfer import padded_context_len, fp8_paged_mqa_logits
+    from flashinfer import padded_seq_len, fp8_paged_mqa_logits
 
     B, next_n, block_size = 2, 1, 64
     ctx = 1024
@@ -441,21 +441,21 @@ def test_adv_guards_raise():
 
     # Undersized out= (would OOB-write) -> ValueError
     bad = torch.empty((B * next_n, max_ml), device=DEVICE, dtype=torch.float32)
-    assert padded_context_len(max_ml) > max_ml
-    with pytest.raises(ValueError, match="padded_context_len"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, out=bad)
+    assert padded_seq_len(max_ml) > max_ml
+    with pytest.raises(ValueError, match="padded_seq_len"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, out=bad)
 
     # FP8 bf16 output unsupported
     with pytest.raises(ValueError, match="float32, float16"):
         fp8_paged_mqa_logits(
-            q, kv_fused, w, cl, bt, max_ml, output_dtype=torch.bfloat16
+            q, kv_fused, w, bt, cl, max_ml, output_dtype=torch.bfloat16
         )
 
     # CPU / int64 index tensors
-    with pytest.raises(ValueError, match="context_lens"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl.cpu(), bt, max_ml)
-    with pytest.raises(ValueError, match="block_table"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt.to(torch.int64), max_ml)
+    with pytest.raises(ValueError, match="seq_lens"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl.cpu(), max_ml)
+    with pytest.raises(ValueError, match="block_tables"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt.to(torch.int64), cl, max_ml)
 
 
 def test_adv_new_guards_raise():
@@ -475,45 +475,45 @@ def test_adv_new_guards_raise():
 
     # (#2) fp8 e5m2 q rejected
     with pytest.raises(ValueError, match="float8_e4m3fn"):
-        fp8_paged_mqa_logits(q.view(torch.float8_e5m2), kv_fused, w, cl, bt, max_ml)
+        fp8_paged_mqa_logits(q.view(torch.float8_e5m2), kv_fused, w, bt, cl, max_ml)
 
     # (#3) kv_fused wrong last dim (misreads scale region)
     bad_kv = kv_fused[..., :-1].contiguous()
     with pytest.raises(ValueError, match="kv_fused"):
-        fp8_paged_mqa_logits(q, bad_kv, w, cl, bt, max_ml)
+        fp8_paged_mqa_logits(q, bad_kv, w, bt, cl, max_ml)
 
-    # (#1) context_lens / block_table row count != B
+    # (#1) seq_lens / block_tables row count != B
     with pytest.raises(ValueError, match="batch_size"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl[:-1], bt, max_ml)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl[:-1], max_ml)
     with pytest.raises(ValueError, match="batch_size"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt[:-1].contiguous(), max_ml)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt[:-1].contiguous(), cl, max_ml)
 
     # (#4) caller schedule_meta of the wrong size
     bad_sched = torch.zeros((4, 2), dtype=torch.int32, device=DEVICE)
     with pytest.raises(ValueError, match="schedule_meta"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, schedule_meta=bad_sched)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, schedule_meta=bad_sched)
     # correct schedule_meta passes the guard
     good = compute_paged_mqa_logits_schedule(cl)
-    fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, schedule_meta=good)
+    fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, schedule_meta=good)
 
     # (#6/#9) num_epi_subtiles < 1
     with pytest.raises(ValueError, match="num_epi_subtiles"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, num_epi_subtiles=0)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, num_epi_subtiles=0)
 
-    # FP4-specific guards: q must be uint8, sf_q must be int32 [B, next_n, H]
+    # FP4-specific guards: q must be uint8, q_sf must be int32 [B, next_n, H]
     q_bf = torch.randn(B, next_n, 64, 128, device=DEVICE, dtype=torch.bfloat16)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, 128), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, 64, 64)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, 64)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, 64)
     kv_cache = torch.randn(
         kv_fp8.shape[0], block_size, 1, 128, device=DEVICE, dtype=torch.bfloat16
     )
     kv_fused4, _ = _kv_cache_cast_to_fp4(kv_cache)
     with pytest.raises(ValueError, match="uint8"):
-        fp4_paged_mqa_logits(q_fp4.float(), sf_q, kv_fused4, w, cl, bt, max_ml)
-    with pytest.raises(ValueError, match="sf_q"):
+        fp4_paged_mqa_logits(q_fp4.float(), q_sf, kv_fused4, w, bt, cl, max_ml)
+    with pytest.raises(ValueError, match="q_sf"):
         fp4_paged_mqa_logits(
-            q_fp4, sf_q[..., :-1].contiguous(), kv_fused4, w, cl, bt, max_ml
+            q_fp4, q_sf[..., :-1].contiguous(), kv_fused4, w, bt, cl, max_ml
         )
 
 
@@ -542,7 +542,7 @@ def test_adv_zero_length_row_not_executed(variant):
     from flashinfer import (
         fp4_paged_mqa_logits,
         fp8_paged_mqa_logits,
-        padded_context_len,
+        padded_seq_len,
     )
 
     B, next_n, block_size, H, D = 2, 1, 128, 64, 128
@@ -551,13 +551,13 @@ def test_adv_zero_length_row_not_executed(variant):
 
     cl = torch.tensor([128, 0], dtype=torch.int32, device=DEVICE)
     width = max(-(-int(c) // 128) for c in cl.tolist()) * (128 // block_size)
-    block_table = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
+    block_tables = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
     ntb = 4
     w = torch.ones(B * next_n, H, device=DEVICE, dtype=torch.float32)
     dtype = torch.float32 if variant == "fp8" else torch.bfloat16
 
     out = torch.full(
-        (B * next_n, padded_context_len(max_ml)),
+        (B * next_n, padded_seq_len(max_ml)),
         SENTINEL,
         device=DEVICE,
         dtype=dtype,
@@ -566,20 +566,20 @@ def test_adv_zero_length_row_not_executed(variant):
     if variant == "fp8":
         q = torch.zeros(B, next_n, H, D, device=DEVICE).to(torch.float8_e4m3fn)
         kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=DEVICE)
-        fp8_paged_mqa_logits(q, kv, w, cl, block_table, max_ml, out=out)
+        fp8_paged_mqa_logits(q, kv, w, block_tables, cl, max_ml, out=out)
     else:
         q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=DEVICE)
-        sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=DEVICE)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=DEVICE)
         kv = torch.zeros(
             ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=DEVICE
         )
         fp4_paged_mqa_logits(
             q,
-            sf_q,
+            q_sf,
             kv,
             w,
+            block_tables,
             cl,
-            block_table,
             max_ml,
             output_dtype=torch.bfloat16,
             out=out,
@@ -672,15 +672,15 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
             q,
             _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, D),
             weights,
-            cl,
             bt,
+            cl,
             max_ml,
         )
     else:
         q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
         q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
         q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
-        sf_q = sf_q_packed.view(torch.int32).view(B, next_n, H)
+        q_sf = sf_q_packed.view(torch.int32).view(B, next_n, H)
         q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(
             B, next_n, H, D
         )
@@ -693,11 +693,11 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
         )
         out = fp4_paged_mqa_logits(
             q_fp4,
-            sf_q,
+            q_sf,
             kv_fused,
             weights,
-            cl,
             bt,
+            cl,
             max_ml,
             output_dtype=torch.float32,
         )
@@ -778,7 +778,7 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows():
     q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
     q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
     q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
-    sf_q = sf_q_packed.view(torch.int32).view(B, next_n, H)
+    q_sf = sf_q_packed.view(torch.int32).view(B, next_n, H)
     q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(B, next_n, H, D)
     kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
@@ -788,11 +788,11 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows():
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
-        sf_q,
+        q_sf,
         kv_fused,
         weights,
-        cl,
         bt,
+        cl,
         max_ml,
         output_dtype=torch.float32,
     )
