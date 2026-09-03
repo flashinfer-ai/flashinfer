@@ -127,6 +127,65 @@ def test_gvr_hostile_hint(top_k, hint, load_balance):
     _assert_exact_topk(indices, logits, seq_lens, top_k, compress_ratio=cr)
 
 
+def _run_gvr_filled(logits, seq_lens, top_k, load_balance):
+    """Run gvr into a -7-filled buffer and check every slot was written with a
+    unique in-range index (the only contract an all-tie row can have)."""
+    rows, n = logits.shape
+    gen = torch.Generator(device=_DEV).manual_seed(rows * n + top_k)
+    hint = torch.randint(
+        0, n, (rows, top_k), generator=gen, device=_DEV, dtype=torch.int32
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=hint,
+        out_indices=out,
+        backend="gvr",
+        load_balance=load_balance,
+    )
+    torch.cuda.synchronize()
+    assert int((out == -7).sum()) == 0, "unwritten output slots"
+    assert bool(((out >= 0) & (out < n)).all()), "index out of range"
+    for r in range(rows):
+        assert int(torch.unique(out[r]).numel()) == top_k, f"row {r}: duplicate indices"
+    return out
+
+
+@requires_gvr
+@pytest.mark.parametrize("load_balance", [True, False])
+def test_gvr_rows_below_neg_flt_max(load_balance):
+    """Rows with fewer than K values above -FLT_MAX (all -inf, or a few finite
+    values followed by a -inf tail) used to come back with unwritten slots:
+    the two-sided repair anchored the lower bracket end at -FLT_MAX, so
+    count(>= val_lo) < K contradicted the collapse invariant and the plateau
+    fill never ran. The anchor is now -inf. Any K unique in-range indices are
+    a valid answer for an all-tie row; every finite value must be selected in
+    the partial row."""
+    for rows, n, k in [(1, 8192, 1024), (4, 8192, 512), (2, 32768, 1024)]:
+        logits = torch.full((rows, n), float("-inf"), device=_DEV)
+        seq_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+        _run_gvr_filled(logits, seq_lens, k, load_balance)
+    # one all -inf row inside a normal batch: the other rows stay exact
+    rows, n, k = 4, 8192, 1024
+    torch.manual_seed(5)
+    logits = torch.randn(rows, n, device=_DEV)
+    logits[2] = float("-inf")
+    seq_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = _run_gvr_filled(logits, seq_lens, k, load_balance)
+    for r in (0, 1, 3):
+        got = torch.sort(logits[r][out[r].long()], descending=True).values
+        ref = torch.sort(torch.topk(logits[r], k).values, descending=True).values
+        assert torch.equal(got, ref), f"row {r}: inexact"
+    # 10 finite values + -inf tail, N > K: the 10 must all be selected
+    logits = torch.full((1, n), float("-inf"), device=_DEV)
+    logits[0, :10] = torch.arange(10, device=_DEV).float()
+    seq_lens = torch.full((1,), n, dtype=torch.int32, device=_DEV)
+    out = _run_gvr_filled(logits, seq_lens, k, load_balance)
+    assert set(range(10)) <= set(out[0].tolist()), "finite values dropped"
+
+
 @requires_gvr
 @pytest.mark.parametrize("n_pos", [3, 100, 1000])
 def test_gvr_relu_sparse_plateau(n_pos):

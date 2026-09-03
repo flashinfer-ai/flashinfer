@@ -1506,7 +1506,13 @@ class GvrTopKKernel:
             # Two-sided repair: the old retry only guarded overflow, so an
             # undershooting threshold shipped a -1-padded, silently wrong
             # top-K. Anchor the untested bracket end at a float extreme, then
-            # bisect on the signed order-key image (provable collapse).
+            # bisect on the signed order-key image (provable collapse). The
+            # lower anchor is the true minimum key, -inf, not -FLT_MAX: a row
+            # with fewer than K values >= -FLT_MAX (all -inf, or a short
+            # finite head over a -inf tail) has count(>= -FLT_MAX) < K, which
+            # broke the "val_lo admits >= kK" invariant below and left its
+            # slots unwritten. -inf is an ordinary (non-NaN) key for the
+            # signed order-key mapping, so the bisection is unchanged.
             if tidx == 0:
                 c0 = s_iscalars[0]
                 if c0 > cutlass.Int32(kCC):
@@ -1514,7 +1520,7 @@ class GvrTopKKernel:
                     s_thr[2] = cutlass.Float32(self.FLT_MAX)
                 elif c0 < cutlass.Int32(kK):
                     s_thr[2] = s_thr[0]
-                    s_thr[1] = cutlass.Float32(self.NEG_FLT_MAX)
+                    s_thr[1] = cutlass.Float32(float("-inf"))
             cute.arch.barrier()
 
             rs = cutlass.Int32(0)
@@ -2798,6 +2804,14 @@ class GvrTopKKernel:
             N = actual_kv_len
         else:
             N = actual_kv_len // cutlass.Int32(self.compress_ratio)
+        # Clamp to the physical row width. seq_lens is the dynamic side (read on
+        # device, grows every decode step) and the logits width is the static
+        # side (fixed at allocation / graph capture); a row whose length has
+        # outgrown the width holds only its first `width` scores, so rank those
+        # instead of reading past the row (and the tensor).
+        n_cols = input_data.shape[1]
+        if N > n_cols:
+            N = n_cols
 
         # Slice per-row views.
         input_row = input_data[row_idx, None]
