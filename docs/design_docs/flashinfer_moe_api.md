@@ -630,7 +630,7 @@ The branch can merge to `main` early for team review and may land in a nightly/e
 | Status | Task | Continuity notes |
 | --- | --- | --- |
 | [x] | Add the MVP config and pack surface. | `MoEConfig`, component configs, `MoEActivationPack`, and `MoEWeightPack` exist in `flashinfer/fused_moe/api.py`. |
-| [x] | Add two MVP backend runners. | `CuteDslNvfp4Runner` and `TrtllmFp4RoutedRunner` exist as `TunableRunner` adapters in `flashinfer/fused_moe/runners.py`. |
+| [x] | Add two MVP backend runners. | `CuteDslRunner` and `TrtllmFp4RoutedRunner` exist as `TunableRunner` adapters in `flashinfer/fused_moe/runners.py`. |
 | [x] | Add cross-backend `MoELayer` dispatch. | `MoELayer` builds compatible runners, selects a winner, caches it, and exposes `winner_backend` plus `reset_winner()`. |
 | [x] | Preserve legacy flat MoE APIs. | `flashinfer/fused_moe/__init__.py` exports the new MVP API while keeping the existing flat APIs available. |
 | [x] | Add unified NVFP4 benchmark path. | `unified_nvfp4_moe` is wired into the benchmark registry; the sweep script is `benchmarks/bench_unified_moe.sh`. |
@@ -696,7 +696,31 @@ Key mechanisms (and where they live):
 - **Fail-fast scope:** each runner declares quantization and typed-activation
   capabilities; unsupported pairs are filtered before build and direct-runner
   calls raise a specific `NotImplementedError`.
-- **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+- **Runners delegate** to canonical inner runners (`CuteDslFusedMoERunner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+- **Direct-runner packed-call lifetime.** Preserve the exact object returned by
+  `runner.pack_inputs(...)` until `runner.forward(...)`; TRTLLM runners attach
+  immutable per-call launch state and a matching tuning config to that list
+  subclass. Direct forward recovers the metadata from the packed object:
+
+  ```python
+  inputs = runner.pack_inputs(act, weights)
+  out = runner.forward(inputs, tactic=-1)
+  ```
+
+  Do not replace `inputs` with `list(inputs)` or a slice. Callers that invoke
+  the autotuner directly must carry the metadata explicitly because profiling
+  synthesizes ordinary tensor lists:
+
+  ```python
+  _, tactic = tuner.choose_one(
+      custom_op=f"moe_{runner.backend_key}",
+      runners=[runner],
+      tuning_config=runner.tuning_config_for(inputs),
+      inputs=inputs,
+      **runner.launch_kwargs_for(inputs),
+  )
+  out = runner.forward(inputs, tactic=tactic)
+  ```
 
 ### Typed activation values and backend parity
 
@@ -718,21 +742,45 @@ TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
-The truthful unified support matrix follows the already executable flat path:
+The class-level matrix below is generated from the registered runner classes.
+Regenerate its contents with:
 
-| Runner / quantization | Unified activations |
-| --- | --- |
-| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
-| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
-| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
-| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
-| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
-| TRTLLM W4A16 | SwiGLU |
-| TRTLLM MxInt4 | SwiGLU (typed scalars) |
-| CUTLASS BF16 / NVFP4 / FP8 per-tensor / FP8 block / MXFP8×MXFP4 / MXFP8 / W4A16 / W4A8 / Humming | SwiGLU (typed scalars), SwiGLUStep, GeGLU, GeGLUTanh, ReLU2, SiTU (typed scalars), Identity, GELU, ReLU, SiLU |
-| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
-| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
-| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
+```bash
+python scripts/generate_moe_activation_matrix.py --write
+```
+
+<!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->
+| Backend | Config | Quantization | Typed activations |
+| --- | --- | --- | --- |
+| `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+| `b12x_w4a16` | `B12xW4A16Config` | `W4A16` | `SwiGLU`, `ReLU2` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl` | `CuteDslConfig` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl` | `CuteDslConfig` | `W4A16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cutile_bf16` | `CuTileBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_bf16` | `CutlassBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_humming` | `CutlassHummingConfig` | `Humming` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MxFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a16` | `CutlassW4A16Config` | `W4A16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a8` | `CutlassW4A8Config` | `W4A8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `W4A16` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MxFp8` | `SwiGLU`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MxInt4` | `SwiGLU` |
+<!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+This table records activation classes, not every accepted scalar value. For
+example, TRT-LLM FP8 per-tensor and b12x accept only default-scalar `SwiGLU`,
+while other runner-specific restrictions remain in `check_support()`.
 
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
@@ -773,7 +821,7 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 
 - **P0 — branch alignment verified.** Local `moe_api`, `origin/moe_api`, and PR #3093 head all resolve to the same commit (`1f74494b` at the time of writing), so the cut edits the live PR state. The most recent prior change on the branch (`fix(fused_moe): align TrtllmFp4RoutedRunner with hybrid token buckets`) is already reflected in `runners.py`.
 - **P1 / CR1 — single-knob `QuantVariant`, explicit `BackendOptions(candidates=...)`.** The CPU config tests (`tests/moe/test_moe_api.py`) were rewritten to match the implementation rather than the other way around. Rationale: the implementation deliberately collapsed the older `QuantDtype` + `QuantGranularity` + `Fp8Variant` triple into one `QuantVariant` enum (`NVFP4`, `MxFp8`, `DeepSeekFp8`, `FP8PerTensor`, `MxInt4`, `MXFP4`, `BF16`). One knob is simpler for the MVP and still distinguishes the cases reviewers flagged (C14 MXFP4 block size, C28 activation+weight dtype) because each becomes a distinct enum member. The `|` pipe-operator sugar and a richer multi-field `QuantConfig` are listed as Explicit Non-Goals for this MVP, so the canonical spelling is the explicit `BackendOptions(candidates=(...))` already used by the GPU test (`tests/moe/test_unified_moe_api.py`) and the benchmark. Verified: 84 CPU tests pass in the B200 container.
-- **Runner rework (blocker fix) — delegate to the canonical inner runners.** `TrtllmFp4RoutedRunner` now wraps `core.MoERunner` (newly exported from `get_trtllm_moe_sm100_module()`), mirroring how `CuteDslNvfp4Runner` wraps `CuteDslFusedMoENvfp4Runner`. `pack_inputs` builds the `MoEInputs` list (with an allocated output buffer and the kernel-required `topk_weights` placeholder for `PackedPrecomputed`) plus a static weight/config kwargs dict; `forward`/`get_valid_tactics` delegate to the inner runner, which owns the one fragile raw-op launch. This keeps the unified adapters thin and resistant to future `core.py` signature drift. The CuteDSL adapter additionally appends the optional `moe_output` buffer (index 11) its tuning_config declares as dynamic. The nvfp4 activation scale is viewed to `float8_e4m3fn` (the canonical Pack may carry raw `uint8` bytes; trtllm-gen accepts the *linear* scale layout, so no per-call swizzle is needed). Validated on B200: all 9 `tests/moe/test_unified_moe_api.py` pass.
+- **Runner rework (blocker fix) — delegate to the canonical inner runners.** `TrtllmFp4RoutedRunner` now wraps `core.MoERunner` (newly exported from `get_trtllm_moe_sm100_module()`), mirroring how `CuteDslRunner` wraps `CuteDslFusedMoERunner`. `pack_inputs` builds the `MoEInputs` list (with an allocated output buffer and the kernel-required `topk_weights` placeholder for `PackedPrecomputed`) plus a static weight/config kwargs dict; `forward`/`get_valid_tactics` delegate to the inner runner, which owns the one fragile raw-op launch. This keeps the unified adapters thin and resistant to future `core.py` signature drift. The CuteDSL adapter additionally appends the optional `moe_output` buffer (index 11) its tuning_config declares as dynamic. The nvfp4 activation scale is viewed to `float8_e4m3fn` (the canonical Pack may carry raw `uint8` bytes; trtllm-gen accepts the *linear* scale layout, so no per-call swizzle is needed). Validated on B200: all 9 `tests/moe/test_unified_moe_api.py` pass.
 - **P1 / CR3 — offset read from config, not a dead parameter.** `pack_inputs` no longer takes a `local_expert_offset` argument (no caller ever passed it, so it silently defaulted to 0); it reads `ExpertConfig.local_expert_offset` off the runner's own config. A focused SM100 test (`TestTrtllmRoutedPackingContract`) decodes the packed ids for offsets 0/32/96 and asserts GLOBAL ids are packed, with `local_expert_offset` passed to the kernel separately.
 - **P1 / CR6 — fail fast at construction.** `MoELayer._validate_mvp_scope` raises `NotImplementedError` for any non-`NVFP4` quant variant or non-`Swiglu` activation, and the "no usable backend" error now names the MVP-supported backend set. Pre-routed-only is structural (the layer consumes `MoEActivationPack`, which carries `selected_experts`/`final_scales`). Covered by CPU tests in `TestMoELayerMVPValidation`.
 - **P2 / CR4 — bucket-keyed winner cache.** The cross-backend winner can legitimately differ across token-count buckets (the per-tactic autotuner is already bucket-aware), so `MoELayer` now caches `(runner, tactic)` keyed by `map_to_hybrid_bucket(num_tokens, tune_max_num_tokens)` instead of a single `_winner`. Reusing one layer across token counts re-selects correctly per bucket; `winner_backend` reports the most-recent call's choice and `reset_winner()` clears all buckets. This removes the silent stale-winner trap without forcing one-layer-per-shape on callers.

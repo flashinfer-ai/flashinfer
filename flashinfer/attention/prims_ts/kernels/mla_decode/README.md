@@ -7,7 +7,7 @@ layout: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
 
 FlashInfer selects the 1-CTA throughput/latency family or the 2-CTA throughput
-family automatically. Query grouping, persistent scheduling, split-KV, and
+family automatically. Flat-row tiling, persistent scheduling, split-KV, and
 local versus separate reduction are implementation decisions. Unsupported
 shape, dtype, or mask combinations raise an error rather than falling back to
 another backend.
@@ -39,9 +39,9 @@ carry the wrapper's plan-owned fixed-versus-packed query mode.
 | Output dimension | 512 |
 | Q/cache dtype | Matching `torch.bfloat16` or `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` only |
-| Q length | Fixed or packed variable length; static maximum must be positive |
+| Q length | Fixed or packed variable length; packed requests may be empty, while the static maximum remains positive |
 | K/V length | Positive and at most `2**31 - 32768`; the reserve keeps the largest padded split-KV coordinate span in signed `int32` |
-| Q heads | Validated at 8, 16, 32, 64, and 128; other positive counts are accepted only when automatic selection reports an implementation |
+| Q heads | Validated at 6, 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
 | K/V cache | Paged, one logical KV head; `[num_pages, page_size, 576]` or `[num_pages, 1, page_size, 576]` compact storage |
 | Metadata/cache index extents | Flattened query-head capacity, block-table elements, and physical page count must fit signed `int32` |
 | Page size | 16, 32, 64, or 128 tokens |
@@ -52,8 +52,8 @@ carry the wrapper's plan-owned fixed-versus-packed query mode.
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
 
-Some head and Q-length combinations outside the validated power-of-two matrix
-do not have a generated implementation and are rejected.
+Some head and Q-length combinations outside the validated matrix do not have a
+generated implementation and are rejected.
 
 Query, cache, and output tensors must be compact, 16-byte-aligned CUDA tensors
 on the metadata device. `block_tables` and `seq_lens` are compact,
@@ -80,6 +80,21 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
 - Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
   positive and no larger than the static K/V bound.
 
+Internally, the query-token and query-head axes form one affine row space,
+`flat_row = query_idx * H + head_idx`. The 1-CTA profiles partition this space
+with physical M8/M16/M32/M64 tiles, while the 2-CTA family uses M128. Therefore
+the number of scheduled query tiles is `ceil(H * SQ / M)` and only the final
+physical tile can contain inactive rows. Public tensor shapes remain unchanged;
+valid physical rows map back to their logical `(query_idx, head_idx)` output
+coordinates.
+
+Split-KV workspaces intentionally retain rectangular physical geometry with
+`M * ceil(H * SQ / M)` rows. Producer stores and every reducer use the same
+mapping, and final-tile rows beyond `H * SQ` are predicated from public output.
+For packed Q, each request applies the same mapping to its runtime query length;
+rectangular tiles beyond a shorter request's active prefix retire scheduler
+bookkeeping without issuing Q/K/V or output accesses.
+
 For causal request `b`, query row `i` can attend through
 `seq_lens[b] - query_length[b] + i`. `bmm1_scale` and `bmm2_scale` default to
 1 and must be finite, positive Python scalars representable as positive
@@ -87,18 +102,20 @@ For causal request `b`, query row `i` can attend through
 
 Each `block_tables` row must contain at least
 `ceil(max_kv_len / page_size)` columns, and every page ID used by a runtime
-length must index the physical cache. Packed offsets start at zero, increase
-strictly, end at `total_q`, and have every per-request delta no greater than
-`max_seq_len_q`.
+length must index the physical cache. Packed offsets start at zero, are
+nondecreasing, end at `total_q`, and have every nonnegative per-request delta
+no greater than `max_seq_len_q`.
 
 The wrapper retains `block_tables`, `seq_lens`, and packed `qo_indptr` as live
 device inputs. Their storage must remain valid. Values may be changed in-place
 only while page IDs remain valid, K/V lengths stay positive and within the
-planned bound, packed-Q deltas stay positive and within their bound, and the
+planned bound, packed-Q deltas stay nonnegative and within their bound, and the
 final packed offset remains equal to the planned query/output extent. Causal
 metadata must also preserve `q_len[b] <= seq_lens[b]` for every request.
 For a packed wrapper plan, omitting `max_seq_len_q` makes `plan()` read the
-offsets once and use their largest delta as the bound. Every wrapper plan also
+offsets once and use their largest delta as the bound. An all-empty packed
+batch therefore requires an explicit positive `max_seq_len_q`; its launch
+returns an empty output without dispatching a GPU kernel. Every wrapper plan also
 reads `seq_lens` once, rejects nonpositive rows, and checks every row against
 the K/V bound. The standalone packed API requires an explicit bound and trusts
 the device-side values on each launch. Wrapper and standalone hot paths do not
@@ -123,8 +140,13 @@ and reduction topology automatically. CLC-persistent scheduling is used when
 the logical work benefits from reusing resident CTAs; callers do not select a
 scheduler or kernel family through the public wrappers.
 
+For a static split-KV 2-CTA launch, every reducer follows the same physical
+flat-row geometry. Padded M128 tails retain the compact logical-row reducer;
+fully populated layouts may use row-parallel or clustered reduction when their
+work and capacity bounds are satisfied.
+
 The BF16 2-CTA path enables CLC only when logical work exceeds one resident
-wave. Inactive Q groups, pruned split slots, and zero-visible-K tiles skip
+wave. Inactive physical Q tiles, pruned split slots, and zero-visible-K tiles skip
 their Q/K/V and TMEM data work and skip the active-tile throttle edge
 symmetrically. Every participating task still advances the work queue, so all
 tasks retire the same work-tile sequence. This matched progression is the
@@ -248,8 +270,9 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 
 The public accuracy suite covers fixed and packed Q, `torch.bfloat16` and
 `torch.float8_e4m3fn` input, dense and causal masks, all four page sizes, both
-automatic kernel families, runtime K pruning, split-KV reduction,
-output/workspace contracts, and CUDA graphs:
+automatic kernel families, H6/H12/H24/H48/H96 flat-row cases, M128 tails,
+runtime K pruning, split-KV reduction, output/workspace contracts, and CUDA
+graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py

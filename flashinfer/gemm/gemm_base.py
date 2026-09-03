@@ -444,7 +444,7 @@ def _tgv_gemm_requirement(
     # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
     # active path and the dependency is missing.
     if not _TGV_DEBUG_USE_CPP:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
         if not is_cute_dsl_available():
             raise LibraryError(
@@ -503,7 +503,7 @@ def _cute_dsl_mm_bf16_requirement(
             a, b, out, out_dtype, bias, False, "cublaslt"
         )
 
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
         raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
@@ -883,7 +883,7 @@ def _tgv_bmm_bf16_requirement(
         raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
     # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
     # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
         raise LibraryError(
@@ -1956,8 +1956,6 @@ def fp8_gemm_sm100(
     tuner = AutoTuner.get()
 
     runners = []
-    if "cute-dsl_sm107" in runner_names:
-        runners.append(_cute_dsl_fp8_gemm_runner_sm107())
     if "cutlass_sm10x" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cutlass_sm12x" in runner_names:
@@ -1966,6 +1964,8 @@ def fp8_gemm_sm100(
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
+    if "cute-dsl_sm107" in runner_names:
+        runners.append(_cute_dsl_fp8_gemm_runner_sm107())
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -5279,7 +5279,7 @@ def _check_cute_dsl_arch(device: torch.device) -> None:
 
 def _check_cute_dsl_availability():
     try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
     except ImportError as err:
         raise RuntimeError("CuTe DSL is not available.") from err
 
