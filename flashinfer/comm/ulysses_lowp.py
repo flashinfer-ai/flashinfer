@@ -57,6 +57,10 @@ STATS_PROTOCOL = 3
 # Both stats protocols share the payload ABI: 3 = ALIGN-128 (no boundary
 # machinery, aligned unpack); 2 = 64-aligned global packing (boundary
 # descriptor/min-max machinery below + unpack_for_sage(aligned=False)).
+# ``stats_protocol_for`` derives the protocol from the shard length
+# (local_sequence % 128 == 0 -> 3, else 2); the routed entry points
+# local_stats / finalize_stats / quant_and_pack / unpack_for_sage(aligned=None)
+# apply it, and the two routes are byte-identical wherever both are legal.
 SUPPORTED_STATS_PROTOCOLS = (2, 3)
 HEAD_DIM = 128
 Q_GROUP = 32
@@ -1482,7 +1486,10 @@ def stats_protocol_for(local_sequence: int, world_size: int) -> int:
     Protocol 2 handles ANY shard length (a partial global tail group is
     covered by the slot formulas and the receiver's zero tail); padding the
     global sequence per ``required_alignment`` is the recommended policy,
-    not a kernel precondition."""
+    not a kernel precondition.  The one admission condition protocol 2 does
+    enforce concerns a live prefix: with ``used_sequence`` the zero tail must
+    stay inside the last global K group (``ceil(used/64) == ceil(S/64)``),
+    which the 64-multiple padding policy guarantees."""
 
     local_sequence = _positive_int("local_sequence", local_sequence)
     _world_size(world_size)
@@ -1515,7 +1522,22 @@ def aligned_length(n_tokens: int, world_size: int, stats_protocol: int) -> int:
     return (n_tokens + alignment - 1) // alignment * alignment
 
 
-@dataclasses.dataclass
+def _fields_repr(obj: Any) -> str:
+    """Dataclass repr that never touches tensor CONTENTS: the routing
+    objects are passed through ``@flashinfer_api``-logged calls, and a default
+    repr of a CUDA tensor is a device-to-host copy (illegal under CUDA-graph
+    capture, and a sync on the hot path)."""
+
+    parts = []
+    for field in dataclasses.fields(obj):
+        value = getattr(obj, field.name)
+        if isinstance(value, torch.Tensor):
+            value = f"Tensor{tuple(value.shape)}[{value.dtype}, {value.device}]"
+        parts.append(f"{field.name}={value!r}")
+    return f"{type(obj).__name__}({', '.join(parts)})"
+
+
+@dataclasses.dataclass(repr=False, eq=False)
 class StatsContext:
     """Carries ``local_stats`` state across the caller's AllGather to
     ``finalize_stats``.  ``q_amax`` (protocol 2 only) is this rank's local
@@ -1536,8 +1558,10 @@ class StatsContext:
     q_desc_shape: Optional[Tuple[int, ...]] = None
     k_minmax_shape: Optional[Tuple[int, ...]] = None
 
+    __repr__ = _fields_repr
 
-@dataclasses.dataclass
+
+@dataclasses.dataclass(repr=False, eq=False)
 class V2GStats:
     """Finalized global statistics, ready for :func:`quant_and_pack`.  Under
     protocol 3 the per-group scales are computed inside the fused pack
@@ -1551,6 +1575,8 @@ class V2GStats:
     v_scale_global: torch.Tensor
     q_amax_final: Optional[torch.Tensor] = None
     k_amax_final: Optional[torch.Tensor] = None
+
+    __repr__ = _fields_repr
 
 
 @flashinfer_api

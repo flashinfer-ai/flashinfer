@@ -1444,3 +1444,17 @@ def test_auto_routing_rejects_bad_inputs():
         lowp.quant_and_pack(q_r, k_r, v_r, {"stats_protocol": 3})
     with pytest.raises(TypeError, match="StatsContext"):
         lowp.finalize_stats(torch.stack([send] * world), {"rank": 0}, k_r)
+
+
+@requires_sm120
+def test_routing_dataclasses_repr_without_touching_tensor_contents():
+    """StatsContext / V2GStats flow through @flashinfer_api-logged calls; their
+    repr must describe tensors by shape/dtype/device only (no D2H copy)."""
+    world, L = 4, 1180  # protocol 2: q_amax rides in the context
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    q_r, k_r, v_r = (x[:, :L].contiguous() for x in (q, k, v))
+    send, ctx = lowp.local_stats(q_r, k_r, v_r, rank=0, world_size=world)
+    st = lowp.finalize_stats(torch.stack([send] * world), ctx, k_r)
+    for text in (repr(ctx), repr(st)):
+        assert "Tensor(" in text and "tensor(" not in text and "[" in text
+    assert "stats_protocol=2" in repr(st)
