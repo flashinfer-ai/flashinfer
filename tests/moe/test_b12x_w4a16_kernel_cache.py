@@ -50,7 +50,9 @@ from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (  # 
     _w4a16_disk_kernel_name,
     _w4a16_topk_sum_launch_flat,
     clear_w4a16_kernel_cache,
+    compile_w4a16_activation,
     compile_w4a16_topk_sum,
+    is_gated_moe_activation,
 )
 
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -189,3 +191,36 @@ def test_topk_sum_warm_artifact_numerics_and_graph_capture():
     torch.cuda.synchronize()
     ref_g = fc2_g.view(m, topk, hidden).float().sum(dim=1).to(torch.bfloat16)
     assert torch.allclose(out_g.float(), ref_g.float(), **tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_activation_row_buckets_share_one_artifact():
+    """Both row-specialization buckets must resolve to one disk artifact.
+
+    The activation cache key deliberately excludes the row bucket -- the
+    in-process cache reuses one compiled kernel across rows via
+    ``replace(cached, rows=rows)`` -- so under the extent policy the
+    m-varying fake extents bake (1,) and a single artifact serves every
+    rows value, warm-launchable at any row count.
+    """
+    inter = 768
+    clear_w4a16_kernel_cache()
+    compile_w4a16_activation(rows=1, intermediate_size=inter, activation="silu")
+    after_bucket1 = _w4a16_module_artifacts()
+    clear_w4a16_kernel_cache()
+    compile_w4a16_activation(rows=64, intermediate_size=inter, activation="silu")
+    after_bucket2 = _w4a16_module_artifacts()
+    act_names = [n for n in after_bucket2 if n.startswith("activation_")]
+    assert len(act_names) == 1, f"row buckets split into artifacts: {act_names}"
+    assert after_bucket2 == after_bucket1, "second bucket rewrote the artifact"
+
+    shards = 2 if is_gated_moe_activation("silu") else 1
+    for rows in (1, 64):
+        result = compile_w4a16_activation(
+            rows=rows, intermediate_size=inter, activation="silu"
+        )
+        fc1 = torch.randn(rows * shards * inter, device="cuda", dtype=torch.bfloat16)
+        activated = torch.zeros(rows * inter, device="cuda", dtype=torch.bfloat16)
+        result.compiled(fc1[:1], activated[:1], rows)
+        torch.cuda.synchronize()
+        assert activated.abs().sum().item() > 0, f"no output written at rows={rows}"

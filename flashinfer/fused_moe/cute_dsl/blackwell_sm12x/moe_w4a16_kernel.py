@@ -5875,7 +5875,7 @@ def compile_w4a16_activation(
 ) -> W4A16ActivationCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     activation = normalize_moe_activation(activation)
-    is_gated = validate_activation(activation)
+    validate_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
         activation,
         swiglu_limit,
@@ -5900,16 +5900,19 @@ def compile_w4a16_activation(
     if cached is not None:
         return replace(cached, rows=rows)
 
-    w13_shards = 2 if is_gated else 1
-    compile_rows = _fake_m_for_specialization(rows)
+    # Extent policy (see compile_w4a16_fused_moe): the row bucket is not
+    # part of the cache key -- the in-process cache deliberately reuses one
+    # compiled kernel across rows via ``replace(cached, rows=rows)`` -- so
+    # the m-varying extents bake (1,) and one artifact serves every rows
+    # value. The kernel bounds all accesses by its ``active_rows`` scalar.
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_rows * w13_shards * intermediate_size,),
+        (1,),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_rows * intermediate_size,),
+        (1,),
         assumed_align=16,
     )
     raise_if_kernel_resolution_frozen(
@@ -5929,7 +5932,7 @@ def compile_w4a16_activation(
             kernel,
             fc1_fake,
             activated_fake,
-            Int32(compile_rows),
+            Int32(1),
             stream_fake,
             options="--opt-level 2 --enable-tvm-ffi",
         )
