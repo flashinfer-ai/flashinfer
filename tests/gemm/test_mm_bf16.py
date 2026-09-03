@@ -33,6 +33,11 @@ _SMOKE_CASES = [
     (1, 1024, 3072, torch.bfloat16, True, False, "tinygemm", False),
     (32, 1024, 1024, torch.bfloat16, False, False, "cutile", False),
     (25, 2048, 1024, torch.bfloat16, False, False, "cute-dsl", False),
+    # Warp Split-K: tuned low-M with bias and PDL; M > 16 (32-token tile, tail rows)
+    # on the default tactic; K above its tile bound (served by the other runners).
+    (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
+    (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
+    (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
     (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
@@ -133,6 +138,11 @@ def test_mm_bf16(
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+    if backend == "cute-dsl":
+        fp32_reference = F.linear(
+            input.float(), mat2.float(), bias.float() if bias is not None else None
+        ).to(res_dtype)
+        torch.testing.assert_close(out, fp32_reference, rtol=2e-2, atol=5e-2)
 
 
 def test_mm_bf16_cutile_rejects_bias_and_pdl():

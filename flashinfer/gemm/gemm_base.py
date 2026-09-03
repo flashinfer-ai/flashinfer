@@ -727,12 +727,15 @@ def mm_bf16(
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
-        ``"cute-dsl"`` uses standalone Blackwell low-M direct and split-K
-        kernels for M <= 32 and falls back to cuBLASLt for larger M. It is
-        never auto-selected; serving frameworks must select it explicitly.
-        Without autotuning, a measured shape
-        heuristic chooses between the algorithms. With autotuning, both tactic
-        spaces are profiled when bias is disabled; bias uses split-K only.
+        ``"cute-dsl"`` uses standalone Blackwell low-M direct and cluster
+        Split-K kernels for M <= 32, plus a warp Split-K kernel (also
+        M <= 32), and falls back to cuBLASLt for larger M. It is never
+        auto-selected; serving frameworks must select it explicitly. Without
+        autotuning, the direct kernel runs where its shape heuristic applies,
+        otherwise the warp Split-K kernel whenever it is eligible (M <= 32,
+        N % 16 == 0, K % 128 == 0 with at most 64 K tiles), and cluster
+        Split-K otherwise. With autotuning, all three tactic spaces are
+        profiled; with bias the Direct kernel is excluded.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -1458,8 +1461,12 @@ def get_mm_bf16_cublaslt_module():
     )
 
 
+_CUTE_DSL_BF16_AUTOTUNE_VERSION = 10
+
+
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     use_cuda_graph=True,
+    use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -1599,6 +1606,7 @@ def _cute_dsl_splitk_bf16_gemm_runner(
                 bias is not None,
                 bool(pdl),
                 compute_capability,
+                _CUTE_DSL_BF16_AUTOTUNE_VERSION,
             )
 
         def get_valid_tactics(
@@ -1647,6 +1655,73 @@ def _cute_dsl_splitk_bf16_gemm_runner(
 
 
 @functools.cache
+def _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability: int):
+    from .kernels.dense_bf16_gemm_warp_splitk import (
+        WarpSplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_warp_splitk_dense,
+        validate_inputs,
+    )
+
+    class CuteDSLWarpSplitKBf16Runner(TunableRunner):
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            a, b, bias, _, out, *_ = inputs
+            try:
+                validate_inputs(a, b, out, bias)
+            except ValueError:
+                return False
+            return True
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, bias, pdl, out, *_ = inputs
+            return (
+                str(a.dtype),
+                str(out.dtype),
+                bias is not None,
+                bool(pdl),
+                compute_capability,
+                _CUTE_DSL_BF16_AUTOTUNE_VERSION,
+            )
+
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> list[tuple[int, int, int, int, int]]:
+            if not self.supports_inputs(inputs):
+                return []
+            a, b, *_ = inputs
+            with torch.cuda.device(a.device):
+                return [
+                    astuple(config)
+                    for config in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+                ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            with torch.cuda.device(a.device):
+                if tactic == -1:
+                    tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+                else:
+                    try:
+                        tactic = WarpSplitKTactic(*tactic)
+                    except TypeError as error:
+                        raise ValueError(
+                            "CuTeDSL warp split-K tactics must be "
+                            "(output_tile, token_tile, k_tile, stages, "
+                            "b_loader_warps)."
+                        ) from error
+                return run_warp_splitk_dense(a, b, out, bool(pdl), tactic, bias)
+
+    return CuteDSLWarpSplitKBf16Runner()
+
+
+@functools.cache
 def _cute_dsl_direct_bf16_gemm_runner(
     compute_capability: int,
 ):
@@ -1687,6 +1762,7 @@ def _cute_dsl_direct_bf16_gemm_runner(
                 str(out.dtype),
                 bool(pdl),
                 compute_capability,
+                _CUTE_DSL_BF16_AUTOTUNE_VERSION,
             )
 
         def get_valid_tactics(
@@ -1744,8 +1820,11 @@ def bf16_gemm_sm100(
     is_a_k_major = a.stride(-1) == 1
     is_b_k_major = b.stride(-2) == 1
 
+    inputs = [a, b, bias, pdl, out, workspace_buffer]
     runners = []
     direct_runner = None
+    warp_splitk_runner = None
+    warp_splitk_supported = True
     if "cudnn" in runner_names:
         runners.append(
             _cudnn_gemm_bf16_runner(
@@ -1767,7 +1846,15 @@ def bf16_gemm_sm100(
         compute_capability = torch.cuda.get_device_capability(a.device)
         compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
         splitk_runner = _cute_dsl_splitk_bf16_gemm_runner(compute_capability_number)
-        if bias is None:
+        from .kernels.dense_bf16_gemm_warp_splitk import (
+            _MAX_M as warp_splitk_max_m,
+        )
+
+        warp_splitk_runner = _cute_dsl_warp_splitk_bf16_gemm_runner(
+            compute_capability_number
+        )
+        prefer_direct = False
+        if bias is None:  # the Direct kernel has no bias epilogue
             from .kernels.dense_bf16_gemm_direct import (
                 prefer_direct_bf16_gemm_sm100,
             )
@@ -1776,16 +1863,38 @@ def bf16_gemm_sm100(
             prefer_direct = prefer_direct_bf16_gemm_sm100(
                 a.shape[0], b.shape[1], a.shape[1]
             )
-            runners.extend(
+        warp_splitk_supported = warp_splitk_runner.supports_inputs(inputs)
+        profile_m = min(a.shape[0], warp_splitk_max_m)
+        warp_splitk_profile_supported = warp_splitk_runner.supports_inputs(
+            [a[:profile_m], b, bias, pdl, out[:profile_m], workspace_buffer]
+        )
+        base_runners = tuple(
+            runner
+            for runner in (
                 (direct_runner, splitk_runner)
                 if prefer_direct
                 else (splitk_runner, direct_runner)
             )
+            if runner is not None
+        )
+        if not warp_splitk_profile_supported:
+            ordered_runners = base_runners
+        elif not warp_splitk_supported:
+            ordered_runners = (*base_runners, warp_splitk_runner)
+        elif prefer_direct:
+            ordered_runners = (direct_runner, warp_splitk_runner, splitk_runner)
         else:
-            runners.append(splitk_runner)
+            # runners[0] is the no-autotune default and the fallback for an
+            # incompatible cached Direct tactic; the warp Split-K kernel wins
+            # nearly every tuned M <= 16 cell on B300.
+            ordered_runners = tuple(
+                runner
+                for runner in (warp_splitk_runner, splitk_runner, direct_runner)
+                if runner is not None
+            )
+        runners.extend(ordered_runners)
     assert runners, "No suitable runners found"
 
-    inputs = [a, b, bias, pdl, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
         "bf16_gemm",
         runners,
@@ -1793,12 +1902,20 @@ def bf16_gemm_sm100(
         inputs,
     )
 
-    if (
+    # A cached entry can come from a bucket profiled at another M (e.g. the warp
+    # kernel tuned at M=16 for a real M=25, or a Direct tactic illegal for this
+    # M); run the first runner that supports the real inputs with its default.
+    if (runner is warp_splitk_runner and not warp_splitk_supported) or (
         direct_runner is not None
         and runner is direct_runner
         and not direct_runner.is_tactic_compatible(inputs, tactic)
     ):
-        runner, tactic = runners[0], -1
+        runner = next(
+            candidate
+            for candidate in runners
+            if candidate is not warp_splitk_runner or warp_splitk_supported
+        )
+        tactic = -1
 
     runner(inputs=inputs, tactic=tactic)
 
