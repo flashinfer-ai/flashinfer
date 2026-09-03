@@ -909,13 +909,23 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=SwiGLU(),
-            backend=BackendOptions(
-                candidates=(TrtllmFp4Config(), CutlassNvfp4Config())
-            ),
+            backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
         )
         assert cfg.routing.method == RoutingMethodType.DeepSeekV3
         assert cfg.quant.variant == QuantVariant.NVFP4
         assert cfg.activation.is_gated
+
+    def test_nvfp4_rejects_incompatible_activation_pack_candidates(self):
+        """Autotune has one activation pack, not one pack per backend."""
+        with pytest.raises(ValueError, match="incompatible MoEActivationPack"):
+            MoEConfig(
+                routing=RoutingConfig(num_experts=8, top_k=2),
+                quant=QuantConfig(variant=QuantVariant.NVFP4),
+                experts=ExpertConfig(intermediate_size=128),
+                backend=BackendOptions(
+                    candidates=(TrtllmFp4Config(), CutlassNvfp4Config())
+                ),
+            )
 
     def test_trtllm_fp8_block_mxfp8(self):
         """MxFP8 block-scale config."""

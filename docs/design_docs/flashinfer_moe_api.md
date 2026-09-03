@@ -42,24 +42,24 @@ config = MoEConfig(
     ),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(extra_backend_params...), CutlassNvfp4Config()],
+    # NVFP4 activation packs are backend-native; choose one candidate set.
+    backends=[TrtllmFp4Config(extra_backend_params...)],
 )
 # --- Find possible backends ---
 backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_nvfp4":CutlassNvfp4Config()}
-# or {"trtllm_fp4":"unsupported reason...", "cutlass_nvfp4":CutlassNvfp4Config()}
+# this contains {"trtllm_fp4":TrtllmFp4Config()}
+# or {"trtllm_fp4":"unsupported reason..."}
 # more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_nvfp4":CutlassNvfp4Config()]
+backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...)]
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
 weight_pack.prepare_for("trtllm_fp4", trtllm_weights)
-weight_pack.prepare_for("cutlass_nvfp4", CutlassNvfp4Config.prepare_weights(...))
 act_pack = MoEActivationPack(
-    hidden_states_q=cute_dsl_data["x"],
-    hidden_states_scale=x_sf,
-    selected_experts=cute_dsl_data["token_selected_experts"],
-    final_scales=cute_dsl_data["token_final_scales"],
+    hidden_states_q=trtllm_data["x"],
+    hidden_states_scale=trtllm_data["x_sf"],
+    selected_experts=trtllm_data["token_selected_experts"],
+    final_scales=trtllm_data["token_final_scales"],
 )
 tensors = (act_pack, weight_pack)
 # --- Eager (heuristic backend) ---
@@ -120,8 +120,11 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmFp4Config(), CutlassNvfp4Config()]
+# Multiple candidates are valid only when they consume the same activation
+# pack contract. NVFP4 TRT-LLM and CUTLASS require different packs, so select
+# either singleton candidate set explicitly.
+backends = [TrtllmFp4Config()]
+# or: backends = [CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -147,7 +150,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CutlassNvfp4Config()],
+    backends=[TrtllmFp4Config()],
 )
 # Unpack into any call accepting these kwargs
 output = moe_layer(tensors, **config)

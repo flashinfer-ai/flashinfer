@@ -1475,6 +1475,27 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
+        self._validate_activation_pack_contract()
+
+    def _validate_activation_pack_contract(self) -> None:
+        """Reject candidate sets that need mutually exclusive input packs.
+
+        ``MoELayer`` passes one :class:`MoEActivationPack` to every candidate
+        while autotuning.  TRT-LLM NVFP4 consumes packed FP4 values and block
+        scales, whereas CUTLASS NVFP4 consumes raw BF16 values without an
+        activation scale.  Letting both reach dispatch therefore fails only
+        after the layer has begun constructing and profiling runners.
+        """
+        if self.quant.variant is not QuantVariant.NVFP4:
+            return
+
+        candidate_types = {type(candidate) for candidate in self.backend}
+        if {TrtllmFp4Config, CutlassNvfp4Config} <= candidate_types:
+            raise ValueError(
+                "TrtllmFp4Config and CutlassNvfp4Config require incompatible "
+                "MoEActivationPack layouts for QuantVariant.NVFP4; configure "
+                "one backend candidate at a time."
+            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
@@ -1584,8 +1605,13 @@ class MoEActivationPack:
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
-    * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;
-      the calibrated scalar is folded into the backend's epilogue scales.
+    * FP8 per-tensor with ``TrtllmFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with no activation scale; the calibrated scalar is
+      folded into the TRT-LLM weight view.
+    * FP8 per-tensor with ``CutlassFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with a scalar ``float32`` dequantization scale. Obtain
+      both tensors from ``CutlassFp8PerTensorConfig.prepare_activations``.
+      This pack cannot be shared with the TRT-LLM per-tensor backend.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -1614,7 +1640,7 @@ class MoEActivationPack:
 
     # Backend-native activation payload; layouts documented above.
     hidden_states_q: Tensor
-    # Variant-specific scales documented above; None for BF16/per-tensor FP8.
+    # Variant-specific scales documented above; None for BF16 and TRT-LLM FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
