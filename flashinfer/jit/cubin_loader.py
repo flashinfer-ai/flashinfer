@@ -211,7 +211,11 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     or its SHA-256 doesn't match, it is downloaded from
     ``FLASHINFER_CUBINS_REPOSITORY``.
 
-    Returns the file contents as bytes, or empty bytes on failure.
+    Returns the file contents as bytes.
+
+    Raises:
+        RuntimeError: If the artifact cannot be downloaded or fails checksum
+            validation after downloading.
     """
     local_path = str(FLASHINFER_CUBIN_DIR / file_name)
     data = load_cubin(local_path, sha256)
