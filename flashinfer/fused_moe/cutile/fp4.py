@@ -23,9 +23,15 @@ import cuda.tile as ct
 import torch
 
 from ...cutile.cutile_common import cached_replace_hints
-from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import _apply_activation, _validate_activation, launch_activation
+from ..api import ActivationConfig
+from .activation import (
+    _activation_kernel_args,
+    _apply_gated_activation,
+    _apply_ungated_activation,
+    _validate_activation,
+    launch_activation,
+)
 from .indexing import needs_int64_indexing
 from .moe import (
     GemmConfig,
@@ -37,12 +43,12 @@ from .moe import (
     allocate_workspace as allocate_bf16_workspace,
 )
 
+ConstFloat: TypeAlias = ct.Constant[float]
 ConstInt: TypeAlias = ct.Constant[int]
 ConstBool: TypeAlias = ct.Constant[bool]
 
 _NVFP4_BLOCK_SIZE = 16
 _E4M3_TINY = 2.0**-9
-_SWIGLU = int(ActivationType.Swiglu)
 _SORT_INPUT_MIN_ASSIGNMENTS = 4096
 _SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS = 65536
 _PERSISTENT_CTAS_PER_SM = 2
@@ -276,6 +282,10 @@ def _activation_quantize_nvfp4_impl(
     Q,
     SCALE,
     activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
@@ -293,7 +303,7 @@ def _activation_quantize_nvfp4_impl(
         ),
         ct.float32,
     )
-    if activation_type == _SWIGLU:
+    if IS_GATED:
         up = ct.astype(
             ct.load(
                 X,
@@ -303,9 +313,22 @@ def _activation_quantize_nvfp4_impl(
             ),
             ct.float32,
         )
-        values = _apply_activation(values, activation_type) * up
+        values = _apply_gated_activation(
+            values,
+            up,
+            activation_type,
+            activation_param1,
+            activation_param2,
+            activation_param3,
+        )
     else:
-        values = _apply_activation(values, activation_type)
+        values = _apply_ungated_activation(
+            values,
+            activation_type,
+            activation_param1,
+            activation_param2,
+            activation_param3,
+        )
 
     # Preserve the existing BF16 activation boundary while eliminating its
     # global-memory round trip.
@@ -331,6 +354,10 @@ def _activation_quantize_nvfp4(
     Q,
     SCALE,
     activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
@@ -341,6 +368,10 @@ def _activation_quantize_nvfp4(
         Q,
         SCALE,
         activation_type,
+        activation_param1,
+        activation_param2,
+        activation_param3,
+        IS_GATED,
         TILE_M,
         TILE_I,
         NUM_TILES,
@@ -354,6 +385,10 @@ def _activation_quantize_nvfp4_i64(
     Q: ct.IndexedWithInt64,
     SCALE: ct.IndexedWithInt64,
     activation_type: ConstInt,
+    activation_param1: ConstFloat,
+    activation_param2: ConstFloat,
+    activation_param3: ConstFloat,
+    IS_GATED: ConstBool,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
@@ -364,6 +399,10 @@ def _activation_quantize_nvfp4_i64(
         Q,
         SCALE,
         activation_type,
+        activation_param1,
+        activation_param2,
+        activation_param3,
+        IS_GATED,
         TILE_M,
         TILE_I,
         NUM_TILES,
@@ -620,19 +659,19 @@ def _launch_activation_quantize(
     x: torch.Tensor,
     q: torch.Tensor,
     scale: torch.Tensor,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     *,
     tile_i: int = 64,
     occupancy: int = 2,
     scale_row_major: bool = False,
 ) -> None:
-    activation_type = _validate_activation(activation_type)
+    activation = _validate_activation(activation)
     intermediate_size = q.shape[1] * 2
-    expected_input_size = intermediate_size * (2 if activation_type.is_gated else 1)
+    expected_input_size = intermediate_size * (2 if activation.is_gated else 1)
     if x.ndim != 2 or x.shape[1] != expected_input_size:
         raise ValueError(
             f"cuTile NVFP4 activation input shape {tuple(x.shape)} is incompatible "
-            f"with intermediate_size={intermediate_size} and {activation_type!r}."
+            f"with intermediate_size={intermediate_size} and {activation.type!r}."
         )
     if intermediate_size % 64 != 0:
         raise ValueError(
@@ -670,7 +709,8 @@ def _launch_activation_quantize(
             x,
             q,
             scale,
-            int(activation_type),
+            *_activation_kernel_args(activation),
+            activation.is_gated,
             tile_m,
             tile_i,
             num_tiles,
@@ -695,19 +735,16 @@ def _activation_quantize_config(
 def _launch_unfused_activation_quantize(
     gemm1_out: torch.Tensor,
     workspace: Workspace,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     *,
     num_assignments: int,
     num_sms: int,
 ) -> None:
-    if (
-        activation_type.is_gated
-        and num_assignments < _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS
-    ):
+    if activation.is_gated and num_assignments < _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS:
         if workspace.activation_out.numel() == 0:
             raise RuntimeError("W4A4 workspace is missing the activation buffer.")
         activation_out = workspace.activation_out[:num_assignments]
-        launch_activation(gemm1_out, activation_out, activation_type)
+        launch_activation(gemm1_out, activation_out, activation)
         _quantize(
             activation_out,
             workspace.activation_q,
@@ -726,7 +763,7 @@ def _launch_unfused_activation_quantize(
         gemm1_out,
         workspace.activation_q,
         workspace.activation_scale,
-        activation_type,
+        activation,
         tile_i=tile_i,
         occupancy=occupancy,
         scale_row_major=workspace.scale_row_major,
@@ -1143,6 +1180,9 @@ def _grouped_gemm1_w4a4_fused_impl(
     K_IN: ConstInt,
     INTERMEDIATE_SIZE: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
     IS_GATED: ConstInt,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
@@ -1276,9 +1316,22 @@ def _grouped_gemm1_w4a4_fused_impl(
                     ct.astype(up_accumulator * up_alpha, ct.bfloat16),
                     ct.float32,
                 )
-                values = _apply_activation(values, ACTIVATION_TYPE) * up
+                values = _apply_gated_activation(
+                    values,
+                    up,
+                    ACTIVATION_TYPE,
+                    ACTIVATION_PARAM1,
+                    ACTIVATION_PARAM2,
+                    ACTIVATION_PARAM3,
+                )
             else:
-                values = _apply_activation(values, ACTIVATION_TYPE)
+                values = _apply_ungated_activation(
+                    values,
+                    ACTIVATION_TYPE,
+                    ACTIVATION_PARAM1,
+                    ACTIVATION_PARAM2,
+                    ACTIVATION_PARAM3,
+                )
             groups = ct.reshape(
                 ct.astype(ct.astype(values, ct.bfloat16), ct.float32),
                 (TILE_M, groups_per_output_tile, _NVFP4_BLOCK_SIZE),
@@ -1338,6 +1391,9 @@ def _grouped_gemm1_w4a4_fused(
     K_IN: ConstInt,
     INTERMEDIATE_SIZE: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
     IS_GATED: ConstInt,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
@@ -1367,6 +1423,9 @@ def _grouped_gemm1_w4a4_fused(
         K_IN,
         INTERMEDIATE_SIZE,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
         IS_GATED,
         TILE_M,
         TILE_I,
@@ -1400,6 +1459,9 @@ def _grouped_gemm1_w4a4_fused_i64(
     K_IN: ConstInt,
     INTERMEDIATE_SIZE: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
     IS_GATED: ConstInt,
     TILE_M: ConstInt,
     TILE_I: ConstInt,
@@ -1429,6 +1491,9 @@ def _grouped_gemm1_w4a4_fused_i64(
         K_IN,
         INTERMEDIATE_SIZE,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
         IS_GATED,
         TILE_M,
         TILE_I,
@@ -1539,15 +1604,15 @@ def _grouped_gemm(
 
 def _can_fuse_gemm1(
     intermediate_size: int,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     config: GemmConfig,
 ) -> bool:
-    activation_type = _validate_activation(activation_type)
-    tile_i = config.tile_n // 2 if activation_type.is_gated else config.tile_n
+    activation = _validate_activation(activation)
+    tile_i = config.tile_n // 2 if activation.is_gated else config.tile_n
     return (
         tile_i >= 128
         and intermediate_size % 64 == 0
-        and (not activation_type.is_gated or intermediate_size % tile_i == 0)
+        and (not activation.is_gated or intermediate_size % tile_i == 0)
     )
 
 
@@ -1566,7 +1631,7 @@ def _grouped_gemm1_fused(
     num_assignments: int,
     top_k: int,
     intermediate_size: int,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     block_size: int,
     config: GemmConfig,
     scale_row_major: bool,
@@ -1574,11 +1639,12 @@ def _grouped_gemm1_fused(
     sorted_x_scale: torch.Tensor | None = None,
     output_sorted: bool = False,
 ) -> None:
-    tile_i = config.tile_n // 2 if activation_type.is_gated else config.tile_n
-    if not _can_fuse_gemm1(intermediate_size, activation_type, config):
+    activation = _validate_activation(activation)
+    tile_i = config.tile_n // 2 if activation.is_gated else config.tile_n
+    if not _can_fuse_gemm1(intermediate_size, activation, config):
         raise ValueError(
             "unsupported fused W4A4 GEMM1 activation tile: "
-            f"intermediate_size={intermediate_size}, activation={activation_type!r}, "
+            f"intermediate_size={intermediate_size}, activation={activation.type!r}, "
             f"tile_i={tile_i}."
         )
     k = x.shape[1] * 2
@@ -1592,7 +1658,7 @@ def _grouped_gemm1_fused(
     global_scale_shards = (
         int(weight_global_scale.shape[1]) if weight_global_scale.ndim == 2 else 1
     )
-    physical_n = intermediate_size * (2 if activation_type.is_gated else 1)
+    physical_n = intermediate_size * (2 if activation.is_gated else 1)
     if physical_n % global_scale_shards != 0:
         raise ValueError(
             f"GEMM1 output size {physical_n} is not divisible by "
@@ -1642,8 +1708,8 @@ def _grouped_gemm1_fused(
             physical_n // global_scale_shards,
             k,
             intermediate_size,
-            int(activation_type),
-            int(activation_type.is_gated),
+            *_activation_kernel_args(activation),
+            int(activation.is_gated),
             block_size,
             tile_i,
             config.tile_k,
@@ -1667,7 +1733,7 @@ def run_moe(
     output: torch.Tensor,
     workspace: Workspace,
     *,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     fuse_gemm1: bool | None = None,
     num_sms: int,
     block_size: int,
@@ -1675,6 +1741,7 @@ def run_moe(
     gemm2_config: GemmConfig,
 ) -> torch.Tensor:
     """Run the pre-routed W4A4 NVFP4 MoE pipeline."""
+    activation = _validate_activation(activation)
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_assignments = num_tokens * top_k
@@ -1714,11 +1781,11 @@ def run_moe(
 
     can_fuse_gemm1 = _can_fuse_gemm1(
         workspace.activation_q.shape[1] * 2,
-        activation_type,
+        activation,
         gemm1_config,
     )
     auto_fuse_gemm1 = (
-        not activation_type.is_gated
+        not activation.is_gated
         or num_assignments >= _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS
         or workspace.activation_q.shape[1] * 2 % gemm1_config.tile_n != 0
     ) and can_fuse_gemm1
@@ -1745,7 +1812,7 @@ def run_moe(
             num_assignments=num_assignments,
             top_k=top_k,
             intermediate_size=intermediate_size,
-            activation_type=activation_type,
+            activation=activation,
             block_size=block_size,
             config=gemm1_config,
             scale_row_major=workspace.scale_row_major,
@@ -1778,7 +1845,7 @@ def run_moe(
         _launch_unfused_activation_quantize(
             gemm1_out,
             workspace,
-            activation_type,
+            activation,
             num_assignments=num_assignments,
             num_sms=num_sms,
         )

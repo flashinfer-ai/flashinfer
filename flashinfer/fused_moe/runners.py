@@ -2165,7 +2165,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.BF16,)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _num_top_tactics_per_stage: ClassVar[int] = 2
@@ -2216,15 +2216,6 @@ class CuTileBf16Runner(MoERunner):
                 f"cuTile {self._precision_name} requires cuda-tile and a "
                 "tileiras/NVRTC toolchain "
                 f"that supports SM{self._device_arch}."
-            )
-
-    def _check_activation_parameters(self) -> None:
-        if (
-            isinstance(self.config.activation, SwiGLU)
-            and self.config.activation != SwiGLU()
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} cannot represent non-default SwiGLU scalars."
             )
 
     def _build(self) -> None:
@@ -2378,6 +2369,7 @@ class CuTileBf16Runner(MoERunner):
             stage,
             block_size,
             int(self.config.activation.type),
+            repr(self.config.activation),
             self.config.routing.num_experts,
             self.config.routing.top_k,
             self.config.experts.intermediate_size,
@@ -2537,7 +2529,7 @@ class CuTileBf16Runner(MoERunner):
             inputs[5],
             inputs[0],
             self._workspace,
-            activation_type=self.config.activation.type,
+            activation=self.config.activation,
             block_size=block_size,
             gemm1_config=gemm1_config,
             gemm2_config=gemm2_config,
@@ -2753,6 +2745,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             self._w4a4_fusion_modes(inputs, block_size) if stage == 1 else (False,),
             problem.input_sorted,
             int(self.config.activation.type),
+            repr(self.config.activation),
             self.config.routing.num_experts,
             self.config.routing.top_k,
             self.config.experts.intermediate_size,
@@ -3041,7 +3034,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             inputs[9],
             inputs[0],
             self._workspace,
-            activation_type=self.config.activation.type,
+            activation=self.config.activation,
             fuse_gemm1=bool(fuse_gemm1),
             num_sms=self._num_sms,
             block_size=block_size,
