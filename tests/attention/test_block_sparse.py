@@ -34,6 +34,7 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
+import flashinfer.sparse as sparse_module
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
 
@@ -757,7 +758,7 @@ def test_paged_fp8_cache_sizes_its_default_scales_by_the_head_count(layout):
 
 
 @requires_cuda_sm80
-def test_a_second_plan_still_takes_a_page_size_after_auto_resolved():
+def test_a_second_plan_still_takes_a_page_size_after_auto_resolved(monkeypatch):
     """plan() resolves "auto" and keeps the answer on the wrapper. Gating the
     page size on that resolved value refused a second plan for a backend the
     caller never named -- so a wrapper that first planned a flat route could not
@@ -795,13 +796,19 @@ def test_a_second_plan_still_takes_a_page_size_after_auto_resolved():
     # And back to a flat one. The paged plan left fa2 behind, which is not
     # "auto", so a plan that does not reset first never resolves again -- it
     # keeps every later flat route on whatever the paged one settled on.
+    #
+    # Comparing against what the resolver would return does not show that: on
+    # this device it returns fa2 as well, so a stale fa2 and a fresh one look
+    # the same. The resolver is intercepted instead, and the question becomes
+    # whether it was consulted at all.
+    calls = []
+    real = sparse_module.determine_attention_backend
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sparse_module, "determine_attention_backend", spy)
     wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
+    assert calls, "the flat plan reused the paged plan's backend"
     assert wrapper._requested_backend == "auto"
-    assert wrapper._backend == flashinfer.utils.determine_attention_backend(
-        wrapper.device,
-        0,
-        False,
-        True,
-        torch.float16,
-        torch.float16,
-    ), wrapper._backend
