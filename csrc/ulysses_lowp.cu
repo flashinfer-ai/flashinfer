@@ -26,6 +26,7 @@
 // FINAL per-group scale -- no cross-rank scale merge exists.
 
 #include <cstdint>
+#include <utility>
 
 #include "flashinfer/comm/ulysses_lowp.cuh"
 #include "tvm_ffi_utils.h"
@@ -74,12 +75,35 @@ void check_v2g_rank(int64_t rank, int64_t world_size) {
   TVM_FFI_ICHECK(rank >= 0 && rank < world_size) << "V2-G requires 0 <= rank < world_size";
 }
 
+// Every kernel launches through cudaLaunchKernelEx so the programmatic-stream-
+// serialization attribute can be set: with enable_pdl the grid may start while
+// the preceding grid on the stream drains, and the kernels order their global
+// accesses behind detail::pdl_wait() (see ulysses_lowp.cuh).
+template <typename... KArgs, typename... Args>
+void launch_kernel(const char* name, bool enable_pdl, void (*kernel)(KArgs...), dim3 grid,
+                   dim3 block, cudaStream_t stream, Args&&... args) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  const cudaError_t status = cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << name << " failed with error code " << cudaGetErrorString(status);
+}
+
 }  // namespace
 
 // Quantize canonical NHD V with an externally supplied per-channel scale. The
 // output intentionally remains canonical uint8 FP8 bits for low-precision
 // Ulysses communication; Sage's sequence permutation is a separate operation.
-void ulysses_lowp_quant_v_fp8_with_scale(TensorView input, TensorView scale, TensorView output) {
+void ulysses_lowp_quant_v_fp8_with_scale(TensorView input, TensorView scale, TensorView output,
+                                         bool enable_pdl) {
   CHECK_CUDA(input);
   CHECK_CUDA(scale);
   CHECK_CUDA(output);
@@ -107,13 +131,11 @@ void ulysses_lowp_quant_v_fp8_with_scale(TensorView input, TensorView scale, Ten
   const cudaStream_t stream = get_stream(input.device());
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-    lowp::QuantVFP8WithScaleKernel<c_type><<<blocks, THREADS, 0, stream>>>(
-        static_cast<const c_type*>(input.data_ptr()), static_cast<float*>(scale.data_ptr()),
-        static_cast<int8_t*>(output.data_ptr()), num_packs, static_cast<uint32_t>(input.size(1)),
-        static_cast<uint32_t>(input.size(2)), static_cast<uint32_t>(input.size(3)));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "QuantVFP8WithScaleKernel failed with error code " << cudaGetErrorString(status);
+    launch_kernel("QuantVFP8WithScaleKernel", enable_pdl, lowp::QuantVFP8WithScaleKernel<c_type>,
+                  dim3(blocks), dim3(THREADS), stream, static_cast<const c_type*>(input.data_ptr()),
+                  static_cast<float*>(scale.data_ptr()), static_cast<int8_t*>(output.data_ptr()),
+                  num_packs, static_cast<uint32_t>(input.size(1)),
+                  static_cast<uint32_t>(input.size(2)), static_cast<uint32_t>(input.size(3)));
     return true;
   });
 }
@@ -123,7 +145,7 @@ void ulysses_lowp_quant_v_fp8_with_scale(TensorView input, TensorView scale, Ten
 // chunk-partial workspaces: the Python wrapper allocates k_partial/v_partial
 // [B, H, ceil(L/256), 128] fp32 and passes them through.
 void ulysses_lowp_k_sum_v_amax(TensorView k, TensorView v, TensorView k_sum, TensorView v_amax,
-                               TensorView k_partial, TensorView v_partial) {
+                               TensorView k_partial, TensorView v_partial, bool enable_pdl) {
   CHECK_CUDA(k);
   CHECK_CUDA(v);
   CHECK_CUDA(k_sum);
@@ -178,15 +200,13 @@ void ulysses_lowp_k_sum_v_amax(TensorView k, TensorView v, TensorView k_sum, Ten
   dim3 grid(heads, batch, chunks);
   dim3 block(HEAD_DIM * TOKEN_LANES);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
-    lowp::KSumVAmaxPartialKernel<c_type, HEAD_DIM, CHUNK_TOKENS><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(v.data_ptr()),
-        static_cast<float*>(k_partial.data_ptr()), static_cast<float*>(v_partial.data_ptr()),
-        static_cast<uint32_t>(tokens), static_cast<uint32_t>(heads),
-        static_cast<uint32_t>(chunks), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
-        v.stride(1), v.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "KSumVAmaxPartialKernel failed with error code " << cudaGetErrorString(status);
+    launch_kernel("KSumVAmaxPartialKernel", enable_pdl,
+                  lowp::KSumVAmaxPartialKernel<c_type, HEAD_DIM, CHUNK_TOKENS>, grid, block, stream,
+                  static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(v.data_ptr()),
+                  static_cast<float*>(k_partial.data_ptr()), static_cast<float*>(v_partial.data_ptr()),
+                  static_cast<uint32_t>(tokens), static_cast<uint32_t>(heads),
+                  static_cast<uint32_t>(chunks), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+                  v.stride(1), v.stride(2));
     return true;
   });
   // Stage 2 combines the chunk partials in FIXED ascending chunk order, so
@@ -195,20 +215,17 @@ void ulysses_lowp_k_sum_v_amax(TensorView k, TensorView v, TensorView k_sum, Ten
   // two-stage form.
   dim3 grid2(heads, batch);
   dim3 block2(HEAD_DIM);
-  lowp::KSumVAmaxCombineKernel<HEAD_DIM><<<grid2, block2, 0, stream>>>(
-      static_cast<const float*>(k_partial.data_ptr()),
-      static_cast<const float*>(v_partial.data_ptr()), static_cast<float*>(k_sum.data_ptr()),
-      static_cast<float*>(v_amax.data_ptr()), static_cast<uint32_t>(heads),
-      static_cast<uint32_t>(chunks));
-  cudaError_t status = cudaGetLastError();
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "KSumVAmaxCombineKernel failed with error code " << cudaGetErrorString(status);
+  launch_kernel("KSumVAmaxCombineKernel", enable_pdl, lowp::KSumVAmaxCombineKernel<HEAD_DIM>, grid2,
+                block2, stream, static_cast<const float*>(k_partial.data_ptr()),
+                static_cast<const float*>(v_partial.data_ptr()), static_cast<float*>(k_sum.data_ptr()),
+                static_cast<float*>(v_amax.data_ptr()), static_cast<uint32_t>(heads),
+                static_cast<uint32_t>(chunks));
 }
 
 // Per-touched-group partial Q amax on this rank's shard, on the GLOBAL
 // 32-token grid.
 void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank,
-                                 int64_t world_size) {
+                                 int64_t world_size, bool enable_pdl) {
   check_v2g_shard(q, "q");
   check_v2g_rank(rank, world_size);
   CHECK_CUDA(amax_out);
@@ -230,15 +247,13 @@ void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank
     constexpr uint32_t GROUP = 32;
     dim3 grid(touched, q.size(2), q.size(0));
     dim3 block(GROUP * (HEAD_DIM / 8));
-    lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, false, c_type><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(q.data_ptr()), nullptr,
-        static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
-        static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(q.size(2)),
-        static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), q.stride(0),
-        q.stride(1), q.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "GroupedAmaxKernel failed with error code " << cudaGetErrorString(status);
+    launch_kernel("GroupedAmaxKernel(Q)", enable_pdl,
+                  lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, false, c_type>, grid, block, stream,
+                  static_cast<const c_type*>(q.data_ptr()), static_cast<const c_type*>(nullptr),
+                  static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
+                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(q.size(2)),
+                  static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), q.stride(0),
+                  q.stride(1), q.stride(2));
     return true;
   });
 }
@@ -246,7 +261,7 @@ void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank
 // Per-touched-group partial K amax (mean-subtracted) on this rank's shard, on
 // the GLOBAL 64-token grid.
 void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView amax_out, int64_t rank,
-                                 int64_t world_size) {
+                                 int64_t world_size, bool enable_pdl) {
   check_v2g_shard(k, "k");
   check_v2g_rank(rank, world_size);
   CHECK_CUDA(k_mean);
@@ -274,15 +289,13 @@ void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView ama
     constexpr uint32_t GROUP = 64;
     dim3 grid(touched, k.size(2), k.size(0));
     dim3 block(GROUP * (HEAD_DIM / 8));
-    lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, true, c_type><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
-        static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
-        static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(k.size(2)),
-        static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), k.stride(0),
-        k.stride(1), k.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "GroupedAmaxKernel failed with error code " << cudaGetErrorString(status);
+    launch_kernel("GroupedAmaxKernel(K)", enable_pdl,
+                  lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, true, c_type>, grid, block, stream,
+                  static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
+                  static_cast<float*>(amax_out.data_ptr()), static_cast<uint32_t>(local_sequence),
+                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(k.size(2)),
+                  static_cast<uint32_t>(slots_alloc), static_cast<uint32_t>(group_first), k.stride(0),
+                  k.stride(1), k.stride(2));
     return true;
   });
 }
@@ -291,7 +304,7 @@ void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView ama
 // of every destination chunk before the first V2-G pack launch; the kernels
 // write only the touched slots.
 void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, TensorView output,
-                                    int64_t rank, int64_t world_size) {
+                                    int64_t rank, int64_t world_size, bool enable_pdl) {
   check_v2g_shard(q, "q");
   check_v2g_rank(rank, world_size);
   CHECK_CUDA(q_amax_final);
@@ -324,20 +337,16 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
     constexpr uint32_t GROUP = 32;
     dim3 grid(touched, num_heads, batch_size);
     dim3 block(GROUP * (HEAD_DIM / 8));
-    lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, false, c_type>
-        <<<grid, block, 0, stream>>>(
-            static_cast<const c_type*>(q.data_ptr()), nullptr,
-            static_cast<float*>(q_amax_final.data_ptr()),
-            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
-            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
-            static_cast<uint64_t>(spec.chunk_bytes), 0,
-            static_cast<uint64_t>(3 * spec.main_bytes), static_cast<uint32_t>(spec.q_slots),
-            static_cast<uint32_t>(group_first), q.stride(0), q.stride(1), q.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "QuantInt8GroupScalePackKernel failed with error code "
-        << cudaGetErrorString(status);
+    launch_kernel("QuantInt8GroupScalePackKernel(Q)", enable_pdl,
+                  lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block,
+                  stream, static_cast<const c_type*>(q.data_ptr()),
+                  static_cast<const c_type*>(nullptr), static_cast<float*>(q_amax_final.data_ptr()),
+                  static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+                  static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+                  static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(0),
+                  static_cast<uint64_t>(3 * spec.main_bytes), static_cast<uint32_t>(spec.q_slots),
+                  static_cast<uint32_t>(group_first), q.stride(0), q.stride(1), q.stride(2));
     return true;
   });
 }
@@ -347,7 +356,8 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
 // launch of a payload.
 void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView k_mean,
                                          TensorView k_amax_final, TensorView v_scale,
-                                         TensorView output, int64_t rank, int64_t world_size) {
+                                         TensorView output, int64_t rank, int64_t world_size,
+                                         bool enable_pdl) {
   check_v2g_shard(k, "k");
   check_v2g_shard(v, "v");
   check_v2g_rank(rank, world_size);
@@ -396,32 +406,31 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
     constexpr uint32_t GROUP = 64;
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(GROUP * (HEAD_DIM / 8));
-    lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, true, c_type>
-        <<<k_grid, k_block, 0, stream>>>(
-            static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
-            static_cast<float*>(k_amax_final.data_ptr()),
-            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
-            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
-            static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(spec.main_bytes),
-            static_cast<uint64_t>(3 * spec.main_bytes + spec.q_scale_bytes),
-            static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(group_first), k.stride(0),
-            k.stride(1), k.stride(2));
+    launch_kernel("QuantInt8GroupScalePackKernel(K)", enable_pdl,
+                  lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid,
+                  k_block, stream, static_cast<const c_type*>(k.data_ptr()),
+                  static_cast<const c_type*>(k_mean.data_ptr()),
+                  static_cast<float*>(k_amax_final.data_ptr()),
+                  static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+                  static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+                  static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(spec.main_bytes),
+                  static_cast<uint64_t>(3 * spec.main_bytes + spec.q_scale_bytes),
+                  static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(group_first),
+                  k.stride(0), k.stride(1), k.stride(2));
     constexpr uint32_t V_THREADS = 256;
     const uint64_t v_packs =
         static_cast<uint64_t>(batch_size) * local_sequence * local_heads * head_dim / 8;
     dim3 v_grid((v_packs + V_THREADS - 1) / V_THREADS, world_size);
     dim3 v_block(V_THREADS);
-    lowp::QuantVFP8WithScalePackKernel<c_type><<<v_grid, v_block, 0, stream>>>(
-        static_cast<const c_type*>(v.data_ptr()), static_cast<float*>(v_scale.data_ptr()),
-        static_cast<uint8_t*>(output.data_ptr()), v_packs, static_cast<uint32_t>(local_sequence),
-        static_cast<uint32_t>(num_heads), static_cast<uint32_t>(local_heads),
-        static_cast<uint32_t>(head_dim), static_cast<uint32_t>(batch_size),
-        static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
-        v.stride(0), v.stride(1), v.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "quant_kv_int8_fp8_pack kernels failed with error code " << cudaGetErrorString(status);
+    launch_kernel("QuantVFP8WithScalePackKernel", enable_pdl,
+                  lowp::QuantVFP8WithScalePackKernel<c_type>, v_grid, v_block, stream,
+                  static_cast<const c_type*>(v.data_ptr()), static_cast<float*>(v_scale.data_ptr()),
+                  static_cast<uint8_t*>(output.data_ptr()), v_packs,
+                  static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(num_heads),
+                  static_cast<uint32_t>(local_heads), static_cast<uint32_t>(head_dim),
+                  static_cast<uint32_t>(batch_size), static_cast<uint64_t>(spec.main_bytes),
+                  static_cast<uint64_t>(spec.chunk_bytes), v.stride(0), v.stride(1), v.stride(2));
     return true;
   });
 }
@@ -431,7 +440,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
 // identical to the split GroupedAmax + QuantInt8GroupScalePack path.  Same
 // zero-fill contract as the split packers.
 void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64_t rank,
-                                          int64_t world_size) {
+                                          int64_t world_size, bool enable_pdl) {
   check_v2g_shard(q, "q");
   check_v2g_rank(rank, world_size);
   CHECK_CUDA(output);
@@ -461,20 +470,16 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
     constexpr uint32_t GROUP = 32;
     dim3 grid(touched, num_heads, batch_size);
     dim3 block(GROUP * (HEAD_DIM / 8));
-    lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>
-        <<<grid, block, 0, stream>>>(
-            static_cast<const c_type*>(q.data_ptr()), nullptr,
-            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
-            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
-            static_cast<uint64_t>(spec.chunk_bytes), 0,
-            static_cast<uint64_t>(3 * spec.main_bytes), static_cast<uint32_t>(spec.q_slots),
-            static_cast<uint32_t>(group_first), 0xFFFFFFFFu, 0u, q.stride(0), q.stride(1),
-            q.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "QuantInt8FusedAmaxPackKernel(Q) failed with error code "
-        << cudaGetErrorString(status);
+    launch_kernel("QuantInt8FusedAmaxPackKernel(Q)", enable_pdl,
+                  lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block,
+                  stream, static_cast<const c_type*>(q.data_ptr()),
+                  static_cast<const c_type*>(nullptr), static_cast<uint8_t*>(output.data_ptr()),
+                  static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(rank * local_sequence),
+                  static_cast<uint32_t>(num_heads), static_cast<uint32_t>(local_heads),
+                  static_cast<uint32_t>(batch_size), static_cast<uint64_t>(spec.chunk_bytes),
+                  static_cast<uint64_t>(0), static_cast<uint64_t>(3 * spec.main_bytes),
+                  static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(group_first),
+                  0xFFFFFFFFu, 0u, q.stride(0), q.stride(1), q.stride(2));
     return true;
   });
 }
@@ -484,7 +489,7 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
 void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, TensorView k_mean,
                                                TensorView v_scale, TensorView output,
                                                int64_t rank, int64_t world_size,
-                                               int64_t used_sequence) {
+                                               int64_t used_sequence, bool enable_pdl) {
   check_v2g_shard(k, "k");
   check_v2g_shard(v, "v");
   check_v2g_rank(rank, world_size);
@@ -542,31 +547,30 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
     constexpr uint32_t GROUP = 64;
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(GROUP * (HEAD_DIM / 8));
-    lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>
-        <<<k_grid, k_block, 0, stream>>>(
-            static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
-            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
-            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
-            static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(spec.main_bytes),
-            static_cast<uint64_t>(3 * spec.main_bytes + spec.q_scale_bytes),
-            static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(group_first),
-            exclude_group, used_u32, k.stride(0), k.stride(1), k.stride(2));
+    launch_kernel("QuantInt8FusedAmaxPackKernel(K)", enable_pdl,
+                  lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid, k_block,
+                  stream, static_cast<const c_type*>(k.data_ptr()),
+                  static_cast<const c_type*>(k_mean.data_ptr()),
+                  static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+                  static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+                  static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+                  static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(spec.main_bytes),
+                  static_cast<uint64_t>(3 * spec.main_bytes + spec.q_scale_bytes),
+                  static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(group_first),
+                  exclude_group, used_u32, k.stride(0), k.stride(1), k.stride(2));
     constexpr uint32_t V_THREADS = 256;
     const uint64_t v_packs =
         static_cast<uint64_t>(batch_size) * local_sequence * local_heads * head_dim / 8;
     dim3 v_grid((v_packs + V_THREADS - 1) / V_THREADS, world_size);
     dim3 v_block(V_THREADS);
-    lowp::QuantVFP8WithScalePackKernel<c_type><<<v_grid, v_block, 0, stream>>>(
-        static_cast<const c_type*>(v.data_ptr()), static_cast<float*>(v_scale.data_ptr()),
-        static_cast<uint8_t*>(output.data_ptr()), v_packs, static_cast<uint32_t>(local_sequence),
-        static_cast<uint32_t>(num_heads), static_cast<uint32_t>(local_heads),
-        static_cast<uint32_t>(head_dim), static_cast<uint32_t>(batch_size),
-        static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
-        v.stride(0), v.stride(1), v.stride(2));
-    cudaError_t status = cudaGetLastError();
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "fused quant_kv pack kernels failed with error code " << cudaGetErrorString(status);
+    launch_kernel("QuantVFP8WithScalePackKernel", enable_pdl,
+                  lowp::QuantVFP8WithScalePackKernel<c_type>, v_grid, v_block, stream,
+                  static_cast<const c_type*>(v.data_ptr()), static_cast<float*>(v_scale.data_ptr()),
+                  static_cast<uint8_t*>(output.data_ptr()), v_packs,
+                  static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(num_heads),
+                  static_cast<uint32_t>(local_heads), static_cast<uint32_t>(head_dim),
+                  static_cast<uint32_t>(batch_size), static_cast<uint64_t>(spec.main_bytes),
+                  static_cast<uint64_t>(spec.chunk_bytes), v.stride(0), v.stride(1), v.stride(2));
     return true;
   });
 }
@@ -577,7 +581,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
 // writes; unused tail slots are deterministically zeroed).
 void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, TensorView v,
                                   TensorView q_scale, TensorView k_scale, int64_t local_sequence,
-                                  int64_t world_size, int64_t scale_sequence) {
+                                  int64_t world_size, int64_t scale_sequence, bool enable_pdl) {
   CHECK_CUDA(input);
   CHECK_CUDA(q);
   CHECK_CUDA(k);
@@ -647,18 +651,16 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   constexpr uint32_t VECTOR_SIZE = 16;
   dim3 grid(padded_sequence / CTA_SIZE, local_heads, batch_size);
   dim3 block(CTA_SIZE * HEAD_DIM / VECTOR_SIZE);
-  lowp::UnpackForSageKernel<HEAD_DIM, CTA_SIZE><<<grid, block, 0, stream>>>(
-      static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
-      static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
-      static_cast<uint8_t*>(q_scale.data_ptr()), static_cast<uint8_t*>(k_scale.data_ptr()),
-      static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
-      static_cast<uint32_t>(batch_size), static_cast<uint32_t>(local_sequence),
-      static_cast<uint32_t>(logical_sequence), static_cast<uint32_t>(padded_sequence),
-      static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(spec.k_slots),
-      static_cast<uint32_t>(q_scale_alloc), static_cast<uint32_t>(k_scale_alloc));
-  cudaError_t status = cudaGetLastError();
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "UnpackForSageKernel failed with error code " << cudaGetErrorString(status);
+  launch_kernel("UnpackForSageKernel", enable_pdl, lowp::UnpackForSageKernel<HEAD_DIM, CTA_SIZE>,
+                grid, block, stream, static_cast<const uint8_t*>(input.data_ptr()),
+                static_cast<uint8_t*>(q.data_ptr()), static_cast<uint8_t*>(k.data_ptr()),
+                static_cast<uint8_t*>(v.data_ptr()), static_cast<uint8_t*>(q_scale.data_ptr()),
+                static_cast<uint8_t*>(k_scale.data_ptr()), static_cast<uint64_t>(spec.main_bytes),
+                static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint32_t>(batch_size),
+                static_cast<uint32_t>(local_sequence), static_cast<uint32_t>(logical_sequence),
+                static_cast<uint32_t>(padded_sequence), static_cast<uint32_t>(spec.q_slots),
+                static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(q_scale_alloc),
+                static_cast<uint32_t>(k_scale_alloc));
 }
 
 // UNALIGNED receiver (boundary-stats protocol 2, 64-aligned GLOBAL packing):
@@ -669,7 +671,8 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
 void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, TensorView k,
                                             TensorView v, TensorView q_scale,
                                             TensorView k_scale, int64_t local_sequence,
-                                            int64_t world_size, int64_t scale_sequence) {
+                                            int64_t world_size, int64_t scale_sequence,
+                                            bool enable_pdl) {
   CHECK_CUDA(input);
   CHECK_CUDA(q);
   CHECK_CUDA(k);
@@ -737,18 +740,16 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   constexpr uint32_t VECTOR_SIZE = 16;
   dim3 grid(padded_sequence / CTA_SIZE, local_heads, batch_size);
   dim3 block(CTA_SIZE * HEAD_DIM / VECTOR_SIZE);
-  lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE><<<grid, block, 0, stream>>>(
-      static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
-      static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
-      static_cast<uint8_t*>(q_scale.data_ptr()), static_cast<uint8_t*>(k_scale.data_ptr()),
-      static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
-      static_cast<uint32_t>(batch_size), static_cast<uint32_t>(local_sequence),
-      static_cast<uint32_t>(logical_sequence), static_cast<uint32_t>(padded_sequence),
-      static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(spec.k_slots),
-      static_cast<uint32_t>(q_scale_alloc), static_cast<uint32_t>(k_scale_alloc));
-  cudaError_t status = cudaGetLastError();
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "UnpackForSageUnalignedKernel failed with error code " << cudaGetErrorString(status);
+  launch_kernel("UnpackForSageUnalignedKernel", enable_pdl,
+                lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE>, grid, block, stream,
+                static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
+                static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
+                static_cast<uint8_t*>(q_scale.data_ptr()), static_cast<uint8_t*>(k_scale.data_ptr()),
+                static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
+                static_cast<uint32_t>(batch_size), static_cast<uint32_t>(local_sequence),
+                static_cast<uint32_t>(logical_sequence), static_cast<uint32_t>(padded_sequence),
+                static_cast<uint32_t>(spec.q_slots), static_cast<uint32_t>(spec.k_slots),
+                static_cast<uint32_t>(q_scale_alloc), static_cast<uint32_t>(k_scale_alloc));
 }
 
 // Payload ABI version consumed by the Python capability handshake

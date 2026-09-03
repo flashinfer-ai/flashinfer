@@ -752,3 +752,76 @@ def test_scale_sequence_rejects_out_of_range_and_mismatched_out():
     full = lowp.unpack_for_sage(recv, **kwargs)
     with pytest.raises(Exception):  # FFI shape check: full-width scale buffers
         lowp.unpack_for_sage(recv, scale_sequence=S - 130, out=full, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 10. Programmatic Dependent Launch: identical bytes with the attribute on/off
+# ---------------------------------------------------------------------------
+
+
+def _full_chain(q, k, v, k_mean, v_scale, world, L, used, enable_pdl):
+    """Every kernel of the module, launched back-to-back on one stream with no
+    host synchronization in between, so the PDL edges really overlap.  A
+    misplaced griddepcontrol.wait shows up as a byte difference."""
+    outs = []
+    sends = []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+        ks, va = lowp.k_sum_v_amax(k_r, v_r, enable_pdl=enable_pdl)
+        qa = lowp.q_grouped_amax(q_r, rank=r, world_size=world, enable_pdl=enable_pdl)
+        ka = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world,
+                                 used_sequence=used, enable_pdl=enable_pdl)
+        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, qa, ka, v_scale, rank=r,
+                                    world_size=world, enable_pdl=enable_pdl)
+        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=r,
+                                          world_size=world, used_sequence=used,
+                                          enable_pdl=enable_pdl)
+        v8 = lowp.quant_v_fp8_with_scale(v_r, v_scale, enable_pdl=enable_pdl)
+        outs.extend([ks, va, qa, ka, split, fused, v8])
+        sends.append(split)
+    recv = torch.stack([sends[src][0] for src in range(world)])
+    outs.extend(lowp.unpack_for_sage(
+        recv, batch_size=1, local_sequence=L, local_heads=_HEADS // world,
+        head_dim=_HEAD_DIM, world_size=world, scale_sequence=used, enable_pdl=enable_pdl))
+    return outs
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_pdl_on_and_off_produce_identical_bytes(dtype):
+    world, L = 4, 256
+    S = world * L
+    for seed in range(6):
+        q, k, v = _global_inputs(dtype, world, L, seed=seed)
+        k_mean, v_scale = _stats(k, v, world, L)
+        on = _full_chain(q, k, v, k_mean, v_scale, world, L, S - 130, True)
+        off = _full_chain(q, k, v, k_mean, v_scale, world, L, S - 130, False)
+        assert len(on) == len(off)
+        for i, (a, b) in enumerate(zip(on, off)):
+            assert _same_bits(a, b), f"seed={seed} output #{i} differs with PDL"
+
+
+@requires_sm120
+def test_pdl_launches_capture_into_a_cuda_graph():
+    world, L = 4, 256
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    q_r, k_r, v_r = (x[:, :L].contiguous() for x in (q, k, v))
+    eager = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
+                                      world_size=world, enable_pdl=True)
+    send = torch.empty_like(eager)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # warm-up on the capture stream
+        lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
+                                  world_size=world, out=send, enable_pdl=True)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
+                                  world_size=world, out=send, enable_pdl=True)
+    send.fill_(0xCD)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(send, eager)

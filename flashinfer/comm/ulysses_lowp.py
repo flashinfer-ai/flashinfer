@@ -43,7 +43,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_lowp_module
-from ..utils import register_custom_op
+from ..utils import device_support_pdl, register_custom_op
 
 ABI_VERSION = 3
 # Stats protocol 3 (ALIGN-128): ONE stats AllGather carrying the K per-channel
@@ -124,8 +124,9 @@ def get_ulysses_lowp_module():
         v_amax: torch.Tensor,
         k_partial: torch.Tensor,
         v_partial: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_k_sum_v_amax(k, v, k_sum, v_amax, k_partial, v_partial)
+        module.ulysses_lowp_k_sum_v_amax(k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl)
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_q_grouped_amax", mutates_args=["amax_out"]
@@ -135,8 +136,9 @@ def get_ulysses_lowp_module():
         amax_out: torch.Tensor,
         rank: int,
         world_size: int,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_q_grouped_amax(q, amax_out, rank, world_size)
+        module.ulysses_lowp_q_grouped_amax(q, amax_out, rank, world_size, enable_pdl)
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_k_grouped_amax", mutates_args=["amax_out"]
@@ -147,8 +149,9 @@ def get_ulysses_lowp_module():
         amax_out: torch.Tensor,
         rank: int,
         world_size: int,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_k_grouped_amax(k, k_mean, amax_out, rank, world_size)
+        module.ulysses_lowp_k_grouped_amax(k, k_mean, amax_out, rank, world_size, enable_pdl)
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_quant_q_int8_pack", mutates_args=["output"]
@@ -159,8 +162,11 @@ def get_ulysses_lowp_module():
         output: torch.Tensor,
         rank: int,
         world_size: int,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_quant_q_int8_pack(q, q_amax_final, output, rank, world_size)
+        module.ulysses_lowp_quant_q_int8_pack(
+            q, q_amax_final, output, rank, world_size, enable_pdl
+        )
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack", mutates_args=["output"]
@@ -174,9 +180,10 @@ def get_ulysses_lowp_module():
         output: torch.Tensor,
         rank: int,
         world_size: int,
+        enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_quant_kv_int8_fp8_pack(
-            k, v, k_mean, k_amax_final, v_scale, output, rank, world_size
+            k, v, k_mean, k_amax_final, v_scale, output, rank, world_size, enable_pdl
         )
 
     @register_custom_op(
@@ -187,8 +194,9 @@ def get_ulysses_lowp_module():
         output: torch.Tensor,
         rank: int,
         world_size: int,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_quant_q_int8_pack_fused(q, output, rank, world_size)
+        module.ulysses_lowp_quant_q_int8_pack_fused(q, output, rank, world_size, enable_pdl)
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack_fused", mutates_args=["output"]
@@ -202,9 +210,10 @@ def get_ulysses_lowp_module():
         rank: int,
         world_size: int,
         used_sequence: int,
+        enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
-            k, v, k_mean, v_scale, output, rank, world_size, used_sequence
+            k, v, k_mean, v_scale, output, rank, world_size, used_sequence, enable_pdl
         )
 
     @register_custom_op(
@@ -221,9 +230,11 @@ def get_ulysses_lowp_module():
         local_sequence: int,
         world_size: int,
         scale_sequence: int,
+        enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence
+            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -240,9 +251,11 @@ def get_ulysses_lowp_module():
         local_sequence: int,
         world_size: int,
         scale_sequence: int,
+        enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage_unaligned(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence
+            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -252,8 +265,9 @@ def get_ulysses_lowp_module():
         input: torch.Tensor,
         scale: torch.Tensor,
         output: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_quant_v_fp8_with_scale(input, scale, output)
+        module.ulysses_lowp_quant_v_fp8_with_scale(input, scale, output, enable_pdl)
 
     @register_custom_op("flashinfer::ulysses_lowp_abi_version", mutates_args=[])
     def ulysses_lowp_abi_version() -> int:
@@ -310,6 +324,16 @@ def _rank(rank: int, world_size: int) -> int:
     if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < world_size:
         raise ValueError("V2-G requires 0 <= rank < world_size")
     return rank
+
+
+def _resolve_pdl(enable_pdl: Optional[bool], tensor: torch.Tensor) -> bool:
+    """Programmatic Dependent Launch: default on wherever the device supports
+    it (every SM120 target does); the kernels order their global accesses
+    behind griddepcontrol.wait, so the flag never changes results."""
+
+    if enable_pdl is None:
+        return bool(device_support_pdl(tensor.device))
+    return bool(enable_pdl)
 
 
 def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int, int]:
@@ -479,6 +503,7 @@ def k_sum_v_amax(
     v: torch.Tensor,
     *,
     out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute local FP32 K sum and V absolute maximum over sequence.
 
@@ -520,7 +545,7 @@ def k_sum_v_amax(
     )
     v_partial = torch.empty_like(k_partial)
     get_ulysses_lowp_module().ulysses_lowp_k_sum_v_amax(
-        k, v, k_sum, v_amax, k_partial, v_partial
+        k, v, k_sum, v_amax, k_partial, v_partial, _resolve_pdl(enable_pdl, k)
     )
     return k_sum, v_amax
 
@@ -531,7 +556,13 @@ def k_sum_v_amax(
 
 
 @flashinfer_api
-def q_grouped_amax(q: torch.Tensor, *, rank: int, world_size: int) -> torch.Tensor:
+def q_grouped_amax(
+    q: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
     """Per-touched-global-group |Q| partial amax, ``[B, H, slots(L,32)]``.
 
     Valid slots are ``[0, touched)``; the surplus allocation stays zero.
@@ -545,7 +576,9 @@ def q_grouped_amax(q: torch.Tensor, *, rank: int, world_size: int) -> torch.Tens
         dtype=torch.float32,
         device=q.device,
     )
-    get_ulysses_lowp_module().ulysses_lowp_q_grouped_amax(q, amax, rank, world_size)
+    get_ulysses_lowp_module().ulysses_lowp_q_grouped_amax(
+        q, amax, rank, world_size, _resolve_pdl(enable_pdl, q)
+    )
     return amax
 
 
@@ -557,6 +590,7 @@ def k_grouped_amax(
     rank: int,
     world_size: int,
     used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Per-touched-global-group |K - global mean| partial amax, ``[B, H, slots(L,64)]``.
 
@@ -604,7 +638,7 @@ def k_grouped_amax(
         device=k.device,
     )
     get_ulysses_lowp_module().ulysses_lowp_k_grouped_amax(
-        k, k_mean_global, amax, rank, world_size
+        k, k_mean_global, amax, rank, world_size, _resolve_pdl(enable_pdl, k)
     )
     if (
         used_sequence is not None
@@ -906,6 +940,7 @@ def quant_q_into_payload(
     *,
     rank: int,
     world_size: int,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     """Quantize Q on the global grid directly into the V2-G payload."""
 
@@ -922,7 +957,7 @@ def quant_q_into_payload(
     if send_u8.device != q.device or q_amax_final.device != q.device:
         raise ValueError("q, q_amax_final, and send_u8 must share a device")
     get_ulysses_lowp_module().ulysses_lowp_quant_q_int8_pack(
-        q, q_amax_final, send_u8, rank, world_size
+        q, q_amax_final, send_u8, rank, world_size, _resolve_pdl(enable_pdl, q)
     )
 
 
@@ -937,6 +972,7 @@ def quant_kv_into_payload(
     *,
     rank: int,
     world_size: int,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     """Quantize K (global grid) and V (global per-channel) into the payload."""
 
@@ -965,7 +1001,8 @@ def quant_kv_into_payload(
     if send_u8.device != k.device:
         raise ValueError("K/V, statistics, and send_u8 must share a device")
     get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack(
-        k, v, k_mean_global, k_amax_final, v_scale_global, send_u8, rank, world_size
+        k, v, k_mean_global, k_amax_final, v_scale_global, send_u8, rank, world_size,
+        _resolve_pdl(enable_pdl, k),
     )
 
 
@@ -982,6 +1019,7 @@ def quant_qkv_pack(
     rank: int,
     world_size: int,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Fused V2-G quantize-and-pack convenience entry point."""
 
@@ -1000,7 +1038,10 @@ def quant_qkv_pack(
             (world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
         )
     zero_scale_and_padding(out, spec)
-    quant_q_into_payload(q, q_amax_final, out, rank=rank, world_size=world_size)
+    enable_pdl = _resolve_pdl(enable_pdl, q)
+    quant_q_into_payload(
+        q, q_amax_final, out, rank=rank, world_size=world_size, enable_pdl=enable_pdl
+    )
     quant_kv_into_payload(
         k,
         v,
@@ -1010,6 +1051,7 @@ def quant_qkv_pack(
         out,
         rank=rank,
         world_size=world_size,
+        enable_pdl=enable_pdl,
     )
     return out
 
@@ -1029,6 +1071,7 @@ def quant_q_into_payload_fused(
     *,
     rank: int,
     world_size: int,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     """Fused amax+quant of Q into the payload (ALIGN-128 fast path).
 
@@ -1056,7 +1099,7 @@ def quant_q_into_payload_fused(
     if send_u8.device != q.device:
         raise ValueError("q and send_u8 must share a device")
     get_ulysses_lowp_module().ulysses_lowp_quant_q_int8_pack_fused(
-        q, send_u8, rank, world_size
+        q, send_u8, rank, world_size, _resolve_pdl(enable_pdl, q)
     )
 
 
@@ -1071,6 +1114,7 @@ def quant_kv_into_payload_fused(
     rank: int,
     world_size: int,
     used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     """Fused amax+quant of K plus per-channel FP8 V into the payload.
 
@@ -1111,6 +1155,7 @@ def quant_kv_into_payload_fused(
     get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack_fused(
         k, v, k_mean_global, v_scale_global, send_u8, rank, world_size,
         int(used_sequence) if used_sequence is not None else 0,
+        _resolve_pdl(enable_pdl, k),
     )
 
 
@@ -1126,6 +1171,7 @@ def quant_qkv_pack_fused(
     world_size: int,
     used_sequence: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Fused amax+quant V2-G pack (ALIGN-128 fast path).
 
@@ -1168,7 +1214,10 @@ def quant_qkv_pack_fused(
         world_size=world_size,
     )
     zero_scale_and_padding(out, spec)
-    quant_q_into_payload_fused(q, out, rank=rank, world_size=world_size)
+    enable_pdl = _resolve_pdl(enable_pdl, q)
+    quant_q_into_payload_fused(
+        q, out, rank=rank, world_size=world_size, enable_pdl=enable_pdl
+    )
     quant_kv_into_payload_fused(
         k,
         v,
@@ -1178,6 +1227,7 @@ def quant_qkv_pack_fused(
         rank=rank,
         world_size=world_size,
         used_sequence=used_sequence,
+        enable_pdl=enable_pdl,
     )
     return out
 
@@ -1212,6 +1262,7 @@ def unpack_for_sage(
     out: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unpack source chunks into pre-quant compute inputs on the global grid.
 
@@ -1308,6 +1359,7 @@ def unpack_for_sage(
         local_sequence,
         world_size,
         int(scale_sequence),
+        _resolve_pdl(enable_pdl, recv_u8),
     )
     return q_logical, k_logical, v_packed, q_scale, k_scale
 
@@ -1380,6 +1432,7 @@ def quant_v_fp8_with_scale(
     v: torch.Tensor,
     v_scale_global: torch.Tensor,
     scale_max: float = V_SCALE_MAX,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Quantize canonical NHD V to canonical E4M3 bit patterns.
 
@@ -1432,7 +1485,7 @@ def quant_v_fp8_with_scale(
     _require_sm120(v)
     output = torch.empty_like(v, dtype=torch.uint8, memory_format=torch.contiguous_format)
     get_ulysses_lowp_module().ulysses_lowp_quant_v_fp8_with_scale(
-        v, v_scale_global, output
+        v, v_scale_global, output, _resolve_pdl(enable_pdl, v)
     )
     return output
 

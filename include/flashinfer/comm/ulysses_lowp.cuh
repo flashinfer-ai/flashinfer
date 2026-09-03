@@ -62,6 +62,27 @@ namespace detail {
 #define FLASHINFER_ULYSSES_LOWP_RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
+// Programmatic Dependent Launch barriers.  A grid launched with the
+// programmatic-stream-serialization attribute may begin before the preceding
+// grid on its stream has retired, so every global access that depends on --
+// or must stay ordered after -- earlier work sits behind pdl_wait(); index
+// arithmetic may run ahead of it.  pdl_launch_dependents() only lets the next
+// grid start its own prologue early and never affects correctness.  Without
+// the launch attribute both are no-ops.
+__device__ __forceinline__ void pdl_wait()
+{
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void pdl_launch_dependents()
+{
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 __device__ __forceinline__ void floatx4_to_e4m3x4(uint32_t *dest, float *source0, float *source1)
 {
 #ifdef FLASHINFER_ULYSSES_LOWP_FP8_CAST_ENABLED
@@ -235,6 +256,7 @@ __global__ void QuantVFP8WithScaleKernel(
   float x_val_float[pack_size];
   uint32_t x_val_fp8[2];
 
+  detail::pdl_wait();
   *reinterpret_cast<float4 *>(&x_val[0]) =
       *reinterpret_cast<const float4 *>(input + element_offset);
   *reinterpret_cast<float4 *>(&scale_val[0]) =
@@ -259,6 +281,7 @@ __global__ void QuantVFP8WithScaleKernel(
   detail::floatx4_to_e4m3x4(x_val_fp8 + 1, x_val_float + 4, x_val_float + 6);
   *reinterpret_cast<uint2 *>(output + element_offset) =
       *reinterpret_cast<uint2 *>(&x_val_fp8[0]);
+  detail::pdl_launch_dependents();
 }
 
 // Quantize canonical NHD V directly into the destination-major V section of
@@ -315,6 +338,7 @@ __global__ void QuantVFP8WithScalePackKernel(
   float x_val_float[pack_size];
   uint32_t x_val_fp8[2];
 
+  detail::pdl_wait();
   *reinterpret_cast<float4 *>(&x_val[0]) =
       *reinterpret_cast<const float4 *>(input + input_offset);
   *reinterpret_cast<float4 *>(&scale_val[0]) =
@@ -333,6 +357,7 @@ __global__ void QuantVFP8WithScalePackKernel(
   detail::floatx4_to_e4m3x4(x_val_fp8 + 1, x_val_float + 4, x_val_float + 6);
   *reinterpret_cast<uint2 *>(output + output_offset) =
       *reinterpret_cast<uint2 *>(&x_val_fp8[0]);
+  detail::pdl_launch_dependents();
 }
 
 // Fused local statistics for the V1 NHD path, two-stage sequence-parallel
@@ -378,6 +403,7 @@ __global__ void KSumVAmaxPartialKernel(
 
   float local_sum = 0.0f;
   float local_amax = 0.0f;
+  detail::pdl_wait();
   for (uint32_t token_id = token_begin + token_lane; token_id < token_end;
        token_id += token_lanes)
   {
@@ -407,6 +433,7 @@ __global__ void KSumVAmaxPartialKernel(
     k_partial[out] = shared_sum[d_id] + shared_sum[head_dim + d_id];
     v_partial[out] = fmaxf(shared_amax[d_id], shared_amax[head_dim + d_id]);
   }
+  detail::pdl_launch_dependents();
 }
 
 template <uint32_t head_dim>
@@ -427,6 +454,7 @@ __global__ void KSumVAmaxCombineKernel(
       (static_cast<uint64_t>(batch_id) * num_heads + head_id) * num_chunks;
   float s = 0.0f;
   float m = 0.0f;
+  detail::pdl_wait();
   for (uint32_t c = 0; c < num_chunks; ++c)
   {
     s += k_partial[(base + c) * head_dim + d_id];
@@ -436,6 +464,7 @@ __global__ void KSumVAmaxCombineKernel(
       (static_cast<uint64_t>(batch_id) * num_heads + head_id) * head_dim + d_id;
   k_sum[out] = s;
   v_amax[out] = m;
+  detail::pdl_launch_dependents();
 }
 
 // Per-touched-group partial amax on this rank's shard, on the GLOBAL grid.
@@ -475,6 +504,7 @@ __global__ void GroupedAmaxKernel(
   T x_val[pack_size];
   float x_val_float[pack_size];
   float amax_val = 0.0000001f;
+  detail::pdl_wait();
   if (valid)
   {
     const uint32_t local_token = global_token - global_offset;
@@ -517,6 +547,7 @@ __global__ void GroupedAmaxKernel(
     amax_out[(static_cast<uint64_t>(batch_id) * num_heads + head_id) * slots_alloc + slot] =
         block_amax_val;
   }
+  detail::pdl_launch_dependents();
 }
 
 // Quantize this rank's shard with externally supplied FINAL per-global-group
@@ -566,6 +597,7 @@ __global__ void QuantInt8GroupScalePackKernel(
   const uint32_t destination = head_id / local_heads;
   const uint32_t local_head = head_id % local_heads;
 
+  detail::pdl_wait();
   const float amax_val =
       amax_final[(static_cast<uint64_t>(batch_id) * num_heads + head_id) * slots_alloc + slot];
 
@@ -630,6 +662,7 @@ __global__ void QuantInt8GroupScalePackKernel(
       d_base;
   *reinterpret_cast<float2 *>(output + packed_offset) =
       *reinterpret_cast<float2 *>(&quantized[0]);
+  detail::pdl_launch_dependents();
 }
 
 // Fused per-group amax + int8 quantize-and-pack (ALIGN-128 fast path).
@@ -694,6 +727,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
   T x_val[pack_size];
   float x_val_float[pack_size];
   float amax_val = 0.0000001f;
+  detail::pdl_wait();
   if (valid)
   {
     const uint32_t local_token = global_token - global_offset;
@@ -774,6 +808,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
       d_base;
   *reinterpret_cast<float2 *>(output + packed_offset) =
       *reinterpret_cast<float2 *>(&quantized[0]);
+  detail::pdl_launch_dependents();
 }
 
 // V2-G receiver, ALIGN-128 (stats protocol 3): rebuild contiguous logical
@@ -827,6 +862,7 @@ __global__ void UnpackForSageKernel(
        local_head) *
           head_dim +
       d_base;
+  detail::pdl_wait();
   const uint4 q_value =
       *reinterpret_cast<const uint4 *>(input + source_chunk + source_element);
   const uint4 k_value =
@@ -909,6 +945,7 @@ __global__ void UnpackForSageKernel(
     k_scale_output[scale_head * k_scale_alloc + g] =
         k_scale_input[scale_head * k_slots_per_source + owner_slot];
   }
+  detail::pdl_launch_dependents();
 }
 
 // V2-G receiver, UNALIGNED variant (boundary-stats protocol 2, 64-aligned
@@ -957,6 +994,8 @@ __global__ void UnpackForSageUnalignedKernel(
   uint4 q_value = make_uint4(0, 0, 0, 0);
   uint4 k_value = make_uint4(0, 0, 0, 0);
   uint4 v_value = make_uint4(0, 0, 0, 0);
+  // Outside the validity branch: padded rows still store V and scales below.
+  detail::pdl_wait();
   if (token_valid)
   {
     const uint32_t source = global_token / local_sequence;
@@ -1056,6 +1095,7 @@ __global__ void UnpackForSageUnalignedKernel(
     }
     k_scale_output[scale_head * k_scale_alloc + g] = value;
   }
+  detail::pdl_launch_dependents();
 }
 
 }  // namespace ulysses_lowp
