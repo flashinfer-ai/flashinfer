@@ -1501,6 +1501,7 @@ def _should_use_small_bh_owner_helper(
     *,
     compute_capability: tuple[int, int],
     sm_count: int,
+    fixed_layout: bool,
     num_sequences: int,
     num_heads: int,
     sequence_length: int,
@@ -1510,6 +1511,7 @@ def _should_use_small_bh_owner_helper(
     total_tasks = num_sequences * num_heads
     return (
         compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and fixed_layout
         and 0 < total_tasks <= _FLASH_KDA_SMALL_BH_MAX_TASKS
         and num_heads <= _FLASH_KDA_SMALL_BH_MAX_TASKS
         and sequence_length >= _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH
@@ -1714,6 +1716,7 @@ def _select_flash_kda_bf16_route(
     if _should_use_small_bh_owner_helper(
         compute_capability=compute_capability,
         sm_count=sm_count,
+        fixed_layout=fixed_layout,
         num_sequences=num_sequences,
         num_heads=num_heads,
         sequence_length=max_sequence_length,
@@ -2319,6 +2322,7 @@ def _select_bf16_route(
     if _should_use_small_bh_owner_helper(
         compute_capability=compute_capability,
         sm_count=sm_count,
+        fixed_layout=fixed_layout,
         num_sequences=num_sequences,
         num_heads=num_heads,
         sequence_length=max_sequence_length,
@@ -2459,6 +2463,7 @@ def _select_fp32_schedule_route(
     if _should_use_small_bh_owner_helper(
         compute_capability=compute_capability,
         sm_count=sm_count,
+        fixed_layout=fixed_layout,
         num_sequences=len(sequence_lengths),
         num_heads=num_heads,
         sequence_length=max_sequence_length,
