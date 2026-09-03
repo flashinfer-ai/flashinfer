@@ -756,7 +756,8 @@ def test_expand_block_route_reads_every_rank_the_selector_filled(path):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_expand_block_route_covers_more_rows_than_one_grid_can_hold():
+@pytest.mark.parametrize("path", ["expand", "logical", "blocks"])
+def test_a_route_covers_more_rows_than_one_grid_can_hold(path):
     """Rows go on the grid's y dimension, which stops at 65535 on every compute
     capability, and a row is a query token. A long-context step goes past that,
     so the rows a grid cannot cover are walked by a stride rather than dropped
@@ -767,8 +768,46 @@ def test_expand_block_route_covers_more_rows_than_one_grid_can_hold():
     positions = torch.full((rows,), 31, dtype=torch.int32, device=DEV)
     lengths = torch.tensor([64], dtype=torch.int32, device=DEV)
     token_to_req = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    out = flashinfer.expand_block_route(blocks, positions, lengths, token_to_req, ratio)
+    width = topk * ratio + ratio - 1
+    page_size, pages = 8, 8
+    table = torch.arange(pages, dtype=torch.int32, device=DEV).reshape(1, pages)
+    logical = flashinfer.expand_block_route(
+        blocks, positions, lengths, token_to_req, ratio
+    )
+    if path == "expand":
+        out = logical
+    else:
+        route = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+        mask = torch.empty(rows * (-(-width // 8)), dtype=torch.uint8, device=DEV)
+        if path == "blocks":
+            fused = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+            flashinfer.qsa_route_from_blocks(
+                blocks,
+                positions,
+                lengths,
+                token_to_req,
+                table,
+                fused,
+                route,
+                mask,
+                ratio,
+                page_size,
+                pages * page_size,
+            )
+            out = fused
+        else:
+            flashinfer.qsa_route_from_logical(
+                logical,
+                token_to_req,
+                table,
+                route,
+                mask,
+                rows,
+                page_size,
+                pages * page_size,
+            )
+            out = route
     torch.cuda.synchronize()
-    # Every row is the same query, so every row is the same route.
+    # Every row is the same query, so every row comes out the same.
     assert bool((out == out[0]).all()), out[-1].tolist()
     assert int((out[-1] >= 0).sum()) > 0, out[-1].tolist()
