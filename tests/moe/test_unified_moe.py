@@ -1231,6 +1231,77 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="already bound"):
             runner.pack_inputs(act, weights)
 
+    def test_cute_dsl_from_logits_pack_appends_router_logits(self):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            routing=RoutingConfig(
+                num_experts=32, top_k=2, method=RoutingMethodType.Renormalize
+            ),
+            quant=QuantConfig(variant=QuantVariant.MXFP4),
+        )
+        runner._built = True
+        runner._inner = SimpleNamespace(top_k=2)
+        intermediate = runner.config.experts.intermediate_size
+        weights = MoEWeightPack()
+        weights.prepare_for(
+            "cute_dsl",
+            {
+                "w1_weight": torch.empty(32, 2 * intermediate, 64, dtype=torch.uint8),
+                "w1_weight_sf": torch.empty(1, dtype=torch.uint8),
+                "w1_alpha": torch.ones(32),
+                "w2_weight": torch.empty(32, 128, intermediate // 2, dtype=torch.uint8),
+                "w2_weight_sf": torch.empty(1, dtype=torch.uint8),
+                "w2_alpha": torch.ones(32),
+                "weight_interleave": 64,
+            },
+        )
+        logits = torch.zeros(4, 32, dtype=torch.float32)
+        act = MoEActivationPack(
+            hidden_states_q=torch.empty(4, 128, dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits,
+        )
+        packed = runner.pack_inputs(act, weights)
+        # Trailing logits, and kernel-written selection buffers in slots 2/3.
+        assert packed[-1] is logits
+        assert packed[2].shape == (4, 2) and packed[2].dtype is torch.int32
+        assert packed[3].shape == (4, 2) and packed[3].dtype is torch.float32
+        assert packed[-2].shape == (4, 128)
+
+    @pytest.mark.parametrize(
+        "overrides,match",
+        [
+            ({"routing": RoutingConfig(num_experts=32, top_k=2)}, "TopK -> Softmax"),
+            (
+                {
+                    "routing": RoutingConfig(
+                        num_experts=32, top_k=2, method=RoutingMethodType.Renormalize
+                    ),
+                    "experts": ExpertConfig(
+                        intermediate_size=512, local_num_experts=16
+                    ),
+                },
+                "all experts to be local",
+            ),
+        ],
+    )
+    def test_cute_dsl_from_logits_rejects_unsupported_routing(self, overrides, match):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.MXFP4), **overrides
+        )
+        runner._built = True
+        runner._inner = SimpleNamespace(top_k=2)
+        act = MoEActivationPack(
+            hidden_states_q=torch.empty(4, 128, dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=torch.zeros(4, 32, dtype=torch.float32),
+        )
+        with pytest.raises(NotImplementedError, match=match):
+            runner._check_from_logits(act)
+
     def test_cute_dsl_mxfp4_pack_rejects_unaligned_geometry(self):
         w1 = torch.zeros(2, 2 * 96, 256, dtype=torch.bfloat16)
         w2 = torch.zeros(2, 256, 96, dtype=torch.bfloat16)

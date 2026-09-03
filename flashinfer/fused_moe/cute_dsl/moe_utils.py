@@ -24,7 +24,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import torch as cutlass_torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from ...jit.moe_utils import gen_moe_utils_module
@@ -164,7 +163,7 @@ def get_max_num_tiles(
     return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
 
 
-def get_token_capacity(num_tokens: int) -> int:
+def _get_token_capacity(num_tokens: int) -> int:
     """Return the power-of-two launcher capacity for a token count."""
     if num_tokens < 1:
         raise ValueError("num_tokens must be positive")
@@ -209,12 +208,19 @@ class MoeActivationType(IntEnum):
     Identity = 5
 
 
+_CUTLASS_ROUTING_TYPES = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+    torch.float32: cutlass.Float32,
+}
+
+
 def _cutlass_type(dtype: torch.dtype):
-    """Resolve a torch dtype through CUTLASS's canonical dtype mapping."""
-    for cutlass_dtype in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
-        if cutlass_torch.dtype(cutlass_dtype) == dtype:
-            return cutlass_dtype
-    raise ValueError(f"unsupported routing dtype: {dtype}")
+    """Map a torch routing dtype to its CUTLASS counterpart."""
+    try:
+        return _CUTLASS_ROUTING_TYPES[dtype]
+    except KeyError:
+        raise ValueError(f"unsupported routing dtype: {dtype}") from None
 
 
 @functools.lru_cache(maxsize=1)
@@ -595,83 +601,81 @@ def allocate_moe_sort_buffers(
     }
 
 
-def allocate_moe_routing_buffers(
+def _routing_buffer_shapes(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    padded_m: Optional[int],
+    tile_size: Optional[int],
+    num_ctas: int,
+    emit_expanded_to_permuted: bool,
+) -> Dict[str, Tuple[int, ...]]:
+    """Routing buffer shapes shared by the allocator and the compiled signature.
+
+    Both must agree exactly: a mismatch on ``global_counts`` would let the
+    atomic histogram run past its allocation instead of raising.
+    """
+    if padded_m is None or tile_size is None:
+        raise ValueError("tiled routing requires padded_m and tile_size")
+    num_tiles = padded_m // tile_size
+    return {
+        "token_final_scales": (num_tokens, top_k),
+        "token_selected_experts": (num_tokens, top_k),
+        "output0": (num_tiles,),
+        "output1": (num_tiles,),
+        "output2": (padded_m,),
+        "output3": (1,),
+        "expanded_to_permuted": (
+            (num_tokens, top_k) if emit_expanded_to_permuted else (1,)
+        ),
+        "global_counts": (
+            2 * num_experts if num_tokens > 2048 else num_ctas * num_experts,
+        ),
+        "global_cursors": (num_ctas * num_experts,),
+        "global_routed_experts": (num_tokens * top_k,),
+        "grid_sync": (2,),
+    }
+
+
+def _allocate_moe_routing_buffers(
     num_tokens: int,
     num_experts: int,
     top_k: int,
     device: torch.device | str,
     padded_m: Optional[int] = None,
     tile_size: Optional[int] = None,
-    capacity: Optional[int] = None,
     emit_expanded_to_permuted: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Pre-allocate outputs and scratch buffers for ``moe_routing``."""
     from .blackwell.moe_routing import MoeRoutingKernel
 
-    if capacity is not None and emit_expanded_to_permuted:
-        raise ValueError(
-            "fixed-slot routing already emits the expanded-to-slot mapping"
-        )
     device = torch.device(device)
-    max_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     kernel = MoeRoutingKernel(
         num_tokens,
         num_experts,
         top_k,
         padded_m=padded_m,
         tile_size=tile_size,
-        capacity=capacity,
         use_pdl=False,
         emit_expanded_to_permuted=emit_expanded_to_permuted,
-        max_ctas=max_ctas,
+        max_ctas=torch.cuda.get_device_properties(device).multi_processor_count,
     )
-    fixed_slot = capacity is not None
-    if fixed_slot:
-        num_slots = num_experts * int(capacity)
-        output0 = torch.empty(num_slots, dtype=torch.int64, device=device)
-        output1 = torch.empty(num_experts, dtype=torch.int32, device=device)
-        output2 = torch.empty(num_slots, dtype=torch.int32, device=device)
-        output3 = torch.empty(num_tokens * top_k, dtype=torch.int32, device=device)
-    else:
-        if padded_m is None or tile_size is None:
-            raise ValueError("tiled routing requires padded_m and tile_size")
-        num_tiles = padded_m // tile_size
-        output0 = torch.empty(num_tiles, dtype=torch.int32, device=device)
-        output1 = torch.empty_like(output0)
-        output2 = torch.empty(padded_m, dtype=torch.int32, device=device)
-        output3 = torch.empty(1, dtype=torch.int32, device=device)
+    shapes = _routing_buffer_shapes(
+        num_tokens,
+        num_experts,
+        top_k,
+        padded_m,
+        tile_size,
+        kernel.num_ctas,
+        emit_expanded_to_permuted,
+    )
+    dtypes = {"token_final_scales": torch.float32}
+    zeroed = ("global_counts", "grid_sync")
     return {
-        "token_final_scales": torch.empty(
-            num_tokens, top_k, dtype=torch.float32, device=device
-        ),
-        "token_selected_experts": torch.empty(
-            num_tokens, top_k, dtype=torch.int32, device=device
-        ),
-        "output0": output0,
-        "output1": output1,
-        "output2": output2,
-        "output3": output3,
-        "expanded_to_permuted": torch.empty(
-            (num_tokens, top_k) if emit_expanded_to_permuted else (1,),
-            dtype=torch.int32,
-            device=device,
-        ),
-        "global_counts": torch.zeros(
-            (
-                2 * num_experts
-                if not fixed_slot and num_tokens > 2048
-                else kernel.num_ctas * num_experts
-            ),
-            dtype=torch.int32,
-            device=device,
-        ),
-        "global_cursors": torch.empty(
-            kernel.num_ctas * num_experts, dtype=torch.int32, device=device
-        ),
-        "global_routed_experts": torch.empty(
-            num_tokens * top_k, dtype=torch.int32, device=device
-        ),
-        "grid_sync": torch.zeros(2, dtype=torch.int32, device=device),
+        name: (torch.zeros if name in zeroed else torch.empty)(
+            shape, dtype=dtypes.get(name, torch.int32), device=device
+        )
+        for name, shape in shapes.items()
     }
 
 
@@ -680,7 +684,6 @@ def moe_routing(
     top_k: int,
     padded_m: Optional[int] = None,
     tile_size: Optional[int] = None,
-    capacity: Optional[int] = None,
     use_pdl: bool = True,
     emit_expanded_to_permuted: bool = False,
     token_capacity: Optional[int] = None,
@@ -691,24 +694,17 @@ def moe_routing(
         raise ValueError("scores must be a contiguous 2D tensor")
     if scores.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("scores must have dtype bf16, fp16, or fp32")
-    if capacity is not None and emit_expanded_to_permuted:
-        raise ValueError(
-            "fixed-slot routing already emits the expanded-to-slot mapping"
-        )
     num_tokens, num_experts = scores.shape
     token_capacity = token_capacity or num_tokens
     if not 0 < num_tokens <= token_capacity:
         raise ValueError("token_capacity must cover scores")
-    if capacity is not None and num_tokens != token_capacity:
-        raise ValueError("fixed-slot routing requires an exact token capacity")
-    routing_buffers = routing_buffers or allocate_moe_routing_buffers(
+    routing_buffers = routing_buffers or _allocate_moe_routing_buffers(
         token_capacity,
         num_experts,
         top_k,
         scores.device,
         padded_m,
         tile_size,
-        capacity,
         emit_expanded_to_permuted,
     )
     compiled = compile_moe_routing(
@@ -717,7 +713,6 @@ def moe_routing(
         top_k,
         padded_m,
         tile_size,
-        capacity,
         use_pdl,
         emit_expanded_to_permuted,
         scores.dtype,
@@ -743,15 +738,6 @@ def moe_routing(
         routing_buffers["grid_sync"],
         cuda.CUstream(_get_cuda_stream_ptr()),
     )
-    if capacity is not None:
-        return {
-            "token_final_scales": token_final_scales,
-            "token_selected_experts": token_selected_experts,
-            "token_ids": routing_buffers["output0"],
-            "expert_counts": routing_buffers["output1"],
-            "slot_to_expanded": routing_buffers["output2"],
-            "expanded_to_slot": routing_buffers["output3"],
-        }
     return {
         "token_final_scales": token_final_scales,
         "token_selected_experts": token_selected_experts,
@@ -1012,7 +998,6 @@ def compile_moe_routing(
     top_k: int,
     padded_m: Optional[int],
     tile_size: Optional[int],
-    capacity: Optional[int],
     use_pdl: bool,
     emit_expanded_to_permuted: bool,
     dtype: torch.dtype,
@@ -1021,40 +1006,25 @@ def compile_moe_routing(
     from .blackwell.moe_routing import MoeRoutingKernel
 
     with torch.cuda.device(device):
-        max_ctas = torch.cuda.get_device_properties(device).multi_processor_count
         kernel = MoeRoutingKernel(
             num_tokens,
             num_experts,
             top_k,
             padded_m=padded_m,
             tile_size=tile_size,
-            capacity=capacity,
             use_pdl=use_pdl,
             compact_topk=dtype != torch.float32 and num_tokens >= 64,
             emit_expanded_to_permuted=emit_expanded_to_permuted,
-            max_ctas=max_ctas,
+            max_ctas=torch.cuda.get_device_properties(device).multi_processor_count,
         )
-        fixed_slot = capacity is not None
-        if fixed_slot:
-            output_shapes = (
-                (num_experts * int(capacity),),
-                (num_experts,),
-                (num_experts * int(capacity),),
-                (num_tokens * top_k,),
-            )
-        else:
-            if padded_m is None or tile_size is None:
-                raise ValueError("tiled routing requires padded_m and tile_size")
-            output_shapes = (
-                (padded_m // tile_size,),
-                (padded_m // tile_size,),
-                (padded_m,),
-                (1,),
-            )
-        output_types = (
-            (cutlass.Int64, cutlass.Int32, cutlass.Int32, cutlass.Int32)
-            if fixed_slot
-            else (cutlass.Int32,) * 4
+        shapes = _routing_buffer_shapes(
+            num_tokens,
+            num_experts,
+            top_k,
+            padded_m,
+            tile_size,
+            kernel.num_ctas,
+            emit_expanded_to_permuted,
         )
 
         def fake(dtype, shape, align=16):
@@ -1064,29 +1034,24 @@ def compile_moe_routing(
             return make_fake_compact_tensor(dtype, shape, **kwargs)
 
         dynamic_tokens = cute.sym_int()
-        global_count_size = (
-            2 * num_experts
-            if not fixed_slot and num_tokens > 2048
-            else kernel.num_ctas * num_experts
-        )
+
+        def fake_i32(name):
+            shape = shapes[name]
+            if name == "expanded_to_permuted" and emit_expanded_to_permuted:
+                shape = (dynamic_tokens, top_k)
+            return fake(cutlass.Int32, shape, 4 if shape == (1,) else 16)
+
         return cute.compile(
             kernel,
             fake(_cutlass_type(dtype), (dynamic_tokens, num_experts)),
             fake(cutlass.Float32, (dynamic_tokens, top_k)),
             fake(cutlass.Int32, (dynamic_tokens, top_k)),
-            *(
-                fake(output_type, shape, 4 if shape == (1,) else 16)
-                for output_type, shape in zip(output_types, output_shapes, strict=True)
-            ),
-            fake(
-                cutlass.Int32,
-                (dynamic_tokens, top_k) if emit_expanded_to_permuted else (1,),
-                4 if not emit_expanded_to_permuted else 16,
-            ),
-            fake(cutlass.Int32, (global_count_size,)),
-            fake(cutlass.Int32, (kernel.num_ctas * num_experts,)),
-            fake(cutlass.Int32, (num_tokens * top_k,)),
-            fake(cutlass.Int32, (2,)),
+            *(fake_i32(f"output{i}") for i in range(4)),
+            fake_i32("expanded_to_permuted"),
+            fake_i32("global_counts"),
+            fake_i32("global_cursors"),
+            fake_i32("global_routed_experts"),
+            fake_i32("grid_sync"),
             make_fake_stream(),
             options="--enable-tvm-ffi",
         )
@@ -1202,7 +1167,7 @@ def prepare_moe_routing(
         }
     if num_local_experts != num_experts or local_expert_offset != 0:
         raise ValueError("router logits require all experts to be local")
-    token_capacity = get_token_capacity(router_logits.shape[0])
+    token_capacity = _get_token_capacity(router_logits.shape[0])
     padded_m = get_max_num_permuted_tokens(
         token_capacity,
         top_k,
@@ -1227,7 +1192,7 @@ def prepare_moe_routing(
                 "MoE routing token bucket is not initialized for CUDA graph "
                 "capture; warm up this token shape before capture"
             )
-        routing_buffers = allocate_moe_routing_buffers(
+        routing_buffers = _allocate_moe_routing_buffers(
             token_capacity,
             num_experts,
             top_k,

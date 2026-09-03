@@ -3011,8 +3011,10 @@ class CuteDslRunner(MoERunner):
     """Translate activation and weight packs into a CuTe DSL runner input list."""
 
     backend_key = "cute_dsl"
-    # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
-    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
     supported_quant_variants = (
         QuantVariant.NVFP4,
         QuantVariant.MXFP4,
@@ -3203,6 +3205,29 @@ class CuteDslRunner(MoERunner):
             inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
         )
 
+    def _check_from_logits(self, act: MoEActivationPack) -> None:
+        """Reject configs the CuTe routing kernel cannot express."""
+        from ..tllm_enums import RoutingMethodType
+
+        routing = self.config.routing
+        experts = self.config.experts
+        if routing.method is not RoutingMethodType.Renormalize:
+            raise NotImplementedError(
+                "CuteDslRunner in-kernel routing implements TopK -> Softmax; "
+                f"got routing method {routing.method!r}"
+            )
+        if act.routing_bias is not None:
+            raise NotImplementedError(
+                "CuteDslRunner in-kernel routing does not apply a routing bias"
+            )
+        local_num_experts = experts.local_num_experts
+        if (
+            local_num_experts is not None and local_num_experts != routing.num_experts
+        ) or experts.local_expert_offset:
+            raise NotImplementedError(
+                "CuteDslRunner in-kernel routing requires all experts to be local"
+            )
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -3224,7 +3249,7 @@ class CuteDslRunner(MoERunner):
             raise NotImplementedError(
                 f"CuteDslRunner does not support "
                 f"routing_input_mode={act.routing_input_mode!r} "
-                "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
+                "(only PackedPrecomputed and FromLogits are wired)."
             )
         v = weights.get_view(self.backend_key)
         weight_interleave = v.get("weight_interleave")
@@ -3261,7 +3286,22 @@ class CuteDslRunner(MoERunner):
         if self.config.quant.variant is not QuantVariant.W4A16:
             self._inner.weight_interleave = weight_interleave
         num_tokens = act.hidden_states_q.shape[0]
-        _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
+        top_k = self._inner.top_k
+        if act.routing_input_mode is RoutingInputMode.FromLogits:
+            self._check_from_logits(act)
+            # The CuTe routing kernel writes the selection itself; these slots
+            # stay in the input list because the autotuner buckets on them.
+            topk_ids = act.routing_logits.new_empty(
+                (num_tokens, top_k), dtype=torch.int32
+            )
+            topk_weights = act.routing_logits.new_empty(
+                (num_tokens, top_k), dtype=torch.float32
+            )
+            routing_inputs = [act.routing_logits]
+        else:
+            _validate_prerouted_inputs(act, num_tokens, top_k, "CuteDslRunner")
+            topk_ids, topk_weights = act.topk_ids, act.topk_weights
+            routing_inputs = []
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
         # default-prepared view yields 2I rows. The tuner infers intermediate_size
         # from this tensor, so the mismatch would surface as a shape error deep in
@@ -3298,8 +3338,8 @@ class CuteDslRunner(MoERunner):
                     if is_mxfp4
                     else act.hidden_states_scale.unsqueeze(-1)
                 ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
-                act.topk_ids,
-                act.topk_weights,
+                topk_ids,
+                topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
@@ -3310,6 +3350,7 @@ class CuteDslRunner(MoERunner):
                 v["w2_alpha"],
                 v.get("w2_bias"),
                 moe_output,
+                *routing_inputs,
             ]
         elif (
             quant_variant is QuantVariant.NVFP4
@@ -3324,8 +3365,8 @@ class CuteDslRunner(MoERunner):
             return [
                 act.hidden_states_q,
                 act.hidden_states_scale.unsqueeze(-1),
-                act.topk_ids,
-                act.topk_weights,
+                topk_ids,
+                topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
@@ -3337,6 +3378,7 @@ class CuteDslRunner(MoERunner):
                 v.get("w2_bias"),
                 act.per_token_scale,
                 moe_output,
+                *routing_inputs,
             ]
         elif (
             quant_variant is QuantVariant.W4A16
@@ -3349,8 +3391,8 @@ class CuteDslRunner(MoERunner):
             )
             return [
                 act.hidden_states_q,
-                act.topk_ids,
-                act.topk_weights,
+                topk_ids,
+                topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
@@ -3358,6 +3400,7 @@ class CuteDslRunner(MoERunner):
                 v["w2_weight_sf"],
                 v["w2_alpha"],
                 moe_output,
+                *routing_inputs,
             ]
         else:
             raise ValueError(
