@@ -44,6 +44,14 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_lowp_module
+from ..trace.templates.comm import (
+    ulysses_lowp_k_grouped_amax_trace,
+    ulysses_lowp_k_sum_v_amax_trace,
+    ulysses_lowp_q_grouped_amax_trace,
+    ulysses_lowp_quant_qkv_pack_fused_trace,
+    ulysses_lowp_quant_qkv_pack_trace,
+    ulysses_lowp_unpack_for_sage_trace,
+)
 from ..utils import device_support_pdl, register_custom_op
 
 ABI_VERSION = 3
@@ -528,7 +536,7 @@ def payload_spec(
 # ---------------------------------------------------------------------------
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_k_sum_v_amax_trace)
 def k_sum_v_amax(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -586,7 +594,7 @@ def k_sum_v_amax(
 # ---------------------------------------------------------------------------
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_q_grouped_amax_trace)
 def q_grouped_amax(
     q: torch.Tensor,
     *,
@@ -613,7 +621,7 @@ def q_grouped_amax(
     return amax
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_k_grouped_amax_trace)
 def k_grouped_amax(
     k: torch.Tensor,
     k_mean_global: torch.Tensor,
@@ -1053,7 +1061,7 @@ def quant_kv_into_payload(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_quant_qkv_pack_trace)
 def quant_qkv_pack(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1232,7 +1240,7 @@ def quant_kv_into_payload_fused(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_quant_qkv_pack_fused_trace)
 def quant_qkv_pack_fused(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1329,7 +1337,7 @@ def scale_widths(sequence: int) -> Tuple[int, int]:
     return (sequence + 127) // 128 * 4, (sequence + 63) // 64
 
 
-@flashinfer_api
+@flashinfer_api(trace=ulysses_lowp_unpack_for_sage_trace)
 def unpack_for_sage(
     recv_u8: torch.Tensor,
     *,
