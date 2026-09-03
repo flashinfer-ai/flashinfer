@@ -1237,7 +1237,7 @@ class TllmGenFmhaKernel {
         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
         ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
-        ", usesDsv4Ue8m0ScaleO=" + std::to_string(params.mUsesDsv4Ue8m0ScaleO);
+        ", usesDsv4Ue8m0ScaleO=" + std::to_string(selectKernelParams.mUsesDsv4Ue8m0ScaleO);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1256,7 +1256,7 @@ class TllmGenFmhaKernel {
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
                /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
-               selectKernelParams.mUsesSpcompress, params.mUsesDsv4Ue8m0ScaleO),
+               selectKernelParams.mUsesSpcompress, selectKernelParams.mUsesDsv4Ue8m0ScaleO),
         info);
   }
 

@@ -79,9 +79,7 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
-  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue
-  // fusion. Unused by FlashInfer but part of the kernel-side KernelParams ABI; the field order
-  // must stay in sync with the kernels or every later field is misread by the cubins.
+  // DSv4 output epilogue (fused cubins and fmhaReduction.cu); null for every other kernel.
   float const* ptrDsv4InvRopeCosSinCache;
   // Dsv4 output block-scaled tensor, only for epilogue fusion
   float* ptrDsv4OScaleFp32;
@@ -136,8 +134,7 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
-  // Padded token dimension for the DSv4 fused FP32 scale layout. Unused by FlashInfer; kept for
-  // the KernelParams ABI (see the DSv4 pointer fields above).
+  // Token extent of the DSv4 scale layout: align(sumOfSeqLensQ, 4).
   int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
@@ -846,7 +843,7 @@ struct KernelParams {
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
 
-    // DSv4 fused output epilogue; null/zero for every other kernel.
+    // DSv4 output epilogue; null/zero for every other kernel.
     params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
     params.ptrDsv4OScaleFp32 = static_cast<float*>(options.dsv4OScalePtr);
     params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;

@@ -36,13 +36,12 @@ namespace kernels {
 // cubin).
 namespace dsv4 {
 
-static constexpr int kHeadDim = 512;
-static constexpr int kRopeDim = 64;  // trailing interleaved pairs
-static constexpr int kQuantBlock = 128;
-static constexpr int kHeadsPerGroup = 8;
-static constexpr int kCosSinRowWidth = 64;  // cos(32) || sin(32)
+constexpr int kHeadDim = 512;
+constexpr int kRopeDim = 64;  // trailing interleaved pairs; cos/sin rows are cos(32) || sin(32)
+constexpr int kQuantBlock = 128;
+constexpr int kHeadsPerGroup = 8;
 static constexpr float kE4m3Max = 448.f;
-static constexpr float kAmaxFloor = 1e-10f;
+constexpr float kAmaxFloor = 1e-10f;
 
 // Plain multiply-add so nvcc contracts to FMA.
 __device__ __forceinline__ void inverseRopePair(float& even, float& odd, float cosVal,
@@ -53,8 +52,7 @@ __device__ __forceinline__ void inverseRopePair(float& even, float& odd, float c
   odd = o * cosVal - e * sinVal;
 }
 
-// ceil(log2(max(amax, floor) / 448)) + 127. Not ceilf(log2f(amax * (1/448))): 1/448 is inexact
-// in binary32, so exact power-of-two quotients (e.g. amax 3.5) would round one exponent high.
+// ceil(log2(max(amax, floor) / 448)) + 127, exact at power-of-two quotients where log2f rounds up.
 __device__ __forceinline__ int32_t ue8m0ExponentFromAmax(float amax) {
   amax = fmaxf(amax, kAmaxFloor);
   int32_t e = ilogbf(amax) - 8;  // 448 = 1.75 * 2^8: never high, at most one low
@@ -62,14 +60,6 @@ __device__ __forceinline__ int32_t ue8m0ExponentFromAmax(float amax) {
     ++e;
   }
   return min(max(e + 127, 0), 255);
-}
-
-__device__ __forceinline__ float reciprocalScaleFromExponent(int32_t biasedExp) {
-  return __frcp_rn(__int_as_float(biasedExp << 23));
-}
-
-__device__ __forceinline__ __nv_fp8_e4m3 quantizeToE4m3(float scaled) {
-  return static_cast<__nv_fp8_e4m3>(fminf(fmaxf(scaled, -kE4m3Max), kE4m3Max));
 }
 
 // Element offset into E4M3 values [numGroups, numTokens, 8, kHeadDim].
@@ -363,7 +353,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
       if (dimIdx >= RopeStart) {
         int32_t const position{params.ptrSeqLensKv[batchIdx] - seqLenQ + tokenIdx - seqOffsetQ};
         float const* cosSin{params.ptrDsv4InvRopeCosSinCache +
-                            static_cast<int64_t>(position) * dsv4::kCosSinRowWidth};
+                            static_cast<int64_t>(position) * dsv4::kRopeDim};
 #pragma unroll
         for (int32_t ii = 0; ii < NumEltsPer16BVec; ii += 2) {
           int32_t const pairIdx{(dimIdx + ii - RopeStart) >> 1};
@@ -387,11 +377,12 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
       if (isValidRow) {
         int32_t const group{headIdx / dsv4::kHeadsPerGroup};
         int32_t const headInGroup{headIdx % dsv4::kHeadsPerGroup};
-        float const invScale{dsv4::reciprocalScaleFromExponent(biasedExp)};
+        float const invScale{__frcp_rn(__int_as_float(biasedExp << 23))};  // exact: power of two
         __nv_fp8_e4m3 quantized[NumEltsPer16BVec];
 #pragma unroll
         for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
-          quantized[ii] = dsv4::quantizeToE4m3(outputVals[ii] * invScale);
+          quantized[ii] = static_cast<__nv_fp8_e4m3>(
+              fminf(fmaxf(outputVals[ii] * invScale, -dsv4::kE4m3Max), dsv4::kE4m3Max));
         }
         *reinterpret_cast<uint2*>(
             reinterpret_cast<__nv_fp8_e4m3*>(params.ptrO) +
@@ -533,8 +524,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     // The instantiations below: flat [token, headQ] rows, tileSizeQ 64, a whole quant block per
     // CTA, whole head groups.
     FLASHINFER_CHECK(kernelMeta.mGroupsHeadsQ && kernelMeta.mTileSizeQ == 64 &&
-                         headDimPerCtaV >= 128 &&
-                         numCtasForAllHeads * numHeadsPerCta == params.mNumHeadsQ,
+                         headDimPerCtaV >= 128 && params.mNumHeadsQ % numHeadsPerCta == 0,
                      "Not implemented");
     if (headDimPerCtaV == 128) {
       kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, true>;

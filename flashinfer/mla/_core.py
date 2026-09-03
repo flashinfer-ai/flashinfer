@@ -1457,6 +1457,11 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
+def dsv4_fused_epilogue_scale_tokens(sum_seq_q: int) -> int:
+    """Token extent of the fused-epilogue scale layout: ``sum_seq_q`` rounded up to 4."""
+    return (sum_seq_q + 3) // 4 * 4
+
+
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1631,14 +1636,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     out_scales : Optional[torch.Tensor]
         Selects the TRTLLM-GEN fused DSv4 output epilogue (inverse RoPE of the
         trailing 64 lanes, block-128 UE8M0 scales, FP8 E4M3 values). INT32
-        ``[num_heads // 8, 8, dsv4_fused_epilogue_scale_buf_m(sum_q)]``,
+        ``[num_heads // 8, 8, dsv4_fused_epilogue_scale_tokens(sum_q)]``,
         contiguous; each word packs one head's four exponents, block 0 in the
         least significant byte, and a block dequantizes by ``2 ** (e - 127)``.
         ``out`` is then required as contiguous float8_e4m3fn
         ``[num_heads // 8, sum_q, 8, 512]``. Supported with all 128 query heads on
         the calling rank (DP attention, no attention TP); every batch size, query
         length and top-k is then served by the fused cubin or the split-KV
-        reduction kernel. Other head counts raise.
+        reduction kernel. Other head counts raise. Columns past ``sum_q`` are left
+        untouched.
     cos_sin_cache : Optional[torch.Tensor]
         FP32 ``[max_position, 64]`` rows ``cos(32) || sin(32)`` for the inverse
         RoPE at position ``seq_lens[b] - q_len[b] + i``. Required with
@@ -1912,7 +1918,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
         check_shape_dtype_device(
             out_scales,
-            (num_heads // 8, 8, dsv4_fused_epilogue_scale_buf_m(sum_seq_q)),
+            (num_heads // 8, 8, dsv4_fused_epilogue_scale_tokens(sum_seq_q)),
             torch.int32,
             query.device,
             "out_scales",
@@ -2016,11 +2022,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         cos_sin_cache.contiguous() if cos_sin_cache is not None else None,
     )
     return out
-
-
-def dsv4_fused_epilogue_scale_buf_m(sum_seq_q: int) -> int:
-    """Token extent of the fused-epilogue scale layout: ``sum_seq_q`` rounded up to 4."""
-    return (sum_seq_q + 3) // 4 * 4
 
 
 # Keep the backend-neutral spelling as a compatibility alias, while the

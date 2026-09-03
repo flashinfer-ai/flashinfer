@@ -265,9 +265,8 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
-  // DSv4 inverse-RoPE + UE8M0 FP8 output epilogue: E4M3 O as [numHeadsQ / 8, sumSeqLensQ, 8,
-  // headDimV]; packed UE8M0 exponents as [numHeadsQ / 8, 8, mDsv4ScaleBufM = align(sumSeqLensQ,
-  // 4)].
+  // DSv4 output epilogue (E4M3 O + packed UE8M0 scales); see
+  // trtllm_paged_attention_decode_sparse_mla_dsv4.
   bool mUsesDsv4Ue8m0ScaleO{false};
   float const* dsv4InvRopeCosSinCachePtr{nullptr};
   void* dsv4OScalePtr{nullptr};
@@ -434,6 +433,8 @@ struct TllmGenSelectKernelParams {
   bool mUseFp16Softmax;
   // Use spcompress or not.
   bool mUsesSpcompress;
+  // Use the DSv4 fused output epilogue or not.
+  bool mUsesDsv4Ue8m0ScaleO;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -467,6 +468,7 @@ struct TllmGenSelectKernelParams {
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
+        mUsesDsv4Ue8m0ScaleO(params.mUsesDsv4Ue8m0ScaleO),
         mTileScheduler(params.mUsesDsv4Ue8m0ScaleO ? TileScheduler::Persistent
                                                    : params.mTileScheduler),
         mTileSizeQ(128),
