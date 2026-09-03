@@ -68,8 +68,16 @@ from .ulysses import ulysses_a2a as ulysses_a2a
 # shadow the flashinfer.comm.ulysses_lowp submodule (see ulysses.py's
 # ulysses_a2a merge note). Generic names (abi_version/capability) are exported
 # with the ulysses_lowp_ prefix, following the vllm_meta_size precedent.
+from .ulysses_lowp import StatsContext as StatsContext
+from .ulysses_lowp import V2GStats as V2GStats
 from .ulysses_lowp import abi_version as ulysses_lowp_abi_version
+from .ulysses_lowp import aligned_length as aligned_length
 from .ulysses_lowp import capability as ulysses_lowp_capability
+from .ulysses_lowp import finalize_stats as finalize_stats
+from .ulysses_lowp import local_stats as local_stats
+from .ulysses_lowp import quant_and_pack as quant_and_pack
+from .ulysses_lowp import required_alignment as required_alignment
+from .ulysses_lowp import stats_protocol_for as stats_protocol_for
 from .ulysses_lowp import gen_ulysses_lowp_module as gen_ulysses_lowp_module
 from .ulysses_lowp import get_ulysses_lowp_module as get_ulysses_lowp_module
 from .ulysses_lowp import boundary_descriptors as boundary_descriptors

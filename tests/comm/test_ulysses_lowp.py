@@ -1170,3 +1170,277 @@ def test_packed_q_amax_matches_split_path_on_special_values(dtype):
             q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world
         )
         assert torch.equal(split, fused), f"rank {r}"
+
+
+# ---------------------------------------------------------------------------
+# 12. Automatic protocol routing (local_stats / finalize_stats /
+#     quant_and_pack / unpack aligned=None)
+# ---------------------------------------------------------------------------
+
+
+def test_protocol_routing_structural():
+    assert lowp.stats_protocol_for(256, 4) == 3
+    assert lowp.stats_protocol_for(4736, 8) == 3
+    assert lowp.stats_protocol_for(1180, 4) == 2
+    assert lowp.stats_protocol_for(65, 8) == 2
+    assert lowp.required_alignment(8, 3) == 1024
+    assert lowp.required_alignment(4, 2) == 64
+    with pytest.raises(ValueError, match="stats_protocol"):
+        lowp.required_alignment(4, 1)
+    assert lowp.aligned_length(37730, 8, 3) == 37888
+    assert lowp.aligned_length(4685, 4, 2) == 4736
+    assert lowp.aligned_length(1024, 4, 3) == 1024
+
+
+def _reference_global_stats(k, v, world, L, used, dtype):
+    """The production backends' exact reduction: rank-major stack,
+    sum(dim=0) / live rows for the mean, amax(dim=0) / 2.25 for V."""
+    ks, va = [], []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        a, b = lowp.k_sum_v_amax(k[:, s].contiguous(), v[:, s].contiguous())
+        ks.append(a)
+        va.append(b)
+    denom = used if used is not None else world * L
+    k_mean = (torch.stack(ks).sum(dim=0) / denom).to(dtype).contiguous()
+    v_scale = (torch.stack(va).amax(dim=0) / _SCALE_MAX).contiguous()
+    return k_mean, v_scale
+
+
+def _auto_chain(q, k, v, world, L, used, flatten_gathered=False):
+    """local_stats -> simulated AllGather -> finalize_stats -> quant_and_pack
+    on every rank; returns (payloads, stats_list)."""
+    sends, ctxs = [], []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        send, ctx = lowp.local_stats(
+            q[:, s].contiguous(),
+            k[:, s].contiguous(),
+            v[:, s].contiguous(),
+            rank=r,
+            world_size=world,
+            used_sequence=used,
+        )
+        sends.append(send)
+        ctxs.append(ctx)
+    gathered = torch.stack(sends).contiguous()
+    if flatten_gathered:
+        gathered = gathered.view(-1)
+    payloads, stats_list = [], []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        st = lowp.finalize_stats(gathered, ctxs[r], k[:, s].contiguous())
+        payloads.append(
+            lowp.quant_and_pack(
+                q[:, s].contiguous(), k[:, s].contiguous(), v[:, s].contiguous(), st
+            )
+        )
+        stats_list.append(st)
+    return payloads, stats_list
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("flatten_gathered", [False, True])
+def test_auto_routing_matches_explicit_protocol3(dtype, flatten_gathered):
+    world, L = 4, 256
+    S = world * L
+    for used in (None, S - 130):
+        q, k, v = _global_inputs(dtype, world, L)
+        if used is not None:
+            q[:, used:] = 0
+            k[:, used:] = 0
+            v[:, used:] = 0
+        k_mean, v_scale = _reference_global_stats(k, v, world, L, used, dtype)
+        payloads, stats_list = _auto_chain(
+            q, k, v, world, L, used, flatten_gathered=flatten_gathered
+        )
+        for r in range(world):
+            st = stats_list[r]
+            assert st.stats_protocol == 3
+            assert st.q_amax_final is None and st.k_amax_final is None
+            assert _same_bits(st.k_mean_global, k_mean)
+            assert _same_bits(st.v_scale_global, v_scale)
+            s = slice(r * L, (r + 1) * L)
+            explicit = lowp.quant_qkv_pack_fused(
+                q[:, s].contiguous(),
+                k[:, s].contiguous(),
+                v[:, s].contiguous(),
+                k_mean,
+                v_scale,
+                rank=r,
+                world_size=world,
+                used_sequence=used,
+            )
+            assert torch.equal(payloads[r], explicit), f"used={used} r={r}"
+        recv = torch.stack([payloads[src][0] for src in range(world)]).contiguous()
+        common = dict(
+            batch_size=1,
+            local_sequence=L,
+            local_heads=_HEADS // world,
+            head_dim=_HEAD_DIM,
+            world_size=world,
+        )
+        auto = lowp.unpack_for_sage(recv, aligned=None, **common)
+        explicit = lowp.unpack_for_sage(recv, aligned=True, **common)
+        for a, b in zip(auto, explicit, strict=True):
+            assert _same_bits(a, b)
+
+
+def _reference_protocol2_payloads(q, k, v, world, L, used, k_mean, v_scale):
+    """The protocol-2 pipeline composed exactly as the validated sglang
+    wiring does it: descriptors and raw-K min/max ride the (simulated)
+    AllGather, merge/derive finalize the boundary slots, split pack."""
+    q_amaxes, descs, minmaxes = [], [], []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        qa = lowp.q_grouped_amax(q[:, s].contiguous(), rank=r, world_size=world)
+        descs.append(
+            lowp.boundary_descriptors(
+                qa, rank=r, local_sequence=L, group=32, world_size=world
+            )
+        )
+        minmaxes.append(
+            lowp.k_boundary_minmax(
+                k[:, s].contiguous(), rank=r, world_size=world, used_sequence=used
+            )
+        )
+        q_amaxes.append(qa)
+    qg = torch.stack(descs).contiguous()
+    mmg = torch.stack(minmaxes).contiguous()
+    payloads = []
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        lowp.merge_boundary_amax(
+            q_amaxes[r], qg, rank=r, local_sequence=L, group=32, world_size=world
+        )
+        ka = lowp.k_grouped_amax(
+            k[:, s].contiguous(),
+            k_mean,
+            rank=r,
+            world_size=world,
+            used_sequence=used,
+        )
+        lowp.derive_k_boundary_amax(
+            ka, mmg, k_mean, rank=r, local_sequence=L, world_size=world
+        )
+        payloads.append(
+            lowp.quant_qkv_pack(
+                q[:, s].contiguous(),
+                k[:, s].contiguous(),
+                v[:, s].contiguous(),
+                k_mean,
+                q_amaxes[r],
+                ka,
+                v_scale,
+                rank=r,
+                world_size=world,
+            )
+        )
+    return payloads
+
+
+@requires_sm120
+@pytest.mark.parametrize(("world", "local_sequence"), [(4, 1180), (8, 65), (4, 4720)])
+def test_auto_routing_matches_explicit_protocol2(world, local_sequence):
+    L = local_sequence
+    S = world * L
+    dtype = torch.bfloat16
+    # Protocol 2's legal domain keeps the tail padding inside the last
+    # global K group (ceil(used/64) == ceil(S/64)).
+    padded_used = max(S - 35, 64 * ((S + 63) // 64 - 1) + 1)
+    for used in (None, padded_used):
+        q, k, v = _global_inputs(dtype, world, L)
+        if used is not None:
+            q[:, used:] = 0
+            k[:, used:] = 0
+            v[:, used:] = 0
+        k_mean, v_scale = _reference_global_stats(k, v, world, L, used, dtype)
+        reference = _reference_protocol2_payloads(
+            q, k, v, world, L, used, k_mean, v_scale
+        )
+        payloads, stats_list = _auto_chain(q, k, v, world, L, used)
+        for r in range(world):
+            assert stats_list[r].stats_protocol == 2
+            assert _same_bits(stats_list[r].k_mean_global, k_mean)
+            assert torch.equal(payloads[r], reference[r]), f"used={used} r={r}"
+        recv = torch.stack([payloads[src][0] for src in range(world)]).contiguous()
+        common = dict(
+            batch_size=1,
+            local_sequence=L,
+            local_heads=_HEADS // world,
+            head_dim=_HEAD_DIM,
+            world_size=world,
+        )
+        auto = lowp.unpack_for_sage(recv, aligned=None, **common)
+        explicit = lowp.unpack_for_sage(recv, aligned=False, **common)
+        for a, b in zip(auto, explicit, strict=True):
+            assert _same_bits(a, b)
+
+
+@requires_sm120
+@pytest.mark.parametrize("world", [4, 8])
+@pytest.mark.parametrize("local_sequence", [128, 256])
+def test_protocol2_machinery_equals_protocol3_on_aligned_shards(world, local_sequence):
+    """The theorem behind automatic routing: on 128-aligned shards the FULL
+    protocol-2 pipeline (descriptors, min/max, merge, derive, split pack,
+    per-token unpack) produces byte-identical payloads and unpacked outputs
+    to the protocol-3 fast path (fused pack, tile-hoisted unpack), because
+    no group crosses a rank boundary: the merge degenerates to the local
+    amax and the derive to the kernel's own partials."""
+    L = local_sequence
+    S = world * L
+    dtype = torch.bfloat16
+    for used in (None, S - 35):
+        q, k, v = _global_inputs(dtype, world, L)
+        if used is not None:
+            q[:, used:] = 0
+            k[:, used:] = 0
+            v[:, used:] = 0
+        k_mean, v_scale = _reference_global_stats(k, v, world, L, used, dtype)
+        p2 = _reference_protocol2_payloads(q, k, v, world, L, used, k_mean, v_scale)
+        for r in range(world):
+            s = slice(r * L, (r + 1) * L)
+            p3 = lowp.quant_qkv_pack_fused(
+                q[:, s].contiguous(),
+                k[:, s].contiguous(),
+                v[:, s].contiguous(),
+                k_mean,
+                v_scale,
+                rank=r,
+                world_size=world,
+                used_sequence=used,
+            )
+            assert torch.equal(p2[r], p3), f"used={used} r={r}"
+        recv = torch.stack([p2[src][0] for src in range(world)]).contiguous()
+        common = dict(
+            batch_size=1,
+            local_sequence=L,
+            local_heads=_HEADS // world,
+            head_dim=_HEAD_DIM,
+            world_size=world,
+        )
+        via_p2 = lowp.unpack_for_sage(recv, aligned=False, **common)
+        via_p3 = lowp.unpack_for_sage(recv, aligned=True, **common)
+        for name, a, b in zip(
+            ("q", "k", "v", "q_scale", "k_scale"), via_p2, via_p3, strict=True
+        ):
+            assert _same_bits(a, b), f"used={used} unpack {name}"
+
+
+@requires_sm120
+def test_auto_routing_rejects_bad_inputs():
+    world, L = 4, 256
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    q_r, k_r, v_r = (x[:, :L].contiguous() for x in (q, k, v))
+    send, ctx = lowp.local_stats(q_r, k_r, v_r, rank=0, world_size=world)
+    with pytest.raises(ValueError, match="gathered has"):
+        lowp.finalize_stats(torch.stack([send] * 3), ctx, k_r)
+    with pytest.raises(TypeError, match="fp32"):
+        lowp.finalize_stats(torch.stack([send] * world).to(torch.float16), ctx, k_r)
+    with pytest.raises(ValueError, match="same shard"):
+        lowp.finalize_stats(torch.stack([send] * world), ctx, k_r.to(torch.float16))
+    with pytest.raises(TypeError, match="V2GStats"):
+        lowp.quant_and_pack(q_r, k_r, v_r, {"stats_protocol": 3})
+    with pytest.raises(TypeError, match="StatsContext"):
+        lowp.finalize_stats(torch.stack([send] * world), {"rank": 0}, k_r)

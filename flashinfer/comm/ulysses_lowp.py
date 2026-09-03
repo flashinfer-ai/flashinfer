@@ -34,6 +34,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import dataclasses
 import functools
 import math
 from types import SimpleNamespace
@@ -1333,7 +1334,7 @@ def unpack_for_sage(
     local_heads: int,
     head_dim: int,
     world_size: int,
-    aligned: bool = True,
+    aligned: Optional[bool] = True,
     scale_sequence: Optional[int] = None,
     out: Optional[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -1354,6 +1355,14 @@ def unpack_for_sage(
     instead of the caller narrowing them with a copy per layer.  ``None``
     keeps the full logical width.  Q/K/V are always emitted for the full
     logical sequence.
+
+    ``aligned`` selects the receiver kernel: ``True`` is the ALIGN-128 fast
+    path (requires ``local_sequence % 128 == 0``), ``False`` the per-token
+    protocol-2 kernel, and ``None`` picks automatically from the shard length
+    (``local_sequence % 128 == 0``) -- the same rank-uniform rule
+    :func:`stats_protocol_for` applies, so all ranks agree without a
+    collective.  On 128-aligned shards both kernels produce byte-identical
+    outputs; the aligned path is purely a fast path.
     """
 
     batch_size = _positive_int("batch_size", batch_size)
@@ -1361,6 +1370,8 @@ def unpack_for_sage(
     local_heads = _positive_int("local_heads", local_heads)
     head_dim = _positive_int("head_dim", head_dim)
     world_size = _world_size(world_size)
+    if aligned is None:
+        aligned = local_sequence % 128 == 0
     if aligned and local_sequence % 128:
         raise ValueError(
             "ALIGN-128 (stats protocol 3): local_sequence must be a whole "
@@ -1438,6 +1449,337 @@ def unpack_for_sage(
         _resolve_pdl(enable_pdl, recv_u8),
     )
     return q_logical, k_logical, v_packed, q_scale, k_scale
+
+
+# ---------------------------------------------------------------------------
+# Automatic protocol routing (padding decides, everything else follows)
+#
+# The caller owns exactly one decision: how far the packed global sequence is
+# padded.  Everything downstream -- which statistics ride the single
+# AllGather, whether the boundary machinery runs, fused vs split packing, and
+# which receiver kernel unpacks -- follows from ``local_sequence`` alone via
+# ``stats_protocol_for``.  The rule is rank-uniform (every rank has the same
+# L), so all ranks route identically with no extra collective.  The two
+# routes produce byte-identical payloads whenever both are legal (128-aligned
+# shards); the protocol-3 route is purely the fast path for that case.
+#
+# The collectives themselves stay with the caller:
+#
+#   send, ctx = local_stats(q, k, v, rank=..., world_size=..., used_sequence=u)
+#   gathered  = all_gather(send)                    # caller's process group
+#   stats     = finalize_stats(gathered, ctx, k)
+#   payload   = quant_and_pack(q, k, v, stats, out=send_u8)
+#   recv      = all_to_all(payload)                 # caller's process group
+#   q8, k8, v8, qs, ks = unpack_for_sage(recv, ..., aligned=None,
+#                                        scale_sequence=u)
+# ---------------------------------------------------------------------------
+
+
+def stats_protocol_for(local_sequence: int, world_size: int) -> int:
+    """Stats protocol implied by the shard length: 3 (ALIGN-128 fast path)
+    when ``local_sequence % 128 == 0``, else 2 (boundary machinery).  Every
+    rank has the same L, so all ranks route identically with no collective.
+    Protocol 2 handles ANY shard length (a partial global tail group is
+    covered by the slot formulas and the receiver's zero tail); padding the
+    global sequence per ``required_alignment`` is the recommended policy,
+    not a kernel precondition."""
+
+    local_sequence = _positive_int("local_sequence", local_sequence)
+    _world_size(world_size)
+    return 3 if local_sequence % 128 == 0 else 2
+
+
+def required_alignment(world_size: int, stats_protocol: int) -> int:
+    """Recommended multiple for padding the packed GLOBAL sequence before
+    the Ulysses split: ``128 * world_size`` routes to protocol 3 (every
+    shard a whole number of 128-token blocks; tail padding < 128*P), ``64``
+    keeps whole global K groups under protocol 2 (tail padding < 64)."""
+
+    world_size = _world_size(world_size)
+    if stats_protocol == 3:
+        return 128 * world_size
+    if stats_protocol == 2:
+        return 64
+    raise ValueError(
+        f"stats_protocol must be one of {SUPPORTED_STATS_PROTOCOLS}, "
+        f"got {stats_protocol}"
+    )
+
+
+def aligned_length(n_tokens: int, world_size: int, stats_protocol: int) -> int:
+    """``n_tokens`` rounded up to ``required_alignment``: the padded global
+    sequence length the caller should materialize (zero-filled tail)."""
+
+    n_tokens = _positive_int("n_tokens", n_tokens)
+    alignment = required_alignment(world_size, stats_protocol)
+    return (n_tokens + alignment - 1) // alignment * alignment
+
+
+@dataclasses.dataclass
+class StatsContext:
+    """Carries ``local_stats`` state across the caller's AllGather to
+    ``finalize_stats``.  ``q_amax`` (protocol 2 only) is this rank's local
+    grouped Q amax; ``finalize_stats`` max-merges its boundary slots in
+    place, so the context is single-use."""
+
+    stats_protocol: int
+    rank: int
+    world_size: int
+    used_sequence: Optional[int]
+    batch_size: int
+    local_sequence: int
+    num_heads: int
+    head_dim: int
+    input_dtype: torch.dtype
+    stats_numel: int
+    q_amax: Optional[torch.Tensor] = None
+    q_desc_shape: Optional[Tuple[int, ...]] = None
+    k_minmax_shape: Optional[Tuple[int, ...]] = None
+
+
+@dataclasses.dataclass
+class V2GStats:
+    """Finalized global statistics, ready for :func:`quant_and_pack`.  Under
+    protocol 3 the per-group scales are computed inside the fused pack
+    kernels, so ``q_amax_final``/``k_amax_final`` are ``None``."""
+
+    stats_protocol: int
+    rank: int
+    world_size: int
+    used_sequence: Optional[int]
+    k_mean_global: torch.Tensor
+    v_scale_global: torch.Tensor
+    q_amax_final: Optional[torch.Tensor] = None
+    k_amax_final: Optional[torch.Tensor] = None
+
+
+@flashinfer_api
+def local_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, StatsContext]:
+    """Everything the single stats AllGather must carry, protocol-routed.
+
+    Returns a contiguous 1-D fp32 tensor (identical numel on every rank) and
+    the context for :func:`finalize_stats`.  Protocol 3 sends the K
+    per-channel sum and V per-channel amax; protocol 2 additionally sends the
+    Q boundary descriptors and the per-channel raw-K min/max of this rank's
+    two K boundary slices (min/max over LIVE rows only when
+    ``used_sequence`` is given: a zero padding row would contribute
+    min=0/max=0, and |0 - mean| would re-create the tail-group scale
+    pollution at the derive)."""
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        raise ValueError("q, k, and v must have identical shape and dtype")
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    protocol = stats_protocol_for(local_sequence, world_size)
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+
+    k_sum, v_amax = k_sum_v_amax(k, v, enable_pdl=enable_pdl)
+    ctx = StatsContext(
+        stats_protocol=protocol,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=int(used_sequence) if used_sequence is not None else None,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        input_dtype=q.dtype,
+        stats_numel=k_sum.numel(),
+    )
+    if protocol == 3:
+        send = torch.cat([k_sum.flatten(), v_amax.flatten()]).contiguous()
+        return send, ctx
+
+    q_amax = q_grouped_amax(q, rank=rank, world_size=world_size, enable_pdl=enable_pdl)
+    q_desc = boundary_descriptors(
+        q_amax,
+        rank=rank,
+        local_sequence=local_sequence,
+        group=Q_GROUP,
+        world_size=world_size,
+    )
+    k_minmax = k_boundary_minmax(
+        k, rank=rank, world_size=world_size, used_sequence=used_sequence
+    )
+    ctx.q_amax = q_amax
+    ctx.q_desc_shape = tuple(q_desc.shape)
+    ctx.k_minmax_shape = tuple(k_minmax.shape)
+    send = torch.cat(
+        [k_sum.flatten(), v_amax.flatten(), q_desc.flatten(), k_minmax.flatten()]
+    ).contiguous()
+    return send, ctx
+
+
+@flashinfer_api
+def finalize_stats(
+    gathered: torch.Tensor,
+    ctx: StatsContext,
+    k: torch.Tensor,
+    *,
+    enable_pdl: Optional[bool] = None,
+) -> V2GStats:
+    """Turn the gathered statistics into final quantization inputs.
+
+    ``gathered`` is the AllGather of ``local_stats`` sends, rank-major
+    (``[world_size * N]`` or ``[world_size, N]`` fp32); ``k`` is the same
+    local K shard passed to ``local_stats`` (protocol 2 computes its grouped
+    amax here, after the global mean exists).  The K mean divides by the
+    LIVE row count (``used_sequence``): tail padding contributes exactly 0
+    to the gathered sum, so dividing by the padded length would bias the
+    mean toward zero; with no padding the two are equal.  Reductions run in
+    fixed rank-major layout (``sum(dim=0)`` / ``amax(dim=0)``), so results
+    are bit-identical on every rank."""
+
+    if not isinstance(ctx, StatsContext):
+        raise TypeError("ctx must be the StatsContext returned by local_stats")
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    if (batch, local_sequence, num_heads, head_dim) != (
+        ctx.batch_size,
+        ctx.local_sequence,
+        ctx.num_heads,
+        ctx.head_dim,
+    ) or k.dtype != ctx.input_dtype:
+        raise ValueError("k must be the same shard local_stats saw")
+    if not isinstance(gathered, torch.Tensor) or gathered.dtype != torch.float32:
+        raise TypeError("gathered must be the fp32 AllGather of local_stats sends")
+    per_rank = ctx.stats_numel * 2
+    if ctx.stats_protocol == 2:
+        per_rank += int(math.prod(ctx.q_desc_shape)) + int(
+            math.prod(ctx.k_minmax_shape)
+        )
+    if gathered.numel() != ctx.world_size * per_rank:
+        raise ValueError(
+            f"gathered has {gathered.numel()} elements, expected "
+            f"{ctx.world_size} x {per_rank}"
+        )
+
+    world_size = ctx.world_size
+    used = ctx.used_sequence
+    denominator = used if used is not None else local_sequence * world_size
+    stat_shape = (batch, num_heads, head_dim)
+    g = gathered.reshape(world_size, per_rank)
+    n_stat = ctx.stats_numel
+    k_mean_global = (
+        (g[:, :n_stat].sum(dim=0).view(stat_shape) / denominator)
+        .to(ctx.input_dtype)
+        .contiguous()
+    )
+    v_scale_global = (
+        g[:, n_stat : 2 * n_stat].amax(dim=0).view(stat_shape) / V_SCALE_MAX
+    ).contiguous()
+    if ctx.stats_protocol == 3:
+        return V2GStats(
+            stats_protocol=3,
+            rank=ctx.rank,
+            world_size=world_size,
+            used_sequence=used,
+            k_mean_global=k_mean_global,
+            v_scale_global=v_scale_global,
+        )
+
+    n_desc = int(math.prod(ctx.q_desc_shape))
+    merge_boundary_amax(
+        ctx.q_amax,
+        g[:, 2 * n_stat : 2 * n_stat + n_desc]
+        .reshape(world_size, *ctx.q_desc_shape)
+        .contiguous(),
+        rank=ctx.rank,
+        local_sequence=local_sequence,
+        group=Q_GROUP,
+        world_size=world_size,
+    )
+    k_amax = k_grouped_amax(
+        k,
+        k_mean_global,
+        rank=ctx.rank,
+        world_size=world_size,
+        used_sequence=used,
+        enable_pdl=enable_pdl,
+    )
+    derive_k_boundary_amax(
+        k_amax,
+        g[:, 2 * n_stat + n_desc :]
+        .reshape(world_size, *ctx.k_minmax_shape)
+        .contiguous(),
+        k_mean_global,
+        rank=ctx.rank,
+        local_sequence=local_sequence,
+        world_size=world_size,
+    )
+    return V2GStats(
+        stats_protocol=2,
+        rank=ctx.rank,
+        world_size=world_size,
+        used_sequence=used,
+        k_mean_global=k_mean_global,
+        v_scale_global=v_scale_global,
+        q_amax_final=ctx.q_amax,
+        k_amax_final=k_amax,
+    )
+
+
+@flashinfer_api
+def quant_and_pack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    stats: V2GStats,
+    *,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Protocol-routed quantize-and-pack: the fused amax+quant fast path
+    under protocol 3, the split kernels with the merged/derived final scales
+    under protocol 2.  Byte-identical to each other on shards where both are
+    legal."""
+
+    if not isinstance(stats, V2GStats):
+        raise TypeError("stats must be the V2GStats returned by finalize_stats")
+    if stats.stats_protocol == 3:
+        return quant_qkv_pack_fused(
+            q,
+            k,
+            v,
+            stats.k_mean_global,
+            stats.v_scale_global,
+            rank=stats.rank,
+            world_size=stats.world_size,
+            used_sequence=stats.used_sequence,
+            out=out,
+            enable_pdl=enable_pdl,
+        )
+    return quant_qkv_pack(
+        q,
+        k,
+        v,
+        stats.k_mean_global,
+        stats.q_amax_final,
+        stats.k_amax_final,
+        stats.v_scale_global,
+        rank=stats.rank,
+        world_size=stats.world_size,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
 
 
 @flashinfer_api
@@ -1578,8 +1920,11 @@ __all__ = [
     "K_GROUP",
     "Q_GROUP",
     "STATS_PROTOCOL",
+    "StatsContext",
+    "V2GStats",
     "V_SCALE_MAX",
     "abi_version",
+    "aligned_length",
     "capability",
     "gen_ulysses_lowp_module",
     "get_ulysses_lowp_module",
@@ -1592,9 +1937,12 @@ __all__ = [
     "q_grouped_amax",
     "boundary_descriptors",
     "derive_k_boundary_amax",
+    "finalize_stats",
     "k_boundary_minmax",
+    "local_stats",
     "merge_boundary_amax",
     "SUPPORTED_STATS_PROTOCOLS",
+    "quant_and_pack",
     "quant_kv_into_payload",
     "quant_kv_into_payload_fused",
     "quant_q_into_payload",
@@ -1602,8 +1950,10 @@ __all__ = [
     "quant_qkv_pack",
     "quant_qkv_pack_fused",
     "quant_v_fp8_with_scale",
+    "required_alignment",
     "scale_widths",
     "slots",
+    "stats_protocol_for",
     "touched",
     "unpack_for_sage",
     "verify_duplicate_scale_slots",
