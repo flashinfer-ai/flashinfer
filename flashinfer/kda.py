@@ -50,6 +50,66 @@ from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
 
+def _expand_auto_gqa_prefill_inputs(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+) -> Optional[
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]
+]:
+    """Expand a valid grouped-query prefill contract to value-head layout."""
+
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v, g, beta)):
+        return None
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4 or g.shape != v.shape:
+        return None
+    if q.shape[:2] != v.shape[:2] or beta.shape != v.shape[:3]:
+        return None
+    query_heads = q.shape[2]
+    value_heads = v.shape[2]
+    if query_heads <= 0 or value_heads <= query_heads or value_heads % query_heads:
+        return None
+    if A_log is not None and (
+        not isinstance(A_log, torch.Tensor) or A_log.numel() != query_heads
+    ):
+        return None
+    if dt_bias is not None and (
+        not isinstance(dt_bias, torch.Tensor)
+        or dt_bias.numel() != query_heads * q.shape[-1]
+    ):
+        return None
+
+    group_size = value_heads // query_heads
+    expanded_A_log = (
+        None
+        if A_log is None
+        else A_log.reshape(query_heads).repeat_interleave(group_size).contiguous()
+    )
+    expanded_dt_bias = (
+        None
+        if dt_bias is None
+        else dt_bias.reshape(query_heads, q.shape[-1])
+        .repeat_interleave(group_size, dim=0)
+        .contiguous()
+    )
+    return (
+        q.repeat_interleave(group_size, dim=2).contiguous(),
+        k.repeat_interleave(group_size, dim=2).contiguous(),
+        expanded_A_log,
+        expanded_dt_bias,
+    )
+
+
 @flashinfer_api(trace=recurrent_kda_trace)
 def recurrent_kda(
     q: torch.Tensor,
@@ -274,6 +334,24 @@ def recurrent_kda(
             f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
         )
 
+    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
+        q, cu_seqlens, num_spec_tokens
+    )
+    expanded_gqa_prefill = False
+    if backend == "auto" and is_plain_prefill:
+        expanded_inputs = _expand_auto_gqa_prefill_inputs(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+        if expanded_inputs is not None:
+            q, k, A_log, dt_bias = expanded_inputs
+            expanded_gqa_prefill = True
+
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
     # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
     sm120_rejection: Optional[str] = None
@@ -339,9 +417,6 @@ def recurrent_kda(
                 **sm120_prefill_kwargs
             )
 
-    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
-        q, cu_seqlens, num_spec_tokens
-    )
     try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
@@ -506,6 +581,11 @@ def recurrent_kda(
         raise ValueError(
             "seq_order is only supported by eligible packed ordinary "
             "SM100-family prefill"
+        )
+    if expanded_gqa_prefill:
+        raise ValueError(
+            "backend='auto' could not route this grouped-query recurrent_kda "
+            "prefill contract to a multi-token backend"
         )
     if _kda_decode._run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")

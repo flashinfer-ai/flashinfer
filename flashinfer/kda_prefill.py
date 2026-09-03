@@ -2450,7 +2450,10 @@ def _select_fp32_schedule_route(
     num_heads: int,
     indexed_state: bool,
 ) -> str:
-    """Mirror the source dispatch order for bounded FP32 state."""
+    """Use the raw compact closure or source dispatch for indexed FP32 state."""
+
+    if not indexed_state:
+        return _FLASH_KDA_ROUTE_FP32_COMPAT_M128
 
     max_sequence_length = max(sequence_lengths)
     if _should_use_small_bh_owner_helper(
@@ -2470,9 +2473,7 @@ def _select_fp32_schedule_route(
         use_initial_state=True,
         store_final_state=True,
     )
-    if indexed_state or source_route == _FLASH_KDA_ROUTE_BT16_M64:
-        return source_route
-    return _FLASH_KDA_ROUTE_FP32_COMPAT_M128
+    return source_route
 
 
 def _persistent_task_plan(

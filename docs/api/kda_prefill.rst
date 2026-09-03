@@ -30,6 +30,13 @@ unsupported contracts. Decode retains the existing KDA decode routing.
 ``backend="cake"`` and ``backend="cute-dsl"`` select a backend strictly and
 raise when its contract is unsupported.
 
+For ``backend="auto"``, valid grouped-query prefill is first expanded from H
+query heads to HV value heads when ``HV`` is an integer multiple of ``H``. Q,
+K, ``A_log``, and ``dt_bias`` repeat according to the grouped-head mapping; V,
+G, beta, state, output, and the result shape retain HV heads. This adapter is
+limited to ordinary multi-token prefill so decode and speculative decode keep
+their native grouped-query path.
+
 For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
 It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
 head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
@@ -55,10 +62,17 @@ every condition below holds:
 * ``A_log`` is contiguous FP32 ``[H]`` and ``dt_bias`` is contiguous FP32
   ``[H,128]`` or flattened ``[H*128]``;
 * ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
-  ``beta_is_logit=True``, and ``lower_bound`` is a finite negative value;
-* speculative decode, GQA, committed-state sources, and accepted-token
-  features are not enabled. Plain int32 ``ssm_state_indices`` and native
-  prefill checkpoints are supported by direct M128.
+  ``beta_is_logit=True``, and ``lower_bound`` is a finite negative value for
+  BF16 state or is in the source FP32 interval ``[-5, 0]``;
+* speculative decode, direct GQA, committed-state sources, and accepted-token
+  features are not enabled. ``backend="auto"`` may present the equal-head GQA
+  adapter described above. Plain int32 ``ssm_state_indices`` and native prefill
+  checkpoints are supported by direct M128.
+
+Compact FP32 state uses the separately sealed source-exact raw compatibility
+closure on every supported shape. Indexed FP32 state continues through the
+normal generated source dispatch, so its explicit pool and slot-stride ABI are
+preserved.
 
 T=1 decode and speculative decode are not handled by either prefill backend.
 

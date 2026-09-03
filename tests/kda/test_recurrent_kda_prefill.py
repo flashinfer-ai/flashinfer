@@ -1437,9 +1437,9 @@ def test_frozen_prefill_state_pool_eligibility_rejects_non_source_compact_fp32_c
         "expected_route",
     ),
     [
-        (True, (2048,), 6, False, "small_bh_owner_helper_m128"),
+        (True, (2048,), 6, False, "compact_fp32_compat_m128"),
         (True, (4096,), 6, True, "small_bh_owner_helper_m128"),
-        (True, (512,), 12, False, "bt16_prepare_chain_m64"),
+        (True, (512,), 12, False, "compact_fp32_compat_m128"),
         (False, (17, 33), 6, False, "compact_fp32_compat_m128"),
         (False, (17, 33), 12, False, "compact_fp32_compat_m128"),
     ],
@@ -1643,35 +1643,21 @@ def test_frozen_prefill_auto_real_gqa_fallback_matches_decode(
         checkpoint_every_n_tokens=0,
     )
 
-    real_decode = kda_decode_api._run_recurrent_kda
-    assert real_decode is not None
-    expected = real_decode(
-        **common,
-        initial_state=initial_state.clone(),
-        output=torch.empty_like(output),
-        output_final_state=True,
-        backend="auto",
-    )
-    decode_calls = []
-
-    def record_decode(**kwargs):
-        decode_calls.append(kwargs)
-        return real_decode(**kwargs)
-
-    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", record_decode)
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_get_flash_kda_generated_module",
-        lambda selector: pytest.fail(
-            f"fallback loaded generated Cake module: {selector}"
-        ),
+    group_size = value_heads // query_heads
+    expected = _reference(
+        {
+            **common,
+            "q": q.repeat_interleave(group_size, dim=2).contiguous(),
+            "k": k.repeat_interleave(group_size, dim=2).contiguous(),
+            "A_log": A_log.repeat_interleave(group_size).contiguous(),
+            "dt_bias": dt_bias.repeat_interleave(group_size, dim=0).contiguous(),
+            "initial_state": initial_state.clone(),
+        }
     )
     monkeypatch.setattr(
-        kda_prefill_api,
-        "_get_cake_kda_prefill_module",
-        lambda variant, target: pytest.fail(
-            f"fallback loaded raw Cake module: {variant}/{target}"
-        ),
+        kda_decode_api,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail("multi-token GQA prefill reached T=1 decode"),
     )
     actual = recurrent_kda(
         **common,
@@ -1680,7 +1666,6 @@ def test_frozen_prefill_auto_real_gqa_fallback_matches_decode(
         output_final_state=True,
     )
 
-    assert len(decode_calls) == 1
     for actual_value, expected_value in zip(actual, expected, strict=True):
         torch.testing.assert_close(
             actual_value.float(), expected_value.float(), atol=1e-2, rtol=1e-2
@@ -3515,33 +3500,58 @@ def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
     assert len(calls) == 2
 
 
-def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
+def test_multi_token_gqa_expands_query_heads_for_prefill(cuda_device, monkeypatch):
     sentinel = (object(), object())
+    prefill_calls = []
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
     )
-    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", lambda **kwargs: sentinel)
     monkeypatch.setattr(
-        kda_prefill_api,
-        "_get_flash_kda_prefill_module",
-        lambda variant, arch: pytest.fail(f"unexpected frozen route {variant}/{arch}"),
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+
+    def run_prefill(**kwargs):
+        prefill_calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api, "_run_cute_dsl_kda_prefill", run_prefill
+    )
+    monkeypatch.setattr(
+        kda_decode_api,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail("multi-token GQA prefill reached T=1 decode"),
     )
     q = torch.randn((1, 2, 2, 128), dtype=torch.bfloat16, device=cuda_device)
     v = torch.randn((1, 2, 4, 128), dtype=torch.bfloat16, device=cuda_device)
+    A_log = torch.randn(2, device=cuda_device)
+    dt_bias = torch.randn((2, 128), device=cuda_device)
     result = recurrent_kda(
         q,
         q.clone(),
         v,
         v.clone(),
         torch.randn((1, 2, 4), dtype=torch.bfloat16, device=cuda_device),
-        A_log=torch.randn(2, device=cuda_device),
-        dt_bias=torch.randn((2, 128), device=cuda_device),
+        A_log=A_log,
+        dt_bias=dt_bias,
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,
         lower_bound=-5.0,
         beta_is_logit=True,
     )
     assert result is sentinel
+    assert len(prefill_calls) == 1
+    call = prefill_calls[0]
+    assert call["q"].is_contiguous()
+    assert call["k"].is_contiguous()
+    assert call["A_log"].is_contiguous()
+    assert call["dt_bias"].is_contiguous()
+    assert torch.equal(call["q"], q.repeat_interleave(2, dim=2))
+    assert torch.equal(call["k"], q.repeat_interleave(2, dim=2))
+    assert torch.equal(call["A_log"], A_log.repeat_interleave(2))
+    assert torch.equal(call["dt_bias"], dt_bias.repeat_interleave(2, dim=0))
 
 
 @pytest.mark.parametrize(
@@ -3847,7 +3857,7 @@ def test_compact_fp32_zero_bound_small_bh_matches_compat_control(
     )
     small_output = small_output.clone()
     small_state = small_state.clone()
-    assert selector_keys[0]["route"] == "small_bh_owner_helper_m128"
+    assert selector_keys == []
 
     control_inputs = {**inputs, "initial_state": state_seed.clone()}
     monkeypatch.setattr(
@@ -3903,12 +3913,7 @@ def test_compact_fp32_zero_bound_bt16_matches_compat_control(
     )
     bt16_output = bt16_output.clone()
     bt16_state = bt16_state.clone()
-    assert [
-        (selector["route"], selector["route_role"]) for selector in selector_keys
-    ] == [
-        ("bt16_prepare_chain_m64", "bt16_prepare"),
-        ("bt16_prepare_chain_m64", "main"),
-    ]
+    assert selector_keys == []
 
     control_inputs = {**inputs, "initial_state": state_seed.clone()}
     monkeypatch.setattr(
