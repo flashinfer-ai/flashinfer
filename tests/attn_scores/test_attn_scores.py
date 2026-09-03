@@ -1014,7 +1014,7 @@ def test_fp4_next_n4_split_rejects_caller_schedule():
     w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
 
     sched = compute_paged_mqa_logits_schedule(context_lens)
-    with pytest.raises(ValueError, match=r"silently wrong"):
+    with pytest.raises(ValueError, match=r"schedule_meta must be None for next_n=4"):
         fp4_paged_mqa_logits(
             q,
             sf_q,
@@ -1384,7 +1384,10 @@ def test_block_table_width_contract(monkeypatch):
     # Default (unset): no sync, no check. Exercise the validator directly rather
     # than launching -- a narrow table would genuinely read out of bounds.
     monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
-    assert _validate_paged_bounds(narrow, context_lens, ctx, block_size, "x") is None
+    assert (
+        _validate_paged_bounds(narrow, context_lens, ctx, block_size, B * need, "x")
+        is None
+    )
 
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     ntb = B * need
@@ -1445,7 +1448,7 @@ def test_max_context_len_bound(monkeypatch):
     # rather than launching, which would genuinely write out of bounds.
     monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
     assert (
-        _validate_paged_bounds(block_table, context_lens, max_ml, block_size, "x")
+        _validate_paged_bounds(block_table, context_lens, max_ml, block_size, ntb, "x")
         is None
     )
 
@@ -1764,9 +1767,11 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
 
     Both "did not schedule" and "did not compile" are checked directly rather
     than by patching:
-      * a deliberately malformed schedule_meta is passed. Both arms of the
-        schedule branch call _validate_schedule_meta, so reaching that branch
-        would raise; returning cleanly proves it was skipped.
+      * a well-formed but content-garbage schedule_meta is passed.  Its shape/
+        dtype/device pass the always-on buffer validation (which now runs even
+        at B == 0, like out=), but launching with those garbage boundaries
+        would hang the persistent kernel -- returning cleanly proves the
+        schedule/launch path was skipped.
       * the compile entry points are functools-cached, so cache_info() moving
         would mean the compile path was entered.
 
@@ -1783,6 +1788,7 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
     from flashinfer.attn_scores.attn_scores import (
         _cached_compile_fp4_kernel,
         _cached_compile_fp8_kernel,
+        _cached_num_sms,
     )
 
     device = "cuda"
@@ -1794,9 +1800,13 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
     w = torch.zeros(0, H, device=device, dtype=torch.float32)
     dtype = torch.float32 if variant == "fp8" else torch.bfloat16
 
-    # malformed on purpose: the wrong shape entirely. If the schedule branch is
-    # reached, _validate_schedule_meta raises.
-    bad_schedule = torch.zeros((3, 2), dtype=torch.int32, device=device)
+    # Well-formed shape/dtype/device (so it passes the always-on buffer
+    # validation) but garbage contents: launching with it would hang, so a
+    # clean return proves the schedule/launch path was skipped.
+    num_sms = _cached_num_sms(0)
+    bad_schedule = torch.full(
+        (num_sms + 1, 2), 123_456_789, dtype=torch.int32, device=device
+    )
 
     out = None
     if preallocated_out:
@@ -1878,6 +1888,186 @@ def test_empty_batch_still_validates_out():
     too_narrow = torch.empty((0, 8), device=device, dtype=torch.float32)
     with pytest.raises(ValueError, match="out must be at least"):
         fp8_paged_mqa_logits(q, kv, w, context_lens, block_table, ctx, out=too_narrow)
+
+    # A malformed caller-supplied schedule_meta is likewise validated at B == 0:
+    # a buffer that cannot be right at any batch size fails immediately.
+    bad_schedule = torch.zeros((3, 2), dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="schedule_meta must have shape"):
+        fp8_paged_mqa_logits(
+            q, kv, w, context_lens, block_table, ctx, schedule_meta=bad_schedule
+        )
+
+
+def test_api_rejects_malformed_ranks_and_dtypes():
+    """Wrong-rank q / kv_fused and non-uint8 kv_fused get curated errors.
+
+    Before these guards a 3-D q died on the checker's tuple unpack ("not
+    enough values to unpack"), naming neither the argument nor the fix, and a
+    wrong-dtype kv_fused passed every curated check only to fail post-JIT at
+    the FFI boundary with a bare dtype error.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((2,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+    q3 = torch.zeros(2, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match=r"q must be 4-D.*unsqueeze"):
+        fp8_paged_mqa_logits(q3, kv, w, cl, bt, ctx)
+
+    q4_fp4 = torch.zeros(2, H, D // 2, dtype=torch.uint8, device=device)
+    sf = torch.zeros(2, 1, H, dtype=torch.int32, device=device)
+    kv4 = torch.zeros(8, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match=r"q must be 4-D"):
+        fp4_paged_mqa_logits(q4_fp4, sf, kv4, w, cl, bt, ctx)
+
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="kv_fused must be 4-D"):
+        fp8_paged_mqa_logits(q, kv.flatten(1), w, cl, bt, ctx)
+    with pytest.raises(ValueError, match="kv_fused must be uint8"):
+        fp8_paged_mqa_logits(
+            q,
+            torch.zeros(8, block_size, 1, D + 4, dtype=torch.float16, device=device),
+            w,
+            cl,
+            bt,
+            ctx,
+        )
+
+    # Strided index tensors are rejected with the fix, not a bare FFI error.
+    bt_noncontig = torch.zeros((4, 2), dtype=torch.int32, device=device).t()
+    with pytest.raises(ValueError, match="block_table must be contiguous"):
+        fp8_paged_mqa_logits(q, kv, w, cl, bt_noncontig, ctx)
+
+
+def test_out_layout_rejected():
+    """A column-strided out= view is rejected with the allocation recipe.
+
+    Previously it passed device/dtype/shape validation and reached the FFI
+    binding, which either errored bare or silently misplaced stores.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits, padded_context_len
+
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((2,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    base = torch.empty(
+        (2, 2 * padded_context_len(ctx)), device=device, dtype=torch.float32
+    )
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
+        fp8_paged_mqa_logits(q, kv, w, cl, bt, ctx, out=base[:, ::2])
+
+
+def test_inputs_foreign_device_rejected_paged():
+    """Tensor arguments on a different GPU than q are rejected by name.
+
+    is_cuda alone admits a tensor on another device; the kernel launched on
+    q's device would dereference peer pointers -- silently right or wrong
+    depending on peer access.  Needs two GPUs.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda:0"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl_far = torch.full((2,), ctx, dtype=torch.int32, device="cuda:1")
+    bt = torch.zeros((2, 4), dtype=torch.int32, device=device)
+    w = torch.zeros(2, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match=r"context_lens is on cuda:1 but q is on"):
+        fp8_paged_mqa_logits(q, kv, w, cl_far, bt, ctx)
+
+
+def test_schedule_helper_validates_inputs():
+    """compute_paged_mqa_logits_schedule validates dtype and out= up front.
+
+    Previously an int64 context_lens died inside the DSL (CUDA path) or was
+    silently truncated by numpy (CPU path), and a malformed out= reached the
+    compiled kernel or out.copy_ bare.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer import compute_paged_mqa_logits_schedule
+
+    cl64 = torch.full((2,), 256, dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError, match="context_lens must be int32"):
+        compute_paged_mqa_logits_schedule(cl64)
+
+    cl = torch.full((2,), 256, dtype=torch.int32, device="cuda")
+    bad_out = torch.zeros((3, 2), dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="schedule_meta must have shape"):
+        compute_paged_mqa_logits_schedule(cl, out=bad_out)
+
+
+def test_precompile_dsl_guards(monkeypatch):
+    """precompile warns (not silently no-ops) without a DSL, and fails with
+    the curated stale-toolchain message when the DSL cannot target the device.
+
+    Previously it returned silently with no DSL (a deployment build step
+    "succeeded" and serving JIT'd later), and went straight into cute.compile
+    -- deep KeyError -- on a DSL predating the device.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.attn_scores import attn_scores as A
+
+    monkeypatch.setattr(A, "_CUTE_DSL_AVAILABLE", False)
+    with pytest.warns(RuntimeWarning, match="nothing was precompiled"):
+        A.precompile_paged_mqa_logits()
+
+    monkeypatch.setattr(A, "_CUTE_DSL_AVAILABLE", True)
+    monkeypatch.setattr(A, "_cached_dsl_targets_device", lambda i: False)
+    with pytest.raises(RuntimeError, match="cannot target"):
+        A.precompile_paged_mqa_logits()
+
+
+def test_validate_inputs_rejects_out_of_pool_block_index(monkeypatch):
+    """FLASHINFER_VALIDATE_INPUTS=1 catches stale/out-of-pool page indices.
+
+    The debug validator already pays the D2H sync for the width check; the
+    value check rides along.  A stale page index is the classic silent OOB
+    READ this validator exists to surface.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    device = "cuda"
+    H, D, block_size, ctx = 64, 128, 64, 256
+    cl = torch.full((1,), ctx, dtype=torch.int32, device=device)
+    bt = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    bt[0, 1] = 99  # only 8 blocks in the pool
+    w = torch.zeros(1, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(1, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match=r"only 8 blocks"):
+        fp8_paged_mqa_logits(q, kv, w, cl, bt, ctx)
 
 
 def test_schedule_meta_device_must_match():

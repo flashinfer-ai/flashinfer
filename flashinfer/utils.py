@@ -1542,8 +1542,15 @@ def backend_requirement(
                 else:
                     # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
+                        _ccs = getattr(common_check, "_supported_ccs", None)
+                        _supported = (
+                            f"; supported compute capabilities: {sorted(_ccs)}"
+                            if _ccs
+                            else ""
+                        )
                         raise BackendSupportedError(
-                            f"{func.__name__} does not support compute capability {capability}"
+                            f"{func.__name__} does not support compute capability "
+                            f"{capability}{_supported}"
                         )
                     if not _is_problem_size_supported(**kwargs_with_defaults):
                         raise ValueError(
