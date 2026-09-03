@@ -279,9 +279,8 @@ def _moe_core_impl(
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
 
-    # No reachable Rubin tactic uses a multi-CTA cluster (tile_size is capped at
-    # 128, which forces cluster_shape_m == 1), so refuse rather than carry a
-    # workaround nothing exercises.
+    # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
+    # is the backstop for callers that pass tactic parameters directly.
     cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
     if is_rubin and cluster_m > 1:
         raise NotImplementedError(

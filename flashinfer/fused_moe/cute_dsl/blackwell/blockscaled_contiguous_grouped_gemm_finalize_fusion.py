@@ -1415,11 +1415,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                     tiled_mma.thr_id.shape
                 )
-                expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                 tile_idx = mma_tile_coord_m
 
                 if tile_idx < num_valid_tiles:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    expert_idx = tile_idx_to_expert_idx[tile_idx]
                     mn_limit = tile_idx_to_mn_limit[tile_idx]
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
@@ -1467,10 +1467,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                         tiled_mma.thr_id.shape
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
@@ -1502,10 +1502,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                         tiled_mma.thr_id.shape
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[

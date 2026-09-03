@@ -650,6 +650,11 @@ def moe_sort(
 
     # Use pre-allocated buffers if provided, otherwise allocate new ones
     # Pre-allocation is required for CUDA graph compatibility
+    #
+    # Entries outside the active prefix are intentionally uninitialized.
+    # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
+    # that count. Rubin multi-CTA tactics, which would require rounded/padded
+    # metadata entries, are rejected before moe_sort.
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:

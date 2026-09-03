@@ -1125,11 +1125,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
 
-                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
 
                     if tile_idx < num_valid_tiles:
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expert_idx = tile_idx_to_group_idx[tile_idx]
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
 
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
@@ -1154,11 +1154,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
 
-                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
 
                     if tile_idx < num_valid_tiles:
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expert_idx = tile_idx_to_group_idx[tile_idx]
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
