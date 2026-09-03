@@ -178,6 +178,27 @@ def test_graph_plan_rejects_small_workspace():
 
 
 @requires_prims_ts_gpu
+def test_graph_plan_grows_kv_lens_buffer():
+    # One page per request; the batch exceeds the 32768-slot default buffer.
+    # The tiny workspace stops plan() right after the kv-lens staging, so the
+    # test never reaches kernel warming.
+    batch_size = 32769
+    kv_lens = [PAGE_SIZE] * batch_size
+    workspace = torch.zeros(64, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        "HND",
+        backend="prims-ts",
+        use_cuda_graph=True,
+        **_graph_buffers(batch_size, max_pages=batch_size),
+    )
+    with pytest.raises(ValueError, match="workspace bytes"):
+        wrapper.plan(*_plan_args(kv_lens, "cuda"), q_data_type=torch.bfloat16)
+    assert wrapper._kv_lens_buffer.shape[0] == batch_size
+    assert wrapper._kv_lens_buffer[-1].item() == PAGE_SIZE
+
+
+@requires_prims_ts_gpu
 def test_eager_plan_binds_caller_buffers():
     kv_lens = [64, 96]
     workspace = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")

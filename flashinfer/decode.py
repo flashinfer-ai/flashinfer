@@ -1925,6 +1925,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             int(self._paged_kv_indices_buf.numel()) * page_size, _DECODE_MAX_KV_LEN
         )
         batch_size = len(kv_lens_arr_host)
+        if batch_size > self._kv_lens_buffer.shape[0]:
+            self._kv_lens_buffer = torch.empty(
+                (batch_size,), dtype=torch.int32, device=self.device
+            )
         self._kv_lens_buffer[:batch_size].copy_(
             kv_lens_arr_host, non_blocking=non_blocking
         )
