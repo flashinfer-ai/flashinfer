@@ -212,6 +212,14 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
     monkeypatch.setitem(sys.modules, "package_config", package_config)
     monkeypatch.setitem(sys.modules, "build_utils", build_utils)
     monkeypatch.setattr(sys, "path", list(sys.path))
+    # Register environment mutations performed during backend import for teardown.
+    monkeypatch.setenv(
+        "FLASHINFER_DISABLE_VERSION_CHECK",
+        os.environ.get("FLASHINFER_DISABLE_VERSION_CHECK", ""),
+    )
+    monkeypatch.setenv(
+        "FLASHINFER_CUDA_ARCH_LIST", os.environ.get("FLASHINFER_CUDA_ARCH_LIST", "")
+    )
 
     module_name = "_test_jit_cache_provider_build_backend"
     spec = importlib.util.spec_from_file_location(module_name, backend_path)
@@ -250,7 +258,7 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
 
         monkeypatch.setenv(module.PROVIDER_PLATFORM_TAG_ENV, "manylinux_2_28_x86_64")
         monkeypatch.setattr(module.platform, "libc_ver", lambda: ("glibc", "2.34"))
-        with pytest.raises(RuntimeError, match="glibc 2.34 is too new"):
+        with pytest.raises(RuntimeError, match=r"glibc 2\.34 is too new"):
             module._provider_platform_tag("linux_x86_64")
     finally:
         sys.modules.pop(module_name, None)
@@ -356,14 +364,17 @@ set -euo pipefail
 trap 'touch "{trap_marker}"' EXIT
 source "{common_script}"
 export PIP_CONSTRAINT=/tmp/original-constraint
+export PIP_BUILD_CONSTRAINT=/tmp/original-build-constraint
 export PIP_EXTRA_INDEX_URL=https://mirror.example/simple
 setup_jit_cache_python_build "{fake_python}" 13.0 cu130
 generated_constraint=${{PIP_CONSTRAINT}}
 test -f "${{generated_constraint}}"
+test "${{PIP_BUILD_CONSTRAINT}}" = "${{generated_constraint}}"
 test "${{PIP_EXTRA_INDEX_URL}}" = "https://mirror.example/simple https://download.pytorch.org/whl/cu130"
 cleanup_jit_cache_python_build
 test ! -e "${{generated_constraint}}"
 test "${{PIP_CONSTRAINT}}" = /tmp/original-constraint
+test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 """
 
     subprocess.run(["bash", "-c", script], check=True)
