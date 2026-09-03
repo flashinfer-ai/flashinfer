@@ -126,7 +126,9 @@ def get_ulysses_lowp_module():
         v_partial: torch.Tensor,
         enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_k_sum_v_amax(k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl)
+        module.ulysses_lowp_k_sum_v_amax(
+            k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl
+        )
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_q_grouped_amax", mutates_args=["amax_out"]
@@ -151,7 +153,9 @@ def get_ulysses_lowp_module():
         world_size: int,
         enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_k_grouped_amax(k, k_mean, amax_out, rank, world_size, enable_pdl)
+        module.ulysses_lowp_k_grouped_amax(
+            k, k_mean, amax_out, rank, world_size, enable_pdl
+        )
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_quant_q_int8_pack", mutates_args=["output"]
@@ -196,7 +200,9 @@ def get_ulysses_lowp_module():
         world_size: int,
         enable_pdl: bool,
     ) -> None:
-        module.ulysses_lowp_quant_q_int8_pack_fused(q, output, rank, world_size, enable_pdl)
+        module.ulysses_lowp_quant_q_int8_pack_fused(
+            q, output, rank, world_size, enable_pdl
+        )
 
     @register_custom_op(
         "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack_fused", mutates_args=["output"]
@@ -233,7 +239,15 @@ def get_ulysses_lowp_module():
         enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence,
+            input,
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            local_sequence,
+            world_size,
+            scale_sequence,
             enable_pdl,
         )
 
@@ -254,7 +268,15 @@ def get_ulysses_lowp_module():
         enable_pdl: bool,
     ) -> None:
         module.ulysses_lowp_unpack_for_sage_unaligned(
-            input, q, k, v, q_scale, k_scale, local_sequence, world_size, scale_sequence,
+            input,
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            local_sequence,
+            world_size,
+            scale_sequence,
             enable_pdl,
         )
 
@@ -321,7 +343,11 @@ def _world_size(world_size: int) -> int:
 
 
 def _rank(rank: int, world_size: int) -> int:
-    if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < world_size:
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, int)
+        or not 0 <= rank < world_size
+    ):
         raise ValueError("V2-G requires 0 <= rank < world_size")
     return rank
 
@@ -626,7 +652,9 @@ def k_grouped_amax(
     if k_mean_global.dtype != k.dtype:
         raise TypeError("k_mean_global must have the same dtype as k")
     if tuple(k_mean_global.shape) != (batch, num_heads, head_dim):
-        raise ValueError(f"k_mean_global must have shape {(batch, num_heads, head_dim)}")
+        raise ValueError(
+            f"k_mean_global must have shape {(batch, num_heads, head_dim)}"
+        )
     if not k_mean_global.is_contiguous() or k_mean_global.device != k.device:
         raise ValueError("k_mean_global must be contiguous and on the K device")
     global_sequence = local_sequence * world_size
@@ -667,7 +695,9 @@ def k_grouped_amax(
             lo_local = lo - rank * local_sequence
             hi_local = hi - rank * local_sequence
             if hi_local > lo_local:
-                kc = k[:, lo_local:hi_local].float() - k_mean_global.float().unsqueeze(1)
+                kc = k[:, lo_local:hi_local].float() - k_mean_global.float().unsqueeze(
+                    1
+                )
                 live = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
             else:
                 # this rank's slice of the tail group is padding only
@@ -729,7 +759,10 @@ def merge_boundary_amax(
 
     world_size = _world_size(world_size)
     rank = _rank(rank, world_size)
-    if gathered_descriptors.shape[0] != world_size or gathered_descriptors.shape[-1] != 2:
+    if (
+        gathered_descriptors.shape[0] != world_size
+        or gathered_descriptors.shape[-1] != 2
+    ):
         raise ValueError("gathered_descriptors must have shape [P, B, H, 2]")
     my_first = group_first(rank, local_sequence, group)
     touched_count = touched(rank, local_sequence, group)
@@ -791,7 +824,9 @@ def k_boundary_minmax(
     global_sequence = local_sequence * world_size
     if used_sequence is not None:
         if not 0 < int(used_sequence) <= global_sequence:
-            raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+            raise ValueError(
+                "used_sequence must lie in (0, local_sequence * world_size]"
+            )
         # Enforced admission condition (comment-only precondition upstream):
         # all padding must live in the single last global K group.
         if (int(used_sequence) + K_GROUP - 1) // K_GROUP != (
@@ -875,14 +910,11 @@ def derive_k_boundary_amax(
             mn = gathered_minmax[other, :, :, slot, 0]
             mx = gathered_minmax[other, :, :, slot, 1]
             contrib = (
-                torch.maximum(mx - mean32, mean32 - mn)
-                .amax(dim=-1)
-                .clamp_(min=1e-7)
+                torch.maximum(mx - mean32, mean32 - mn).amax(dim=-1).clamp_(min=1e-7)
             )
             merged = contrib if merged is None else torch.maximum(merged, contrib)
         grouped_amax[..., boundary_group - my_first] = merged
     return grouped_amax
-
 
 
 # ---------------------------------------------------------------------------
@@ -986,7 +1018,10 @@ def quant_kv_into_payload(
         raise TypeError("k_mean_global must have the same dtype as k")
     if v_scale_global.dtype != torch.float32:
         raise TypeError("v_scale_global must have dtype torch.float32")
-    for name, tensor in (("k_mean_global", k_mean_global), ("v_scale_global", v_scale_global)):
+    for name, tensor in (
+        ("k_mean_global", k_mean_global),
+        ("v_scale_global", v_scale_global),
+    ):
         if tuple(tensor.shape) != (batch, num_heads, head_dim):
             raise ValueError(f"{name} must have shape {(batch, num_heads, head_dim)}")
         if not tensor.is_contiguous() or tensor.device != k.device:
@@ -1001,7 +1036,14 @@ def quant_kv_into_payload(
     if send_u8.device != k.device:
         raise ValueError("K/V, statistics, and send_u8 must share a device")
     get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack(
-        k, v, k_mean_global, k_amax_final, v_scale_global, send_u8, rank, world_size,
+        k,
+        v,
+        k_mean_global,
+        k_amax_final,
+        v_scale_global,
+        send_u8,
+        rank,
+        world_size,
         _resolve_pdl(enable_pdl, k),
     )
 
@@ -1024,8 +1066,17 @@ def quant_qkv_pack(
     """Fused V2-G quantize-and-pack convenience entry point."""
 
     batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
-    if q.shape != k.shape or q.shape != v.shape or q.dtype != k.dtype or q.dtype != v.dtype:
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
         raise ValueError("q, k, and v must have identical shape and dtype")
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
     spec = payload_spec(
         batch_size=batch,
         local_sequence=local_sequence,
@@ -1037,6 +1088,14 @@ def quant_qkv_pack(
         out = torch.empty(
             (world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
         )
+    # Validate before the first write so a rejected call leaves `out` intact.
+    _validate_send(
+        out,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
     zero_scale_and_padding(out, spec)
     enable_pdl = _resolve_pdl(enable_pdl, q)
     quant_q_into_payload(
@@ -1135,7 +1194,10 @@ def quant_kv_into_payload_fused(
         raise TypeError("k_mean_global must have the same dtype as k")
     if v_scale_global.dtype != torch.float32:
         raise TypeError("v_scale_global must have dtype torch.float32")
-    for name, tensor in (("k_mean_global", k_mean_global), ("v_scale_global", v_scale_global)):
+    for name, tensor in (
+        ("k_mean_global", k_mean_global),
+        ("v_scale_global", v_scale_global),
+    ):
         if tuple(tensor.shape) != (batch, num_heads, head_dim):
             raise ValueError(f"{name} must have shape {(batch, num_heads, head_dim)}")
         if not tensor.is_contiguous() or tensor.device != k.device:
@@ -1153,7 +1215,13 @@ def quant_kv_into_payload_fused(
     if send_u8.device != k.device:
         raise ValueError("K/V, statistics, and send_u8 must share a device")
     get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack_fused(
-        k, v, k_mean_global, v_scale_global, send_u8, rank, world_size,
+        k,
+        v,
+        k_mean_global,
+        v_scale_global,
+        send_u8,
+        rank,
+        world_size,
         int(used_sequence) if used_sequence is not None else 0,
         _resolve_pdl(enable_pdl, k),
     )
@@ -1191,10 +1259,18 @@ def quant_qkv_pack_fused(
     """
 
     batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
-    if q.shape != k.shape or q.shape != v.shape or q.dtype != k.dtype or q.dtype != v.dtype:
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
         raise ValueError("q, k, and v must have identical shape and dtype")
     _require_align128("quant_qkv_pack_fused", local_sequence)
     world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
     spec = payload_spec(
         batch_size=batch,
         local_sequence=local_sequence,
@@ -1432,6 +1508,7 @@ def quant_v_fp8_with_scale(
     v: torch.Tensor,
     v_scale_global: torch.Tensor,
     scale_max: float = V_SCALE_MAX,
+    *,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Quantize canonical NHD V to canonical E4M3 bit patterns.
@@ -1470,7 +1547,9 @@ def quant_v_fp8_with_scale(
     if batch <= 0 or sequence <= 0 or heads <= 0:
         raise ValueError("B, S, and H must all be non-zero")
     if head_dim != HEAD_DIM:
-        raise ValueError(f"quant_v_fp8_with_scale requires D={HEAD_DIM}, got D={head_dim}")
+        raise ValueError(
+            f"quant_v_fp8_with_scale requires D={HEAD_DIM}, got D={head_dim}"
+        )
     if tuple(v_scale_global.shape) != (batch, heads, head_dim):
         raise ValueError(
             "v_scale_global must have shape "
@@ -1483,7 +1562,9 @@ def quant_v_fp8_with_scale(
         raise ValueError(f"quant_v_fp8_with_scale requires scale_max={V_SCALE_MAX}")
 
     _require_sm120(v)
-    output = torch.empty_like(v, dtype=torch.uint8, memory_format=torch.contiguous_format)
+    output = torch.empty_like(
+        v, dtype=torch.uint8, memory_format=torch.contiguous_format
+    )
     get_ulysses_lowp_module().ulysses_lowp_quant_v_fp8_with_scale(
         v, v_scale_global, output, _resolve_pdl(enable_pdl, v)
     )

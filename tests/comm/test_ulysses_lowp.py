@@ -20,8 +20,7 @@ import torch
 import flashinfer.comm.ulysses_lowp as lowp
 
 requires_sm120 = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability(0) != (12, 0),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0),
     reason="V2-G requires an SM120 CUDA device",
 )
 
@@ -37,7 +36,14 @@ _SCALE_MAX = 2.25
 
 @pytest.mark.parametrize(
     ("local_sequence", "group", "expected_slots"),
-    [(1, 32, 1), (32, 32, 2), (64, 32, 3), (64, 64, 2), (9440, 32, 296), (9440, 64, 149)],
+    [
+        (1, 32, 1),
+        (32, 32, 2),
+        (64, 32, 3),
+        (64, 64, 2),
+        (9440, 32, 296),
+        (9440, 64, 149),
+    ],
 )
 def test_slot_upper_bound_formula(local_sequence, group, expected_slots):
     assert lowp.slots(local_sequence, group) == expected_slots
@@ -139,8 +145,15 @@ def _run_pipeline(q, k, v, k_mean, v_scale, world, L):
         k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
         sends.append(
             lowp.quant_qkv_pack(
-                q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale,
-                rank=r, world_size=world,
+                q_r,
+                k_r,
+                v_r,
+                k_mean,
+                q_amax,
+                k_amax,
+                v_scale,
+                rank=r,
+                world_size=world,
             )
         )
     return sends
@@ -161,8 +174,11 @@ def test_packed_v_section_matches_standalone_quantizer(world, local_sequence):
     q, k, v = _global_inputs(torch.bfloat16, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
     spec = lowp.payload_spec(
-        batch_size=1, local_sequence=L, num_heads=_HEADS,
-        head_dim=_HEAD_DIM, world_size=world,
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
     )
     local_heads = _HEADS // world
     sends = _run_pipeline(q, k, v, k_mean, v_scale, world, L)
@@ -190,16 +206,23 @@ def test_unpack_reproduces_packed_bytes(world, dtype):
     q, k, v = _global_inputs(dtype, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
     spec = lowp.payload_spec(
-        batch_size=1, local_sequence=L, num_heads=_HEADS,
-        head_dim=_HEAD_DIM, world_size=world,
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
     )
     local_heads = _HEADS // world
     sends = _run_pipeline(q, k, v, k_mean, v_scale, world, L)
     for d in range(world):
         recv = torch.stack([sends[r][d] for r in range(world)]).contiguous()
         q_u, k_u, v_u, q_scale_u, k_scale_u = lowp.unpack_for_sage(
-            recv, batch_size=1, local_sequence=L,
-            local_heads=local_heads, head_dim=_HEAD_DIM, world_size=world,
+            recv,
+            batch_size=1,
+            local_sequence=L,
+            local_heads=local_heads,
+            head_dim=_HEAD_DIM,
+            world_size=world,
         )
         for name, out, offset in (
             ("q", q_u, 0),
@@ -220,20 +243,28 @@ def test_unpack_reproduces_packed_bytes(world, dtype):
         q_groups = L // 32
         k_groups = L // 64
         for src in range(world):
-            q_section = recv[
-                src,
-                int(spec["q_scale_offset"]) : int(spec["q_scale_offset"])
-                + local_heads * int(spec["q_slots_per_source"]) * 4,
-            ].view(torch.float32).view(1, local_heads, -1)
+            q_section = (
+                recv[
+                    src,
+                    int(spec["q_scale_offset"]) : int(spec["q_scale_offset"])
+                    + local_heads * int(spec["q_slots_per_source"]) * 4,
+                ]
+                .view(torch.float32)
+                .view(1, local_heads, -1)
+            )
             assert torch.equal(
                 q_scale_u[..., src * q_groups : (src + 1) * q_groups],
                 q_section[..., :q_groups],
             )
-            k_section = recv[
-                src,
-                int(spec["k_scale_offset"]) : int(spec["k_scale_offset"])
-                + local_heads * int(spec["k_slots_per_source"]) * 4,
-            ].view(torch.float32).view(1, local_heads, -1)
+            k_section = (
+                recv[
+                    src,
+                    int(spec["k_scale_offset"]) : int(spec["k_scale_offset"])
+                    + local_heads * int(spec["k_slots_per_source"]) * 4,
+                ]
+                .view(torch.float32)
+                .view(1, local_heads, -1)
+            )
             assert torch.equal(
                 k_scale_u[..., src * k_groups : (src + 1) * k_groups],
                 k_section[..., :k_groups],
@@ -254,8 +285,11 @@ def test_quantized_values_close_to_torch_reference(dtype):
     q, k, v = _global_inputs(dtype, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
     spec = lowp.payload_spec(
-        batch_size=1, local_sequence=L, num_heads=_HEADS,
-        head_dim=_HEAD_DIM, world_size=world,
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
     )
     local_heads = _HEADS // world
     r = 1
@@ -276,8 +310,15 @@ def test_quantized_values_close_to_torch_reference(dtype):
 
     k_amax = lowp.k_grouped_amax(k[:, s].contiguous(), k_mean, rank=r, world_size=world)
     send = lowp.quant_qkv_pack(
-        q_r, k[:, s].contiguous(), v[:, s].contiguous(),
-        k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world,
+        q_r,
+        k[:, s].contiguous(),
+        v[:, s].contiguous(),
+        k_mean,
+        q_amax,
+        k_amax,
+        v_scale,
+        rank=r,
+        world_size=world,
     )
     dest = 0
     codes = (
@@ -289,9 +330,7 @@ def test_quantized_values_close_to_torch_reference(dtype):
     )
     heads = slice(dest * local_heads, (dest + 1) * local_heads)
     scale = (q_amax[:, heads] / 127.0).float()
-    token_groups = (
-        torch.arange(L, device="cuda") + r * L
-    ) // 32 - g_first
+    token_groups = (torch.arange(L, device="cuda") + r * L) // 32 - g_first
     per_token_scale = scale[:, :, token_groups].permute(0, 2, 1).unsqueeze(-1)
     ref_codes = torch.clamp(
         torch.round(qf[:, :, heads] / per_token_scale.squeeze(-1).unsqueeze(-1)),
@@ -305,12 +344,14 @@ def test_quantized_values_close_to_torch_reference(dtype):
 # 4. Optional bit-parity vs the SageAttention fork
 # ---------------------------------------------------------------------------
 
-sage_v2g = pytest.importorskip(
-    "sageattention.ulysses_v2g_ops", reason="fork reference not installed"
-)
+try:
+    import sageattention.ulysses_v2g_ops as sage_v2g
+except ImportError:  # only the fork-parity test below needs the reference
+    sage_v2g = None
 
 
 @requires_sm120
+@pytest.mark.skipif(sage_v2g is None, reason="fork reference not installed")
 @pytest.mark.parametrize("world", [4, 8])
 @pytest.mark.parametrize("local_sequence", [128, 384])
 def test_bit_parity_vs_fork(world, local_sequence):
@@ -344,14 +385,22 @@ def test_bit_parity_vs_fork(world, local_sequence):
     for d in range(world):
         recv = torch.stack([sends_fi[r][d] for r in range(world)]).contiguous()
         o_fi = lowp.unpack_for_sage(
-            recv, batch_size=1, local_sequence=L,
-            local_heads=local_heads, head_dim=_HEAD_DIM, world_size=world,
+            recv,
+            batch_size=1,
+            local_sequence=L,
+            local_heads=local_heads,
+            head_dim=_HEAD_DIM,
+            world_size=world,
         )
         o_rf = sage_v2g.unpack_lowp_a2a_v2g_for_sage(
-            recv, batch_size=1, local_sequence=L,
-            local_heads=local_heads, head_dim=_HEAD_DIM, world_size=world,
+            recv,
+            batch_size=1,
+            local_sequence=L,
+            local_heads=local_heads,
+            head_dim=_HEAD_DIM,
+            world_size=world,
         )
-        for x, y in zip(o_fi, o_rf):
+        for x, y in zip(o_fi, o_rf, strict=True):
             assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
 
 
@@ -370,8 +419,11 @@ def test_unaligned_unpack_reproduces_packed_bytes(world, local_sequence):
     q, k, v = _global_inputs(torch.bfloat16, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
     spec = lowp.payload_spec(
-        batch_size=1, local_sequence=L, num_heads=_HEADS,
-        head_dim=_HEAD_DIM, world_size=world,
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
     )
     local_heads = _HEADS // world
     S = world * L
@@ -379,13 +431,23 @@ def test_unaligned_unpack_reproduces_packed_bytes(world, local_sequence):
     d = world - 1
     recv = torch.stack([sends[r][d] for r in range(world)]).contiguous()
     q_u, k_u, v_u, q_scale_u, k_scale_u = lowp.unpack_for_sage(
-        recv, batch_size=1, local_sequence=L, local_heads=local_heads,
-        head_dim=_HEAD_DIM, world_size=world, aligned=False,
+        recv,
+        batch_size=1,
+        local_sequence=L,
+        local_heads=local_heads,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+        aligned=False,
     )
     rebuilt_q = torch.cat(
-        [recv[src, : int(spec["main_bytes"])]
-         .view(L, 1, local_heads, _HEAD_DIM).permute(1, 0, 2, 3)
-         for src in range(world)], dim=1)
+        [
+            recv[src, : int(spec["main_bytes"])]
+            .view(L, 1, local_heads, _HEAD_DIM)
+            .permute(1, 0, 2, 3)
+            for src in range(world)
+        ],
+        dim=1,
+    )
     assert torch.equal(q_u.view(torch.uint8), rebuilt_q.contiguous().view(torch.uint8))
     # owner-rule scale rebuild incl. deterministic zero tail
     q_groups_total = (S + 31) // 32
@@ -396,11 +458,15 @@ def test_unaligned_unpack_reproduces_packed_bytes(world, local_sequence):
             continue
         owner = (g * 32) // L
         owner_slot = g - (owner * L) // 32
-        section = recv[
-            owner,
-            int(spec["q_scale_offset"]) : int(spec["q_scale_offset"])
-            + local_heads * int(spec["q_slots_per_source"]) * 4,
-        ].view(torch.float32).view(1, local_heads, -1)
+        section = (
+            recv[
+                owner,
+                int(spec["q_scale_offset"]) : int(spec["q_scale_offset"])
+                + local_heads * int(spec["q_slots_per_source"]) * 4,
+            ]
+            .view(torch.float32)
+            .view(1, local_heads, -1)
+        )
         assert torch.equal(col, section[..., owner_slot]), f"slot {g}"
 
 
@@ -417,13 +483,17 @@ def test_boundary_derive_matches_direct_computation(world):
         s = slice(r * L, (r + 1) * L)
         k_r = k[:, s].contiguous()
         ka = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
-        gathered = torch.stack([
-            lowp.k_boundary_minmax(k[:, o * L : (o + 1) * L].contiguous(),
-                                   rank=o, world_size=world)
-            for o in range(world)
-        ])
-        lowp.derive_k_boundary_amax(ka, gathered, k_mean, rank=r,
-                                    local_sequence=L, world_size=world)
+        gathered = torch.stack(
+            [
+                lowp.k_boundary_minmax(
+                    k[:, o * L : (o + 1) * L].contiguous(), rank=o, world_size=world
+                )
+                for o in range(world)
+            ]
+        )
+        lowp.derive_k_boundary_amax(
+            ka, gathered, k_mean, rank=r, local_sequence=L, world_size=world
+        )
         g_first = lowp.group_first(r, L, 64)
         touched_count = lowp.touched(r, L, 64)
         for g in {g_first, g_first + touched_count - 1}:
@@ -443,22 +513,31 @@ def test_boundary_derive_matches_direct_computation(world):
 def test_boundary_merge_is_idempotent_and_max():
     world, L = 4, 65
     q, _, _ = _global_inputs(torch.bfloat16, world, L)
-    amaxes = [lowp.q_grouped_amax(q[:, r * L : (r + 1) * L].contiguous(),
-                                  rank=r, world_size=world) for r in range(world)]
-    descs = torch.stack([
-        lowp.boundary_descriptors(amaxes[r], rank=r, local_sequence=L,
-                                  group=32, world_size=world)
+    amaxes = [
+        lowp.q_grouped_amax(
+            q[:, r * L : (r + 1) * L].contiguous(), rank=r, world_size=world
+        )
         for r in range(world)
-    ])
+    ]
+    descs = torch.stack(
+        [
+            lowp.boundary_descriptors(
+                amaxes[r], rank=r, local_sequence=L, group=32, world_size=world
+            )
+            for r in range(world)
+        ]
+    )
     once = [a.clone() for a in amaxes]
     for r in range(world):
-        lowp.merge_boundary_amax(once[r], descs, rank=r, local_sequence=L,
-                                 group=32, world_size=world)
+        lowp.merge_boundary_amax(
+            once[r], descs, rank=r, local_sequence=L, group=32, world_size=world
+        )
     twice = [a.clone() for a in once]
     for r in range(world):
-        lowp.merge_boundary_amax(twice[r], descs, rank=r, local_sequence=L,
-                                 group=32, world_size=world)
-    for a, b in zip(once, twice):
+        lowp.merge_boundary_amax(
+            twice[r], descs, rank=r, local_sequence=L, group=32, world_size=world
+        )
+    for a, b in zip(once, twice, strict=True):
         assert torch.equal(a, b)
 
 
@@ -479,10 +558,12 @@ def test_fused_pack_matches_split_path(world, dtype):
         q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
         q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
         k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
-        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
-                                    v_scale, rank=r, world_size=world)
-        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
-                                          rank=r, world_size=world)
+        split = lowp.quant_qkv_pack(
+            q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+        )
+        fused = lowp.quant_qkv_pack_fused(
+            q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world
+        )
         assert torch.equal(split, fused)
 
 
@@ -500,13 +581,22 @@ def test_fused_pack_used_sequence_tail_repair_matches_split():
             s = slice(r * L, (r + 1) * L)
             q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
             q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
-            k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r,
-                                         world_size=world, used_sequence=used)
-            split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
-                                        v_scale, rank=r, world_size=world)
-            fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
-                                              rank=r, world_size=world,
-                                              used_sequence=used)
+            k_amax = lowp.k_grouped_amax(
+                k_r, k_mean, rank=r, world_size=world, used_sequence=used
+            )
+            split = lowp.quant_qkv_pack(
+                q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+            )
+            fused = lowp.quant_qkv_pack_fused(
+                q_r,
+                k_r,
+                v_r,
+                k_mean,
+                v_scale,
+                rank=r,
+                world_size=world,
+                used_sequence=used,
+            )
             assert torch.equal(split, fused), f"used={used} r={r}"
 
 
@@ -561,22 +651,26 @@ def test_interleaved_views_match_contiguous_pack(dtype):
         q_r, k_r, v_r = q[:, s], k[:, s], v[:, s]
         q_c, k_c, v_c = (x.contiguous() for x in (q_r, k_r, v_r))
         q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
-        k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world,
-                                     used_sequence=used)
+        k_amax = lowp.k_grouped_amax(
+            k_r, k_mean, rank=r, world_size=world, used_sequence=used
+        )
         assert torch.equal(q_amax, lowp.q_grouped_amax(q_c, rank=r, world_size=world))
         assert torch.equal(
             k_amax,
-            lowp.k_grouped_amax(k_c, k_mean, rank=r, world_size=world,
-                                used_sequence=used),
+            lowp.k_grouped_amax(
+                k_c, k_mean, rank=r, world_size=world, used_sequence=used
+            ),
         )
-        split_view = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
-                                         v_scale, rank=r, world_size=world)
-        split_ref = lowp.quant_qkv_pack(q_c, k_c, v_c, k_mean, q_amax, k_amax,
-                                        v_scale, rank=r, world_size=world)
+        split_view = lowp.quant_qkv_pack(
+            q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+        )
+        split_ref = lowp.quant_qkv_pack(
+            q_c, k_c, v_c, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+        )
         assert torch.equal(split_view, split_ref)
-        fused_view = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
-                                               rank=r, world_size=world,
-                                               used_sequence=used)
+        fused_view = lowp.quant_qkv_pack_fused(
+            q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world, used_sequence=used
+        )
         assert torch.equal(fused_view, split_ref)
 
 
@@ -594,13 +688,15 @@ def test_interleaved_views_match_contiguous_boundary_minmax():
 
 @requires_sm120
 def test_rejects_views_the_vector_loads_cannot_address():
-    base = torch.randn((1, 128, _HEADS, 3 * _HEAD_DIM + 8), device="cuda",
-                       dtype=torch.bfloat16)
-    misaligned = base[..., 1:1 + _HEAD_DIM]  # row starts 2 bytes past alignment
+    base = torch.randn(
+        (1, 128, _HEADS, 3 * _HEAD_DIM + 8), device="cuda", dtype=torch.bfloat16
+    )
+    misaligned = base[..., 1 : 1 + _HEAD_DIM]  # row starts 2 bytes past alignment
     with pytest.raises(ValueError, match="16-byte alignment"):
         lowp.q_grouped_amax(misaligned, rank=0, world_size=4)
-    transposed = torch.randn((1, 128, _HEAD_DIM, _HEADS), device="cuda",
-                             dtype=torch.bfloat16).transpose(-1, -2)
+    transposed = torch.randn(
+        (1, 128, _HEAD_DIM, _HEADS), device="cuda", dtype=torch.bfloat16
+    ).transpose(-1, -2)
     with pytest.raises(ValueError, match="contiguous along head_dim"):
         lowp.q_grouped_amax(transposed, rank=0, world_size=4)
 
@@ -617,23 +713,43 @@ def test_split_fused_halves_compose_to_the_combined_bytes(dtype):
     S = world * L
     q, k, v = _global_inputs(dtype, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
-    spec = lowp.payload_spec(batch_size=1, local_sequence=L, num_heads=_HEADS,
-                             head_dim=_HEAD_DIM, world_size=world)
+    spec = lowp.payload_spec(
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
     for used in (None, S - 130):
         for r in range(world):
             s = slice(r * L, (r + 1) * L)
             q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
-            combined = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
-                                                 rank=r, world_size=world,
-                                                 used_sequence=used)
-            send = torch.full((world, spec["chunk_bytes"]), 0xAB,
-                              dtype=torch.uint8, device="cuda")
+            combined = lowp.quant_qkv_pack_fused(
+                q_r,
+                k_r,
+                v_r,
+                k_mean,
+                v_scale,
+                rank=r,
+                world_size=world,
+                used_sequence=used,
+            )
+            send = torch.full(
+                (world, spec["chunk_bytes"]), 0xAB, dtype=torch.uint8, device="cuda"
+            )
             lowp.zero_scale_and_padding(send, spec)
             # KV first, Q second: the halves touch disjoint bytes so the
             # order must not matter.
-            lowp.quant_kv_into_payload_fused(k_r, v_r, k_mean, v_scale, send,
-                                             rank=r, world_size=world,
-                                             used_sequence=used)
+            lowp.quant_kv_into_payload_fused(
+                k_r,
+                v_r,
+                k_mean,
+                v_scale,
+                send,
+                rank=r,
+                world_size=world,
+                used_sequence=used,
+            )
             lowp.quant_q_into_payload_fused(q_r, send, rank=r, world_size=world)
             assert torch.equal(send, combined), f"used={used} r={r}"
 
@@ -645,23 +761,31 @@ def test_split_fused_q_half_on_a_side_stream():
     world, L = 8, 512
     q, k, v = _global_inputs(torch.bfloat16, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
-    spec = lowp.payload_spec(batch_size=1, local_sequence=L, num_heads=_HEADS,
-                             head_dim=_HEAD_DIM, world_size=world)
+    spec = lowp.payload_spec(
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
     side = torch.cuda.Stream()
     main = torch.cuda.current_stream()
     for r in range(world):
         s = slice(r * L, (r + 1) * L)
         q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
-        combined = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
-                                             rank=r, world_size=world)
-        send = torch.empty((world, spec["chunk_bytes"]), dtype=torch.uint8,
-                           device="cuda")
+        combined = lowp.quant_qkv_pack_fused(
+            q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world
+        )
+        send = torch.empty(
+            (world, spec["chunk_bytes"]), dtype=torch.uint8, device="cuda"
+        )
         lowp.zero_scale_and_padding(send, spec)
         side.wait_stream(main)
         with torch.cuda.stream(side):
             lowp.quant_q_into_payload_fused(q_r, send, rank=r, world_size=world)
-        lowp.quant_kv_into_payload_fused(k_r, v_r, k_mean, v_scale, send,
-                                         rank=r, world_size=world)
+        lowp.quant_kv_into_payload_fused(
+            k_r, v_r, k_mean, v_scale, send, rank=r, world_size=world
+        )
         main.wait_stream(side)
         assert torch.equal(send, combined), f"r={r}"
 
@@ -675,8 +799,9 @@ def test_split_fused_halves_reject_unaligned():
     km = torch.randn((1, 56, 128), device="cuda", dtype=torch.bfloat16)
     vs = torch.rand((1, 56, 128), device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="ALIGN-128"):
-        lowp.quant_kv_into_payload_fused(q, q.clone(), km, vs, send, rank=0,
-                                         world_size=4)
+        lowp.quant_kv_into_payload_fused(
+            q, q.clone(), km, vs, send, rank=0, world_size=4
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -703,14 +828,26 @@ def test_scale_sequence_is_the_prefix_of_the_full_width(world, local_sequence, a
     narrow scale tensors must equal the leading slots of the full-width ones
     and Q/K/V must be untouched by the option."""
     local_heads = _HEADS // world
-    spec = lowp.payload_spec(batch_size=1, local_sequence=local_sequence,
-                             num_heads=_HEADS, head_dim=_HEAD_DIM, world_size=world)
+    spec = lowp.payload_spec(
+        batch_size=1,
+        local_sequence=local_sequence,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
     S = spec["logical_sequence"]
     torch.manual_seed(1)
-    recv = torch.randint(0, 256, (world, spec["chunk_bytes"]), dtype=torch.uint8,
-                         device="cuda")
-    kwargs = dict(batch_size=1, local_sequence=local_sequence, local_heads=local_heads,
-                  head_dim=_HEAD_DIM, world_size=world, aligned=aligned)
+    recv = torch.randint(
+        0, 256, (world, spec["chunk_bytes"]), dtype=torch.uint8, device="cuda"
+    )
+    kwargs = dict(
+        batch_size=1,
+        local_sequence=local_sequence,
+        local_heads=local_heads,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+        aligned=aligned,
+    )
     q_full, k_full, v_full, qs_full, ks_full = lowp.unpack_for_sage(recv, **kwargs)
     assert qs_full.shape[-1] == spec["q_scale_alloc"]
     assert ks_full.shape[-1] == spec["k_scale_alloc"]
@@ -727,30 +864,48 @@ def test_scale_sequence_is_the_prefix_of_the_full_width(world, local_sequence, a
         assert torch.equal(q, q_full) and torch.equal(k, k_full)
         assert _same_bits(v, v_full)
         # out= must be sized with scale_widths(used)
-        outs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v),
-                torch.empty_like(qs), torch.empty_like(ks))
+        outs = (
+            torch.empty_like(q),
+            torch.empty_like(k),
+            torch.empty_like(v),
+            torch.empty_like(qs),
+            torch.empty_like(ks),
+        )
         lowp.unpack_for_sage(recv, scale_sequence=used, out=outs, **kwargs)
         assert _same_bits(outs[3], qs) and _same_bits(outs[4], ks)
 
 
 def _same_bits(a, b):
-    return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+    return torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
 
 
 @requires_sm120
 def test_scale_sequence_rejects_out_of_range_and_mismatched_out():
     world, local_sequence = 4, 256
-    spec = lowp.payload_spec(batch_size=1, local_sequence=local_sequence,
-                             num_heads=_HEADS, head_dim=_HEAD_DIM, world_size=world)
+    spec = lowp.payload_spec(
+        batch_size=1,
+        local_sequence=local_sequence,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
     S = spec["logical_sequence"]
     recv = torch.zeros((world, spec["chunk_bytes"]), dtype=torch.uint8, device="cuda")
-    kwargs = dict(batch_size=1, local_sequence=local_sequence, local_heads=_HEADS // world,
-                  head_dim=_HEAD_DIM, world_size=world)
+    kwargs = dict(
+        batch_size=1,
+        local_sequence=local_sequence,
+        local_heads=_HEADS // world,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
     for bad in (0, S + 1):
         with pytest.raises(ValueError, match="scale_sequence"):
             lowp.unpack_for_sage(recv, scale_sequence=bad, **kwargs)
     full = lowp.unpack_for_sage(recv, **kwargs)
-    with pytest.raises(Exception):  # FFI shape check: full-width scale buffers
+    # The FFI shape check rejects full-width scale buffers for a narrow request.
+    with pytest.raises(Exception, match="q_scale has shape"):
         lowp.unpack_for_sage(recv, scale_sequence=S - 130, out=full, **kwargs)
 
 
@@ -770,20 +925,53 @@ def _full_chain(q, k, v, k_mean, v_scale, world, L, used, enable_pdl):
         q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
         ks, va = lowp.k_sum_v_amax(k_r, v_r, enable_pdl=enable_pdl)
         qa = lowp.q_grouped_amax(q_r, rank=r, world_size=world, enable_pdl=enable_pdl)
-        ka = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world,
-                                 used_sequence=used, enable_pdl=enable_pdl)
-        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, qa, ka, v_scale, rank=r,
-                                    world_size=world, enable_pdl=enable_pdl)
-        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=r,
-                                          world_size=world, used_sequence=used,
-                                          enable_pdl=enable_pdl)
+        ka = lowp.k_grouped_amax(
+            k_r,
+            k_mean,
+            rank=r,
+            world_size=world,
+            used_sequence=used,
+            enable_pdl=enable_pdl,
+        )
+        split = lowp.quant_qkv_pack(
+            q_r,
+            k_r,
+            v_r,
+            k_mean,
+            qa,
+            ka,
+            v_scale,
+            rank=r,
+            world_size=world,
+            enable_pdl=enable_pdl,
+        )
+        fused = lowp.quant_qkv_pack_fused(
+            q_r,
+            k_r,
+            v_r,
+            k_mean,
+            v_scale,
+            rank=r,
+            world_size=world,
+            used_sequence=used,
+            enable_pdl=enable_pdl,
+        )
         v8 = lowp.quant_v_fp8_with_scale(v_r, v_scale, enable_pdl=enable_pdl)
         outs.extend([ks, va, qa, ka, split, fused, v8])
         sends.append(split)
     recv = torch.stack([sends[src][0] for src in range(world)])
-    outs.extend(lowp.unpack_for_sage(
-        recv, batch_size=1, local_sequence=L, local_heads=_HEADS // world,
-        head_dim=_HEAD_DIM, world_size=world, scale_sequence=used, enable_pdl=enable_pdl))
+    outs.extend(
+        lowp.unpack_for_sage(
+            recv,
+            batch_size=1,
+            local_sequence=L,
+            local_heads=_HEADS // world,
+            head_dim=_HEAD_DIM,
+            world_size=world,
+            scale_sequence=used,
+            enable_pdl=enable_pdl,
+        )
+    )
     return outs
 
 
@@ -798,7 +986,7 @@ def test_pdl_on_and_off_produce_identical_bytes(dtype):
         on = _full_chain(q, k, v, k_mean, v_scale, world, L, S - 130, True)
         off = _full_chain(q, k, v, k_mean, v_scale, world, L, S - 130, False)
         assert len(on) == len(off)
-        for i, (a, b) in enumerate(zip(on, off)):
+        for i, (a, b) in enumerate(zip(on, off, strict=True)):
             assert _same_bits(a, b), f"seed={seed} output #{i} differs with PDL"
 
 
@@ -808,23 +996,135 @@ def test_pdl_launches_capture_into_a_cuda_graph():
     q, k, v = _global_inputs(torch.bfloat16, world, L)
     k_mean, v_scale = _stats(k, v, world, L)
     q_r, k_r, v_r = (x[:, :L].contiguous() for x in (q, k, v))
-    eager = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
-                                      world_size=world, enable_pdl=True)
+    eager = lowp.quant_qkv_pack_fused(
+        q_r, k_r, v_r, k_mean, v_scale, rank=0, world_size=world, enable_pdl=True
+    )
     send = torch.empty_like(eager)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):  # warm-up on the capture stream
-        lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
-                                  world_size=world, out=send, enable_pdl=True)
+        lowp.quant_qkv_pack_fused(
+            q_r,
+            k_r,
+            v_r,
+            k_mean,
+            v_scale,
+            rank=0,
+            world_size=world,
+            out=send,
+            enable_pdl=True,
+        )
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=side):
-        lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=0,
-                                  world_size=world, out=send, enable_pdl=True)
+        lowp.quant_qkv_pack_fused(
+            q_r,
+            k_r,
+            v_r,
+            k_mean,
+            v_scale,
+            rank=0,
+            world_size=world,
+            out=send,
+            enable_pdl=True,
+        )
     send.fill_(0xCD)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(send, eager)
+
+
+@requires_sm120
+@pytest.mark.parametrize("aligned_shape", [True, False])
+def test_pdl_raw_edges_between_module_kernels(aligned_shape):
+    """Back-to-back MODULE kernels with a real read-after-write dependency and
+    no torch kernel in between: GroupedAmax -> pack reads the amax the
+    previous grid wrote, Partial -> Combine reads the partials, fused Q ->
+    fused K/V -> V share the payload.  Inputs are pre-contiguous and the
+    payload pre-zeroed so the only launches on the stream are ours; a
+    pdl_wait placed after a dependent read would surface here as a byte
+    difference against the fully serialized (PDL off) run."""
+    world, L = 4, (256 if aligned_shape else 1056)
+    dtype = torch.bfloat16
+    q, k, v = _global_inputs(dtype, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    spec = lowp.payload_spec(
+        batch_size=1,
+        local_sequence=L,
+        num_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        world_size=world,
+    )
+    shards = [
+        tuple(x[:, r * L : (r + 1) * L].contiguous() for x in (q, k, v))
+        for r in range(world)
+    ]
+    sends = {
+        pdl: [
+            torch.empty((world, spec["chunk_bytes"]), dtype=torch.uint8, device="cuda")
+            for _ in range(world)
+        ]
+        for pdl in (True, False)
+    }
+    fused = {
+        pdl: [torch.empty_like(sends[pdl][0]) for _ in range(world)]
+        for pdl in (True, False)
+    }
+    for pdl in (True, False):
+        for s in sends[pdl] + fused[pdl]:
+            lowp.zero_scale_and_padding(s, spec)
+    torch.cuda.synchronize()
+    stats = {}
+    for pdl in (True, False):
+        chain_stats = []
+        for r, (q_r, k_r, v_r) in enumerate(shards):
+            # Partial -> Combine (RAW on the partial workspaces)
+            chain_stats.append(lowp.k_sum_v_amax(k_r, v_r, enable_pdl=pdl))
+            # GroupedAmax(Q) -> Q pack (RAW on q_amax); GroupedAmax(K) -> K pack
+            qa = lowp.q_grouped_amax(q_r, rank=r, world_size=world, enable_pdl=pdl)
+            lowp.quant_q_into_payload(
+                q_r, qa, sends[pdl][r], rank=r, world_size=world, enable_pdl=pdl
+            )
+            ka = lowp.k_grouped_amax(
+                k_r, k_mean, rank=r, world_size=world, enable_pdl=pdl
+            )
+            lowp.quant_kv_into_payload(
+                k_r,
+                v_r,
+                k_mean,
+                ka,
+                v_scale,
+                sends[pdl][r],
+                rank=r,
+                world_size=world,
+                enable_pdl=pdl,
+            )
+            if aligned_shape:
+                # fused Q -> fused K -> V pack on one payload
+                lowp.quant_q_into_payload_fused(
+                    q_r, fused[pdl][r], rank=r, world_size=world, enable_pdl=pdl
+                )
+                lowp.quant_kv_into_payload_fused(
+                    k_r,
+                    v_r,
+                    k_mean,
+                    v_scale,
+                    fused[pdl][r],
+                    rank=r,
+                    world_size=world,
+                    enable_pdl=pdl,
+                )
+        stats[pdl] = chain_stats
+        if not pdl:
+            torch.cuda.synchronize()
+    torch.cuda.synchronize()
+    for r in range(world):
+        assert torch.equal(sends[True][r], sends[False][r]), f"split payload r={r}"
+        if aligned_shape:
+            assert torch.equal(fused[True][r], fused[False][r]), f"fused payload r={r}"
+            assert torch.equal(fused[True][r], sends[True][r]), f"fused!=split r={r}"
+        for a, b in zip(stats[True][r], stats[False][r], strict=True):
+            assert torch.equal(a, b), f"stats r={r}"
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +1150,7 @@ def test_packed_q_amax_matches_split_path_on_special_values(dtype):
     }
     # One 32-token Q group per case, each on a different rank/head, plus a
     # NaN-only group and a group mixing NaN with finite values.
-    for gi, (name, value) in enumerate(specials.items()):
+    for gi, value in enumerate(specials.values()):
         r, h = gi % world, gi
         rows = slice(r * L + gi * 32, r * L + (gi + 1) * 32)
         q[:, rows, h] = value
@@ -863,8 +1163,10 @@ def test_packed_q_amax_matches_split_path_on_special_values(dtype):
         q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
         q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
         k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
-        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale,
-                                    rank=r, world_size=world)
-        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale, rank=r,
-                                          world_size=world)
+        split = lowp.quant_qkv_pack(
+            q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+        )
+        fused = lowp.quant_qkv_pack_fused(
+            q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world
+        )
         assert torch.equal(split, fused), f"rank {r}"
