@@ -912,7 +912,7 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
 
 
 def test_attention_ts_context_uses_ldtm_stat_default_is_off():
-    """LDTM.STAT row_max is off unless FmhaTs(uses_ldtm_stat=True) is passed."""
+    """FmhaTs stays off unless requested; the runner enables it on SM103/SM107."""
     from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
         FmhaConfig,
     )
@@ -935,6 +935,15 @@ def test_attention_ts_context_uses_ldtm_stat_default_is_off():
         uses_ldtm_stat=True,
     )
     assert enabled_fmha.cfg.uses_ldtm_stat is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
+    """Context attention enables LDTM.STAT on B300 (SM103) and Rubin (SM107)."""
+    expected = torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+    assert (
+        context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
+    )
 
 
 def test_attention_ts_context_uses_ldtm_stat_schedule_builds():

@@ -2368,8 +2368,9 @@ class FmhaTs:
         Enable skip-correction for softmax rescaling (default: True).
     uses_ldtm_stat : bool, optional
         Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
-        into the TMEM S load on the non-masked path (default: False). Requires
-        SM103+/SM110+.
+        into the TMEM S load on the non-masked path (default: False). The
+        context runner enables this by default on SM103 (B300) and SM107
+        (Rubin).
     causal_single_kv_tile : bool, optional
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
