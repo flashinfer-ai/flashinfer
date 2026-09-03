@@ -322,7 +322,7 @@ def _load_source_bundle() -> tuple[Path, bytes]:
         "constraints": {
             "dtypes": ["float16", "bfloat16"],
             "hidden_dim": 7168,
-            "max_tokens": 2048,
+            "max_lamport_comm_size_bytes": 2145386496,
             "quantization": False,
             "world_sizes": [2, 4, 8],
         },

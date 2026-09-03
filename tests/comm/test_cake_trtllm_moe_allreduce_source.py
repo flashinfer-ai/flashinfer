@@ -67,6 +67,8 @@ def test_source_bundle_has_exact_twelve_symbol_inventory() -> None:
     assert manifest["kernel_symbols"] == list(backend._KERNEL_SYMBOLS)
     assert manifest["architectures"] == ["sm_100a", "sm_103a"]
     assert manifest["constraints"]["world_sizes"] == [2, 4, 8]
+    assert manifest["constraints"]["max_lamport_comm_size_bytes"] == 2145386496
+    assert "max_tokens" not in manifest["constraints"]
     assert not re.search(rb"kernel_cake_trtllm_moe_(?!reduction_)", source)
 
 

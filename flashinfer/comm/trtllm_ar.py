@@ -1169,7 +1169,6 @@ def trtllm_allreduce_fusion(
 
 _CakeMoeAllReduceBackend = Literal["trtllm", "cake"]
 _CAKE_MOE_ALLREDUCE_HIDDEN_DIM = 7168
-_CAKE_MOE_ALLREDUCE_MAX_TOKENS = 2048
 
 
 def _check_cake_moe_allreduce_backend(backend: str) -> None:
@@ -1235,11 +1234,8 @@ def _validate_cake_moe_allreduce(
         raise ValueError("Cake MoE all-reduce supports world_size 2, 4, or 8 only")
     if not 0 <= world_rank < world_size:
         raise ValueError("world_rank must be in [0, world_size)")
-    if not 1 <= token_num <= _CAKE_MOE_ALLREDUCE_MAX_TOKENS:
-        raise ValueError(
-            "Cake MoE all-reduce supports 1 to "
-            f"{_CAKE_MOE_ALLREDUCE_MAX_TOKENS} tokens"
-        )
+    if token_num < 1:
+        raise ValueError("Cake MoE all-reduce requires at least 1 token")
     if hidden_dim != _CAKE_MOE_ALLREDUCE_HIDDEN_DIM:
         raise ValueError(
             "Cake MoE all-reduce requires "
@@ -1359,9 +1355,10 @@ def trtllm_moe_allreduce_fusion(
       backend. The public Python API has 22 parameters; the isolated source
       module's ``run_reduction`` entry has an exact 18-argument FFI ABI.
       The optional backend supports contiguous FP16/BF16 tensors, world sizes 2, 4,
-      and 8, hidden_dim=7168, 1 to 2048 tokens, and residual plus norm outputs.
-      It does not support quantization. ``weight_bias`` remains a runtime value;
-      ``None`` is passed to the kernel as 0.0.
+      and 8, hidden_dim=7168, token payloads within the existing Lamport
+      ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It does not
+      support quantization. ``weight_bias`` remains a runtime value; ``None`` is
+      passed to the kernel as 0.0.
     """
 
     _check_cake_moe_allreduce_backend(backend)

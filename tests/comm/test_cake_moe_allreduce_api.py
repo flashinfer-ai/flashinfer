@@ -138,6 +138,75 @@ def test_cake_backend_dispatches_exact_18_argument_ffi_contract(
     assert call[17] is None
 
 
+def test_cake_validator_accepts_tokens_above_legacy_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_num = 2049
+    hidden_dim = 7168
+    experts = 2
+    device = torch.device("cuda:0")
+
+    def fake_tensor(numel: int, dtype: torch.dtype) -> SimpleNamespace:
+        return SimpleNamespace(
+            device=device,
+            dtype=dtype,
+            numel=lambda: numel,
+            is_contiguous=lambda: True,
+        )
+
+    dtype = torch.float16
+    token_elements = token_num * hidden_dim
+    monkeypatch.setattr(trtllm_ar, "_check_cake_moe_allreduce_arch", lambda _: None)
+
+    device_index = trtllm_ar._validate_cake_moe_allreduce(
+        world_size=2,
+        world_rank=0,
+        token_num=token_num,
+        hidden_dim=hidden_dim,
+        workspace_ptrs=fake_tensor(7, torch.int64),
+        residual_in=fake_tensor(token_elements, dtype),
+        rms_gamma=fake_tensor(hidden_dim, dtype),
+        moe_reduction_device_num_experts=experts,
+        moe_reduction_scale_input=fake_tensor(experts * token_num, torch.float32),
+        moe_reduction_active_experts_token_input=fake_tensor(
+            experts * token_elements, dtype
+        ),
+        moe_reduction_token_input=fake_tensor(token_elements, dtype),
+        layout_code=None,
+        moe_allreduce_out=None,
+        residual_out=fake_tensor(token_elements, dtype),
+        norm_out=fake_tensor(token_elements, dtype),
+        quant_out=None,
+        scale_out=None,
+    )
+
+    assert device_index == 0
+    assert not hasattr(trtllm_ar, "_CAKE_MOE_ALLREDUCE_MAX_TOKENS")
+
+
+def test_lamport_byte_limit_rejects_before_backend_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_size = 2
+    overflow_numel = trtllm_ar.MAX_COMM_SIZE // (2 * world_size) + 1
+    args = _reduction_args()
+    args["moe_reduction_token_input"] = SimpleNamespace(numel=lambda: overflow_numel)
+    monkeypatch.setattr(
+        trtllm_ar,
+        "get_cake_moe_allreduce_module",
+        lambda _: pytest.fail("oversize payload must fail before Cake module load"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"required_lamport_comm_size .* is greater than MAX_COMM_SIZE "
+            rf"{trtllm_ar.MAX_COMM_SIZE}"
+        ),
+    ):
+        trtllm_ar.trtllm_moe_allreduce_fusion(**args, backend="cake")
+
+
 def test_invalid_backend_fails_before_module_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

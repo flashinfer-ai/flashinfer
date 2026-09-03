@@ -12,7 +12,7 @@
       "bfloat16"
     ],
     "hidden_dim": 7168,
-    "max_tokens": 2048,
+    "max_lamport_comm_size_bytes": 2145386496,
     "quantization": false,
     "world_sizes": [
       2,
