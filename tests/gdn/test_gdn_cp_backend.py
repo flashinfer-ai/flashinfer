@@ -36,6 +36,10 @@ def _source_root() -> Path:
     return Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "gdn_cp"
 
 
+def _cuda_major() -> int:
+    return int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+
+
 def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     """Require exact non-finite masks and the public tolerance elsewhere."""
 
@@ -73,6 +77,13 @@ def test_generated_source_inventory_and_hashes() -> None:
     }
     assert manifest["frozen_performance_shape_count"] == 120
     assert len(manifest["frozen_performance_shapes"]) == 120
+    assert {
+        (shape["Hq"], shape["Hk"], shape["Hv"])
+        for shape in manifest["frozen_performance_shapes"]
+    } == gdn_prefill._GDN_CP_QUALIFIED_HEAD_SHAPES
+    assert {
+        tuple(shape["seq_lens"]) for shape in manifest["frozen_performance_shapes"]
+    } == gdn_prefill._GDN_CP_QUALIFIED_SEQUENCE_SHAPES
     assert len(tuple(path for path in root.rglob("*") if path.is_file())) == 72
     assert manifest["launch_order"] == [
         "t_precompute",
@@ -84,7 +95,7 @@ def test_generated_source_inventory_and_hashes() -> None:
     assert len(manifest["cuda_headers"]) == 1
     assert manifest["cuda_headers"][0]["path"] == "cuda/gdn_cp_common.cuh"
     assert manifest["cuda_headers"][0]["sha256"] == (
-        "f42b51a944b0b0ed1481a8a05daa48bf4e9b6cd354f9eac97cce17be60fa3af3"
+        "58977b0805adba62e0f07df9e3e90d4b46754fc672f02deef6c27f0b55952777"
     )
     assert [record["name"] for record in manifest["kernels"]] == [
         "qk_norm",
@@ -981,6 +992,40 @@ def test_public_gdn_cp_cache_requires_warmed_metadata_during_graph_capture(
         invoke(cu_seqlens)
 
 
+def _qualified_public_dispatch_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    q = torch.zeros((2048, 2, 128), dtype=torch.float16)
+    k = torch.zeros_like(q)
+    v = torch.zeros((2048, 8, 128), dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, 2048], dtype=torch.int32)
+    return q, k, v, cu_seqlens
+
+
+def test_qualified_shape_metadata_is_reused_during_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = SimpleNamespace(ndim=3, shape=(2048, 2, 128), is_cuda=True)
+    k = SimpleNamespace(ndim=3, shape=(2048, 2, 128))
+    v = SimpleNamespace(ndim=3, shape=(2048, 8, 128))
+    cu_seqlens = torch.tensor([0, 2048], dtype=torch.int32)
+    capturing = False
+
+    monkeypatch.setattr(
+        gdn_prefill.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+    monkeypatch.setattr(gdn_prefill, "_gdn_cp_qualified_metadata_binding", None)
+
+    assert gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
+    capturing = True
+    assert gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
+    cu_seqlens.add_(0)
+    with pytest.raises(RuntimeError, match="same unchanged tensors"):
+        gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
+
+
 @pytest.mark.parametrize(
     ("use_cp", "heuristic_matches", "expected_route"),
     [
@@ -1018,17 +1063,16 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
         lambda *_args, **_kwargs: calls.append("non_cp"),
     )
 
-    q = torch.zeros((2, 1, 128), dtype=torch.float16)
-    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
     output = gdn_prefill.chunk_gated_delta_rule(
         q,
-        q,
-        q,
+        k,
+        v,
         cu_seqlens=cu_seqlens,
         use_cp=use_cp,
     )
 
-    assert output.shape == q.shape
+    assert output.shape == (2048, 8, 128)
     assert calls == [expected_route]
 
 
@@ -1049,16 +1093,16 @@ def test_public_dispatch_allows_gdn_cp_before_cuda_13(
         lambda *_args, **_kwargs: calls.append("gdn_cp"),
     )
 
-    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
     output = gdn_prefill.chunk_gated_delta_rule(
         q,
-        q,
-        q,
-        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
         use_cp=True,
     )
 
-    assert output.shape == q.shape
+    assert output.shape == (2048, 8, 128)
     assert calls == ["gdn_cp"]
 
 
@@ -1079,13 +1123,13 @@ def test_public_dispatch_rejects_gdn_cp_before_cuda_12_8(
         lambda *_args, **_kwargs: calls.append("gdn_cp"),
     )
 
-    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
     with pytest.raises(ValueError, match="GDN CP SM100 kernel requires CUDA 12.8"):
         gdn_prefill.chunk_gated_delta_rule(
             q,
-            q,
-            q,
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
             use_cp=True,
         )
 
@@ -1127,12 +1171,12 @@ def test_public_dispatch_keeps_cuda_13_gate_for_sm100_dsl(
 @pytest.mark.parametrize(
     ("extension", "expected_route"),
     [
-        ("checkpoint", "gdn_cp"),
+        ("checkpoint", "cute_cp"),
         ("fp8_state", "cute_cp"),
-        ("cp_chunk_len", "gdn_cp"),
+        ("cp_chunk_len", "cute_cp"),
     ],
 )
-def test_public_dispatch_preserves_upstream_sm100_cp_extensions(
+def test_public_dispatch_routes_unqualified_sm100_cp_extensions_to_dsl(
     monkeypatch: pytest.MonkeyPatch,
     extension: str,
     expected_route: str,
@@ -1192,15 +1236,50 @@ def test_public_dispatch_fails_closed_when_gdn_cp_is_unavailable(
     monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
     monkeypatch.setattr(gdn_prefill, "_chunk_gated_delta_rule_gdn_cp_sm100", None)
 
-    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
     with pytest.raises(ValueError, match="GDN CP SM100 kernel"):
         gdn_prefill.chunk_gated_delta_rule(
             q,
-            q,
-            q,
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
             use_cp=True,
         )
+
+
+def test_public_dispatch_routes_other_blackwell_capabilities_to_dsl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 84)
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(
+        gdn_prefill, "get_device_name", lambda _device: "NVIDIA RTX PRO"
+    )
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **_kwargs: calls.append("gdn_cp"),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "cp_delta_rule_dsl_sm100",
+        lambda *_args, **_kwargs: calls.append("cute_cp"),
+    )
+
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
+    output = gdn_prefill.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        use_cp=True,
+    )
+
+    assert output.shape == (2048, 8, 128)
+    assert calls == ["cute_cp"]
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -1293,9 +1372,7 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
-def test_public_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph() -> None:
     torch.manual_seed(4436)
     seq_lens = (128, 256)
     interval = 128
@@ -1371,35 +1448,29 @@ def test_public_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
         token_start += seq_len
     expected_checkpoints_tensor = torch.stack(expected_checkpoints)
 
-    def forbidden_external(*_args, **_kwargs):
-        raise AssertionError("checkpoint route left the GDN CP backend")
-
-    monkeypatch.setattr(gdn_prefill, "cp_delta_rule_dsl_sm100", forbidden_external)
     gdn_cp._public_key = None
     gdn_cp._public_prepared = None
 
     def invoke() -> None:
-        result = gdn_prefill.chunk_gated_delta_rule(
+        gdn_cp.chunk_gated_delta_rule_gdn_cp_sm100(
+            output,
+            output_state,
             q,
             k,
             v,
             alpha,
             beta,
-            1.0 / 128**0.5,
-            None,
-            True,
             cu_seqlens,
-            True,
-            output=output,
-            output_state=output_state,
+            1.0 / 128**0.5,
+            initial_state=None,
+            state_indices=None,
             state_checkpoints=checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=interval,
-            use_cp=True,
-            _cp_chunk_len=interval,
+            cp_chunk_len=interval,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
-        assert result[0] is output
-        assert result[1] is output_state
 
     stream = torch.cuda.Stream()
     torch.cuda.synchronize()
@@ -1451,8 +1522,10 @@ def _allocate_state_pool(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an SM100a-compatible GPU",
+    not torch.cuda.is_available()
+    or not is_sm100a_supported(torch.device("cuda"))
+    or _cuda_major() < 13,
+    reason="requires an SM100a-compatible GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     "case",
@@ -1513,7 +1586,8 @@ def _allocate_state_pool(
     ],
     ids=lambda case: case["label"],
 )
-def test_generic_backend_matches_pr4078_state_and_lifecycle(
+def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
     case: dict[str, object],
 ) -> None:
     from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
@@ -1633,22 +1707,35 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
         state_indices=state_indices,
         max_seqlen=total,
     )
-    prepared = gdn_cp.prepare_gdn_cp_prefill(
+
+    def forbidden_generated(*_args, **_kwargs):
+        raise AssertionError("unqualified public route entered generated GDN CP")
+
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        forbidden_generated,
+    )
+    result = gdn_prefill.chunk_gated_delta_rule(
         q,
         k,
         v,
         alpha,
         beta,
-        cu_seqlens,
-        candidate_initial,
-        seq_lens=seq_lens,
+        float(case["scale"]),
+        initial_state=candidate_initial,
+        output_final_state=output_state_dtype is not None,
+        cu_seqlens=cu_seqlens,
         output=output,
         output_state=candidate_state,
         state_indices=state_indices,
-        scale=float(case["scale"]),
-        output_final_state=output_state_dtype is not None,
+        use_cp=True,
     )
-    actual_output, actual_state = prepared.replay()
+    if output_state_dtype is None:
+        actual_output = result
+        actual_state = None
+    else:
+        actual_output, actual_state = result
     torch.cuda.synchronize()
 
     _assert_oracle_close(actual_output, expected_output)
@@ -1673,8 +1760,10 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an SM100a-compatible GPU",
+    not torch.cuda.is_available()
+    or not is_sm100a_supported(torch.device("cuda"))
+    or _cuda_major() < 13,
+    reason="requires an SM100a-compatible GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     ("seq_lens", "cu_dtype"),
@@ -1688,7 +1777,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     seq_lens: tuple[int, ...],
     cu_dtype: torch.dtype,
 ) -> None:
-    """Keep empty rows semantic while staying exclusively on the GDN CP route."""
+    """Keep empty-row semantics when an unqualified shape uses the CP DSL."""
 
     torch.manual_seed(504079 + sum(seq_lens))
     total = sum(seq_lens)
@@ -1739,29 +1828,29 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     )
     output_state_before = output_state.clone()
     route_calls: list[str] = []
-    real_gdn_cp = gdn_prefill._chunk_gated_delta_rule_gdn_cp_sm100
+    real_dsl = gdn_prefill.cp_delta_rule_dsl_sm100
 
-    def observed_gdn_cp(*args, **kwargs):
-        route_calls.append("gdn_cp")
-        return real_gdn_cp(*args, **kwargs)
+    def observed_dsl(*args, **kwargs):
+        route_calls.append("cute_cp")
+        return real_dsl(*args, **kwargs)
 
-    def forbidden_external(*_args, **_kwargs):
-        raise AssertionError("zero-length public route left GDN CP")
+    def forbidden_generated(*_args, **_kwargs):
+        raise AssertionError("unqualified zero-length route entered generated GDN CP")
 
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_gdn_cp_sm100",
-        observed_gdn_cp,
+        forbidden_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "chunk_gated_delta_rule_sm100",
-        forbidden_external,
+        forbidden_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "cp_delta_rule_dsl_sm100",
-        forbidden_external,
+        observed_dsl,
         raising=False,
     )
     gdn_cp._reset_gdn_cp_prefill_cache()
@@ -1784,7 +1873,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     )
     torch.cuda.synchronize()
 
-    assert route_calls == ["gdn_cp"]
+    assert route_calls == ["cute_cp"]
     assert actual_output is output
     assert actual_state is output_state
     _assert_oracle_close(actual_output, expected_output)
@@ -1800,13 +1889,15 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="requires an SM100a-compatible GPU",
+    not torch.cuda.is_available()
+    or not is_sm100a_supported(torch.device("cuda"))
+    or _cuda_major() < 13,
+    reason="requires an SM100a-compatible GPU with CUDA 13",
 )
-def test_public_dispatcher_uses_only_gdn_cp_for_indexed_inplace_gqa(
+def test_public_dispatcher_uses_dsl_for_unqualified_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the GDN CP public use_cp=True route with no external arm."""
+    """Exercise the unqualified public use_cp=True fallback to the CP DSL."""
 
     torch.manual_seed(504078)
     seq_lens = (64, 129)
@@ -1861,30 +1952,30 @@ def test_public_dispatcher_uses_only_gdn_cp_for_indexed_inplace_gqa(
 
     immutable = tuple(tensor.clone() for tensor in (q, k, v, cu_seqlens, state_indices))
     state_before = candidate_state.clone()
-    gdn_cp_calls: list[str] = []
-    real_gdn_cp = gdn_prefill._chunk_gated_delta_rule_gdn_cp_sm100
+    route_calls: list[str] = []
+    real_dsl = gdn_prefill.cp_delta_rule_dsl_sm100
 
-    def observed_gdn_cp(*args, **kwargs):
-        gdn_cp_calls.append("gdn_cp")
-        return real_gdn_cp(*args, **kwargs)
+    def observed_dsl(*args, **kwargs):
+        route_calls.append("cute_cp")
+        return real_dsl(*args, **kwargs)
 
-    def forbidden_external(*_args, **_kwargs):
-        raise AssertionError("public SM100/SM103 use_cp=True route left GDN CP")
+    def forbidden_generated(*_args, **_kwargs):
+        raise AssertionError("unqualified public route entered generated GDN CP")
 
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_gdn_cp_sm100",
-        observed_gdn_cp,
+        forbidden_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "chunk_gated_delta_rule_sm100",
-        forbidden_external,
+        forbidden_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "cp_delta_rule_dsl_sm100",
-        forbidden_external,
+        observed_dsl,
         raising=False,
     )
     gdn_cp._public_key = None
@@ -1908,7 +1999,7 @@ def test_public_dispatcher_uses_only_gdn_cp_for_indexed_inplace_gqa(
     )
     torch.cuda.synchronize()
 
-    assert gdn_cp_calls == ["gdn_cp"]
+    assert route_calls == ["cute_cp"]
     assert actual_output is output
     assert actual_state is candidate_state
     torch.testing.assert_close(actual_output, expected_output, atol=1e-2, rtol=1e-2)
