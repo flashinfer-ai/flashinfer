@@ -678,6 +678,7 @@ def create_load_task(
 
 
 def create_mma_task(
+    gmem_qkv: GmemQKVResource,
     smem_q: SmemQResource,
     smem_kv: SmemKVResource,
     tmem_sp0: TmemSPResource,
@@ -693,14 +694,16 @@ def create_mma_task(
     """Create the one-warp MMA compute task."""
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
-    src = _src_resources(smem_q, smem_kv, work_queue=work_queue)
+    src = _src_resources(gmem_qkv, smem_q, smem_kv, work_queue=work_queue)
 
     if (
         smem_q.cfg.single_qkv_instance
         and smem_q.cfg.has_tmem_p_pipeline
         and tmem_p0 is not None
     ):
-        split_src = _src_resources(smem_q, smem_kv, tmem_p0, work_queue=work_queue)
+        split_src = _src_resources(
+            gmem_qkv, smem_q, smem_kv, tmem_p0, work_queue=work_queue
+        )
         num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
         loop_carried_head_dim_stages = 2
@@ -712,6 +715,7 @@ def create_mma_task(
 
         @schedule
         def mma_schedule(
+            gqkv: GmemQKVResource,
             sq: SmemQResource,
             skv: SmemKVResource,
             sp0: TmemSPResource,
@@ -727,6 +731,24 @@ def create_mma_task(
             with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
                 sp0.init_mma_work_tile_state()
                 to.init_mma_work_tile_state()
+                v_seqlen_k = Int32(0)
+                v_kv_tile_start = Int32(0)
+                if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    (
+                        _seq_coord,
+                        _head_coord,
+                        _kv_head_coord,
+                        _head_coord_kv,
+                        _batch_coord,
+                        _seq_coord_q,
+                        _cuseqlen_q,
+                        _cuseqlen_k,
+                        _seqlen_q,
+                        v_seqlen_k,
+                        v_kv_tile_start,
+                        _kv_request_begin,
+                        _kv_page_idx_ub,
+                    ) = gqkv.compute_coords()
 
                 sq.wait()
                 desc_q0_base = sq.q0_desc(inst_idx=0)
@@ -784,7 +806,14 @@ def create_mma_task(
                     to.set_p_base(tmem_p_base=tmem_p_base)
 
                     skv.wait()
-                    desc_v_base = skv.v_desc()
+                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                        desc_v_base = skv.v_desc_paged(
+                            section=FmhaStage.Loop,
+                            seqlen_k=v_seqlen_k,
+                            kv_tile_start=v_kv_tile_start,
+                        )
+                    else:
+                        desc_v_base = skv.v_desc()
                     to.pv_mma(
                         desc_v_base=desc_v_base,
                         section=FmhaStage.Loop,
@@ -793,7 +822,14 @@ def create_mma_task(
                     skv.release()
 
                     skv.wait()
-                    desc_v_base = skv.v_desc()
+                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                        desc_v_base = skv.v_desc_paged(
+                            section=FmhaStage.Loop,
+                            seqlen_k=v_seqlen_k,
+                            kv_tile_start=v_kv_tile_start,
+                        )
+                    else:
+                        desc_v_base = skv.v_desc()
                     to.pv_mma(
                         desc_v_base=desc_v_base,
                         section=FmhaStage.Loop,
@@ -810,7 +846,14 @@ def create_mma_task(
                 to.set_p_base(tmem_p_base=tmem_p_base)
                 for head_dim_stage_idx in range(num_head_dim_stages_v):
                     skv.wait()
-                    desc_v_base = skv.v_desc()
+                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                        desc_v_base = skv.v_desc_paged(
+                            section=FmhaStage.Tail,
+                            seqlen_k=v_seqlen_k,
+                            kv_tile_start=v_kv_tile_start,
+                        )
+                    else:
+                        desc_v_base = skv.v_desc()
                     to.pv_mma(
                         desc_v_base=desc_v_base,
                         section=FmhaStage.Tail,
@@ -830,6 +873,7 @@ def create_mma_task(
 
         captured_schedule = _schedule_with_work_queue(
             mma_schedule,
+            gmem_qkv,
             smem_q,
             smem_kv,
             tmem_sp0,
@@ -856,6 +900,7 @@ def create_mma_task(
 
         @schedule
         def mma_schedule(
+            gqkv: GmemQKVResource,
             sq: SmemQResource,
             skv: SmemKVResource,
             sp0: TmemSPResource,
@@ -869,6 +914,24 @@ def create_mma_task(
             to.create_function_variables()
             vd0.create_function_variables()
             with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
+                v_seqlen_k = Int32(0)
+                v_kv_tile_start = Int32(0)
+                if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    (
+                        _seq_coord,
+                        _head_coord,
+                        _kv_head_coord,
+                        _head_coord_kv,
+                        _batch_coord,
+                        _seq_coord_q,
+                        _cuseqlen_q,
+                        _cuseqlen_k,
+                        _seqlen_q,
+                        v_seqlen_k,
+                        v_kv_tile_start,
+                        _kv_request_begin,
+                        _kv_page_idx_ub,
+                    ) = gqkv.compute_coords()
                 if wq is not None:
                     sp0.create_work_tile_variables()
                     to.create_work_tile_variables()
@@ -897,7 +960,14 @@ def create_mma_task(
                     sp0.p_read()
                     for head_dim_stage_idx in range(num_head_dim_stages_v):
                         skv.wait()
-                        desc_v_base = skv.v_desc()
+                        if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                            desc_v_base = skv.v_desc_paged(
+                                section=FmhaStage.Loop,
+                                seqlen_k=v_seqlen_k,
+                                kv_tile_start=v_kv_tile_start,
+                            )
+                        else:
+                            desc_v_base = skv.v_desc()
                         to.pv_mma(
                             desc_v_base=desc_v_base,
                             section=FmhaStage.Loop,
@@ -911,6 +981,7 @@ def create_mma_task(
 
         captured_schedule = _schedule_with_work_queue(
             mma_schedule,
+            gmem_qkv,
             smem_q,
             smem_kv,
             tmem_sp0,
@@ -934,6 +1005,7 @@ def create_mma_task(
 
     @schedule
     def mma_schedule(
+        gqkv: GmemQKVResource,
         sq: SmemQResource,
         skv: SmemKVResource,
         sp0: TmemSPResource,
@@ -950,6 +1022,24 @@ def create_mma_task(
         sp1.init_mma_state()
         to.init_mma_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
+            v_seqlen_k = Int32(0)
+            v_kv_tile_start = Int32(0)
+            if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                (
+                    _seq_coord,
+                    _head_coord,
+                    _kv_head_coord,
+                    _head_coord_kv,
+                    _batch_coord,
+                    _seq_coord_q,
+                    _cuseqlen_q,
+                    _cuseqlen_k,
+                    _seqlen_q,
+                    v_seqlen_k,
+                    v_kv_tile_start,
+                    _kv_request_begin,
+                    _kv_page_idx_ub,
+                ) = gqkv.compute_coords()
             # HEAD: consume Q0, K0, Q1, and V0. TmemStatsDone starts empty, so
             # the first acquire succeeds without priming. On later work tiles,
             # correction has released the previous stats slot.
@@ -988,7 +1078,14 @@ def create_mma_task(
             # Release K0 (done with QK→S0 and QK→S1), then consume V0.
             skv.release()
             skv.wait()
-            desc_v_base = skv.v_desc()
+            if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                desc_v_base = skv.v_desc_paged(
+                    section=FmhaStage.Head,
+                    seqlen_k=v_seqlen_k,
+                    kv_tile_start=v_kv_tile_start,
+                )
+            else:
+                desc_v_base = skv.v_desc()
             # Acquire O first (off critical path), then acquire SP0 and run PV→O0.
             to.acquire()
             sp0.acquire()
@@ -1028,7 +1125,15 @@ def create_mma_task(
                 # Release Ki+1, then wait Vi+1.
                 skv.release()
                 skv.wait()
-                desc_v_base = skv.v_desc()
+                if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    desc_v_base = skv.v_desc_paged(
+                        section=FmhaStage.Loop,
+                        tile_offset=1,
+                        seqlen_k=v_seqlen_k,
+                        kv_tile_start=v_kv_tile_start,
+                    )
+                else:
+                    desc_v_base = skv.v_desc()
                 # PV0: P0 * Vi+1 → O0.
                 to.acquire()
                 sp0.acquire()
@@ -1059,6 +1164,7 @@ def create_mma_task(
 
     captured_schedule = _schedule_with_work_queue(
         mma_schedule,
+        gmem_qkv,
         smem_q,
         smem_kv,
         tmem_sp0,

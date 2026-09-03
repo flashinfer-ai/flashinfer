@@ -1156,8 +1156,8 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
     return leading_byte_offset, stride_byte_offset
 
 
-def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
-    """Return the shared-memory swizzle used when staging O for TMA store."""
+def _qkv_smem_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
+    """Return the physical TMA swizzle used by Q/K/V SMEM fragments."""
     inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return cutlass.Swizzle(3, 4, 3)
@@ -1166,6 +1166,11 @@ def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
     if inner_dim_size == 32:
         return cutlass.Swizzle(1, 4, 3)
     raise RuntimeError(f"Unsupported inner dimension size: {inner_dim_size}")
+
+
+def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
+    """Return the shared-memory swizzle used when staging O for TMA store."""
+    return _qkv_smem_swizzle(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1706,12 +1711,8 @@ class SmemKVResource(MemoryResource):
 
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Paged-KV path: read pre-staged page IDs and issue one TMA per
-            # (page fragment, d fragment). K uses the dense descriptor with
-            # coordinates (d_off, 0, kv_head_coord, page_id). V uses the
-            # flattened ragged descriptor (D, Hkv * page_size, pages); its
-            # per-request logical extent makes TMA zero-fill invalid final-page
-            # rows before PV consumes them. SMEM layout and transaction counts
-            # remain identical for both descriptors.
+            # (page fragment, d fragment). K and V share the native rank-4
+            # descriptor coordinates (d_off, 0, kv_head_coord, page_id).
             tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
             pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
             d_granu_inner = self.cfg.tma_copy_kv_granu_inner
@@ -1755,39 +1756,16 @@ class SmemKVResource(MemoryResource):
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])
-                    logical_page_idx = tile_idx * Int32(pages_per_tile) + Int32(frag)
                     for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
                         d_offset = Int32(
                             head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                             + i * d_granu_inner
                         )
                         smem_offset = Int32(i * d_iter_elems + frag * page_d_elems)
-                        if cutlass.const_expr(is_v):
-                            tma_coords = transform_ragged_coords(
-                                (
-                                    d_offset,
-                                    kv_head_coord * Int32(self.cfg.num_tokens_per_page),
-                                    page_id,
-                                ),
-                                ragged_dim_idx=1,
-                                ragged_box_size=self.cfg.num_tokens_per_page,
-                                ragged_extent=(
-                                    seqlen_k
-                                    - logical_page_idx
-                                    * Int32(self.cfg.num_tokens_per_page)
-                                ),
-                            )
-                        else:
-                            tma_coords = (
-                                d_offset,
-                                Int32(0),
-                                kv_head_coord,
-                                page_id,
-                            )
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             sK_curr.subview(smem_offset),
                             tma_desc,
-                            tma_coords,
+                            (d_offset, Int32(0), kv_head_coord, page_id),
                             stage_info.barrier,
                         )
             return
@@ -1987,20 +1965,128 @@ class SmemKVResource(MemoryResource):
         )
         return desc_k_base
 
-    @consumer_work(returns=desc_v_base)
     @cute.jit
-    def v_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
-        """Build V SMEM descriptor (MN-major layout for PV MMA) -> desc_v_base."""
+    def _zero_paged_v_tail(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[FmhaStage],
+        tile_offset: cutlass.Constexpr[int],
+        seqlen_k: Int32,
+        kv_tile_start: Int32,
+    ) -> None:
+        """Overwrite request-invalid V rows after TMA completion."""
+        if cutlass.const_expr(section == FmhaStage.Head):
+            domain_tile_idx = stage_info.loop_start
+        elif cutlass.const_expr(section == FmhaStage.Tail):
+            domain_tile_idx = stage_info.loop_end
+        else:
+            domain_tile_idx = stage_info.loop_offset
+        logical_v_tile_idx = kv_tile_start + domain_tile_idx + tile_offset
+        valid_rows = cute.math.min(
+            cute.math.max(
+                seqlen_k - logical_v_tile_idx * Int32(self.cfg.kv_tile_n),
+                Int32(0),
+            ),
+            Int32(self.cfg.kv_tile_n),
+        )
+
+        if valid_rows < Int32(self.cfg.kv_tile_n):
+            # Each paged TMA transaction writes one swizzled
+            # (D-fragment, page-token) box. Pages are concatenated within a D
+            # iteration, and D iterations are concatenated within the stage.
+            # Mirror that exact physical layout: a flat row-major clear would
+            # target the wrong bytes under the s128b swizzle.
+            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            chunks_per_d_iter = d_granu_inner // 16
+            chunks_per_v_row = self.cfg.tma_copy_kv_stage_iters * chunks_per_d_iter
+            page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
+            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
+            invalid_chunks = (Int32(self.cfg.kv_tile_n) - valid_rows) * Int32(
+                chunks_per_v_row
+            )
+            zero_vec = cutlass.vector.full(
+                [16], self.cfg.v_dtype(0.0), dtype=self.cfg.v_dtype
+            )
+            sV_curr = self.sK_array.subview(
+                stage_info.stage_idx * self.cfg.tma_copy_kv_elements
+            )
+            lane_idx = cute.arch.lane_idx()
+            for tail_chunk in cutlass.range(
+                lane_idx,
+                invalid_chunks,
+                Int32(cute.arch.WARP_SIZE),
+                unroll=1,
+            ):
+                invalid_row = tail_chunk // Int32(chunks_per_v_row)
+                d_chunk = tail_chunk - invalid_row * Int32(chunks_per_v_row)
+                d_iter = d_chunk // Int32(chunks_per_d_iter)
+                d_chunk_in_iter = d_chunk - d_iter * Int32(chunks_per_d_iter)
+                logical_row = valid_rows + invalid_row
+                page_frag = logical_row // Int32(self.cfg.num_tokens_per_page)
+                row_in_page = logical_row - page_frag * Int32(
+                    self.cfg.num_tokens_per_page
+                )
+                smem_offset = (
+                    d_iter * Int32(d_iter_elems)
+                    + page_frag * Int32(page_d_elems)
+                    + row_in_page * Int32(d_granu_inner)
+                    + d_chunk_in_iter * Int32(16)
+                )
+                sV_curr.subview(smem_offset).data_ptr().store_swizzled(
+                    zero_vec,
+                    alignment=16,
+                    swizzle=_qkv_smem_swizzle(self.cfg),
+                )
+
+            # v_desc is called only after this stage's skv.wait(), which makes
+            # the TMA writes visible. Converge the one MMA warp after its
+            # generic stores, then publish them to the async SMEM proxy before
+            # tcgen05 consumes the descriptor.
+            cute.arch.sync_warp()
+            prims.fence_proxy(
+                kind=prims.Proxy.ASYNC_SHARED,
+                space=prims.SharedSpace.shared_cta,
+            )
+
+    def _build_v_descriptor(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Build the current stage's V descriptor after any required clear."""
         smem_stage_elements = self.cfg.tma_copy_kv_elements
         sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
         leading_byte_offset, stride_byte_offset = _pv_smem_desc_offsets(self.cfg)
-        desc_v_base = prims.Tcgen05SmemDesc.build(
+        return prims.Tcgen05SmemDesc.build(
             sK_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
             layout=_qkv_smem_layout(self.cfg),
         )
-        return desc_v_base
+
+    @consumer_work(returns=desc_v_base)
+    @cute.jit
+    def v_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Build a nonpaged V SMEM descriptor -> desc_v_base."""
+        return self._build_v_descriptor(stage_info)
+
+    @consumer_work(returns=desc_v_base)
+    @cute.jit
+    def v_desc_paged(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[FmhaStage],
+        tile_offset: cutlass.Constexpr[int] = 0,
+        seqlen_k: Int32,
+        kv_tile_start: Int32,
+    ) -> prims.Tcgen05SmemDesc:
+        """Clear invalid paged-V rows, then build its SMEM descriptor."""
+        self._zero_paged_v_tail(
+            stage_info,
+            section=section,
+            tile_offset=tile_offset,
+            seqlen_k=seqlen_k,
+            kv_tile_start=kv_tile_start,
+        )
+        return self._build_v_descriptor(stage_info)
 
 
 # ---------------------------------------------------------------------------
