@@ -2491,9 +2491,7 @@ def run_recurrent_kda(
             dc[a_log_key] = torch.empty(H, dtype=torch.float32, device=device)
         gate_mode = 0 if not use_gate_in_kernel else (2 if USE_LB else 1)
         a_log_grouped = A_log if A_log is not None else dc[a_log_key]
-        dt_bias_grouped = (
-            dt_bias.reshape(-1) if dt_bias is not None else dc["f32_1"]
-        )
+        dt_bias_grouped = dt_bias.reshape(-1) if dt_bias is not None else dc["f32_1"]
         source_grouped = (
             initial_state_source if initial_state_source is not None else state
         )

@@ -44,6 +44,7 @@ _H12_CASES = (
     ),
 )
 
+
 @pytest.mark.parametrize(
     (
         "variant",
