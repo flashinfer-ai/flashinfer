@@ -20,7 +20,7 @@ import functools
 import math
 from enum import Enum
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
@@ -224,18 +224,22 @@ def get_alibi_slopes(
 SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_cache_buf_retired: List[torch.Tensor] = []
 
 
 def _get_cache_buf(
-    name: str, bytes: int, device: torch.device, zero_init: bool = False
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
 ) -> torch.Tensor:
+    """Return the process-wide ``name`` scratch buffer, grown to ``num_bytes``."""
     key = (name, device)
     buf = _cache_buf.get(key)
-    if buf is None or buf.size(0) < bytes:
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
         if zero_init:
-            buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+            buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
         else:
-            buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+            buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
 
@@ -278,10 +282,33 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
 
 
 @functools.cache
+def get_device_properties(device: torch.device):
+    return torch.cuda.get_device_properties(device)
+
+
+@functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
-    return torch.cuda.get_device_capability(device.index)
+    properties = get_device_properties(device)
+    return properties.major, properties.minor
+
+
+# trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
+# public FMHA packs contain zero of either for sm100a/sm100f/sm103a. Requesting one on another
+# architecture cannot be served, and without this check it surfaces late as a "Missing
+# TRTLLM-GEN kernel" from the launcher rather than as a clear error at the call site.
+def check_trtllm_gen_sm107_only_feature(
+    enabled: Optional[bool], feature_name: str, device: torch.device
+) -> None:
+    if not enabled:
+        return
+    major, minor = get_compute_capability(device)
+    if (major, minor) != (10, 7):
+        raise ValueError(
+            f"{feature_name} is only supported on SM107 (Rubin); the current device is "
+            f"sm{major}{minor}. trtllm-gen exports those cubin variants for SM107 only."
+        )
 
 
 @functools.cache
@@ -326,7 +353,7 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
 
 @functools.cache
 def get_shared_bytes_per_block_optin(device: torch.device) -> int:
-    cap = torch.cuda.get_device_properties(device.index)
+    cap = get_device_properties(device)
     return cap.shared_memory_per_block_optin
 
 
@@ -830,7 +857,12 @@ def round_up(x: int, y: int) -> int:
 
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return get_device_properties(device).multi_processor_count
+
+
+@functools.cache
+def get_device_name(device: torch.device) -> str:
+    return get_device_properties(device).name
 
 
 def get_device_index(device: torch.device) -> int:

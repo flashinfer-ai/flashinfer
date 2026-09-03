@@ -58,8 +58,10 @@ enum class RoutingMethodType : int64_t {
   MiniMax2 = 7,
   // Sigmoid: Sigmoid -> TopK (no renormalization)
   Sigmoid = 8,
+  // TopKSigmoid: TopK -> Sigmoid (no renormalization)
+  TopKSigmoid = 9,
   // Unspecified
-  Unspecified = 9,
+  Unspecified = 10,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -89,6 +91,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "MiniMax2";
     case RoutingMethodType::Sigmoid:
       return "Sigmoid";
+    case RoutingMethodType::TopKSigmoid:
+      return "TopKSigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -315,8 +319,9 @@ struct MoERunnerArgs {
                                    // gemm(hidden_state, routing_weights)
   void* routing_bias = nullptr;    // [num_experts] in bfloat16 for now = mDtypeExpW
   void* hidden_states = nullptr;   // [num_tokens, hidden_size] in fp8 = mDtypeElt
-  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
-  // and [num_tokens, hidden_size/16] in float for e2m1
+  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe,
+  // [num_tokens, hidden_size/16] in float for e2m1, and [num_tokens, 1]
+  // in float for FP8 per-token/per-channel.
   void* hidden_states_scale = nullptr;
 
   // Gemm input:
@@ -372,6 +377,10 @@ struct MoERunnerArgs {
   float* output1_scales_scalar = nullptr;
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
+
+  // Gated GEMM1 scales follow the shuffled, interleaved weight rows.
+  float* gemm1_per_channel_weight_scale = nullptr;  // [local_num_experts, M]
+  float* gemm2_per_channel_weight_scale = nullptr;  // [local_num_experts, hidden_size]
 
   // Output:
   void* output = nullptr;
@@ -465,6 +474,8 @@ class Runner {
                                                            int32_t numLocalExperts,
                                                            int32_t numTokens,
                                                            int32_t hiddenSizeOutput = -1) const;
+
+  [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
 
   [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
                                         int32_t intermediateSize, int32_t numLocalExperts,

@@ -21,9 +21,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from flashinfer.fused_moe import QuantVariant  # noqa: E402
 from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (  # noqa: E402
     build_activation_pack,
     build_activation_pack_rank_major,
+    pack_mxfp8_dispatch_payload,
+    packed_mxfp8_dispatch_width,
     reshape_for_combine,
 )
 
@@ -40,7 +43,11 @@ def test_bf16_pack_shapes_and_routing():
     offset = 12  # rank 3 of an 8-expert/rank shard, say
     et = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
 
-    pack = build_activation_pack(et, local_expert_offset=offset, is_nvfp4=False)
+    pack = build_activation_pack(
+        et,
+        local_expert_offset=offset,
+        quant_variant=QuantVariant.BF16,
+    )
 
     m = num_local_experts * cap
     assert pack.hidden_states_q.shape == (m, hidden)
@@ -80,7 +87,7 @@ def test_rank_major_pack_faithful_routing_and_masking():
         recv_w,
         num_local_experts=num_local_experts,
         local_expert_offset=offset,
-        is_nvfp4=False,
+        quant_variant=QuantVariant.BF16,
     )
 
     assert pack.hidden_states_q.shape == (m, hidden)
@@ -123,7 +130,7 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
         recv_w,
         num_local_experts=num_local_experts,
         local_expert_offset=offset,
-        is_nvfp4=False,
+        quant_variant=QuantVariant.BF16,
     )
 
     assert torch.all(pack.topk_ids == offset)
@@ -136,7 +143,11 @@ def test_build_activation_pack_rank_major_rejects_2d():
     w = torch.zeros(8, 8, dtype=torch.float32)
     with pytest.raises(ValueError):
         build_activation_pack_rank_major(
-            bad, idx, w, num_local_experts=4, is_nvfp4=False
+            bad,
+            idx,
+            w,
+            num_local_experts=4,
+            quant_variant=QuantVariant.BF16,
         )
 
 
@@ -154,7 +165,43 @@ def test_reshape_for_combine_roundtrips():
 def test_build_activation_pack_rejects_2d():
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        build_activation_pack(bad, is_nvfp4=False)
+        build_activation_pack(bad, quant_variant=QuantVariant.BF16)
+
+
+def test_packed_mxfp8_dispatch_width_uses_supported_transport_rows():
+    assert packed_mxfp8_dispatch_width(256) == 2048
+    assert packed_mxfp8_dispatch_width(4096) == 2560
+    with pytest.raises(ValueError, match="hidden % 64"):
+        packed_mxfp8_dispatch_width(255)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="MXFP8 quantization needs SM100/SM103",
+)
+def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
+    num_local_experts, cap, hidden = 2, 3, 256
+    expert_tensors = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
+    direct = build_activation_pack(
+        expert_tensors,
+        quant_variant=QuantVariant.MXFP4,
+    )
+
+    flat = expert_tensors.reshape(num_local_experts * cap, hidden)
+    payload = pack_mxfp8_dispatch_payload(flat)
+    packed = build_activation_pack(
+        payload.reshape(num_local_experts, cap, -1),
+        quant_variant=QuantVariant.MXFP4,
+        mxfp8_dispatch=True,
+        hidden_size=hidden,
+    )
+
+    assert packed.hidden_states_q.dtype is torch.float8_e4m3fn
+    assert packed.hidden_states_scale.dtype is torch.uint8
+    assert torch.equal(packed.hidden_states_q, direct.hidden_states_q)
+    assert torch.equal(packed.hidden_states_scale, direct.hidden_states_scale)
+    assert torch.equal(packed.topk_ids, direct.topk_ids)
 
 
 @pytest.mark.skipif(
@@ -165,10 +212,32 @@ def test_nvfp4_pack_quantizes():
     num_local_experts, cap, hidden = 4, 8, 128
     et = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
 
-    pack = build_activation_pack(et, local_expert_offset=0, is_nvfp4=True)
+    pack = build_activation_pack(
+        et,
+        local_expert_offset=0,
+        quant_variant=QuantVariant.NVFP4,
+    )
 
     m = num_local_experts * cap
     assert pack.hidden_states_q.shape[0] == m
     assert pack.hidden_states_q.shape[1] == hidden // 2
     assert pack.hidden_states_scale.numel() > 0
     assert pack.topk_ids.shape == (m, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_w4a16_pack_preserves_bf16_activation():
+    num_local_experts, cap, hidden = 4, 8, 128
+    et = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
+
+    pack = build_activation_pack(
+        et,
+        local_expert_offset=0,
+        quant_variant=QuantVariant.W4A16,
+    )
+
+    flat = et.reshape(num_local_experts * cap, hidden)
+    assert pack.hidden_states_q.dtype == torch.bfloat16
+    assert torch.equal(pack.hidden_states_q, flat)
+    assert pack.hidden_states_scale is None
+    assert pack.per_token_scale is None

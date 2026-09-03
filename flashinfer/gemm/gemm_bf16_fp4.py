@@ -12,7 +12,11 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import mm_bf16_fp4_trace_dispatch
-from ..utils import backend_requirement, supported_compute_capability
+from ..utils import (
+    backend_requirement,
+    get_compute_capability,
+    supported_compute_capability,
+)
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
@@ -104,10 +108,14 @@ def _cute_dsl_bf16_fp4_requirement(
     block_size: int = 16,
     enable_pdl: bool = True,
 ):
-    if b.dtype != torch.int32:
+    major, minor = get_compute_capability(a.device)
+    cc = major * 10 + minor
+    expected_dtype = torch.uint8 if cc in (100, 103) else torch.int32
+    if b.dtype != expected_dtype:
         raise ValueError(
-            f"cute-dsl bf16 x fp4 expects the int32 tile-packed weight from "
-            f"prepare_bf16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
+            f"cute-dsl bf16 x fp4 on SM{cc} expects the {expected_dtype} weight "
+            "returned by prepare_bf16_fp4_weights(..., backend='cute-dsl'); "
+            f"got {b.dtype}."
         )
     _check_cute_dsl_availability()
     return True

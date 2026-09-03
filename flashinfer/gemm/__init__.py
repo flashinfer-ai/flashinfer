@@ -38,31 +38,56 @@ from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
+    mm_M1_16_K7168_N256_bf16 as mm_M1_16_K7168_N256_bf16,
+    mm_M1_16_K7168_N384 as mm_M1_16_K7168_N384,
+    mm_M1_16_K7168_N384_bf16 as mm_M1_16_K7168_N384_bf16,
+    mm_M1_16_K7168_N896 as mm_M1_16_K7168_N896,
+    mm_M1_16_K7168_N896_bf16 as mm_M1_16_K7168_N896_bf16,
     tinygemm_bf16 as tinygemm_bf16,
 )
 
 # Import CuTe-DSL kernels if available
 _cute_dsl_kernels = []
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import (
+        is_cute_dsl_available,
+        is_rubin_cute_dsl_available,
+    )
 
     if is_cute_dsl_available():
-        from .kernels.grouped_gemm_masked_blackwell import (
+        from .kernels.grouped_gemm_masked_wrapper import (
             grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+        )
+        from .kernels.grouped_gemm_masked_blackwell import (
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
+        )
+        from .kernels.cute_dsl.low_latency_blockscaled_gemm import (
+            LowLatencyBlockscaledGemmKernel as LowLatencyBlockscaledGemmKernel,
         )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
+            "LowLatencyBlockscaledGemmKernel",
         ]
+
+        # The SM107 kernel imports cutlass.utils.rubin_helpers at module scope,
+        # which only exists from CuTe DSL 4.8. Gate it separately and extend the
+        # export list incrementally: sharing the try/except above would let an
+        # older DSL take the Blackwell exports down with it.
+        if is_rubin_cute_dsl_available():
+            from .kernels.grouped_gemm_masked_rubin import (
+                Sm107BlockScaledPersistentDenseGemmKernel as Sm107BlockScaledPersistentDenseGemmKernel,
+            )
+
+            _cute_dsl_kernels.append("Sm107BlockScaledPersistentDenseGemmKernel")
 except ImportError:
     pass
 
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if is_cute_dsl_available():
         from .kernels.dense_blockscaled_gemm_sm120_b12x import (
@@ -117,6 +142,11 @@ __all__ = (
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
+        "mm_M1_16_K7168_N256_bf16",
+        "mm_M1_16_K7168_N384",
+        "mm_M1_16_K7168_N384_bf16",
+        "mm_M1_16_K7168_N896",
+        "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
     ]
     + _cute_dsl_kernels

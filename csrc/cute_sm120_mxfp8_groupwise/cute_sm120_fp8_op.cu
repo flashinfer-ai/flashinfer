@@ -19,11 +19,13 @@
 #include "cute_sm120_mxfp8_groupwise/cute_sm120_fp8_runner.h"
 #include "tvm_ffi_utils.h"
 
-void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_scale,
-                                     TensorView b_scale, TensorView m_indptr, TensorView out,
-                                     std::string scale_major_mode, int64_t scale_granularity_m,
-                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
-                                     int64_t is_gated) {
+static void CutlassFP8GroupwiseMoeGEMMSM120Impl(TensorView a, TensorView b, TensorView a_scale,
+                                                TensorView b_scale, TensorView m_indptr,
+                                                TensorView out, std::string scale_major_mode,
+                                                int64_t scale_granularity_m,
+                                                int64_t scale_granularity_n,
+                                                int64_t scale_granularity_k, int64_t is_gated,
+                                                int64_t tactic_tile_m, int64_t tactic_tile_n) {
   TVM_FFI_ICHECK(scale_major_mode == "MN")
       << "Only scale_major_mode=\"MN\" is supported; got \"" << scale_major_mode << "\"";
 
@@ -31,6 +33,17 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
                  scale_granularity_k == 128)
       << "scale_granularity_mnk must be (1, 128, 128); got (" << scale_granularity_m << ", "
       << scale_granularity_n << ", " << scale_granularity_k << ")";
+  bool gated = is_gated != 0;
+  bool fallback_tactic = tactic_tile_m == -1 && tactic_tile_n == -1;
+  bool common_tactic = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                       (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+                       (tactic_tile_m == 128 && tactic_tile_n == 8);
+  bool plain_only_tactic = tactic_tile_m == 128 && tactic_tile_n == 128;
+  bool gated_only_tactic = tactic_tile_m == 128 && tactic_tile_n == 64;
+  TVM_FFI_ICHECK(fallback_tactic || common_tactic || (!gated && plain_only_tactic) ||
+                 (gated && gated_only_tactic))
+      << "unsupported FP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m << ", " << tactic_tile_n
+      << ") for " << (gated ? "gated" : "plain") << " mode";
 
   // a_scale is a zero-padding-mode float SFA: contiguous [Kb, MpE] with per-expert
   // 4-row-aligned offsets; b_scale is a compact float SFB [num_experts, Kb, Nb].
@@ -67,7 +80,6 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   // (b.size(1) == 2 * out_n); the kernel fuses SiLU(gate)*up so output N is halved. b_scale
   // still spans the full b.size(1) weight dimension (SFB is over b.size(1)), so only out /
   // runner shape_n use out_n.
-  bool gated = is_gated != 0;
   if (gated) {
     TVM_FFI_ICHECK_EQ(n % 2, 0)
         << "gated (fused SwiGLU) moe requires even b.size(1) (gate+up); got " << n;
@@ -120,10 +132,41 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
                                                              float, float>
       runner;
 
-  runner.moe_gemm_fp8_nt_groupwise(
-      out.data_ptr(), static_cast<void const*>(a.data_ptr()),
-      static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
-      num_experts, total_rows, out_n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
-      static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_m),
-      static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
+  if (tactic_tile_m == -1) {
+    runner.moe_gemm_fp8_nt_groupwise(
+        out.data_ptr(), static_cast<void const*>(a.data_ptr()),
+        static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
+        num_experts, total_rows, n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
+        static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_m),
+        static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
+  } else {
+    runner.moe_gemm_fp8_nt_groupwise_tuned(
+        out.data_ptr(), static_cast<void const*>(a.data_ptr()),
+        static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
+        num_experts, total_rows, n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
+        static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(tactic_tile_m),
+        static_cast<int>(tactic_tile_n), static_cast<int>(scale_granularity_m),
+        static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
+  }
+}
+
+void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_scale,
+                                     TensorView b_scale, TensorView m_indptr, TensorView out,
+                                     std::string scale_major_mode, int64_t scale_granularity_m,
+                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
+                                     int64_t is_gated) {
+  CutlassFP8GroupwiseMoeGEMMSM120Impl(a, b, a_scale, b_scale, m_indptr, out, scale_major_mode,
+                                      scale_granularity_m, scale_granularity_n, scale_granularity_k,
+                                      is_gated, -1, -1);
+}
+
+void CutlassFP8GroupwiseMoeGEMMSM120Tuned(TensorView a, TensorView b, TensorView a_scale,
+                                          TensorView b_scale, TensorView m_indptr, TensorView out,
+                                          std::string scale_major_mode, int64_t scale_granularity_m,
+                                          int64_t scale_granularity_n, int64_t scale_granularity_k,
+                                          int64_t is_gated, int64_t tactic_tile_m,
+                                          int64_t tactic_tile_n) {
+  CutlassFP8GroupwiseMoeGEMMSM120Impl(a, b, a_scale, b_scale, m_indptr, out, scale_major_mode,
+                                      scale_granularity_m, scale_granularity_n, scale_granularity_k,
+                                      is_gated, tactic_tile_m, tactic_tile_n);
 }

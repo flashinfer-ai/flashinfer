@@ -28,6 +28,16 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+
+    spec = core.gen_jit_spec(name="test_module", sources=[])
+
+    assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
+    assert "--compress-mode=size" in spec.extra_cuda_cflags
+
+
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     monkeypatch, tmp_path
 ):
@@ -129,11 +139,10 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     ]
 
 
-def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
-    writes = []
-    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
-
-    spec = core.JitSpecNvcc(
+@pytest.fixture
+def jit_spec_nvcc(monkeypatch, tmp_path):
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    return core.JitSpecNvcc(
         name="test_module",
         sources=[],
         extra_cflags=None,
@@ -142,12 +151,89 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
         extra_include_dirs=None,
     )
 
+
+def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch, jit_spec_nvcc):
+    writes = []
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    spec = jit_spec_nvcc
     monkeypatch.setattr(spec, "write_ninja", lambda: writes.append(True))
     monkeypatch.setattr(core, "run_ninja", lambda *_args, **_kwargs: None)
 
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_jit_spec_build_logs_only_for_cold_cache(monkeypatch, jit_spec_nvcc, cached):
+    events = []
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    spec = jit_spec_nvcc
+    if cached:
+        spec.jit_library_path.parent.mkdir(parents=True)
+        spec.jit_library_path.touch()
+    monkeypatch.setattr(spec, "write_ninja", lambda: None)
+    monkeypatch.setattr(
+        core, "run_ninja", lambda *_args, **_kwargs: events.append("run_ninja")
+    )
+    monkeypatch.setattr(
+        core.logger,
+        "info_once",
+        lambda message, *args: events.append(message % args),
+    )
+
+    spec.build(verbose=False, need_lock=False)
+
+    expected = ["run_ninja"]
+    if not cached:
+        expected.insert(
+            0,
+            "Building JIT module test_module; this can take several minutes on "
+            "first use.",
+        )
+    assert events == expected
+
+
+def test_jit_spec_aot_cache_hit_does_not_log_jit_build(
+    monkeypatch, tmp_path, jit_spec_nvcc
+):
+    logs = []
+    cached_module = object()
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_AOT_DIR", tmp_path)
+
+    spec = jit_spec_nvcc
+    spec.aot_path.parent.mkdir(parents=True)
+    spec.aot_path.touch()
+
+    monkeypatch.setattr(spec, "load", lambda _path=None: cached_module)
+    monkeypatch.setattr(core.logger, "info_once", logs.append)
+
+    assert spec.build_and_load() is cached_module
+    assert logs == []
+
+
+@pytest.mark.parametrize("is_aot", [False, True])
+def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
+    monkeypatch, tmp_path, is_aot
+):
+    raw_module = object()
+    seen = []
+    spec = core.JitSpecNvcc(
+        name="test_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        post_load_adapter=lambda module: seen.append(module) or ("wrapped", module),
+    )
+    monkeypatch.setattr(core.tvm_ffi, "load_module", lambda _path: raw_module)
+    path = tmp_path / ("aot.so" if is_aot else "jit.so")
+
+    assert spec.load(path if is_aot else None) == ("wrapped", raw_module)
+    assert seen == [raw_module]
 
 
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
@@ -170,8 +256,11 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
         torch.int32,
         512,
         512,
-        [],
-        [],
+        # NVFP4 (uint8) KV paged prefill now requires the scale-factor tensors as
+        # additional inputs (maybe_k_cache_sf / maybe_v_cache_sf), matching the
+        # generator contract; pass them so generation reaches the flag assertions.
+        ["maybe_k_cache_sf", "maybe_v_cache_sf"],
+        ["uint8_t", "uint8_t"],
         ["sm_scale"],
         ["double"],
         "DefaultAttention<false, false, false, false>",

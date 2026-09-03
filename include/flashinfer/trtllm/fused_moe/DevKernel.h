@@ -178,6 +178,18 @@ struct Data {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+
+  // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
+  // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
+  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation
+  // kernel below (DeepSeek FP8) has to apply them itself.
+  float const* gatedActAlphaPtr = nullptr;
+  float const* gatedActBetaPtr = nullptr;
+  float const* gatedActClampLimitPtr = nullptr;
+  // Maps a permuted-token tile to its local expert, i.e. the batch index of the FC1 GEMM.
+  // Only read when one of the pointers above is set.
+  int32_t const* ctaIdxXyToBatchIdx = nullptr;
+  int32_t tileTokensDim{0};
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -199,6 +211,12 @@ struct KernelParams {
 
   int32_t const* totalNumPaddedTokens;
 
+  float const* gatedActAlphaPtr = nullptr;
+  float const* gatedActBetaPtr = nullptr;
+  float const* gatedActClampLimitPtr = nullptr;
+  int32_t const* ctaIdxXyToBatchIdx = nullptr;
+  int32_t tileTokensDim{0};
+
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
 
@@ -213,6 +231,12 @@ struct KernelParams {
     params.numTokens = data.numTokens;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+
+    params.gatedActAlphaPtr = data.gatedActAlphaPtr;
+    params.gatedActBetaPtr = data.gatedActBetaPtr;
+    params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
+    params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
+    params.tileTokensDim = data.tileTokensDim;
 
     return params;
   }

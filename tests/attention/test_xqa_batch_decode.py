@@ -390,18 +390,23 @@ def generate_spec_dec_mask(
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim",
     [
-        (4, 4, 64, 4, 2),
-        (4, 2, 16, 2, 4),
-        (4, 3, 32, 2, 6),
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (128, 1, 64, 2, 6),
-        (256, 1, 64, 4, 8),
+        (4, 4, 64, 4, 2, 128),
+        (4, 2, 16, 2, 4, 128),
+        (4, 3, 32, 2, 6, 128),
+        (4, 1, 16, 2, 1, 128),
+        (4, 1, 32, 2, 5, 128),
+        (128, 1, 64, 2, 6, 128),
+        (256, 1, 64, 4, 8, 128),
         # 32 q heads / 2 kv heads (group ratio 16)
-        (4, 1, 32, 2, 16),
-        (4, 4, 32, 2, 16),
+        (4, 1, 32, 2, 16, 128),
+        (4, 4, 32, 2, 16, 128),
+        # head_dim 512 (Gemma-style GQA), decode only (no spec dec)
+        (4, 1, 32, 2, 4, 512),
+        (4, 1, 32, 2, 5, 512),
+        (16, 1, 64, 2, 8, 512),
+        (4, 1, 16, 2, 16, 512),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1, 127])
@@ -427,6 +432,7 @@ def test_xqa_batch_decode(
     page_size,
     num_kv_heads,
     head_grp_size,
+    head_dim,
     window_left,
     q_dtype,
     o_dtype,
@@ -443,7 +449,6 @@ def test_xqa_batch_decode(
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -641,6 +646,7 @@ def test_xqa_batch_decode_spec_dec_sliding_window(
         page_size=page_size,
         num_kv_heads=num_kv_heads,
         head_grp_size=head_grp_size,
+        head_dim=128,
         window_left=window_left,
         q_dtype=q_dtype,
         o_dtype=o_dtype,
@@ -1173,6 +1179,7 @@ if __name__ == "__main__":
         page_size=16,
         num_kv_heads=2,
         head_grp_size=1,
+        head_dim=128,
         window_left=-1,
         q_dtype="bf16",
         kv_dtype="bf16",

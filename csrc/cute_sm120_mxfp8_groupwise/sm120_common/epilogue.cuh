@@ -308,7 +308,9 @@ CUTE_DEVICE void epi_pred_stg(Params const& params, Accum const& accum, int thre
   auto tCcD = thr_mma.partition_C(cD);
   auto epi = convert_accum_to_output_type<KT>(accum);
 
-  store_empty_mbar[0].arrive();
+  if constexpr (KT::kUnionSmem) {
+    store_empty_mbar[0].arrive();
+  }
 
   CUTE_UNROLL
   for (int i = 0; i < cute::size(epi); ++i) {
@@ -346,7 +348,9 @@ CUTE_DEVICE void epi_pred_r2g(Params const& params, SharedStorage& shared_storag
 
   cute::copy(tiled_copy_S2R, tSR_sD, tSR_rD);
   cutlass::arch::NamedBarrier::sync(KT::MMAConfig::kNumMathThreads, 0);
-  store_empty_mbar[0].arrive();
+  if constexpr (KT::kUnionSmem) {
+    store_empty_mbar[0].arrive();
+  }
 
   auto mD_full = cute::make_tensor(
       cute::make_gmem_ptr(params.ptr_D),

@@ -774,7 +774,11 @@ class MegaMoENvfp4Frontend:
 
     @staticmethod
     def _to_cute(
-        tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False
+        tensor: torch.Tensor,
+        assumed_align: int = 16,
+        *,
+        static_layout: bool = False,
+        dynamic_compact_shape_modes: tuple[int, ...] = (),
     ):
         import cutlass.torch as cutlass_torch
 
@@ -782,7 +786,13 @@ class MegaMoENvfp4Frontend:
         if static_layout:
             return cute_tensor
         leading_dim = cutlass_torch.get_leading_dim(tensor)
-        return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        for mode in dynamic_compact_shape_modes:
+            cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+                mode=mode,
+                stride_order=tensor.dim_order(),
+            )
+        return cute_tensor
 
     def _build_mega_runtime_kwargs(
         self,
@@ -806,15 +816,22 @@ class MegaMoENvfp4Frontend:
             rank_idx=c.rank,
             num_max_ranks=c.world_size,
         )
+        dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
         return dict(
             activation=self._to_cute(inputs.activation),
             activation_sf=self._to_cute(inputs.activation_sf),
             topk_idx=self._to_cute(inputs.topk_idx),
             topk_weights=self._to_cute(inputs.topk_weights),
-            fc1_weight=self._to_cute(inputs.fc1_weight),
+            fc1_weight=self._to_cute(
+                inputs.fc1_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc1_weight_sf=self._to_cute(inputs.fc1_weight_sf),
-            fc2_weight=self._to_cute(inputs.fc2_weight),
+            fc2_weight=self._to_cute(
+                inputs.fc2_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
             fc1_alpha=self._to_cute(inputs.fc1_alpha, assumed_align=4),
             fc2_alpha=self._to_cute(inputs.fc2_alpha, assumed_align=4),
@@ -1210,8 +1227,27 @@ def nvfp4_mega_moe(
         raise ValueError(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
-    if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
-        return symm_buffer.output_activation[:0] if y is None else None
+    # n == 0 used to shortcut here without ever calling frontend.run() below.
+    # That's unsafe for in_kernel_fc2_reduce (fc2_reduces_topk): this
+    # session's EP peers rely on every rank physically launching the kernel
+    # every round (its persistent CTA grid -- get_grid_shape() -- is sized
+    # from hardware occupancy, not num_tokens, so even a 0-token round still
+    # runs the warp-specialized dispatch / token-back / tail-cleanup logic
+    # peers' cross-rank REDG combine depends on -- see the MXFP8 shim's
+    # mxfp8_mega_moe() for the identical bug, root cause, and fix, verified
+    # end-to-end against a real SGLang server). A rank that takes this
+    # shortcut instead silently skips that round's participation,
+    # desynchronizing the session's cross-rank bookkeeping -- peers'
+    # subsequent launches then wait on a signal this rank never posts,
+    # deadlocking within tens of rounds under real (unsynchronized,
+    # per-rank-independent) traffic.
+    #
+    # n == 0 needs no special case at all: it's just the degenerate instance
+    # of the padding scheme every other n already uses below (staging
+    # already marks unrouted rows as "no work" when num_tokens=0, exactly
+    # like it pads the tail for any other n), so falling through to the same
+    # full-buffer frontend.run() call every nonzero n takes is correct, not
+    # just safe.
     if y is not None:
         if y.shape != (n, symm_buffer.hidden):
             raise ValueError(

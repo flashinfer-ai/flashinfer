@@ -1,0 +1,2 @@
+# Pytest plugins required for the repository's test semantics.
+pytest-timeout

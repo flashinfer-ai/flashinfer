@@ -1,0 +1,81 @@
+ARG CUDA_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu24.04
+FROM ${CUDA_IMAGE} AS base
+
+ARG PYTORCH_INDEX=cu129
+ARG CUDNN_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV FLASHINFER_PYTHON_ENV=flashinfer
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY .python-version /install/.python-version
+COPY docker/install/install_python.sh /install/install_python.sh
+RUN bash /install/install_python.sh /opt/conda "$FLASHINFER_PYTHON_ENV" /install/.python-version
+
+WORKDIR /workspace
+
+RUN echo "source activate ${FLASHINFER_PYTHON_ENV}" >> /etc/bash.bashrc
+ENV PATH="/opt/conda/bin:$PATH"
+ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
+
+# Cover both CUDA-major layouts used by NVIDIA's pip packages. The path that
+# does not exist for a particular CUDA major is harmless.
+ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib:/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
+ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
+ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
+
+COPY requirements.txt /install/requirements.txt
+COPY build_utils.py /install/build_utils.py
+COPY ci/cuda-versions.json /install/ci/cuda-versions.json
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
+
+RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
+
+FROM base AS dev
+
+ARG USERNAME=devuser
+ARG USER_UID=1003
+ARG USER_GID=${USER_UID}
+
+USER root
+RUN apt-get update && apt-get install -y \
+    clang-format \
+    clangd-19 \
+    sudo \
+    vim \
+    zsh \
+    && groupadd --gid "${USER_GID}" "${USERNAME}" \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" -m "${USERNAME}" \
+    && echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}" \
+    && chmod 0440 "/etc/sudoers.d/${USERNAME}" \
+    && if grep ubuntu:x:1000:1000 /etc/passwd >/dev/null; then userdel -f -r ubuntu; fi \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install pre-commit
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+ENV PYTHONUSERBASE="/home/${USERNAME}/.local"
+ENV PATH="/home/${USERNAME}/.local/bin:/usr/lib/llvm-19/bin:$PATH"
+
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+RUN git clone https://github.com/zsh-users/zsh-autosuggestions "${ZSH_CUSTOM:-/home/${USERNAME}/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
+RUN sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="fino-time"/' ~/.zshrc \
+    && sed -i 's/plugins=(git)/plugins=(git zsh-autosuggestions)/' ~/.zshrc
+
+ENV SHELL=/bin/zsh
+CMD ["zsh"]
+
+FROM base AS ci
+
+RUN mkdir -p /opt/pip-user && chmod 1777 /opt/pip-user
+ENV PYTHONUSERBASE=/opt/pip-user
+ENV PATH="/opt/pip-user/bin:$PATH"
+CMD ["bash"]

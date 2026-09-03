@@ -1393,6 +1393,80 @@ def test_nvfp4_quantize_tma_backend_parity(
     )
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_tma_oob_rows(device: str) -> None:
+    """Verify partial and fully-OOB rows for M padded from 8193 to 8320."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    from flashinfer.quantization.kernels.nvfp4_quantize import (
+        SF_LAYOUT_128x4,
+        _get_compiled_kernel_nvfp4_tma,
+    )
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = 8193, 4096
+    padded_m = ((m + 127) // 128) * 128
+    padded_sf_cols = n // 16
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax).reshape(1)
+    quant_ref, scale_ref = nvfp4_quantize(
+        x,
+        global_scale,
+        sfLayout=SfLayout.layout_128x4,
+        backend="cuda",
+    )
+
+    kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4_tma(
+        "bfloat16", n, SF_LAYOUT_128x4
+    )
+    num_sm = torch.cuda.get_device_properties(
+        torch.device(device)
+    ).multi_processor_count
+    num_blocks = min(
+        (padded_m + rows_per_block - 1) // rows_per_block,
+        num_sm * 2,
+    )
+
+    quant_output = torch.empty(m, n // 2, dtype=torch.uint8)
+    scale_output = torch.full(
+        (padded_m * padded_sf_cols,),
+        0xA5,
+        dtype=torch.uint8,
+    )
+    kernel_fn(
+        x,
+        quant_output,
+        scale_output,
+        m,
+        padded_m,
+        num_blocks,
+        global_scale,
+    )
+    torch.cuda.synchronize()
+
+    scale_unswizzled = unswizzle_sf(
+        scale_output.reshape(padded_m, padded_sf_cols),
+        padded_m,
+        n,
+    )
+    scale_ref_unswizzled = unswizzle_sf(scale_ref, padded_m, n)
+
+    quant_match_pct = (quant_output[-1] == quant_ref[-1]).float().mean().item() * 100
+    assert quant_match_pct > 95.0
+    scale_match_pct = (
+        scale_unswizzled[m - 1] == scale_ref_unswizzled[m - 1]
+    ).float().mean().item() * 100
+    assert scale_match_pct > 95.0
+    assert torch.count_nonzero(scale_unswizzled[m:]).item() == 0
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)

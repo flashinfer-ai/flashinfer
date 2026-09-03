@@ -27,7 +27,7 @@ Run standalone:
 
 import argparse
 import os
-import random
+import tempfile
 
 # Suppress NCCL watchdog timeout during Triton JIT compilation
 os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
@@ -59,13 +59,13 @@ def ref_all_reduce_bf16(inp: torch.Tensor, group: dist.ProcessGroup) -> torch.Te
     return out
 
 
-def setup(rank: int, world_size: int, port: int):
+def setup(rank: int, world_size: int, init_method: str):
     """Initialize distributed process group."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://localhost:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
         device_id=device,
@@ -76,8 +76,8 @@ def setup(rank: int, world_size: int, port: int):
     return device, group
 
 
-def run_correctness(rank: int, world_size: int, port: int):
-    device, group = setup(rank, world_size, port)
+def run_correctness(rank: int, world_size: int, init_method: str):
+    device, group = setup(rank, world_size, init_method)
 
     # Test across sizes: 32KB to 64MB
     sizes_numel = [
@@ -114,8 +114,8 @@ def run_correctness(rank: int, world_size: int, port: int):
     dist.destroy_process_group()
 
 
-def run_scale_group_sweep(rank: int, world_size: int, port: int):
-    device, group = setup(rank, world_size, port)
+def run_scale_group_sweep(rank: int, world_size: int, init_method: str):
+    device, group = setup(rank, world_size, init_method)
 
     numel = 4194304  # 8MB
     inp = torch.randn(numel, dtype=torch.bfloat16, device=device)
@@ -134,8 +134,8 @@ def run_scale_group_sweep(rank: int, world_size: int, port: int):
     dist.destroy_process_group()
 
 
-def run_edge_cases(rank: int, world_size: int, port: int):
-    device, group = setup(rank, world_size, port)
+def run_edge_cases(rank: int, world_size: int, init_method: str):
+    device, group = setup(rank, world_size, init_method)
 
     edge_sizes = [
         256 * world_size,  # minimum: SCALE_GROUP * ws (one group per stripe)
@@ -163,8 +163,8 @@ def run_edge_cases(rank: int, world_size: int, port: int):
     dist.destroy_process_group()
 
 
-def run_benchmark(rank: int, world_size: int, port: int):
-    device, group = setup(rank, world_size, port)
+def run_benchmark(rank: int, world_size: int, init_method: str):
+    device, group = setup(rank, world_size, init_method)
 
     sizes_numel = [65536, 262144, 1048576, 4194304, 16777216, 67108864]
 
@@ -208,6 +208,16 @@ def run_benchmark(rank: int, world_size: int, port: int):
     dist.destroy_process_group()
 
 
+def _spawn_distributed_test(fn):
+    world_size = _supported_world_size()
+    # This file is single-node spawn-managed; use a file store to avoid
+    # unrelated TCP port collisions. Multi-node launches need a different
+    # rendezvous method.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_method = f"file://{os.path.join(tmpdir, 'rdzv')}"
+        mp.spawn(fn, args=(world_size, init_method), nprocs=world_size, join=True)
+
+
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="Tests require at least 2 CUDA devices",
@@ -217,9 +227,7 @@ def run_benchmark(rank: int, world_size: int, port: int):
     reason="Requires SM90+ (Hopper or later)",
 )
 def test_quantized_allreduce_correctness():
-    port = random.randint(30000, 60000)
-    world_size = _supported_world_size()
-    mp.spawn(run_correctness, args=(world_size, port), nprocs=world_size, join=True)
+    _spawn_distributed_test(run_correctness)
 
 
 @pytest.mark.skipif(
@@ -231,11 +239,7 @@ def test_quantized_allreduce_correctness():
     reason="Requires SM90+ (Hopper or later)",
 )
 def test_quantized_allreduce_scale_groups():
-    port = random.randint(30000, 60000)
-    world_size = _supported_world_size()
-    mp.spawn(
-        run_scale_group_sweep, args=(world_size, port), nprocs=world_size, join=True
-    )
+    _spawn_distributed_test(run_scale_group_sweep)
 
 
 @pytest.mark.skipif(
@@ -248,9 +252,7 @@ def test_quantized_allreduce_scale_groups():
 )
 def test_quantized_allreduce_edge_cases():
     """Test edge cases: small tensors, exact block boundaries."""
-    port = random.randint(30000, 60000)
-    world_size = _supported_world_size()
-    mp.spawn(run_edge_cases, args=(world_size, port), nprocs=world_size, join=True)
+    _spawn_distributed_test(run_edge_cases)
 
 
 if __name__ == "__main__":
@@ -260,13 +262,9 @@ if __name__ == "__main__":
     parser.add_argument("--scale-sweep", action="store_true")
     args = parser.parse_args()
 
-    port = random.randint(30000, 60000)
-    world_size = _supported_world_size()
-    spawn_kwargs = dict(args=(world_size, port), nprocs=world_size, join=True)
-
     if args.benchmark:
-        mp.spawn(run_benchmark, **spawn_kwargs)
+        _spawn_distributed_test(run_benchmark)
     elif args.scale_sweep:
-        mp.spawn(run_scale_group_sweep, **spawn_kwargs)
+        _spawn_distributed_test(run_scale_group_sweep)
     else:
-        mp.spawn(run_correctness, **spawn_kwargs)
+        _spawn_distributed_test(run_correctness)

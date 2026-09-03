@@ -120,31 +120,33 @@ __device__ inline void copyPartialHeadsAsync(
   constexpr uint32_t thrdLdBytes = exactDiv(warpLdBytes, warp_size);
   assertIsPowerOf2<thrdLdBytes>();
   static_assert(thrdLdBytes >= grainBytesSmem);
-  // a segment is responsible for loading one partial head collaboratively
-  constexpr uint32_t thrdsPerSeg = exactDiv(partBytes, grainBytesSmem);
-  static_assert(thrdsPerSeg > 0 && thrdsPerSeg <= warp_size);
-  assertIsPowerOf2<thrdsPerSeg>();
+  // a segment is responsible for loading one partial head collaboratively. A segment may
+  // span multiple warp iterations when a partial head is larger than one warp-wide load
+  // (grainsPerPart > warp_size, e.g. full 512-elem fp16 heads).
+  constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytesSmem);
+  static_assert(grainsPerPart > 0);
+  assertIsPowerOf2<grainsPerPart>();
   assert(__shfl_sync(0xFU << (laneId() / 4 * 4), src.offset, 0, 4) == src.offset);
   auto const warpLane = laneId();
-  uint32_t const segIdx = warpLane / thrdsPerSeg;
-  uint32_t const segLane = warpLane % thrdsPerSeg;
-  constexpr uint32_t partsPerWarpInst = exactDiv(grainBytesSmem * warp_size, partBytes);
 #pragma unroll
   for (uint32_t i = 0; i < thrdLdBytes / grainBytesSmem; i++) {
-    uint32_t const idxHeadLocal = partsPerWarpInst * i + segIdx;
+    // flat grain index into the warp's copy region, laid out part-major. Equivalent to the
+    // previous segIdx/segLane scheme for grainsPerPart <= warp_size.
+    uint32_t const flatGrainIdx = warp_size * i + warpLane;
+    uint32_t const idxHeadLocal = flatGrainIdx / grainsPerPart;
+    uint32_t const grainInPart = flatGrainIdx % grainsPerPart;
     assert(idxHeadLocal < maxNbCopiedHeads);
     bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
-    constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytesSmem);
     using SrcHead = mha::decay_t<decltype(src[0])>;
     constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytesGmem);
-    uint32_t const idxGrainInsideHead = grainsPerPart * idxPart + segLane;
+    uint32_t const idxGrainInsideHead = grainsPerPart * idxPart + grainInPart;
     bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
     SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
     bool const isValidPage = (pSrcHead != nullptr);
     Vec<uint8_t, grainBytesGmem> const* const pSrc =
         reinterpret_cast<Vec<uint8_t, grainBytesGmem> const*>(pSrcHead) + idxGrainInsideHead;
     Vec<uint8_t, grainBytesSmem>* const pDst = reinterpret_cast<Vec<uint8_t, grainBytesSmem>*>(
-        &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, segLane));
+        &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, grainInPart));
 #if !ENABLE_4BIT_KV_CACHE
     // 4-bit KV cache is not bank-conflict free now.
     assert(!hasBankConflict(pDst));

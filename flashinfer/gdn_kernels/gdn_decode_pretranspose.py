@@ -905,8 +905,6 @@ def _get_compiled_decode_kernel(
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
-    pool_size: int = 0,
-    stride0: int = 0,
     stride1: int = 0,
     stride2: int = 0,
     stride3: int = 0,
@@ -956,10 +954,13 @@ def run_pretranspose_decode(
     """
     # Compile kernel with TVM FFI (cached)
     if use_pool_indexing:
-        pool_size = int(h0_source.shape[0])
         stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
+        assert stride0 % 4 == 0, (
+            "initial_state stride(0) must be a multiple of 4 FP32 elements "
+            f"for 128-bit state copies, got stride(0)={stride0}"
+        )
     else:
-        pool_size = stride0 = stride1 = stride2 = stride3 = 0
+        stride1 = stride2 = stride3 = 0
     cache_key = (
         T,
         H,
@@ -970,8 +971,6 @@ def run_pretranspose_decode(
         scale,
         use_qk_l2norm,
         use_pool_indexing,
-        pool_size,
-        stride0,
         stride1,
         stride2,
         stride3,
@@ -1000,8 +999,20 @@ def run_pretranspose_decode(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-        if not use_pool_indexing:
+        if use_pool_indexing:
+            # Pool capacity and the distance between slots do not affect codegen.
+            # Keep the inner state layout static while accepting arbitrary pool
+            # sizes and padded slot strides through the same compiled callable.
+            sym_pool_size = cute.sym_int()
+            sym_pool_stride0 = cute.sym_int64(divisibility=4)
+            h0_source_tensor = cute.runtime.make_fake_tensor(
+                cute.Float32,
+                shape=(sym_pool_size, HV, V, K),
+                stride=(sym_pool_stride0, stride1, stride2, stride3),
+                assumed_align=16,
+            )
+        else:
+            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
             h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )

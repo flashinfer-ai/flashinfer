@@ -66,6 +66,16 @@ def _cache_path() -> Optional[str]:
     return os.path.expanduser("~/.cache/flashinfer/moe_ep_knob_cache.json")
 
 
+def knob_cache_path() -> Optional[str]:
+    """Resolved knob-cache file path, or None when the cache is disabled.
+
+    Public wrapper so callers outside the shim never import ``_cache_path``
+    (tests monkeypatch that name; routing through this wrapper at call time
+    keeps their patches effective).
+    """
+    return _cache_path()
+
+
 def _current_device_name() -> str:
     import torch
 
