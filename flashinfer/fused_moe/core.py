@@ -425,6 +425,24 @@ def _infer_trtllm_moe_output_hidden_size(
     return output_hidden_size
 
 
+def _check_valid_hidden_size_supports_finalize(
+    valid_hidden_size: Optional[int], do_finalize: bool
+) -> None:
+    """Reject the unsupported ``valid_hidden_size`` + ``do_finalize=False`` combo.
+
+    Without finalization there is no finalized output row to narrow, so the
+    launcher falls back to the padded hidden size and the C++ dimension check
+    would otherwise fail with a message about the output width being wrong.
+    """
+    if valid_hidden_size is not None and not do_finalize:
+        raise ValueError(
+            "valid_hidden_size is not supported with do_finalize=False: the "
+            "unfinalized expert output keeps the padded hidden size, so the "
+            "valid (unpadded) hidden dimension cannot be applied. Pass "
+            "do_finalize=True or drop valid_hidden_size."
+        )
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -2056,6 +2074,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 self.fp8_quantization_type,
                 self.top_k + self.num_fused_shared_experts,
                 self.hidden_size,
+                self.hidden_size_output,
                 self.intermediate_size,
                 self.num_local_experts + self.num_fused_shared_experts,
                 self.activation_type,
@@ -2774,7 +2793,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
-            hidden_size_output=output.shape[1],
+            # GEMM2's N. This op has no valid-dims support, so GEMM2 always runs at
+            # the full padded hidden_size and finalize truncates to the output width
+            # (mirrors getGemm2OutputHiddenSize() in csrc/trtllm_fused_moe_runner.cu).
+            hidden_size_output=hidden_size,
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
@@ -3044,7 +3066,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,  # per_tensor mode
             hidden_size=hidden_size,
-            hidden_size_output=output.shape[1],
+            # GEMM2's N. This op has no valid-dims support, so GEMM2 always runs at
+            # the full padded hidden_size and finalize truncates to the output width
+            # (mirrors getGemm2OutputHiddenSize() in csrc/trtllm_fused_moe_runner.cu).
+            hidden_size_output=hidden_size,
             intermediate_size=intermediate_size,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
@@ -3738,6 +3763,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
+        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
 
         if output is None:
             output = _alloc_trtllm_moe_output(
@@ -3806,7 +3832,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             dtype_weights=dtype_weights,
             fp8_quantization_type=fp8_quantization_type,  # block_scale mode
             hidden_size=hidden_size,
-            hidden_size_output=output.shape[1],
+            # GEMM2's N. hidden_size_output only narrows the GEMM when valid dims were
+            # supplied; otherwise a caller-supplied narrow output must NOT shrink N,
+            # because the FP4 weights are row-shuffled over the full hidden_size and
+            # shrinking N would reinterpret them as a scrambled subset rather than a
+            # prefix. Mirrors getGemm2OutputHiddenSize() in
+            # csrc/trtllm_fused_moe_runner.cu.
+            hidden_size_output=(
+                output_hidden_size if valid_hidden_size is not None else hidden_size
+            ),
             intermediate_size=intermediate_size,
             activation_type=activation_type,
             weight_layout=weight_layout,
@@ -4099,6 +4133,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
+        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
 
         # workspace buffers required by trtllm-gen
         # For Mode 3 (UnpackedPrecomputed), topk_ids and topk_weights are user-provided INPUTS
@@ -4174,7 +4209,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
-            hidden_size_output=output.shape[1],
+            # GEMM2's N. hidden_size_output only narrows the GEMM when valid dims were
+            # supplied; otherwise a caller-supplied narrow output must NOT shrink N,
+            # because the FP4 weights are row-shuffled over the full hidden_size and
+            # shrinking N would reinterpret them as a scrambled subset rather than a
+            # prefix. Mirrors getGemm2OutputHiddenSize() in
+            # csrc/trtllm_fused_moe_runner.cu.
+            hidden_size_output=(
+                output_hidden_size if valid_hidden_size is not None else hidden_size
+            ),
             intermediate_size=intermediate_size,
             activation_type=activation_type,
             weight_layout=WeightLayout.MajorK,
@@ -4460,6 +4503,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
         )
+        _check_valid_hidden_size_supports_finalize(valid_hidden_size, do_finalize)
 
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
@@ -4512,7 +4556,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
-            hidden_size_output=output.shape[1],
+            # GEMM2's N. hidden_size_output only narrows the GEMM when valid dims were
+            # supplied; otherwise a caller-supplied narrow output must NOT shrink N,
+            # because the FP4 weights are row-shuffled over the full hidden_size and
+            # shrinking N would reinterpret them as a scrambled subset rather than a
+            # prefix. Mirrors getGemm2OutputHiddenSize() in
+            # csrc/trtllm_fused_moe_runner.cu.
+            hidden_size_output=(
+                output_hidden_size if valid_hidden_size is not None else hidden_size
+            ),
             intermediate_size=intermediate_size,
             activation_type=ActivationType.Swiglu,
             weight_layout=WeightLayout.BlockMajorK,

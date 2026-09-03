@@ -1234,8 +1234,24 @@ class FusedMoeLauncher {
         << "hidden_states has incorrect shape.";
   }
 
+  // GEMM2's N, mirroring getGemm2OutputHiddenSize() in trtllm_fused_moe_runner.cu:
+  // hidden_size_output narrows the GEMM only when the caller also supplied valid dims. Without
+  // them a caller may hand in an `output` narrower than hidden_size (the pre-existing NVFP4
+  // contract) while the FC2 weights still describe the full padded hidden_size, so GEMM2 keeps
+  // the full N there and finalize truncates instead. Tactic selection must use the same value.
+  int32_t gemm2_output_hidden_size() const {
+    return args->valid_hidden_size.has_value()
+               ? args->hidden_size_output.value_or(args->hidden_size)
+               : args->hidden_size;
+  }
+
   // GEMM1 or GEMM2 weights [num_experts, M, K] or [num_experts, K/block_k, M, block_k]
-  void check_weights_shape(std::string which_weights) const {
+  //
+  // `check_reduction_dim` must be false for launchers whose weights hold sub-byte values
+  // packed two per stored element (FP4 / MXINT4): their K extent counts bytes, i.e. half the
+  // logical contraction width, so the K equalities below do not apply. The M extent is never
+  // packed, so the GEMM2 output-width check stays meaningful for those launchers.
+  void check_weights_shape(std::string which_weights, bool check_reduction_dim = true) const {
     TensorView weights = (which_weights == "gemm1") ? gemm1_weights : gemm2_weights;
     if (which_weights != "gemm1" && which_weights != "gemm2") {
       TVM_FFI_LOG_AND_THROW(InternalError) << "Internal error: which_weights = " << which_weights;
@@ -1265,15 +1281,20 @@ class FusedMoeLauncher {
       // so Mn = intermediate_size. This check covers both gated and non-gated cases.
       TVM_FFI_ICHECK_EQ(args->intermediate_size * intermediate_size_factor, Mn)
           << "intermediate_size has incorrect shape.";
-      TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
-          << which_weights << " weights K dimension must be equal to hidden_size.";
+      if (check_reduction_dim) {
+        TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
+            << which_weights << " weights K dimension must be equal to hidden_size.";
+      }
     } else if (which_weights == "gemm2") {
-      auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
-      TVM_FFI_ICHECK_EQ(Mn, hidden_size_output)
-          << which_weights << " weights M dimension must be equal to hidden_size_output.";
+      // The FC2 weights are laid out for GEMM2's N, which is not always hidden_size_output;
+      // see gemm2_output_hidden_size().
+      TVM_FFI_ICHECK_EQ(Mn, gemm2_output_hidden_size())
+          << which_weights << " weights M dimension must be equal to GEMM2's output hidden size.";
       // GEMM2 always consumes the post-activation hidden of size intermediate_size.
-      TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
-          << which_weights << " weights K dimension must be equal to intermediate_size.";
+      if (check_reduction_dim) {
+        TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
+            << which_weights << " weights K dimension must be equal to intermediate_size.";
+      }
     }
     if (args->num_fused_shared_experts > 0) {
       TVM_FFI_ICHECK_EQ(weights.size(0), args->local_num_experts + args->num_fused_shared_experts)
@@ -1481,7 +1502,9 @@ class FusedMoeLauncher {
     int32_t const effectiveTopK = args->top_k + args->num_fused_shared_experts;
     int32_t const effectiveLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
 
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // Tactic validity is keyed on GEMM2's N, so this must be the same width the runner will
+    // launch GEMM2 with, not the raw hidden_size_output. See gemm2_output_hidden_size().
+    auto const hidden_size_output = gemm2_output_hidden_size();
     if (moe_tactic == -1) {
       moe_tactic = moe_runner->getDefaultValidConfigIndex(
           effectiveTopK, args->hidden_size, args->intermediate_size, effectiveLocalExperts,
@@ -1780,7 +1803,9 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args->intermediate_size,
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
+    // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
+    auto const hidden_size_output = gemm2_output_hidden_size();
     int32_t max_num_padded_tokens_gemm2 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, hidden_size_output, btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
@@ -1853,7 +1878,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                                                bool use_shuffled_weight, int64_t weight_layout,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
@@ -2057,6 +2082,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         << "FP8 MoE: gemm1_weights must be float8_e4m3fn.";
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn)
         << "FP8 MoE: gemm2_weights must be float8_e4m3fn.";
+    check_weights_shape("gemm2");
   }
 
   /** Allocate and bind one ordinary FP8 per-tensor MoE body workspace. */
@@ -2072,7 +2098,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
                      hidden_states.device());
 
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
+    // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
+    auto const hidden_size_output = gemm2_output_hidden_size();
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
                                 hidden_states.device());
 
@@ -2164,7 +2192,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                                                btg::Dtype dtype_act, btg::Dtype dtype_weights,
                                                bool use_routing_scales_on_input) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
@@ -2423,7 +2451,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
                                                bool use_shuffled_weight, int64_t weight_layout,
                                                btg::Dtype dtype_act, btg::Dtype dtype_weights) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
@@ -2703,8 +2731,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), totalLocalExperts)
           << "gemm2_weights_scale has incorrect dim 0.";
-      TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1),
-                        args->hidden_size_output.value_or(args->hidden_size) / 128)
+      TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), gemm2_output_hidden_size() / 128)
           << "gemm2_weights_scale has incorrect shape.";
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), args->intermediate_size / 128)
           << "gemm2_weights_scale has incorrect shape.";
@@ -2735,7 +2762,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             btg::dtypeGetNumBits(args->mDtypeElt));
     int32_t max_num_padded_tokens_gemm2 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
-            workspace.total_max_padded_tokens, args->hidden_size_output.value_or(args->hidden_size),
+            workspace.total_max_padded_tokens, gemm2_output_hidden_size(),
             btg::dtypeGetNumBits(args->mDtypeOut));
 
     // DeepSeek has unfused activation function so it must allocate using intermediate_size_factor
@@ -2765,7 +2792,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                        hidden_states.device());
     }
 
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
+    // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
+    auto const hidden_size_output = gemm2_output_hidden_size();
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
                                 hidden_states.device());
 
@@ -2968,7 +2997,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       Fp8QuantizationType quantization_type, int64_t act_type,
       batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
     auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
@@ -3119,6 +3148,8 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be uint8.";
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
         << "gemm2_weights_scale must be bf16.";
+    // MXINT4 packs two 4-bit weights per byte along K, so only the M extent is checked.
+    check_weights_shape("gemm2", /*check_reduction_dim=*/false);
   }
 
   void prepare_moe(int64_t& moe_tactic) override {
@@ -3147,7 +3178,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
             btg::dtypeGetNumBits(mDtypeAct));
     max_num_padded_tokens_gemm2 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
-            workspace.total_max_padded_tokens, args->hidden_size_output.value_or(args->hidden_size),
+            workspace.total_max_padded_tokens, gemm2_output_hidden_size(),
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));  // Output is always BF16
 
     auto const gemm1_output_hidden = args->intermediate_size;
@@ -3155,7 +3186,9 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
                                 hidden_states.device());
 
     // Allocate gemm2_output
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
+    // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
+    auto const hidden_size_output = gemm2_output_hidden_size();
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
                                 hidden_states.device());
 
@@ -3221,7 +3254,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
                                                int64_t num_tokens,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
@@ -3395,6 +3428,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be byte.";
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
         << "gemm2_weights_scale must be fp8.";
+    // FP4 packs two 4-bit weights per byte along K, so only the M extent is checked.
+    check_weights_shape("gemm2", /*check_reduction_dim=*/false);
 
     if (args->num_fused_shared_experts > 0) {
       int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
@@ -3473,7 +3508,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             btg::dtypeGetNumBits(mDtypeAct));
     max_num_padded_tokens_gemm2 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
-            workspace.total_max_padded_tokens, args->hidden_size_output.value_or(args->hidden_size),
+            workspace.total_max_padded_tokens, gemm2_output_hidden_size(),
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));  // Output is always BF16
 
     auto const gemm1_output_hidden =
@@ -3501,7 +3536,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     }
 
     // Allocate gemm2_output
-    auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+    // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
+    // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
+    auto const hidden_size_output = gemm2_output_hidden_size();
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
                                 hidden_states.device());
 
@@ -3661,7 +3698,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                                bool use_per_token_scaling,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
-    hidden_size_output = hidden_size_output >= 0 ? hidden_size_output : hidden_size;
+    hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
     std::set<int32_t> selected_tile_nums =
@@ -4380,7 +4417,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->num_experts = num_experts;
     // For E2m1, hidden_size is already multiplied by 2 above, so use it directly
     args->hidden_size = hidden_size;
-    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : hidden_size / 2;
+    // With do_finalize=false the caller hands down a zero-width placeholder output, so fall
+    // back to the padded hidden size. The output is bf16 (never fp4-packed), so the fallback
+    // must not be halved.
+    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : args->hidden_size;
     args->top_k = top_k;
     args->num_fused_shared_experts = nFusedShared;
     args->n_group = n_group.value_or(0);
@@ -4712,7 +4752,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
     auto const components = runnerIt->second->getConfigComponents(configIndex);
     auto const anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
-        hidden_size_output >= 0 ? hidden_size_output : hidden_size);
+        hidden_size_output > 0 ? hidden_size_output : hidden_size);
     result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
                       configIndex == anchorIndex ? 1 : 0});
   }

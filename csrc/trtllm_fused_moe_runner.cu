@@ -337,7 +337,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
   // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
   // hiddenSize] For batched GEMM with transposeMmaOutput: M=numTokens, N=hiddenSize,
   // K=intermediateSize validN = validHiddenSize, validK = validIntermediateSize
-  // Note hiddenSize here is already the *output* hidden size (hidden_size_output).
+  // Note hiddenSize here is the GEMM2 N the MoE runner selected, which is the *output* hidden
+  // size (hidden_size_output) only when the caller supplied valid dims.
   int32_t validN = alignValidDim(validHiddenSize, hiddenSize);
   int32_t validK = alignValidDim(validIntermediateSize, intermediateSize);
   mRunner.run(
@@ -389,6 +390,24 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 }  // namespace Gemm2
 
 namespace MoE {
+
+namespace {
+
+// GEMM2's N dimension, i.e. the row width of the gemm2_output workspace.
+//
+// hidden_size_output narrows the GEMM only when the caller opted in by also supplying valid dims:
+// that is the contract under which the FC2 weights are laid out for the narrower N. Without valid
+// dims a caller may still hand in an `output` narrower than hidden_size (the pre-existing NVFP4
+// contract), while the weights still describe the full padded hidden_size. Shrinking N there would
+// reinterpret a row-shuffled weight matrix as having fewer rows -- a scrambled subset, not a
+// prefix -- so GEMM2 keeps the full N and finalize truncates the rows instead.
+int32_t getGemm2OutputHiddenSize(MoERunnerArgs const& args) {
+  return args.valid_hidden_size.has_value() ? args.hidden_size_output.value_or(args.hidden_size)
+                                            : args.hidden_size;
+}
+
+}  // namespace
+
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
                int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout,
@@ -500,11 +519,16 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     // [valid_hidden_size, roundUp(valid_hidden_size, 128)) as uninitialized torch.empty
     // memory in the tensor handed back to the caller. GEMM2 produced real values for that
     // span, so write the whole aligned width.
-    auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
+    //
+    // Without valid dims GEMM2 keeps the full padded N (see getGemm2OutputHiddenSize), and this
+    // is the only place a narrower hidden_size_output takes effect: finalize reads the full
+    // hidden_size stride and writes just the leading hidden_size_output columns.
+    int32_t const gemm2HiddenSize = getGemm2OutputHiddenSize(args);
     auto const validHiddenSize =
-        alignValidDim(args.valid_hidden_size.value_or(-1), hiddenSizeOutput);
-    finalizeData.hiddenDim = validHiddenSize >= 0 ? validHiddenSize : hiddenSizeOutput;
-    finalizeData.hiddenDimPadded = hiddenSizeOutput;
+        alignValidDim(args.valid_hidden_size.value_or(-1), gemm2HiddenSize);
+    finalizeData.hiddenDim =
+        validHiddenSize >= 0 ? validHiddenSize : args.hidden_size_output.value_or(args.hidden_size);
+    finalizeData.hiddenDimPadded = gemm2HiddenSize;
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }
 }
@@ -522,9 +546,10 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
   auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(
       totalExpertsPerToken, args.hidden_size, args.intermediate_size, totalLocalExperts,
       args.num_tokens, config.gemm1Config));
-  auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
+  // Must match the N that Runner::run actually gives GEMM2.
+  int32_t const gemm2HiddenSize = getGemm2OutputHiddenSize(args);
   auto workspace_size_fc2 = static_cast<int32_t>(
-      mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken, hiddenSizeOutput, args.intermediate_size,
+      mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken, gemm2HiddenSize, args.intermediate_size,
                                      totalLocalExperts, args.num_tokens, config.gemm2Config));
   return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
@@ -534,7 +559,7 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
                                                    int32_t numLocalExperts, int32_t numTokens,
                                                    int32_t hiddenSizeOutput) const {
   std::vector<int64_t> validIndices;
-  hiddenSizeOutput = hiddenSizeOutput >= 0 ? hiddenSizeOutput : hiddenSize;
+  hiddenSizeOutput = hiddenSizeOutput > 0 ? hiddenSizeOutput : hiddenSize;
 
   for (int i = 0; i < mPassingConfigs.size(); ++i) {
     auto const& config = mPassingConfigs[i];
@@ -563,7 +588,7 @@ bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hidde
   if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
     return false;
   }
-  hiddenSizeOutput = hiddenSizeOutput >= 0 ? hiddenSizeOutput : hiddenSize;
+  hiddenSizeOutput = hiddenSizeOutput > 0 ? hiddenSizeOutput : hiddenSize;
 
   auto const& config = mPassingConfigs[configIndex];
   return mPermuteGemm1.isValidConfigIndex(static_cast<int32_t>(config.gemm1Config), topK,
@@ -576,7 +601,7 @@ bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hidde
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t intermediateSize, int32_t numLocalExperts,
                                            int32_t numTokens, int32_t hiddenSizeOutput) const {
-  hiddenSizeOutput = hiddenSizeOutput >= 0 ? hiddenSizeOutput : hiddenSize;
+  hiddenSizeOutput = hiddenSizeOutput > 0 ? hiddenSizeOutput : hiddenSize;
   int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
                                                                 numLocalExperts, numTokens);
   int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(topK, hiddenSizeOutput, intermediateSize,
@@ -689,13 +714,13 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   // Run gemm2
   // Pass valid dimensions: validIntermediateSize (K for GEMM2), validHiddenSize (N for GEMM2)
-  int32_t hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
+  int32_t const gemm2HiddenSize = getGemm2OutputHiddenSize(args);
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              args.gemm2_per_channel_weight_scale == nullptr ? workspace.token_scales_fc2
                                                             : gemm2_input_scale,
              args.gemm2_per_channel_weight_scale, args.output2_scales_scalar, args.gemm2_bias,
              workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
-             hiddenSizeOutput, args.intermediate_size, totalLocalExperts, args.num_tokens,
+             gemm2HiddenSize, args.intermediate_size, totalLocalExperts, args.num_tokens,
              workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
              workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl,
