@@ -39,11 +39,11 @@ def _test_mm_fp4(
             pytest.skip("Skipping test for trtllm fp4 with float16")
         if compute_capability[0] in [11, 12]:
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
-    if backend == "cute-dsl":
+    if backend in ("cute-dsl", "cutedsl_low_latency"):
         if not use_128x4_sf_layout:
-            pytest.skip("cute_dsl backend only supports 128x4 SF layout")
+            pytest.skip(f"{backend} backend only supports 128x4 SF layout")
         if compute_capability[0] not in [10]:
-            pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+            pytest.skip(f"{backend} backend only supports SM100/SM103 GPUs.")
     if backend == "b12x":
         if not use_128x4_sf_layout:
             pytest.skip("b12x backend only supports 128x4 SF layout")
@@ -57,9 +57,15 @@ def _test_mm_fp4(
             )
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
+    if not use_nvfp4 and backend not in [
+        "cudnn",
+        "auto",
+        "cute-dsl",
+        "cutedsl_low_latency",
+        "b12x",
+    ]:
         pytest.skip(
-            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, and auto backends"
+            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, cutedsl_low_latency, and auto backends"
         )
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -150,8 +156,25 @@ _SMOKE_CASES = [
 ]
 
 
+_CUTEDSL_LOW_LATENCY_MODEL_CASES = [
+    # GPT-OSS-120B
+    (1, 1280, 2880, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 1280, 2944, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (1, 2880, 1024, torch.float16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 2880, 1024, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4_alpha"),
+    # DeepSeek-V3
+    (4, 7168, 2048, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 7168, 2048, torch.float16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (1, 3072, 1536, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (7, 3072, 1536, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (3, 129, 320, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (7, 127, 384, torch.float16, "cutedsl_low_latency", True, False, "mxfp4"),
+]
+
+
 @pytest.mark.parametrize(
-    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type", _SMOKE_CASES
+    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type",
+    _SMOKE_CASES + _CUTEDSL_LOW_LATENCY_MODEL_CASES,
 )
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
