@@ -31,6 +31,13 @@ _OPTIONAL_TRACE_MODULES = frozenset(
 def _load_attention_trace_templates() -> ModuleType | None:
     """Load trace templates when the hosting FlashInfer build provides them."""
 
+    # Downstream projects may vendor PrimTS while depending on a different
+    # FlashInfer release.  Its trace schemas need not match these wrappers, so
+    # keep every binding local to PrimTS and disable tracing for that vendored
+    # copy without changing the host package's module or attributes.
+    if __package__ != "flashinfer.attention.prims_ts":
+        return None
+
     try:
         return import_module("flashinfer.trace.templates.attention")
     except ModuleNotFoundError as error:
