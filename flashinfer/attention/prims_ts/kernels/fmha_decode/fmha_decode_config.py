@@ -140,15 +140,15 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
 
 _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 
-# Public cost-model collection uses the FP8 proxy for every source dtype.  The
-# original fixed-Q1 ratio-32 requests exercise a partial grouped-Q tile; the
-# shape-aware path also admits complete fixed multi-Q tiles at any legal head
-# ratio. These are profile families rather than shape exceptions: batch size,
-# KV length, tile choice, and legal GMEM split fanout remain unrestricted by
-# this declaration.
+# Public cost-model collection uses the FP8 proxy for every source dtype. The
+# fixed-Q1 path admits every head ratio covered by its Q64/Q128 tile, while the
+# shape-aware path also admits complete fixed multi-Q tiles. These are profile
+# families rather than shape exceptions: batch size, KV length, tile choice,
+# and legal GMEM split fanout remain unrestricted by this declaration.
 _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
 }
 
@@ -1835,14 +1835,17 @@ class FmhaDecodeConfig:
         direct = not (self.use_split_kv or self.use_separate_reduction_kernel)
 
         if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
-            fixed_q1_ratio32 = self.max_seq_len_q == 1 and self.heads_q_per_kv == 32
+            fixed_q1 = (
+                self.max_seq_len_q == 1
+                and 1 <= self.heads_q_per_kv <= self.tile_size_q
+            )
             fixed_grouped_q = self.max_seq_len_q > 1
             return (
-                (fixed_q1_ratio32 or fixed_grouped_q)
+                (fixed_q1 or fixed_grouped_q)
                 and not self.use_variable_seqlens_q
                 and self.use_paged_kv
                 and self.num_tokens_per_page == 32
-                and self.mask_type == CAUSAL
+                and self.mask_type in (DENSE, CAUSAL)
                 and not any(
                     (
                         self.use_cluster_smem_reduction,
@@ -2836,6 +2839,70 @@ _LAUNCH_SELECTION_FIELDS = {
 }
 
 
+def _try_apply_default_wide_keeps_config(
+    cfg: FmhaDecodeConfig,
+    *,
+    explicit_fields: set[str],
+    seq_len_q: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+) -> bool:
+    """Select Q64/Q128 Keeps for an unpinned head ratio above 32.
+
+    Prefer a grouped tile so a partial GQA group can occupy the next supported
+    MMA width. If that profile family is not qualified, an exact 64- or
+    128-head group may still use the established ungrouped Keeps path. The
+    caller falls back to ungrouped Q16 Swaps head bands for other profiles.
+    """
+
+    heads_q_per_kv = num_heads_q // num_heads_kv
+    if (
+        heads_q_per_kv <= 32
+        or heads_q_per_kv > 128
+        or bool(_MMA_SELECTION_FIELDS & explicit_fields)
+    ):
+        return False
+
+    tile_size_q = 64 if heads_q_per_kv <= 64 else 128
+    grouping_was_explicit = "groups_tokens_heads_q" in explicit_fields
+    grouping_candidates = (cfg.groups_tokens_heads_q,)
+    if (
+        not grouping_was_explicit
+        and cfg.groups_tokens_heads_q
+        and heads_q_per_kv == tile_size_q
+    ):
+        grouping_candidates += (False,)
+
+    for groups_tokens_heads_q in grouping_candidates:
+        probe = deepcopy(cfg)
+        probe.groups_tokens_heads_q = groups_tokens_heads_q
+        probe.use_keeps_mma_ab = True
+        probe.tile_size_q = tile_size_q
+        try:
+            _finalize_static_decode_config(
+                probe,
+                explicit_fields | {"tile_size_q"},
+            )
+            _validate_profile_support(
+                cfg=probe,
+                seq_len_q=seq_len_q,
+                num_heads_q=num_heads_q,
+                num_heads_kv=num_heads_kv,
+                split_kv_mode="disabled",
+            )
+        except ValueError:
+            continue
+
+        cfg.groups_tokens_heads_q = groups_tokens_heads_q
+        cfg.use_keeps_mma_ab = True
+        cfg.tile_size_q = tile_size_q
+        # Keeps finalization otherwise canonicalizes an implicit tile to Q64.
+        explicit_fields.add("tile_size_q")
+        return True
+
+    return False
+
+
 def _try_apply_auto_kv256_profile(
     cfg: FmhaDecodeConfig,
     *,
@@ -3110,10 +3177,11 @@ def _apply_default_q_grouping(
     cfg: FmhaDecodeConfig,
     *,
     explicit_fields: set[str],
+    heads_q_per_kv: int,
 ) -> None:
-    """Enable token/head grouping unless the caller explicitly opts out."""
+    """Group complete head sets when they fit one supported Q tile."""
     if "groups_tokens_heads_q" not in explicit_fields:
-        cfg.groups_tokens_heads_q = True
+        cfg.groups_tokens_heads_q = heads_q_per_kv <= 128
 
 
 def _apply_layout_config(
@@ -3770,7 +3838,9 @@ def make_decode_config(
        KV128. The final KV width re-derives launch policy instead of reusing a
        fanout scored for KV128. Explicit policies remain caller-controlled.
        TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 is
-       outside this grouped-Q cost model and therefore remains KV128.
+       outside this cost model and remains KV128, but ratios above 32 select
+       the smallest qualified Q64/Q128 Keeps tile. Other profile families use
+       exact-width ungrouped Keeps or ungrouped Swaps head bands as a fallback.
     3. Shapes outside that qualified Q/launch selector retain the general launch
        policy: under-filled fixed-Q long-sequence grids use split-KV GMEM
        reduction, direct grids above one resident wave use persistent
@@ -3833,6 +3903,7 @@ def make_decode_config(
     _apply_default_q_grouping(
         cfg,
         explicit_fields=explicit_fields,
+        heads_q_per_kv=num_heads_q // num_heads_kv,
     )
     cfg.q_dtype = qkv_dtype
     cfg.kv_dtype = qkv_dtype
@@ -3876,12 +3947,29 @@ def make_decode_config(
         max_splits_kv=max_splits_kv,
     )
     if selected_grouped_q_recipe is None:
-        _apply_swaps_tile_config(
+        selected_wide_keeps = _try_apply_default_wide_keeps_config(
             cfg,
             explicit_fields=explicit_fields,
+            seq_len_q=seq_len_q,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
         )
+        if not selected_wide_keeps:
+            heads_q_per_kv = num_heads_q // num_heads_kv
+            if (
+                heads_q_per_kv > 32
+                and "groups_tokens_heads_q" not in explicit_fields
+                and not (_MMA_SELECTION_FIELDS & auto_selection_explicit_fields)
+            ):
+                # Profiles outside the grouped-Keeps matrix remain valid via
+                # the established ungrouped Swaps head bands.
+                cfg.groups_tokens_heads_q = False
+            _apply_swaps_tile_config(
+                cfg,
+                explicit_fields=explicit_fields,
+                num_heads_q=num_heads_q,
+                num_heads_kv=num_heads_kv,
+            )
     kv_tile_was_promoted = _try_apply_auto_kv256_profile(
         cfg,
         q_candidate=(

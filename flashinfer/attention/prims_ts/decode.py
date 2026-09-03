@@ -59,6 +59,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
+_MAX_HEAD_RATIO = 128
 
 
 @dataclass(frozen=True)
@@ -574,9 +575,10 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> None:
             f"{num_qo_heads} and {num_kv_heads}"
         )
     head_ratio = num_qo_heads // num_kv_heads
-    if head_ratio > 32:
+    if head_ratio > _MAX_HEAD_RATIO:
         raise ValueError(
-            f"attention-ts decode requires 1 <= Hq/Hkv <= 32, got {head_ratio}"
+            "attention-ts decode requires "
+            f"1 <= Hq/Hkv <= {_MAX_HEAD_RATIO}, got {head_ratio}"
         )
 
 
