@@ -18,6 +18,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -209,6 +210,85 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
         wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
         wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
         wan_hybrid_jit.gen_wan_hybrid_dispatch_module.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected_targets"),
+    [
+        ({}, []),
+        ({"sm100": True}, ["sm100"]),
+        ({"sm103": True}, ["sm103"]),
+        ({"sm100": True, "sm103": True}, ["sm100", "sm103"]),
+    ],
+)
+def test_wan_hybrid_aot_registers_target_specific_modules(
+    monkeypatch, capabilities, expected_targets
+) -> None:
+    from flashinfer import aot
+
+    calls = []
+
+    def fake_module(component):
+        def generate(target):
+            calls.append((component, target))
+            return SimpleNamespace(name=f"wan_hybrid_{component}_{target}")
+
+        return generate
+
+    monkeypatch.setattr(
+        aot,
+        "gen_wan_hybrid_quantization_module",
+        fake_module("quantization"),
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_wan_hybrid_attention_module",
+        fake_module("attention"),
+    )
+    monkeypatch.setattr(
+        aot,
+        "gen_wan_hybrid_dispatch_module",
+        fake_module("dispatch"),
+    )
+    monkeypatch.setattr(
+        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
+    )
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    monkeypatch.setattr(
+        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
+    )
+
+    specs = aot.gen_all_modules(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        capabilities,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+
+    assert calls == [
+        (component, target)
+        for target in expected_targets
+        for component in ("quantization", "attention", "dispatch")
+    ]
+    assert [spec.name for spec in specs] == [
+        "spdlog",
+        *(
+            f"wan_hybrid_{component}_{target}"
+            for target in expected_targets
+            for component in ("quantization", "attention", "dispatch")
+        ),
+        "cudnn",
+    ]
 
 
 def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:

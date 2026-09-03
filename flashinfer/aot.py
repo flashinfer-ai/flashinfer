@@ -109,6 +109,11 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
 )
+from .jit.wan_hybrid import (
+    gen_wan_hybrid_attention_module,
+    gen_wan_hybrid_dispatch_module,
+    gen_wan_hybrid_quantization_module,
+)
 from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.blackwell_bgmv_moe import (
     BLACKWELL_BGMV_MOE_DTYPES,
@@ -568,6 +573,19 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    wan_hybrid_targets = (
+        ("sm100", has_sm100),
+        ("sm103", has_sm103),
+    )
+    for wan_hybrid_target, enabled in wan_hybrid_targets:
+        if enabled:
+            jit_specs.extend(
+                [
+                    gen_wan_hybrid_quantization_module(wan_hybrid_target),
+                    gen_wan_hybrid_attention_module(wan_hybrid_target),
+                    gen_wan_hybrid_dispatch_module(wan_hybrid_target),
+                ]
+            )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
