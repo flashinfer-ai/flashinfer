@@ -6480,42 +6480,81 @@ def _run_flash_kda_prefill(
         if variant == "bt16":
             assert flash_target is not None
             assert lower_bound is not None
-            _run_generated_bt16_prepare_chain(
-                workspace=workspace,
-                target=flash_target,
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                cu_seqlens=cu_seqlens_i64,
-                seq_order=seq_order_i32,
-                state_indices=(
-                    state_indices if state_indices is not None else _dummy_i32(q.device)
-                ),
-                initial_state=initial_state_arg,
-                out=out_buf,
-                final_state=final_state_arg,
-                offsets=offsets,
-                num_heads=num_heads,
-                sm_count=sm_count,
-                compute_capability=compute_capability,
-                fixed_layout=fixed_layout,
-                max_sequence_length=max_sequence_length,
-                use_initial_state=use_initial_state,
-                store_final_state=store_final_state,
-                use_state_indices=use_state_indices,
-                state_slot_stride=state_slot_stride,
-                state_dtype_is_fp32=(
+            from .jit.flash_kda import _GeneratedFlashKDASelectorNotFoundError
+
+            try:
+                _run_generated_bt16_prepare_chain(
+                    workspace=workspace,
+                    target=flash_target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    state_indices=(
+                        state_indices
+                        if state_indices is not None
+                        else _dummy_i32(q.device)
+                    ),
+                    initial_state=initial_state_arg,
+                    out=out_buf,
+                    final_state=final_state_arg,
+                    offsets=offsets,
+                    num_heads=num_heads,
+                    sm_count=sm_count,
+                    compute_capability=compute_capability,
+                    fixed_layout=fixed_layout,
+                    max_sequence_length=max_sequence_length,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    use_state_indices=use_state_indices,
+                    state_slot_stride=state_slot_stride,
+                    state_dtype_is_fp32=(
+                        initial_state is not None
+                        and initial_state.dtype == torch.float32
+                    ),
+                    scale=scale_value,
+                    lower_bound=float(lower_bound),
+                    stream_ptr=stream_ptr,
+                    capturing=capturing,
+                )
+            except _GeneratedFlashKDASelectorNotFoundError:
+                if use_state_indices or (
                     initial_state is not None and initial_state.dtype == torch.float32
-                ),
-                scale=scale_value,
-                lower_bound=float(lower_bound),
-                stream_ptr=stream_ptr,
-                capturing=capturing,
-            )
+                ):
+                    raise
+                _run_bt16_prepare_chain(
+                    workspace=workspace,
+                    target=flash_target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    initial_state=initial_state_arg,
+                    out=out_buf,
+                    final_state=final_state_arg,
+                    offsets=offsets,
+                    num_heads=num_heads,
+                    sm_count=sm_count,
+                    compute_capability=compute_capability,
+                    fixed_layout=fixed_layout,
+                    max_sequence_length=max_sequence_length,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    scale=scale_value,
+                    lower_bound=float(lower_bound),
+                    stream_ptr=stream_ptr,
+                    capturing=capturing,
+                )
             if capturing and explicit_workspace:
                 workspace._captured = True
             return (out_buf, returned_state if output_final_state else None)

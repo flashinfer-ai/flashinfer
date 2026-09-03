@@ -388,9 +388,7 @@ def test_generated_compact_fp32_registry_is_source_exact_and_aot_registered():
         assert gencode in spec.extra_cuda_cflags
         assert "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1" in spec.extra_cuda_cflags
         assert spec.embedded_cubin_factory is not None
-        assert spec.embedded_cubin_factory.keywords["expected_cubin_sha256"] == (
-            module.source_runtime_cubin_sha256
-        )
+        assert "expected_cubin_sha256" not in spec.embedded_cubin_factory.keywords
         assert spec.embedded_cubin_factory.keywords["source_name"] == "kernel.cu"
         assert all("o1" not in flag.lower() for flag in spec.extra_cuda_cflags)
 

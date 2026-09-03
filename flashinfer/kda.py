@@ -486,7 +486,7 @@ def recurrent_kda(
 
     use_flash_kda_prefill = (
         not (
-            initial_state is not None
+            isinstance(initial_state, torch.Tensor)
             and initial_state.dtype == torch.float32
             and (
                 checkpoint_every_n_tokens != 0
@@ -523,7 +523,7 @@ def recurrent_kda(
     if (
         backend in ("auto", "cake")
         and is_plain_prefill
-        and initial_state is not None
+        and isinstance(initial_state, torch.Tensor)
         and initial_state.dtype == torch.float32
         and (
             checkpoint_every_n_tokens != 0

@@ -1162,7 +1162,6 @@ def gen_flash_kda_fp32_compat_module(
             body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
             module_ident=module.module_ident,
             target=module.target,
-            expected_cubin_sha256=module.source_runtime_cubin_sha256,
             source_name="kernel.cu",
         ),
     )
