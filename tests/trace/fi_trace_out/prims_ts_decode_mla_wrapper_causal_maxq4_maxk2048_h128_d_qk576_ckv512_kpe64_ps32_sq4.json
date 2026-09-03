@@ -6,7 +6,6 @@
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchMLADecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
-    "status:experimental",
     "mla",
     "mask:causal"
   ],
@@ -58,7 +57,7 @@
     },
     "max_pages_per_seq": {
       "type": "var",
-      "description": "Live block-table column capacity."
+      "description": "Per-run block-table column capacity."
     },
     "len_qo_indptr": {
       "type": "var",
@@ -101,14 +100,14 @@
         "max_pages_per_seq"
       ],
       "dtype": "int32",
-      "description": "Required physical page table supplied live to run()."
+      "description": "Required physical page table supplied to run()."
     },
     "seq_lens": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Required per-request KV lengths supplied live to run()."
+      "description": "Required per-request KV lengths supplied to run()."
     },
     "qo_indptr": {
       "shape": [
@@ -132,7 +131,7 @@
       "shape": null,
       "dtype": "bool",
       "optional": true,
-      "description": "Whether to validate live tensors and metadata values."
+      "description": "Whether to validate per-run tensors and metadata values."
     }
   },
   "outputs": {

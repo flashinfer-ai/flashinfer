@@ -1798,7 +1798,7 @@ _DECODE_PUBLIC_SURFACES = (
 
 
 def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
-    """Freeze the intentionally breaking experimental plan/run split."""
+    """Freeze the compile-oriented plan/run split."""
 
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -1944,7 +1944,7 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
 
 
 def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
-    """Trace packed-Q shape and planned output dtype from the live wrapper."""
+    """Trace packed-Q shape and planned output dtype from the bound wrapper."""
     from flashinfer.fi_trace import fi_trace
 
     wrapper = BatchDecodePagedTSWrapper()
@@ -1962,7 +1962,7 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
 
     with pytest.raises(
         ValueError,
-        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+        match=r"requires the bound wrapper's plan state.*flashinfer\.fi_trace",
     ):
         wrapper.run.fi_trace(**kwargs)
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
@@ -2957,7 +2957,7 @@ def _make_decode_specialization_validation_args(
 
 
 def test_attention_ts_decode_validated_run_rechecks_uniform_max_evidence() -> None:
-    """Live lengths must preserve a compiled uniform-maximum proof."""
+    """Per-run lengths must preserve a compiled uniform-maximum proof."""
 
     state, runtime, indptr, indices = _make_decode_specialization_validation_args(
         kv_prefix_mode="dynamic",
@@ -2985,7 +2985,7 @@ def test_attention_ts_decode_validated_run_rechecks_uniform_max_evidence() -> No
 def test_attention_ts_decode_validated_run_rechecks_full_prefix_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Live lengths must independently satisfy a compiled split-prefix proof."""
+    """Per-run lengths must independently satisfy a compiled split-prefix proof."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
@@ -3109,7 +3109,7 @@ def test_attention_ts_decode_run_rejects_malformed_paged_metadata(
     runtime_seq_lens,
     message,
 ):
-    """Default run validation rejects malformed live native-CSR values."""
+    """Default run validation rejects malformed per-run native-CSR values."""
 
     device = torch.device("cuda")
     paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
@@ -4100,7 +4100,7 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
+def test_attention_ts_decode_standalone_graph_reloads_all_per_run_metadata():
     """One replay reloads packed Q offsets, native CSR, K lengths, and page IDs."""
 
     max_seq_len_q = 8
@@ -4287,7 +4287,7 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
-    """Run live packed offsets and sliding bounds through the CLC scheduler."""
+    """Run per-run packed offsets and sliding bounds through the CLC scheduler."""
 
     q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(22))
     max_seq_len_q = max(q_lens)

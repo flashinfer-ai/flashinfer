@@ -80,32 +80,10 @@ def _drop_backend(backends, backend, reason):
 
 
 def _get_prims_ts_module():
-    """Import the experimental backend only when a benchmark requests it."""
+    """Import the PrimTS backend only when a benchmark requests it."""
     from flashinfer.attention import prims_ts
 
     return prims_ts
-
-
-def _make_prims_ts_context_page_table(
-    block_tables: torch.Tensor, page_size: int
-) -> torch.Tensor:
-    """Build the dense, fragment-aligned page-table ABI used by PrimTS context."""
-    from flashinfer.attention.prims_ts.context import _CONTEXT_KV_TILE_N
-
-    if page_size not in (16, 32, 64, 128):
-        raise ValueError(
-            "PrimTS context requires page_size to be one of 16, 32, 64, or 128"
-        )
-    pages_per_kv_tile = _CONTEXT_KV_TILE_N // page_size
-    column_capacity = (
-        (block_tables.shape[1] + pages_per_kv_tile - 1) // pages_per_kv_tile
-    ) * pages_per_kv_tile
-    if column_capacity > block_tables.shape[1]:
-        padding = block_tables[:, -1:].expand(
-            -1, column_capacity - block_tables.shape[1]
-        )
-        block_tables = torch.cat((block_tables, padding), dim=1)
-    return torch.stack((block_tables, block_tables), dim=1).contiguous()
 
 
 def _select_reference_output(outputs, priority):
@@ -1770,15 +1748,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     prims_ts_out = None
     prims_ts_sm_scale = None
     prims_ts_output_scale = None
-    prims_ts_dense_page_idx_kv = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_k_cache = kv_cache[:, 0].contiguous()
         prims_ts_v_cache = kv_cache[:, 1].contiguous()
         prims_ts_out = torch.empty_like(q, dtype=o_data_type)
-        prims_ts_dense_page_idx_kv = _make_prims_ts_context_page_table(
-            block_tables, page_size
-        )
         backend_wrappers_prims_ts = prims_ts.BatchPrefillPagedTSWrapper("HND")
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
@@ -1789,8 +1763,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             device=device,
             batch_size=batch_size,
             max_seq_len_q=s_qo,
-            max_seq_len_k=s_kv,
-            max_num_pages_per_seq_kv=int(prims_ts_dense_page_idx_kv.shape[-1]),
+            max_kv_len=s_kv,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
@@ -2013,8 +1986,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 k_cache,
                 v_cache,
                 qo_indptr,
-                kv_token_indptr,
-                prims_ts_dense_page_idx_kv,
+                kv_indptr,
+                kv_indices,
                 actual_seq_lens_kv_device.flatten(),
                 out=out,
                 validate=False,
@@ -2140,8 +2113,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     prims_ts_k_cache,
                     prims_ts_v_cache,
                     qo_indptr,
-                    kv_token_indptr,
-                    prims_ts_dense_page_idx_kv,
+                    kv_indptr,
+                    kv_indices,
                     actual_seq_lens_kv_device.flatten(),
                     out=prims_ts_out,
                     validate=False,

@@ -1,12 +1,11 @@
 {
   "name": "prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64",
-  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live page tables, K/V lengths, and per-KV-head BSR metadata. Static K/V capacity, block geometry, and mask type are retained by plan() and represented as optional trace context.",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and per-run page tables, K/V lengths, and per-KV-head BSR metadata. Static K/V capacity, block geometry, and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparsePagedTSWrapper.run",
     "backend:prims-ts",
     "sparse:block",
-    "status:experimental",
     "kv-cache:paged"
   ],
   "axes": {
@@ -60,7 +59,7 @@
     },
     "num_page_indices": {
       "type": "var",
-      "description": "Capacity of the runtime physical-page ID tensor; the final live page-table offset may be smaller."
+      "description": "Capacity of the runtime physical-page ID tensor; the final active page-table offset may be smaller."
     }
   },
   "constraints": [
@@ -101,14 +100,14 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into live block_indices for this wrapper run."
+      "description": "Absolute offsets into active block_indices for this wrapper run."
     },
     "block_indices": {
       "shape": [
         "num_block_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are live."
+      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are active."
     },
     "kv_valid_bits": {
       "shape": [
@@ -164,14 +163,14 @@
         "num_page_offsets"
       ],
       "dtype": "int32",
-      "description": "Live request offsets into paged_kv_indices, read for this call."
+      "description": "Per-run request offsets into paged_kv_indices."
     },
     "paged_kv_indices": {
       "shape": [
         "num_page_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is live."
+      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is active."
     },
     "max_seq_len_kv": {
       "shape": null,
@@ -184,7 +183,7 @@
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Live per-request logical K/V lengths read for this call."
+      "description": "Per-run logical K/V lengths read for this call."
     }
   },
   "outputs": {

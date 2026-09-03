@@ -352,7 +352,7 @@ class FmhaConfig:
     #
     # Mirrors decode FmhaDecodeConfig: when use_paged_kv is True, K/V live in
     # a fixed-size page pool [num_pages_in_pool, h_kv, num_tokens_per_page, d]
-    # and the kernel follows page_idx_kv[b, 2, max_num_pages_per_seq_kv] to
+    # and the kernel follows paged_kv_indptr/paged_kv_indices CSR metadata to
     # resolve logical (b, s) -> physical page id at TMA-issue time.
     #
     # Staged D256 assigns page-offset prefetch to its empty/padding warp.
@@ -364,6 +364,8 @@ class FmhaConfig:
     # staged O.  This frees the standalone epilogue warp for scheduling.
     fuse_epilogue_into_correction: bool = False
     num_tokens_per_page: int = 32
+    # Static upper bound derived from max_kv_len during kernel construction.
+    # Runtime page-row bounds always come from paged_kv_indptr.
     max_num_pages_per_seq_kv: int = 1
     page_offsets_num_warps: int = 1
     # Selected internally from the staged topology, static page geometry, and
@@ -788,6 +790,7 @@ class GmemQKVResource(MemoryResource):
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
     q_offset_default: int | Int32 = field(init=False, default=0)
     seqlens_kv: cute.Pointer | None = field(init=False, default=None)
+    paged_kv_indptr: cute.Pointer | None = field(init=False, default=None)
     max_seq_len_kv: Optional[Int32 | int] = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     seq_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -801,7 +804,8 @@ class GmemQKVResource(MemoryResource):
     seqlen_q: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     kv_tile_start: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    cached_seqlen_kv: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    kv_request_begin: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    kv_page_idx_ub: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
         self,
@@ -813,6 +817,7 @@ class GmemQKVResource(MemoryResource):
         q_offset: int | Int32,
         cfg: FmhaConfig,
         seqlens_kv: cute.Pointer | None = None,
+        paged_kv_indptr: cute.Pointer | None = None,
         max_seq_len_kv: Int32 | int | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
@@ -828,6 +833,7 @@ class GmemQKVResource(MemoryResource):
         self.cum_seqlen_k = cum_seqlen_k
         self.q_offset_default = q_offset
         self.seqlens_kv = seqlens_kv
+        self.paged_kv_indptr = paged_kv_indptr
         self.max_seq_len_kv = max_seq_len_kv
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_cta_starts = variable_window_cta_starts
@@ -888,10 +894,15 @@ class GmemQKVResource(MemoryResource):
             default=Int32(0),
             docs="First K/V loop tile for sliding-window FMHA.",
         )
-        self.cached_seqlen_kv = TaskLocalVariable(
+        self.kv_request_begin = TaskLocalVariable(
             dtype=Int32,
             default=Int32(0),
-            docs="seq_len_kv cached in a register so paged K/V fires reuse one GMEM load.",
+            docs="Offset of the request's first page ID in CSR values storage.",
+        )
+        self.kv_page_idx_ub = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="Inclusive logical-page upper bound for the request.",
         )
 
     @consumer_work(
@@ -907,13 +918,27 @@ class GmemQKVResource(MemoryResource):
             seqlen_q,
             seqlen_k,
             kv_tile_start,
+            kv_request_begin,
+            kv_page_idx_ub,
         )
     )
     @cute.jit
     def compute_coords(
         self, stage_info: StageInfo
     ) -> tuple[
-        Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
     ]:
         """Resolve per-tile coordinates from work_tile for downstream use.
 
@@ -935,24 +960,47 @@ class GmemQKVResource(MemoryResource):
         seqlen_k = Int32(0)
         window_q_offset = Int32(self.q_offset_default)
         kv_tile_start = Int32(0)
+        kv_request_begin = Int32(0)
+        kv_page_idx_ub = Int32(0)
         if cutlass.const_expr(self.cfg.has_varlen):
             if cutlass.const_expr(self.cfg.has_uniform_varlen):
                 seqlen_q = Int32(self.cfg.uniform_seq_len_q)
-                seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                 cuseqlen_q = batch_coord * seqlen_q
-                cuseqlen_k = batch_coord * seqlen_k
             else:
                 cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
                 next_cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
+                seqlen_q = next_cuseqlen_q - cuseqlen_q
+            if cutlass.const_expr(self.cfg.use_paged_kv):
+                # Paged K/V is addressed through CSR rather than a packed
+                # token buffer, so it has no cumulative token offset.
+                from .helpers_paged import _load_runtime_seq_len_kv
+
+                seqlen_k = _load_runtime_seq_len_kv(
+                    self.seqlens_kv, self.max_seq_len_kv, batch_coord
+                )
+            elif cutlass.const_expr(self.cfg.has_uniform_varlen):
+                seqlen_k = Int32(self.cfg.uniform_seq_len_k)
+                cuseqlen_k = batch_coord * seqlen_k
+            else:
                 cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
                 next_cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord + Int32(1)])
-                seqlen_q = next_cuseqlen_q - cuseqlen_q
                 seqlen_k = next_cuseqlen_k - cuseqlen_k
             seq_coord_q = cuseqlen_q + seq_coord_q
             # Each packed request uses its own bottom-right window origin. For
             # mixed causal plans the task manager also derives the request's
-            # K-loop extent from these live Q/K lengths.
+            # K-loop extent from these runtime Q/K lengths.
             window_q_offset = seqlen_k - seqlen_q
+            if cutlass.const_expr(
+                self.cfg.use_paged_kv and not self.cfg.stages_page_offsets_in_smem
+            ):
+                from .helpers_paged import _load_paged_request_bounds
+
+                kv_request_begin, kv_page_idx_ub = _load_paged_request_bounds(
+                    self.paged_kv_indptr,
+                    self.cfg,
+                    seqlen_k,
+                    batch_coord,
+                )
         if cutlass.const_expr(self.cfg.kv_tile_start_window_size_left > 0):
             if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
                 kv_tile_start = bottom_right_window_tile_start(
@@ -994,25 +1042,17 @@ class GmemQKVResource(MemoryResource):
             seqlen_q,
             seqlen_k,
             kv_tile_start,
+            kv_request_begin,
+            kv_page_idx_ub,
         )
 
-    @consumer_work(returns=cached_seqlen_kv)
-    @cute.jit
-    def cache_seqlen_kv(self, stage_info: StageInfo, *, batch_coord: Int32) -> Int32:
-        """Cache seqlens_kv[batch_coord] once per work tile for paged-KV.
-
-        K/V loop fires reuse the register instead of re-reading the GMEM
-        seqlens_kv pointer every iteration. When seqlens_kv is None, falls
-        back to the static max_seq_len_kv.
-        """
-        from .helpers_paged import _load_runtime_seq_len_kv
-
-        _ = stage_info
-        return _load_runtime_seq_len_kv(
-            self.seqlens_kv, self.max_seq_len_kv, batch_coord
+    @consumer_work(
+        returns=(
+            kv_tile_start,
+            kv_request_begin,
+            kv_page_idx_ub,
         )
-
-    @consumer_work(returns=(batch_coord, kv_tile_start, cached_seqlen_kv))
+    )
     @cute.jit
     def compute_page_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32]:
         """Resolve only the coordinates needed by paged-KV prefetch.
@@ -1025,17 +1065,30 @@ class GmemQKVResource(MemoryResource):
             self.cfg, stage_info.work_tile.tile_idx
         )
 
+        from .helpers_paged import _load_runtime_seq_len_kv
+
+        cached_seqlen_kv = _load_runtime_seq_len_kv(
+            self.seqlens_kv, self.max_seq_len_kv, batch_coord
+        )
+        from .helpers_paged import _load_paged_request_bounds
+
+        kv_request_begin, kv_page_idx_ub = _load_paged_request_bounds(
+            self.paged_kv_indptr,
+            self.cfg,
+            cached_seqlen_kv,
+            batch_coord,
+        )
         window_q_offset = Int32(self.q_offset_default)
         kv_tile_start = Int32(0)
         if cutlass.const_expr(self.cfg.kv_tile_start_window_size_left > 0):
             if cutlass.const_expr(self.cfg.has_varlen):
-                cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
-                next_cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
-                cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
-                next_cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord + Int32(1)])
-                window_q_offset = (next_cuseqlen_k - cuseqlen_k) - (
-                    next_cuseqlen_q - cuseqlen_q
-                )
+                if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                    seqlen_q = Int32(self.cfg.uniform_seq_len_q)
+                else:
+                    cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
+                    next_cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
+                    seqlen_q = next_cuseqlen_q - cuseqlen_q
+                window_q_offset = cached_seqlen_kv - seqlen_q
             if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
                 kv_tile_start = bottom_right_window_tile_start(
                     seq_coord=seq_coord,
@@ -1054,12 +1107,11 @@ class GmemQKVResource(MemoryResource):
                     // self.cfg.seq_tile_n,
                 )
 
-        from .helpers_paged import _load_runtime_seq_len_kv
-
-        cached_seqlen_kv = _load_runtime_seq_len_kv(
-            self.seqlens_kv, self.max_seq_len_kv, batch_coord
+        return (
+            kv_tile_start,
+            kv_request_begin,
+            kv_page_idx_ub,
         )
-        return batch_coord, kv_tile_start, cached_seqlen_kv
 
 
 def _qkv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
@@ -1286,8 +1338,8 @@ class SmemPageOffsetsKvResource(MemoryResource):
     The staged D256 path uses a dedicated warp to prefetch page-table
     entries for the next K/V tile so the TMA load warp can read SMEM-cached
     offsets. Each pipeline stage holds one topology-derived page-ID window
-    from one side of the page table; all 32 lanes co-load it. ``page_ids``
-    slices ``pages_per_tile`` entries for the current tile.
+    from the request's CSR row; all 32 lanes co-load it. ``page_ids`` slices
+    ``pages_per_tile`` entries for the current tile.
 
     Differences from decode:
     - Single ``load_k`` / ``load_v`` producer pair (context has no
@@ -1299,7 +1351,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
-    page_idx_kv: cute.Pointer | None = field(init=False, default=None)
+    paged_kv_indices: cute.Pointer | None = field(init=False, default=None)
     page_table_is_v: Constexpr[bool] = field(init=False, default=False)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     _smem_page_offsets: cutlass.Array = field(init=False, default=None)
@@ -1307,7 +1359,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
 
     def __init__(
         self,
-        page_idx_kv: cute.Pointer | None,
+        paged_kv_indices: cute.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         page_table_is_v: bool = False,
@@ -1319,7 +1371,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
         pipeline_config = replace(pipeline_config, advance_on_wait=True)
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
-        self.page_idx_kv = page_idx_kv
+        self.paged_kv_indices = paged_kv_indices
         self.page_table_is_v = page_table_is_v
         num_stages = pipeline_config.num_stages
         total_entries = num_stages * cfg.page_table_window_entries
@@ -1400,17 +1452,13 @@ class SmemPageOffsetsKvResource(MemoryResource):
     def _producer_load_page_offsets(
         self,
         stage_info: StageInfo,
-        is_v: int,
         tile_offset: cutlass.Constexpr[int] = 0,
         *,
-        batch_coord: Int32,
         kv_tile_start: Int32,
-        cached_seqlen_kv: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
-        from .helpers_paged import (
-            _runtime_last_valid_page_idx,
-            _resolve_kv_tile_idx_context,
-        )
+        from .helpers_paged import _resolve_kv_tile_idx_context
 
         cfg = self.cfg
         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
@@ -1420,16 +1468,8 @@ class SmemPageOffsetsKvResource(MemoryResource):
             stage_info, kv_tile_start, tile_offset=tile_offset
         )
         pages_per_tile = Int32(cfg.kv_tile_n // cfg.num_tokens_per_page)
-        page_idx_ub = _runtime_last_valid_page_idx(cfg, cached_seqlen_kv)
 
-        # K and V page tables are interleaved per batch:
-        #   [b][0][p] = K page at logical position p
-        #   [b][1][p] = V page at logical position p
-        page_table_offset = batch_coord * Int32(2 * cfg.max_num_pages_per_seq_kv)
-        if cutlass.const_expr(is_v):
-            page_table_offset += Int32(cfg.max_num_pages_per_seq_kv)
-
-        page_idx_kv = self.page_idx_kv
+        paged_kv_indices = self.paged_kv_indices
         smem_page_offsets = self._smem_page_offsets
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         # Lanes cooperatively fetch one topology-derived aligned window. A
@@ -1444,11 +1484,11 @@ class SmemPageOffsetsKvResource(MemoryResource):
         for lane_group in cutlass.range_constexpr(entries_per_lane):
             lane_offset = lane_idx + Int32(lane_group * cute.arch.WARP_SIZE)
             grouped_logical_page_idx = cute.math.min(
-                grouped_base_page_idx + lane_offset, page_idx_ub
+                grouped_base_page_idx + lane_offset, kv_page_idx_ub
             )
             prims.cp_async_shared_global(
                 smem_page_offsets.data_ptr() + grouped_smem_base + lane_offset,
-                page_idx_kv + page_table_offset + grouped_logical_page_idx,
+                paged_kv_indices + kv_request_begin + grouped_logical_page_idx,
                 4,
                 "ca",
             )
@@ -1460,18 +1500,17 @@ class SmemPageOffsetsKvResource(MemoryResource):
         stage_info: StageInfo,
         *,
         tile_offset: cutlass.Constexpr[int] = 0,
-        batch_coord: Int32,
         kv_tile_start: Int32,
-        cached_seqlen_kv: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """Prefetch K-side page IDs for the current K tile."""
         self._producer_load_page_offsets(
             stage_info,
-            is_v=0,
             tile_offset=tile_offset,
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @producer_work
@@ -1482,18 +1521,17 @@ class SmemPageOffsetsKvResource(MemoryResource):
         *,
         previous: cutlass.Constexpr[bool] = False,
         tile_offset: cutlass.Constexpr[int] = 0,
-        batch_coord: Int32,
         kv_tile_start: Int32,
-        cached_seqlen_kv: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """Prefetch V-side page IDs for the current V tile."""
         self._producer_load_page_offsets(
             stage_info,
-            is_v=1,
             tile_offset=tile_offset + (-1 if previous else 0),
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @consumer_work
@@ -1565,7 +1603,7 @@ class SmemKVResource(MemoryResource):
     page_offsets_v: Optional["SmemPageOffsetsKvResource"] = field(
         init=False, default=None
     )
-    page_idx_kv: cute.Pointer | None = field(init=False, default=None)
+    paged_kv_indices: cute.Pointer | None = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -1579,7 +1617,7 @@ class SmemKVResource(MemoryResource):
         cfg: FmhaConfig,
         page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
         page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
-        page_idx_kv: cute.Pointer | None = None,
+        paged_kv_indices: cute.Pointer | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind K/V TMA descriptors and reserve shared SMEM staging."""
@@ -1590,7 +1628,7 @@ class SmemKVResource(MemoryResource):
         self.page_offsets_v = (
             page_offsets_v if page_offsets_v is not None else page_offsets_kv
         )
-        self.page_idx_kv = page_idx_kv
+        self.paged_kv_indices = paged_kv_indices
         self.cfg = cfg
         total_elements = cfg.sK_shape[0] * cfg.sK_shape[1]
         size_bytes = total_elements * cfg.k_dtype.width // 8
@@ -1656,6 +1694,8 @@ class SmemKVResource(MemoryResource):
         cuseqlen_k: Int32,
         seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """Issue TMA bulk-copy for one K or V tile."""
         seq_offset = (
@@ -1695,12 +1735,9 @@ class SmemKVResource(MemoryResource):
                         # Reading its four contiguous page IDs directly avoids
                         # a producer warp spinning on an always-full auxiliary
                         # pipeline and leaves that warp available for CLC.
-                        # FlashInfer's context ABI publishes the same dense
-                        # logical page row for K and V, so both descriptors use
-                        # the first row here.
-                        page_table_offset = batch_coord * Int32(
-                            2 * self.cfg.max_num_pages_per_seq_kv
-                        )
+                        # K and V share the same CSR logical-to-physical page
+                        # row. Clamp both to the row capacity and to the pages
+                        # covered by the request's runtime sequence length.
                         logical_page_idx = tile_idx * Int32(pages_per_tile)
                         page_ids = cutlass.Array(
                             Int32,
@@ -1708,9 +1745,12 @@ class SmemKVResource(MemoryResource):
                             space=cutlass.AddressSpace.rmem,
                         )
                         for frag in cutlass.range_constexpr(pages_per_tile):
+                            clamped_page_idx = cute.math.min(
+                                logical_page_idx + Int32(frag), kv_page_idx_ub
+                            )
                             page_ids[frag] = Int32(
-                                self.page_idx_kv[
-                                    page_table_offset + logical_page_idx + frag
+                                self.paged_kv_indices[
+                                    kv_request_begin + clamped_page_idx
                                 ]
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
@@ -1781,7 +1821,10 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load K tile from GMEM to SMEM."""
         self._tma_load(
@@ -1792,8 +1835,10 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
-            seqlen_k=Int32(0),
+            seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @producer_work
@@ -1807,7 +1852,10 @@ class SmemKVResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         cuseqlen_k: Int32,
+        seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load one K head-dim stage for split D scheduling."""
         self._tma_load(
@@ -1819,8 +1867,10 @@ class SmemKVResource(MemoryResource):
             kv_head_coord=kv_head_coord,
             batch_coord=batch_coord,
             cuseqlen_k=cuseqlen_k,
-            seqlen_k=Int32(0),
+            seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @producer_work
@@ -1836,6 +1886,8 @@ class SmemKVResource(MemoryResource):
         cuseqlen_k: Int32,
         seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load V tile from GMEM to SMEM."""
         self._tma_load(
@@ -1849,6 +1901,8 @@ class SmemKVResource(MemoryResource):
             cuseqlen_k=cuseqlen_k,
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @producer_work
@@ -1865,6 +1919,8 @@ class SmemKVResource(MemoryResource):
         cuseqlen_k: Int32,
         seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load one current or previous V head-dim stage."""
         self._tma_load(
@@ -1878,6 +1934,8 @@ class SmemKVResource(MemoryResource):
             cuseqlen_k=cuseqlen_k,
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @producer_work
@@ -1894,6 +1952,8 @@ class SmemKVResource(MemoryResource):
         cuseqlen_k: Int32,
         seqlen_k: Int32,
         kv_tile_start: Int32,
+        kv_request_begin: Int32,
+        kv_page_idx_ub: Int32,
     ) -> None:
         """Load one V head-dimension stage using register-cached page IDs."""
         self._tma_load(
@@ -1908,6 +1968,8 @@ class SmemKVResource(MemoryResource):
             cuseqlen_k=cuseqlen_k,
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
 
     @consumer_work(returns=desc_k_base)
@@ -1967,6 +2029,7 @@ class TmemSPResource(MemoryResource):
     q_offset_default: int | Int32 = field(init=False, default=0)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
+    seq_lens_kv: cute.Pointer | None = field(init=False, default=None)
     variable_window_token_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_token_ends: cute.Tensor | None = field(init=False, default=None)
     variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
@@ -2005,6 +2068,7 @@ class TmemSPResource(MemoryResource):
         q_offset: int | Int32 = 0,
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
+        seq_lens_kv: cute.Pointer | None = None,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
@@ -2022,6 +2086,7 @@ class TmemSPResource(MemoryResource):
         self.q_offset_default = q_offset
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
+        self.seq_lens_kv = seq_lens_kv
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_token_ends = variable_window_token_ends
         self.variable_window_cta_starts = variable_window_cta_starts
@@ -2433,21 +2498,34 @@ class TmemSPResource(MemoryResource):
         Mixed-varlen batches cannot use the uniform kernel q_offset because
         each batch can have a different S_kv - S_q. This pre-wait hook runs
         once in the softmax task HEAD, before the K/V loop, so loop and tail
-        masks reuse the cached offset instead of rereading cum_seqlen_q/k.
+        masks reuse the cached offset instead of rereading the request metadata.
         """
-        if cutlass.const_expr(self.cfg.has_uniform_varlen):
+        if cutlass.const_expr(
+            self.cfg.has_uniform_varlen and not self.cfg.use_paged_kv
+        ):
             return Int32(self.cfg.uniform_seq_len_k - self.cfg.uniform_seq_len_q)
         batch_coord = self._varlen_batch_coord(stage_info)
-        cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
-        cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
-        seqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)]) - cuseqlen_q
-        seqlen_k = Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k
+        if cutlass.const_expr(self.cfg.has_uniform_varlen):
+            seqlen_q = Int32(self.cfg.uniform_seq_len_q)
+        else:
+            cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
+            seqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)]) - cuseqlen_q
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            seqlen_k = Int32(self.seq_lens_kv[batch_coord])
+        elif cutlass.const_expr(self.cfg.has_uniform_varlen):
+            seqlen_k = Int32(self.cfg.uniform_seq_len_k)
+        else:
+            cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
+            seqlen_k = Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k
         return seqlen_k - seqlen_q
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=seqlen_k)
     @cute.jit
     def cache_seqlen_k(self, stage_info: StageInfo) -> Int32:
-        """Cache the request-local packed K/V extent once per work tile."""
+        """Cache the request-local K/V extent once per work tile."""
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            batch_coord = self._varlen_batch_coord(stage_info)
+            return Int32(self.seq_lens_kv[batch_coord])
         if cutlass.const_expr(self.cfg.has_uniform_varlen):
             return Int32(self.cfg.uniform_seq_len_k)
         batch_coord = self._varlen_batch_coord(stage_info)

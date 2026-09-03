@@ -61,7 +61,7 @@ from .fmha_resources import (
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips Q tiles outside a live packed request."""
+    """Persistent queue that skips Q tiles outside a runtime packed request."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
@@ -72,7 +72,7 @@ class PackedContextWorkQueue(WorkQueue):
         cum_seqlen_q: cute.Tensor,
         **kwargs: Any,
     ) -> None:
-        """Attach the live packed-Q metadata used by the skip predicate."""
+        """Attach the per-run packed-Q metadata used by the skip predicate."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cum_seqlen_q = cum_seqlen_q
@@ -123,7 +123,7 @@ def _schedule_with_work_queue(
 def _packed_context_skip_predicate(
     work_queue: WorkQueue | None,
 ) -> Callable[..., object] | None:
-    """Select the live-Q skip predicate before schedule capture creates proxies."""
+    """Select the runtime-Q skip predicate before schedule capture creates proxies."""
     if isinstance(work_queue, PackedContextWorkQueue):
         return PackedContextWorkQueue.skip_work_tile_if
     return None
@@ -251,6 +251,8 @@ def create_load_task(
                         seqlen_q,
                         seqlen_k,
                         kv_tile_start,
+                        kv_request_begin,
+                        kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     sq.acquire()
                     sq.tma_load(
@@ -273,7 +275,10 @@ def create_load_task(
                                 kv_head_coord=kv_head_coord,
                                 batch_coord=batch_coord,
                                 cuseqlen_k=cuseqlen_k,
+                                seqlen_k=seqlen_k,
                                 kv_tile_start=kv_tile_start,
+                                kv_request_begin=kv_request_begin,
+                                kv_page_idx_ub=kv_page_idx_ub,
                             )
                             skv.commit()
 
@@ -301,6 +306,8 @@ def create_load_task(
                                     cuseqlen_k=cuseqlen_k,
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
+                                    kv_request_begin=kv_request_begin,
+                                    kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             else:
                                 skv.v_load_stage(
@@ -311,6 +318,8 @@ def create_load_task(
                                     cuseqlen_k=cuseqlen_k,
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
+                                    kv_request_begin=kv_request_begin,
+                                    kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             skv.commit()
 
@@ -416,6 +425,8 @@ def create_load_task(
                     seqlen_q,
                     seqlen_k,
                     kv_tile_start,
+                    kv_request_begin,
+                    kv_page_idx_ub,
                 ) = coords
                 sq.acquire()
                 sq.tma_load(
@@ -439,7 +450,10 @@ def create_load_task(
                         kv_head_coord=kv_head_coord,
                         batch_coord=batch_coord,
                         cuseqlen_k=cuseqlen_k,
+                        seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
+                        kv_request_begin=kv_request_begin,
+                        kv_page_idx_ub=kv_page_idx_ub,
                     )
                     skv.commit()
                 if spo is not None:
@@ -457,7 +471,10 @@ def create_load_task(
                             kv_head_coord=kv_head_coord,
                             batch_coord=batch_coord,
                             cuseqlen_k=cuseqlen_k,
+                            seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
+                            kv_request_begin=kv_request_begin,
+                            kv_page_idx_ub=kv_page_idx_ub,
                         )
                         skv.commit()
                     if spo is not None:
@@ -477,6 +494,8 @@ def create_load_task(
                             cuseqlen_k=cuseqlen_k,
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
+                            kv_request_begin=kv_request_begin,
+                            kv_page_idx_ub=kv_page_idx_ub,
                         )
                         skv.commit()
                     if spo is not None:
@@ -496,6 +515,8 @@ def create_load_task(
                         cuseqlen_k=cuseqlen_k,
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
+                        kv_request_begin=kv_request_begin,
+                        kv_page_idx_ub=kv_page_idx_ub,
                     )
                     skv.commit()
                 if spo is not None:
@@ -575,6 +596,8 @@ def create_load_task(
                         seqlen_q,
                         seqlen_k,
                         kv_tile_start,
+                        kv_request_begin,
+                        kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     # Load Q0 for the first Q tile in this work tile.
                     sq.acquire()
@@ -595,7 +618,10 @@ def create_load_task(
                     kv_head_coord=kv_head_coord,
                     batch_coord=batch_coord,
                     cuseqlen_k=cuseqlen_k,
+                    seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
+                    kv_request_begin=kv_request_begin,
+                    kv_page_idx_ub=kv_page_idx_ub,
                 )
                 skv.commit()
                 with d.first_iter():
@@ -620,6 +646,8 @@ def create_load_task(
                     cuseqlen_k=cuseqlen_k,
                     seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
+                    kv_request_begin=kv_request_begin,
+                    kv_page_idx_ub=kv_page_idx_ub,
                 )
                 skv.commit()
 
@@ -2303,9 +2331,9 @@ def create_padding_task(
 def _prefetch_page_offsets_for_work_tile(
     spo: SmemPageOffsetsKvResource,
     *,
-    batch_coord: Int32,
     kv_tile_start: Int32,
-    cached_seqlen_kv: Int32,
+    kv_request_begin: Int32,
+    kv_page_idx_ub: Int32,
     loop_start: int,
     loop_end: int,
     loop_step: int,
@@ -2318,33 +2346,33 @@ def _prefetch_page_offsets_for_work_tile(
         # K or V tile, so this producer fires once per tile rather than per slice.
         spo.acquire()
         spo.load_k(
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spo.commit()
         with domain_loop(loop_start + 1, loop_end, loop_step):
             spo.acquire()
             spo.load_k(
-                batch_coord=batch_coord,
                 kv_tile_start=kv_tile_start,
-                cached_seqlen_kv=cached_seqlen_kv,
+                kv_request_begin=kv_request_begin,
+                kv_page_idx_ub=kv_page_idx_ub,
             )
             spo.commit()
             spo.acquire()
             spo.load_v(
                 previous=True,
-                batch_coord=batch_coord,
                 kv_tile_start=kv_tile_start,
-                cached_seqlen_kv=cached_seqlen_kv,
+                kv_request_begin=kv_request_begin,
+                kv_page_idx_ub=kv_page_idx_ub,
             )
             spo.commit()
         spo.acquire()
         spo.load_v(
             previous=False,
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spo.commit()
         return
@@ -2352,16 +2380,16 @@ def _prefetch_page_offsets_for_work_tile(
     with domain_loop(loop_start, loop_end, loop_step):
         spo.acquire()
         spo.load_k(
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spo.commit()
         spo.acquire()
         spo.load_v(
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spo.commit()
 
@@ -2370,9 +2398,9 @@ def _prefetch_reused_page_windows_for_work_tile(
     spok: SmemPageOffsetsKvResource,
     spov: SmemPageOffsetsKvResource,
     *,
-    batch_coord: Int32,
     kv_tile_start: Int32,
-    cached_seqlen_kv: Int32,
+    kv_request_begin: Int32,
+    kv_page_idx_ub: Int32,
     loop_start: object,
     loop_end: object,
     loop_step: object,
@@ -2396,17 +2424,17 @@ def _prefetch_reused_page_windows_for_work_tile(
     spok.acquire()
     spok.load_k(
         tile_offset=0,
-        batch_coord=batch_coord,
         kv_tile_start=kv_tile_start,
-        cached_seqlen_kv=cached_seqlen_kv,
+        kv_request_begin=kv_request_begin,
+        kv_page_idx_ub=kv_page_idx_ub,
     )
     spok.commit()
     spov.acquire()
     spov.load_v(
         tile_offset=0,
-        batch_coord=batch_coord,
         kv_tile_start=kv_tile_start,
-        cached_seqlen_kv=cached_seqlen_kv,
+        kv_request_begin=kv_request_begin,
+        kv_page_idx_ub=kv_page_idx_ub,
     )
     spov.commit()
 
@@ -2414,17 +2442,17 @@ def _prefetch_reused_page_windows_for_work_tile(
         spok.acquire()
         spok.load_k(
             tile_offset=0,
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spok.commit()
         spov.acquire()
         spov.load_v(
             tile_offset=0,
-            batch_coord=batch_coord,
             kv_tile_start=kv_tile_start,
-            cached_seqlen_kv=cached_seqlen_kv,
+            kv_request_begin=kv_request_begin,
+            kv_page_idx_ub=kv_page_idx_ub,
         )
         spov.commit()
 
@@ -2477,13 +2505,17 @@ def create_page_offsets_task(
         if spov is not None:
             spov.init_load_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
-            batch_coord, kv_tile_start, cached_seqlen_kv = gqkv.compute_page_coords()
+            (
+                kv_tile_start,
+                kv_request_begin,
+                kv_page_idx_ub,
+            ) = gqkv.compute_page_coords()
             if spov is None:
                 _prefetch_page_offsets_for_work_tile(
                     spo,
-                    batch_coord=batch_coord,
                     kv_tile_start=kv_tile_start,
-                    cached_seqlen_kv=cached_seqlen_kv,
+                    kv_request_begin=kv_request_begin,
+                    kv_page_idx_ub=kv_page_idx_ub,
                     loop_start=loop_start,
                     loop_end=loop_end,
                     loop_step=loop_step,
@@ -2493,9 +2525,9 @@ def create_page_offsets_task(
                 _prefetch_reused_page_windows_for_work_tile(
                     spo,
                     spov,
-                    batch_coord=batch_coord,
                     kv_tile_start=kv_tile_start,
-                    cached_seqlen_kv=cached_seqlen_kv,
+                    kv_request_begin=kv_request_begin,
+                    kv_page_idx_ub=kv_page_idx_ub,
                     loop_start=loop_start,
                     loop_end=loop_end,
                     loop_step=loop_step,

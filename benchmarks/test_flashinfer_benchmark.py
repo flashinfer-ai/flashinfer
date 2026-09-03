@@ -1,5 +1,4 @@
 import math
-import sys
 from types import SimpleNamespace
 
 import flashinfer_benchmark
@@ -39,12 +38,6 @@ def mocked_prims_ts_benchmark(monkeypatch):
 
     benchmark_outputs = []
     real_torch_empty = torch.empty
-    monkeypatch.setitem(
-        sys.modules,
-        "flashinfer.attention.prims_ts.context",
-        SimpleNamespace(_CONTEXT_KV_TILE_N=128),
-    )
-
     monkeypatch.setattr(
         attention_routine, "get_device", lambda _args: torch.device("cpu")
     )
@@ -425,8 +418,8 @@ def test_prims_ts_paged_context_adapter_contract(
     assert plan_kwargs["device"] == torch.device("cpu")
     assert plan_kwargs["batch_size"] == 2
     assert plan_kwargs["max_seq_len_q"] == 2
-    assert plan_kwargs["max_seq_len_k"] == 16
-    assert plan_kwargs["max_num_pages_per_seq_kv"] == 8
+    assert plan_kwargs["max_kv_len"] == 16
+    assert "max_num_pages_per_seq_kv" not in plan_kwargs
     assert plan_kwargs["num_qo_heads"] == 2
     assert plan_kwargs["num_kv_heads"] == 1
     assert plan_kwargs["head_dim"] == 128
@@ -444,10 +437,8 @@ def test_prims_ts_paged_context_adapter_contract(
     assert k_cache.stride() == v_cache.stride() == (2048, 2048, 128, 1)
     assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
     assert run_args[3].tolist() == [0, 2, 4]
-    assert run_args[4].tolist() == [0, 16, 32]
-    assert run_args[5].shape == (2, 2, 8)
-    assert run_args[5][0].tolist() == [[0] * 8, [0] * 8]
-    assert run_args[5][1].tolist() == [[1] * 8, [1] * 8]
+    assert run_args[4].tolist() == [0, 1, 2]
+    assert run_args[5].tolist() == [0, 1]
     assert run_args[6].tolist() == [16, 16]
     # With deterministic identical Q/K/V input, all three dequantization
     # scales match. This relation proves both Q and K scales are folded into
@@ -461,23 +452,6 @@ def test_prims_ts_paged_context_adapter_contract(
     assert run_kwargs["out"].dtype == torch.float8_e4m3fn
     assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == q.shape
-
-
-def test_prims_ts_context_page_table_uses_kernel_tile_contract(monkeypatch):
-    monkeypatch.setitem(
-        sys.modules,
-        "flashinfer.attention.prims_ts.context",
-        SimpleNamespace(_CONTEXT_KV_TILE_N=64),
-    )
-    block_tables = torch.tensor(((3,), (7,)), dtype=torch.int32)
-
-    dense_page_table = attention_routine._make_prims_ts_context_page_table(
-        block_tables, page_size=16
-    )
-
-    assert dense_page_table.shape == (2, 2, 4)
-    assert dense_page_table[0].tolist() == [[3] * 4, [3] * 4]
-    assert dense_page_table[1].tolist() == [[7] * 4, [7] * 4]
 
 
 def test_prims_ts_ragged_context_adapter_contract(

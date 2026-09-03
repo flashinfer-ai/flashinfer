@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -435,7 +435,7 @@ def test_template_axes_covered(func, template, label):
 
 
 def test_attention_ts_trace_registry_coverage():
-    """All public PrimTS attention surfaces register their complete variants."""
+    """All public PrimTS surfaces register finite discovery examples."""
 
     discovered = Counter(
         (func.__module__, func.__qualname__)
@@ -444,6 +444,54 @@ def test_attention_ts_trace_registry_coverage():
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
     assert sum(discovered.values()) == 54
+
+
+@pytest.mark.parametrize(
+    "missing_module",
+    (
+        "flashinfer.trace",
+        "flashinfer.trace.templates",
+        "flashinfer.trace.templates.attention",
+    ),
+)
+def test_prims_ts_trace_loader_accepts_only_missing_trace_modules(
+    monkeypatch, missing_module
+):
+    """A hosting build may omit tracing without disabling PrimTS imports."""
+    from flashinfer.attention.prims_ts import _trace
+
+    def raise_missing(_module_name):
+        raise ModuleNotFoundError(
+            f"No module named '{missing_module}'", name=missing_module
+        )
+
+    monkeypatch.setattr(_trace, "import_module", raise_missing)
+    assert _trace._load_attention_trace_templates() is None
+
+
+def test_prims_ts_trace_loader_reraises_nested_dependency_failure(monkeypatch):
+    """A broken dependency inside the trace module must remain visible."""
+    from flashinfer.attention.prims_ts import _trace
+
+    def raise_missing(_module_name):
+        raise ModuleNotFoundError(
+            "No module named 'trace_template_dependency'",
+            name="trace_template_dependency",
+        )
+
+    monkeypatch.setattr(_trace, "import_module", raise_missing)
+    with pytest.raises(ModuleNotFoundError, match="trace_template_dependency"):
+        _trace._load_attention_trace_templates()
+
+
+def test_prims_ts_missing_trace_symbol_is_local_and_optional(monkeypatch):
+    """Absent template symbols resolve to None without mutating their module."""
+    from flashinfer.attention.prims_ts import _trace
+
+    trace_module = SimpleNamespace(existing=object())
+    monkeypatch.setattr(_trace, "_ATTENTION_TRACE_TEMPLATES", trace_module)
+    assert _trace._get_attention_trace_template("missing") is None
+    assert vars(trace_module) == {"existing": trace_module.existing}
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
@@ -757,7 +805,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             "shape": None,
             "dtype": "bool",
             "optional": True,
-            "description": "Whether to validate live tensors and metadata values.",
+            "description": "Whether to validate per-run tensors and metadata values.",
         }
         assert definition["inputs"]["bmm1_scale"]["optional"] is True
         assert definition["inputs"]["bmm2_scale"]["optional"] is True
@@ -825,7 +873,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     assert definition["outputs"]["output"]["dtype"] == "float16"
 
 
-def test_prims_ts_bound_wrapper_traces_require_every_live_metadata_tensor():
+def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     """An incomplete redesigned run call must not emit unknown trace inputs."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
     from flashinfer.attention.prims_ts.mla_decode import (

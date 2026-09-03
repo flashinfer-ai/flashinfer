@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import inspect
+import itertools
 import math
 from types import SimpleNamespace
 from typing import Optional, Sequence
@@ -100,13 +101,12 @@ class _PagedContextCase:
 
 @dataclass(frozen=True)
 class _NativePagedMetadata:
-    """Kernel-native live metadata and its static page-table capacity."""
+    """Per-run CSR metadata accepted directly by the context kernel."""
 
     qo_indptr: torch.Tensor
-    logical_kv_indptr: torch.Tensor
-    dense_page_idx_kv: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
     seq_lens_kv: torch.Tensor
-    max_num_pages_per_seq_kv: int
 
 
 def _cumulative(lengths: Sequence[int]) -> tuple[int, ...]:
@@ -455,51 +455,19 @@ def _assert_context_correct(
 
 def _make_native_paged_metadata(
     case: _PagedContextCase,
-    *,
-    max_num_pages_per_seq_kv: Optional[int] = None,
 ) -> _NativePagedMetadata:
-    """Translate test CSR metadata to the live native context ABI."""
-
-    page_counts = tuple(
-        math.ceil(length / case.page_size) for length in case.reference.k_lengths
-    )
-    pages_per_kv_tile = context_module._CONTEXT_KV_TILE_N // case.page_size
-    required_capacity = (
-        (max(page_counts) + pages_per_kv_tile - 1) // pages_per_kv_tile
-    ) * pages_per_kv_tile
-    if max_num_pages_per_seq_kv is None:
-        max_num_pages_per_seq_kv = required_capacity
-    if max_num_pages_per_seq_kv < required_capacity:
-        raise ValueError("native page-table capacity is too small for this case")
-
-    page_indptr = case.paged_kv_indptr.tolist()
-    page_indices = case.paged_kv_indices.tolist()
-    dense_rows = []
-    for batch_idx, page_count in enumerate(page_counts):
-        page_begin = page_indptr[batch_idx]
-        row = page_indices[page_begin : page_begin + page_count]
-        padded_row = row + [row[-1]] * (max_num_pages_per_seq_kv - page_count)
-        dense_rows.append((padded_row, padded_row))
+    """Pair test CSR storage with explicit logical K/V lengths."""
 
     device = case.reference.q.device
     return _NativePagedMetadata(
         qo_indptr=case.qo_indptr,
-        logical_kv_indptr=torch.tensor(
-            _cumulative(case.reference.k_lengths),
-            dtype=torch.int32,
-            device=device,
-        ),
-        dense_page_idx_kv=torch.tensor(
-            dense_rows,
-            dtype=torch.int32,
-            device=device,
-        ),
+        paged_kv_indptr=case.paged_kv_indptr,
+        paged_kv_indices=case.paged_kv_indices,
         seq_lens_kv=torch.tensor(
             case.reference.k_lengths,
             dtype=torch.int32,
             device=device,
         ),
-        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
     )
 
 
@@ -523,28 +491,19 @@ def _plan_paged_wrapper(
     case: _PagedContextCase,
     *,
     max_seq_len_q: Optional[int] = None,
-    max_seq_len_k: Optional[int] = None,
+    max_kv_len: Optional[int] = None,
 ) -> _NativePagedMetadata:
-    """Compile a conservative paged plan and return its live metadata."""
+    """Compile a conservative paged plan and return its per-run metadata."""
 
     reference = case.reference
     max_seq_len_q = max(reference.q_lengths) if max_seq_len_q is None else max_seq_len_q
-    max_seq_len_k = max(reference.k_lengths) if max_seq_len_k is None else max_seq_len_k
-    pages_per_kv_tile = context_module._CONTEXT_KV_TILE_N // case.page_size
-    required_pages = math.ceil(max_seq_len_k / case.page_size)
-    max_num_pages_per_seq_kv = (
-        (required_pages + pages_per_kv_tile - 1) // pages_per_kv_tile
-    ) * pages_per_kv_tile
-    metadata = _make_native_paged_metadata(
-        case,
-        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-    )
+    max_kv_len = max(reference.k_lengths) if max_kv_len is None else max_kv_len
+    metadata = _make_native_paged_metadata(case)
     wrapper.plan(
         device=reference.q.device,
         batch_size=len(reference.q_lengths),
         max_seq_len_q=max_seq_len_q,
-        max_seq_len_k=max_seq_len_k,
-        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+        max_kv_len=max_kv_len,
         num_qo_heads=int(reference.q.shape[1]),
         num_kv_heads=int(case.k_cache.shape[1]),
         head_dim=int(reference.q.shape[2]),
@@ -573,8 +532,8 @@ def _run_paged_wrapper(
         case.k_cache,
         case.v_cache,
         metadata.qo_indptr,
-        metadata.logical_kv_indptr,
-        metadata.dense_page_idx_kv,
+        metadata.paged_kv_indptr,
+        metadata.paged_kv_indices,
         metadata.seq_lens_kv,
         out=out,
         validate=validate,
@@ -599,10 +558,11 @@ def _capture_context_graph(
             k,
             v,
             paged_metadata.qo_indptr,
-            paged_metadata.logical_kv_indptr,
-            paged_metadata.dense_page_idx_kv,
+            paged_metadata.paged_kv_indptr,
+            paged_metadata.paged_kv_indices,
             paged_metadata.seq_lens_kv,
             out=out,
+            validate=False,
         )
 
     assert launch() is out
@@ -710,13 +670,15 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
 def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
     monkeypatch,
 ) -> None:
-    """The paged wrapper checks every live and plan-owned launch allocation."""
+    """The paged wrapper checks every per-run and plan-owned allocation."""
 
     monkeypatch.setattr(
-        context_module, "_validate_live_paged_runtime_inputs", lambda *_: None
+        context_module, "_validate_paged_runtime_inputs", lambda *_: None
     )
     monkeypatch.setattr(
-        context_module, "_validate_live_paged_metadata", lambda *_: None
+        context_module,
+        "_validate_paged_runtime_metadata",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         context_module,
@@ -727,9 +689,9 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
         "k_cache",
         "v_cache",
         "qo_indptr",
-        "logical_kv_indptr",
+        "paged_kv_indptr",
+        "paged_kv_indices",
         "seq_lens_kv",
-        "dense_page_idx_kv",
     )
     plan_owned_names = (
         "scale_softmax_log2",
@@ -764,8 +726,8 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
                 arguments["k_cache"],
                 arguments["v_cache"],
                 arguments["qo_indptr"],
-                arguments["logical_kv_indptr"],
-                arguments["dense_page_idx_kv"],
+                arguments["paged_kv_indptr"],
+                arguments["paged_kv_indices"],
                 arguments["seq_lens_kv"],
                 out=out,
             )
@@ -867,8 +829,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "device",
         "batch_size",
         "max_seq_len_q",
-        "max_seq_len_k",
-        "max_num_pages_per_seq_kv",
+        "max_kv_len",
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
@@ -892,8 +853,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "k_cache",
         "v_cache",
         "qo_indptr",
-        "logical_kv_indptr",
-        "dense_page_idx_kv",
+        "paged_kv_indptr",
+        "paged_kv_indices",
         "seq_lens_kv",
         "out",
         "scale_softmax_log2",
@@ -906,6 +867,119 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
     assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
+
+
+def test_attention_ts_context_paged_one_shot_forwards_csr_to_wrapper(
+    monkeypatch,
+) -> None:
+    """The convenience API derives lengths but never materializes a dense table."""
+
+    calls = {}
+
+    class StubWrapper:
+        def __init__(self, *, kv_layout):
+            calls["kv_layout"] = kv_layout
+
+        def plan(self, **kwargs):
+            calls["plan"] = kwargs
+
+        def run(self, *args, **kwargs):
+            calls["run"] = (args, kwargs)
+            return kwargs["out"]
+
+    geometry = context_module._PagedContextOneShotGeometry(
+        device=torch.device("cpu"),
+        batch_size=2,
+        max_seq_len_q=8,
+        max_kv_len=65,
+        page_size=32,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        q_dtype=torch.float16,
+        output_dtype=torch.float16,
+    )
+    metadata = context_module._PagedContextOneShotMetadata(seq_lens=(33, 65))
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_paged_one_shot_inputs",
+        lambda *_args, **_kwargs: (geometry, metadata),
+    )
+    monkeypatch.setattr(context_module, "BatchPrefillPagedTSWrapper", StubWrapper)
+
+    q = torch.empty((9, 4, 128), dtype=torch.float16)
+    k_cache = torch.empty((8, 2, 32, 128), dtype=torch.float16)
+    v_cache = torch.empty_like(k_cache)
+    qo_indptr = torch.tensor((0, 4, 9), dtype=torch.int32)
+    paged_kv_indptr = torch.tensor((0, 2, 5), dtype=torch.int32)
+    paged_kv_indices = torch.tensor((3, 1, 7, 0, 2), dtype=torch.int32)
+    last_page_len = torch.tensor((1, 1), dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    returned = batch_prefill_with_paged_kv_cache(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        last_page_len,
+        out=out,
+    )
+
+    assert returned is out
+    assert calls["plan"]["max_kv_len"] == 65
+    assert "max_num_pages_per_seq_kv" not in calls["plan"]
+    run_args, run_kwargs = calls["run"]
+    assert run_args[3] is qo_indptr
+    assert run_args[4] is paged_kv_indptr
+    assert run_args[5] is paged_kv_indices
+    torch.testing.assert_close(run_args[6], torch.tensor((33, 65), dtype=torch.int32))
+    assert tuple(run_kwargs) == ("out",)
+    assert run_kwargs["out"] is out
+
+
+def test_attention_ts_context_paged_one_shot_ignores_aggregate_kv_extent(
+    monkeypatch,
+) -> None:
+    """Native CSR needs only per-request K/V lengths to fit in Int32."""
+
+    batch_size = 17
+    monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
+    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
+    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
+    )
+
+    q = torch.empty((batch_size, 4, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((2, 4, 32, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
+    paged_kv_indptr = 2 * qo_indptr
+    paged_kv_indices = torch.tensor((0, 1) * batch_size, dtype=torch.int32)
+    paged_kv_last_page_len = torch.ones(batch_size, dtype=torch.int32)
+
+    geometry, metadata = context_module._resolve_paged_one_shot_inputs(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+        page_size=32,
+        mask_type="dense",
+        window_left=-1,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert geometry.max_kv_len == 33
+    assert metadata.seq_lens == (33,) * batch_size
+    assert sum(metadata.seq_lens) > context_module._CONTEXT_PADDED_EXTENT_MAX
 
 
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
@@ -933,8 +1007,7 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         device="cuda:0",
         batch_size=2,
         max_seq_len_q=16,
-        max_seq_len_k=64,
-        max_num_pages_per_seq_kv=4,
+        max_kv_len=64,
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=128,
@@ -942,13 +1015,12 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         kv_dtype=torch.float16,
     )
     first_state = wrapper._plan_state
-    with pytest.raises(ValueError, match="max_num_pages_per_seq_kv"):
+    with pytest.raises(ValueError, match="max_kv_len must be positive"):
         wrapper.plan(
             device="cuda:0",
             batch_size=2,
             max_seq_len_q=16,
-            max_seq_len_k=64,
-            max_num_pages_per_seq_kv=1,
+            max_kv_len=0,
             num_qo_heads=4,
             num_kv_heads=2,
             head_dim=128,
@@ -1024,8 +1096,7 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
         device="cuda:0",
         batch_size=2,
         max_seq_len_q=16,
-        max_seq_len_k=64,
-        max_num_pages_per_seq_kv=4,
+        max_kv_len=64,
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=128,
@@ -1049,9 +1120,9 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     def fail(*_args, **_kwargs):
         pytest.fail("validate=False reached an explicit runtime validator")
 
-    monkeypatch.setattr(context_module, "_validate_live_paged_runtime_inputs", fail)
-    monkeypatch.setattr(context_module, "_validate_live_paged_metadata", fail)
-    monkeypatch.setattr(context_module, "_validate_live_scale_tensor", fail)
+    monkeypatch.setattr(context_module, "_validate_paged_runtime_inputs", fail)
+    monkeypatch.setattr(context_module, "_validate_paged_runtime_metadata", fail)
+    monkeypatch.setattr(context_module, "_validate_runtime_scale_tensor", fail)
     monkeypatch.setattr(context_module, "_prepare_out", fail)
     monkeypatch.setattr(context_module, "_validate_out_does_not_overlap_inputs", fail)
 
@@ -1121,6 +1192,108 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
             placeholder,
             validate=1,
         )
+
+
+def _validate_paged_metadata_on_cpu(
+    monkeypatch,
+    *,
+    qo_indptr: tuple[int, ...] = (0, 2, 5),
+    paged_kv_indptr: tuple[int, ...] = (0, 3, 6),
+    paged_kv_indices: tuple[int, ...] = (0, 1, -1, 2, 3, -1),
+    seq_lens_kv: tuple[int, ...] = (33, 64),
+    max_kv_len: int = 65,
+) -> None:
+    """Exercise metadata value checks without requiring a CUDA device."""
+
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
+    )
+    geometry = SimpleNamespace(
+        device=torch.device("cpu"),
+        batch_size=2,
+        max_seq_len_q=64,
+        max_kv_len=max_kv_len,
+        page_size=32,
+        mask_type="causal",
+    )
+    context_module._validate_paged_runtime_metadata(
+        torch.tensor(qo_indptr, dtype=torch.int32),
+        torch.tensor(paged_kv_indptr, dtype=torch.int32),
+        torch.tensor(paged_kv_indices, dtype=torch.int32),
+        torch.tensor(seq_lens_kv, dtype=torch.int32),
+        geometry,
+        total_q=qo_indptr[-1],
+        num_physical_pages=4,
+    )
+
+
+def test_attention_ts_context_paged_validation_allows_arbitrary_padding_ids(
+    monkeypatch,
+) -> None:
+    """Only page IDs required by each logical K/V length are dereferenced."""
+
+    _validate_paged_metadata_on_cpu(monkeypatch)
+
+
+def test_attention_ts_context_paged_validation_allows_fixed_stride_extra_padding(
+    monkeypatch,
+) -> None:
+    """CSR row width may exceed the page count implied by ``max_kv_len``."""
+
+    _validate_paged_metadata_on_cpu(
+        monkeypatch,
+        paged_kv_indptr=(0, 4, 8),
+        paged_kv_indices=(0, 1, -1, -1, 2, -1, -1, -1),
+        seq_lens_kv=(33, 32),
+        max_kv_len=33,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            {"paged_kv_indptr": (0, 0, 6)},
+            "strictly increasing",
+            id="empty-row",
+        ),
+        pytest.param(
+            {"paged_kv_indptr": (0, 1, 6)},
+            "needs 2, got 1",
+            id="short-row",
+        ),
+        pytest.param(
+            {"paged_kv_indptr": (0, 3, 5)},
+            "final paged_kv_indptr offset",
+            id="wrong-final-offset",
+        ),
+        pytest.param(
+            {"seq_lens_kv": (66, 64)},
+            "max_kv_len=65",
+            id="kv-bound",
+        ),
+        pytest.param(
+            {"qo_indptr": (0, 34, 35)},
+            "Sq=34, Sk=33",
+            id="causal-q-longer-than-kv",
+        ),
+        pytest.param(
+            {"paged_kv_indices": (4, 1, -1, 2, 3, -1)},
+            "active paged_kv_indices",
+            id="active-page-out-of-range",
+        ),
+    ),
+)
+def test_attention_ts_context_paged_validation_rejects_unsafe_csr_values(
+    monkeypatch,
+    overrides: dict[str, tuple[int, ...]],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _validate_paged_metadata_on_cpu(monkeypatch, **overrides)
 
 
 def test_attention_ts_context_fixed_oracle_is_bottom_right_causal():
@@ -1323,7 +1496,7 @@ def test_attention_ts_context_page_window_fits_static_geometry_and_capacity(
         is_persistent=True,
         is_causal=is_causal,
         use_paged_kv=True,
-        max_num_pages_per_seq_kv=max_pages,
+        max_kv_len=max_pages * 32,
     ).cfg
 
     assert cfg.page_table_window_entries == expected_entries
@@ -1373,7 +1546,7 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
     ),
     (
         pytest.param(True, True, True, True, False, id="fixed-causal-static"),
-        pytest.param(True, True, True, False, True, id="live-ragged-clc"),
+        pytest.param(True, True, True, False, True, id="runtime-ragged-clc"),
         pytest.param(True, False, True, True, True, id="paired-clc"),
         pytest.param(True, True, False, False, False, id="dense-static"),
         pytest.param(False, True, True, False, False, id="nonpersistent"),
@@ -1386,7 +1559,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     uniform_packed_lengths: bool,
     expected: bool,
 ):
-    """Paged CLC selection follows topology and live-domain requirements."""
+    """Paged CLC selection follows topology and runtime-domain requirements."""
 
     assert (
         context_module._paged_context_uses_clc_scheduler(
@@ -1412,7 +1585,9 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     (
         pytest.param(False, False, True, True, True, True, True, id="paired-clc"),
         pytest.param(True, True, False, False, True, True, True, id="head-paired-clc"),
-        pytest.param(True, False, True, False, True, True, True, id="live-ragged-clc"),
+        pytest.param(
+            True, False, True, False, True, True, True, id="runtime-ragged-clc"
+        ),
         pytest.param(True, False, True, True, True, False, True, id="triangular-clc"),
         pytest.param(True, False, True, True, True, True, False, id="offset-static"),
         pytest.param(True, False, True, True, False, False, False, id="dense-static"),
@@ -1456,7 +1631,9 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
     (
         pytest.param(False, False, True, True, 1, True, True, True, id="paired"),
         pytest.param(True, True, False, False, 1, True, True, True, id="head-paired"),
-        pytest.param(True, False, True, False, 1, True, True, True, id="live-ragged"),
+        pytest.param(
+            True, False, True, False, 1, True, True, True, id="runtime-ragged"
+        ),
         pytest.param(True, False, True, True, 1, True, False, True, id="triangular"),
         pytest.param(True, False, True, True, 148, True, True, False, id="one-wave"),
         pytest.param(True, False, True, True, 149, True, True, True, id="multi-wave"),
@@ -1509,7 +1686,7 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
         is_causal=True,
         is_clc_dynamic=True,
         use_paged_kv=True,
-        max_num_pages_per_seq_kv=8,
+        max_kv_len=256,
     )
     cfg = kernel.cfg
     cfg.has_varlen = True
@@ -1529,7 +1706,8 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128,
-            g_page_idx_kv=None,
+            g_paged_kv_indptr=None,
+            g_paged_kv_indices=None,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -1553,10 +1731,10 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
     (Float8E4M3FN, BFloat16),
     ids=("fp8", "bf16"),
 )
-def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
+def test_attention_ts_context_d256_runtime_paged_clc_uses_distinct_auxiliary_warps(
     input_dtype,
 ):
-    """The live-ragged D256 CLC and page-ID producers cannot overlap."""
+    """The runtime-ragged D256 CLC and page-ID producers cannot overlap."""
     kernel = FmhaTs(
         in_dtype=input_dtype,
         out_dtype=Float16,
@@ -1565,7 +1743,7 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
         is_causal=True,
         is_clc_dynamic=True,
         use_paged_kv=True,
-        max_num_pages_per_seq_kv=8,
+        max_kv_len=256,
     )
     cfg = kernel.cfg
     cfg.has_varlen = True
@@ -1585,7 +1763,8 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128,
-            g_page_idx_kv=None,
+            g_paged_kv_indptr=None,
+            g_paged_kv_indices=None,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -1645,7 +1824,7 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
         balance_causal_workload=balance_causal_workload,
         is_clc_dynamic=False,
         use_paged_kv=True,
-        max_num_pages_per_seq_kv=8,
+        max_kv_len=256,
     )
     cfg = kernel.cfg
     cfg.has_varlen = True
@@ -1668,7 +1847,8 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128 if has_q_offset else 0,
-            g_page_idx_kv=None,
+            g_paged_kv_indptr=None,
+            g_paged_kv_indices=None,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -1928,8 +2108,7 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         device="cuda:0",
         batch_size=2,
         max_seq_len_q=64,
-        max_seq_len_k=128,
-        max_num_pages_per_seq_kv=4,
+        max_kv_len=128,
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
@@ -1983,8 +2162,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
             device="cuda:0",
             batch_size=1,
             max_seq_len_q=1,
-            max_seq_len_k=1,
-            max_num_pages_per_seq_kv=4,
+            max_kv_len=1,
             num_qo_heads=1,
             num_kv_heads=1,
             head_dim=128,
@@ -1995,39 +2173,55 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
         )
 
 
-def test_attention_ts_context_rejects_int32_page_table_offset_overflow(monkeypatch):
-    """The flattened [B, 2, max_pages] table must fit kernel Int32 offsets."""
+def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypatch):
+    """Large static K/V capacity does not constrain small native-CSR rows."""
 
-    # Seventeen rows padded to four pages produce 136 flattened elements.
-    # Lowering the test-only limit exercises the product guard without an
-    # enormous allocation while retaining the supported D128 head size.
-    monkeypatch.setattr(context_module, "_INT32_MAX", 128)
+    batch_size = 17
+    monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
     monkeypatch.setattr(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
     )
+    geometry = context_module._resolve_paged_plan_geometry(
+        device="cuda:0",
+        batch_size=batch_size,
+        max_seq_len_q=1,
+        max_kv_len=65,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=32,
+        mask_type="dense",
+        window_left=-1,
+        output_dtype=torch.bfloat16,
+    )
 
-    with pytest.raises(
-        NotImplementedError,
-        match="dense page-table elements must fit in a signed int32",
-    ):
-        context_module._resolve_paged_plan_geometry(
-            device="cuda:0",
-            batch_size=17,
-            max_seq_len_q=1,
-            max_seq_len_k=1,
-            max_num_pages_per_seq_kv=4,
-            num_qo_heads=4,
-            num_kv_heads=4,
-            head_dim=128,
-            q_dtype=torch.bfloat16,
-            kv_dtype=torch.bfloat16,
-            page_size=32,
-            mask_type="dense",
-            window_left=-1,
-            output_dtype=torch.bfloat16,
-        )
+    assert geometry.max_kv_len == 65
+    assert not hasattr(geometry, "max_num_pages_per_seq_kv")
+    assert (
+        geometry.batch_size * geometry.max_kv_len
+        > context_module._CONTEXT_PADDED_EXTENT_MAX
+    )
+
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
+    )
+    runtime_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
+    context_module._validate_paged_runtime_metadata(
+        runtime_indptr,
+        runtime_indptr.clone(),
+        torch.zeros(batch_size, dtype=torch.int32),
+        torch.ones(batch_size, dtype=torch.int32),
+        geometry,
+        total_q=batch_size,
+        num_physical_pages=1,
+    )
 
 
 def test_attention_ts_context_reserves_int32_work_tile_padding():
@@ -2682,6 +2876,87 @@ def test_attention_ts_context_paged_dense_k_mask_accuracy(
     _assert_context_correct(output, case.reference)
 
 
+@pytest.mark.parametrize(
+    ("head_dim", "stages_page_offsets"),
+    (
+        pytest.param(128, False, id="d128-direct-page-ids"),
+        pytest.param(256, True, id="d256-staged-page-ids"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
+    head_dim: int,
+    stages_page_offsets: bool,
+) -> None:
+    """Both page-ID lookup paths ignore invalid fixed-stride CSR padding."""
+
+    case = _make_paged_context_case(
+        q_lengths=(17, 17),
+        k_lengths=(65, 33),
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        output_scale=1.0,
+        seed=2026090303 + head_dim,
+    )
+    active_indptr = case.paged_kv_indptr.tolist()
+    active_page_ids = case.paged_kv_indices.tolist()
+    fixed_stride = (
+        max(end - begin for begin, end in itertools.pairwise(active_indptr)) + 2
+    )
+    invalid_page_id = int(case.k_cache.shape[0]) + 17
+    padded_page_ids = []
+    for begin, end in itertools.pairwise(active_indptr):
+        row = active_page_ids[begin:end]
+        padding = tuple(
+            (-1, invalid_page_id)[offset % 2]
+            for offset in range(fixed_stride - len(row))
+        )
+        padded_page_ids.extend((*row, *padding))
+        assert -1 in padding
+        assert invalid_page_id in padding
+
+    metadata = _NativePagedMetadata(
+        qo_indptr=case.qo_indptr,
+        paged_kv_indptr=torch.arange(
+            0,
+            (len(case.reference.k_lengths) + 1) * fixed_stride,
+            fixed_stride,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        paged_kv_indices=torch.tensor(
+            padded_page_ids, dtype=torch.int32, device="cuda"
+        ),
+        seq_lens_kv=torch.tensor(
+            case.reference.k_lengths, dtype=torch.int32, device="cuda"
+        ),
+    )
+    wrapper = BatchPrefillPagedTSWrapper()
+    _plan_paged_wrapper(wrapper, case)
+
+    cfg = FmhaTs(
+        in_dtype=BFloat16,
+        out_dtype=BFloat16,
+        d=head_dim,
+        is_persistent=True,
+        is_causal=True,
+        is_clc_dynamic=True,
+        use_paged_kv=True,
+        num_tokens_per_page=case.page_size,
+        max_kv_len=max(case.reference.k_lengths),
+    ).cfg
+    assert cfg.stages_page_offsets_in_smem is stages_page_offsets
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+
+    output = _run_paged_wrapper(wrapper, case, metadata)
+    _assert_context_correct(output, case.reference)
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
@@ -2888,7 +3163,7 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
     assert wrapper._plan_state is not None
     assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
     if kv_length == 993:
-        assert wrapper._plan_state.geometry.max_num_pages_per_seq_kv == 32
+        assert wrapper._plan_state.geometry.max_kv_len == 993
         cfg = FmhaTs(
             in_dtype=BFloat16,
             out_dtype=BFloat16,
@@ -2897,7 +3172,7 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
             is_causal=False,
             use_paged_kv=True,
             num_tokens_per_page=case.page_size,
-            max_num_pages_per_seq_kv=32,
+            max_kv_len=993,
         ).cfg
         assert cfg.reuses_page_table_windows
     output = _run_paged_wrapper(wrapper, case, metadata)
@@ -2980,7 +3255,7 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
     expected_q_offset: bool,
     qkv_dtype: torch.dtype,
 ):
-    """Conservative causal planning handles both live offset geometries."""
+    """Conservative causal planning handles both runtime offset geometries."""
 
     case = _make_paged_context_case(
         q_lengths=q_lengths,
@@ -3023,6 +3298,150 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
 
     _assert_context_correct(direct_out, case.reference)
     _assert_context_correct(graph_out, case.reference)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize(
+    ("head_dim", "plan_k_lengths"),
+    (
+        pytest.param(128, (65, 33), id="d128-direct-page-ids"),
+        pytest.param(256, (1057, 1025), id="d256-staged-page-window"),
+    ),
+)
+def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
+    head_dim: int,
+    plan_k_lengths: tuple[int, int],
+) -> None:
+    """Captured runs reload CSR rows, page IDs, and K/V lengths in place."""
+
+    case = _make_paged_context_case(
+        q_lengths=(17, 17),
+        k_lengths=plan_k_lengths,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        output_scale=1.0,
+        seed=2026090302 + head_dim,
+    )
+    wrapper = BatchPrefillPagedTSWrapper()
+    metadata = _plan_paged_wrapper(wrapper, case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+
+    cfg = FmhaTs(
+        in_dtype=BFloat16,
+        out_dtype=BFloat16,
+        d=head_dim,
+        is_persistent=True,
+        is_causal=True,
+        is_clc_dynamic=True,
+        use_paged_kv=True,
+        num_tokens_per_page=case.page_size,
+        max_kv_len=max(plan_k_lengths),
+    ).cfg
+    assert cfg.stages_page_offsets_in_smem is (head_dim == 256)
+
+    warmup_out = torch.empty_like(case.reference.q)
+    _run_paged_wrapper(wrapper, case, metadata, out=warmup_out)
+
+    graph_out = torch.full_like(case.reference.q, float("nan"))
+    graph = _capture_context_graph(
+        wrapper,
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        graph_out,
+        metadata,
+    )
+    metadata_ptrs = tuple(
+        tensor.data_ptr()
+        for tensor in (
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_indices,
+            metadata.seq_lens_kv,
+        )
+    )
+
+    runtime_k_lengths = tuple(reversed(plan_k_lengths))
+    runtime_page_counts = tuple(
+        math.ceil(length / case.page_size) for length in runtime_k_lengths
+    )
+    runtime_page_indptr = _cumulative(runtime_page_counts)
+    runtime_page_indices = tuple(range(1, runtime_page_indptr[-1] + 1))
+    assert runtime_page_indptr[-1] == metadata.paged_kv_indices.numel()
+    if head_dim == 256:
+        assert max(runtime_page_counts) > cfg.page_table_window_entries
+    metadata.paged_kv_indptr.copy_(
+        torch.tensor(runtime_page_indptr, dtype=torch.int32, device="cuda")
+    )
+    metadata.paged_kv_indices.copy_(
+        torch.tensor(runtime_page_indices, dtype=torch.int32, device="cuda")
+    )
+    metadata.seq_lens_kv.copy_(
+        torch.tensor(runtime_k_lengths, dtype=torch.int32, device="cuda")
+    )
+    assert metadata_ptrs == tuple(
+        tensor.data_ptr()
+        for tensor in (
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_indices,
+            metadata.seq_lens_kv,
+        )
+    )
+
+    def gather_logical_cache(cache: torch.Tensor) -> torch.Tensor:
+        requests = []
+        for batch_idx, k_length in enumerate(runtime_k_lengths):
+            page_begin = runtime_page_indptr[batch_idx]
+            page_end = runtime_page_indptr[batch_idx + 1]
+            page_ids = runtime_page_indices[page_begin:page_end]
+            requests.append(
+                cache[list(page_ids)]
+                .permute(0, 2, 1, 3)
+                .reshape(-1, cache.shape[1], cache.shape[3])[:k_length]
+            )
+        return torch.cat(requests)
+
+    runtime_reference = replace(
+        case.reference,
+        k=gather_logical_cache(case.k_cache),
+        v=gather_logical_cache(case.v_cache),
+        kv_indptr=torch.tensor(
+            _cumulative(runtime_k_lengths), dtype=torch.int32, device="cuda"
+        ),
+        k_lengths=runtime_k_lengths,
+    )
+    expected = _context_reference(runtime_reference)
+
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    last_page_len = torch.tensor(
+        tuple((length - 1) % case.page_size + 1 for length in runtime_k_lengths),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    one_shot_out = batch_prefill_with_paged_kv_cache(
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        metadata.qo_indptr,
+        metadata.paged_kv_indptr,
+        metadata.paged_kv_indices,
+        last_page_len,
+        page_size=case.page_size,
+        mask_type=case.reference.mask_type,
+        sm_scale=case.reference.sm_scale,
+        output_scale=case.reference.output_scale,
+        out_dtype=case.reference.output_dtype,
+    )
+
+    _assert_context_correct(graph_out, runtime_reference, expected=expected)
+    _assert_context_correct(one_shot_out, runtime_reference, expected=expected)
 
 
 @pytest.mark.arch_blackwell
@@ -3095,12 +3514,12 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_replay(
+def test_attention_ts_context_runtime_q_offsets_expand_causal_domain_on_graph_replay(
     paged: bool,
     head_dim: int,
     qkv_dtype: torch.dtype,
 ):
-    """Live Q offsets must drive the causal K-tile count for each request.
+    """Per-run Q offsets must drive the causal K-tile count for each request.
 
     Both plans have total_q=564 and max(Sq)=500. Redistributing the same Q
     storage from (500, 64) to (64, 500) raises request zero's bottom-right
@@ -3231,8 +3650,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
             k,
             v,
             paged_metadata.qo_indptr,
-            paged_metadata.logical_kv_indptr,
-            paged_metadata.dense_page_idx_kv,
+            paged_metadata.paged_kv_indptr,
+            paged_metadata.paged_kv_indices,
             paged_metadata.seq_lens_kv,
             out=direct_out,
         )
@@ -3240,7 +3659,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
     graph.replay()
     torch.cuda.synchronize()
 
-    # Check graph replay first so this specifically locks down live metadata
+    # Check graph replay first so this specifically locks down per-run metadata
     # behavior under capture; the direct launch must obey the same contract.
     _assert_context_correct(graph_out, runtime_reference, expected=expected)
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
@@ -3248,8 +3667,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
-    """Live Q/K redistribution preserves D128 zero-offset paired semantics."""
+def test_attention_ts_context_runtime_zero_offset_qk_redistribution_graph_replay():
+    """Per-run Q/K redistribution preserves D128 zero-offset paired semantics."""
 
     plan_lengths = (500, 64)
     replay_lengths = (300, 264)
@@ -3312,8 +3731,8 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_live_k_redistribution_graph_replay():
-    """Live K offsets independently update causal domains and right bounds."""
+def test_attention_ts_context_runtime_k_redistribution_graph_replay():
+    """Per-run K offsets independently update causal domains and right bounds."""
 
     q_lengths = (64, 500)
     plan_k_lengths = (1000, 500)
@@ -3369,8 +3788,8 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
-    """Finite-window start and right masks follow live packed Q offsets."""
+def test_attention_ts_context_paged_window_runtime_q_redistribution_graph_replay():
+    """Finite-window start and right masks follow per-run packed Q offsets."""
 
     plan_q_lengths = (48, 16)
     replay_q_lengths = (16, 48)
@@ -3441,7 +3860,9 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_paged_wrapper(wrapper, case, metadata, out=output)
+        captured = _run_paged_wrapper(
+            wrapper, case, metadata, out=output, validate=False
+        )
     assert captured is output
     output.fill_(float("nan"))
     graph.replay()

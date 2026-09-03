@@ -1,7 +1,7 @@
 # Task-Scheduled MLA Decode
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
-Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
+Attention (MLA) decode kernels used by FlashInfer's Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
 layout: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
@@ -21,13 +21,10 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus live-metadata `run()` interface. |
+| `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
 | `batch_decode_mla_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_mla_workspace_size` | Size caller-owned standalone scratch. |
 | `prims_ts_batch_decode_with_kv_cache_mla` | Standalone launch with caller-owned scratch. |
-
-The PrimTS MLA wrapper is experimental and may change incompatibly while this
-API family is stabilized.
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -132,7 +129,7 @@ With default `validate=True`, a wrapper run checks those metadata values and
 the tensor, output, and aliasing contracts. Once the caller has established
 the conditions, `validate=False` avoids the explicit checks and host metadata
 reads. The caller-workspace standalone launch likewise trusts device-side values.
-Invalid live page IDs, lengths, offsets, or aliases in either unchecked path
+Invalid per-run page IDs, lengths, offsets, or aliases in either unchecked path
 may cause incorrect results or out-of-bounds access. Do not mutate metadata
 concurrently with a launch or graph replay that reads it. CUDA Graph replay
 also requires stable captured addresses and shapes.
@@ -274,7 +271,7 @@ buffer includes internal FP32 LSE storage, does not require initialization,
 and is exclusive to one in-flight launch or captured graph. It must not overlap
 query, K/V cache, metadata, or output storage. The standalone hot path does not
 copy metadata to the host; callers must maintain all page, length, and
-packed-offset preconditions for every launch. These live values are not fully
+packed-offset preconditions for every launch. These per-run values are not fully
 value-checked by the launch.
 
 For CUDA graph capture, call `plan()` and perform one default-validating

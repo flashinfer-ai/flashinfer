@@ -1,7 +1,7 @@
 # Task-Scheduled FMHA Decode
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA kernel used by
-FlashInfer's experimental paged decode APIs on NVIDIA Blackwell GPUs. It
+FlashInfer's paged decode APIs on NVIDIA Blackwell GPUs. It
 supports token-at-a-time decode, small fixed speculative-query batches, and
 packed variable-length queries over a paged K/V cache.
 
@@ -23,13 +23,10 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable static `plan()` plus live-metadata `run()` interface. |
+| `BatchDecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
-
-The PrimTS decode wrapper is experimental and may change incompatibly while
-this API family is stabilized.
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -112,7 +109,7 @@ Valid CSR metadata starts `paged_kv_indptr` at zero, increases it strictly,
 and ends it at the number of used page-index entries. Every request owns at
 least one page, every page ID indexes the physical cache, and one-shot
 last-page lengths are in `[1, page_size]`. For every wrapper or standalone
-request `b`, the live metadata must also satisfy
+request `b`, the per-run metadata must also satisfy
 `ceil(seq_lens[b] / page_size) <= paged_kv_indptr[b + 1] - paged_kv_indptr[b]`.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
 and have every delta no larger than the planned `max_seq_len_q`. Causal
@@ -141,7 +138,7 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-K/V lengths, CSR row offsets, page IDs, and packed-Q offsets are live inputs
+K/V lengths, CSR row offsets, page IDs, and packed-Q offsets are per-run inputs
 loaded on every run and graph replay. Their storage and values may change
 between completed launches without recompiling while the static plan contract
 remains satisfied. CUDA Graph replay additionally requires stable captured
@@ -238,11 +235,11 @@ in-flight run or captured-graph replay; use separate wrappers and workspaces
 for concurrent execution. Caller-owned scratch must remain alive and must not
 overlap Q, K/V cache, metadata, or output storage.
 
-With default `validate=True`, each wrapper run checks the live CSR metadata,
+With default `validate=True`, each wrapper run checks the per-run CSR metadata,
 K/V lengths, packed offsets when present, tensors, output, and any selected
 sequence-length specialization. Once the caller has established those
 conditions, `validate=False` avoids the explicit checks and host metadata
-reads. Invalid live lengths, page IDs, offsets, aliases, or specialization
+reads. Invalid per-run lengths, page IDs, offsets, aliases, or specialization
 predicates in that mode may cause incorrect results or out-of-bounds access.
 Do not mutate metadata concurrently with a launch or replay that reads it.
 
@@ -261,7 +258,7 @@ all page IDs valid. CSR
 offsets, sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution
-that reads them. These live values are not host-synchronized or fully
+that reads them. These per-run values are not host-synchronized or fully
 value-checked at launch; invalid lengths or IDs may cause incorrect results or
 out-of-bounds access.
 
@@ -279,7 +276,7 @@ preallocated compact, 16-byte-aligned `out` tensor.
 - Runtime K lengths must be positive and no greater than the static plan bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks
   them; `validate=False` and the standalone hot path trust them to preserve a
-  synchronization-free launch. Live causal metadata must preserve
+  synchronization-free launch. Per-run causal metadata must preserve
   `q_len[b] <= kv_len[b]`.
 
 ## Validation
