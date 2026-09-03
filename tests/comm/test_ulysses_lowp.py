@@ -518,3 +518,88 @@ def test_fused_pack_rejects_unaligned():
     vs = torch.rand((1, 56, 128), device="cuda", dtype=torch.float32).contiguous()
     with pytest.raises(ValueError, match="ALIGN-128"):
         lowp.quant_qkv_pack_fused(q, k, v, km, vs, rank=0, world_size=4)
+
+
+# ---------------------------------------------------------------------------
+# 7. Fused-projection interleaved views (head stride 3*D) are admitted and
+#    produce the same bytes as contiguous copies
+# ---------------------------------------------------------------------------
+
+
+def _interleaved_inputs(dtype, world, L, seed=20260903):
+    """q/k/v as views of one [B, S, H, 3, D] projection output (head stride
+    3*D, token stride 3*H*D), exactly what a fused QKV GEMM emits."""
+    torch.manual_seed(seed)
+    qkv = torch.randn((1, world * L, _HEADS, 3, _HEAD_DIM), device="cuda", dtype=dtype)
+    q, k, v = (qkv[..., i, :] for i in range(3))
+    assert q.stride(-2) == 3 * _HEAD_DIM and not q.is_contiguous()
+    return q, k, v
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_interleaved_views_match_contiguous_stats(dtype):
+    world, L = 4, 256
+    _, k, v = _interleaved_inputs(dtype, world, L)
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        ks_view, va_view = lowp.k_sum_v_amax(k[:, s], v[:, s])
+        ks_ref, va_ref = lowp.k_sum_v_amax(k[:, s].contiguous(), v[:, s].contiguous())
+        assert torch.equal(ks_view, ks_ref) and torch.equal(va_view, va_ref)
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_interleaved_views_match_contiguous_pack(dtype):
+    world, L = 4, 256
+    S = world * L
+    used = S - 100
+    q, k, v = _interleaved_inputs(dtype, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        q_r, k_r, v_r = q[:, s], k[:, s], v[:, s]
+        q_c, k_c, v_c = (x.contiguous() for x in (q_r, k_r, v_r))
+        q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
+        k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world,
+                                     used_sequence=used)
+        assert torch.equal(q_amax, lowp.q_grouped_amax(q_c, rank=r, world_size=world))
+        assert torch.equal(
+            k_amax,
+            lowp.k_grouped_amax(k_c, k_mean, rank=r, world_size=world,
+                                used_sequence=used),
+        )
+        split_view = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
+                                         v_scale, rank=r, world_size=world)
+        split_ref = lowp.quant_qkv_pack(q_c, k_c, v_c, k_mean, q_amax, k_amax,
+                                        v_scale, rank=r, world_size=world)
+        assert torch.equal(split_view, split_ref)
+        fused_view = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
+                                               rank=r, world_size=world,
+                                               used_sequence=used)
+        assert torch.equal(fused_view, split_ref)
+
+
+@requires_sm120
+def test_interleaved_views_match_contiguous_boundary_minmax():
+    world, L = 4, 1056  # protocol-2 shape: 64-groups straddle ranks
+    _, k, _ = _interleaved_inputs(torch.bfloat16, world, L)
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        assert torch.equal(
+            lowp.k_boundary_minmax(k[:, s], rank=r, world_size=world),
+            lowp.k_boundary_minmax(k[:, s].contiguous(), rank=r, world_size=world),
+        )
+
+
+@requires_sm120
+def test_rejects_views_the_vector_loads_cannot_address():
+    base = torch.randn((1, 128, _HEADS, 3 * _HEAD_DIM + 8), device="cuda",
+                       dtype=torch.bfloat16)
+    misaligned = base[..., 1:1 + _HEAD_DIM]  # row starts 2 bytes past alignment
+    with pytest.raises(ValueError, match="16-byte alignment"):
+        lowp.q_grouped_amax(misaligned, rank=0, world_size=4)
+    transposed = torch.randn((1, 128, _HEAD_DIM, _HEADS), device="cuda",
+                             dtype=torch.bfloat16).transpose(-1, -2)
+    with pytest.raises(ValueError, match="contiguous along head_dim"):
+        lowp.q_grouped_amax(transposed, rank=0, world_size=4)

@@ -330,9 +330,23 @@ def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int,
         raise ValueError(f"V2-G requires a positive head count, got H={num_heads}")
     if head_dim != HEAD_DIM:
         raise ValueError(f"V2-G requires D={HEAD_DIM}, got D={head_dim}")
-    if tensor.stride(-1) != 1 or tensor.stride(-2) != head_dim:
+    if tensor.stride(-1) != 1:
         raise ValueError(
-            f"{name} must be dense across heads and head_dim; got strides {tensor.stride()}"
+            f"{name} must be contiguous along head_dim; got strides {tensor.stride()}"
+        )
+    # Every kernel addresses the source through explicit batch/token/head
+    # strides, so only head_dim has to be dense.  This admits the fused
+    # QKV-projection views ([B, L, H, 3, D] sliced on the 3-axis: head stride
+    # 3*D) without materializing three contiguous copies.  The kernels load
+    # 16-byte vectors along head_dim, so the base pointer and the outer
+    # strides must keep 16-byte alignment (8 elements of bf16/fp16).
+    vec_elems = 16 // tensor.element_size()
+    if tensor.data_ptr() % 16 != 0 or any(
+        tensor.stride(i) % vec_elems != 0 for i in range(3)
+    ):
+        raise ValueError(
+            f"{name} must keep 16-byte alignment of every head_dim row; "
+            f"got data_ptr % 16 = {tensor.data_ptr() % 16}, strides {tensor.stride()}"
         )
     _require_sm120(tensor)
     return batch, local_sequence, num_heads, head_dim
@@ -1024,6 +1038,8 @@ def quant_qkv_pack_fused(
     """
 
     batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
     if q.shape != k.shape or q.shape != v.shape or q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q, k, and v must have identical shape and dtype")
     if local_sequence % 128:
