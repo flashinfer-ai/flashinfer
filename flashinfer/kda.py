@@ -465,9 +465,7 @@ def recurrent_kda(
                 or checkpoint_cu_starts is not None
             )
         ):
-            raise ValueError(
-                "backend='cake' does not support FP32 state checkpoints"
-            )
+            raise ValueError("backend='cake' does not support FP32 state checkpoints")
         raise ValueError(
             "backend='cake' does not support this recurrent_kda prefill contract"
         )
