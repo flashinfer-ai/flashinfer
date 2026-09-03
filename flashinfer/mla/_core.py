@@ -726,35 +726,56 @@ _DSV4_ROPE_QUANT_HEAD_DIM = 512
 _DSV4_ROPE_QUANT_SCALE_ALIGNMENT = 4
 
 
-def _allocate_dsv4_rope_quant_outputs(
-    num_tokens: int, num_heads: int, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the group-major output layouts consumed by DSv4 DeepGEMM."""
+def _dsv4_rope_quant_group_layout(num_heads: int) -> Tuple[int, int, int]:
+    """Return ``(num_groups, heads_per_group, flattened_group_width)``."""
     if num_heads != 128:
         raise ValueError(f"DSv4 RopeQuant requires 128 query heads, got {num_heads}")
     heads_per_group = _DSV4_ROPE_QUANT_HEADS_PER_GROUP
     num_groups = num_heads // heads_per_group
     group_width = heads_per_group * _DSV4_ROPE_QUANT_HEAD_DIM
+    return num_groups, heads_per_group, group_width
+
+
+def _allocate_dsv4_rope_quant_output(
+    num_tokens: int, num_heads: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the group-major FP8 RopeQuant output view."""
+    num_groups, _, group_width = _dsv4_rope_quant_group_layout(num_heads)
+    # Physical O is [group, token, flattened-head]; expose [token, group, K].
+    return torch.empty(
+        (num_groups, num_tokens, group_width),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    ).transpose(0, 1)
+
+
+def _allocate_dsv4_rope_quant_output_scale(
+    num_tokens: int, num_heads: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate the padded, group-major packed UE8M0 scale view."""
+    num_groups, heads_per_group, _ = _dsv4_rope_quant_group_layout(num_heads)
     scale_buf_m = (
         (num_tokens + _DSV4_ROPE_QUANT_SCALE_ALIGNMENT - 1)
         // _DSV4_ROPE_QUANT_SCALE_ALIGNMENT
         * _DSV4_ROPE_QUANT_SCALE_ALIGNMENT
     )
-
-    # Physical O is [group, token, flattened-head]; expose [token, group, K].
-    out = torch.empty(
-        (num_groups, num_tokens, group_width),
-        dtype=torch.float8_e4m3fn,
-        device=device,
-    ).transpose(0, 1)
     # Physical SF is [group, head-in-group, padded-token]. Each INT32 packs the
     # four UE8M0 exponent bytes for one 512-wide head.
-    out_scale = torch.zeros(
+    return torch.zeros(
         (num_groups, heads_per_group, scale_buf_m),
         dtype=torch.int32,
         device=device,
     ).permute(2, 0, 1)[:num_tokens]
-    return out, out_scale
+
+
+def _allocate_dsv4_rope_quant_outputs(
+    num_tokens: int, num_heads: int, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Allocate the group-major output layouts consumed by DSv4 DeepGEMM."""
+    return (
+        _allocate_dsv4_rope_quant_output(num_tokens, num_heads, device),
+        _allocate_dsv4_rope_quant_output_scale(num_tokens, num_heads, device),
+    )
 
 
 def _check_dsv4_rope_quant_outputs(
@@ -765,11 +786,8 @@ def _check_dsv4_rope_quant_outputs(
     num_heads: int,
     device: torch.device,
 ) -> None:
-    heads_per_group = _DSV4_ROPE_QUANT_HEADS_PER_GROUP
-    if num_heads != 128:
-        raise ValueError(f"DSv4 RopeQuant requires 128 query heads, got {num_heads}")
-    num_groups = num_heads // heads_per_group
-    group_width = heads_per_group * _DSV4_ROPE_QUANT_HEAD_DIM
+    """Validate the two fixed-layout output views required by the cubin ABI."""
+    num_groups, heads_per_group, group_width = _dsv4_rope_quant_group_layout(num_heads)
     check_shape_dtype_device(
         out,
         (num_tokens, num_groups, group_width),
@@ -2043,26 +2061,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 num_tokens, num_heads, query.device
             )
         else:
-            heads_per_group = _DSV4_ROPE_QUANT_HEADS_PER_GROUP
-            num_groups = num_heads // heads_per_group
-            group_width = heads_per_group * _DSV4_ROPE_QUANT_HEAD_DIM
             if out is None:
-                out = torch.empty(
-                    (num_groups, num_tokens, group_width),
-                    dtype=torch.float8_e4m3fn,
-                    device=query.device,
-                ).transpose(0, 1)
-            if dsv4_output_scale is None:
-                scale_buf_m = (
-                    (num_tokens + _DSV4_ROPE_QUANT_SCALE_ALIGNMENT - 1)
-                    // _DSV4_ROPE_QUANT_SCALE_ALIGNMENT
-                    * _DSV4_ROPE_QUANT_SCALE_ALIGNMENT
+                out = _allocate_dsv4_rope_quant_output(
+                    num_tokens, num_heads, query.device
                 )
-                dsv4_output_scale = torch.zeros(
-                    (num_groups, heads_per_group, scale_buf_m),
-                    dtype=torch.int32,
-                    device=query.device,
-                ).permute(2, 0, 1)[:num_tokens]
+            if dsv4_output_scale is None:
+                dsv4_output_scale = _allocate_dsv4_rope_quant_output_scale(
+                    num_tokens, num_heads, query.device
+                )
         assert out is not None and dsv4_output_scale is not None
         _check_dsv4_rope_quant_outputs(
             out,
@@ -2097,8 +2103,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 )
             scale_buf_m = dsv4_output_scale.stride(2)
             if scale_buf_m > query_flat.size(0):
+                num_groups = dsv4_output_scale.size(1)
+                heads_per_group = dsv4_output_scale.size(2)
                 scale_storage = dsv4_output_scale.as_strided(
-                    (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
+                    (num_groups, heads_per_group, scale_buf_m),
+                    (heads_per_group * scale_buf_m, scale_buf_m, 1),
                 )
                 if torch.any(scale_storage[..., query_flat.size(0) :] != 0).item():
                     raise ValueError(
