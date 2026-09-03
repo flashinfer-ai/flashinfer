@@ -14,8 +14,8 @@
 
 """Four-stage context-parallel GDN prefill backend for SM100/SM103.
 
-The prepared launcher owns every address-bearing prefix/index mapping and all
-cross-stage workspaces.  Its captured replay path preserves the pinned PR4078
+The prepared launcher stages prefix sums, directly binds index mappings, and
+owns all cross-stage workspaces.  Its captured replay path preserves the pinned PR4078
 semantic order
 
 ``T precompute -> MN precompute -> state fixup -> checkpoint copy -> CP prefill``
@@ -29,8 +29,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from itertools import pairwise
-from typing import Sequence
 
 import torch
 import tvm_ffi
@@ -61,23 +59,48 @@ def _workspace_num_chunks(total_tokens: int, num_seqs: int, chunk_size: int) -> 
     return bounded_prefix + (total_tokens - bounded_prefix) // chunk_size
 
 
-def _choose_chunk_len(*, total_tokens: int, num_heads: int, num_sms: int) -> int:
+def _resolve_max_seqlen(
+    *, total_tokens: int, num_seqs: int, max_seqlen: int | None
+) -> int:
+    if num_seqs <= 0:
+        raise ValueError("num_seqs must be positive")
+    resolved = (
+        max_seqlen if max_seqlen is not None else _ceil_div(total_tokens, num_seqs)
+    )
+    if type(resolved) is not int or resolved < 0:
+        raise ValueError("max_seqlen must be a nonnegative integer")
+    if total_tokens and resolved == 0:
+        raise ValueError("max_seqlen must be positive when q is nonempty")
+    return resolved
+
+
+def _choose_chunk_len(
+    *,
+    total_tokens: int,
+    num_seqs: int,
+    max_seqlen: int,
+    num_heads: int,
+    num_sms: int,
+) -> int:
     approx_ctas = _ceil_div(total_tokens, _CHUNK_GRANULARITY) * num_heads
     if approx_ctas * 2 < num_sms:
-        balanced = math.isqrt(total_tokens * _BLOCK)
-        if balanced * balanced < total_tokens * _BLOCK:
+        balanced = math.isqrt(max_seqlen * _BLOCK)
+        if balanced * balanced < max_seqlen * _BLOCK:
             balanced += 1
         return max(_BLOCK, _round_up(balanced, _BLOCK))
 
     target_chunks = max(1, num_sms // num_heads)
+    remaining_tokens = max(0, total_tokens - max_seqlen)
+    remaining_seqs = max(0, num_seqs - 1)
 
     def bounded_chunks(chunk_len: int) -> int:
-        # PR4078's public wrapper passes total_seq_len as max_seqlen, so its
-        # remaining-sequence term is exactly zero even for a varlen batch.
-        return _ceil_div(total_tokens, chunk_len)
+        longest = _ceil_div(max_seqlen, chunk_len)
+        compact_bound = min(remaining_seqs, remaining_tokens)
+        compact_bound += (remaining_tokens - compact_bound) // chunk_len
+        return longest + compact_bound
 
     lo = 1
-    hi = max(1, _ceil_div(total_tokens, _CHUNK_GRANULARITY))
+    hi = max(1, _ceil_div(max_seqlen, _CHUNK_GRANULARITY))
     while lo < hi:
         mid = (lo + hi) // 2
         if bounded_chunks(mid * _CHUNK_GRANULARITY) <= target_chunks:
@@ -193,7 +216,6 @@ def _arch_for(device: torch.device) -> GDNCPArch:
 class GDNCPPrefillPlan:
     """Resolved launch and workspace policy for one legal public input."""
 
-    seq_lens: tuple[int, ...]
     arch: GDNCPArch
     io_dtype: torch.dtype
     num_q_heads: int
@@ -202,6 +224,7 @@ class GDNCPPrefillPlan:
     num_sab_heads: int
     num_seqs: int
     total_tokens: int
+    max_seqlen: int
     num_sms: int
     cp_chunk_len: int
     source_cp_chunk_len: int
@@ -252,23 +275,6 @@ def _validate_contiguous_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
-def _read_seq_lens(
-    cu_seqlens: torch.Tensor,
-    *,
-    total_tokens: int,
-    expected: Sequence[int] | None,
-) -> tuple[int, ...]:
-    values = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
-    if len(values) < 2 or values[0] != 0 or values[-1] != total_tokens:
-        raise ValueError("cu_seqlens must start at zero and end at q.shape[0]")
-    lengths = tuple(end - start for start, end in pairwise(values))
-    if any(length < 0 for length in lengths):
-        raise ValueError("cu_seqlens must describe nonnegative-length sequences")
-    if expected is not None and tuple(int(length) for length in expected) != lengths:
-        raise ValueError("seq_lens does not match cu_seqlens")
-    return lengths
-
-
 def _head_mapping_is_legal(hq: int, hk: int, hv: int) -> bool:
     return bool(
         hq > 0
@@ -310,8 +316,10 @@ def _build_plan(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    seq_lens: tuple[int, ...],
     *,
+    num_seqs: int,
+    max_seqlen: int | None,
+    checkpoint_count: int = 0,
     checkpoint_every_n_tokens: int = 0,
     cp_chunk_len: int | None = None,
 ) -> GDNCPPrefillPlan:
@@ -324,8 +332,13 @@ def _build_plan(
             "GDN CP PR4078 CP-prefill requires D=128 and equal-head, GQA, or GVA "
             f"mapping; got heads={(hq, hk, hv)}, D={head_dim}"
         )
-    if total_tokens != sum(seq_lens):
-        raise ValueError("q.shape[0] does not match cu_seqlens")
+    max_seqlen = _resolve_max_seqlen(
+        total_tokens=total_tokens,
+        num_seqs=num_seqs,
+        max_seqlen=max_seqlen,
+    )
+    if checkpoint_count < 0:
+        raise ValueError("checkpoint_count must be nonnegative")
     num_sab_heads = max(hq, hv)
     props = torch.cuda.get_device_properties(q.device)
     num_sms = int(props.multi_processor_count)
@@ -333,12 +346,17 @@ def _build_plan(
         source_cp_chunk_len = cp_chunk_len or checkpoint_every_n_tokens or _BLOCK
     else:
         source_cp_chunk_len = _choose_chunk_len(
-            total_tokens=total_tokens, num_heads=num_sab_heads, num_sms=num_sms
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+            max_seqlen=max_seqlen,
+            num_heads=num_sab_heads,
+            num_sms=num_sms,
         )
     gb300_long_hv64_override = (
         not checkpoint_every_n_tokens
         and arch == "sm_103a"
-        and seq_lens == (65536,)
+        and num_seqs == 1
+        and total_tokens == 65536
         and (hq, hk, hv) == (16, 16, 64)
     )
     if cp_chunk_len is None:
@@ -361,15 +379,16 @@ def _build_plan(
     if (
         q.dtype == torch.float16
         and arch == "sm_103a"
-        and seq_lens == (65536,)
+        and num_seqs == 1
+        and total_tokens == 65536
         and (hq, hk, hv) == (16, 16, 48)
     ):
         t_kernel = "t_precompute_gb300_hv48_min6"
-    # The chunk-size policy is anchored to total_tokens, matching the public
-    # dispatcher, while the frozen native launch only needs enough x-CTAs for
-    # the longest sequence in each y-row.
-    launch_max_seqlen = max(seq_lens, default=0)
-    generic_tail = any(length % (2 * _BLOCK) != 0 for length in seq_lens)
+    # Without reading prefix-sum payloads, the full-block path is provably safe
+    # only when the host bound and total force every sequence to have the same
+    # aligned length. All other batches use the tail-safe generic kernel.
+    all_sequences_equal = total_tokens == num_seqs * max_seqlen
+    generic_tail = not (all_sequences_equal and max_seqlen % (2 * _BLOCK) == 0)
     if q.dtype == torch.float16 and not generic_tail and hq == hk == hv:
         prefill_kernel = (
             "cp_prefill_equal_head_h32"
@@ -390,36 +409,30 @@ def _build_plan(
             "cp_prefill_generic": "cp_prefill_generic_checkpoint",
         }[prefill_kernel]
     return GDNCPPrefillPlan(
-        seq_lens=seq_lens,
         arch=arch,
         io_dtype=q.dtype,
         num_q_heads=hq,
         num_k_heads=hk,
         num_v_heads=hv,
         num_sab_heads=num_sab_heads,
-        num_seqs=len(seq_lens),
+        num_seqs=num_seqs,
         total_tokens=total_tokens,
+        max_seqlen=max_seqlen,
         num_sms=num_sms,
         cp_chunk_len=cp_chunk_len,
         source_cp_chunk_len=source_cp_chunk_len,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        checkpoint_count=(
-            sum(length // checkpoint_every_n_tokens for length in seq_lens)
-            if checkpoint_every_n_tokens
-            else 0
-        ),
-        total_t_blocks=_workspace_num_chunks(total_tokens, len(seq_lens), _BLOCK),
-        total_cp_chunks=_workspace_num_chunks(
-            total_tokens, len(seq_lens), cp_chunk_len
-        ),
-        max_t_blocks_per_seq=_ceil_div(launch_max_seqlen, _BLOCK),
-        max_cp_chunks_per_seq=_ceil_div(launch_max_seqlen, cp_chunk_len),
+        checkpoint_count=checkpoint_count if checkpoint_every_n_tokens else 0,
+        total_t_blocks=_workspace_num_chunks(total_tokens, num_seqs, _BLOCK),
+        total_cp_chunks=_workspace_num_chunks(total_tokens, num_seqs, cp_chunk_len),
+        max_t_blocks_per_seq=_ceil_div(max_seqlen, _BLOCK),
+        max_cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
         t_kernel=t_kernel,
         mn_kernel=f"mn_precompute{dtype_suffix}",
         fixup_kernel=(
             "state_fixup_simt_row4"
-            if any(length == 0 for length in seq_lens)
-            else _choose_fixup_kind(len(seq_lens) * num_sab_heads, num_sms)
+            if total_tokens <= (num_seqs - 1) * max_seqlen
+            else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,
     )
@@ -456,24 +469,36 @@ def _state_carrier(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _checkpoint_fixed_state_indices(
-    plan: GDNCPPrefillPlan, device: torch.device
+    cu_seqlens: torch.Tensor,
+    checkpoint_cu_starts: torch.Tensor,
+    *,
+    checkpoint_count: int,
+    cp_chunk_len: int,
 ) -> torch.Tensor:
-    """Map sequence-major checkpoint rows to the conservative chunk workspace."""
+    """Build checkpoint-to-workspace indices entirely on the tensor device."""
 
-    indices: list[int] = []
-    token_start = 0
-    for seq_idx, seq_len in enumerate(plan.seq_lens):
-        bounded = min(seq_idx, token_start)
-        chunk_start = bounded + (token_start - bounded) // plan.cp_chunk_len
-        indices.extend(
-            chunk_start + chunk_idx for chunk_idx in range(seq_len // plan.cp_chunk_len)
-        )
-        token_start += seq_len
-    if len(indices) != plan.checkpoint_count:
-        raise ValueError("checkpoint count does not match the CP chunk mapping")
-    if indices and indices[-1] > (1 << 31) - 1:
-        raise ValueError("checkpoint workspace index exceeds int32")
-    return torch.tensor(indices, dtype=torch.int32, device=device)
+    checkpoint_rows = torch.arange(
+        checkpoint_count,
+        dtype=torch.int64,
+        device=cu_seqlens.device,
+    )
+    if checkpoint_count == 0:
+        return checkpoint_rows
+    checkpoint_starts_i64 = checkpoint_cu_starts.to(dtype=torch.int64)
+    sequence_indices = torch.searchsorted(
+        checkpoint_starts_i64[1:], checkpoint_rows, right=True
+    )
+    token_starts = torch.index_select(cu_seqlens, 0, sequence_indices)
+    sequence_checkpoint_starts = torch.index_select(
+        checkpoint_starts_i64, 0, sequence_indices
+    )
+    bounded_starts = torch.minimum(sequence_indices, token_starts)
+    chunk_starts = bounded_starts + torch.div(
+        token_starts - bounded_starts,
+        cp_chunk_len,
+        rounding_mode="floor",
+    )
+    return chunk_starts + checkpoint_rows - sequence_checkpoint_starts
 
 
 class GDNCPPrefill:
@@ -525,27 +550,21 @@ class GDNCPPrefill:
             self._device_index = torch.cuda.current_device()
         self._stream = torch.cuda.current_stream(q.device)
 
-        # Prefix sums and indexed-state routing are address maps, not payloads.
-        # Own their validated values for every future graph replay.
-        cu_values = [0]
-        for length in plan.seq_lens:
-            cu_values.append(cu_values[-1] + length)
-        self.cu_seqlens = torch.tensor(cu_values, dtype=torch.int64, device=q.device)
+        # Generated stage ABIs consume int64 prefix sums. Stage the caller's
+        # int32/int64 tensor on-device before every launch so changing metadata
+        # never requires a host read or a new plan.
+        self.cu_seqlens_input = cu_seqlens
+        self.cu_seqlens = torch.empty(
+            (plan.num_seqs + 1,), dtype=torch.int64, device=q.device
+        )
         if state_indices is None:
             self.state_indices = torch.empty((1,), dtype=torch.int32, device=q.device)
             self._use_state_indices = False
         else:
-            index_values = tuple(
-                int(value) for value in state_indices.detach().cpu().tolist()
-            )
-            self.state_indices = torch.tensor(
-                index_values, dtype=state_indices.dtype, device=q.device
-            )
+            self.state_indices = state_indices
             self._use_state_indices = True
-        self.checkpoint_indices = (
-            _checkpoint_fixed_state_indices(plan, q.device)
-            if plan.checkpoint_count
-            else torch.empty((0,), dtype=torch.int32, device=q.device)
+        self.checkpoint_indices = torch.empty(
+            (plan.checkpoint_count,), dtype=torch.int64, device=q.device
         )
 
         state_shape = (plan.num_seqs, plan.num_sab_heads, _HEAD_DIM, _HEAD_DIM)
@@ -666,7 +685,7 @@ class GDNCPPrefill:
             self._scatter_output = _state_carrier(self.final_state)
         if plan.checkpoint_count:
             assert self.state_checkpoints is not None
-            self._checkpoint = load_gdn_cp_kernel("state_gather_fp32", plan.arch)
+            self._checkpoint = load_gdn_cp_kernel("state_gather_fp32_int64", plan.arch)
         recurrence_name = (
             "normalized_final_state_bf16"
             if q.dtype == torch.bfloat16
@@ -702,12 +721,18 @@ class GDNCPPrefill:
         def restore_inplace_state() -> None:
             if snapshot is not None:
                 initial_state.copy_(snapshot)
-                torch.cuda.synchronize(q.device)
 
         with torch.cuda.device(q.device), tvm_ffi.use_torch_stream():
             self._launch_direct()
-        torch.cuda.synchronize(q.device)
+        # Internal fixed-address graph preparation needs the eager warm launch
+        # to finish before capture begins.  The public structurally cached path
+        # passes capture_graph=False and therefore keeps its hot path free of a
+        # host synchronization.
+        if capture_graph:
+            torch.cuda.synchronize(q.device)
         restore_inplace_state()
+        if capture_graph and snapshot is not None:
+            torch.cuda.synchronize(q.device)
         self._graph: torch.cuda.CUDAGraph | None = None
         if capture_graph and not self._inplace_state:
             self._graph = torch.cuda.CUDAGraph()
@@ -730,10 +755,12 @@ class GDNCPPrefill:
             self.output,
             self.initial_state_input,
             self.final_state,
+            self.cu_seqlens_input,
             self.cu_seqlens,
             self.state_indices,
             self.checkpoint_indices,
             self.state_checkpoints,
+            self.checkpoint_cu_starts,
             self.initial_state,
             self.output_state_workspace,
             self.q_normalized,
@@ -763,6 +790,9 @@ class GDNCPPrefill:
         output: torch.Tensor,
         output_state: torch.Tensor | None,
         state_checkpoints: torch.Tensor | None,
+        cu_seqlens: torch.Tensor,
+        state_indices: torch.Tensor | None,
+        checkpoint_cu_starts: torch.Tensor | None,
     ) -> None:
         """Launch the direct composite with structurally compatible addresses."""
 
@@ -776,6 +806,9 @@ class GDNCPPrefill:
         self.k = k
         self.v = v
         self.output = output
+        self.cu_seqlens_input = cu_seqlens
+        if state_indices is not None:
+            self.state_indices = state_indices
         if self._qk_norm is None:
             self.q_normalized = q
             self.k_normalized = k
@@ -798,15 +831,25 @@ class GDNCPPrefill:
             else:
                 self._scatter_output = _state_carrier(output_state)
         self.state_checkpoints = state_checkpoints
+        self.checkpoint_cu_starts = checkpoint_cu_starts
 
-        self._refresh_retained_tensors()
         with torch.cuda.device(q.device), tvm_ffi.use_torch_stream():
             self._launch_direct()
+        self._refresh_retained_tensors()
         for tensor in self._retained_tensors:
             tensor.record_stream(self._stream)
 
     def _launch_direct(self) -> None:
         p = self.plan
+        self.cu_seqlens.copy_(self.cu_seqlens_input)
+        if p.checkpoint_count:
+            assert self.checkpoint_cu_starts is not None
+            self.checkpoint_indices = _checkpoint_fixed_state_indices(
+                self.cu_seqlens,
+                self.checkpoint_cu_starts,
+                checkpoint_count=p.checkpoint_count,
+                cp_chunk_len=p.cp_chunk_len,
+            )
         if p.total_tokens:
             if self._qk_norm is not None:
                 self._qk_norm(
@@ -1012,7 +1055,6 @@ def prepare_gdn_cp_prefill(
     cu_seqlens: torch.Tensor,
     initial_state: torch.Tensor | None,
     *,
-    seq_lens: Sequence[int] | None = None,
     output: torch.Tensor | None = None,
     output_state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
@@ -1020,6 +1062,7 @@ def prepare_gdn_cp_prefill(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     cp_chunk_len: int | None = None,
+    max_seqlen: int | None = None,
     scale: float | None = None,
     output_final_state: bool = True,
     use_qk_l2norm_in_kernel: bool = False,
@@ -1041,6 +1084,9 @@ def prepare_gdn_cp_prefill(
         raise TypeError("cu_seqlens must have int32 or int64 dtype")
     if cu_seqlens.ndim != 1 or not cu_seqlens.is_contiguous():
         raise ValueError("cu_seqlens must be a contiguous rank-1 tensor")
+    num_seqs = int(cu_seqlens.shape[0]) - 1
+    if num_seqs <= 0:
+        raise ValueError("cu_seqlens must contain at least two entries")
     if checkpoint_every_n_tokens < 0 or (
         checkpoint_every_n_tokens and checkpoint_every_n_tokens % _BLOCK
     ):
@@ -1051,12 +1097,18 @@ def prepare_gdn_cp_prefill(
         raise ValueError("cp_chunk_len must be a positive multiple of 64")
     if not isinstance(use_qk_l2norm_in_kernel, bool):
         raise TypeError("use_qk_l2norm_in_kernel must be a bool")
-    lengths = _read_seq_lens(cu_seqlens, total_tokens=total, expected=seq_lens)
+    checkpoint_count = (
+        int(state_checkpoints.shape[0])
+        if checkpoint_every_n_tokens and state_checkpoints is not None
+        else 0
+    )
     plan = _build_plan(
         q,
         k,
         v,
-        lengths,
+        num_seqs=num_seqs,
+        max_seqlen=max_seqlen,
+        checkpoint_count=checkpoint_count,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         cp_chunk_len=cp_chunk_len,
     )
@@ -1134,20 +1186,8 @@ def prepare_gdn_cp_prefill(
             raise ValueError(
                 "checkpoint_cu_starts must be contiguous with shape [num_seqs + 1]"
             )
-        if checkpoint_cu_starts.device not in (device, torch.device("cpu")):
-            raise ValueError("checkpoint_cu_starts must be on q.device or CPU")
-        expected_checkpoint_cu = [0]
-        for length in plan.seq_lens:
-            expected_checkpoint_cu.append(
-                expected_checkpoint_cu[-1] + length // checkpoint_every_n_tokens
-            )
-        observed_checkpoint_cu = tuple(
-            int(value) for value in checkpoint_cu_starts.detach().cpu().tolist()
-        )
-        if observed_checkpoint_cu != tuple(expected_checkpoint_cu):
-            raise ValueError(
-                "checkpoint_cu_starts does not match sequence lengths and interval"
-            )
+        if checkpoint_cu_starts.device != device:
+            raise ValueError("checkpoint_cu_starts must be on q.device")
     elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         raise ValueError(
             "state_checkpoints and checkpoint_cu_starts must be None when "
@@ -1187,12 +1227,6 @@ def prepare_gdn_cp_prefill(
             raise ValueError(
                 "state_indices requires an initial_state or output_state pool"
             )
-        indices = tuple(int(value) for value in state_indices.detach().cpu().tolist())
-        pool_size = next(iter(pool_rows))
-        if len(set(indices)) != len(indices):
-            raise ValueError("state_indices values must be unique")
-        if any(index < 0 or index >= pool_size for index in indices):
-            raise ValueError("state_indices values must address the state pool")
     if initial_state is not None and output_state is not None:
         aliases = (
             initial_state.untyped_storage().data_ptr()
@@ -1251,63 +1285,13 @@ def _layout_key(tensor: torch.Tensor | None) -> tuple[object, ...]:
 
 _public_prepared: GDNCPPrefill | None = None
 _public_key: tuple[object, ...] | None = None
-_public_metadata_binding: (
-    tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        int | None,
-        int | None,
-        int | None,
-        tuple[
-            tuple[int, ...],
-            tuple[int, ...] | None,
-            tuple[int, ...] | None,
-        ],
-    ]
-    | None
-) = None
-
-
-def _metadata_version(tensor: torch.Tensor | None) -> int | None:
-    """Return a version counter when the tensor tracks one."""
-
-    if tensor is None or torch.is_inference(tensor):
-        return None
-    return int(tensor._version)
-
-
-def _metadata_signature(
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    checkpoint_cu_starts: torch.Tensor | None,
-) -> tuple[
-    tuple[int, ...],
-    tuple[int, ...] | None,
-    tuple[int, ...] | None,
-]:
-    """Read the address maps whose payload determines the prepared plan."""
-
-    cu_values = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
-    state_values = (
-        tuple(int(value) for value in state_indices.detach().cpu().tolist())
-        if state_indices is not None
-        else None
-    )
-    checkpoint_values = (
-        tuple(int(value) for value in checkpoint_cu_starts.detach().cpu().tolist())
-        if checkpoint_cu_starts is not None
-        else None
-    )
-    return cu_values, state_values, checkpoint_values
 
 
 def _reset_gdn_cp_prefill_cache() -> None:
     """Release the internal public-dispatch plan and its owned workspaces."""
 
-    global _public_key, _public_metadata_binding, _public_prepared
+    global _public_key, _public_prepared
     _public_key = None
-    _public_metadata_binding = None
     _public_prepared = None
 
 
@@ -1329,37 +1313,18 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     cp_chunk_len: int | None = None,
+    max_seqlen: int | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> None:
     """Public dispatcher target; every accepted SM100/SM103 route uses GDN CP."""
 
-    global _public_key, _public_metadata_binding, _public_prepared
+    global _public_key, _public_prepared
     stream = torch.cuda.current_stream(q.device)
-    cu_seqlens_version = _metadata_version(cu_seqlens)
-    state_indices_version = _metadata_version(state_indices)
-    checkpoint_cu_starts_version = _metadata_version(checkpoint_cu_starts)
-    capturing = torch.cuda.is_current_stream_capturing()
-    if capturing:
-        if not (
-            _public_metadata_binding is not None
-            and _public_metadata_binding[0] is cu_seqlens
-            and _public_metadata_binding[1] is state_indices
-            and _public_metadata_binding[2] is checkpoint_cu_starts
-            and _public_metadata_binding[3] == cu_seqlens_version
-            and _public_metadata_binding[4] == state_indices_version
-            and _public_metadata_binding[5] == checkpoint_cu_starts_version
-        ):
-            raise RuntimeError(
-                "GDN CP-prefill metadata must be warmed with the same "
-                "unchanged tensors before CUDA graph capture"
-            )
-        metadata_signature = _public_metadata_binding[6]
-    else:
-        metadata_signature = _metadata_signature(
-            cu_seqlens,
-            state_indices,
-            checkpoint_cu_starts,
-        )
+    resolved_max_seqlen = _resolve_max_seqlen(
+        total_tokens=int(q.shape[0]),
+        num_seqs=int(cu_seqlens.shape[0]) - 1,
+        max_seqlen=max_seqlen,
+    )
     key: tuple[object, ...] = (
         *(
             _layout_key(tensor)
@@ -1378,17 +1343,17 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
         _layout_key(cu_seqlens),
         _layout_key(state_indices),
         _layout_key(checkpoint_cu_starts),
-        metadata_signature,
         output_state is initial_state and initial_state is not None,
         float(scale),
         bool(output_final_state),
         int(checkpoint_every_n_tokens),
         cp_chunk_len,
+        resolved_max_seqlen,
         bool(use_qk_l2norm_in_kernel),
         int(stream.cuda_stream),
     )
     if _public_prepared is None or _public_key != key:
-        if capturing:
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "GDN CP-prefill plan must be warmed before CUDA graph capture"
             )
@@ -1407,34 +1372,16 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cp_chunk_len=cp_chunk_len,
+            max_seqlen=resolved_max_seqlen,
             scale=scale,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             _capture_graph=False,
         )
         _public_key = key
-        _public_metadata_binding = (
-            cu_seqlens,
-            state_indices,
-            checkpoint_cu_starts,
-            cu_seqlens_version,
-            state_indices_version,
-            checkpoint_cu_starts_version,
-            metadata_signature,
-        )
         if initial_state is not None and output_state is initial_state:
             _public_prepared.replay()
         return
-    if not capturing:
-        _public_metadata_binding = (
-            cu_seqlens,
-            state_indices,
-            checkpoint_cu_starts,
-            cu_seqlens_version,
-            state_indices_version,
-            checkpoint_cu_starts_version,
-            metadata_signature,
-        )
     _public_prepared.launch_with_bindings(
         q=q,
         k=k,
@@ -1445,6 +1392,9 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
         output=output,
         output_state=output_state,
         state_checkpoints=state_checkpoints,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        checkpoint_cu_starts=checkpoint_cu_starts,
     )
 
 

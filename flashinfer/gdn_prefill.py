@@ -51,49 +51,6 @@ _GDN_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float16,
 )
 
-_GDN_CP_QUALIFIED_HEAD_SHAPES = frozenset(
-    {
-        (2, 2, 8),
-        (4, 4, 16),
-        (8, 8, 32),
-        (16, 16, 16),
-        (16, 16, 32),
-        (16, 16, 48),
-        (16, 16, 64),
-        (32, 32, 32),
-    }
-)
-
-_GDN_CP_QUALIFIED_SEQUENCE_SHAPES = frozenset(
-    {
-        (2048,),
-        (4096,),
-        (8192,),
-        (16384,),
-        (32768,),
-        (65536,),
-        (4096, 4096),
-        (2048, 6144),
-        (6144, 2048),
-        (1024, 7168),
-        (2048,) * 4,
-        (1024,) * 8,
-        (8192,) * 8,
-        (8192,) * 16,
-        (8192,) * 32,
-    }
-)
-
-_gdn_cp_qualified_metadata_binding: (
-    tuple[
-        torch.Tensor,
-        int | None,
-        tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
-        bool,
-    ]
-    | None
-) = None
-
 
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
@@ -117,6 +74,7 @@ def _use_gdn_cp_sm100(
             or state_checkpoints.dtype != torch.float32
             or checkpoint_cu_starts is None
             or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or not checkpoint_cu_starts.is_cuda
             or cp_chunk_len not in (None, checkpoint_every_n_tokens)
         ):
             return False
@@ -130,16 +88,13 @@ def _use_gdn_cp_sm100(
     )
 
 
-def _is_gdn_cp_sm100_qualified_shape(
+def _is_gdn_cp_sm100_supported_shape(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
 ) -> bool:
-    """Return whether an invocation belongs to the GPU-qualified 120-row set."""
+    """Return whether tensor shapes satisfy the generated backend contract."""
 
-    global _gdn_cp_qualified_metadata_binding
-    shape_signature = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
     if (
         q.ndim != 3
         or k.ndim != 3
@@ -149,42 +104,15 @@ def _is_gdn_cp_sm100_qualified_shape(
         or q.shape[2] != 128
         or k.shape[2] != 128
         or v.shape[2] != 128
-        or (q.shape[1], k.shape[1], v.shape[1]) not in _GDN_CP_QUALIFIED_HEAD_SHAPES
     ):
         return False
-
-    metadata_version = (
-        None if torch.is_inference(cu_seqlens) else int(cu_seqlens._version)
+    hq, hk, hv = int(q.shape[1]), int(k.shape[1]), int(v.shape[1])
+    return bool(
+        hq > 0
+        and hk > 0
+        and hv > 0
+        and ((hq == hk and hv % hq == 0) or (hk == hv and hq % hk == 0))
     )
-    if q.is_cuda and torch.cuda.is_current_stream_capturing():
-        binding = _gdn_cp_qualified_metadata_binding
-        if (
-            binding is None
-            or binding[0] is not cu_seqlens
-            or binding[1] != metadata_version
-            or binding[2] != shape_signature
-        ):
-            raise RuntimeError(
-                "GDN CP-prefill metadata must be warmed with the same "
-                "unchanged tensors before CUDA graph capture"
-            )
-        return binding[3]
-
-    offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
-    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != q.shape[0]:
-        qualified = False
-    else:
-        seq_lens = tuple(
-            end - start for start, end in zip(offsets, offsets[1:], strict=False)
-        )
-        qualified = seq_lens in _GDN_CP_QUALIFIED_SEQUENCE_SHAPES
-    _gdn_cp_qualified_metadata_binding = (
-        cu_seqlens,
-        metadata_version,
-        shape_signature,
-        qualified,
-    )
-    return qualified
 
 
 def _cp_delta_rule_rejection_reason(
@@ -271,6 +199,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    max_seqlen: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -341,20 +270,22 @@ def chunk_gated_delta_rule(
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
         currently supported on SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
-        Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
+        Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
+        int64 on the same CUDA device as ``q``.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
         number of checkpoints for sequence ``i`` (= ``seq_len_i //
         checkpoint_every_n_tokens``).  Required when
-        ``checkpoint_every_n_tokens > 0``.
+        ``checkpoint_every_n_tokens > 0``. The values must be monotonic and
+        consistent with ``cu_seqlens``; this caller precondition is not checked
+        at launch to avoid a device-to-host synchronization.
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
         Whether to use context parallelism when low-parallelism heuristics
         match. SM100/SM103 uses the generated GDN CP-only four-stage
-        implementation for the 120 GPU-qualified shapes recorded in its
-        checked-in manifest. Other legal configurations retain the CuTe-DSL
-        implementation.
+        implementation for structurally supported shapes. Other legal
+        configurations retain the CuTe-DSL implementation.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
         and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
@@ -380,6 +311,14 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
+    max_seqlen : int, optional
+        Maximum logical sequence length. CP kernels use this host-side hint to
+        bound their per-sequence launch grids without reading ``cu_seqlens``
+        back from the GPU. Pass the exact maximum for variable-length or
+        imbalanced batches. When omitted, CP assumes a balanced batch and uses
+        ``ceil(total_seq_len / num_seqs)``. That fallback can under-launch an
+        imbalanced batch, so callers allowing unequal lengths must provide this
+        argument whenever the CP path may be selected.
 
     Returns
     -------
@@ -399,7 +338,8 @@ def chunk_gated_delta_rule(
     - The final state layout is ``[N, H, V, K]``.
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
-      its manifest-qualified shapes on CUDA 12.8, CUDA 12.9, and CUDA 13.
+      structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
+      CUDA 12.9, and CUDA 13.
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
@@ -438,6 +378,17 @@ def chunk_gated_delta_rule(
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
+    if num_seqs <= 0:
+        raise ValueError("cu_seqlens must contain at least two entries")
+    cp_max_seqlen = (
+        max_seqlen
+        if max_seqlen is not None
+        else (total_seq_len + num_seqs - 1) // num_seqs
+    )
+    if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
+        raise ValueError("max_seqlen must be a nonnegative integer")
+    if total_seq_len and cp_max_seqlen == 0:
+        raise ValueError("max_seqlen must be positive when q is nonempty")
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -526,7 +477,7 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts=checkpoint_cu_starts,
             cp_chunk_len=_cp_chunk_len,
         )
-        and _is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
+        and _is_gdn_cp_sm100_supported_shape(q, k, v)
     )
     if state_indices is not None:
         if not is_integer_dtype(state_indices.dtype):
@@ -610,6 +561,7 @@ def chunk_gated_delta_rule(
                     checkpoint_cu_starts=checkpoint_cu_starts,
                     checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                     cp_chunk_len=_cp_chunk_len,
+                    max_seqlen=cp_max_seqlen,
                     output_final_state=output_final_state,
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 )
@@ -661,7 +613,7 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                max_seqlen=total_seq_len,
+                max_seqlen=cp_max_seqlen,
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,

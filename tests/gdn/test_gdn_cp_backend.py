@@ -77,13 +77,6 @@ def test_generated_source_inventory_and_hashes() -> None:
     }
     assert manifest["frozen_performance_shape_count"] == 120
     assert len(manifest["frozen_performance_shapes"]) == 120
-    assert {
-        (shape["Hq"], shape["Hk"], shape["Hv"])
-        for shape in manifest["frozen_performance_shapes"]
-    } == gdn_prefill._GDN_CP_QUALIFIED_HEAD_SHAPES
-    assert {
-        tuple(shape["seq_lens"]) for shape in manifest["frozen_performance_shapes"]
-    } == gdn_prefill._GDN_CP_QUALIFIED_SEQUENCE_SHAPES
     assert len(tuple(path for path in root.rglob("*") if path.is_file())) == 72
     assert manifest["launch_order"] == [
         "t_precompute",
@@ -189,7 +182,7 @@ def test_long_row_dispatch_is_exact(
     )
     k = SimpleNamespace(shape=(65536, hq, 128))
     v = SimpleNamespace(shape=(65536, hv, 128))
-    plan = gdn_cp._build_plan(q, k, v, (65536,))
+    plan = gdn_cp._build_plan(q, k, v, num_seqs=1, max_seqlen=65536)
     assert plan.t_kernel == expected_t
     if expected_chunk is not None:
         assert plan.cp_chunk_len == expected_chunk
@@ -247,7 +240,13 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     k = SimpleNamespace(shape=(total, hk, 128))
     v = SimpleNamespace(shape=(total, hv, 128))
 
-    plan = gdn_cp._build_plan(q, k, v, seq_lens)
+    plan = gdn_cp._build_plan(
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max(seq_lens, default=0),
+    )
 
     suffix = "_bf16" if dtype == torch.bfloat16 else ""
     assert plan.t_kernel == f"t_precompute{suffix}"
@@ -256,8 +255,10 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     assert plan.num_sab_heads == max(hq, hv)
 
 
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
 def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
     monkeypatch: pytest.MonkeyPatch,
+    metadata_dtype: torch.dtype,
 ) -> None:
     monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_103a")
     monkeypatch.setattr(
@@ -265,8 +266,9 @@ def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
         "get_device_properties",
         lambda _device: SimpleNamespace(multi_processor_count=148),
     )
-    device = torch.device("cpu")
-    q = SimpleNamespace(shape=(640, 1, 128), device=device, dtype=torch.float16)
+    q = SimpleNamespace(
+        shape=(640, 1, 128), device=torch.device("cpu"), dtype=torch.float16
+    )
     k = SimpleNamespace(shape=(640, 1, 128))
     v = SimpleNamespace(shape=(640, 1, 128))
 
@@ -274,19 +276,67 @@ def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
         q,
         k,
         v,
-        (256, 384),
+        num_seqs=2,
+        max_seqlen=384,
+        checkpoint_count=5,
         checkpoint_every_n_tokens=128,
     )
 
     assert plan.cp_chunk_len == 128
     assert plan.checkpoint_count == 5
-    assert gdn_cp._checkpoint_fixed_state_indices(plan, device).tolist() == [
+    assert gdn_cp._checkpoint_fixed_state_indices(
+        torch.tensor([0, 256, 640], dtype=torch.int64),
+        torch.tensor([0, 2, 5], dtype=metadata_dtype),
+        checkpoint_count=5,
+        cp_chunk_len=plan.cp_chunk_len,
+    ).tolist() == [
         0,
         1,
         2,
         3,
         4,
     ]
+
+
+def test_checkpoint_indices_skip_zero_length_sequences() -> None:
+    indices = gdn_cp._checkpoint_fixed_state_indices(
+        torch.tensor([0, 0, 256, 256, 640], dtype=torch.int64),
+        torch.tensor([0, 0, 2, 2, 5], dtype=torch.int32),
+        checkpoint_count=5,
+        cp_chunk_len=128,
+    )
+
+    assert indices.dtype == torch.int64
+    assert indices.tolist() == [0, 1, 4, 5, 6]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "chunk_len"),
+    [
+        ((0, 64, 0), 64),
+        ((1, 0, 1), 64),
+        ((64, 65, 129), 64),
+        ((0, 128, 0, 384), 128),
+    ],
+)
+def test_workspace_bound_covers_every_valid_chunk_mapping(
+    seq_lens: tuple[int, ...], chunk_len: int
+) -> None:
+    total = sum(seq_lens)
+    bound = gdn_cp._workspace_num_chunks(total, len(seq_lens), chunk_len)
+    token_start = 0
+    for seq_idx, seq_len in enumerate(seq_lens):
+        bounded = min(seq_idx, token_start)
+        chunk_start = bounded + (token_start - bounded) // chunk_len
+        assert chunk_start + gdn_cp._ceil_div(seq_len, chunk_len) <= bound
+        token_start += seq_len
+
+
+def test_short_workload_chunk_heuristic_uses_max_seqlen() -> None:
+    common = dict(total_tokens=2048, num_seqs=2, num_heads=1, num_sms=148)
+
+    assert gdn_cp._choose_chunk_len(max_seqlen=1024, **common) == 256
+    assert gdn_cp._choose_chunk_len(max_seqlen=2048, **common) == 384
 
 
 def test_bf16_two_block_factor_keeps_source_and_physical_chunks_distinct(
@@ -304,13 +354,13 @@ def test_bf16_two_block_factor_keeps_source_and_physical_chunks_distinct(
     k = SimpleNamespace(shape=(256, 64, 128))
     v = SimpleNamespace(shape=(256, 64, 128))
 
-    plan = gdn_cp._build_plan(q, k, v, (256,))
+    plan = gdn_cp._build_plan(q, k, v, num_seqs=1, max_seqlen=256)
 
     assert plan.source_cp_chunk_len == 128
     assert plan.cp_chunk_len == 64
 
 
-def test_all_contract_plans_match_frozen_dispatch(
+def test_all_contract_plans_use_payload_independent_bounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -331,19 +381,34 @@ def test_all_contract_plans_match_frozen_dispatch(
         )
         k = SimpleNamespace(shape=(total, shape["Hk"], shape["D"]))
         v = SimpleNamespace(shape=(total, shape["Hv"], shape["D"]))
-        for arch, expected in shape["dispatch"].items():
+        for arch in shape["dispatch"]:
             monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device, value=arch: value)
-            plan = gdn_cp._build_plan(q, k, v, tuple(shape["seq_lens"]))
-            assert {
-                "cp_chunk_len": plan.cp_chunk_len,
-                "t_kernel": plan.t_kernel,
-                "fixup_kernel": plan.fixup_kernel,
-                "total_t_blocks": plan.total_t_blocks,
-                "total_cp_chunks": plan.total_cp_chunks,
-                "t_grid": list(plan.t_grid),
-                "fixup_grid": list(plan.fixup_grid),
-                "cp_grid": list(plan.cp_grid),
-            } == expected
+            seq_lens = tuple(shape["seq_lens"])
+            max_seqlen = max(seq_lens, default=0)
+            plan = gdn_cp._build_plan(
+                q,
+                k,
+                v,
+                num_seqs=len(seq_lens),
+                max_seqlen=max_seqlen,
+            )
+            assert plan.max_seqlen == max_seqlen
+            assert plan.total_t_blocks == gdn_cp._workspace_num_chunks(
+                total, len(seq_lens), 64
+            )
+            assert plan.total_cp_chunks == gdn_cp._workspace_num_chunks(
+                total, len(seq_lens), plan.cp_chunk_len
+            )
+            assert plan.t_grid == (
+                plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, 64),
+                len(seq_lens),
+                1,
+            )
+            assert plan.cp_grid == (
+                plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, plan.cp_chunk_len),
+                len(seq_lens),
+                1,
+            )
 
 
 def test_gdn_cp_prepared_launcher_is_not_a_new_public_api() -> None:
@@ -411,7 +476,13 @@ def test_zero_length_plans_keep_semantic_fixup_and_skip_empty_grids(
         q = SimpleNamespace(shape=(total, 1, 128), device=device, dtype=torch.float16)
         k = SimpleNamespace(shape=(total, 1, 128))
         v = SimpleNamespace(shape=(total, 1, 128))
-        return gdn_cp._build_plan(q, k, v, seq_lens)
+        return gdn_cp._build_plan(
+            q,
+            k,
+            v,
+            num_seqs=len(seq_lens),
+            max_seqlen=max(seq_lens, default=0),
+        )
 
     mixed = plan_for((0, 64, 0))
     assert mixed.fixup_kernel == "state_fixup_simt_row4"
@@ -488,6 +559,7 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
         total_t_blocks=1,
         total_cp_chunks=1,
         num_seqs=2,
+        checkpoint_count=0,
         cp_chunk_len=64,
         source_cp_chunk_len=64,
         t_grid=(1, 1, 1),
@@ -514,6 +586,8 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
         "tensormap_workspace",
     ):
         setattr(prepared, name, object())
+    prepared.cu_seqlens = torch.empty((3,), dtype=torch.int64)
+    prepared.cu_seqlens_input = torch.tensor([0, 0, 1], dtype=torch.int64)
     prepared.scale = 0.125
     prepared._recurrence_normalize_qk = 0
     prepared._recurrence_use_block64_final_state = 1
@@ -569,9 +643,7 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
         lambda _device: SimpleNamespace(cuda_stream=7),
     )
     monkeypatch.setattr(gdn_cp.torch.cuda, "is_current_stream_capturing", lambda: False)
-    gdn_cp._public_key = None
-    gdn_cp._public_metadata_binding = None
-    gdn_cp._public_prepared = None
+    gdn_cp._reset_gdn_cp_prefill_cache()
 
     cu_seqlens = torch.tensor([0, 2], dtype=torch.int64)
     alpha = torch.ones((2, 1), dtype=torch.float32)
@@ -601,6 +673,7 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
     assert len(dynamic_launches) == 1
     assert dynamic_launches[0]["output"] is output
     assert dynamic_launches[0]["q"] is q
+    assert dynamic_launches[0]["cu_seqlens"] is cu_seqlens
 
     gdn_cp.chunk_gated_delta_rule_gdn_cp_sm100(
         output,
@@ -620,7 +693,6 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
 
     gdn_cp._reset_gdn_cp_prefill_cache()
     assert gdn_cp._public_key is None
-    assert gdn_cp._public_metadata_binding is None
     assert gdn_cp._public_prepared is None
 
     gdn_cp.chunk_gated_delta_rule_gdn_cp_sm100(
@@ -679,6 +751,9 @@ def test_direct_binding_refreshes_unnormalized_qk_aliases(
         output=torch.empty((1,)),
         output_state=None,
         state_checkpoints=None,
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int64),
+        state_indices=None,
+        checkpoint_cu_starts=None,
     )
 
     assert launched == [(q, k)]
@@ -759,8 +834,6 @@ def test_public_gdn_cp_cache_accepts_inference_metadata_during_graph_capture(
 
     assert preparations == ["prepare"]
     assert dynamic_launches == ["launch"]
-    assert gdn_cp._public_metadata_binding is not None
-    assert gdn_cp._public_metadata_binding[3:6] == (None, None, None)
 
 
 def test_public_gdn_cp_cache_preserves_alpha_absence_across_address_rebinds(
@@ -833,38 +906,21 @@ def test_public_gdn_cp_cache_preserves_alpha_absence_across_address_rebinds(
     assert dynamic_launches[0]["alpha"] is None
 
 
-def test_public_gdn_cp_cache_detects_metadata_writes_without_version_bump(
+def test_public_gdn_cp_cache_rebinds_metadata_without_reading_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    preparations: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+    preparations: list[str] = []
+    dynamic_launches: list[dict[str, object]] = []
 
     class FakePrepared:
-        def launch_with_bindings(self, **_kwargs) -> None:
-            pass
+        def launch_with_bindings(self, **kwargs) -> None:
+            dynamic_launches.append(kwargs)
 
         def replay(self) -> None:
             pass
 
-    def fake_prepare(
-        _q,
-        _k,
-        _v,
-        _alpha,
-        _beta,
-        cu_seqlens,
-        _initial_state,
-        *,
-        state_indices,
-        checkpoint_cu_starts,
-        **_kwargs,
-    ):
-        preparations.append(
-            (
-                tuple(int(value) for value in cu_seqlens.tolist()),
-                tuple(int(value) for value in state_indices.tolist()),
-                tuple(int(value) for value in checkpoint_cu_starts.tolist()),
-            )
-        )
+    def fake_prepare(*_args, **_kwargs):
+        preparations.append("prepare")
         return FakePrepared()
 
     monkeypatch.setattr(gdn_cp, "prepare_gdn_cp_prefill", fake_prepare)
@@ -918,22 +974,23 @@ def test_public_gdn_cp_cache_detects_metadata_writes_without_version_bump(
     assert int(checkpoint_cu_starts._version) == checkpoint_version
     invoke()
 
-    assert preparations == [
-        ((0, 1, 4), (0, 1), (0, 1, 2)),
-        ((0, 2, 4), (1, 0), (0, 0, 2)),
-    ]
+    assert preparations == ["prepare"]
+    assert len(dynamic_launches) == 1
+    assert dynamic_launches[0]["cu_seqlens"] is cu_seqlens
+    assert dynamic_launches[0]["state_indices"] is state_indices
+    assert dynamic_launches[0]["checkpoint_cu_starts"] is checkpoint_cu_starts
 
 
-def test_public_gdn_cp_cache_requires_warmed_metadata_during_graph_capture(
+def test_public_gdn_cp_cache_rebinds_metadata_during_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     preparations: list[str] = []
-    dynamic_launches: list[str] = []
+    dynamic_launches: list[torch.Tensor] = []
     capturing = False
 
     class FakePrepared:
-        def launch_with_bindings(self, **_kwargs) -> None:
-            dynamic_launches.append("launch")
+        def launch_with_bindings(self, **kwargs) -> None:
+            dynamic_launches.append(kwargs["cu_seqlens"])
 
         def replay(self) -> None:
             pass
@@ -983,13 +1040,17 @@ def test_public_gdn_cp_cache_requires_warmed_metadata_during_graph_capture(
     capturing = True
     invoke(cu_seqlens)
     assert preparations == ["prepare"]
-    assert dynamic_launches == ["launch"]
+    assert len(dynamic_launches) == 1
+    assert dynamic_launches[0] is cu_seqlens
 
-    with pytest.raises(RuntimeError, match="same unchanged tensors"):
-        invoke(cu_seqlens.clone())
+    rebound = cu_seqlens.clone()
+    invoke(rebound)
     cu_seqlens.add_(0)
-    with pytest.raises(RuntimeError, match="same unchanged tensors"):
-        invoke(cu_seqlens)
+    invoke(cu_seqlens)
+    assert preparations == ["prepare"]
+    assert len(dynamic_launches) == 3
+    assert dynamic_launches[1] is rebound
+    assert dynamic_launches[2] is cu_seqlens
 
 
 def _qualified_public_dispatch_inputs() -> tuple[
@@ -1002,28 +1063,17 @@ def _qualified_public_dispatch_inputs() -> tuple[
     return q, k, v, cu_seqlens
 
 
-def test_qualified_shape_metadata_is_reused_during_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    q = SimpleNamespace(ndim=3, shape=(2048, 2, 128), is_cuda=True)
-    k = SimpleNamespace(ndim=3, shape=(2048, 2, 128))
-    v = SimpleNamespace(ndim=3, shape=(2048, 8, 128))
-    cu_seqlens = torch.tensor([0, 2048], dtype=torch.int32)
-    capturing = False
+def test_generated_shape_qualification_is_structural() -> None:
+    q = SimpleNamespace(ndim=3, shape=(17, 3, 128))
+    k = SimpleNamespace(ndim=3, shape=(17, 3, 128))
+    v = SimpleNamespace(ndim=3, shape=(17, 12, 128))
 
-    monkeypatch.setattr(
-        gdn_prefill.torch.cuda,
-        "is_current_stream_capturing",
-        lambda: capturing,
+    assert gdn_prefill._is_gdn_cp_sm100_supported_shape(q, k, v)
+    assert not gdn_prefill._is_gdn_cp_sm100_supported_shape(
+        q,
+        SimpleNamespace(ndim=3, shape=(17, 2, 128)),
+        v,
     )
-    monkeypatch.setattr(gdn_prefill, "_gdn_cp_qualified_metadata_binding", None)
-
-    assert gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
-    capturing = True
-    assert gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
-    cu_seqlens.add_(0)
-    with pytest.raises(RuntimeError, match="same unchanged tensors"):
-        gdn_prefill._is_gdn_cp_sm100_qualified_shape(q, k, v, cu_seqlens)
 
 
 @pytest.mark.parametrize(
@@ -1074,6 +1124,47 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
 
     assert output.shape == (2048, 8, 128)
     assert calls == [expected_route]
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (12, 0)])
+@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 5), (11, 11)])
+def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    max_seqlen: int | None,
+    expected: int,
+) -> None:
+    observed: list[int] = []
+
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(
+        gdn_prefill, "get_compute_capability", lambda _device: capability
+    )
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **kwargs: observed.append(kwargs["max_seqlen"]),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "cp_delta_rule_dsl_sm120",
+        lambda *_args, **kwargs: observed.append(kwargs["max_seqlen"]),
+    )
+
+    q = torch.zeros((17, 1, 128), dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, 4, 8, 12, 17], dtype=torch.int32)
+    gdn_prefill.chunk_gated_delta_rule(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        use_cp=True,
+        max_seqlen=max_seqlen,
+    )
+
+    assert observed == [expected]
 
 
 @pytest.mark.parametrize("cuda_version", ["12.8", "12.9"])
@@ -1173,10 +1264,10 @@ def test_public_dispatch_keeps_cuda_13_gate_for_sm100_dsl(
     [
         ("checkpoint", "cute_cp"),
         ("fp8_state", "cute_cp"),
-        ("cp_chunk_len", "cute_cp"),
+        ("cp_chunk_len", "gdn_cp"),
     ],
 )
-def test_public_dispatch_routes_unqualified_sm100_cp_extensions_to_dsl(
+def test_public_dispatch_routes_sm100_cp_extensions_by_backend_support(
     monkeypatch: pytest.MonkeyPatch,
     extension: str,
     expected_route: str,
@@ -1282,11 +1373,28 @@ def test_public_dispatch_routes_other_blackwell_capabilities_to_dsl(
     assert calls == ["cute_cp"]
 
 
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=dtype)
-
-    assert gdn_cp._read_seq_lens(cu_seqlens, total_tokens=5, expected=(2, 3)) == (2, 3)
+@pytest.mark.parametrize(
+    ("total_tokens", "num_seqs", "max_seqlen", "expected"),
+    [
+        (17, 4, None, 5),
+        (17, 4, 11, 11),
+        (0, 3, None, 0),
+    ],
+)
+def test_max_seqlen_resolution_matches_public_cp_fallback(
+    total_tokens: int,
+    num_seqs: int,
+    max_seqlen: int | None,
+    expected: int,
+) -> None:
+    assert (
+        gdn_cp._resolve_max_seqlen(
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+            max_seqlen=max_seqlen,
+        )
+        == expected
+    )
 
 
 @pytest.mark.skipif(
@@ -1354,7 +1462,7 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
         beta,
         cu_seqlens,
         initial_state,
-        seq_lens=seq_lens,
+        max_seqlen=max(seq_lens),
         output_state=output_state,
     )
     output, final_state = prepared.replay()
@@ -1372,7 +1480,10 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
-def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph() -> None:
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
+    metadata_dtype: torch.dtype,
+) -> None:
     torch.manual_seed(4436)
     seq_lens = (128, 256)
     interval = 128
@@ -1389,7 +1500,7 @@ def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph() -
     alpha = torch.rand((total, state_heads), dtype=torch.float32, device="cuda")
     beta = torch.rand((total, state_heads), dtype=torch.float32, device="cuda")
     cu_seqlens = torch.tensor([0, 128, total], dtype=torch.int64, device="cuda")
-    checkpoint_cu_starts = torch.tensor([0, 1, 3], dtype=torch.int64, device="cuda")
+    checkpoint_cu_starts = torch.tensor([0, 1, 3], dtype=metadata_dtype, device="cuda")
     output = torch.empty((total, state_heads, 128), dtype=q.dtype, device="cuda")
     output_state = torch.empty(
         (len(seq_lens), state_heads, 128, 128),
@@ -1468,6 +1579,7 @@ def test_generated_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph() -
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=interval,
             cp_chunk_len=interval,
+            max_seqlen=max(seq_lens),
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
@@ -1586,7 +1698,7 @@ def _allocate_state_pool(
     ],
     ids=lambda case: case["label"],
 )
-def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
+def test_structurally_supported_public_route_uses_generated_state_and_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
     case: dict[str, object],
 ) -> None:
@@ -1601,12 +1713,14 @@ def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
     hq, hk, hv = (int(value) for value in case["heads"])
     state_heads = max(hq, hv)
     io_dtype = case["io_dtype"]
-    q = torch.randn((total, hq, 128), dtype=io_dtype, device="cuda")
+    input_scale = 1.0 / 16.0
+    q = torch.randn((total, hq, 128), dtype=io_dtype, device="cuda") * input_scale
     k_fp32 = torch.randn((total, hk, 128), dtype=torch.float32, device="cuda")
     if case["normalize_k"]:
         k_fp32 = torch.nn.functional.normalize(k_fp32, p=2.0, dim=-1)
+    k_fp32 *= input_scale
     k = k_fp32.to(io_dtype)
-    v = torch.randn((total, hv, 128), dtype=io_dtype, device="cuda")
+    v = torch.randn((total, hv, 128), dtype=io_dtype, device="cuda") * input_scale
     alpha = (
         torch.rand((total, state_heads), dtype=torch.float32, device="cuda")
         if case["alpha"]
@@ -1626,7 +1740,7 @@ def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
         (pool_rows, state_heads, 128, 128),
         dtype=case["initial_dtype"],
         device="cuda",
-    )
+    ) * input_scale
     candidate_initial = _allocate_state_pool(
         pool_rows,
         state_heads,
@@ -1708,14 +1822,22 @@ def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
         max_seqlen=total,
     )
 
-    def forbidden_generated(*_args, **_kwargs):
-        raise AssertionError("unqualified public route entered generated GDN CP")
+    route_calls: list[str] = []
+    real_generated = gdn_prefill._chunk_gated_delta_rule_gdn_cp_sm100
+
+    def observed_generated(*args, **kwargs):
+        route_calls.append("gdn_cp")
+        return real_generated(*args, **kwargs)
+
+    def forbidden_dsl(*_args, **_kwargs):
+        raise AssertionError("structurally supported route entered the CP DSL")
 
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_gdn_cp_sm100",
-        forbidden_generated,
+        observed_generated,
     )
+    monkeypatch.setattr(gdn_prefill, "cp_delta_rule_dsl_sm100", forbidden_dsl)
     result = gdn_prefill.chunk_gated_delta_rule(
         q,
         k,
@@ -1730,6 +1852,7 @@ def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
         output_state=candidate_state,
         state_indices=state_indices,
         use_cp=True,
+        max_seqlen=max(seq_lens),
     )
     if output_state_dtype is None:
         actual_output = result
@@ -1737,6 +1860,7 @@ def test_unqualified_public_route_uses_dsl_state_and_lifecycle(
     else:
         actual_output, actual_state = result
     torch.cuda.synchronize()
+    assert route_calls == ["gdn_cp"]
 
     _assert_oracle_close(actual_output, expected_output)
     if reference_state is None:
@@ -1777,7 +1901,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     seq_lens: tuple[int, ...],
     cu_dtype: torch.dtype,
 ) -> None:
-    """Keep empty-row semantics when an unqualified shape uses the CP DSL."""
+    """Keep empty-row semantics on the structurally selected generated route."""
 
     torch.manual_seed(504079 + sum(seq_lens))
     total = sum(seq_lens)
@@ -1828,29 +1952,29 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     )
     output_state_before = output_state.clone()
     route_calls: list[str] = []
-    real_dsl = gdn_prefill.cp_delta_rule_dsl_sm100
+    real_generated = gdn_prefill._chunk_gated_delta_rule_gdn_cp_sm100
 
-    def observed_dsl(*args, **kwargs):
-        route_calls.append("cute_cp")
-        return real_dsl(*args, **kwargs)
+    def observed_generated(*args, **kwargs):
+        route_calls.append("gdn_cp")
+        return real_generated(*args, **kwargs)
 
-    def forbidden_generated(*_args, **_kwargs):
-        raise AssertionError("unqualified zero-length route entered generated GDN CP")
+    def forbidden_dsl(*_args, **_kwargs):
+        raise AssertionError("structurally supported zero-length route entered CP DSL")
 
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_gdn_cp_sm100",
-        forbidden_generated,
+        observed_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "chunk_gated_delta_rule_sm100",
-        forbidden_generated,
+        forbidden_dsl,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "cp_delta_rule_dsl_sm100",
-        observed_dsl,
+        forbidden_dsl,
         raising=False,
     )
     gdn_cp._reset_gdn_cp_prefill_cache()
@@ -1870,10 +1994,11 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
         output_state=output_state,
         use_cp=True,
         state_indices=state_indices,
+        max_seqlen=max(seq_lens, default=0),
     )
     torch.cuda.synchronize()
 
-    assert route_calls == ["cute_cp"]
+    assert route_calls == ["gdn_cp"]
     assert actual_output is output
     assert actual_state is output_state
     _assert_oracle_close(actual_output, expected_output)
@@ -1894,10 +2019,10 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
     or _cuda_major() < 13,
     reason="requires an SM100a-compatible GPU with CUDA 13",
 )
-def test_public_dispatcher_uses_dsl_for_unqualified_indexed_inplace_gqa(
+def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the unqualified public use_cp=True fallback to the CP DSL."""
+    """Exercise generated public use_cp=True indexed in-place state."""
 
     torch.manual_seed(504078)
     seq_lens = (64, 129)
@@ -1953,29 +2078,29 @@ def test_public_dispatcher_uses_dsl_for_unqualified_indexed_inplace_gqa(
     immutable = tuple(tensor.clone() for tensor in (q, k, v, cu_seqlens, state_indices))
     state_before = candidate_state.clone()
     route_calls: list[str] = []
-    real_dsl = gdn_prefill.cp_delta_rule_dsl_sm100
+    real_generated = gdn_prefill._chunk_gated_delta_rule_gdn_cp_sm100
 
-    def observed_dsl(*args, **kwargs):
-        route_calls.append("cute_cp")
-        return real_dsl(*args, **kwargs)
+    def observed_generated(*args, **kwargs):
+        route_calls.append("gdn_cp")
+        return real_generated(*args, **kwargs)
 
-    def forbidden_generated(*_args, **_kwargs):
-        raise AssertionError("unqualified public route entered generated GDN CP")
+    def forbidden_dsl(*_args, **_kwargs):
+        raise AssertionError("structurally supported route entered the CP DSL")
 
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_gdn_cp_sm100",
-        forbidden_generated,
+        observed_generated,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "chunk_gated_delta_rule_sm100",
-        forbidden_generated,
+        forbidden_dsl,
     )
     monkeypatch.setattr(
         gdn_prefill,
         "cp_delta_rule_dsl_sm100",
-        observed_dsl,
+        forbidden_dsl,
         raising=False,
     )
     gdn_cp._public_key = None
@@ -1996,10 +2121,11 @@ def test_public_dispatcher_uses_dsl_for_unqualified_indexed_inplace_gqa(
         output_state=candidate_state,
         use_cp=True,
         state_indices=state_indices,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 
-    assert route_calls == ["cute_cp"]
+    assert route_calls == ["gdn_cp"]
     assert actual_output is output
     assert actual_state is candidate_state
     torch.testing.assert_close(actual_output, expected_output, atol=1e-2, rtol=1e-2)
