@@ -25,11 +25,6 @@ _KIND_TO_DTYPE = {
     "bf16_mxfp8_e4m3": torch.float8_e4m3fn,
     "bf16_mxfp8_e5m2": torch.float8_e5m2,
 }
-_VALID_IMPLS = {
-    ((256, 128, 128), "tmem", False, 128),
-    ((256, 256, 128), "smem", False, 128),
-    ((256, 256, 128), "tmem", True, 64),
-}
 
 
 @dataclass(frozen=True)
@@ -78,6 +73,11 @@ class MegaMoEBf16Mxfp8Config:
             raise ValueError("intermediate must be divisible by 64.")
         if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
             raise ValueError("mixed MegaMoE requires two-CTA cluster (2, 1, 1).")
+        from ..src.moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
+            Sm100SwapABMxfp8Bf16Fc12Kernel,
+        )
+
+        _VALID_IMPLS = Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs
         if (
             self.mma_tiler_mnk,
             self.transform_buffer,
