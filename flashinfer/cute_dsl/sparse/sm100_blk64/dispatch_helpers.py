@@ -859,6 +859,11 @@ def validate_sm100_blk64_fp8_sage(
             "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
             "be None); partial/padded KV blocks are not supported yet"
         )
+    if seqlen_k % 64 != 0:
+        raise ValueError(
+            "Sage FP8 blk64 requires seqlen_k to be a multiple of 64; "
+            "partial KV blocks are not supported yet"
+        )
     if (
         q_scale.dtype != torch.float32
         or k_scale.dtype != torch.float32

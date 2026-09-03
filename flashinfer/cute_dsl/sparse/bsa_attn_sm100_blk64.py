@@ -49,6 +49,11 @@ from .sm100_blk64.dispatch_helpers import (
 _sm100_blk64_compile_cache = get_jit_cache("bsa_fwd_blk64")
 
 
+def _sm100_blk64_has_partial_kv_tail(k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Return whether the final physical KV block is shorter than 64 rows."""
+    return k.shape[2] % 64 != 0 or v.shape[2] % 64 != 0
+
+
 @flashinfer_api
 def bsa_attn_sm100_blk64_fwd(
     q: torch.Tensor,
@@ -249,6 +254,12 @@ def bsa_attn_sm100_blk64_fwd(
         q2k_block_nums,
     )
     use_int64_kv_strides = sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    # Keep the true sequence extent for a partial final KV block so TMA
+    # zero-fills rows beyond it. The packed sparse-block view rounds this
+    # extent up to 64 and can otherwise read tensor storage past seqlen_k.
+    use_exact_kv_layout = use_int64_kv_strides or _sm100_blk64_has_partial_kv_tail(
+        k_bhsd, v_bhsd
+    )
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -363,6 +374,7 @@ def bsa_attn_sm100_blk64_fwd(
             is_persistent,
             use_clc_scheduler,
             "bhsd_native",
+            use_exact_kv_layout,
             use_int64_kv_strides,
             is_sage_fp8,
             "tvm_ffi_env_stream_v1",
@@ -417,6 +429,7 @@ def bsa_attn_sm100_blk64_fwd(
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
+            use_exact_kv_layout=use_exact_kv_layout,
             use_int64_kv_strides=use_int64_kv_strides,
         )
 

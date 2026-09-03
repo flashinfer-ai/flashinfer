@@ -66,6 +66,7 @@ class BlockSparseAttnForwardSm100Blk64:
         allow_empty_block_nums: cutlass.Constexpr[bool] = False,
         has_block_sizes: cutlass.Constexpr[bool] = True,
         num_splits: cutlass.Constexpr[int] = 1,
+        use_exact_kv_layout: cutlass.Constexpr[bool] = False,
         use_int64_kv_strides: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
@@ -135,6 +136,7 @@ class BlockSparseAttnForwardSm100Blk64:
         self.is_split_kv = num_splits > 1
         self.allow_empty_block_nums = allow_empty_block_nums
         self.has_block_sizes = has_block_sizes
+        self.use_exact_kv_layout = use_exact_kv_layout
         self.use_int64_kv_strides = use_int64_kv_strides
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = pack_gqa
@@ -340,17 +342,17 @@ class BlockSparseAttnForwardSm100Blk64:
             if const_expr(mLSE is not None)
             else None
         )
-        # The fast rank-6 view matches the sparse-block layout. CuTe DSL
-        # cannot lower an Int64 basis in that rank-6 TMA view, so layouts with
-        # large active strides use a rank-5 Int64 view and divide it into
-        # sparse blocks in the device kernel instead.
+        # The fast rank-6 view matches the sparse-block layout. Use an exact-
+        # boundary view for partial tails or wide strides: it retains the
+        # logical KV sequence extent so TMA zero-fills out-of-bounds rows.
         k_dim_half = self.head_dim_padded // 2
         v_dim_part = self.head_dim_v_padded // 2
-        if const_expr(self.use_int64_kv_strides):
-            k_stride_s = Int64(mK_seq.layout.stride[0])
-            k_stride_d = Int64(mK_seq.layout.stride[1])
-            k_stride_h = Int64(mK_seq.layout.stride[2])
-            k_stride_b = Int64(mK_seq.layout.stride[3])
+        if const_expr(self.use_exact_kv_layout):
+            stride_dtype = Int64 if const_expr(self.use_int64_kv_strides) else Int32
+            k_stride_s = stride_dtype(mK_seq.layout.stride[0])
+            k_stride_d = stride_dtype(mK_seq.layout.stride[1])
+            k_stride_h = stride_dtype(mK_seq.layout.stride[2])
+            k_stride_b = stride_dtype(mK_seq.layout.stride[3])
             mK = cute.make_tensor(
                 mK_seq.iterator,
                 cute.make_layout(
@@ -360,6 +362,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         2,
                         mK_seq.shape[2],
                         mK_seq.shape[3],
+                        1,
                     ),
                     stride=(
                         k_stride_s,
@@ -367,13 +370,14 @@ class BlockSparseAttnForwardSm100Blk64:
                         k_dim_half * k_stride_d,
                         k_stride_h,
                         k_stride_b,
+                        0,
                     ),
                 ),
             )
-            v_stride_s = Int64(mV_seq.layout.stride[0])
-            v_stride_d = Int64(mV_seq.layout.stride[1])
-            v_stride_h = Int64(mV_seq.layout.stride[2])
-            v_stride_b = Int64(mV_seq.layout.stride[3])
+            v_stride_s = stride_dtype(mV_seq.layout.stride[0])
+            v_stride_d = stride_dtype(mV_seq.layout.stride[1])
+            v_stride_h = stride_dtype(mV_seq.layout.stride[2])
+            v_stride_b = stride_dtype(mV_seq.layout.stride[3])
             mV = cute.make_tensor(
                 mV_seq.iterator,
                 cute.make_layout(
@@ -383,6 +387,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         2,
                         mV_seq.shape[2],
                         mV_seq.shape[3],
+                        1,
                     ),
                     stride=(
                         v_stride_d,
@@ -390,6 +395,7 @@ class BlockSparseAttnForwardSm100Blk64:
                         v_dim_part * v_stride_d,
                         v_stride_h,
                         v_stride_b,
+                        0,
                     ),
                 ),
             )
@@ -1529,14 +1535,22 @@ class BlockSparseAttnForwardSm100Blk64:
                 if const_expr(not self.pack_gqa)
                 else head_idx
             )
-            if const_expr(self.use_int64_kv_strides):
-                mK_cur = mK[None, None, None, head_idx_kv, batch_idx]
-                mV_cur = mV[None, None, None, head_idx_kv, batch_idx]
-                gK_tma = cute.zipped_divide(
-                    mK_cur, (self.sparse_block_size, self.head_dim_padded // 2, 2)
+            if const_expr(self.use_exact_kv_layout):
+                mK_cur = mK[None, None, None, head_idx_kv, batch_idx, None]
+                mV_cur = mV[None, None, None, head_idx_kv, batch_idx, None]
+                gK_tma = cute.coalesce(
+                    cute.zipped_divide(
+                        mK_cur,
+                        (self.sparse_block_size, self.head_dim_padded // 2, 2, 1),
+                    ),
+                    target_profile=((1, 1, 1, 1), 1),
                 )
-                gV_tma = cute.zipped_divide(
-                    mV_cur, (self.head_dim_v_padded // 2, self.sparse_block_size, 2)
+                gV_tma = cute.coalesce(
+                    cute.zipped_divide(
+                        mV_cur,
+                        (self.head_dim_v_padded // 2, self.sparse_block_size, 2, 1),
+                    ),
+                    target_profile=((1, 1, 1, 1), 1),
                 )
             else:
                 mK_cur = mK[None, None, None, head_idx_kv, None, batch_idx]

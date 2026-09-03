@@ -696,6 +696,67 @@ def _make_wrapper_blk64(workspace):
 
 
 @_requires_sm100_or_sm103
+@pytest.mark.parametrize("use_clc", [False, True])
+@pytest.mark.parametrize("kv_splits", [1, 2])
+def test_vsa_blk64_partial_kv_tail_does_not_read_capacity_tail(use_clc, kv_splits):
+    """Partial KV tails must ignore poisoned rows beyond their logical extent."""
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
+        bsa_attn_sm100_blk64_fwd,
+    )
+
+    torch.manual_seed(859)
+    device = torch.device("cuda")
+    batch_size, num_heads, seqlen_q, seqlen_k = 1, 1, R64, R64 + 1
+    q = torch.randn(
+        batch_size,
+        seqlen_q,
+        num_heads,
+        HEAD_DIM_BLK64,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_storage = torch.randn(
+        batch_size,
+        2 * R64,
+        num_heads,
+        HEAD_DIM_BLK64,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_storage = torch.randn_like(k_storage)
+    k_storage[:, seqlen_k:].fill_(float("nan"))
+    v_storage[:, seqlen_k:].fill_(float("nan"))
+    k, v = k_storage[:, :seqlen_k], v_storage[:, :seqlen_k]
+    q2k_block_index = torch.tensor([0, 1], dtype=torch.int32, device=device).view(
+        1, 1, 1, 2
+    )
+    block_sizes = torch.tensor([R64, 1], dtype=torch.int32, device=device)
+
+    out, lse = bsa_attn_sm100_blk64_fwd(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        block_sparse_num=2,
+        block_sizes=block_sizes,
+        return_lse=True,
+        kv_splits=kv_splits,
+        use_clc=use_clc,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).all()
+
+    q_ref, k_ref, v_ref = (
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    )
+    scores = torch.matmul(q_ref, k_ref.transpose(-1, -2)) / math.sqrt(HEAD_DIM_BLK64)
+    out_ref = torch.matmul(torch.softmax(scores, dim=-1), v_ref).transpose(1, 2)
+    torch.testing.assert_close(out.float(), out_ref, atol=3e-2, rtol=3e-2)
+
+
+@_requires_sm100_or_sm103
 def test_vsa_blk64_rejects_empty_rows(workspace):
     """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
     device = torch.device("cuda")
