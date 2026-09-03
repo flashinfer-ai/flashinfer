@@ -48,7 +48,7 @@ import torch
 from flashinfer import (
     fp4_paged_mqa_logits,
     fp8_paged_mqa_logits,
-    padded_context_len,
+    padded_seq_len,
 )
 
 _HEADS = 64  # both kernels pin num_heads
@@ -59,8 +59,8 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
     """Random inputs in the exact layouts the public API requires."""
     ntb_cols = ((ctx + 127) // 128 * 128) // block_size
     num_blocks = max(batch * ntb_cols, 1)
-    context_lens = torch.full((batch,), ctx, dtype=torch.int32, device=device)
-    block_table = (
+    seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device=device)
+    block_tables = (
         torch.arange(batch * ntb_cols, dtype=torch.int32, device=device)
         .reshape(batch, ntb_cols)
         .contiguous()
@@ -77,7 +77,7 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
             dtype=torch.uint8,
             device=device,
         )
-        return (q, kv, weights, context_lens, block_table, ctx)
+        return (q, kv, weights, block_tables, seq_lens, ctx)
     q = torch.randint(
         0,
         256,
@@ -86,7 +86,7 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
         device=device,
     )
     # UE8M0 exponents near 1.0 (bias 127) in each packed byte keep values finite.
-    sf_q = torch.full(
+    q_sf = torch.full(
         (batch, next_n, _HEADS), 0x7F7F7F7F, dtype=torch.int32, device=device
     )
     kv = torch.randint(
@@ -97,7 +97,7 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
         device=device,
     )
     kv[:, :, :, _HEAD_DIM // 2 :] = 0x7F
-    return (q, sf_q, kv, weights, context_lens, block_table, ctx)
+    return (q, q_sf, kv, weights, block_tables, seq_lens, ctx)
 
 
 def _call(kind, args, out):
@@ -109,7 +109,7 @@ def _call(kind, args, out):
 def bench_one(kind, batch, ctx, next_n, block_size, iters, device):
     args = _make_inputs(kind, batch, ctx, next_n, block_size, device)
     out = torch.empty(
-        (batch * next_n, padded_context_len(ctx)),
+        (batch * next_n, padded_seq_len(ctx)),
         dtype=torch.float32 if kind == "fp8" else torch.bfloat16,
         device=device,
     )

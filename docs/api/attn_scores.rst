@@ -28,10 +28,10 @@ Two things about that expression are easy to get wrong:
 
   The kernels write every position unconditionally and apply no causal or
   context mask.  Output row ``b*next_n + t`` is meaningful only for KV
-  positions ``0 .. context_lens[b] - next_n + t`` inclusive (the newest slot
+  positions ``0 .. seq_lens[b] - next_n + t`` inclusive (the newest slot
   ``t = next_n - 1`` sees the whole context, each earlier slot one position
   fewer); callers must mask or slice past that per-slot limit themselves.  A
-  request with ``context_lens[b] == 0`` is skipped entirely and its output
+  request with ``seq_lens[b] == 0`` is skipped entirely and its output
   rows are never written -- when passing ``out=``, initialise it if you
   intend to read those rows.
 
@@ -60,7 +60,7 @@ build it once and pass it back via ``schedule_meta=``.
 
 .. warning::
 
-  A reused schedule is only valid while ``ceil(context_lens / 256)`` is
+  A reused schedule is only valid while ``ceil(seq_lens / 256)`` is
   unchanged for every request. Recompute it whenever a context length crosses
   a 256-token boundary, including on every CUDA-graph replay.
 
@@ -68,5 +68,5 @@ build it once and pass it back via ``schedule_meta=``.
   :toctree: ../generated
 
   attn_scores.compute_paged_mqa_logits_schedule
-  attn_scores.padded_context_len
+  attn_scores.padded_seq_len
   attn_scores.precompile_paged_mqa_logits

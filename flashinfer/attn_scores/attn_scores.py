@@ -19,7 +19,7 @@ position pos:
 
     output[b*next_n + t, pos] = Σ_h w[b*next_n+t, h] · relu(Q[b,t,h,:] @ K[pos,:]ᵀ)
 
-where K is paged via block_table, used for sparse attention indexing in DeepSeek MLA.
+where K is paged via block_tables, used for sparse attention indexing in DeepSeek MLA.
 
 ReLU is applied per head, *before* weighting and reduction -- not to the sum.
 With head scores [1, -1] and weights [1, 1] the result is 1, not 0, and negative
@@ -40,10 +40,10 @@ parts).
 Typical call (the DeepSeek indexer shape)::
 
     # q [B, next_n, 64, 128] e4m3fn; kv_fused [num_blocks, 64, 1, 132] uint8;
-    # weights [B*next_n, 64] f32; context_lens/block_table int32 on q's device
+    # weights [B*next_n, 64] f32; seq_lens/block_tables int32 on q's device
     logits = flashinfer.fp8_paged_mqa_logits(
-        q, kv_fused, weights, context_lens, block_table, max_context_len
-    )  # -> [B*next_n, max_context_len]; mask each row past its causal limit
+        q, kv_fused, weights, block_tables, seq_lens, max_seq_len
+    )  # -> [B*next_n, max_seq_len]; mask each row past its causal limit
 
 See each function's docstring for a runnable example, the fused-KV byte
 layout, and the CUDA-graph recipe.
@@ -105,7 +105,7 @@ _FP4_SF_INTERLEAVE_BLOCK_SIZE = 128
 _EPI_SUBTILE_UNROLL = 4
 # MXFP4 scale-factor block size: one UE8M0 exponent per this many FP4 values.
 _FP4_SF_VEC_SIZE = 32
-# sf_q packs the per-token scale factors of one head into a single int32, so
+# q_sf packs the per-token scale factors of one head into a single int32, so
 # head_dim // sf_vec_size must equal the number of bytes in an int32.
 _SF_PER_INT32 = 4
 
@@ -174,7 +174,7 @@ def _validate_sf_vec_size(sf_vec_size: int, head_dim: int, fn_name: str) -> int:
     if scales_per_token != _SF_PER_INT32:
         raise ValueError(
             f"{fn_name}: head_dim/sf_vec_size = {scales_per_token} scale factors "
-            f"per token, but sf_q packs exactly {_SF_PER_INT32} UE8M0 bytes into "
+            f"per token, but q_sf packs exactly {_SF_PER_INT32} UE8M0 bytes into "
             f"each int32."
         )
     return scales_per_token
@@ -274,72 +274,72 @@ def _validate_on_device(device: torch.device, fn_name: str, **tensors) -> None:
 
 
 def _validate_paged_inputs(
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
     batch_size: int,
     fn_name: str,
 ) -> None:
-    """Validate context_lens / block_table (cheap host-side checks; no device sync).
+    """Validate seq_lens / block_tables (cheap host-side checks; no device sync).
 
     They must be int32 CUDA tensors (the kernels are compiled against on-device
     Int32 fakes; a CPU or int64 tensor would make the kernel dereference a bad
     pointer or misread storage) and have exactly ``batch_size`` rows.
 
     NOTE (caller invariant, not checked here): the kernel reads
-    ceil(context_lens[b]/128) compute tiles * (128 // block_size) physical
-    blocks per row, so ``block_table`` must have at least
-    ``max_b ceil(context_lens[b]/128) * (128 // block_size)`` columns. A
-    narrower block_table causes an out-of-bounds read. The bound needs the
+    ceil(seq_lens[b]/128) compute tiles * (128 // block_size) physical
+    blocks per row, so ``block_tables`` must have at least
+    ``max_b ceil(seq_lens[b]/128) * (128 // block_size)`` columns. A
+    narrower block_tables causes an out-of-bounds read. The bound needs the
     per-row lengths from device memory, so it cannot be checked here without a
     D2H copy; :func:`_validate_paged_bounds` performs it when
     ``FLASHINFER_VALIDATE_INPUTS`` is set."""
-    if not (context_lens.is_cuda and context_lens.dtype == torch.int32):
+    if not (seq_lens.is_cuda and seq_lens.dtype == torch.int32):
         raise ValueError(
-            f"{fn_name}: context_lens must be an int32 CUDA tensor, got "
-            f"dtype={context_lens.dtype}, device={context_lens.device}"
+            f"{fn_name}: seq_lens must be an int32 CUDA tensor, got "
+            f"dtype={seq_lens.dtype}, device={seq_lens.device}"
         )
-    if not (block_table.is_cuda and block_table.dtype == torch.int32):
+    if not (block_tables.is_cuda and block_tables.dtype == torch.int32):
         raise ValueError(
-            f"{fn_name}: block_table must be an int32 CUDA tensor, got "
-            f"dtype={block_table.dtype}, device={block_table.device}"
+            f"{fn_name}: block_tables must be an int32 CUDA tensor, got "
+            f"dtype={block_tables.dtype}, device={block_tables.device}"
         )
-    if context_lens.dim() != 1 or context_lens.shape[0] != batch_size:
+    if seq_lens.dim() != 1 or seq_lens.shape[0] != batch_size:
         raise ValueError(
-            f"{fn_name}: context_lens must be 1-D with shape[0] == batch_size "
+            f"{fn_name}: seq_lens must be 1-D with shape[0] == batch_size "
             f"({batch_size}) inferred from q.shape[0]; got shape "
-            f"{tuple(context_lens.shape)}"
+            f"{tuple(seq_lens.shape)}"
         )
-    if block_table.dim() != 2 or block_table.shape[0] != batch_size:
+    if block_tables.dim() != 2 or block_tables.shape[0] != batch_size:
         raise ValueError(
-            f"{fn_name}: block_table must be 2-D with shape[0] == batch_size "
+            f"{fn_name}: block_tables must be 2-D with shape[0] == batch_size "
             f"({batch_size}) inferred from q.shape[0]; got shape "
-            f"{tuple(block_table.shape)}"
+            f"{tuple(block_tables.shape)}"
         )
     # The kernels are compiled against compact (contiguous) index tensors; a
     # strided view reaches the FFI binding with a bare layout error otherwise.
-    if not context_lens.is_contiguous():
+    if not seq_lens.is_contiguous():
         raise ValueError(
-            f"{fn_name}: context_lens must be contiguous; got stride "
-            f"{tuple(context_lens.stride())}. Call .contiguous() first."
+            f"{fn_name}: seq_lens must be contiguous; got stride "
+            f"{tuple(seq_lens.stride())}. Call .contiguous() first."
         )
-    if not block_table.is_contiguous():
+    if not block_tables.is_contiguous():
         raise ValueError(
-            f"{fn_name}: block_table must be contiguous (the kernel is compiled "
+            f"{fn_name}: block_tables must be contiguous (the kernel is compiled "
             f"against a compact row-major table); got stride "
-            f"{tuple(block_table.stride())}. Call .contiguous() first."
+            f"{tuple(block_tables.stride())}. Call .contiguous() first."
         )
 
 
 def _validate_schedule_meta_fresh(
     schedule_meta: torch.Tensor,
-    context_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
     fn_name: str,
 ) -> None:
     """Debug-mode check that a caller-supplied ``schedule_meta`` is not stale.
 
-    The schedule is a pure function of ``(context_lens, num_sms)``, so it can be
+    The schedule is a pure function of ``(seq_lens, num_sms)``, so it can be
     recomputed and compared exactly.  Reuse is only valid while the whole
-    ``ceil(context_lens / _SPLIT_KV)`` vector is unchanged -- a single sequence
+    ``ceil(seq_lens / _SPLIT_KV)`` vector is unchanged -- a single sequence
     crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's split count
     from 1 to 2 while every tensor shape stays identical.
 
@@ -360,17 +360,15 @@ def _validate_schedule_meta_fresh(
         return
     if torch.cuda.is_current_stream_capturing():
         return
-    expected = compute_paged_mqa_logits_schedule(
-        context_lens, device=schedule_meta.device
-    )
+    expected = compute_paged_mqa_logits_schedule(seq_lens, device=schedule_meta.device)
     if not torch.equal(expected, schedule_meta):
         raise ValueError(
-            f"{fn_name}: schedule_meta does not match context_lens. It is a "
-            f"function of the whole ceil(context_lens / {_SPLIT_KV}) vector and "
+            f"{fn_name}: schedule_meta does not match seq_lens. It is a "
+            f"function of the whole ceil(seq_lens / {_SPLIT_KV}) vector and "
             f"the device SM count, so a single sequence crossing a "
             f"{_SPLIT_KV}-token boundary invalidates it even when every shape is "
             f"unchanged. Recompute it with compute_paged_mqa_logits_schedule("
-            f"context_lens, out=schedule_meta); reusing a stale schedule can hang "
+            f"seq_lens, out=schedule_meta); reusing a stale schedule can hang "
             f"the persistent kernel."
         )
 
@@ -418,7 +416,7 @@ def _validate_out(
 
     The kernel writes UNCONDITIONALLY into the SPLIT_KV-padded trailing region,
     so ``out`` must have at least ``padded_ctx_len`` columns (use
-    :func:`padded_context_len`) and ``rows`` rows — otherwise the store spills
+    :func:`padded_seq_len`) and ``rows`` rows — otherwise the store spills
     past each row / past the buffer (silent corruption or illegal address)."""
     if out.device != device:
         raise ValueError(
@@ -432,7 +430,7 @@ def _validate_out(
         raise ValueError(
             f"{fn_name}: out must be at least ({rows}, {padded_ctx_len}); the "
             f"kernel writes into the SPLIT_KV=256-padded trailing region. Use "
-            f"padded_context_len(max_context_len) for the column count. "
+            f"padded_seq_len(max_seq_len) for the column count. "
             f"Got shape {tuple(out.shape)}."
         )
     # The kernel is compiled against a row-major output with unit inner stride;
@@ -442,7 +440,7 @@ def _validate_out(
         raise ValueError(
             f"{fn_name}: out's innermost stride must be 1 (row-contiguous); got "
             f"strides {tuple(out.stride())}. Allocate with torch.empty((rows, "
-            f"padded_context_len(max_context_len)), ...)."
+            f"padded_seq_len(max_seq_len)), ...)."
         )
 
 
@@ -452,27 +450,27 @@ def _sync_input_validation_enabled() -> bool:
 
 
 def _validate_paged_bounds(
-    block_table: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_context_len: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
     block_size: int,
     num_blocks: int,
     fn_name: str,
 ) -> None:
-    """Debug-mode bounds checks that need the per-row ``context_lens``.
+    """Debug-mode bounds checks that need the per-row ``seq_lens``.
 
     Two invariants keep the kernel inside its buffers, and both depend on values
     that live in device memory, so one D2H copy covers both.
 
-    1. ``max(context_lens) <= max_context_len``.  The output row is sized from
-       ``max_context_len`` while the schedule is derived from ``context_lens``,
+    1. ``max(seq_lens) <= max_seq_len``.  The output row is sized from
+       ``max_seq_len`` while the schedule is derived from ``seq_lens``,
        and nothing ties the two together.  A longer sequence schedules splits
        past the end of the allocated row, and the kernel stores unconditionally,
        so it writes there -- silent corruption rather than a fault.  e.g.
-       context_lens=[257] with max_context_len=256 allocates 256 columns while
+       seq_lens=[257] with max_seq_len=256 allocates 256 columns while
        the schedule reaches 512.
 
-    2. ``block_table`` wide enough for the kernel
+    2. ``block_tables`` wide enough for the kernel
 
     The kernel walks KV in ``_COMPUTE_BLOCK_KV``-token compute tiles and reads
     ``_COMPUTE_BLOCK_KV // block_size`` pages per tile, so it indexes columns up
@@ -485,10 +483,10 @@ def _validate_paged_bounds(
     belonging to another sequence), and the last row reads past the allocation,
     feeding a wild index to the KV TMA load.
 
-    The bound depends on the per-row ``context_lens``, which live on device, so
+    The bound depends on the per-row ``seq_lens``, which live on device, so
     this costs a D2H copy.  It is therefore opt-in via
     ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph capture, where
-    a sync is illegal.  ``max_context_len`` cannot stand in for the per-row
+    a sync is illegal.  ``max_seq_len`` cannot stand in for the per-row
     lengths: it is the output width (typically the model maximum), so it
     over-estimates the requirement by the ratio between it and the real lengths.
     """
@@ -496,23 +494,23 @@ def _validate_paged_bounds(
         return
     if torch.cuda.is_current_stream_capturing():
         return
-    lens = context_lens.tolist()  # the single D2H sync; both checks use it
+    lens = seq_lens.tolist()  # the single D2H sync; both checks use it
     if not lens:
         return
     longest = max(lens)
-    if longest > max_context_len:
+    if longest > max_seq_len:
         raise ValueError(
-            f"{fn_name}: max_context_len ({max_context_len}) must be at least "
-            f"max(context_lens) ({longest}). The output row is sized from "
-            f"max_context_len but the schedule follows context_lens, so a longer "
+            f"{fn_name}: max_seq_len ({max_seq_len}) must be at least "
+            f"max(seq_lens) ({longest}). The output row is sized from "
+            f"max_seq_len but the schedule follows seq_lens, so a longer "
             f"sequence is written past the end of the row."
         )
     pages_per_tile = _COMPUTE_BLOCK_KV // block_size
     need = max(-(-c // _COMPUTE_BLOCK_KV) for c in lens) * pages_per_tile
-    if block_table.shape[1] < need:
+    if block_tables.shape[1] < need:
         raise ValueError(
-            f"{fn_name}: block_table has {block_table.shape[1]} columns but the "
-            f"kernel indexes up to {need} for these context_lens with "
+            f"{fn_name}: block_tables has {block_tables.shape[1]} columns but the "
+            f"kernel indexes up to {need} for these seq_lens with "
             f"block_size={block_size} (ceil(ctx/{_COMPUTE_BLOCK_KV}) compute "
             f"tiles x {pages_per_tile} pages per tile). Columns past a "
             f"sequence's real pages are read but masked, so they may hold any "
@@ -523,7 +521,7 @@ def _validate_paged_bounds(
     #    columns [0, ceil(ctx_r/128)*pages_per_tile); entries beyond a row's
     #    own read region are unconstrained. This path already paid the D2H
     #    sync, so the value check rides along.
-    bt = block_table.cpu()
+    bt = block_tables.cpu()
     per_row_need = torch.tensor(
         [-(-c // _COMPUTE_BLOCK_KV) * pages_per_tile for c in lens],
         dtype=torch.int64,
@@ -536,7 +534,7 @@ def _validate_paged_bounds(
         lo, hi = int(used.min()), int(used.max())
         if lo < 0 or hi >= num_blocks:
             raise ValueError(
-                f"{fn_name}: block_table entries the kernel reads span "
+                f"{fn_name}: block_tables entries the kernel reads span "
                 f"[{lo}, {hi}] but kv_fused has only {num_blocks} blocks "
                 f"(valid indices 0..{num_blocks - 1}); a stale or out-of-pool "
                 f"page index is a device-side out-of-bounds READ."
@@ -698,7 +696,7 @@ def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tens
     """Per-atom context-length offsets ``[(num_atoms-1)*atom, ..., 0]``.
 
     Cached because it depends only on the decomposition and the device, while
-    ``_expand_context_lens`` runs on every call. These kernels are only a few
+    ``_expand_seq_lens`` runs on every call. These kernels are only a few
     microseconds each, so the whole API call is host-launch-bound -- building
     this tensor per call cost more in dispatch overhead than the paged-MQA
     kernel itself takes to run.
@@ -720,9 +718,7 @@ def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tens
     return off
 
 
-def _expand_context_lens(
-    context_lens: torch.Tensor, num_atoms: int, atom: int
-) -> torch.Tensor:
+def _expand_seq_lens(seq_lens: torch.Tensor, num_atoms: int, atom: int) -> torch.Tensor:
     """Expand ``[batch]`` context lengths to ``[batch*num_atoms]`` for the split.
 
     Atom ``i`` (0 = oldest) of a sequence sees ``ctx - (num_atoms-1-i)*atom``,
@@ -737,15 +733,15 @@ def _expand_context_lens(
     keeps this function a pure inverse of the kernel's ``_atom_ctx_len``.
     """
     if num_atoms == 1:
-        return context_lens
-    off = _atom_offsets(num_atoms, atom, context_lens.device)
+        return seq_lens
+    off = _atom_offsets(num_atoms, atom, seq_lens.device)
     # One kernel: the broadcast subtract already produces a contiguous
     # [batch, num_atoms] result, so reshape is a view and no copy is needed.
-    return (context_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1)
+    return (seq_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1)
 
 
 def _compute_schedule_metadata(
-    context_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
     num_ctas: int,
 ) -> torch.Tensor:
     """Return [num_ctas+1, 2] int32 on CPU.
@@ -757,7 +753,7 @@ def _compute_schedule_metadata(
     Implemented with vectorized numpy to avoid Python-loop overhead (~150
     torch.tensor() allocations per call that otherwise cost ~600µs).
     """
-    ctx_np = context_lens_cpu.numpy().astype(np.int64)
+    ctx_np = seq_lens_cpu.numpy().astype(np.int64)
     num_kv = (ctx_np + _COMPUTE_BLOCK_KV - 1) // _COMPUTE_BLOCK_KV
     splits = (num_kv + 1) // 2  # ceil_div(num_kv, NUM_MATH_WG)
 
@@ -971,7 +967,7 @@ def _cached_compile_fp4_kernel(
 
     # next_n is the LOGICAL next-token count. The fake Q/SF/W carry one atom of
     # N = next_n_atom * num_heads, and the kernel tiles the split over
-    # q_atom_idx; block_table / context_lens stay [batch]-shaped.
+    # q_atom_idx; block_tables / seq_lens stay [batch]-shaped.
     next_n_atom = next_n // num_next_n_atoms
     N = next_n_atom * num_heads
     half_D = head_dim // 2
@@ -979,7 +975,7 @@ def _cached_compile_fp4_kernel(
 
     sym_npb = cute.sym_int()
     sym_B = cute.sym_int()  # Q / SF / weights L dim = batch * num_next_n_atoms
-    sym_batch = cute.sym_int()  # native block_table / context_lens rows
+    sym_batch = cute.sym_int()  # native block_tables / seq_lens rows
     max_ctx = cute.sym_int()
     max_blocks = cute.sym_int()
     num_ctas_sym = cute.sym_int()
@@ -1073,18 +1069,18 @@ _SPLIT_KV = _COMPUTE_BLOCK_KV * _NUM_MATH_WG  # 256 — output alignment granula
 
 
 def _gpu_schedule(
-    context_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
     schedule_meta: torch.Tensor,
     num_sms: int,
 ) -> None:
-    """Run GPU schedule kernel in-place: fills schedule_meta from context_lens.
+    """Run GPU schedule kernel in-place: fills schedule_meta from seq_lens.
 
     Both tensors must already be on the same CUDA device.
     schedule_meta must be [num_sms+1, 2] int32.
     """
     from .kernels.schedule_kernel import _compile_schedule_kernel
 
-    batch_size = int(context_lens.shape[0])
+    batch_size = int(seq_lens.shape[0])
     aligned_b = max(((batch_size + 31) // 32) * 32, 32)
     dev_index = get_device_index(schedule_meta.device)
     with _on_device(dev_index):
@@ -1094,27 +1090,27 @@ def _gpu_schedule(
             num_sms,
             _arch_for_launch(dev_index, "compute_paged_mqa_logits_schedule"),
         )
-        compiled(context_lens, schedule_meta, batch_size)
+        compiled(seq_lens, schedule_meta, batch_size)
 
 
-def padded_context_len(max_context_len: int) -> int:
+def padded_seq_len(max_seq_len: int) -> int:
     """Return the minimum allocated context dimension for paged MQA logits output.
 
-    Rounds ``max_context_len`` up to a multiple of 256: the kernels store
+    Rounds ``max_seq_len`` up to a multiple of 256: the kernels store
     output in 256-column chunks and may write unconditionally into the padded
     trailing positions, so the output tensor must be allocated with at least
     this many columns (a narrower ``out`` is an out-of-bounds write).  The
     padding columns hold unspecified scratch -- never consume them.
 
     Use this to pre-allocate the ``out`` parameter:
-        out = torch.empty((B * next_n, padded_context_len(max_ctx)), dtype=..., device="cuda")
+        out = torch.empty((B * next_n, padded_seq_len(max_ctx)), dtype=..., device="cuda")
         logits = fp8_paged_mqa_logits(..., out=out)
     """
-    return ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    return ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
 
 
 def compute_paged_mqa_logits_schedule(
-    context_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
     device: Optional[torch.device] = None,
     *,
     use_gpu_kernel: bool = True,
@@ -1126,38 +1122,38 @@ def compute_paged_mqa_logits_schedule(
     to :func:`fp8_paged_mqa_logits` or :func:`fp4_paged_mqa_logits`.  One
     exception: when fp4's atom split is active (always the case for next_n=4
     on SM100/SM103), the kernel schedules batch_size*num_atoms rows, so a
-    schedule built from the native context_lens is rejected there -- omit
+    schedule built from the native seq_lens is rejected there -- omit
     schedule_meta on split configurations instead.
 
     Args:
-        context_lens:   [B] int32, on CPU or CUDA.
-        device:         target CUDA device.  Defaults to context_lens.device,
-                        or the current CUDA device when context_lens is on CPU.
+        seq_lens:   [B] int32, on CPU or CUDA.
+        device:         target CUDA device.  Defaults to seq_lens.device,
+                        or the current CUDA device when seq_lens is on CPU.
         use_gpu_kernel: if True (default), compute entirely on-GPU via
                         :class:`PagedMQALogitsScheduleKernel` — no D2H copy,
                         CUDA-graph-capturable.  Falls back to CPU numpy (not
                         graph-capturable) when the CuTe DSL is unavailable,
                         cannot target the device's architecture, or
-                        context_lens is on CPU.
+                        seq_lens is on CPU.
         out:            optional pre-allocated [num_sms+1, 2] int32 on CUDA.
                         Required for CUDA-graph capture (static buffer).
                         If None, a new tensor is allocated each call.
                         This provides static storage, not static contents:
                         the address stays stable, but the values must be
-                        recomputed into it whenever ceil(context_lens / 256)
+                        recomputed into it whenever ceil(seq_lens / 256)
                         changes -- including on every graph replay where the
                         lengths may have moved across a 256-token boundary.
 
     Returns:
         schedule_meta: [num_sms+1, 2] int32 on CUDA (``out`` if provided).
     """
-    if context_lens.dtype != torch.int32:
+    if seq_lens.dtype != torch.int32:
         raise ValueError(
-            f"compute_paged_mqa_logits_schedule: context_lens must be int32 "
-            f"(matching fp8/fp4_paged_mqa_logits); got {context_lens.dtype}"
+            f"compute_paged_mqa_logits_schedule: seq_lens must be int32 "
+            f"(matching fp8/fp4_paged_mqa_logits); got {seq_lens.dtype}"
         )
     if device is None:
-        device = context_lens.device if context_lens.is_cuda else torch.device("cuda")
+        device = seq_lens.device if seq_lens.is_cuda else torch.device("cuda")
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         # Normalize an index-less "cuda" to the current device so the out=
@@ -1175,16 +1171,16 @@ def compute_paged_mqa_logits_schedule(
     if (
         use_gpu_kernel
         and _CUTE_DSL_AVAILABLE
-        and context_lens.is_cuda
+        and seq_lens.is_cuda
         and _cached_dsl_targets_device(get_device_index(device))
     ):
         if out is None:
             out = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
-        _gpu_schedule(context_lens, out, num_sms)
+        _gpu_schedule(seq_lens, out, num_sms)
         return out
 
     # CPU fallback: D2H copy + numpy schedule + H2D copy
-    result = _compute_schedule_metadata(context_lens.cpu(), num_sms).to(device)
+    result = _compute_schedule_metadata(seq_lens.cpu(), num_sms).to(device)
     if out is not None:
         out.copy_(result)
         return out
@@ -1196,9 +1192,9 @@ def _check_fp8_paged_mqa_logits_supported(
     q: torch.Tensor,
     kv_fused: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    max_context_len: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
@@ -1246,8 +1242,8 @@ def _check_fp8_paged_mqa_logits_supported(
         "fp8_paged_mqa_logits",
         kv_fused=kv_fused,
         weights=weights,
-        context_lens=context_lens,
-        block_table=block_table,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
     )
     B, next_n, H, D = q.shape
     N = next_n * H
@@ -1316,7 +1312,7 @@ def _check_fp8_paged_mqa_logits_supported(
             f"kv_fused must be [num_blocks, block_size, 1, head_dim+4={D + 4}] "
             f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
         )
-    _validate_paged_inputs(context_lens, block_table, B, "fp8_paged_mqa_logits")
+    _validate_paged_inputs(seq_lens, block_tables, B, "fp8_paged_mqa_logits")
     return True
 
 
@@ -1326,9 +1322,9 @@ def fp8_paged_mqa_logits(
     q: torch.Tensor,
     kv_fused: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    max_context_len: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
     *,
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
@@ -1350,20 +1346,20 @@ def fp8_paged_mqa_logits(
     positions scored per request (speculative/MTP draft depth; use 1 for plain
     decode) -- a dimension of ``q``, not an argument; the kernel specializes on
     it automatically.  Slot ``t = 0`` is the oldest draft position and
-    ``t = next_n - 1`` the newest; ``context_lens[b]`` is the KV length visible
+    ``t = next_n - 1`` the newest; ``seq_lens[b]`` is the KV length visible
     to the newest slot.
 
     Example:
         Two requests, two draft positions each, 64-token pages::
 
             B, next_n, num_heads, head_dim = 2, 2, 64, 128
-            block_size, max_context_len = 64, 4096
+            block_size, max_seq_len = 64, 4096
             device = "cuda"
 
             # Per-request KV lengths and a page table into the shared KV pool.
-            context_lens = torch.tensor([3000, 4096], dtype=torch.int32, device=device)
-            pages_per_seq = -(-max_context_len // block_size)  # 64
-            block_table = torch.arange(
+            seq_lens = torch.tensor([3000, 4096], dtype=torch.int32, device=device)
+            pages_per_seq = -(-max_seq_len // block_size)  # 64
+            block_tables = torch.arange(
                 B * pages_per_seq, dtype=torch.int32, device=device
             ).view(B, pages_per_seq)
 
@@ -1385,10 +1381,10 @@ def fp8_paged_mqa_logits(
             weights = torch.rand(B * next_n, num_heads, device=device)
 
             logits = flashinfer.fp8_paged_mqa_logits(
-                q, kv_fused, weights, context_lens, block_table, max_context_len
+                q, kv_fused, weights, block_tables, seq_lens, max_seq_len
             )
-            # logits: [B*next_n, max_context_len] float32.  Row b*next_n + t is
-            # valid for positions 0 .. context_lens[b] - next_n + t; mask the
+            # logits: [B*next_n, max_seq_len] float32.  Row b*next_n + t is
+            # valid for positions 0 .. seq_lens[b] - next_n + t; mask the
             # rest before use.
 
     Args:
@@ -1416,28 +1412,26 @@ def fp8_paged_mqa_logits(
                          [batch_size, next_n, num_heads] tensor as
                          w.view(batch_size * next_n, num_heads).  Cast
                          internally when epi_dtype is float16.
-        context_lens:    [batch_size]  int32, on q's device.  Per-request KV
-                         length -- the quantity other flashinfer APIs call
-                         ``seq_lens`` (names here follow the DeepGEMM paged-MQA
-                         API this module ports).
-                         No entry may exceed max_context_len.
-        block_table:     [batch_size, max_blocks_per_seq]  int32, on q's device
-                         (elsewhere in flashinfer: ``block_tables``).
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's device.
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
-                         max_b round_up(context_lens[b], 128) // block_size --
-                         wider than ceil(context_lens[b] / block_size) when a
-                         length is not a multiple of 128 (context_len=257 with
+                         max_b round_up(seq_lens[b], 128) // block_size --
+                         wider than ceil(seq_lens[b] / block_size) when a
+                         length is not a multiple of 128 (seq_len=257 with
                          block_size=64 needs 6 columns, not 5).  Extra entries
                          may be any valid index (0).  This is a hard
                          precondition, not a checked argument: too few columns
                          is a device-side out-of-bounds READ, i.e. undefined
                          behaviour -- it may return corrupt logits, or fault and
                          poison the CUDA context.
-        max_context_len: int  maximum KV sequence length (elsewhere:
-                         ``max_seq_len``); must be >= max(context_lens).  The
+        seq_lens:        [batch_size]  int32, on q's device.  Per-request KV
+                         length.  (The DeepGEMM paged-MQA API this module ports
+                         calls it ``context_lens``.)
+                         No entry may exceed max_seq_len.
+        max_seq_len:     int  maximum KV sequence length; must be >=
+                         max(seq_lens).  The
                          output row is sized from this while the schedule
-                         follows context_lens, so a smaller value is a
+                         follows seq_lens, so a smaller value is a
                          device-side out-of-bounds WRITE, likewise undefined
                          behaviour.
 
@@ -1466,7 +1460,7 @@ def fp8_paged_mqa_logits(
                          small GPU kernel, a few microseconds) matters in your
                          eager hot loop.  A caller-managed schedule is reusable
                          only while the entire
-                         ceil(context_lens / 256) vector and the target device's
+                         ceil(seq_lens / 256) vector and the target device's
                          SM count are unchanged -- a fixed batch size is not
                          sufficient, since one sequence crossing a 256-token
                          boundary changes it with every shape identical.  Under
@@ -1476,8 +1470,8 @@ def fp8_paged_mqa_logits(
                          Use compute_paged_mqa_logits_schedule() to generate it.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len], where padded_ctx_len
-                         >= max_context_len and is a multiple of SPLIT_KV=256.
-                         If None, allocated each call.  Use padded_context_len()
+                         >= max_seq_len and is a multiple of SPLIT_KV=256.
+                         If None, allocated each call.  Use padded_seq_len()
                          to size it.  Required for CUDA graph capture.
                          May have more rows than batch_size*next_n, so one
                          address-stable max-batch buffer can be shared across
@@ -1485,24 +1479,24 @@ def fp8_paged_mqa_logits(
                          written and returned.
 
     Returns:
-        logits: [batch_size*next_n, max_context_len]  output_dtype
+        logits: [batch_size*next_n, max_seq_len]  output_dtype
                 (a view of ``out`` when provided).  Row ``b*next_n + t`` holds
-                scores for KV positions ``0 .. context_lens[b] - next_n + t``
+                scores for KV positions ``0 .. seq_lens[b] - next_n + t``
                 inclusive -- the newest slot sees the whole context, each
                 earlier slot one position fewer.  Columns past that limit, and
-                the padding columns of ``out`` beyond max_context_len, are
+                the padding columns of ``out`` beyond max_seq_len, are
                 UNSPECIFIED: slice or mask by the limit before consuming (e.g.
-                before a top-k).  Rows of a request with context_lens[b] == 0
+                before a top-k).  Rows of a request with seq_lens[b] == 0
                 are never written.
 
     CUDA graph capture:
         Pass a pre-allocated, address-stable ``out`` sized with
-        padded_context_len(); keep q / kv_fused / context_lens / block_table at
+        padded_seq_len(); keep q / kv_fused / seq_lens / block_tables at
         static addresses; leave ``schedule_meta=None`` -- the schedule is then
         computed by a small GPU kernel inside the capture and re-derives itself
-        from context_lens' current contents on every replay.  If you manage the
+        from seq_lens' current contents on every replay.  If you manage the
         schedule yourself, recompute it into the same buffer before every
-        replay in which any ceil(context_lens / 256) changed; a stale schedule
+        replay in which any ceil(seq_lens / 256) changed; a stale schedule
         can hang the kernel.
 
     Restrictions of the current kernel:
@@ -1538,14 +1532,14 @@ def fp8_paged_mqa_logits(
     kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
 
     _validate_paged_bounds(
-        block_table,
-        context_lens,
-        max_context_len,
+        block_tables,
+        seq_lens,
+        max_seq_len,
         block_size,
         num_blocks,
         "fp8_paged_mqa_logits",
     )
-    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(
             out,
@@ -1555,12 +1549,12 @@ def fp8_paged_mqa_logits(
             output_dtype,
             "fp8_paged_mqa_logits",
         )
-        logits = out[: B * next_n, :max_context_len]
+        logits = out[: B * next_n, :max_seq_len]
     else:
         logits_full = torch.empty(
             (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
         )
-        logits = logits_full[:, :max_context_len]
+        logits = logits_full[:, :max_seq_len]
 
     # Caller-supplied buffers are validated even for an empty batch, for the
     # same reason as out= above: a malformed buffer is the caller's bug
@@ -1577,11 +1571,9 @@ def fp8_paged_mqa_logits(
         return logits
 
     if schedule_meta is None:
-        schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
+        schedule_meta = compute_paged_mqa_logits_schedule(seq_lens, device=q.device)
     else:
-        _validate_schedule_meta_fresh(
-            schedule_meta, context_lens, "fp8_paged_mqa_logits"
-        )
+        _validate_schedule_meta_fresh(schedule_meta, seq_lens, "fp8_paged_mqa_logits")
 
     # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
     q_for_ffi = (
@@ -1608,8 +1600,8 @@ def fp8_paged_mqa_logits(
             q_for_ffi,
             w_2d,
             logits,
-            block_table,
-            context_lens,
+            block_tables,
+            seq_lens,
             schedule_meta,
             num_blocks,
             B,
@@ -1620,12 +1612,12 @@ def fp8_paged_mqa_logits(
 @supported_compute_capability(_PAGED_MQA_CCS)
 def _check_fp4_paged_mqa_logits_supported(
     q: torch.Tensor,
-    sf_q: torch.Tensor,
+    q_sf: torch.Tensor,
     kv_fused: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    max_context_len: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
     sf_vec_size: int = _FP4_SF_VEC_SIZE,
     output_dtype: torch.dtype = torch.bfloat16,
     epi_dtype: torch.dtype = torch.float32,
@@ -1671,11 +1663,11 @@ def _check_fp4_paged_mqa_logits_supported(
     _validate_on_device(
         q.device,
         "fp4_paged_mqa_logits",
-        sf_q=sf_q,
+        q_sf=q_sf,
         kv_fused=kv_fused,
         weights=weights,
-        context_lens=context_lens,
-        block_table=block_table,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
     )
     B, next_n, H, half_D = q.shape
     D = half_D * 2
@@ -1687,10 +1679,10 @@ def _check_fp4_paged_mqa_logits_supported(
             f"fp4_paged_mqa_logits requires q.dtype == uint8 (packed FP4 e2m1, two "
             f"per byte); got {q.dtype}"
         )
-    if sf_q.dtype != torch.int32 or tuple(sf_q.shape) != (B, next_n, H):
+    if q_sf.dtype != torch.int32 or tuple(q_sf.shape) != (B, next_n, H):
         raise ValueError(
-            f"sf_q must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
-            f"got dtype={sf_q.dtype}, shape={tuple(sf_q.shape)}"
+            f"q_sf must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
+            f"got dtype={q_sf.dtype}, shape={tuple(q_sf.shape)}"
         )
     _validate_num_epi_subtiles(num_epi_subtiles, H, "fp4_paged_mqa_logits")
     if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
@@ -1764,7 +1756,7 @@ def _check_fp4_paged_mqa_logits_supported(
             f"{scales_per_token} scale-factor bytes (head_dim={D} from q, "
             f"sf_vec_size={sf_vec_size}); got shape {tuple(kv_fused.shape)}"
         )
-    _validate_paged_inputs(context_lens, block_table, B, "fp4_paged_mqa_logits")
+    _validate_paged_inputs(seq_lens, block_tables, B, "fp4_paged_mqa_logits")
     return True
 
 
@@ -1772,12 +1764,12 @@ def _check_fp4_paged_mqa_logits_supported(
 @flashinfer_api(trace=fp4_paged_mqa_logits_trace)
 def fp4_paged_mqa_logits(
     q: torch.Tensor,
-    sf_q: torch.Tensor,
+    q_sf: torch.Tensor,
     kv_fused: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    max_context_len: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
     *,
     sf_vec_size: int = _FP4_SF_VEC_SIZE,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -1818,23 +1810,23 @@ def fp4_paged_mqa_logits(
             q_fp4 = torch.zeros(
                 B, next_n, num_heads, head_dim // 2, dtype=torch.uint8, device=device
             )
-            sf_q = torch.zeros(B, next_n, num_heads, dtype=torch.int32, device=device)
+            q_sf = torch.zeros(B, next_n, num_heads, dtype=torch.int32, device=device)
             kv_fused = torch.zeros(
                 num_blocks, block_size, 1, head_dim // 2 + 4,
                 dtype=torch.uint8, device=device,
             )
             logits = flashinfer.fp4_paged_mqa_logits(
-                q_fp4, sf_q, kv_fused, weights, context_lens, block_table,
-                max_context_len,
+                q_fp4, q_sf, kv_fused, weights, block_tables, seq_lens,
+                max_seq_len,
             )
-            # logits: [B*next_n, max_context_len] bfloat16 (fp4's default).
+            # logits: [B*next_n, max_seq_len] bfloat16 (fp4's default).
 
     Args:
         q:               [batch_size, next_n, num_heads, head_dim/2]  uint8
                          Two FP4 (E2M1) values packed per byte: byte j of a
                          head's row holds element 2j in the LOW nibble and
                          element 2j+1 in the HIGH nibble.
-        sf_q:            [batch_size, next_n, num_heads]  int32
+        q_sf:            [batch_size, next_n, num_heads]  int32
                          Packed UE8M0 scale factors for each (token, head):
                          head_dim/sf_vec_size = 4 one-byte scales per int32.
                          Byte k of each int32 (k-th least significant,
@@ -1866,28 +1858,26 @@ def fp4_paged_mqa_logits(
                          [batch_size, next_n, num_heads] tensor as
                          w.view(batch_size * next_n, num_heads).  Cast
                          internally when epi_dtype is float16/bfloat16.
-        context_lens:    [batch_size]  int32, on q's device.  Per-request KV
-                         length -- the quantity other flashinfer APIs call
-                         ``seq_lens`` (names here follow the DeepGEMM paged-MQA
-                         API this module ports).
-                         No entry may exceed max_context_len.
-        block_table:     [batch_size, max_blocks_per_seq]  int32, on q's device
-                         (elsewhere in flashinfer: ``block_tables``).
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's device.
                          Values are physical block indices into kv_fused's dim 0.
                          max_blocks_per_seq must be at least
-                         max_b round_up(context_lens[b], 128) // block_size --
-                         wider than ceil(context_lens[b] / block_size) when a
-                         length is not a multiple of 128 (context_len=257 with
+                         max_b round_up(seq_lens[b], 128) // block_size --
+                         wider than ceil(seq_lens[b] / block_size) when a
+                         length is not a multiple of 128 (seq_len=257 with
                          block_size=64 needs 6 columns, not 5).  Extra entries
                          may be any valid index (0).  This is a hard
                          precondition, not a checked argument: too few columns
                          is a device-side out-of-bounds READ, i.e. undefined
                          behaviour -- it may return corrupt logits, or fault and
                          poison the CUDA context.
-        max_context_len: int  maximum KV sequence length (elsewhere:
-                         ``max_seq_len``); must be >= max(context_lens).  The
+        seq_lens:        [batch_size]  int32, on q's device.  Per-request KV
+                         length.  (The DeepGEMM paged-MQA API this module ports
+                         calls it ``context_lens``.)
+                         No entry may exceed max_seq_len.
+        max_seq_len:     int  maximum KV sequence length; must be >=
+                         max(seq_lens).  The
                          output row is sized from this while the schedule
-                         follows context_lens, so a smaller value is a
+                         follows seq_lens, so a smaller value is a
                          device-side out-of-bounds WRITE, likewise undefined
                          behaviour.
 
@@ -1899,7 +1889,7 @@ def fp4_paged_mqa_logits(
                          there.  Neither setting makes the kernel itself safe
                          against a violated contract.
         sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor
-                         (32).  Determines both sf_q's packing and the
+                         (32).  Determines both q_sf's packing and the
                          scale-factor bytes of each fused KV row.
         output_dtype:    bfloat16 (default), float32, or float16.  The default
                          differs from fp8_paged_mqa_logits (float32) -- it
@@ -1940,7 +1930,7 @@ def fp4_paged_mqa_logits(
                          Rubin it fits in one pass and caller schedules work for
                          every next_n.)
                          A caller-managed schedule is reusable only while the
-                         entire ceil(context_lens / 256) vector and the target
+                         entire ceil(seq_lens / 256) vector and the target
                          device's SM count are unchanged -- a fixed batch size
                          is not sufficient, since one sequence crossing a
                          256-token boundary changes it with every shape
@@ -1950,8 +1940,8 @@ def fp4_paged_mqa_logits(
                          Use compute_paged_mqa_logits_schedule() to generate it.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len], where padded_ctx_len
-                         >= max_context_len and is a multiple of SPLIT_KV=256.
-                         If None, allocated each call.  Use padded_context_len()
+                         >= max_seq_len and is a multiple of SPLIT_KV=256.
+                         If None, allocated each call.  Use padded_seq_len()
                          to size it.  Required for CUDA graph capture.
                          May have more rows than batch_size*next_n, so one
                          address-stable max-batch buffer can be shared across
@@ -1959,26 +1949,26 @@ def fp4_paged_mqa_logits(
                          written and returned.
 
     Returns:
-        logits: [batch_size*next_n, max_context_len]  output_dtype
+        logits: [batch_size*next_n, max_seq_len]  output_dtype
                 (a view of ``out`` when provided).  Row ``b*next_n + t`` holds
-                scores for KV positions ``0 .. context_lens[b] - next_n + t``
+                scores for KV positions ``0 .. seq_lens[b] - next_n + t``
                 inclusive -- the newest slot sees the whole context, each
                 earlier slot one position fewer.  Columns past that limit, and
-                the padding columns of ``out`` beyond max_context_len, are
+                the padding columns of ``out`` beyond max_seq_len, are
                 UNSPECIFIED: slice or mask by the limit before consuming (e.g.
-                before a top-k).  Rows of a request with context_lens[b] == 0
+                before a top-k).  Rows of a request with seq_lens[b] == 0
                 are never written.
 
     CUDA graph capture:
         Pass a pre-allocated, address-stable ``out`` sized with
-        padded_context_len(); keep q / sf_q / kv_fused / context_lens /
-        block_table at static addresses; leave ``schedule_meta=None`` -- the
+        padded_seq_len(); keep q / q_sf / kv_fused / seq_lens /
+        block_tables at static addresses; leave ``schedule_meta=None`` -- the
         schedule is then computed by a small GPU kernel inside the capture and
-        re-derives itself from context_lens' current contents on every replay
+        re-derives itself from seq_lens' current contents on every replay
         (including for the internal next_n=4 split on SM100/SM103).  If you
         manage the schedule yourself (single-pass shapes only), recompute it
         into the same buffer before every replay in which any
-        ceil(context_lens / 256) changed; a stale schedule can hang the kernel.
+        ceil(seq_lens / 256) changed; a stale schedule can hang the kernel.
 
     Restrictions of the current kernel:
         The signature above is the general form.  This kernel is specialised for
@@ -1992,7 +1982,7 @@ def fp4_paged_mqa_logits(
                          kernel runs the internal two-pass split (see
                          schedule_meta above).
         sf_vec_size      must equal 32 (so head_dim/sf_vec_size = 4 scales per
-                         token -- exactly one int32 in sf_q).
+                         token -- exactly one int32 in q_sf).
         block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
         num_epi_subtiles must divide num_heads, with the quotient a multiple of
                          4 (at num_heads=64: 1, 2, 4, 8, or 16).
@@ -2037,10 +2027,10 @@ def fp4_paged_mqa_logits(
     N_atom = atom * H
 
     # Reshape to kernel convention. The atom reshape (exp_B rows of one atom
-    # each) is free for contiguous q / sf_q, and weights [B*next_n, H] is
+    # each) is free for contiguous q / q_sf, and weights [B*next_n, H] is
     # already layout-equivalent to [exp_B*atom, H].
     q_3d = q.reshape(exp_B, N_atom, half_D).permute(1, 2, 0)  # [atom*H, D//2, exp_B]
-    sf_q_2d = sf_q.reshape(exp_B, N_atom).t()  # [atom*H, exp_B]
+    sf_q_2d = q_sf.reshape(exp_B, N_atom).t()  # [atom*H, exp_B]
     if epi_dtype == torch.float16:
         w_2d = weights.reshape(exp_B, N_atom).half().t()
     elif epi_dtype == torch.bfloat16:
@@ -2050,14 +2040,14 @@ def fp4_paged_mqa_logits(
     kv_flat = kv_fused.flatten(1)
 
     _validate_paged_bounds(
-        block_table,
-        context_lens,
-        max_context_len,
+        block_tables,
+        seq_lens,
+        max_seq_len,
         block_size,
         num_blocks,
         "fp4_paged_mqa_logits",
     )
-    padded_ctx_len = ((max_context_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    padded_ctx_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
     if out is not None:
         _validate_out(
             out,
@@ -2067,12 +2057,12 @@ def fp4_paged_mqa_logits(
             output_dtype,
             "fp4_paged_mqa_logits",
         )
-        logits = out[: B * next_n, :max_context_len]
+        logits = out[: B * next_n, :max_seq_len]
     else:
         logits_full = torch.empty(
             (B * next_n, padded_ctx_len), device=q.device, dtype=output_dtype
         )
-        logits = logits_full[:, :max_context_len]
+        logits = logits_full[:, :max_seq_len]
 
     # Caller-supplied buffers are validated even for an empty batch, for the
     # same reason as out= above -- and the split rejection with them: a
@@ -2082,7 +2072,7 @@ def fp4_paged_mqa_logits(
         if num_atoms > 1:
             # A split makes the scheduler describe batch*num_atoms rows, but the
             # schedule's shape ([num_sms+1, 2]) is unchanged, so a schedule built
-            # from the native context_lens passes every always-on check and is
+            # from the native seq_lens passes every always-on check and is
             # still wrong. Worse than wrong results: the persistent kernel
             # terminates on exact equality with the schedule's stored end
             # boundary, and a boundary describing B rows is unreachable when the
@@ -2114,7 +2104,7 @@ def fp4_paged_mqa_logits(
     # The scheduler enumerates batch*num_atoms q_atom tasks, so it must be built
     # from the per-atom context lengths. Identity when num_atoms == 1, which
     # keeps the unsplit path (and any caller-supplied schedule) unchanged.
-    sched_ctx = _expand_context_lens(context_lens, num_atoms, atom)
+    sched_ctx = _expand_seq_lens(seq_lens, num_atoms, atom)
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(sched_ctx, device=q.device)
     else:
@@ -2141,10 +2131,10 @@ def fp4_paged_mqa_logits(
             sf_q_2d,
             w_2d,
             logits,
-            # block_table / context_lens stay NATIVE [batch]; the kernel maps
+            # block_tables / seq_lens stay NATIVE [batch]; the kernel maps
             # q_atom_idx back onto them via _atom_seq / _atom_ctx_len.
-            block_table,
-            context_lens,
+            block_tables,
+            seq_lens,
             schedule_meta,
             num_blocks,
             exp_B,  # kernel batch_size = q's L dim = batch * num_atoms
