@@ -14,21 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Tests for the experimental-feature gating primitives
-# (@flashinfer_experimental_api, require_experimental). CPU-only; no GPU or
-# JIT compilation required.
+# Tests for the experimental-feature primitives: @flashinfer_experimental_api,
+# @experimental_backend inside @backend_requirement, and the
+# FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS gate on automatic selection.
+# CPU-only; no GPU or JIT compilation required.
 
 import warnings
 
 import pytest
 
+import flashinfer.api_logging as api_logging
 from flashinfer.api_logging import (
-    _EXPERIMENTAL_ENV_VAR,
+    _EXPERIMENTAL_AUTO_ENV_VAR,
     ExperimentalWarning,
+    experimental_auto_backends_allowed,
     flashinfer_experimental_api,
-    is_experimental_enabled,
-    require_experimental,
+    require_experimental_auto_backends,
 )
+from flashinfer.utils import (
+    BackendSupportedError,
+    backend_requirement,
+    experimental_backend,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_gate(monkeypatch):
+    # Gate off and no remembered warnings, so every test starts from the same state.
+    monkeypatch.delenv(_EXPERIMENTAL_AUTO_ENV_VAR, raising=False)
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
 
 
 def _make_add():
@@ -40,21 +54,12 @@ def _make_add():
     return sample_add
 
 
-def test_gate_off_raises(monkeypatch):
-    monkeypatch.delenv(_EXPERIMENTAL_ENV_VAR, raising=False)
-    sample_add = _make_add()
-    with pytest.raises(RuntimeError, match=_EXPERIMENTAL_ENV_VAR):
-        sample_add(1, 2)
+# --------------------------------------------------------------------------
+# @flashinfer_experimental_api: calling it is the opt-in
+# --------------------------------------------------------------------------
 
 
-def test_gate_off_for_non_one_values(monkeypatch):
-    for value in ("0", "", "true", "yes"):
-        monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, value)
-        assert not is_experimental_enabled()
-
-
-def test_gate_on_runs_and_warns_once(monkeypatch):
-    monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, "1")
+def test_experimental_api_runs_without_env_var_and_warns_once():
     sample_add = _make_add()
 
     with pytest.warns(ExperimentalWarning, match="sample_add"):
@@ -66,47 +71,25 @@ def test_gate_on_runs_and_warns_once(monkeypatch):
         assert sample_add(3, 4) == 7
 
 
-def test_mechanical_identification(monkeypatch):
-    sample_add = _make_add()
-    assert sample_add.is_experimental is True
-    assert sample_add.experimental_feature.endswith("sample_add")
-    assert "experimental" in sample_add.__doc__
-    # Original docstring is preserved after the banner.
-    assert "Add two values." in sample_add.__doc__
-
-
-def test_decorator_with_arguments(monkeypatch):
-    monkeypatch.delenv(_EXPERIMENTAL_ENV_VAR, raising=False)
-
+def test_decorator_with_arguments():
     @flashinfer_experimental_api(feature="my_feature")
     def sample_mul(x, y):
         return x * y
 
     assert sample_mul.experimental_feature == "my_feature"
-    with pytest.raises(RuntimeError, match="my_feature"):
-        sample_mul(2, 3)
-
-    monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, "1")
     with pytest.warns(ExperimentalWarning, match="my_feature"):
         assert sample_mul(2, 3) == 6
 
 
-def test_require_experimental(monkeypatch):
-    monkeypatch.delenv(_EXPERIMENTAL_ENV_VAR, raising=False)
-    with pytest.raises(RuntimeError, match="some backend"):
-        require_experimental("some backend")
-
-    monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, "1")
-    require_experimental("some backend")  # must not raise
-
-
-def test_experimental_namespace_reexports():
-    import flashinfer.experimental as fe
-
-    assert fe.flashinfer_experimental_api is flashinfer_experimental_api
-    assert fe.require_experimental is require_experimental
-    assert fe.is_experimental_enabled is is_experimental_enabled
-    assert fe.ExperimentalWarning is ExperimentalWarning
+def test_mechanical_identification():
+    sample_add = _make_add()
+    assert sample_add.is_experimental is True
+    assert sample_add.experimental_feature.endswith("sample_add")
+    assert "experimental" in sample_add.__doc__
+    # The banner no longer claims an environment variable is required.
+    assert _EXPERIMENTAL_AUTO_ENV_VAR not in sample_add.__doc__
+    # Original docstring is preserved after the banner.
+    assert "Add two values." in sample_add.__doc__
 
 
 def test_original_function_is_marked_for_registry_filtering():
@@ -117,3 +100,141 @@ def test_original_function_is_marked_for_registry_filtering():
     # The trace registry stores the original, so the flag must live there too.
     assert raw.is_experimental is True
     assert decorated.is_experimental is True
+
+
+# --------------------------------------------------------------------------
+# The environment variable gates automatic selection only
+# --------------------------------------------------------------------------
+
+
+def test_gate_accepts_only_one(monkeypatch):
+    assert not experimental_auto_backends_allowed()
+    for value in ("0", "", "true", "yes"):
+        monkeypatch.setenv(_EXPERIMENTAL_AUTO_ENV_VAR, value)
+        assert not experimental_auto_backends_allowed()
+    monkeypatch.setenv(_EXPERIMENTAL_AUTO_ENV_VAR, "1")
+    assert experimental_auto_backends_allowed()
+
+
+def test_require_experimental_auto_backends(monkeypatch):
+    with pytest.raises(RuntimeError, match=_EXPERIMENTAL_AUTO_ENV_VAR):
+        require_experimental_auto_backends("some_api -> some backend")
+
+    monkeypatch.setenv(_EXPERIMENTAL_AUTO_ENV_VAR, "1")
+    require_experimental_auto_backends("some_api -> some backend")  # must not raise
+
+
+def test_experimental_namespace_reexports():
+    import flashinfer.experimental as fe
+
+    assert fe.flashinfer_experimental_api is flashinfer_experimental_api
+    assert fe.experimental_backend is experimental_backend
+    assert fe.require_experimental_auto_backends is require_experimental_auto_backends
+    assert fe.experimental_auto_backends_allowed is experimental_auto_backends_allowed
+    assert fe.ExperimentalWarning is ExperimentalWarning
+
+
+# --------------------------------------------------------------------------
+# @experimental_backend inside @backend_requirement
+# --------------------------------------------------------------------------
+
+
+def _any_cc(checker):
+    # Test inputs carry no tensor, so backend_requirement sees capability=None;
+    # accept it so the CC check is not what decides these tests.
+    checker.is_compute_capability_supported = lambda cc: True
+    return checker
+
+
+def _make_api(*, prefer_experimental=True, stable=True):
+    @_any_cc
+    def _check_stable(x, backend="auto"):
+        return True
+
+    @experimental_backend
+    @_any_cc
+    def _check_risky(x, backend="auto"):
+        return True
+
+    def _heuristic(backends, *args, **kwargs):
+        order = ["risky", "stable"] if prefer_experimental else ["stable", "risky"]
+        return [b for b in order if b in backends]
+
+    checks = {"risky": _check_risky}
+    if stable:
+        checks["stable"] = _check_stable
+
+    @backend_requirement(checks, heuristic_func=_heuristic)
+    def api(x, backend="auto"):
+        if backend == "auto":
+            backend = api.suitable_auto_backends[0]
+        return backend
+
+    return api
+
+
+def test_marker_sets_flag_and_is_listed():
+    api = _make_api()
+    assert api.experimental_backends == frozenset({"risky"})
+    assert api.is_backend_supported("risky") is True  # explicit use is allowed
+
+
+def test_auto_excludes_experimental_backend_when_gate_off():
+    api = _make_api()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ExperimentalWarning)
+        assert api(1) == "stable"
+    assert api.suitable_auto_backends == ["stable"]
+    assert api.dropped_experimental_backends == ["risky"]
+
+
+def test_auto_includes_experimental_backend_when_gate_on(monkeypatch):
+    monkeypatch.setenv(_EXPERIMENTAL_AUTO_ENV_VAR, "1")
+    api = _make_api()
+    with pytest.warns(ExperimentalWarning, match="risky.*automatically"):
+        assert api(1) == "risky"
+    assert api.suitable_auto_backends == ["risky", "stable"]
+    # Once per (api, backend) pair.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ExperimentalWarning)
+        assert api(1) == "risky"
+
+
+def test_auto_with_only_experimental_candidates_hints_at_env_var():
+    api = _make_api(stable=False)
+    with pytest.raises(BackendSupportedError, match=_EXPERIMENTAL_AUTO_ENV_VAR):
+        api(1)
+
+
+def test_explicit_experimental_backend_needs_no_env_var_and_warns_once():
+    api = _make_api()
+    with pytest.warns(ExperimentalWarning, match="risky.*selected for 'api'"):
+        assert api(1, backend="risky") == "risky"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ExperimentalWarning)
+        assert api(1, backend="risky") == "risky"
+        assert api(1, backend="risky", skip_check=True) == "risky"
+        assert api(1, backend="stable") == "stable"  # stable never warns
+
+
+def test_backstop_rejects_unmarked_checker_under_experimental_package():
+    @_any_cc
+    def _check_unmarked(x, backend="auto"):
+        return True
+
+    _check_unmarked.__module__ = "flashinfer.experimental.fake.support"
+
+    with pytest.raises(ValueError, match="not marked @experimental_backend"):
+
+        @backend_requirement({"fake": _check_unmarked})
+        def api(x, backend="fake"):
+            return backend
+
+    # Marked, the same checker is accepted.
+    experimental_backend(_check_unmarked)
+
+    @backend_requirement({"fake": _check_unmarked})
+    def api_ok(x, backend="fake"):
+        return backend
+
+    assert api_ok.experimental_backends == frozenset({"fake"})

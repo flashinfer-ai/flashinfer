@@ -33,7 +33,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
-| Enable experimental APIs/backends | `export FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1` |
+| Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
@@ -403,9 +403,13 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 
 Experimental backends live under `flashinfer/experimental/`; experimental
 public APIs live in core marked with `@flashinfer_experimental_api` (defined in
-`flashinfer/api_logging.py`). All experimental behavior is gated behind
-`FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`, is JIT-only (never registered in
-`flashinfer/aot.py`), and is tested under `tests/experimental/`.
+`flashinfer/api_logging.py`). Using them is an explicit opt-in: calling an
+experimental API, or naming an experimental backend with `backend="<name>"`,
+needs no environment variable (both warn once). Only automatic selection is
+gated: `backend="auto"` skips backends marked `@experimental_backend` unless
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Experimental code is JIT-only
+(never registered in `flashinfer/aot.py`) and tested under
+`tests/experimental/`.
 
 → **When working under `flashinfer/experimental/`, follow
 [`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
@@ -592,7 +596,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
-| `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES` | unset | `flashinfer/api_logging.py` | `1` permits experimental APIs and backends (see the "Experimental Code" section). The flag is the single opt-in: with it set, stable APIs may route to experimental backends automatically (dispatch, autotuning, trace-apply). Without it, experimental APIs raise `RuntimeError` and automatic routing considers only stable backends. |
+| `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` | unset | `flashinfer/utils.py` (`backend_requirement`), `flashinfer/api_logging.py` | `1` lets `backend="auto"` (dispatch heuristics and autotuning) select backends marked `@experimental_backend` (see the "Experimental Code" section). Explicit use never needs it: calling an `@flashinfer_experimental_api` function or passing `backend="<experimental>"` always works and emits an `ExperimentalWarning` once. Without it, automatic selection considers only stable backends. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |

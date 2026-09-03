@@ -51,15 +51,20 @@ This design preserves a unified API surface while strongly isolating fast-moving
 
 ### **Feature gating**
 
-All experimental backend paths require: `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`
+Opting in to experimental functionality is explicit and needs no environment variable:
 
-**Without** this opt-in:
+* calling an API marked `@flashinfer_experimental_api`; or
+* naming an experimental backend in a stable API (`backend="<name>"`).
 
-* experimental APIs must be gated off;
-* stable APIs must not select experimental backends;
-* automatic routing must consider only stable backends.
+Both emit an `ExperimentalWarning` once. What is gated is **automatic selection**: `backend="auto"` — the dispatch heuristics and autotuning behind it — may pick an experimental backend only with
 
-**With** this opt-in, stable APIs may route to experimental backends automatically: backend dispatch, autotuning, and trace-apply substitution may consider experimental backends alongside stable ones. Setting the flag is consent to experimental behavior wherever it applies; an explicit `backend=` argument remains available to force a specific backend but is not required.
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`
+
+**Without** this opt-in, automatic selection considers only stable backends; a stable API never routes to an experimental backend on its own.
+
+**With** it, experimental backends join the automatic candidate list alongside stable ones, for dispatch and autotuning. Trace-apply is outside this gate: experimental backends are not required to support trace, and a trace-apply solution is the deployer's explicit choice.
+
+Mechanically, an experimental backend's `@backend_requirement` checker is marked `@experimental_backend`. The decorator filters marked backends out of `backend="auto"` unless the variable is set, warns once per API/backend pair when one is selected, and rejects at import time a checker defined under `flashinfer.experimental` that lacks the marker. Stable APIs that route `"auto"` by hand call `require_experimental_auto_backends(...)` on the automatic branch. See `flashinfer/experimental/README.md` for a worked example.
 
 ## Common Rules for Experimental APIs and Backends
 

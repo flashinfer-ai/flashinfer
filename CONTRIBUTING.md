@@ -63,13 +63,15 @@ are enabled, and an experimental API must be clearly identified and gated.
   heuristics, routing, compilation, caching, kernels) live under
   `flashinfer/experimental/`.
 
-**Gating:** all experimental behavior requires
-`FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`. The variable *permits*
-experimental functionality everywhere: with it set, stable APIs may route to
-experimental backends automatically — dispatch, autotuning, and trace-apply
-may consider experimental backends alongside stable ones. Without it,
-experimental APIs raise `RuntimeError` and automatic routing considers only
-stable backends.
+**Opt-in:** using experimental functionality is always explicit. Calling an
+`@flashinfer_experimental_api` function, or naming an experimental backend
+(`backend="<name>"`) in a stable API, needs no environment variable; both warn
+once. Only *automatic* selection is gated: `backend="auto"` (dispatch
+heuristics and autotuning) may pick an experimental backend only with
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Experimental backends are marked
+with `@experimental_backend` on their `@backend_requirement` checker, which
+enforces this; hand-rolled `"auto"` routing calls
+`require_experimental_auto_backends(...)`.
 
 **Requirements for every experimental feature:**
 

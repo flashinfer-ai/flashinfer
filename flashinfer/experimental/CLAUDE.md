@@ -11,23 +11,29 @@ Experimental **backends** and backend-specific logic: support checks,
 heuristics, routing, compilation, caching, and kernels not yet ready for
 stable support. Public experimental **APIs** do NOT live here — they live in
 core, marked with `@flashinfer_experimental_api`, with only a thin entry
-point that validates, checks the feature gate, and hands off to this package.
+point that validates, selects the backend, and hands off to this package.
 
 ## Hard rules (containment)
 
-- **Never** import `flashinfer.experimental` from core at module level. A
-  sanctioned thin entry point in core may do a deferred (function-local)
-  import after calling `require_experimental(...)`.
+- **Never** import `flashinfer.experimental` from core at module level, with
+  one exception: the lightweight support module that defines an
+  `@experimental_backend` checker (dtype/shape/CC logic only, no kernel or
+  JIT imports). Kernels are reached via a deferred (function-local) import in
+  a sanctioned thin entry point.
 - **Never** register experimental modules in `flashinfer/aot.py` —
   experimental features are JIT-only and must not ship in pre-built packages.
-- **Never** let a stable API route here while the gate is off. Setting
-  `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1` permits experimental behavior,
-  including automatic routing from stable APIs to experimental backends
-  (dispatch, autotuning, trace-apply); without it, routing must consider
-  only stable backends.
+- **Never** let `backend="auto"` (dispatch or autotuning) pick an
+  experimental backend unless `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`.
+  `@backend_requirement` enforces this for checkers marked
+  `@experimental_backend`; hand-rolled `"auto"` routing must call
+  `require_experimental_auto_backends(...)` on its automatic branch.
+- Explicit opt-ins need **no** environment variable: calling an
+  `@flashinfer_experimental_api` function, or passing `backend="<name>"` to a
+  stable API. Both warn once (`ExperimentalWarning`).
 - **Never** eagerly import this package from `flashinfer/__init__.py`.
-- Autotuner tactic enumeration and trace_apply substitution must not pick
-  experimental paths without the gate.
+- Autotuning inherits the gate because it tunes over the filtered candidate
+  list. Trace-apply is out of scope: experimental backends need not support
+  trace.
 
 ## Adding an experimental API (new public function)
 
@@ -45,22 +51,57 @@ point that validates, checks the feature gate, and hands off to this package.
        return run(x, ...)
    ```
 
-3. The decorator enforces the gate (RuntimeError when off), warns once per
-   process (`ExperimentalWarning`), and sets `is_experimental = True`.
+3. Calling the API is the opt-in. The decorator warns once per process
+   (`ExperimentalWarning`) and sets `is_experimental = True`; it does not
+   consult any environment variable.
 
 ## Exposing an experimental backend from a stable API
 
-In the stable API's dispatch — behind an explicit `backend=` value or an
-automatic-routing branch — guard the handoff with `require_experimental`:
+Mark the backend's support checker in the experimental package and register
+it in the stable API's `@backend_requirement`; `backend="auto"` then skips it
+unless `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, while an explicit
+`backend="sm12x_cute"` always works (and warns once):
 
 ```python
-from .api_logging import require_experimental
+# flashinfer/experimental/sm12x_gemm/support.py  (lightweight: no kernel imports)
+from flashinfer.utils import supported_compute_capability
+from flashinfer.experimental import experimental_backend
 
-if backend == "experimental_xyz":
-    require_experimental("op_name experimental_xyz backend")
-    from .experimental.xyz import run  # deferred import
-    return run(...)
+@experimental_backend
+@supported_compute_capability([120, 121])
+def check_sm12x_cute(a, b, out=None, backend="auto"):
+    return a.dtype == torch.bfloat16 and a.shape[-1] % 64 == 0
 ```
+
+```python
+# flashinfer/gemm/gemm_base.py
+from ..experimental.sm12x_gemm.support import check_sm12x_cute  # checker only
+
+@backend_requirement(
+    backend_checks={"cutlass": _check_cutlass, "sm12x_cute": check_sm12x_cute},
+    heuristic_func=_heuristic_mm_bf16,
+)
+@flashinfer_api
+def mm_bf16(a, b, out=None, backend="auto"):
+    if backend == "auto":
+        backend = mm_bf16.suitable_auto_backends[0]
+    if backend == "sm12x_cute":
+        from ..experimental.sm12x_gemm import run  # deferred import
+        return run(a, b, out)
+    ...
+```
+
+For hand-rolled `"auto"` routing (no `@backend_requirement`), guard only the
+automatic branch:
+
+```python
+from .api_logging import require_experimental_auto_backends
+
+if backend == "auto" and candidate == "experimental_xyz":
+    require_experimental_auto_backends("op_name -> experimental_xyz")
+```
+
+See README.md for the full worked example and the resulting behavior table.
 
 ## Requirements for every feature
 
@@ -79,7 +120,7 @@ if backend == "experimental_xyz":
 | Register in `flashinfer/aot.py` | Prohibited |
 | Export in `flashinfer/__init__.py` | Optional; must be lazy if added |
 | Tests | Required, under `tests/experimental/` |
-| Docs | Must state experimental status, gate, and limitations |
+| Docs | Must state experimental status, how to opt in, and limitations |
 
 Everything else (JIT module structure, framework separation of
 `include/`/`csrc/`, coding style) follows the root `CLAUDE.md`.

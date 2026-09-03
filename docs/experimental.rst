@@ -12,26 +12,33 @@ for specific problem sizes:
 - an **experimental backend** is an implementation that is not yet ready for
   stable support.
 
-A stable API may route to an experimental backend once experimental features
-are enabled, and experimental APIs are marked with an experimental warning in
-their documentation.
+Experimental APIs are marked with a warning banner in their documentation. A
+stable API exposes an experimental backend by name; it routes to one
+automatically only when the user opts in (below).
 
-Enabling experimental features
-------------------------------
+Opting in to experimental features
+----------------------------------
 
-All experimental behavior requires an explicit opt-in:
+Using experimental functionality is always an explicit opt-in. Two forms need
+no environment variable:
+
+- calling an API marked experimental (``@flashinfer_experimental_api``);
+- passing an experimental backend by name to a stable API, e.g.
+  ``backend="sm12x_cute"``.
+
+Both emit an ``ExperimentalWarning`` once (per API, or per API/backend pair).
+
+Automatic selection is gated. With ``backend="auto"`` — including the dispatch
+heuristics and autotuning behind it — a stable API considers only stable
+backends unless you set:
 
 .. code-block:: bash
 
-   export FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1
+   export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1
 
-Without this variable, experimental APIs raise ``RuntimeError`` and stable
-APIs never route to experimental backends. The variable is the single
-opt-in: with it set, stable APIs may route to experimental backends
-automatically (dispatch, autotuning, trace-apply), and an explicit
-``backend=`` argument remains available to force a specific backend. The
-first use of an experimental API in a process emits an
-``ExperimentalWarning``.
+With the variable set, experimental backends join the automatic candidate
+list. Without it, a call whose only viable backends are experimental fails
+with an error that names the variable and suggests an explicit ``backend=``.
 
 User contract
 -------------

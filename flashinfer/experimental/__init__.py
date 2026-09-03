@@ -22,24 +22,30 @@ limitations under the License.
 # experimental APIs live in core, marked with @flashinfer_experimental_api;
 # only thin entry points in core may hand off to this package.
 #
-# Everything here is gated behind FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1,
-# provides no compatibility guarantees, and may change or be removed without
-# deprecation. Importing this module is always allowed (so tooling and docs
-# can introspect it); the gate is enforced at call time.
+# Everything here provides no compatibility guarantees and may change or be
+# removed without deprecation. Using it is an explicit opt-in: calling an
+# @flashinfer_experimental_api function, or naming an experimental backend
+# with backend="<name>". Only *automatic* selection (backend="auto") is gated,
+# behind FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1. Importing this module
+# is always allowed (so tooling and docs can introspect it).
 #
 # See README.md in this directory for the full policy, and CLAUDE.md for
 # agent-facing contribution rules.
 
 from ..api_logging import (
     ExperimentalWarning,
+    experimental_auto_backends_allowed,
     flashinfer_experimental_api,
-    is_experimental_enabled,
-    require_experimental,
+    require_experimental_auto_backends,
+    warn_experimental_backend_once,
 )
+from ..utils import experimental_backend
 
 __all__ = [
     "ExperimentalWarning",
+    "experimental_auto_backends_allowed",
+    "experimental_backend",
     "flashinfer_experimental_api",
-    "is_experimental_enabled",
-    "require_experimental",
+    "require_experimental_auto_backends",
+    "warn_experimental_backend_once",
 ]
