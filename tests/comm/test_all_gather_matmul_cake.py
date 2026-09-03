@@ -923,9 +923,7 @@ def test_validate_inputs_keeps_packed_qkv_routes_private(
     monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
 
-    with pytest.raises(
-        ValueError, match=f"an N supported by world_size={world_size}"
-    ):
+    with pytest.raises(ValueError, match=f"an N supported by world_size={world_size}"):
         backend._validate_inputs(inp, weight, subgroup)
     assert backend._validate_inputs(
         inp, weight, subgroup, packed_qkv_experiment=True
