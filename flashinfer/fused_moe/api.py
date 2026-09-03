@@ -72,6 +72,7 @@ class QuantVariant(Enum):
     FP8PerTensor = 1
     DeepSeekFp8 = 2
     MXFP8 = 3
+    MxFp8 = MXFP8
     NVFP4 = 4  # day-1 MVP target
     MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
