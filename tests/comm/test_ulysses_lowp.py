@@ -603,3 +603,77 @@ def test_rejects_views_the_vector_loads_cannot_address():
                              dtype=torch.bfloat16).transpose(-1, -2)
     with pytest.raises(ValueError, match="contiguous along head_dim"):
         lowp.q_grouped_amax(transposed, rank=0, world_size=4)
+
+
+# ---------------------------------------------------------------------------
+# 8. Split fused entries: the Q half may overlap the statistics AllGather
+# ---------------------------------------------------------------------------
+
+
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_split_fused_halves_compose_to_the_combined_bytes(dtype):
+    world, L = 4, 256
+    S = world * L
+    q, k, v = _global_inputs(dtype, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    spec = lowp.payload_spec(batch_size=1, local_sequence=L, num_heads=_HEADS,
+                             head_dim=_HEAD_DIM, world_size=world)
+    for used in (None, S - 130):
+        for r in range(world):
+            s = slice(r * L, (r + 1) * L)
+            q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+            combined = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
+                                                 rank=r, world_size=world,
+                                                 used_sequence=used)
+            send = torch.full((world, spec["chunk_bytes"]), 0xAB,
+                              dtype=torch.uint8, device="cuda")
+            lowp.zero_scale_and_padding(send, spec)
+            # KV first, Q second: the halves touch disjoint bytes so the
+            # order must not matter.
+            lowp.quant_kv_into_payload_fused(k_r, v_r, k_mean, v_scale, send,
+                                             rank=r, world_size=world,
+                                             used_sequence=used)
+            lowp.quant_q_into_payload_fused(q_r, send, rank=r, world_size=world)
+            assert torch.equal(send, combined), f"used={used} r={r}"
+
+
+@requires_sm120
+def test_split_fused_q_half_on_a_side_stream():
+    """The intended schedule: Q packs on a side stream while the main stream
+    would be waiting on the stats AllGather, KV packs afterwards."""
+    world, L = 8, 512
+    q, k, v = _global_inputs(torch.bfloat16, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    spec = lowp.payload_spec(batch_size=1, local_sequence=L, num_heads=_HEADS,
+                             head_dim=_HEAD_DIM, world_size=world)
+    side = torch.cuda.Stream()
+    main = torch.cuda.current_stream()
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+        combined = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
+                                             rank=r, world_size=world)
+        send = torch.empty((world, spec["chunk_bytes"]), dtype=torch.uint8,
+                           device="cuda")
+        lowp.zero_scale_and_padding(send, spec)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            lowp.quant_q_into_payload_fused(q_r, send, rank=r, world_size=world)
+        lowp.quant_kv_into_payload_fused(k_r, v_r, k_mean, v_scale, send,
+                                         rank=r, world_size=world)
+        main.wait_stream(side)
+        assert torch.equal(send, combined), f"r={r}"
+
+
+@requires_sm120
+def test_split_fused_halves_reject_unaligned():
+    q = torch.randn((1, 65, 56, 128), device="cuda", dtype=torch.bfloat16)
+    send = torch.zeros((4, 128), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="ALIGN-128"):
+        lowp.quant_q_into_payload_fused(q, send, rank=0, world_size=4)
+    km = torch.randn((1, 56, 128), device="cuda", dtype=torch.bfloat16)
+    vs = torch.rand((1, 56, 128), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="ALIGN-128"):
+        lowp.quant_kv_into_payload_fused(q, q.clone(), km, vs, send, rank=0,
+                                         world_size=4)

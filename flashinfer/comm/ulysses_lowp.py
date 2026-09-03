@@ -1012,6 +1012,106 @@ def quant_qkv_pack(
     return out
 
 
+def _require_align128(api: str, local_sequence: int) -> None:
+    if local_sequence % 128:
+        raise ValueError(
+            f"{api} is an ALIGN-128 fast path: local_sequence must be a whole "
+            f"number of 128-token blocks, got {local_sequence}"
+        )
+
+
+@flashinfer_api
+def quant_q_into_payload_fused(
+    q: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Fused amax+quant of Q into the payload (ALIGN-128 fast path).
+
+    The Q half of :func:`quant_qkv_pack_fused`.  It needs no gathered
+    statistics (Q is scaled per 32-token group by its own amax), so a caller
+    may issue it on a side stream while the K-sum/V-amax AllGather is still
+    in flight and run :func:`quant_kv_into_payload_fused` afterwards; the two
+    write disjoint byte ranges of ``send_u8`` (Q section + Q scales vs the
+    K/V sections + K scales), so their relative order does not matter.  The
+    caller owns :func:`zero_scale_and_padding` before either half and the
+    cross-stream synchronization before the exchange.
+    """
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    _require_align128("quant_q_into_payload_fused", local_sequence)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != q.device:
+        raise ValueError("q and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_q_int8_pack_fused(
+        q, send_u8, rank, world_size
+    )
+
+
+@flashinfer_api
+def quant_kv_into_payload_fused(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+) -> None:
+    """Fused amax+quant of K plus per-channel FP8 V into the payload.
+
+    The K/V half of :func:`quant_qkv_pack_fused`; see
+    :func:`quant_q_into_payload_fused` for the split-launch contract.
+    ``used_sequence`` applies the K tail-group repair in-kernel with the
+    exact split-path semantics.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    _require_align128("quant_kv_into_payload_fused", local_sequence)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if k.shape != v.shape or k.dtype != v.dtype or k.device != v.device:
+        raise ValueError("k and v must have identical shape, dtype, and device")
+    if k_mean_global.dtype != k.dtype:
+        raise TypeError("k_mean_global must have the same dtype as k")
+    if v_scale_global.dtype != torch.float32:
+        raise TypeError("v_scale_global must have dtype torch.float32")
+    for name, tensor in (("k_mean_global", k_mean_global), ("v_scale_global", v_scale_global)):
+        if tuple(tensor.shape) != (batch, num_heads, head_dim):
+            raise ValueError(f"{name} must have shape {(batch, num_heads, head_dim)}")
+        if not tensor.is_contiguous() or tensor.device != k.device:
+            raise ValueError(f"{name} must be contiguous and on the K device")
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != k.device:
+        raise ValueError("K/V, statistics, and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+        k, v, k_mean_global, v_scale_global, send_u8, rank, world_size,
+        int(used_sequence) if used_sequence is not None else 0,
+    )
+
+
 @flashinfer_api
 def quant_qkv_pack_fused(
     q: torch.Tensor,
@@ -1035,23 +1135,18 @@ def quant_qkv_pack_fused(
     path because a collective sits between amax and quant for its boundary
     groups.  ``used_sequence`` applies the K tail-group repair in-kernel with
     the exact split-path semantics.
+
+    Convenience composition of :func:`zero_scale_and_padding`,
+    :func:`quant_q_into_payload_fused` and
+    :func:`quant_kv_into_payload_fused` on the current stream; call the
+    halves directly to overlap the Q half with the statistics AllGather.
     """
 
     batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
-    _validate_nhd_input("k", k)
-    _validate_nhd_input("v", v)
     if q.shape != k.shape or q.shape != v.shape or q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("q, k, and v must have identical shape and dtype")
-    if local_sequence % 128:
-        raise ValueError(
-            "quant_qkv_pack_fused is an ALIGN-128 fast path: local_sequence "
-            f"must be a whole number of 128-token blocks, got {local_sequence}"
-        )
+    _require_align128("quant_qkv_pack_fused", local_sequence)
     world_size = _world_size(world_size)
-    rank = _rank(rank, world_size)
-    global_sequence = local_sequence * world_size
-    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
-        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
     spec = payload_spec(
         batch_size=batch,
         local_sequence=local_sequence,
@@ -1071,11 +1166,16 @@ def quant_qkv_pack_fused(
         world_size=world_size,
     )
     zero_scale_and_padding(out, spec)
-    mod = get_ulysses_lowp_module()
-    mod.ulysses_lowp_quant_q_int8_pack_fused(q, out, rank, world_size)
-    mod.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
-        k, v, k_mean_global, v_scale_global, out, rank, world_size,
-        int(used_sequence) if used_sequence is not None else 0,
+    quant_q_into_payload_fused(q, out, rank=rank, world_size=world_size)
+    quant_kv_into_payload_fused(
+        k,
+        v,
+        k_mean_global,
+        v_scale_global,
+        out,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=used_sequence,
     )
     return out
 
@@ -1333,7 +1433,9 @@ __all__ = [
     "merge_boundary_amax",
     "SUPPORTED_STATS_PROTOCOLS",
     "quant_kv_into_payload",
+    "quant_kv_into_payload_fused",
     "quant_q_into_payload",
+    "quant_q_into_payload_fused",
     "quant_qkv_pack",
     "quant_qkv_pack_fused",
     "quant_v_fp8_with_scale",
