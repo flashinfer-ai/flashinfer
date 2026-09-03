@@ -132,7 +132,7 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 }
 
 // Public surface — explicit instantiation switch over the PR-body bench grid.
-// DSV4 only, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
+// DSV4 and DSV4_NVFP4, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
 // TOPK ∈ {128, 192, 256, 512, 1024}. TOPK=192 covers the padded
 // DeepSeek-V4-Flash-0731 DSpark K=5 shape (128 SWA + 5 active draft entries),
 // while TOPK=256 covers wider DSpark configurations.
@@ -145,16 +145,20 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    const int* extra_topk_length, int extra_topk, int pbs_extra,
                                    size_t stride_extra_kv_block, int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
-  if (mt != ModelType::DSV4 || page_block_size != 64) return false;
+  if ((mt != ModelType::DSV4 && mt != ModelType::DSV4_NVFP4) || page_block_size != 64)
+    return false;
   if (num_splits <= 0) return false;
-#define DSV4_DISPATCH(H, K)                                                                 \
-  if (num_heads == (H) && topk == (K)) {                                                    \
-    return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(                          \
+#define DSV4_DISPATCH_MT(MT_, H, K)                                                         \
+  if (mt == (MT_) && num_heads == (H) && topk == (K)) {                                     \
+    return launch_decode_dsv4_impl<MT_, H, K, 64>(                                          \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
         stride_kv_block, stream);                                                           \
   }
+#define DSV4_DISPATCH(H, K)                    \
+  DSV4_DISPATCH_MT(ModelType::DSV4, H, K)      \
+  DSV4_DISPATCH_MT(ModelType::DSV4_NVFP4, H, K)
   DSV4_DISPATCH(8, 128)
   DSV4_DISPATCH(8, 192)
   DSV4_DISPATCH(8, 256)
