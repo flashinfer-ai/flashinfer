@@ -44,14 +44,12 @@ def _backend_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _backend_available(),
-    reason="Requires torchrun, CUDA, and torch's NCCL symmetric-memory backend",
-)
-
-
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def process_group():
+    if not _backend_available():
+        pytest.skip(
+            "Requires torchrun, CUDA, and torch's NCCL symmetric-memory backend"
+        )
     created = False
     if not dist.is_initialized():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -82,15 +80,16 @@ def _reference_lse_reduce(
         else torch.exp2(recv_lse - lse_max)
     )
     denom = weights.sum(dim=-1, keepdim=True)
-    expected = (
-        (recv_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(1e-20)
+    expected = (recv_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(
+        1e-20
     )
     expected = torch.where(denom == 0, torch.zeros_like(expected), expected)
     return expected.to(partial_o.dtype)
 
 
 def test_workspace_size():
-    expected = 16 + 2 * 4 * 8 * 2 * (128 * 2 + 4)
+    payload_offset = (16 + 2 * 4 * 4 + 15) // 16 * 16
+    expected = payload_offset + 2 * 4 * 8 * 2 * (128 * 2 + 4)
     assert (
         decode_cp_a2a_lse_reduce_workspace_size(
             max_tokens=8,
@@ -103,9 +102,42 @@ def test_workspace_size():
     )
 
 
+@pytest.mark.parametrize(
+    "kwargs, error",
+    [
+        ({"max_tokens": 0}, ValueError),
+        ({"local_heads": 0}, ValueError),
+        ({"cp_size": 65}, ValueError),
+        ({"head_dim": 0}, ValueError),
+        ({"head_dim": 7}, ValueError),
+        ({"dtype": torch.float32}, TypeError),
+    ],
+)
+def test_workspace_size_validation(kwargs, error):
+    params = {
+        "max_tokens": 8,
+        "local_heads": 2,
+        "cp_size": 4,
+        "head_dim": 128,
+        "dtype": torch.bfloat16,
+    }
+    params.update(kwargs)
+    with pytest.raises(error):
+        decode_cp_a2a_lse_reduce_workspace_size(**params)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_lse_base_on_e", [True, False])
-def test_lse_reduce(dtype, is_lse_base_on_e):
+def test_single_rank_reference_is_identity(dtype, is_lse_base_on_e):
+    partial_o = torch.randn(3, 1, 16, dtype=dtype)
+    partial_lse = torch.randn(3, 1)
+    actual = _reference_lse_reduce(partial_o, partial_lse, is_lse_base_on_e)
+    torch.testing.assert_close(actual, partial_o[:, 0])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_lse_base_on_e", [True, False])
+def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
     torch.manual_seed(0)
     group = dist.group.WORLD
     cp_rank = dist.get_rank(group)
@@ -141,6 +173,10 @@ def test_lse_reduce(dtype, is_lse_base_on_e):
         dtype=dtype,
         group=group,
     )
+    recv_o = torch.stack([tensor[..., cp_rank, :] for tensor in all_o], dim=-2)
+    recv_lse = torch.stack([tensor[..., cp_rank] for tensor in all_lse], dim=-1)
+    expected = _reference_lse_reduce(recv_o, recv_lse, is_lse_base_on_e)
+
     # Three calls exercise slot 0, slot 1, and slot 0 reuse without re-init.
     for _ in range(3):
         actual = decode_cp_a2a_lse_reduce(
@@ -152,14 +188,12 @@ def test_lse_reduce(dtype, is_lse_base_on_e):
             is_lse_base_on_e=is_lse_base_on_e,
             enable_pdl=None,
         )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
 
-    recv_o = torch.stack([tensor[..., cp_rank, :] for tensor in all_o], dim=-2)
-    recv_lse = torch.stack([tensor[..., cp_rank] for tensor in all_lse], dim=-1)
-    expected = _reference_lse_reduce(recv_o, recv_lse, is_lse_base_on_e)
     assert actual.shape == (batch, local_heads, head_dim)
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
 
-    # Capture one invocation on every rank, then replay collectively.
+    # Capture one invocation on every rank, then replay enough times to exercise
+    # both slots and slot reuse inside a graph.
     dist.barrier(group=group)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -172,6 +206,7 @@ def test_lse_reduce(dtype, is_lse_base_on_e):
             is_lse_base_on_e=is_lse_base_on_e,
         )
     dist.barrier(group=group)
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(graph_out, expected, rtol=1e-2, atol=1e-3)
+    for _ in range(4):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_out, expected, rtol=1e-2, atol=1e-3)

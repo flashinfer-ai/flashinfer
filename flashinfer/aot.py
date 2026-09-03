@@ -813,6 +813,7 @@ def gen_all_modules(
         from .jit.comm import (
             gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
+            gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -839,6 +840,7 @@ def gen_all_modules(
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        jit_specs.append(gen_dcp_lse_reduce_module())
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is

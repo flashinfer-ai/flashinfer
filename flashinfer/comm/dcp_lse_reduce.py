@@ -29,11 +29,18 @@ import torch.distributed._symmetric_memory as symm_mem
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_dcp_lse_reduce_module
+from ..trace.templates.comm import decode_cp_a2a_lse_reduce_trace
 
 # Keep the rendezvous handle alive and remember the group name needed by the
 # C++ rendezvous lookup. The public hot-path signature remains the issue-4575
 # signature: callers pass only the workspace tensor, rank, and size.
 _workspace_keepalive: Dict[int, Tuple[Any, str]] = {}
+
+
+def _dcp_lse_reduce_payload_offset(cp_size: int) -> int:
+    # 16-byte epoch metadata plus two uint32 readiness arrays, rounded so the
+    # vectorized payload remains 16-byte aligned.
+    return (16 + 2 * cp_size * 4 + 15) // 16 * 16
 
 
 @functools.cache
@@ -57,8 +64,10 @@ def decode_cp_a2a_lse_reduce_workspace_size(
     if dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("dtype must be torch.float16 or torch.bfloat16")
     itemsize = torch.empty((), dtype=dtype).element_size()
-    # 16-byte device epoch/slot metadata followed by two alternating slots.
-    return 16 + 2 * cp_size * max_tokens * local_heads * (
+    if head_dim * itemsize % 16 != 0:
+        raise ValueError("head_dim rows must be 16-byte aligned")
+    payload_offset = _dcp_lse_reduce_payload_offset(cp_size)
+    return payload_offset + 2 * cp_size * max_tokens * local_heads * (
         head_dim * itemsize + 4
     )
 
@@ -73,6 +82,11 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     group: Any,
 ) -> torch.Tensor:
     """Create and rendezvous the fused op's NCCL symmetric workspace.
+
+    All ranks in ``group`` must call this function collectively. The group must
+    fit in one NCCL load/store-accessible (LSA) NVLink domain; multi-node groups
+    spanning LSA domains are not supported. Allocate one workspace per group
+    and reuse it for every invocation and CUDA graph replay.
 
     Parameters
     ----------
@@ -104,14 +118,19 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     )
     symm_mem.set_backend("NCCL")
     workspace = symm_mem.empty(size_bytes, dtype=torch.uint8, device="cuda")
-    workspace.zero_()
+    # Initialize the local epoch and readiness words. The payload is fully
+    # overwritten before every read; clearing it could race a peer's first put.
+    workspace[: _dcp_lse_reduce_payload_offset(cp_size)].zero_()
+    # Initialization must complete before rendezvous; afterwards any peer may
+    # enter the first fused kernel and publish a remote readiness value.
+    torch.cuda.current_stream().synchronize()
     handle = symm_mem.rendezvous(workspace, group)
     group_name = group if isinstance(group, str) else group.group_name
     _workspace_keepalive[workspace.data_ptr()] = (handle, group_name)
     return workspace
 
 
-@flashinfer_api
+@flashinfer_api(trace=decode_cp_a2a_lse_reduce_trace)
 def decode_cp_a2a_lse_reduce(
     partial_o: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -121,7 +140,14 @@ def decode_cp_a2a_lse_reduce(
     is_lse_base_on_e: bool = False,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Fuse the DCP A2A exchange with the LSE-weighted reduce.
+    """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
+
+    Send, receive synchronization, and reduction execute in one cooperative
+    CUDA kernel.
+
+    This is a collective operation. Every rank must invoke it in the same order
+    and the same number of times, including CUDA graph replays. All ranks must
+    belong to one NCCL LSA/NVLink domain.
 
     Parameters
     ----------
@@ -154,8 +180,7 @@ def decode_cp_a2a_lse_reduce(
     workspace_meta = _workspace_keepalive.get(workspace.data_ptr())
     if workspace_meta is None:
         raise ValueError(
-            "workspace was not created by "
-            "decode_cp_a2a_lse_reduce_create_workspace"
+            "workspace was not created by decode_cp_a2a_lse_reduce_create_workspace"
         )
     _, group_name = workspace_meta
     get_dcp_lse_reduce_module()

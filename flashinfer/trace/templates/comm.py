@@ -360,3 +360,100 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     reference=_pcie_ipc_all_reduce_reference,
     init=_pcie_ipc_all_reduce_init,
 )
+
+
+# ── Fused NCCL-LSA DCP all-to-all + LSE reduce ───────────────────────────────
+
+
+@torch.no_grad()
+def _decode_cp_a2a_lse_reduce_reference(
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    workspace,
+    cp_rank: int,
+    cp_size: int,
+    is_lse_base_on_e: bool = False,
+    enable_pdl=None,
+    **_unused,
+):
+    """Local LSE merge reference; multi-rank exchange is tested under tests/comm."""
+    lse = torch.where(
+        torch.isnan(partial_lse) | torch.isposinf(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+    lse_max = lse.amax(dim=-1, keepdim=True)
+    lse_max = torch.where(torch.isneginf(lse_max), 0, lse_max)
+    weights = (
+        torch.exp(lse - lse_max) if is_lse_base_on_e else torch.exp2(lse - lse_max)
+    )
+    denom = weights.sum(dim=-1, keepdim=True)
+    output = (partial_o.float() * weights.unsqueeze(-1)).sum(dim=-2)
+    output = output / denom.clamp_min(1e-20)
+    output = torch.where(denom == 0, torch.zeros_like(output), output)
+    return output.to(partial_o.dtype)
+
+
+def _decode_cp_a2a_lse_reduce_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    workspace_bytes: int = 16,
+    cp_rank: int = 0,
+    is_lse_base_on_e: bool = False,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build schema inputs; the real workspace must be rendezvoused collectively."""
+    torch.manual_seed(seed)
+    return {
+        "partial_o": torch.randn(
+            batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "partial_lse": torch.randn(
+            batch_dim, cp_size, dtype=torch.float32, device=device
+        ),
+        "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+        "is_lse_base_on_e": bool(is_lse_base_on_e),
+    }
+
+
+decode_cp_a2a_lse_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_lse_reduce",
+    description=(
+        "Fused context-parallel NCCL-LSA all-to-all and LSE-weighted "
+        "attention-output reduction. The trace reference models the local "
+        "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
+    ),
+    axes={
+        "batch_dim": Var(description="Flattened leading batch/head dimensions."),
+        "cp_size": Var(description="Context-parallel group size."),
+        "head_dim": Const(abbrev="d"),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(
+            ["batch_dim", "cp_size", "head_dim"],
+            description="Per-rank partial attention outputs [..., cp_size, D].",
+        ),
+        "partial_lse": Tensor(
+            ["batch_dim", "cp_size"],
+            dtype="float32",
+            description="Per-rank log-sum-exp values [..., cp_size].",
+        ),
+        "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+        "is_lse_base_on_e": Scalar("bool"),
+    },
+    outputs={
+        "output": Tensor(["batch_dim", "head_dim"], dtype_from="partial_o"),
+    },
+    tags=["status:experimental", "stage:comm"],
+    reference=_decode_cp_a2a_lse_reduce_reference,
+    init=_decode_cp_a2a_lse_reduce_init,
+)
