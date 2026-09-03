@@ -460,3 +460,61 @@ def test_boundary_merge_is_idempotent_and_max():
                                  group=32, world_size=world)
     for a, b in zip(once, twice):
         assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# 6. Fused amax+quant fast path (ALIGN-128)
+# ---------------------------------------------------------------------------
+
+
+@requires_sm120
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_pack_matches_split_path(world, dtype):
+    L = 256
+    q, k, v = _global_inputs(dtype, world, L)
+    k_mean, v_scale = _stats(k, v, world, L)
+    for r in range(world):
+        s = slice(r * L, (r + 1) * L)
+        q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+        q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
+        k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r, world_size=world)
+        split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
+                                    v_scale, rank=r, world_size=world)
+        fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
+                                          rank=r, world_size=world)
+        assert torch.equal(split, fused)
+
+
+@requires_sm120
+def test_fused_pack_used_sequence_tail_repair_matches_split():
+    world, L = 4, 128
+    S = world * L
+    for used in (S - 35, S - 64, S - 130):
+        q, k, v = _global_inputs(torch.bfloat16, world, L)
+        q[:, used:] = 0
+        k[:, used:] = 0
+        v[:, used:] = 0
+        k_mean, v_scale = _stats(k, v, world, L)
+        for r in range(world):
+            s = slice(r * L, (r + 1) * L)
+            q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+            q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
+            k_amax = lowp.k_grouped_amax(k_r, k_mean, rank=r,
+                                         world_size=world, used_sequence=used)
+            split = lowp.quant_qkv_pack(q_r, k_r, v_r, k_mean, q_amax, k_amax,
+                                        v_scale, rank=r, world_size=world)
+            fused = lowp.quant_qkv_pack_fused(q_r, k_r, v_r, k_mean, v_scale,
+                                              rank=r, world_size=world,
+                                              used_sequence=used)
+            assert torch.equal(split, fused), f"used={used} r={r}"
+
+
+@requires_sm120
+def test_fused_pack_rejects_unaligned():
+    q = torch.randn((1, 65, 56, 128), device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    km = torch.randn((1, 56, 128), device="cuda", dtype=torch.bfloat16).contiguous()
+    vs = torch.rand((1, 56, 128), device="cuda", dtype=torch.float32).contiguous()
+    with pytest.raises(ValueError, match="ALIGN-128"):
+        lowp.quant_qkv_pack_fused(q, k, v, km, vs, rank=0, world_size=4)

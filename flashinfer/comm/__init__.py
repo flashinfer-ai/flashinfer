@@ -83,6 +83,7 @@ from .ulysses_lowp import q_grouped_amax as q_grouped_amax
 from .ulysses_lowp import quant_kv_into_payload as quant_kv_into_payload
 from .ulysses_lowp import quant_q_into_payload as quant_q_into_payload
 from .ulysses_lowp import quant_qkv_pack as quant_qkv_pack
+from .ulysses_lowp import quant_qkv_pack_fused as quant_qkv_pack_fused
 from .ulysses_lowp import quant_v_fp8_with_scale as quant_v_fp8_with_scale
 from .ulysses_lowp import unpack_for_sage as unpack_for_sage
 from .ulysses_lowp import (

@@ -632,6 +632,150 @@ __global__ void QuantInt8GroupScalePackKernel(
       *reinterpret_cast<float2 *>(&quantized[0]);
 }
 
+// Fused per-group amax + int8 quantize-and-pack (ALIGN-128 fast path).
+//
+// One CTA owns one (group, head, batch): it loads the group's values ONCE,
+// reduces the |x| (or |x - mean|) amax across the block, broadcasts it, and
+// quantizes from the already-loaded registers -- removing the separate
+// GroupedAmax pass's full second read of Q/K.  Legal only when the locally
+// computed amax IS the final per-group scale, i.e. under ALIGN-128 where no
+// quantization group straddles a rank boundary (protocol 2's boundary groups
+// need a collective between amax and quant, so they keep the split kernels).
+//
+// Byte contract: amax is a max reduction (order-independent) seeded with the
+// same per-thread 1e-7 floor, and the quant math is the pinned
+// float_to_int8_rn(x * (127/amax)) -- the payload bytes are identical to the
+// split GroupedAmax + QuantInt8GroupScalePack path, anchor-verified.
+//
+// K tail repair (used_sequence): the host passes amax_exclude_group, the ONE
+// group that mixes live and zero-padded rows (via (used-1)/GROUP when
+// used % GROUP != 0); its padded rows are excluded from the amax exactly as
+// the split path's Python repair does, while fully-padded groups keep the
+// kernel's |0 - mean| values (deterministic don't-cares, matching golden).
+// Pass amax_exclude_group = 0xFFFFFFFF to disable.
+template <uint32_t head_dim, uint32_t GROUP, bool sub_mean, typename T>
+__global__ void QuantInt8FusedAmaxPackKernel(
+    const T *__restrict__ input,
+    const T *__restrict__ mean,
+    uint8_t *__restrict__ output,
+    const uint32_t local_sequence,
+    const uint32_t global_offset,
+    const uint32_t num_heads,
+    const uint32_t local_heads,
+    const uint32_t batch_size,
+    const uint64_t chunk_bytes,
+    const uint64_t section_offset,
+    const uint64_t scale_offset,
+    const uint32_t slots_alloc,
+    const uint32_t group_first,
+    const uint32_t amax_exclude_group,
+    const uint32_t used_sequence,
+    const int64_t stride_batch,
+    const int64_t stride_token,
+    const int64_t stride_head)
+{
+  static_assert(head_dim == 128);
+  static_assert(GROUP == 32 || GROUP == 64);
+  constexpr uint32_t pack_size = 8;
+  constexpr uint32_t threads_per_token = head_dim / pack_size;
+  const uint32_t slot = blockIdx.x;
+  const uint32_t head_id = blockIdx.y;
+  const uint32_t batch_id = blockIdx.z;
+  const uint32_t thread_id = threadIdx.x;
+  const uint32_t token_in_group = thread_id / threads_per_token;
+  const uint32_t d_base = thread_id % threads_per_token * pack_size;
+  const uint32_t group_id = group_first + slot;
+  const uint32_t global_token = group_id * GROUP + token_in_group;
+  const bool valid = global_token >= global_offset &&
+                     global_token < global_offset + local_sequence;
+  const uint32_t destination = head_id / local_heads;
+  const uint32_t local_head = head_id % local_heads;
+
+  T x_val[pack_size];
+  float x_val_float[pack_size];
+  float amax_val = 0.0000001f;
+  if (valid)
+  {
+    const uint32_t local_token = global_token - global_offset;
+    const uint64_t input_offset = static_cast<uint64_t>(batch_id) * stride_batch +
+                                  static_cast<uint64_t>(local_token) * stride_token +
+                                  static_cast<uint64_t>(head_id) * stride_head + d_base;
+    *reinterpret_cast<float4 *>(&x_val[0]) =
+        *reinterpret_cast<const float4 *>(input + input_offset);
+    if constexpr (sub_mean)
+    {
+      T mean_val[pack_size];
+      const uint64_t mean_offset =
+          (static_cast<uint64_t>(batch_id) * num_heads + head_id) * head_dim + d_base;
+      *reinterpret_cast<float4 *>(&mean_val[0]) =
+          *reinterpret_cast<const float4 *>(mean + mean_offset);
+#pragma unroll
+      for (uint32_t j = 0; j < pack_size; ++j)
+      {
+        x_val_float[j] = detail::convert_to_float(x_val[j]) - detail::convert_to_float(mean_val[j]);
+      }
+    }
+    else
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < pack_size; ++j)
+      {
+        x_val_float[j] = detail::convert_to_float(x_val[j]);
+      }
+    }
+    // Tail repair: padded rows of the single mixed group contribute nothing
+    // to the amax (they are still quantized below with the group's final
+    // scale, exactly like the split path).
+    const bool amax_valid =
+        !(group_id == amax_exclude_group && global_token >= used_sequence);
+    if (amax_valid)
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < pack_size; ++j)
+      {
+        amax_val = fmaxf(amax_val, fabsf(x_val_float[j]));
+      }
+    }
+  }
+
+  const float block_amax_val = detail::blockReduceMax(amax_val);
+  __shared__ float shared_group_amax;
+  if (thread_id == 0)
+  {
+    shared_group_amax = block_amax_val;
+    float *scale_output = reinterpret_cast<float *>(
+        output + static_cast<uint64_t>(destination) * chunk_bytes + scale_offset);
+    scale_output[(static_cast<uint64_t>(batch_id) * local_heads + local_head) * slots_alloc +
+                 slot] = block_amax_val / 127.0f;
+  }
+  __syncthreads();
+
+  if (!valid)
+  {
+    return;
+  }
+
+  const float reciprocal_scale = 127.0f / shared_group_amax;
+  char4 quantized[2];
+#pragma unroll
+  for (uint32_t j = 0; j < 2; ++j)
+  {
+    quantized[j] = make_char4(
+        detail::float_to_int8_rn(x_val_float[j * 4 + 0] * reciprocal_scale),
+        detail::float_to_int8_rn(x_val_float[j * 4 + 1] * reciprocal_scale),
+        detail::float_to_int8_rn(x_val_float[j * 4 + 2] * reciprocal_scale),
+        detail::float_to_int8_rn(x_val_float[j * 4 + 3] * reciprocal_scale));
+  }
+  const uint32_t local_token = global_token - global_offset;
+  const uint64_t packed_offset =
+      static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
+      ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads + local_head) *
+          head_dim +
+      d_base;
+  *reinterpret_cast<float2 *>(output + packed_offset) =
+      *reinterpret_cast<float2 *>(&quantized[0]);
+}
+
 // V2-G receiver, ALIGN-128 (stats protocol 3): rebuild contiguous logical
 // Q/K [B,S,h,128], globally packed V [B,128,h,S] (Sage 16-token permutation
 // applied on the GLOBAL token index), and global-grid Q/K scale tensors.

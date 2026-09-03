@@ -180,6 +180,34 @@ def get_ulysses_lowp_module():
         )
 
     @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_q_int8_pack_fused", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_q_int8_pack_fused(
+        q: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        module.ulysses_lowp_quant_q_int8_pack_fused(q, output, rank, world_size)
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack_fused", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_mean: torch.Tensor,
+        v_scale: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+        used_sequence: int,
+    ) -> None:
+        module.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+            k, v, k_mean, v_scale, output, rank, world_size, used_sequence
+        )
+
+    @register_custom_op(
         "flashinfer::ulysses_lowp_unpack_for_sage",
         mutates_args=["q", "k", "v", "q_scale", "k_scale"],
     )
@@ -235,6 +263,8 @@ def get_ulysses_lowp_module():
         ulysses_lowp_k_grouped_amax=ulysses_lowp_k_grouped_amax,
         ulysses_lowp_quant_q_int8_pack=ulysses_lowp_quant_q_int8_pack,
         ulysses_lowp_quant_kv_int8_fp8_pack=ulysses_lowp_quant_kv_int8_fp8_pack,
+        ulysses_lowp_quant_q_int8_pack_fused=ulysses_lowp_quant_q_int8_pack_fused,
+        ulysses_lowp_quant_kv_int8_fp8_pack_fused=ulysses_lowp_quant_kv_int8_fp8_pack_fused,
         ulysses_lowp_unpack_for_sage=ulysses_lowp_unpack_for_sage,
         ulysses_lowp_unpack_for_sage_unaligned=ulysses_lowp_unpack_for_sage_unaligned,
         ulysses_lowp_quant_v_fp8_with_scale=ulysses_lowp_quant_v_fp8_with_scale,
@@ -968,6 +998,72 @@ def quant_qkv_pack(
     return out
 
 
+@flashinfer_api
+def quant_qkv_pack_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused amax+quant V2-G pack (ALIGN-128 fast path).
+
+    Byte-identical to ``q_grouped_amax`` + ``k_grouped_amax`` +
+    ``quant_qkv_pack`` but reads Q/K from HBM once: each CTA loads its group,
+    reduces the per-group amax in-block, and quantizes from registers.  Legal
+    only when the locally computed amax IS the final scale, i.e. under
+    ALIGN-128 (``local_sequence % 128 == 0``); protocol 2 keeps the split
+    path because a collective sits between amax and quant for its boundary
+    groups.  ``used_sequence`` applies the K tail-group repair in-kernel with
+    the exact split-path semantics.
+    """
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    if q.shape != k.shape or q.shape != v.shape or q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, and v must have identical shape and dtype")
+    if local_sequence % 128:
+        raise ValueError(
+            "quant_qkv_pack_fused is an ALIGN-128 fast path: local_sequence "
+            f"must be a whole number of 128-token blocks, got {local_sequence}"
+        )
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+    spec = payload_spec(
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=HEAD_DIM,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(
+            (world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
+        )
+    _validate_send(
+        out,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    zero_scale_and_padding(out, spec)
+    mod = get_ulysses_lowp_module()
+    mod.ulysses_lowp_quant_q_int8_pack_fused(q, out, rank, world_size)
+    mod.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+        k, v, k_mean_global, v_scale_global, out, rank, world_size,
+        int(used_sequence) if used_sequence is not None else 0,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Receiver unpack
 # ---------------------------------------------------------------------------
@@ -1223,6 +1319,7 @@ __all__ = [
     "quant_kv_into_payload",
     "quant_q_into_payload",
     "quant_qkv_pack",
+    "quant_qkv_pack_fused",
     "quant_v_fp8_with_scale",
     "slots",
     "touched",

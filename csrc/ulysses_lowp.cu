@@ -426,6 +426,151 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
   });
 }
 
+// Fused amax+quant fast path (ALIGN-128 only): one kernel reads Q once,
+// reduces the per-group amax in-block, and quantizes from registers.  Byte-
+// identical to the split GroupedAmax + QuantInt8GroupScalePack path.  Same
+// zero-fill contract as the split packers.
+void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64_t rank,
+                                          int64_t world_size) {
+  check_v2g_shard(q, "q");
+  check_v2g_rank(rank, world_size);
+  CHECK_CUDA(output);
+  CHECK_CONTIGUOUS(output);
+  CHECK_DIM(2, output);
+  CHECK_INPUT_TYPE(output, dl_uint8);
+  CHECK_DEVICE(q, output);
+  TVM_FFI_ICHECK_EQ(q.size(1) % 128, 0)
+      << "fused amax+quant is an ALIGN-128 fast path: local_sequence must be a "
+         "whole number of 128-token blocks (protocol 2 keeps the split kernels)";
+
+  const int64_t batch_size = q.size(0);
+  const int64_t local_sequence = q.size(1);
+  const int64_t num_heads = q.size(2);
+  const int64_t head_dim = q.size(3);
+  const int64_t local_heads = num_heads / world_size;
+  const lowp::grid::ChunkSpec spec =
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 32);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 32) - group_first + 1;
+  check_shape_2d(output, "output", world_size, spec.chunk_bytes);
+
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
+    constexpr uint32_t HEAD_DIM = 128;
+    constexpr uint32_t GROUP = 32;
+    dim3 grid(touched, num_heads, batch_size);
+    dim3 block(GROUP * (HEAD_DIM / 8));
+    lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const c_type*>(q.data_ptr()), nullptr,
+            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+            static_cast<uint64_t>(spec.chunk_bytes), 0,
+            static_cast<uint64_t>(3 * spec.main_bytes), static_cast<uint32_t>(spec.q_slots),
+            static_cast<uint32_t>(group_first), 0xFFFFFFFFu, 0u, q.stride(0), q.stride(1),
+            q.stride(2));
+    cudaError_t status = cudaGetLastError();
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "QuantInt8FusedAmaxPackKernel(Q) failed with error code "
+        << cudaGetErrorString(status);
+    return true;
+  });
+}
+
+// Fused K (with in-kernel used_sequence tail repair) + packed V.
+// used_sequence <= 0 means "no padding".
+void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, TensorView k_mean,
+                                               TensorView v_scale, TensorView output,
+                                               int64_t rank, int64_t world_size,
+                                               int64_t used_sequence) {
+  check_v2g_shard(k, "k");
+  check_v2g_shard(v, "v");
+  check_v2g_rank(rank, world_size);
+  CHECK_CUDA(k_mean);
+  CHECK_CONTIGUOUS(k_mean);
+  CHECK_DIM(3, k_mean);
+  CHECK_CUDA(v_scale);
+  CHECK_CONTIGUOUS(v_scale);
+  CHECK_DIM(3, v_scale);
+  CHECK_INPUT_TYPE(v_scale, dl_float32);
+  CHECK_CUDA(output);
+  CHECK_CONTIGUOUS(output);
+  CHECK_DIM(2, output);
+  CHECK_INPUT_TYPE(output, dl_uint8);
+  CHECK_SHAPE(k, v);
+  TVM_FFI_ICHECK(k.dtype() == v.dtype() && k.dtype() == k_mean.dtype())
+      << "k, v, and k_mean must have the same dtype";
+  CHECK_DEVICE(k, v);
+  CHECK_DEVICE(k, k_mean);
+  CHECK_DEVICE(k, v_scale);
+  CHECK_DEVICE(k, output);
+  check_shape_3d(k_mean, "k_mean", k.size(0), k.size(2), k.size(3));
+  check_shape_3d(v_scale, "v_scale", k.size(0), k.size(2), k.size(3));
+  TVM_FFI_ICHECK_EQ(k.size(1) % 128, 0)
+      << "fused amax+quant is an ALIGN-128 fast path: local_sequence must be a "
+         "whole number of 128-token blocks (protocol 2 keeps the split kernels)";
+
+  const int64_t batch_size = k.size(0);
+  const int64_t local_sequence = k.size(1);
+  const int64_t num_heads = k.size(2);
+  const int64_t head_dim = k.size(3);
+  const int64_t local_heads = num_heads / world_size;
+  const int64_t global_sequence = local_sequence * world_size;
+  TVM_FFI_ICHECK(used_sequence <= global_sequence)
+      << "used_sequence must not exceed local_sequence * world_size";
+  const lowp::grid::ChunkSpec spec =
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 64);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 64) - group_first + 1;
+  check_shape_2d(output, "output", world_size, spec.chunk_bytes);
+
+  // The ONE group mixing live and padded rows (matches the split path's
+  // Python repair: only when the padding boundary is not group-aligned).
+  uint32_t exclude_group = 0xFFFFFFFFu;
+  uint32_t used_u32 = 0;
+  if (used_sequence > 0 && used_sequence < global_sequence && (used_sequence % 64) != 0) {
+    exclude_group = static_cast<uint32_t>((used_sequence - 1) / 64);
+    used_u32 = static_cast<uint32_t>(used_sequence);
+  }
+
+  ffi::CUDADeviceGuard device_guard(k.device().device_id);
+  const cudaStream_t stream = get_stream(k.device());
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
+    constexpr uint32_t HEAD_DIM = 128;
+    constexpr uint32_t GROUP = 64;
+    dim3 k_grid(touched, num_heads, batch_size);
+    dim3 k_block(GROUP * (HEAD_DIM / 8));
+    lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>
+        <<<k_grid, k_block, 0, stream>>>(
+            static_cast<const c_type*>(k.data_ptr()), static_cast<const c_type*>(k_mean.data_ptr()),
+            static_cast<uint8_t*>(output.data_ptr()), static_cast<uint32_t>(local_sequence),
+            static_cast<uint32_t>(rank * local_sequence), static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(local_heads), static_cast<uint32_t>(batch_size),
+            static_cast<uint64_t>(spec.chunk_bytes), static_cast<uint64_t>(spec.main_bytes),
+            static_cast<uint64_t>(3 * spec.main_bytes + spec.q_scale_bytes),
+            static_cast<uint32_t>(spec.k_slots), static_cast<uint32_t>(group_first),
+            exclude_group, used_u32, k.stride(0), k.stride(1), k.stride(2));
+    constexpr uint32_t V_THREADS = 256;
+    const uint64_t v_packs =
+        static_cast<uint64_t>(batch_size) * local_sequence * local_heads * head_dim / 8;
+    dim3 v_grid((v_packs + V_THREADS - 1) / V_THREADS, world_size);
+    dim3 v_block(V_THREADS);
+    lowp::QuantVFP8WithScalePackKernel<c_type><<<v_grid, v_block, 0, stream>>>(
+        static_cast<const c_type*>(v.data_ptr()), static_cast<float*>(v_scale.data_ptr()),
+        static_cast<uint8_t*>(output.data_ptr()), v_packs, static_cast<uint32_t>(local_sequence),
+        static_cast<uint32_t>(num_heads), static_cast<uint32_t>(local_heads),
+        static_cast<uint32_t>(head_dim), static_cast<uint32_t>(batch_size),
+        static_cast<uint64_t>(spec.main_bytes), static_cast<uint64_t>(spec.chunk_bytes),
+        v.stride(0), v.stride(1), v.stride(2));
+    cudaError_t status = cudaGetLastError();
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "fused quant_kv pack kernels failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
+}
+
 // V2-G receiver: rebuild contiguous logical Q/K [B,S,h,128], the globally
 // packed V [B,128,h,ceil(S/64)*64], and the global-grid Q/K scale tensors
 // where slot g is written only by its canonical owner source (owner-only
@@ -602,6 +747,10 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_k_grouped_amax, ulysses_lowp_k_groupe
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_q_int8_pack, ulysses_lowp_quant_q_int8_pack);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_kv_int8_fp8_pack,
                               ulysses_lowp_quant_kv_int8_fp8_pack);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_q_int8_pack_fused,
+                              ulysses_lowp_quant_q_int8_pack_fused);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_kv_int8_fp8_pack_fused,
+                              ulysses_lowp_quant_kv_int8_fp8_pack_fused);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_unpack_for_sage, ulysses_lowp_unpack_for_sage);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_unpack_for_sage_unaligned,
                               ulysses_lowp_unpack_for_sage_unaligned);
