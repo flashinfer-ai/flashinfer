@@ -1244,9 +1244,13 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
         for input_index in (0, 1, 2, 3):
             assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
     for input_index in (0, 1, 2, 3):
-        assert (
-            len({batch[input_index].data_ptr() for batch in schedule}) == tuner.repeat
-        )
+        pointers = [batch[input_index].data_ptr() for batch in schedule]
+        num_physical_buffers = len(set(pointers))
+        assert 2 <= num_physical_buffers <= tuner.repeat
+        assert num_physical_buffers % 2 == 0
+        assert pointers == [
+            pointers[index % num_physical_buffers] for index in range(tuner.repeat)
+        ]
     assert torch.count_nonzero(inputs[1]).item() == 0
     assert torch.count_nonzero(inputs[2]).item() == 0
     sorted_ids = schedule[0][1].sort(dim=1).values
