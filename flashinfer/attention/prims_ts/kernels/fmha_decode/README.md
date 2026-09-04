@@ -37,11 +37,11 @@ Prefer the reusable wrapper when a static cache geometry is used repeatedly.
 Q and K/V bounds, dtypes, mask, and window. It compiles the specialization and
 either binds an optional caller-owned workspace or allocates private scratch;
 it does not retain request metadata. Every `run()` supplies the current query,
-cache, K/V lengths, CSR row offsets and page IDs, plus query offsets for packed
-Q. Validation is enabled by default. `validate=False` skips explicit wrapper
-checks and host metadata reads for a previously validated steady state or CUDA
-Graph launch; the caller then owns every value, bounds, aliasing, and lifetime
-precondition.
+cache, K/V lengths, and a fixed row-strided page table, plus query offsets for
+packed Q. Validation is enabled by default. `validate=False` skips explicit
+wrapper checks and host metadata reads for a previously validated steady state
+or CUDA Graph launch; the caller then owns every value, bounds, aliasing, and
+lifetime precondition.
 
 An optional host sequence-length list or CPU tensor passed to `plan()` is
 specialization evidence, not run-time metadata. It may prove that every row is
@@ -79,11 +79,17 @@ The public paths require compact, 16-byte-aligned Q and output storage. K/V
 pages must have compact HND inner strides; a padded outer page stride is
 allowed when pages do not overlap and both the tensor base and outer stride
 are 16-byte aligned. All query, cache, metadata, output, and workspace tensors
-must be on one CUDA device. Metadata is contiguous CUDA `torch.int32` with
-4-byte alignment. A caller-provided `out` must not overlap Q, K/V page
+must be on one CUDA device. Metadata uses 4-byte-aligned CUDA `torch.int32`;
+the page table is contiguous within each row but may have padding between
+rows. A caller-provided `out` must not overlap Q, K/V page
 storage, run-time metadata, or caller-owned workspace. The launch
 conservatively rejects overlapping storage spans. The API returns O only; LSE
 and split-KV statistics are internal scratch.
+
+The fixed table controls logical-to-physical lookup only. Native TMA tensor
+maps still span the complete physical page pool and use each cache tensor's
+runtime outer page stride, so page IDs may be arbitrary and physical pages may
+have padded storage.
 
 ## Tensor and metadata layouts
 
@@ -97,20 +103,24 @@ and split-KV statistics are internal scratch.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`.
-- Wrapper metadata is supplied on every run as `seq_lens[B]`,
-  `paged_kv_indptr[B + 1]`, and `paged_kv_indices[num_used_pages]`, all
-  contiguous CUDA `int32` tensors. Packed runs additionally supply
-  `qo_indptr[B + 1]`.
+- Wrapper and standalone metadata is supplied on every run as contiguous
+  `seq_lens[B]` plus `block_tables[B, C]`. The table has unit inner stride and
+  a non-overlapping row stride of at least `C`; padding between rows is
+  supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
 - The one-shot convenience API continues to use FlashInfer CSR metadata with
-  `paged_kv_last_page_len[B]`. The standalone launch continues to use explicit
-  `seq_lens[B]` and a static `max_seq_len` upper bound.
+  `paged_kv_last_page_len[B]`. It validates and converts that metadata before
+  invoking the fixed-table wrapper, so it is not CUDA-graph-capturable.
+  Equal-width CSR rows can use a zero-copy view; ragged rows require a
+  temporary dense table. The standalone launch uses explicit `seq_lens[B]`
+  and a static `max_seq_len` upper bound.
 
 Valid CSR metadata starts `paged_kv_indptr` at zero, increases it strictly,
 and ends it at the number of used page-index entries. Every request owns at
 least one page, every page ID indexes the physical cache, and one-shot
 last-page lengths are in `[1, page_size]`. For every wrapper or standalone
-request `b`, the per-run metadata must also satisfy
-`ceil(seq_lens[b] / page_size) <= paged_kv_indptr[b + 1] - paged_kv_indptr[b]`.
+request `b`, the fixed table must satisfy
+`ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
+valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
 and have every delta no larger than the planned `max_seq_len_q`. Causal
 attention additionally requires each fixed or packed per-request Q length to
@@ -138,7 +148,7 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-K/V lengths, CSR row offsets, page IDs, and packed-Q offsets are per-run inputs
+K/V lengths, fixed-table page IDs, and packed-Q offsets are per-run inputs
 loaded on every run and graph replay. Their storage and values may change
 between completed launches without recompiling while the static plan contract
 remains satisfied. CUDA Graph replay additionally requires stable captured
@@ -174,10 +184,9 @@ kv = torch.randn(
     device=device,
     dtype=torch.float16,
 )
-paged_kv_indptr = torch.arange(
-    0, num_pages + 1, pages_per_request, device=device, dtype=torch.int32
+block_tables = torch.arange(num_pages, device=device, dtype=torch.int32).view(
+    B, pages_per_request
 )
-paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
 max_seq_len = pages_per_request * page_size
 seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
 
@@ -199,7 +208,7 @@ wrapper.plan(
     # Optional stable evidence enables a fixed-length specialization.
     seq_lens=[max_seq_len] * B,
 )
-out = wrapper.run(q, kv, seq_lens, paged_kv_indptr, paged_kv_indices)
+out = wrapper.run(q, kv, seq_lens, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
@@ -219,8 +228,7 @@ standalone_out = prims_ts_batch_decode_with_kv_cache(
     q,
     kv,
     workspace,
-    paged_kv_indptr,
-    paged_kv_indices,
+    block_tables,
     seq_lens,
     max_seq_len,
     mask_type="causal",
@@ -235,7 +243,7 @@ in-flight run or captured-graph replay; use separate wrappers and workspaces
 for concurrent execution. Caller-owned scratch must remain alive and must not
 overlap Q, K/V cache, metadata, or output storage.
 
-With default `validate=True`, each wrapper run checks the per-run CSR metadata,
+With default `validate=True`, each wrapper run checks the per-run fixed table,
 K/V lengths, packed offsets when present, tensors, output, and any selected
 sequence-length specialization. Once the caller has established those
 conditions, `validate=False` avoids the explicit checks and host metadata
@@ -251,11 +259,11 @@ tensor. Zero it before first use and re-zero it whenever any workspace-layout
 input, including batch size, changes because the internal workspace section
 offsets can move even when the compiled callable is reused. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
-cache, metadata, or output storage. The standalone hot path trusts CSR,
-`seq_lens`, and packed-Q values: keep lengths positive and within their static
-bounds, keep enough page entries in every CSR row for its live length, and keep
-all page IDs valid. CSR
-offsets, sequence lengths, page IDs, and packed-Q offsets may change between
+cache, metadata, or output storage. The standalone hot path trusts
+`block_tables`, `seq_lens`, and
+packed-Q values: keep lengths positive and within their static bounds, keep
+enough table columns for every request, and keep all active page IDs valid.
+Sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution
 that reads them. These per-run values are not host-synchronized or fully

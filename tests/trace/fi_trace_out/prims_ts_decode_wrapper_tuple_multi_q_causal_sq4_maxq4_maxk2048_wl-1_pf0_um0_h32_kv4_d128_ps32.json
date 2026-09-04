@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32",
-  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. Every run supplies native CSR metadata and K/V lengths; packed-Q runs also supply Q offsets.",
+  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. Every run supplies a fixed row-strided page table and K/V lengths; packed-Q runs also supply Q offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
@@ -70,13 +70,9 @@
       "type": "const",
       "value": 32
     },
-    "len_indptr": {
+    "max_pages_per_seq": {
       "type": "var",
-      "description": "Length of the per-run native CSR indptr."
-    },
-    "num_kv_indices": {
-      "type": "var",
-      "description": "Number of active page IDs."
+      "description": "Physical page-table capacity per request."
     },
     "len_qo_indptr": {
       "type": "var",
@@ -88,7 +84,9 @@
     "page_size in (16, 32, 64, 128)",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
-    "len_indptr == batch_size + 1",
+    "max_pages_per_seq * page_size >= max(seq_lens)",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_kv_len",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -119,19 +117,13 @@
       ],
       "dtype": "bfloat16"
     },
-    "paged_kv_indptr": {
+    "block_tables": {
       "shape": [
-        "len_indptr"
+        "batch_size",
+        "max_pages_per_seq"
       ],
       "dtype": "int32",
-      "description": "Required native CSR offsets supplied to run()."
-    },
-    "paged_kv_indices": {
-      "shape": [
-        "num_kv_indices"
-      ],
-      "dtype": "int32",
-      "description": "Required physical page IDs supplied to run()."
+      "description": "Required fixed row-strided physical page table supplied to run()."
     },
     "seq_lens": {
       "shape": [

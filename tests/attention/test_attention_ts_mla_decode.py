@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compact public-interface acceptance coverage for PrimTS MLA decode."""
+"""Public-interface acceptance coverage for PrimTS MLA decode."""
 
 from __future__ import annotations
 
@@ -307,6 +307,33 @@ def _pack_mla_case(
         [case.query[batch_idx, :q_len] for batch_idx, q_len in enumerate(q_lens)]
     ).contiguous()
     return replace(case, query=packed_query), qo_indptr
+
+
+def _with_trt_plane0_block_tables(
+    case: _MLACase,
+) -> tuple[_MLACase, torch.Tensor, int]:
+    """Expose K-plane metadata with TRT's two-plane row stride and an offset."""
+
+    batch_size, columns = case.block_tables.shape
+    storage = torch.empty(
+        1 + batch_size * 2 * columns,
+        dtype=torch.int32,
+        device=case.block_tables.device,
+    )
+    trt_block_offsets = storage[1:].view(batch_size, 2, columns)
+    trt_block_offsets[:, 0].copy_(case.block_tables)
+    used_pages = set(int(page) for row in case.block_tables.tolist() for page in row)
+    poison_page = next(
+        page for page in range(int(case.kv_cache.shape[0])) if page not in used_pages
+    )
+    trt_block_offsets[:, 1].fill_(poison_page)
+    block_tables = trt_block_offsets[:, 0]
+    assert block_tables.shape == case.block_tables.shape
+    assert block_tables.stride() == (2 * columns, 1)
+    assert block_tables.storage_offset() == 1
+    assert block_tables.data_ptr() % 4 == 0
+    assert block_tables.data_ptr() % 16 != 0
+    return replace(case, block_tables=block_tables), trt_block_offsets, poison_page
 
 
 def _gather_request_cache(case: _MLACase, batch_idx: int) -> torch.Tensor:
@@ -1708,6 +1735,42 @@ def test_attention_ts_mla_public_interfaces_reject_output_alias():
         _run_standalone(case, out=aliased_out)
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_block_table_stride_contract():
+    """Accept padded rows and reject non-unit inner or overlapping strides."""
+
+    device = torch.device("cuda")
+    batch_size, columns = 2, 3
+    seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    compact = torch.zeros((batch_size, columns), dtype=torch.int32, device=device)
+    padded_storage = torch.zeros(
+        1 + batch_size * 2 * columns, dtype=torch.int32, device=device
+    )
+    padded = padded_storage[1:].view(batch_size, 2, columns)[:, 0]
+
+    assert mla_decode_module._validate_mla_metadata(compact, seq_lens)[1:] == (
+        batch_size,
+        columns,
+    )
+    assert mla_decode_module._validate_mla_metadata(padded, seq_lens)[1:] == (
+        batch_size,
+        columns,
+    )
+
+    non_unit_inner = torch.zeros(
+        (columns, batch_size), dtype=torch.int32, device=device
+    ).transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous within each row"):
+        mla_decode_module._validate_mla_metadata(non_unit_inner, seq_lens)
+
+    overlapping = torch.zeros(
+        columns + batch_size, dtype=torch.int32, device=device
+    ).as_strided((batch_size, columns), (columns - 1, 1))
+    with pytest.raises(ValueError, match="rows must not overlap"):
+        mla_decode_module._validate_mla_metadata(overlapping, seq_lens)
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "max_kv_len", "message"),
     (
@@ -2064,6 +2127,85 @@ def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
         max_seq_len_q=max_seq_len_q,
     )
     assert policy["source"] == "auto"
+
+
+@pytest.mark.parametrize("table_layout", ("compact", "trt-plane0"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
+    table_layout: str,
+):
+    """Reload compact or raw TRT page rows after eager and graph mutations."""
+
+    case = _make_mla_case(
+        batch_size=3,
+        num_qo_heads=8,
+        max_seq_len=129,
+        qkv_dtype=torch.bfloat16,
+        page_size=32,
+        device="cuda",
+        seed=32103,
+    )
+    assert case.block_tables.shape == (3, 5)
+    seq_lens_storage = torch.empty(
+        case.seq_lens.numel() + 1,
+        dtype=torch.int32,
+        device=case.seq_lens.device,
+    )
+    seq_lens = seq_lens_storage[1:]
+    seq_lens.copy_(case.seq_lens)
+    assert seq_lens.is_contiguous()
+    assert seq_lens.data_ptr() % 4 == 0
+    assert seq_lens.data_ptr() % 16 != 0
+    case = replace(case, seq_lens=seq_lens)
+    trt_block_offsets = None
+    poison_page = None
+    if table_layout == "trt-plane0":
+        case, trt_block_offsets, poison_page = _with_trt_plane0_block_tables(case)
+        case.kv_cache[poison_page].fill_(float("nan"))
+    else:
+        assert case.block_tables.is_contiguous()
+        assert case.block_tables.stride() == (5, 1)
+
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    initial = _run_case(wrapper, case).clone()
+    _assert_case_correct(initial, case, policy)
+    standalone = _run_standalone(case)
+    _assert_case_correct(standalone, case, policy)
+    torch.testing.assert_close(standalone, initial, rtol=0, atol=0)
+
+    case.block_tables.copy_(torch.roll(case.block_tables.clone(), 1, dims=0))
+    case.seq_lens.copy_(torch.roll(case.seq_lens.clone(), 1))
+    eager_mutated = _run_case(wrapper, case).clone()
+    _assert_case_correct(eager_mutated, case, policy)
+    assert not torch.allclose(
+        initial.float(), eager_mutated.float(), rtol=1e-3, atol=1e-3
+    )
+
+    graph_out = torch.full_like(eager_mutated, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out, validate=False)
+    assert captured is graph_out
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, eager_mutated, rtol=0, atol=0)
+
+    case.block_tables.copy_(torch.roll(case.block_tables.clone(), 1, dims=0))
+    case.seq_lens.copy_(torch.roll(case.seq_lens.clone(), 1))
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(graph_out, case, policy)
+    assert not torch.allclose(
+        graph_out.float(), eager_mutated.float(), rtol=1e-3, atol=1e-3
+    )
+
+    if trt_block_offsets is not None:
+        assert poison_page is not None
+        assert bool((trt_block_offsets[:, 1] == poison_page).all().item())
 
 
 @pytest.mark.parametrize(

@@ -66,10 +66,14 @@ Some head and Q-length combinations outside the validated matrix do not have a
 generated implementation and are rejected.
 
 Query, cache, and output tensors must be compact, 16-byte-aligned CUDA tensors
-on the metadata device. `block_tables` and `seq_lens` are compact,
-16-byte-aligned CUDA `torch.int32`; packed `qo_indptr` is contiguous CUDA
-`torch.int32`. A caller-provided `out` must not overlap query, cache,
-`block_tables`, `seq_lens`, packed `qo_indptr`, or caller-owned workspace.
+on the metadata device. `block_tables` is a 4-byte-aligned CUDA
+`torch.int32[B, max_num_pages]` view with contiguous, non-overlapping rows:
+`stride(1) == 1` and `stride(0) >= max_num_pages`. This includes both compact
+tables and a K-plane view of `[B, 2, max_num_pages]` TensorRT-LLM metadata.
+`seq_lens` is compact, 4-byte-aligned CUDA `torch.int32`; packed `qo_indptr`
+is contiguous CUDA `torch.int32`. A caller-provided `out` must not overlap
+query, cache, `block_tables`, `seq_lens`, packed `qo_indptr`, or caller-owned
+workspace.
 The launch conservatively rejects overlapping storage spans. The API returns O
 only. FP32 LSE is internal workspace and is not exposed as an output.
 
@@ -85,8 +89,8 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
   `[num_pages, 1, page_size, 576]`. "Compact" means adjacent elements follow
   those row-major shapes without padding in the inner page, token, or feature
   dimensions.
-- Dense page table: contiguous CUDA `int32[B, max_num_pages]`
-  `block_tables`.
+- Dense page table: inner-contiguous, non-overlapping CUDA
+  `int32[B, max_num_pages]` `block_tables`. Padding between rows is accepted.
 - Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
   positive and no larger than the static K/V bound.
 
@@ -132,7 +136,7 @@ reads. The caller-workspace standalone launch likewise trusts device-side values
 Invalid per-run page IDs, lengths, offsets, or aliases in either unchecked path
 may cause incorrect results or out-of-bounds access. Do not mutate metadata
 concurrently with a launch or graph replay that reads it. CUDA Graph replay
-also requires stable captured addresses and shapes.
+also requires stable captured addresses, shapes, and strides.
 
 A wrapper owns its plan-bound mutable scratch and supports only one in-flight
 run or captured-graph replay. If `workspace_buffer` is omitted from `plan()`,

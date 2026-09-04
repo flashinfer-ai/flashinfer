@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,8 +74,7 @@ on ``plan()`` state, pass the live bound method to the module-level helper:
         q=q_tensor,
         paged_kv_cache=(k, v),
         seq_lens=seq_lens,
-        paged_kv_indptr=kv_indptr,
-        paged_kv_indices=kv_indices,
+        block_tables=block_tables,
     )
 
 Both modes support an optional ``save_dir`` argument / env-var to control

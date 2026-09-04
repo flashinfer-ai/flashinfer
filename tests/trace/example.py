@@ -1817,6 +1817,7 @@ with contextlib.suppress(Exception):
         device=device,
     )
     _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
+    _pts_block_tables = _pts_indices.view(_pts_B, _pts_pages_per_request)
     _pts_last_page_len = torch.full(
         (_pts_B,), _pts_PS, dtype=torch.int32, device=device
     )
@@ -1852,8 +1853,7 @@ with contextlib.suppress(Exception):
         _pts_q,
         _pts_cache,
         _pts_workspace,
-        _pts_indptr,
-        _pts_indices,
+        _pts_block_tables,
         _pts_seq_lens,
         _pts_SK,
         seq_len_q=_pts_SQ,
@@ -1882,8 +1882,7 @@ with contextlib.suppress(Exception):
         _pts_q,
         _pts_cache,
         _pts_seq_lens,
-        _pts_indptr,
-        _pts_indices,
+        _pts_block_tables,
     )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
