@@ -150,6 +150,24 @@ jobs:
           # test paths, so the scope is published across `ci/test-scope-N` statuses and
           # reassembled by pr-test.yml. Indices always start at 1, even for a single
           # chunk, so there is one code path rather than a special case.
+          # A scope was asked for but the head SHA could not be resolved: the scope
+          # cannot be published, so honouring the request is impossible. Reject rather
+          # than label -- labelling here would start a full-suite run in place of the
+          # narrowed one, silently, which is the failure this command's contract exists
+          # to avoid. A bare command has nothing to publish and is unaffected, which
+          # keeps the guard on HEAD_SHA from costing anyone their CI.
+          if [ -n "$ARGS" ] && [ -z "$HEAD_SHA" ]; then
+            gh pr comment ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --body "Rejected: could not resolve this PR's head commit, so the requested test scope cannot be published. Please re-issue the command." \
+              || echo "warning: could not post the rejection note"
+            gh api -X POST \
+              "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+              -f content='confused' > /dev/null || echo "warning: could not react"
+            echo "Rejected: head SHA unresolved with a scope requested; run-ci not applied."
+            exit 0
+          fi
+
           CHUNKS=()
           if [ -n "$ARGS" ]; then
             # Charset and root only. Existence needs the PR's files, which this job
