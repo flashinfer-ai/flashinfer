@@ -76,6 +76,50 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+@pytest.mark.parametrize("api", ["sampling", "logits_pipe"])
+def test_softmax_concurrent_streams(api):
+    batch_size = 128
+    vocab_size = 131072
+    iterations = 10
+
+    torch.manual_seed(42)
+    logits = [
+        torch.randn(batch_size, vocab_size, device="cuda:0"),
+        torch.randn(batch_size, vocab_size, device="cuda:0") * 2.0 + 3.0,
+    ]
+    references = [torch.softmax(value, dim=-1) for value in logits]
+
+    if api == "sampling":
+
+        def run_softmax(value):
+            return flashinfer.sampling.softmax(value, enable_pdl=False)
+
+    else:
+        from flashinfer.logits_processor import LogitsPipe, Softmax, Temperature
+
+        pipe = LogitsPipe([Temperature(), Softmax(enable_pdl=False)], compile=True)
+
+        def run_softmax(value):
+            return pipe(value, temperature=1.0)
+
+    # Warm up the split-vocabulary path before launching work on side streams.
+    for value in logits:
+        run_softmax(value)
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    outputs = [[], []]
+    for _ in range(iterations):
+        for stream_index, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outputs[stream_index].append(run_softmax(logits[stream_index]))
+    torch.cuda.synchronize()
+
+    for stream_outputs, reference in zip(outputs, references, strict=True):
+        for output in stream_outputs:
+            torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
