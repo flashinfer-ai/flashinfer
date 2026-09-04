@@ -286,8 +286,9 @@ Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
   experimental APIs (needed for graduation).
 - **AOT registration** (`flashinfer/aot.py`) is **prohibited**: experimental
   features are JIT-only so they never ship in `flashinfer-jit-cache` /
-  `flashinfer-cubin` pre-built packages. Exceptions require maintainer
-  approval.
+  `flashinfer-cubin` pre-built packages. There is no exception -- shipping an
+  experimental kernel in a pre-built package is what the rule exists to
+  prevent, and a graduating feature registers for AOT as part of graduation.
 - Top-level export from `flashinfer/__init__.py` is optional and, if added,
   must be lazy (no eager import of `flashinfer.experimental`).
 
