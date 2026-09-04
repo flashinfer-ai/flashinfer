@@ -18,7 +18,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, log2e
 
 
 def head_dim_512_supported() -> bool:
@@ -484,7 +484,8 @@ def test_ragged_fp8_calibration_scales(q_dtype, kv_dtype, causal, k_scale, v_sca
         logits.masked_fill_(mask, float("-inf"))
     expected = (logits.softmax(-1) @ v_ref) * (1.0 if v_scale is None else v_scale)
     expected = expected.transpose(1, 2).reshape_as(actual)
-    expected_lse = logits.logsumexp(-1).transpose(1, 2).reshape_as(actual_lse)
+    # FlashInfer returns base-2 LSE; torch.logsumexp uses natural logarithms.
+    expected_lse = logits.logsumexp(-1).transpose(1, 2).reshape_as(actual_lse) * log2e
     assert torch.isfinite(actual).all()
     assert torch.isfinite(actual_lse).all()
     torch.testing.assert_close(actual.float(), expected, atol=3e-3, rtol=1e-2)
