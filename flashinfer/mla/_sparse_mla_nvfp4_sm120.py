@@ -18,18 +18,9 @@ from __future__ import annotations
 
 import functools
 from types import SimpleNamespace
-from typing import Any
 
 import torch
 
-from ..autotuner import (
-    AutoTuner,
-    ConstraintSpec,
-    DynamicTensorSpec,
-    OptimizationProfile,
-    TunableRunner,
-    TuningConfig,
-)
 from ..jit.mla import (
     gen_sparse_mla_nvfp4_sm120_module,
     gen_sparse_mla_nvfp4_sm120_tile_module,
@@ -49,278 +40,11 @@ _ROPE_BYTES = _D_ROPE * 2
 _DATA_BYTES_PER_TOKEN = _PACKED_NOPE_BYTES + _ROPE_BYTES
 _SCALE_BYTES_PER_TOKEN = 32
 _BYTES_PER_TOKEN = _DATA_BYTES_PER_TOKEN + _SCALE_BYTES_PER_TOKEN
-_CANDIDATES_PER_CHUNK = 64
-_DECODE_TOKEN_BUCKETS = (1, 4, 8, 16, 32, 64)
-_DECODE_AUTOTUNE_OP = "sparse_mla_sm120_nvfp4_decode"
-_decode_hot_cache: dict[tuple[Any, ...], int] = {}
-
-
-def _decode_token_buckets(*_args, **_kwargs) -> tuple[int, ...]:
-    return _DECODE_TOKEN_BUCKETS
-
-
-def _decode_token_bucket(num_tokens: int) -> int:
-    for bucket in _DECODE_TOKEN_BUCKETS:
-        if num_tokens <= bucket:
-            return bucket
-    return _DECODE_TOKEN_BUCKETS[-1]
-
-
-def _init_decode_q(shapes, dtype, device):
-    return (
-        (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0)
-        .clamp(-1, 1)
-        .to(dtype)
-    )
-
-
-def _init_decode_indices(shapes, dtype, device):
-    # The live paged pools used for serving contain far more than 256 rows.
-    # The autotuner profiles latency only, so arbitrary legal rows are enough.
-    return torch.randint(0, 256, shapes, dtype=dtype, device=device)
-
-
-def _init_decode_topk_length(shapes, dtype, device):
-    return torch.full(shapes, 1 << 30, dtype=dtype, device=device)
-
-
-def _decode_inputs_pre_hook(inputs):
-    inputs = list(inputs)
-    indices = inputs[1] if len(inputs) > 1 else None
-    topk_length = inputs[6] if len(inputs) > 6 else None
-    extra_indices = inputs[8] if len(inputs) > 8 else None
-    extra_topk_length = inputs[9] if len(inputs) > 9 else None
-    if topk_length is not None and indices is not None:
-        inputs[6] = torch.full_like(topk_length, indices.shape[-1])
-    if extra_topk_length is not None and extra_indices is not None:
-        inputs[9] = torch.full_like(extra_topk_length, extra_indices.shape[-1])
-    return inputs
-
-
-@functools.cache
-def _decode_tuning_config() -> TuningConfig:
-    # Keep the bucket and scratch-shape contract aligned with the existing FP8
-    # DSv4 sparse-MLA tuner so paired serving warms the same live batch shapes.
-    return TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1, 6, 8, 9),
-                dim_idx=(0, 0, 0, 0, 0),
-                gen_tuning_buckets=_decode_token_buckets,
-                map_to_tuning_buckets=_decode_token_bucket,
-            ),
-        ),
-        tensor_initializers=(
-            (0, _init_decode_q),
-            (1, _init_decode_indices),
-            (6, _init_decode_topk_length),
-            (8, _init_decode_indices),
-            (9, _init_decode_topk_length),
-        ),
-        inputs_pre_hook=_decode_inputs_pre_hook,
-        constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),
-            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),
-            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
-            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),
-        ),
-    )
-
-
-def _cache_page_size(cache: torch.Tensor | None) -> int:
-    if cache is None:
-        return 0
-    if cache.ndim == 3:
-        return int(cache.shape[1])
-    if cache.ndim == 4 and cache.shape[1] == 1:
-        return int(cache.shape[2])
-    if cache.ndim == 4 and cache.shape[2] == 1:
-        return int(cache.shape[1])
-    raise ValueError(f"unsupported NVFP4 cache shape for decode tuning: {cache.shape}")
-
-
-class _SparseMlaNvfp4DecodeRunner(TunableRunner):
-    """Tune chunks-per-block while preserving the native streaming kernel."""
-
-    def __init__(
-        self,
-        module,
-        primary_page_size: int,
-        extra_page_size: int,
-    ) -> None:
-        self.module = module
-        self.primary_page_size = primary_page_size
-        self.extra_page_size = extra_page_size
-
-    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
-        topk_length = inputs[6] if len(inputs) > 6 else None
-        attn_sink = inputs[7] if len(inputs) > 7 else None
-        extra_indices = inputs[8] if len(inputs) > 8 else None
-        extra_topk_length = inputs[9] if len(inputs) > 9 else None
-        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        return (
-            topk_length is not None,
-            attn_sink is not None,
-            int(extra_topk),
-            extra_topk_length is not None,
-            self.primary_page_size,
-            self.extra_page_size,
-        )
-
-    def get_valid_tactics(
-        self,
-        inputs: list[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> list[int]:
-        del profile
-        indices = inputs[1]
-        extra_indices = inputs[8] if len(inputs) > 8 else None
-        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (
-            indices.shape[-1] + _CANDIDATES_PER_CHUNK - 1
-        ) // _CANDIDATES_PER_CHUNK + (
-            extra_topk + _CANDIDATES_PER_CHUNK - 1
-        ) // _CANDIDATES_PER_CHUNK
-        return list(range(1, num_splits + 1))
-
-    def forward(
-        self,
-        inputs: list[torch.Tensor],
-        tactic: int = -1,
-        do_preparation: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        del do_preparation
-        q, indices, mid_out, mid_lse, output, out_lse = inputs[:6]
-        topk_length, attn_sink, extra_indices, extra_topk_length = inputs[6:10]
-        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (
-            indices.shape[-1] + _CANDIDATES_PER_CHUNK - 1
-        ) // _CANDIDATES_PER_CHUNK + (
-            extra_topk + _CANDIDATES_PER_CHUNK - 1
-        ) // _CANDIDATES_PER_CHUNK
-        self.module.sparse_mla_sm120_nvfp4_decode(
-            q,
-            kwargs["kv_cache"],
-            indices,
-            mid_out,
-            mid_lse,
-            output,
-            out_lse,
-            num_splits,
-            kwargs["sm_scale"],
-            topk_length,
-            attn_sink,
-            kwargs.get("extra_kv_cache"),
-            extra_indices,
-            extra_topk_length,
-            int(tactic) if int(tactic) > 0 else 0,
-            False,
-        )
-        return output
-
-
-def _decode_hot_key(
-    runner: _SparseMlaNvfp4DecodeRunner,
-    inputs: list[torch.Tensor],
-) -> tuple[Any, ...]:
-    q, indices = inputs[:2]
-    extra_indices = inputs[8] if len(inputs) > 8 else None
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-    num_splits = (
-        indices.shape[-1] + _CANDIDATES_PER_CHUNK - 1
-    ) // _CANDIDATES_PER_CHUNK + (
-        extra_topk + _CANDIDATES_PER_CHUNK - 1
-    ) // _CANDIDATES_PER_CHUNK
-    return (
-        _decode_token_bucket(q.shape[0]),
-        q.shape[1],
-        indices.shape[-1],
-        extra_topk,
-        num_splits,
-        runner.get_cache_key_extras(inputs),
-    )
-
-
-def _run_nvfp4_decode(
-    runner: _SparseMlaNvfp4DecodeRunner,
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    indices: torch.Tensor,
-    mid_out: torch.Tensor,
-    mid_lse: torch.Tensor,
-    output: torch.Tensor,
-    out_lse: torch.Tensor,
-    sm_scale: float,
-    topk_length: torch.Tensor | None,
-    attn_sink: torch.Tensor | None,
-    extra_kv_cache: torch.Tensor | None,
-    extra_indices: torch.Tensor | None,
-    extra_topk_length: torch.Tensor | None,
-    chunks_per_block_override: int,
-) -> None:
-    inputs = [
-        q,
-        indices,
-        mid_out,
-        mid_lse,
-        output,
-        out_lse,
-        topk_length,
-        attn_sink,
-        extra_indices,
-        extra_topk_length,
-    ]
-    forward_kwargs = {
-        "sm_scale": sm_scale,
-        "kv_cache": kv_cache,
-        "extra_kv_cache": extra_kv_cache,
-    }
-    if chunks_per_block_override > 0:
-        runner(
-            inputs=inputs,
-            tactic=chunks_per_block_override,
-            **forward_kwargs,
-        )
-        return
-
-    tuner = AutoTuner.get()
-    if not tuner.is_tuning_mode:
-        cached_tactic = _decode_hot_cache.get(_decode_hot_key(runner, inputs))
-        if cached_tactic is not None:
-            runner(inputs=inputs, tactic=cached_tactic, **forward_kwargs)
-            return
-
-    chosen, tactic = tuner.choose_one(
-        _DECODE_AUTOTUNE_OP,
-        [runner],
-        _decode_tuning_config(),
-        inputs,
-        **forward_kwargs,
-    )
-    if int(tactic) > 0:
-        _decode_hot_cache[_decode_hot_key(runner, inputs)] = int(tactic)
-    chosen(inputs=inputs, tactic=tactic, **forward_kwargs)
 
 
 @functools.cache
 def get_sparse_mla_nvfp4_sm120_module():
     module = gen_sparse_mla_nvfp4_sm120_module().build_and_load()
-    decode_runners: dict[tuple[int, int], _SparseMlaNvfp4DecodeRunner] = {}
-
-    def get_decode_runner(
-        kv_cache: torch.Tensor,
-        extra_kv_cache: torch.Tensor | None,
-    ) -> _SparseMlaNvfp4DecodeRunner:
-        page_key = (
-            _cache_page_size(kv_cache),
-            _cache_page_size(extra_kv_cache),
-        )
-        runner = decode_runners.get(page_key)
-        if runner is None:
-            runner = _SparseMlaNvfp4DecodeRunner(module, *page_key)
-            decode_runners[page_key] = runner
-        return runner
 
     @register_custom_op(
         "flashinfer::sparse_mla_nvfp4_sm120_paged_attention",
@@ -351,8 +75,10 @@ def get_sparse_mla_nvfp4_sm120_module():
         if not use_prefill:
             if mid_out is None or mid_lse is None:
                 raise ValueError("NVFP4 decode requires mid_out and mid_lse workspace")
-            _run_nvfp4_decode(
-                get_decode_runner(kv_cache, extra_kv_cache),
+            num_splits = (indices.shape[1] + 63) // 64
+            if extra_indices is not None:
+                num_splits += (extra_indices.shape[1] + 63) // 64
+            module.sparse_mla_sm120_nvfp4_decode(
                 q,
                 kv_cache,
                 indices,
@@ -360,6 +86,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 mid_lse,
                 output,
                 out_lse,
+                num_splits,
                 sm_scale,
                 topk_length,
                 attn_sink,
@@ -367,6 +94,7 @@ def get_sparse_mla_nvfp4_sm120_module():
                 extra_indices,
                 extra_topk_length,
                 chunks_per_block_override,
+                False,
             )
         else:
             module.sparse_mla_sm120_nvfp4_prefill(
@@ -418,7 +146,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
     extra_topk_length: torch.Tensor | None = None,
     mid_out: torch.Tensor | None = None,
     mid_lse: torch.Tensor | None = None,
-    use_prefill: bool | None = None,
+    use_prefill: bool,
     chunks_per_block_override: int = 0,
 ) -> None:
     """Run the allocation-free NVFP4 sparse-MLA custom op."""
@@ -436,7 +164,7 @@ def _sparse_mla_nvfp4_sm120_paged_attention(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
-        q.shape[0] > 64 if use_prefill is None else use_prefill,
+        use_prefill,
         chunks_per_block_override,
     )
 

@@ -18,8 +18,9 @@
 
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv4_kernel.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv4_nvfp4_kernel.cuh>
-#include <flashinfer/attention/sparse_mla_sm120/prefill_dsv4_nvfp4_kernel.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/streaming_dsv4_nvfp4_kernel.cuh>
 
+#include "sparse_mla_sm120_nvfp4_common.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
@@ -34,44 +35,6 @@ namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 namespace {
 
-struct PagedLayout {
-  int page_size;
-  size_t page_stride_bytes;
-};
-
-PagedLayout parse_paged_layout(const TensorView& cache) {
-  constexpr int BPT = DECODE_BYTES_PER_TOKEN;
-  TVM_FFI_ICHECK_EQ(cache.dtype(), dl_uint8) << "kv_cache must be uint8";
-  if (cache.ndim() == 2) {
-    const size_t page_bytes = static_cast<size_t>(cache.size(1));
-    TVM_FFI_ICHECK_EQ(page_bytes % BPT, 0);
-    TVM_FFI_ICHECK_EQ(cache.stride(1), 1) << "kv_cache byte dimension must be contiguous";
-    TVM_FFI_ICHECK_GE(cache.stride(0), static_cast<int64_t>(page_bytes))
-        << "kv_cache page stride is smaller than its logical payload";
-    return {static_cast<int>(page_bytes / BPT), static_cast<size_t>(cache.stride(0))};
-  }
-  TVM_FFI_ICHECK(cache.ndim() == 3 || cache.ndim() == 4) << "kv_cache must be 2D, 3D, HND, or NHD";
-  TVM_FFI_ICHECK_EQ(cache.size(cache.ndim() - 1), BPT)
-      << "NVFP4 cache last dimension must be " << BPT;
-  int page_dim;
-  if (cache.ndim() == 3) {
-    page_dim = 1;
-  } else if (cache.size(1) == 1) {
-    page_dim = 2;
-  } else {
-    TVM_FFI_ICHECK_EQ(cache.size(2), 1) << "4D cache requires a singleton KV-head axis";
-    page_dim = 1;
-  }
-  const int page_size = static_cast<int>(cache.size(page_dim));
-  TVM_FFI_ICHECK_EQ(cache.stride(cache.ndim() - 1), 1)
-      << "kv_cache byte dimension must be contiguous";
-  TVM_FFI_ICHECK_EQ(cache.stride(page_dim), BPT)
-      << "kv_cache entries inside a page must have stride " << BPT;
-  TVM_FFI_ICHECK_GE(cache.stride(0), static_cast<int64_t>(page_size) * BPT)
-      << "kv_cache page stride is smaller than its logical payload";
-  return {page_size, static_cast<size_t>(cache.stride(0))};
-}
-
 template <int NUM_HEADS, int TOPK, int PAGE_SIZE, bool DUAL_CACHE>
 void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, bf16* mid_out,
                    float* mid_lse, bf16* output, float* out_lse, const int* topk_length,
@@ -80,8 +43,9 @@ void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, 
                    size_t extra_page_stride, int num_tokens, int num_splits,
                    int chunks_per_block_override, float sm_scale, size_t page_stride,
                    bool stage1_only, cudaStream_t stream) {
-  constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= PREFILL_HEADS_PER_CTA;
-  constexpr int GROUPED_H_BLOCKS = (NUM_HEADS + PREFILL_HEADS_PER_CTA - 1) / PREFILL_HEADS_PER_CTA;
+  constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
+  constexpr int GROUPED_H_BLOCKS =
+      (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
   constexpr int UNGROUPED_H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
   // Grouping amortizes the local V conversion only when both the candidate
   // range and the grouped grid are large enough. Keep the lower-overhead
@@ -125,13 +89,13 @@ void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, 
   const bool write_direct = !stage1_only && active_splits == 1;
   if constexpr (CAN_GROUP_HEADS) {
     if (use_grouped) {
-      constexpr size_t DYN_SMEM_BYTES = PrefillNVFP4Smem::SIZE;
+      constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
       auto grouped_kernel =
-          sparse_mla_prefill_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
+          sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
       NVFP4_CUDA_CHECK(cudaFuncSetAttribute(
           grouped_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
       grouped_kernel<<<dim3(num_tokens, GROUPED_H_BLOCKS, active_splits),
-                       dim3(PREFILL_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
+                       dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
           q, cache, indices, output, out_lse, mid_out, mid_lse, attn_sink, topk_length, extra_cache,
           extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride,
           num_tokens, active_splits, chunks_per_block, sm_scale, page_stride, write_direct);
@@ -237,7 +201,7 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
       << "extra_topk_length requires an extra cache";
 
   int extra_topk = 0;
-  PagedLayout extra_layout{0, 0};
+  PagedLayout extra_layout{0, 0, 0};
   const uint8_t* extra_cache_ptr = nullptr;
   const int32_t* extra_indices_ptr = nullptr;
   const int* extra_topk_length_ptr = nullptr;
@@ -254,7 +218,7 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
     TVM_FFI_ICHECK_EQ(extra_idx.size(0), num_tokens);
     extra_topk = static_cast<int>(extra_idx.size(1));
     TVM_FFI_ICHECK_GT(extra_topk, 0);
-    extra_layout = parse_paged_layout(extra_cache);
+    extra_layout = parse_nvfp4_paged_layout(extra_cache);
     TVM_FFI_ICHECK(extra_layout.page_size == 2 || extra_layout.page_size == 64)
         << "NVFP4 extra cache page_size must be 2 or 64";
     extra_cache_ptr = static_cast<const uint8_t*>(extra_cache.data_ptr());
@@ -271,7 +235,7 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
   const int expected_splits = (topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW +
                               (extra_topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW;
   TVM_FFI_ICHECK_EQ(num_splits, expected_splits);
-  const PagedLayout layout = parse_paged_layout(kv_cache);
+  const PagedLayout layout = parse_nvfp4_paged_layout(kv_cache);
   TVM_FFI_ICHECK_EQ(layout.page_size, 64) << "initial NVFP4 decode supports page_size=64";
   TVM_FFI_ICHECK_EQ(mid_out.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(mid_out.size(1), num_heads);
