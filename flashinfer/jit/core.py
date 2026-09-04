@@ -1,4 +1,5 @@
 import abc
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -443,10 +444,8 @@ class JitSpecNvcc(JitSpec):
             return False
 
     def _write_stamp(self) -> None:
-        try:
+        with contextlib.suppress(OSError):
             self.stamp_path.write_text(self._stamp_digest() + "\n")
-        except OSError:
-            pass
 
     def try_load(self) -> Optional[Any]:
         # Only the AOT artifact is known-valid without building.
