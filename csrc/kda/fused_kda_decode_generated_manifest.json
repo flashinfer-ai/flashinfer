@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "head_dim": 128,
+    "convolution_width": 4,
+    "activation_dtype": "bfloat16",
+    "state_dtypes": ["bfloat16", "float32"],
+    "lower_bound": "runtime_negative_or_null",
+    "norm_eps": "runtime_nonnegative",
+    "supported_heads": [12, 24, 32, 48, 96],
+    "kernel_abis": {
+      "standard": [
+        ["buffer", "x", "bfloat16"],
+        ["buffer", "weight", "float32"],
+        ["buffer", "conv_state", "bfloat16"],
+        ["buffer", "raw_gate", "bfloat16"],
+        ["buffer", "raw_beta", "bfloat16"],
+        ["buffer", "A_log", "float32"],
+        ["buffer", "dt_bias", "float32"],
+        ["buffer", "state_indices", "int32"],
+        ["buffer", "state", "state_dtype"],
+        ["buffer", "output_gate", "bfloat16"],
+        ["buffer", "norm_weight", "float32"],
+        ["buffer", "output", "bfloat16"],
+        ["parameter", "x_row_stride", "int32"],
+        ["parameter", "conv_slot_stride", "int32"],
+        ["parameter", "beta_row_stride", "int32"],
+        ["parameter", "state_slot_stride", "int32"],
+        ["parameter", "output_gate_row_stride", "int32"],
+        ["parameter", "H", "int32"],
+        ["parameter", "use_lower_bound", "int32"],
+        ["parameter", "lower_bound_log2", "float32_scalar"],
+        ["parameter", "norm_eps", "float32_scalar"]
+      ],
+      "repeated_safe": [
+        ["buffer", "x", "bfloat16"],
+        ["buffer", "weight", "float32"],
+        ["buffer", "conv_state", "bfloat16"],
+        ["buffer", "raw_gate", "bfloat16"],
+        ["buffer", "raw_beta", "bfloat16"],
+        ["buffer", "A_log", "float32"],
+        ["buffer", "dt_bias", "float32"],
+        ["buffer", "state_indices", "int32"],
+        ["buffer", "state", "state_dtype"],
+        ["buffer", "output_gate", "bfloat16"],
+        ["buffer", "norm_weight", "float32"],
+        ["buffer", "output", "bfloat16"],
+        ["parameter", "x_row_stride", "int32"],
+        ["parameter", "conv_slot_stride", "int32"],
+        ["parameter", "beta_row_stride", "int32"],
+        ["parameter", "state_slot_stride", "int32"],
+        ["parameter", "output_gate_row_stride", "int32"],
+        ["parameter", "H", "int32"],
+        ["parameter", "rows", "int32"],
+        ["parameter", "use_lower_bound", "int32"],
+        ["parameter", "lower_bound_log2", "float32_scalar"],
+        ["parameter", "norm_eps", "float32_scalar"]
+      ]
+    }
+  },
+  "status": "pending_generated_sources",
+  "variants": [],
+  "remaining_generated_inputs": [
+    "frozen CUDA bodies",
+    "source SHA-256 identities",
+    "kernel symbols and launch metadata",
+    "verified eligibility routes"
+  ]
+}
