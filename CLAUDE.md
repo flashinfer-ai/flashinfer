@@ -197,6 +197,23 @@ Install hooks to run on every commit:
 pre-commit install
 ```
 
+## Opening a Pull Request
+
+Follow [`CONTRIBUTING.md`](CONTRIBUTING.md) when opening a PR. The two requirements most often
+missed:
+
+- **Keep the default PR template.** Fill in `.github/pull_request_template.md` (Description,
+  Related Issues, Checklist, Tests, Reviewer Notes). Do **not** overwrite or replace it with a
+  custom or tool-generated description format. The title and description normally become the
+  commit title and message on squash-merge, and are what a `git bisect` surfaces months later
+  when someone is hunting the owner of a regression.
+- **Report before/after numbers for performance work.** A perf PR must include measurements from
+  a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), naming the GPU and the
+  problem sizes. Speedup ratios without absolute numbers, or numbers without a named GPU, are
+  not enough.
+
+→ **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
+
 ## Code Review
 
 When reviewing a diff (as an agent or a human), follow the shared focus areas, kernel-review
