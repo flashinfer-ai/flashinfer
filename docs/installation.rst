@@ -37,20 +37,47 @@ Package Options
 FlashInfer provides three packages:
 
 - **flashinfer-python**: Core package that compiles/downloads kernels on first use
-- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
-- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+- **flashinfer-cubin**: Pre-compiled kernel binaries (datacenter GPUs). Hosted on
+  ``https://flashinfer.ai/whl``, not PyPI (PyPI may list older releases).
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions.
+  Also hosted on ``https://flashinfer.ai/whl`` (CUDA-specific sub-index).
 
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 
 .. code-block:: bash
 
     pip install flashinfer-python
-    # cubin package
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
-    # JIT cache package (replace cu129 with your CUDA version: cu129, cu130, or cu134)
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+    flashinfer install-cubin-wheel
+    flashinfer install-jit-cache-wheel
 
 This eliminates compilation and downloading overhead at runtime.
+
+Upgrading
+"""""""""
+
+If you upgrade ``flashinfer-python`` (for example via ``pip install -U vllm``)
+but keep an older ``flashinfer-cubin`` install, ``import flashinfer`` can fail
+with a version mismatch. Upgrade the optional packages together:
+
+.. code-block:: bash
+
+    pip install -U flashinfer-python
+    flashinfer install-cubin-wheel
+    flashinfer install-jit-cache-wheel
+
+Or uninstall the optional packages and use runtime JIT instead:
+
+.. code-block:: bash
+
+    pip uninstall flashinfer-cubin flashinfer-jit-cache
+
+DGX Spark / GB10 (SM121)
+"""""""""""""""""""""""
+
+The ``flashinfer-cubin`` wheel ships datacenter GPU cubins. Kernels on DGX Spark
+/ GB10 are JIT-compiled at runtime. You do not need ``flashinfer-cubin`` on
+Spark; if an old cubin install is left over from a previous setup, uninstalling
+it avoids version-mismatch errors after upgrades.
 
 
 .. _install-from-source:
