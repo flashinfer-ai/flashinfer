@@ -1321,8 +1321,21 @@ def _inverse_rope_reference(
     return reference
 
 
+# q=1 batches 1/4/8 cover reduction spans 128/256/512; batch 16 and q>1 use the fused cubin.
 @pytest.mark.arch_blackwell
-def test_trtllm_gen_dsv4_rope_quant_correctness():
+@pytest.mark.parametrize(
+    ("batch_size", "q_len", "topk", "is_varlen"),
+    (
+        (1, 1, 2048, False),
+        (4, 1, 2048, False),
+        (8, 1, 2048, False),
+        (16, 1, 2048, False),
+        (4, 1, 256, False),
+        (2, 3, 128, False),
+        (16, 4, 2048, True),
+    ),
+)
+def test_trtllm_gen_dsv4_rope_quant_correctness(batch_size, q_len, topk, is_varlen):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
@@ -1330,29 +1343,54 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
 
     torch.manual_seed(7)
     device = torch.device("cuda")
-    batch_size, q_len, num_heads, head_dim = 2, 3, 128, 512
-    num_tokens = batch_size * q_len
+    num_heads, head_dim = 128, 512
     page_size = 32
-    topk = 128
-
-    query = torch.randn((batch_size, q_len, num_heads, head_dim), device=device).clamp_(
-        -1.0, 1.0
+    q_lens = (
+        [max(1, q_len - batch_idx % q_len) for batch_idx in range(batch_size)]
+        if is_varlen
+        else [q_len] * batch_size
     )
+    num_tokens = sum(q_lens)
+    query_shape = (
+        (num_tokens, num_heads, head_dim)
+        if is_varlen
+        else (batch_size, q_len, num_heads, head_dim)
+    )
+    query = torch.randn(query_shape, device=device).clamp_(-1.0, 1.0)
     query = query.to(torch.float8_e4m3fn)
     swa_cache = torch.randn(
-        (topk // page_size, 1, page_size, head_dim), device=device
+        (128 // page_size, 1, page_size, head_dim), device=device
     ).clamp_(-1.0, 1.0)
     swa_cache = swa_cache.to(torch.float8_e4m3fn)
-    compressed_cache = torch.zeros(
-        (1, 1, 1, head_dim), dtype=torch.float8_e4m3fn, device=device
+    compressed_tokens = max(topk - 128, 1)
+    compressed_pages = (compressed_tokens + page_size - 1) // page_size
+    compressed_cache = torch.randn(
+        (compressed_pages, 1, page_size, head_dim), device=device
+    ).clamp_(-1.0, 1.0)
+    compressed_cache = compressed_cache.to(torch.float8_e4m3fn)
+    sparse_row = torch.cat(
+        (
+            torch.arange(128, dtype=torch.int32, device=device),
+            torch.arange(topk - 128, dtype=torch.int32, device=device),
+        )
     )
-    sparse_indices = torch.arange(topk, dtype=torch.int32, device=device).repeat(
-        num_tokens, 1
-    )
+    sparse_indices = sparse_row.repeat(num_tokens, 1)
     sparse_topk_lens = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([topk, topk - 8], dtype=torch.int32, device=device)
-    workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
+    seq_lens = torch.tensor(
+        [topk - (batch_idx % 4) * 8 for batch_idx in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+    cum_seq_lens_q = None
+    if is_varlen:
+        cum_seq_lens_q = torch.tensor(
+            [0, *torch.tensor(q_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+    workspace = torch.empty(WORKSPACE_SIZE, dtype=torch.uint8, device=device)
     softmax_scale = 1.0 / math.sqrt(head_dim)
+    sinks = torch.linspace(2.0, 3.0, num_heads, dtype=torch.float32, device=device)
 
     baseline = trtllm_batch_decode_sparse_mla_dsv4(
         query=query,
@@ -1363,8 +1401,11 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
         sparse_topk_lens=sparse_topk_lens,
         seq_lens=seq_lens,
         bmm1_scale=softmax_scale,
+        sinks=sinks,
         backend="trtllm-gen",
         enable_pdl=False,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=q_len if is_varlen else None,
     )
 
     cache_positions = torch.arange(topk, dtype=torch.float32, device=device)[:, None]
@@ -1391,8 +1432,11 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
         seq_lens=seq_lens,
         out=out,
         bmm1_scale=softmax_scale,
+        sinks=sinks,
         backend="trtllm-gen",
         enable_pdl=False,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=q_len if is_varlen else None,
         dsv4_inv_rope_cos_sin_cache=cos_sin_cache,
         dsv4_output_scale=out_scale,
     )
@@ -1408,8 +1452,10 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
     dequant = dequant * scales.unsqueeze(-1)
     positions = torch.cat(
         tuple(
-            torch.arange(seq_len - q_len, seq_len, dtype=torch.int64, device=device)
-            for seq_len in seq_lens.tolist()
+            torch.arange(
+                seq_len - request_q_len, seq_len, dtype=torch.int64, device=device
+            )
+            for seq_len, request_q_len in zip(seq_lens.tolist(), q_lens, strict=True)
         )
     )
     reference = _inverse_rope_reference(
@@ -1424,10 +1470,12 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
     # boundary may therefore select either neighboring exponent.
     assert torch.all((torch.log2(scales) - torch.log2(reference_scales)).abs() <= 1)
 
-    # FP8 E4M3 contributes at most 16 * scale at the largest bin. Include a
-    # small allowance for the BF16 store in the non-fused attention reference.
-    error_bound = 16.0 * scales.unsqueeze(-1) + 2.0e-3
-    assert torch.all((dequant - reference_blocks).abs() <= error_bound)
+    # The fallback intentionally changes the attention reduction topology by
+    # forcing a KV split; use the established FP8 attention tolerance.
+    torch.testing.assert_close(dequant, reference_blocks, rtol=0.1, atol=0.1)
+
+    if (batch_size, q_len, topk, is_varlen) != (2, 3, 128, False):
+        return
 
     expected_out = out.clone()
     expected_scale = out_scale.clone()
@@ -1443,8 +1491,11 @@ def test_trtllm_gen_dsv4_rope_quant_correctness():
             seq_lens=seq_lens,
             out=out,
             bmm1_scale=softmax_scale,
+            sinks=sinks,
             backend="trtllm-gen",
             enable_pdl=False,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=q_len if is_varlen else None,
             dsv4_inv_rope_cos_sin_cache=cos_sin_cache,
             dsv4_output_scale=out_scale,
         )

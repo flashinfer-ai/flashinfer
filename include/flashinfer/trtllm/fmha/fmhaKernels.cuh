@@ -664,6 +664,11 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // If no fused cubin matched, the BF16 carrier must produce at least two partials so the
+      // separate reduction kernel can apply the requested DSv4 output epilogue.
+      if (params.dsv4OScalePtr != nullptr && !params.mFusesDsv4InvRopeFp8Quant) {
+        numCtasPerSeqKv = std::max(numCtasPerSeqKv, 2);
+      }
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
@@ -926,24 +931,6 @@ class TllmGenFmhaKernel {
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel(RunnerParams const& params,
                                  SelectKernelParams& selectKernelParams) const {
-    if (params.mFusesDsv4InvRopeFp8Quant) {
-      FLASHINFER_CHECK(params.isSparseMla() && params.mHeadDimQk == 512 &&
-                           params.mHeadDimV == 512 && params.mNumHeadsQPerKv == 128,
-                       "DSv4 RopeQuant requires dynamic sparse MLA with 128 query heads and "
-                       "head dimension 512.");
-      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-      selectKernelParams.mTileScheduler = TileScheduler::Persistent;
-      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-      selectKernelParams.mForceGmemReduction = true;
-      selectKernelParams.mHeadDimPerCtaV = 256;
-      selectKernelParams.mTileSizeQ = 64;
-      selectKernelParams.mTileSizeKv = 128;
-      selectKernelParams.mReuseSmemKForV = false;
-      selectKernelParams.mGroupsTokensHeadsQ = false;
-      selectKernelParams.mUses2CtaMma = true;
-      return;
-    }
-
     if (usesGroupedMlaGenerationKernel(params)) {
       selectGroupedMlaGenerationKernel(params, selectKernelParams);
       return;
@@ -1255,8 +1242,9 @@ class TllmGenFmhaKernel {
         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
         ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
-        ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mFusesDsv4InvRopeFp8Quant) +
-        ", usesDsv4Ue8m0ScaleO=" + std::to_string(params.mFusesDsv4InvRopeFp8Quant);
+        ", fusesDsv4InvRopeFp8Quant=" +
+        std::to_string(selectKernelParams.mFusesDsv4InvRopeFp8Quant) +
+        ", usesDsv4Ue8m0ScaleO=" + std::to_string(selectKernelParams.mFusesDsv4InvRopeFp8Quant);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1275,8 +1263,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
                /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
-               selectKernelParams.mUsesSpcompress, params.mFusesDsv4InvRopeFp8Quant,
-               /*usesDsv4Ue8m0ScaleO=*/params.mFusesDsv4InvRopeFp8Quant),
+               selectKernelParams.mUsesSpcompress, selectKernelParams.mFusesDsv4InvRopeFp8Quant,
+               /*usesDsv4Ue8m0ScaleO=*/selectKernelParams.mFusesDsv4InvRopeFp8Quant),
         info);
   }
 

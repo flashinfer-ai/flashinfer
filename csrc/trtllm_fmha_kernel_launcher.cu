@@ -252,7 +252,7 @@ void trtllm_paged_attention_launcher(
   runner_params.oSfPtr = out_scale_factor;
   runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
   runner_params.dsv4OScalePtr = dsv4_output_scale;
-  runner_params.mDsv4ScaleBufM = static_cast<int>(dsv4_scale_buf_m);
+  runner_params.mDsv4ScaleBufM = dsv4_scale_buf_m;
   runner_params.mFusesDsv4InvRopeFp8Quant = dsv4_inv_rope_cos_sin_cache != nullptr;
   runner_params.mSfStartTokenIdx = o_sf_start_index;
   runner_params.mScaleSfO = o_sf_scale;
@@ -377,6 +377,14 @@ void trtllm_paged_attention_launcher(
   runner_params.mUsesSpcompress = uses_spcompress;
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
+  if (!foundKernels && runner_params.mFusesDsv4InvRopeFp8Quant) {
+    // If the normal sparse-MLA heuristic has no matching fused cubin, run its BF16 split-KV
+    // carrier and let the separate reduction kernel apply the same output epilogue.
+    fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type,
+                                              Data_type::DATA_TYPE_BF16);
+    runner_params.mFusesDsv4InvRopeFp8Quant = false;
+    std::tie(foundKernels, kinfo) = fmha_runner->isSupportedWithInfo(runner_params);
+  }
   if (!foundKernels) {
     std::ostringstream err_msg;
     err_msg << "Missing TRTLLM-GEN kernel ("

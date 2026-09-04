@@ -350,7 +350,7 @@ struct TllmGenFmhaRunnerParams {
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
   // Padded token dimension of the DSv4 packed UE8M0 output-scale tensor.
-  int mDsv4ScaleBufM;
+  int64_t mDsv4ScaleBufM;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
   // Whether the fixed DSv4 inverse-RoPE + FP8 quant epilogue is selected.
@@ -433,6 +433,8 @@ struct TllmGenSelectKernelParams {
   bool mUseFp16Softmax;
   // Use spcompress or not.
   bool mUsesSpcompress;
+  // Select the DSv4 inverse-RoPE + E4M3/UE8M0 fused cubin when its exact key exists.
+  bool mFusesDsv4InvRopeFp8Quant;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -452,8 +454,9 @@ struct TllmGenSelectKernelParams {
         mHeadDimPerCtaV(params.mHeadDimV)
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         ,
-        mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction
-                                                 : MultiCtasKvMode::Disabled),
+        mMultiCtasKvMode((params.mMultiCtasKvMode && !params.mFusesDsv4InvRopeFp8Quant)
+                             ? MultiCtasKvMode::GmemReduction
+                             : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
@@ -463,7 +466,9 @@ struct TllmGenSelectKernelParams {
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
-        mTileScheduler(params.mTileScheduler),
+        mFusesDsv4InvRopeFp8Quant(params.mFusesDsv4InvRopeFp8Quant),
+        mTileScheduler(params.mFusesDsv4InvRopeFp8Quant ? TileScheduler::Persistent
+                                                        : params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),
