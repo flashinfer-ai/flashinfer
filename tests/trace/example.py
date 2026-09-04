@@ -18,6 +18,7 @@ bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
+fused_sampling_hy3_v120832.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
@@ -1586,6 +1587,13 @@ with contextlib.suppress(Exception):
     flashinfer.top_k_mask_logits(_sp_logits, 50)
 with contextlib.suppress(Exception):
     flashinfer.top_k_top_p_sampling_from_logits(_sp_logits, 50, 0.9)
+
+# HY3 heavy sampling path (packed penalty + temperature + top-k/top-p + Gumbel).
+with contextlib.suppress(Exception):
+    _hy3_sampling_inputs = flashinfer.fused_sampling_from_logits_hy3.fi_init(
+        batch_size=8, device=device
+    )
+    flashinfer.fused_sampling_from_logits_hy3(**_hy3_sampling_inputs)
 
 # chain_speculative_sampling.
 with contextlib.suppress(Exception):

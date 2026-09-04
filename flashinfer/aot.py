@@ -168,6 +168,7 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
+from .jit.sampling_hy3 import gen_fused_sampling_hy3_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -859,6 +860,8 @@ def gen_all_modules(
         ]
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
+            # The fused sampler's CUDA path is specialized for B200 (SM100).
+            jit_specs.append(gen_fused_sampling_hy3_module())
             for C in _SUPPORTED_C:
                 for tokens in _SUPPORTED_TOKENS:
                     for dtype in ["bf16", "fp8", "nvfp4"]:
