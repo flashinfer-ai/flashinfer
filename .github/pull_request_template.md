@@ -34,11 +34,12 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
   - [ ] The tracking issue names an owner, the reason for the experimental path, and a graduation plan with a target release.
   - [ ] Core changes are limited to a thin entry point (signature, shared validation, feature-gate check, backend selection, handoff).
   - [ ] Tests live in `tests/experimental/` and were validated on the intended hardware; a runnable example is included.
-  - [ ] Nothing is registered in `flashinfer/aot.py`, and all experimental behavior is gated behind `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`.
+  - [ ] Nothing is registered in `flashinfer/aot.py`, and no experimental backend is reachable from `backend="auto"` without `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. (Calling an `@flashinfer_experimental_api` or naming a backend explicitly is itself the opt-in and needs no environment variable.)
   - [ ] **Test scope declared below.** The experimental CI lane runs exactly these targets, so keep them as narrow as the change allows.
 
 <!-- Required for experimental PRs. Replace the commented lines below with your targets.
-     Do not delete the fence or change its `experimental-tests` tag — CI reads it verbatim. -->
+     Do not delete the fence or change its `experimental-tests` tag — the experimental-track
+     watcher reads it verbatim to decide which targets to ask CI for. -->
 
 ```experimental-tests
 # One target per line: a directory or a file. (A pytest ::selector is not
