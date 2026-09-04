@@ -83,10 +83,7 @@ def _aligned_tensor(tensor, alignment):
 
 def _copy_to_generated_alignment(tensor, alignment):
     """Stage a tensor when its storage offset weakens the generated ABI alignment."""
-    if (
-        not isinstance(tensor, torch.Tensor)
-        or int(tensor.data_ptr()) % alignment == 0
-    ):
+    if not isinstance(tensor, torch.Tensor) or int(tensor.data_ptr()) % alignment == 0:
         return tensor
     staged = torch.empty_strided(
         tensor.shape,
@@ -752,9 +749,7 @@ def _select_generated_variant(
         return None
     if int(conv_state.stride(0)) * conv_state.element_size() % 8:
         return None
-    state_alignment = (
-        16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
-    )
+    state_alignment = 16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
     if int(state.stride(0)) * state.element_size() % state_alignment:
         return None
 
@@ -818,9 +813,7 @@ def _run_generated_variant(
 ) -> None:
     module = load_fused_kda_decode_generated_module(variant.name, variant.target)
     generated_conv_state = _copy_to_generated_alignment(conv_state, 8)
-    state_alignment = (
-        16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
-    )
+    state_alignment = 16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
     generated_state = _copy_to_generated_alignment(state, state_alignment)
     generated_output = _copy_to_generated_alignment(output, 8)
     module.run(
