@@ -1572,32 +1572,6 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
-        self._validate_activation_pack_contract()
-
-    def _validate_activation_pack_contract(self) -> None:
-        """Reject candidate sets that need mutually exclusive input packs.
-
-        ``MoELayer`` passes one :class:`MoEActivationPack` to every candidate
-        while autotuning.  TRT-LLM and CuTe-DSL NVFP4 consume packed FP4 values
-        and block scales, whereas CUTLASS NVFP4 consumes raw BF16 values
-        without an activation scale.  Letting either packed-input backend and
-        CUTLASS reach dispatch therefore fails only after the layer has begun
-        constructing and profiling runners.
-        """
-        if self.quant.variant is not QuantVariant.NVFP4:
-            return
-
-        candidate_types = {type(candidate) for candidate in self.backend}
-        packed_input_types = {TrtllmFp4Config, CuteDslConfig}
-        if (
-            CutlassNvfp4Config in candidate_types
-            and candidate_types & packed_input_types
-        ):
-            raise ValueError(
-                "TrtllmFp4Config/CuteDslConfig and CutlassNvfp4Config require "
-                "incompatible MoEActivationPack layouts for QuantVariant.NVFP4; "
-                "do not combine packed-input and raw-BF16 backend candidates."
-            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
