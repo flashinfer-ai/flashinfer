@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from flashinfer.jit import core as jit_core
 from flashinfer.jit.flash_kda_evolution import (
     FLASH_KDA_EVOLUTION_VARIANTS,
     _module_ident,
@@ -278,7 +279,15 @@ def test_flashkda_evolution_routes_persistent_scalar_by_sm_count(
 
 @pytest.mark.parametrize("target", ["sm100a", "sm100f", "sm103a"])
 @pytest.mark.parametrize("variant", FLASH_KDA_EVOLUTION_VARIANTS)
-def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
+def test_flashkda_evolution_jit_spec_has_one_generated_binding(
+    monkeypatch, variant, target
+):
+    target_arch = (10, "3a") if target == "sm103a" else (10, "0a")
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {target_arch},
+    )
     spec = gen_flash_kda_evolution_module(variant, target)
     assert spec.name.endswith(target)
     assert len(spec.sources) == 1
