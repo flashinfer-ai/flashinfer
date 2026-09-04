@@ -114,13 +114,14 @@ def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     )
 
 
-def test_barrier_flag_pad_covers_release_and_rank_zero_arrival_words():
+def test_barrier_flag_pad_covers_epochs_and_double_buffered_peer_mailboxes():
     module = _session_module()
 
     assert module._BARRIER_PHASES == 2
-    assert module._BARRIER_SLOTS_PER_RANK == 18
-    assert module._BARRIER_SLOTS_PER_RANK == module._BARRIER_PHASES * (
-        module._WORLD_SIZE + 1
+    assert module._BARRIER_BANKS == 2
+    assert module._BARRIER_SLOTS_PER_RANK == 34
+    assert module._BARRIER_SLOTS_PER_RANK == module._BARRIER_PHASES + (
+        module._BARRIER_PHASES * module._BARRIER_BANKS * module._WORLD_SIZE
     )
 
 

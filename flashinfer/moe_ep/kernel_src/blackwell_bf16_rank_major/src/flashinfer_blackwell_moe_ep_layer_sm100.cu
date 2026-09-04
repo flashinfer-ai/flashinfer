@@ -364,52 +364,40 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
     for (int route = tid; route < active_tokens_per_rank * 8; route += 32) {
         topk_ids[route] = (int)expert_ids[route];
     }
-    if (warp == 0) {
-        if (elect_sync()) {
-            // nvlink_barrier(pg_flags) phase=0
-            {
-                const int __ws = pg_world;
-                const int __me = pg_rank;
-                const int __release_slot = 0;
-                const int __arrival_base = 2 + 0 * __ws;
-                unsigned* __local_release = pg_flags[__me] + __release_slot;
-                unsigned __previous_epoch;
-                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                    : "=r"(__previous_epoch) : "l"(__local_release) : "memory");
-                const unsigned __arrival_epoch = __previous_epoch + 1u;
-                const unsigned __release_epoch = __previous_epoch + 2u;
-                asm volatile("fence.proxy.async.global;" ::: "memory");
-                unsigned* __coordinator_arrival = pg_flags[0] + __arrival_base + __me;
+    // nvlink_barrier(pg_flags) phase=0 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 0;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
                 asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__coordinator_arrival), "r"(__arrival_epoch) : "memory");
-                if (__me == 0) {
-                    for (int __r = 0; __r < __ws; ++__r) {
-                        unsigned* __local_arrival = pg_flags[0] + __arrival_base + __r;
-                        while (true) {
-                            unsigned __v;
-                            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
-                            if (__v != __arrival_epoch) continue;
-                            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
-                            if (__v == __arrival_epoch) break;
-                        }
-                    }
-                    asm volatile("fence.proxy.alias;" ::: "memory");
-                    for (int __r = 0; __r < __ws; ++__r) {
-                        unsigned* __peer_release = pg_flags[__r] + __release_slot;
-                        asm volatile("st.release.sys.global.u32 [%0], %1;"
-                            :: "l"(__peer_release), "r"(__release_epoch) : "memory");
-                    }
-                } else {
-                    while (true) {
-                        unsigned __v;
-                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
-                        if (__v != __release_epoch) continue;
-                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
-                        if (__v == __release_epoch) break;
-                    }
-                    asm volatile("fence.proxy.alias;" ::: "memory");
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
                 }
-                asm volatile("fence.proxy.async.global;" ::: "memory");
+                asm volatile("fence.proxy.alias;" ::: "memory");
+            }
+            __syncwarp();
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
             }
         }
     }
@@ -3423,52 +3411,40 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (warp == 0) {
-        if (elect_sync()) {
-            // nvlink_barrier(pg_flags) phase=1
-            {
-                const int __ws = pg_world;
-                const int __me = pg_rank;
-                const int __release_slot = 1;
-                const int __arrival_base = 2 + 1 * __ws;
-                unsigned* __local_release = pg_flags[__me] + __release_slot;
-                unsigned __previous_epoch;
-                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                    : "=r"(__previous_epoch) : "l"(__local_release) : "memory");
-                const unsigned __arrival_epoch = __previous_epoch + 1u;
-                const unsigned __release_epoch = __previous_epoch + 2u;
-                asm volatile("fence.proxy.async.global;" ::: "memory");
-                unsigned* __coordinator_arrival = pg_flags[0] + __arrival_base + __me;
+    // nvlink_barrier(pg_flags) phase=1 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 1;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
                 asm volatile("st.release.sys.global.u32 [%0], %1;"
-                    :: "l"(__coordinator_arrival), "r"(__arrival_epoch) : "memory");
-                if (__me == 0) {
-                    for (int __r = 0; __r < __ws; ++__r) {
-                        unsigned* __local_arrival = pg_flags[0] + __arrival_base + __r;
-                        while (true) {
-                            unsigned __v;
-                            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
-                            if (__v != __arrival_epoch) continue;
-                            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_arrival) : "memory");
-                            if (__v == __arrival_epoch) break;
-                        }
-                    }
-                    asm volatile("fence.proxy.alias;" ::: "memory");
-                    for (int __r = 0; __r < __ws; ++__r) {
-                        unsigned* __peer_release = pg_flags[__r] + __release_slot;
-                        asm volatile("st.release.sys.global.u32 [%0], %1;"
-                            :: "l"(__peer_release), "r"(__release_epoch) : "memory");
-                    }
-                } else {
-                    while (true) {
-                        unsigned __v;
-                        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
-                        if (__v != __release_epoch) continue;
-                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_release) : "memory");
-                        if (__v == __release_epoch) break;
-                    }
-                    asm volatile("fence.proxy.alias;" ::: "memory");
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
                 }
-                asm volatile("fence.proxy.async.global;" ::: "memory");
+                asm volatile("fence.proxy.alias;" ::: "memory");
+            }
+            __syncwarp();
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
             }
         }
     }
