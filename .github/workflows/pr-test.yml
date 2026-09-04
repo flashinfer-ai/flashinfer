@@ -101,6 +101,8 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       test_matrix: ${{ steps.matrix.outputs.matrix }}
       test_count: ${{ steps.matrix.outputs.count }}
+      # Surfaced so the required check can say a green result was scoped.
+      test_scope: ${{ steps.scope.outputs.test_path }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -637,6 +639,19 @@ jobs:
           RESULT="${{ needs.test.result }}"
           echo "Tests: ${{ needs.setup.outputs.test_count }}, result: $RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # A scope is sticky per SHA: re-applying run-ci by hand on a commit that
+          # once had a scoped bot run silently reuses it, so this required check can
+          # go green having run three narrow lanes. The job names change from "JIT
+          # Unittest" to "Targeted Unittest", but that is easy to miss on a check
+          # list -- say it outright on the check a merge decision actually reads.
+          SCOPE="${{ needs.setup.outputs.test_scope }}"
+          if [ -n "$SCOPE" ]; then
+            echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`$SCOPE\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
