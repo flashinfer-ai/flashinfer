@@ -156,11 +156,19 @@ jobs:
             # or a backticked path must still start the full suite the way it always
             # did. Failing closed here would turn the trigger into a no-op and the
             # only signal would be a red bot job on a PR with no test checks at all.
+            #
+            # Both calls are inside the same condition on purpose. `mapfile < <(...)`
+            # reports the status of mapfile, never of the child, so chunking used to
+            # fail (a target too long to split) while the step sailed on with an empty
+            # CHUNKS -- full suite substituted, and no note posted, which is precisely
+            # what this branch promises not to do. Capture first, check, then split.
             if SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
                   --targets "$ARGS" --root tests/ --no-check-exists --test-path \
-                  2>/tmp/scope_err); then
-              mapfile -t CHUNKS < <(python3 scripts/pr_checks/experimental_test_scope.py \
-                --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140)
+                  2>/tmp/scope_err) \
+               && CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                  --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
+                  2>>/tmp/scope_err); then
+              mapfile -t CHUNKS <<< "$CHUNKED"
             else
               # This body must NOT contain the bot's own trigger phrase. The job guard
               # is `contains(comment.body, '@flashinfer-bot')` with no bot-author

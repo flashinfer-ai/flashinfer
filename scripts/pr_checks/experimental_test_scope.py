@@ -286,6 +286,15 @@ def _selftest() -> int:
             )
             failures += 1
 
+    # An unsplittable target must surface as a clean ValueError from main()'s guard,
+    # not as a traceback, because the caller cannot see the exit status.
+    try:
+        chunk([ROOT + "t_" + "z" * 200 + ".py"], 140)
+        print("FAIL (unsplittable target accepted by chunk)", file=sys.stderr)
+        failures += 1
+    except ValueError:
+        pass
+
     # Bounds behaviour, relative to whatever the (now-pinned) constant is.
     try:
         validate([f"{ROOT}test_{i}.py" for i in range(MAX_TARGETS)], ROOT)
@@ -404,11 +413,16 @@ def main() -> int:
                 validate(targets, args.root)
         if not args.no_check_exists:
             check_exists(targets, args.repo_root)
+        # Inside the try: chunk() raises ValueError for a target too long to split,
+        # and an uncaught traceback here is worse than it looks -- the caller reads
+        # this through `mapfile < <(...)`, which discards the child's status, so the
+        # scope silently became "full suite" with no note to the requester.
+        chunked = chunk(targets, args.chunk) if args.chunk else None
     except ValueError as e:
         print(f"experimental test scope: {e}", file=sys.stderr)
         return 1
-    if args.chunk:
-        print("\n".join(chunk(targets, args.chunk)))
+    if chunked is not None:
+        print("\n".join(chunked))
     else:
         print(" ".join(targets) if args.test_path else "\n".join(targets))
     return 0
