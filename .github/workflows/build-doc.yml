@@ -4,32 +4,68 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
   pull_request:
     branches:
       - main
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+  # Allow an existing release tag to be redeployed, for example when repairing
+  # the current stable documentation site after this workflow is introduced.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy (for example, v0.6.18)'
+        required: true
+        type: string
+
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Release tag to deploy'
+        required: true
+        type: string
+
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
-# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
 
 jobs:
   test_linux:
-    name: Deploy Docs
+    name: Build Docs
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v2
       with:
+        # Qualify manual inputs as tags so a same-named branch can never be
+        # deployed in place of a release.
+        ref: ${{ inputs.release_tag != '' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
         submodules: recursive
+
+    - name: Validate release tag and version
+      if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+      env:
+        RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
+      run: |
+        if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
+          echo "Invalid release tag: ${RELEASE_TAG}"
+          exit 1
+        fi
+
+        TAG_VERSION="${RELEASE_TAG#v}"
+        FILE_VERSION="$(tr -d '[:space:]' < version.txt)"
+        if [[ "${TAG_VERSION}" != "${FILE_VERSION}" ]]; then
+          echo "Release tag ${RELEASE_TAG} does not match version.txt (${FILE_VERSION})"
+          exit 1
+        fi
+
+        TAG_SHA="$(git rev-list -n 1 "${RELEASE_TAG}")"
+        HEAD_SHA="$(git rev-parse HEAD)"
+        if [[ "${TAG_SHA}" != "${HEAD_SHA}" ]]; then
+          echo "Checked-out commit ${HEAD_SHA} does not match ${RELEASE_TAG} (${TAG_SHA})"
+          exit 1
+        fi
 
     - name: Setup Python
       uses: actions/setup-python@v4
@@ -51,13 +87,29 @@ jobs:
         ./build_docs.sh
 
     - name: Upload artifact
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      if: inputs.release_tag != ''
       uses: actions/upload-pages-artifact@v3
       with:
         # Upload entire repository
         path: 'docs/_build/html'
 
+  deploy:
+    name: Deploy Docs
+    needs: test_linux
+    if: inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Serialize production deployments without allowing main/PR build-only
+    # runs to replace a pending release deployment.
+    concurrency:
+      group: "pages"
+      cancel-in-progress: false
+    steps:
     - name: Deploy to GitHub Pages
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       id: deployment
       uses: actions/deploy-pages@v4
