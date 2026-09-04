@@ -181,7 +181,14 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
     } else if constexpr (!IsMXFPX && is_wfp4afp8) {
       TLLM_THROW("MXFPX is the only supported scaling type for WFP4AFP8");
     } else {
+      // The gather-A mainloop is SM90-only; the TMA WS input must have been
+      // prepared for gather exactly when the tactic requests it (skipped for
+      // workspace-size queries which pass a default-constructed input).
+      TLLM_CHECK_WITH_INFO(
+          workspace_size != nullptr || hopper_input.use_gather_a == gemm_config.gather_a,
+          "TMA WS input gather-A flag does not match the selected tactic");
       if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120) {
+        TLLM_CHECK_WITH_INFO(!gemm_config.gather_a, "gather_a tactics are only supported on SM90");
         bool const dynamic_cga =
             gemm_config.dynamic_cluster_shape != cutlass_extensions::ClusterShape::Undefined;
         bool const swap_ab = hopper_input.swap_ab;
@@ -213,6 +220,28 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
                            Arch::kMinComputeCapability == 90) {
         using EpilogueSchedule = void;  // These are hardcoded in the launcher
         constexpr bool dynamic_cga = false;
+        // Explicit gather-A instantiations only exist for this combination
+        constexpr bool gather_a_instantiated =
+            Arch::kMinComputeCapability == 90 &&
+            kernels::cutlass_kernels::isValidSM90GatherAMOESpecialisation<T, WeightType,
+                                                                          EpilogueTag, FUSION>() &&
+            cute::size(ClusterShape{}) == 1 && !IsMXFPX;
+        if (gemm_config.gather_a) {
+          if constexpr (gather_a_instantiated) {
+            TLLM_CHECK_WITH_INFO(!hopper_input.swap_ab, "gather_a tactics do not support swap_ab");
+            auto selected_func =
+                kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+                    Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
+                    TileShape, ClusterShape, IsMXFPX, dynamic_cga, false, /*SwapAB=*/false,
+                    /*GatherA=*/true>;
+            selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
+                          workspace_size, {}, {});
+            return;
+          } else {
+            TLLM_THROW("gather_a tactic selected for an unsupported configuration.\nConfig was %s",
+                       gemm_config.toString().c_str());
+          }
+        }
         auto selected_func =
             hopper_input.swap_ab
                 ? kernels::cutlass_kernels_oss::

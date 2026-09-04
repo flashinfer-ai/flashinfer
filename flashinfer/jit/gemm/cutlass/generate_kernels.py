@@ -157,6 +157,7 @@ class TrtLlm_GemmLauncher:
         sm90_mixed_input_kernel_type="warp_specialized",
         dynamic_cga=False,
         swap_ab=False,
+        gather_a=False,
     ):
         self.gemm_kind = gemm_kind
         self.arch = arch
@@ -179,6 +180,7 @@ class TrtLlm_GemmLauncher:
         self.mixed_input_scale_mode = mixed_input_scale_mode
         self.sm90_mixed_input_kernel_type = sm90_mixed_input_kernel_type
         self.swap_ab = swap_ab
+        self.gather_a = gather_a
 
     def __repr__(self):
         kernel_prefix = "{}_sm{}_{}_{}_{}_{}_{}_{}_{}_{}x{}x{}_{}x{}x{}_{}".format(
@@ -200,7 +202,7 @@ class TrtLlm_GemmLauncher:
             self.stages,
         )
 
-        hopper_suffix = "_{}x{}x{}{}{}{}{}{}".format(
+        hopper_suffix = "_{}x{}x{}{}{}{}{}{}{}".format(
             self.cga_shape[0],
             self.cga_shape[1],
             self.cga_shape[2],
@@ -209,6 +211,7 @@ class TrtLlm_GemmLauncher:
             EpiFusionSuffixes[self.epi_fusion],
             "_mxfpx_" if self.is_mx_fpx else "",
             "_swap_ab" if self.swap_ab else "",
+            "_gather_a" if self.gather_a else "",
         )
         if self.mixed_input_scale_mode != "post_mma":
             hopper_suffix += f"_{self.mixed_input_scale_mode}"
@@ -320,6 +323,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             use_dynamic_cga = str(operation.dynamic_cga).lower()
             use_bias = str(False).lower()
             swap_ab = str(operation.swap_ab).lower()
+            gather_a = str(operation.gather_a).lower()
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -331,7 +335,7 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
         {epi_sched}, {epi_tag}, {epi_fusion},
         {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]},
-        {is_mx_fpx}, {use_dynamic_cga}, {use_bias}, {swap_ab});
+        {is_mx_fpx}, {use_dynamic_cga}, {use_bias}, {swap_ab}, {gather_a});
 #endif"""
     return instantiation
 
@@ -682,6 +686,39 @@ def generate_sm90_grouped_gemm_operations(is_arch_enabled):
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
+
+                # Gather-A GEMM1 duplicates: currently only supported for 16-bit
+                # same-type dtypes, fusion NONE, 1x1x1 cluster, no swap_ab.
+                # Python mirror of isValidSM90GatherAMOESpecialisation
+                # (moe_tma_warp_specialized_traits.h, the compile-time source
+                # of truth).
+                if (
+                    dtype in (DataType.f16, DataType.bf16)
+                    and epi_fusion == TrtLlm_EpilogueFusion.epilogue_fusion_none
+                    and cga_shape == (1, 1, 1)
+                    and not swap_ab
+                ):
+                    gather_a_operation = TrtLlm_GemmLauncher(
+                        GemmKind.Grouped,
+                        arch,
+                        dtype,
+                        dtype,
+                        dtype,
+                        dtype,
+                        otype,
+                        quant_op,
+                        epi_tag,
+                        cta_shape_mnk,
+                        warp_shape,
+                        stages,
+                        cga_shape,
+                        mainloop_schedule,
+                        epi_schedule,
+                        epi_fusion,
+                        swap_ab=swap_ab,
+                        gather_a=True,
+                    )
+                    operations.append(gather_a_operation)
     return operations
 
 
@@ -1160,6 +1197,7 @@ def generate_gemm_operations(output_dir, architectures):
             op.cta_shape[0],
             op.arch >= 100 and (op.weight_type == e2m1 or op.is_mx_fpx),
             is_mixed_dtype_grouped(op),
+            getattr(op, "gather_a", False),
         )
         op_group = op_groups.get(dict_key, [])
         if len(op_group) == 0 or len(op_group[-1]) >= GROUP_SIZE:
@@ -1170,13 +1208,13 @@ def generate_gemm_operations(output_dir, architectures):
 
     file_list = []
     for key, value in op_groups.items():
-        gemm_kind, arch, m, block_scale, is_mixed = key
+        gemm_kind, arch, m, block_scale, is_mixed, gather_a = key
         for i, op_sub_group in enumerate(value):
             out_file = os.path.join(
                 output_dir,
                 GemmKindNames[gemm_kind],
                 str(arch),
-                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}_group{i}.generated.cu",
+                f"cutlass_kernel_file_{GemmKindNames[gemm_kind]}_sm{arch}_M{m}{'_BS' if block_scale else ''}{'_Mixed' if is_mixed else ''}{'_GatherA' if gather_a else ''}_group{i}.generated.cu",
             )
             inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
             write_file(inl_file, op_sub_group, out_file)
