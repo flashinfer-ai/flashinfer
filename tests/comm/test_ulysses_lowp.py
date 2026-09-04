@@ -105,10 +105,11 @@ def test_unpack_rejects_unaligned_local_sequence():
 
 
 @requires_sm120
-def test_capability_and_abi():
-    assert lowp.abi_version() == 3
+def test_capability_and_layout_constants():
     cap = lowp.capability("cuda")
-    assert cap["compiled_abi_version"] == 3
+    assert cap["compiled_q_group"] == lowp.Q_GROUP
+    assert cap["compiled_k_group"] == lowp.K_GROUP
+    assert cap["compiled_head_dim"] == lowp.HEAD_DIM
     assert cap["supported"] is True
     assert lowp.STATS_PROTOCOL == 3
 

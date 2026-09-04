@@ -97,11 +97,16 @@ quant_and_pack(q, kv, stats)             →  payload  [boundary groups use merg
 On 128-aligned shards, Protocol 2 and Protocol 3 produce byte-identical
 payloads (covered by the test suite).
 
-## 4. Payload Layout — ABI v3
+## 4. Payload Layout
 
 The payload is a flat bytes buffer with a fixed-order section layout. All
 sections are contiguous with no inter-section padding; the buffer ends with a
 128-byte zero tail for alignment.
+
+The layout is determined by three compiled-in constants: `Q_GROUP = 32`,
+`K_GROUP = 64`, `HEAD_DIM = 128`. The Python layer verifies these match the
+compiled kernel at import time via `capability()`; a mismatch means the
+kernel was built with different grouping parameters and the path is disabled.
 
 ```
 Section       Dtype       Shape                         Notes
@@ -133,10 +138,10 @@ All public symbols live in `flashinfer.comm.ulysses_lowp`.
 capability() -> bool
 ```
 
-Returns `True` when the compiled ABI version matches `ABI_VERSION` and the
-device is in `SUPPORTED_DEVICE_CAPABILITIES`. Import succeeds on all
-platforms; callers that depend on the lowp path should gate on
-`capability()` rather than catching import errors.
+Returns `True` when the compiled kernel's `Q_GROUP`, `K_GROUP`, and
+`HEAD_DIM` constants match the Python-side values and the device is SM120.
+Import succeeds on all platforms; callers that depend on the lowp path
+should gate on `capability()` rather than catching import errors.
 
 ### Stats flow
 
@@ -220,7 +225,7 @@ This module does not provide:
   intra-node NVLink all-to-all. Cross-node payload compression or alternate
   quantization formats are out of scope.
 - **Hopper (SM 9.0) native WGMMA kernel support.** The scale granularity
-  in ABI v3 (Q per-32-token, K per-64-token) is matched to the `_qattn_sm89`
+  (Q_GROUP=32 / K_GROUP=64) is matched to the `_qattn_sm89`
   grid used by SageAttention2 on both SM89 and SM120. A future ABI variant
   targeting the SM90 WGMMA kernel (Q per-16-token, K per-128-token) would
   require new kernel instances and is not part of this PR.

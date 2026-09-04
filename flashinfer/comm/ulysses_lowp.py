@@ -54,7 +54,6 @@ from ..trace.templates.comm import (
 )
 from ..utils import device_support_pdl, register_custom_op
 
-ABI_VERSION = 3
 # Stats protocol 3 (ALIGN-128): ONE stats AllGather carrying the K per-channel
 # sum and V per-channel amax only.  The ALIGN-128 shard guarantee
 # (local_sequence % 128 == 0, enforced by the unpack precondition) removes
@@ -426,10 +425,10 @@ def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int,
 def capability(
     device: Optional[Union[int, str, torch.device]] = None,
 ) -> Dict[str, Any]:
-    """Describe availability of the V2-G payload ABI v3.
+    """Describe availability of the ulysses_lowp kernel on the current device.
 
-    Supported means the compiled kernel module reports
-    ``abi_version() == ABI_VERSION`` and the device capability is exactly
+    Supported means the compiled kernel's layout constants (Q_GROUP, K_GROUP,
+    HEAD_DIM) match the Python-side values and the device capability is
     ``(12, 0)`` (SM120).
     """
 
@@ -447,28 +446,27 @@ def capability(
                 cuda_device = torch.device("cuda", torch.cuda.current_device())
             device_capability = tuple(torch.cuda.get_device_capability(cuda_device))
 
+    compiled_q_group = compiled_k_group = compiled_head_dim = 0
     try:
-        compiled_abi_version = int(get_ulysses_lowp_module().ulysses_lowp_abi_version())
-    except Exception:  # noqa: BLE001 — probe never raises; report ABI 0
-        # mirrors the upstream getattr(..., lambda: 0)() probe: a module that
-        # cannot be built or loaded reports compiled ABI 0, never raises
-        compiled_abi_version = 0
-    supported = bool(
-        compiled_abi_version == ABI_VERSION and device_capability == (12, 0)
+        mod = get_ulysses_lowp_module()
+        compiled_q_group = int(mod.ulysses_lowp_compiled_q_group())
+        compiled_k_group = int(mod.ulysses_lowp_compiled_k_group())
+        compiled_head_dim = int(mod.ulysses_lowp_compiled_head_dim())
+    except Exception:  # noqa: BLE001 — probe never raises; zeroes signal mismatch
+        pass
+    layout_match = bool(
+        compiled_q_group == Q_GROUP
+        and compiled_k_group == K_GROUP
+        and compiled_head_dim == HEAD_DIM
     )
+    supported = bool(layout_match and device_capability == (12, 0))
     return {
-        "abi_version": ABI_VERSION,
-        "compiled_abi_version": compiled_abi_version,
+        "compiled_q_group": compiled_q_group,
+        "compiled_k_group": compiled_k_group,
+        "compiled_head_dim": compiled_head_dim,
         "device_capability": device_capability,
         "supported": supported,
     }
-
-
-@flashinfer_api
-def abi_version() -> int:
-    """Return the payload ABI version compiled into the kernel module."""
-
-    return int(get_ulysses_lowp_module().ulysses_lowp_abi_version())
 
 
 @flashinfer_api
@@ -509,7 +507,6 @@ def payload_spec(
     bf16_payload_bytes = 3 * batch_size * local_sequence * num_heads * head_dim * 2
     logical_sequence = world_size * local_sequence
     return {
-        "abi_version": ABI_VERSION,
         "local_heads": local_heads,
         "q_slots_per_source": q_slots,
         "k_slots_per_source": k_slots,
@@ -1948,7 +1945,6 @@ def quant_v_fp8_with_scale(
 
 
 __all__ = [
-    "ABI_VERSION",
     "HEAD_DIM",
     "KSUM_CHUNK_TOKENS",
     "K_GROUP",
@@ -1957,7 +1953,6 @@ __all__ = [
     "StatsContext",
     "V2GStats",
     "V_SCALE_MAX",
-    "abi_version",
     "aligned_length",
     "capability",
     "gen_ulysses_lowp_module",

@@ -752,9 +752,11 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
                 static_cast<uint32_t>(k_scale_alloc));
 }
 
-// Payload ABI version consumed by the Python capability handshake
-// (ABI v3 = chunk layout shared by both stats protocols).
-int64_t ulysses_lowp_abi_version() { return 3; }
+// Layout constants exported so the Python layer can verify the compiled kernel
+// matches its expectations without relying on an opaque version integer.
+int64_t ulysses_lowp_compiled_q_group() { return 32; }
+int64_t ulysses_lowp_compiled_k_group() { return 64; }
+int64_t ulysses_lowp_compiled_head_dim() { return 128; }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_k_sum_v_amax, ulysses_lowp_k_sum_v_amax);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_q_grouped_amax, ulysses_lowp_q_grouped_amax);
@@ -771,4 +773,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_unpack_for_sage_unaligned,
                               ulysses_lowp_unpack_for_sage_unaligned);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_quant_v_fp8_with_scale,
                               ulysses_lowp_quant_v_fp8_with_scale);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_abi_version, ulysses_lowp_abi_version);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_compiled_q_group, ulysses_lowp_compiled_q_group);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_compiled_k_group, ulysses_lowp_compiled_k_group);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_compiled_head_dim, ulysses_lowp_compiled_head_dim);
