@@ -1197,6 +1197,221 @@ def test_sampling_nan_input(batch_size, vocab_size):
     check_result(result, valid)
 
 
+_PER_REQUEST_SAMPLERS = [
+    "from_probs",
+    "from_logits",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_k_top_p",
+]
+
+
+def _sample_with_seed(sampling_type, probs, logits, seed, offset):
+    """Dispatch one sampler with explicit seed/offset (scalars or per-row tensors)."""
+    k = min(100, probs.size(-1))
+    if sampling_type == "from_probs":
+        return flashinfer.sampling.sampling_from_probs(probs, seed=seed, offset=offset)
+    if sampling_type == "from_logits":
+        return flashinfer.sampling.sampling_from_logits(
+            logits, seed=seed, offset=offset
+        )
+    if sampling_type == "top_p":
+        return flashinfer.sampling.top_p_sampling_from_probs(
+            probs, 0.9, seed=seed, offset=offset
+        )
+    if sampling_type == "top_k":
+        return flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, seed=seed, offset=offset
+        )
+    if sampling_type == "min_p":
+        return flashinfer.sampling.min_p_sampling_from_probs(
+            probs, 0.1, seed=seed, offset=offset
+        )
+    if sampling_type == "top_k_top_p":
+        return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, 0.9, filter_apply_order="joint", seed=seed, offset=offset
+        )
+    raise ValueError(sampling_type)
+
+
+@pytest.mark.parametrize("sampling_type", _PER_REQUEST_SAMPLERS)
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_seed_selects_that_rows_stream(sampling_type, vocab_size):
+    """Each row must use the seed its caller gave for that row, not row 0's.
+
+    Note the kernels already vary the Philox *subsequence* by row, so two rows sharing a seed
+    still differ; that is by design and not what is under test here. What must hold is that a
+    row's sample depends on its own seed entry: running with a mixed seed tensor must equal
+    running each half separately with the corresponding scalar seed. Before per-row indexing
+    every row used seed_arr[0], so the second half matched the wrong scalar run.
+    """
+    torch.manual_seed(42)
+    batch_size = 64
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+
+    seed_a, seed_b = 12345, 67890
+    all_a = _sample_with_seed(sampling_type, probs, logits, seed_a, 0)
+    all_b = _sample_with_seed(sampling_type, probs, logits, seed_b, 0)
+
+    half = batch_size // 2
+    seed = torch.tensor(
+        [seed_a] * half + [seed_b] * (batch_size - half),
+        dtype=torch.int64,
+        device="cuda:0",
+    )
+    offset = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    mixed = _sample_with_seed(sampling_type, probs, logits, seed, offset)
+
+    expected = torch.cat([all_a[:half], all_b[half:]])
+    assert torch.all(mixed == expected), (
+        "each row must sample from the stream selected by its own seed entry"
+    )
+
+
+@pytest.mark.parametrize("sampling_type", _PER_REQUEST_SAMPLERS)
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_offset_selects_that_rows_stream(sampling_type, vocab_size):
+    """Same as above for offset: a row must advance by its own offset entry."""
+    torch.manual_seed(42)
+    batch_size = 64
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+
+    offset_a, offset_b = 0, 8192
+    all_a = _sample_with_seed(sampling_type, probs, logits, 12345, offset_a)
+    all_b = _sample_with_seed(sampling_type, probs, logits, 12345, offset_b)
+
+    half = batch_size // 2
+    seed = torch.full((batch_size,), 12345, dtype=torch.int64, device="cuda:0")
+    offset = torch.tensor(
+        [offset_a] * half + [offset_b] * (batch_size - half),
+        dtype=torch.int64,
+        device="cuda:0",
+    )
+    mixed = _sample_with_seed(sampling_type, probs, logits, seed, offset)
+
+    expected = torch.cat([all_a[:half], all_b[half:]])
+    assert torch.all(mixed == expected), (
+        "each row must sample from the stream selected by its own offset entry"
+    )
+
+
+@pytest.mark.parametrize("sampling_type", _PER_REQUEST_SAMPLERS)
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_length_one_seed_tensor_matches_scalar(sampling_type, batch_size, vocab_size):
+    """A length-1 seed/offset tensor is the tensor spelling of a scalar seed.
+
+    It must broadcast to every row and reproduce the scalar path exactly, which is what keeps
+    existing length-1 callers unaffected by per-row indexing.
+    """
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+
+    scalar = _sample_with_seed(sampling_type, probs, logits, 12345, 0)
+    tensor = _sample_with_seed(
+        sampling_type,
+        probs,
+        logits,
+        torch.tensor([12345], dtype=torch.int64, device="cuda:0"),
+        torch.tensor([0], dtype=torch.int64, device="cuda:0"),
+    )
+
+    assert torch.all(scalar == tensor), (
+        "length-1 seed/offset tensors must broadcast and match the scalar path"
+    )
+
+
+@pytest.mark.parametrize("sampling_type", _PER_REQUEST_SAMPLERS)
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_seed_reproducibility(sampling_type, vocab_size):
+    """Per-row seed/offset tensors must be reproducible across calls."""
+    torch.manual_seed(42)
+    batch_size = 37
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+
+    seed = torch.arange(batch_size, dtype=torch.int64, device="cuda:0") + 12345
+    offset = torch.arange(batch_size, dtype=torch.int64, device="cuda:0") * 32
+
+    first = _sample_with_seed(sampling_type, probs, logits, seed, offset)
+    second = _sample_with_seed(sampling_type, probs, logits, seed, offset)
+
+    assert torch.all(first == second)
+
+
+@pytest.mark.parametrize("batch_size", [4, 19])
+def test_seed_offset_tensor_length_validation(batch_size):
+    """Lengths other than 1 or batch_size are rejected rather than read out of bounds."""
+    torch.manual_seed(42)
+    vocab_size = 111
+    probs = torch.softmax(torch.randn(batch_size, vocab_size, device="cuda:0"), dim=-1)
+
+    wrong_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda:0")
+    per_row = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    broadcast = torch.zeros(1, dtype=torch.int64, device="cuda:0")
+
+    with pytest.raises(ValueError, match="length must be 1"):
+        flashinfer.sampling.sampling_from_probs(probs, seed=wrong_len, offset=wrong_len)
+
+    # seed and offset must agree on layout, otherwise one of them is indexed wrongly
+    with pytest.raises(ValueError, match="same length"):
+        flashinfer.sampling.sampling_from_probs(probs, seed=broadcast, offset=per_row)
+
+
+def test_chain_speculative_sampling_per_request_seed():
+    """Per-row seeds must reach the rejection-sampling kernel too.
+
+    Same construction as the sampling tests: a mixed seed tensor must reproduce, row by row,
+    what the corresponding scalar seed produces for that half of the batch.
+    """
+    torch.manual_seed(42)
+    batch_size, num_speculate_tokens, vocab_size = 64, 4, 512
+
+    draft_probs = torch.softmax(
+        torch.randn(batch_size, num_speculate_tokens, vocab_size, device="cuda:0"),
+        dim=-1,
+    )
+    target_probs = torch.softmax(
+        torch.randn(batch_size, num_speculate_tokens + 1, vocab_size, device="cuda:0"),
+        dim=-1,
+    )
+    draft_token_ids = torch.randint(
+        0,
+        vocab_size,
+        (batch_size, num_speculate_tokens),
+        dtype=torch.int32,
+        device="cuda:0",
+    )
+
+    def run(seed, offset):
+        tokens, _, _ = flashinfer.sampling.chain_speculative_sampling(
+            draft_probs, draft_token_ids, target_probs, seed=seed, offset=offset
+        )
+        return tokens
+
+    seed_a, seed_b = 12345, 67890
+    all_a = run(seed_a, 0)
+    all_b = run(seed_b, 0)
+
+    half = batch_size // 2
+    seed = torch.tensor(
+        [seed_a] * half + [seed_b] * (batch_size - half),
+        dtype=torch.int64,
+        device="cuda:0",
+    )
+    offset = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    mixed = run(seed, offset)
+
+    expected = torch.cat([all_a[:half], all_b[half:]])
+    assert torch.all(mixed == expected), (
+        "per-row seeds must reach ChainSpeculativeSampling"
+    )
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
