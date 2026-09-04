@@ -33,6 +33,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
@@ -196,6 +197,23 @@ Install hooks to run on every commit:
 ```bash
 pre-commit install
 ```
+
+## Opening a Pull Request
+
+Follow [`CONTRIBUTING.md`](CONTRIBUTING.md) when opening a PR. The two requirements most often
+missed:
+
+- **Keep the default PR template.** Fill in `.github/pull_request_template.md` (Description,
+  Related Issues, Checklist, Tests, Reviewer Notes). Do **not** overwrite or replace it with a
+  custom or tool-generated description format. The title and description normally become the
+  commit title and message on squash-merge, and are what a `git bisect` surfaces months later
+  when someone is hunting the owner of a regression.
+- **Report before/after numbers for performance work.** A perf PR must include measurements from
+  a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), naming the GPU and the
+  problem sizes. Speedup ratios without absolute numbers, or numbers without a named GPU, are
+  not enough.
+
+→ **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
 ## Code Review
 
@@ -398,6 +416,22 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
 - **Complex**: `flashinfer/decode.py` - plan-run pattern, advanced workspace
 
+## Experimental Code
+
+Experimental backends live under `flashinfer/experimental/`; experimental
+public APIs live in core marked with `@flashinfer_experimental_api` (defined in
+`flashinfer/api_logging.py`). Using them is an explicit opt-in: calling an
+experimental API, or naming an experimental backend with `backend="<name>"`,
+needs no environment variable (both warn once). Only automatic selection is
+gated: `backend="auto"` skips backends marked `@experimental_backend` unless
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Experimental code is JIT-only
+(never registered in `flashinfer/aot.py`) and tested under
+`tests/experimental/`.
+
+→ **When working under `flashinfer/experimental/`, follow
+[`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
+full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/README.md).**
+
 ## Key Architectural Patterns
 
 ### Module Caching
@@ -579,11 +613,12 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
+| `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` | unset | `flashinfer/utils.py` (`backend_requirement`), `flashinfer/api_logging.py` | `1` lets `backend="auto"` (dispatch heuristics and autotuning) select backends marked `@experimental_backend` (see the "Experimental Code" section). Explicit use never needs it: calling an `@flashinfer_experimental_api` function or passing `backend="<experimental>"` always works and emits an `ExperimentalWarning` once. Without it, automatic selection considers only stable backends. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
-| `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py`, `flashinfer/comm/pcie_ipc_tuning.py` | Override the disk path for AutoTuner cache files (MLA, and the PCIe IPC all-reduce). Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
+| `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120_cpb.py`, `flashinfer/comm/pcie_ipc_tuning.py` | Override the disk path for tuning cache files (sparse-MLA SM120 cpb calibration constants, and the PCIe IPC all-reduce). Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
 | `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
 | `FLASHINFER_CUTILE_AUTOTUNE_DISABLED` | `0` | `flashinfer/quantization/kernels/cutile/rope_quantize_fp8_cutile.py` | Non-zero skips exhaustive cuTile RoPE-FP8 tuning and uses the built-in token-count heuristic. |
 | `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
@@ -596,6 +631,19 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
 | `FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE` | `0` | `flashinfer/gemm/gemm_base.py` (read once at import) | `1` downgrades the refusal to build a cuDNN execution plan during CUDA graph capture from a `CudnnPlanBuildInCaptureError` to a warning. Set it only if you have verified your cuDNN version tolerates plan build under capture; the supported alternative is to run each shape once eagerly outside the capture region, which populates the per-shape plan cache the captured call then reuses. |
+
+##### Experimental KDA Output-Only Decode Tuning
+
+Low-level overrides for the output-only / RecoverSSM-verify KDA decode
+kernels (``flashinfer/kda_kernels/kda_decode_wy_output_only.py``); intended
+for benchmarking and bring-up.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FLASHINFER_KDA_OO_REC_MAX_BH` | `192` | WY-vs-recurrent auto-dispatch threshold on `B * HV` at `T <= 2` (a quarter of it at `T` in (2, 4]). |
+| `FLASHINFER_KDA_OO_REC_KS` | batch policy | Override the grouped recurrent backend's K-slices per state column. |
+| `FLASHINFER_KDA_OO_REC_VSPLIT` | batch policy | Override the grouped recurrent backend's value-column split per CTA. |
+| `FLASHINFER_KDA_OO_MBP` | grid policy | Override the WY kernel's minimum-blocks-per-SM launch-bound hint. |
 
 ##### Experimental Packed-KDA Decode Tuning
 

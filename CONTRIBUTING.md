@@ -39,6 +39,63 @@ Code Contribution Procedure
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
 
+# Experimental APIs and Backends
+
+FlashInfer distinguishes stable functionality (normal review and support
+expectations) from **experimental** functionality intended for fast-moving
+work — client-GPU (e.g. SM12x) kernels, new operations from the latest
+models, or highly specialized kernels for specific problem sizes. Two
+separate concerns:
+
+* an **experimental API** — a public interface that may change or disappear;
+* an **experimental backend** — an implementation not yet ready for stable support.
+
+A stable API may route to an experimental backend once experimental features
+are enabled, and an experimental API must be clearly identified and gated.
+
+**Placement:**
+
+* Experimental **APIs** live in core, marked with `@flashinfer_experimental_api`
+  (defined in `flashinfer/api_logging.py`). The core entry point stays thin:
+  signature, shared validation, feature-gate check, backend selection,
+  direct handoff.
+* Experimental **backends** and all backend-specific logic (support checks,
+  heuristics, routing, compilation, caching, kernels) live under
+  `flashinfer/experimental/`.
+
+**Opt-in:** using experimental functionality is always explicit. Calling an
+`@flashinfer_experimental_api` function, or naming an experimental backend
+(`backend="<name>"`) in a stable API, needs no environment variable; both warn
+once. Only *automatic* selection is gated: `backend="auto"` (dispatch
+heuristics and autotuning) may pick an experimental backend only with
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Experimental backends are marked
+with `@experimental_backend` on their `@backend_requirement` checker, which
+enforces this; hand-rolled `"auto"` routing calls
+`require_experimental_auto_backends(...)`.
+
+**Requirements for every experimental feature:**
+
+* a named owner and a tracking issue (use case, reason for the experimental
+  path, graduation plan and target release — default intent is graduation
+  within four weeks);
+* declaration in the PR: tick the **Experimental Track** checkbox in the PR
+  template and link the tracking issue there (maintainers add the
+  `experimental` label);
+* correctness tests against a reference in `tests/experimental/`, validated on
+  the intended hardware, plus a runnable example;
+* no registration in `flashinfer/aot.py` (experimental features are JIT-only
+  and never ship in pre-built packages).
+
+Experimental features provide no compatibility guarantees and may be removed
+without deprecation. Changes under `flashinfer/experimental/` receive narrower
+review (eligibility, correctness, containment, licensing, obvious risks);
+changes to core — including thin entry points — follow the normal review
+process.
+
+For the full policy (admission criteria, lifecycle reviews, containment rules,
+graduation checklist), see
+[flashinfer/experimental/README.md](flashinfer/experimental/README.md).
+
 # Pull Request Guidelines
 
 * **Use the default PR template.** When opening a PR, fill in the repository's PR template
@@ -66,6 +123,8 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 ## Public CI (GitHub Actions)
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
+
+The commands below are the user-facing reference. The design behind them -- why there are two CI systems, how a run is narrowed to specific tests, and the constraints that follow -- is recorded in [`docs/design_docs/ci_bot_and_targeted_testing.md`](docs/design_docs/ci_bot_and_targeted_testing.md).
 
 Public CI does not start on its own for any PR. Commenting `@flashinfer-bot run` starts it, and works for anyone who can label the PR as well as for members of the `ci-users` team. Adding the `run-ci` label by hand does the same, for anyone whose permissions let them label a PR. This applies to everyone, including maintainers.
 

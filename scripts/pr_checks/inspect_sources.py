@@ -15,6 +15,9 @@ Behavioral notes:
 - ``iter_decorated_functions`` is a generator yielding
   ``(py_file, module_dotted_name, FunctionDef)`` tuples — the canonical way
   to scan all ``@flashinfer_api`` functions in the flashinfer package.
+- ``@flashinfer_experimental_api`` does **not** match ``flashinfer_api`` (no
+  dot before the suffix). This is intentional: experimental APIs are excluded
+  from the stable docstring and API/RST checks until they graduate.
 """
 
 from __future__ import annotations

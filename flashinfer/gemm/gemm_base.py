@@ -498,15 +498,17 @@ def _cute_dsl_mm_bf16_requirement(
         raise ValueError(
             f"Bias must be contiguous on A's device with shape {(b.shape[1],)}."
         )
-    if a.shape[0] > 32:
-        return _cublaslt_mm_bf16_requirement(
-            a, b, out, out_dtype, bias, False, "cublaslt"
-        )
-
     from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
         raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
+
+    if a.shape[0] > _CUTE_DSL_BF16_MAX_M:
+        # Served by the cuBLASLt fallback runner of the cute-dsl runner set;
+        # pdl is ignored there because cuBLASLt has no PDL API.
+        return _cublaslt_mm_bf16_requirement(
+            a, b, out, out_dtype, bias, False, "cublaslt"
+        )
 
     from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
 
@@ -727,12 +729,17 @@ def mm_bf16(
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
-        ``"cute-dsl"`` uses standalone Blackwell low-M direct and split-K
-        kernels for M <= 32 and falls back to cuBLASLt for larger M. It is
-        never auto-selected; serving frameworks must select it explicitly.
-        Without autotuning, a measured shape
-        heuristic chooses between the algorithms. With autotuning, both tactic
-        spaces are profiled when bias is disabled; bias uses split-K only.
+        ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
+        (direct, cluster Split-K and warp Split-K) and cuBLASLt above that.
+        It is never auto-selected; serving frameworks must select it
+        explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
+        direct kernel runs where its shape heuristic applies, otherwise the
+        warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
+        with at most 64 K tiles), and cluster Split-K otherwise. With
+        autotuning, one call profiles the low-M kernels on the M <= 32
+        buckets and the cuBLASLt fallback on the larger ones, so a single
+        large-M warm-up tunes both ranges; with bias the direct kernel is
+        excluded.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -817,9 +824,9 @@ def mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
     elif backend == "cute-dsl":
-        # The low-M kernels cap M at 32. Use cuBLASLt above that range;
-        # pdl is intentionally ignored because cuBLASLt has no PDL API.
-        backends = ["cute-dsl"] if a.shape[0] <= 32 else ["cublaslt"]
+        # One runner set covers both M ranges (cuBLASLt above 32, ignoring
+        # pdl), so one autotune call profiles both; see _cute_dsl_bf16_runners.
+        backends = ["cute-dsl"]
     else:
         backends = [backend]
 
@@ -1458,8 +1465,14 @@ def get_mm_bf16_cublaslt_module():
     )
 
 
+_CUTE_DSL_BF16_AUTOTUNE_VERSION = 11
+# M bound of the CuTe-DSL low-M kernels; larger M runs the cuBLASLt fallback.
+_CUTE_DSL_BF16_MAX_M = 32
+
+
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     use_cuda_graph=True,
+    use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -1579,6 +1592,41 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
     return TGVRunner()
 
 
+class _CuteDSLBf16Runner(TunableRunner):
+    """Base of the runners behind ``backend="cute-dsl"``.
+
+    ``_cute_dsl_bf16_runners`` lists every runner of the backend so that one
+    autotune call profiles each of them on the buckets it owns; a runner
+    returns no tactics for a profile whose M it does not serve. The defaults
+    here describe the CuTe-DSL kernels (M <= ``_CUTE_DSL_BF16_MAX_M``, one
+    cache-key layout); the cuBLASLt fallback overrides them. After autotuner
+    selection, ``supports_inputs`` and ``is_tactic_compatible`` are re-checked
+    against the real inputs because a cached entry can come from a bucket on
+    the other side of ``_CUTE_DSL_BF16_MAX_M`` or from another M.
+    """
+
+    def __init__(self, compute_capability: int) -> None:
+        self.compute_capability = compute_capability
+
+    def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+        a, *_ = inputs
+        return 1 <= a.shape[0] <= _CUTE_DSL_BF16_MAX_M
+
+    def is_tactic_compatible(self, inputs: List[torch.Tensor], tactic: object) -> bool:
+        return True
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        a, _, bias, pdl, out, *_ = inputs
+        return (
+            str(a.dtype),
+            str(out.dtype),
+            bias is not None,
+            bool(pdl),
+            self.compute_capability,
+            _CUTE_DSL_BF16_AUTOTUNE_VERSION,
+        )
+
+
 @functools.cache
 def _cute_dsl_splitk_bf16_gemm_runner(
     compute_capability: int,
@@ -1590,17 +1638,10 @@ def _cute_dsl_splitk_bf16_gemm_runner(
         run_splitk_dense,
     )
 
-    class CuteDSLSplitKBf16Runner(TunableRunner):
-        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-            a, _, bias, pdl, out, *_ = inputs
-            return (
-                str(a.dtype),
-                str(out.dtype),
-                bias is not None,
-                bool(pdl),
-                compute_capability,
-            )
-
+    # Serves every M <= 32 input the cute-dsl backend requirement admits (it
+    # validates ``default_tactic`` for the real shape), so the inherited
+    # ``supports_inputs`` holds.
+    class CuteDSLSplitKBf16Runner(_CuteDSLBf16Runner):
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1643,7 +1684,65 @@ def _cute_dsl_splitk_bf16_gemm_runner(
                     ) from error
             return run_splitk_dense(a, b, bias, out, bool(pdl), tactic)
 
-    return CuteDSLSplitKBf16Runner()
+    return CuteDSLSplitKBf16Runner(compute_capability)
+
+
+@functools.cache
+def _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability: int):
+    from .kernels.dense_bf16_gemm_warp_splitk import (
+        WarpSplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_warp_splitk_dense,
+        validate_inputs,
+    )
+
+    # Every warp Split-K tactic serves every M in [1, _MAX_M], so the inherited
+    # ``is_tactic_compatible`` holds.
+    class CuteDSLWarpSplitKBf16Runner(_CuteDSLBf16Runner):
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            a, b, bias, _, out, *_ = inputs
+            try:
+                validate_inputs(a, b, out, bias)
+            except ValueError:
+                return False
+            return True
+
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> list[tuple[int, int, int, int, int]]:
+            if not self.supports_inputs(inputs):
+                return []
+            a, b, *_ = inputs
+            with torch.cuda.device(a.device):
+                return [
+                    astuple(config)
+                    for config in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+                ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            with torch.cuda.device(a.device):
+                if tactic == -1:
+                    tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+                else:
+                    try:
+                        tactic = WarpSplitKTactic(*tactic)
+                    except TypeError as error:
+                        raise ValueError(
+                            "CuTeDSL warp split-K tactics must be "
+                            "(output_tile, token_tile, k_tile, stages, "
+                            "b_loader_warps)."
+                        ) from error
+                return run_warp_splitk_dense(a, b, out, bool(pdl), tactic, bias)
+
+    return CuteDSLWarpSplitKBf16Runner(compute_capability)
 
 
 @functools.cache
@@ -1658,15 +1757,23 @@ def _cute_dsl_direct_bf16_gemm_runner(
         validate_tactic,
     )
 
-    class CuteDSLDirectBf16Runner(TunableRunner):
+    class CuteDSLDirectBf16Runner(_CuteDSLBf16Runner):
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            a, b, bias, *_ = inputs
+            if bias is not None:  # the Direct kernel has no bias epilogue
+                return False
+            try:
+                default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            except ValueError:
+                return False
+            return True
+
         def is_tactic_compatible(
             self, inputs: List[torch.Tensor], tactic: object
         ) -> bool:
             if tactic == -1:
                 return True
-            a, b, bias, *_ = inputs
-            if bias is not None:
-                return False
+            a, b, *_ = inputs
             try:
                 if not isinstance(tactic, (DirectTactic, tuple, list)):
                     return False
@@ -1680,26 +1787,18 @@ def _cute_dsl_direct_bf16_gemm_runner(
                 return False
             return True
 
-        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-            a, _, _, pdl, out, *_ = inputs
-            return (
-                str(a.dtype),
-                str(out.dtype),
-                bool(pdl),
-                compute_capability,
-            )
-
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list[tuple[int, int, int]]:
-            a, b, bias, *_ = inputs
-            if bias is not None:
+            if not self.supports_inputs(inputs):
                 return []
-            m, k = a.shape
-            n = b.shape[1]
-            return [astuple(config) for config in autotune_tactics(m, n, k)]
+            a, b, *_ = inputs
+            return [
+                astuple(config)
+                for config in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+            ]
 
         def forward(
             self,
@@ -1723,7 +1822,87 @@ def _cute_dsl_direct_bf16_gemm_runner(
                     ) from error
             return run_direct_dense(a, b, out, bool(pdl), tactic)
 
-    return CuteDSLDirectBf16Runner()
+    return CuteDSLDirectBf16Runner(compute_capability)
+
+
+@functools.cache
+def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
+    cublaslt_runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+
+    class CuteDSLCublasltFallbackBf16Runner(_CuteDSLBf16Runner):
+        """cuBLASLt for M > _CUTE_DSL_BF16_MAX_M inside ``backend="cute-dsl"``.
+
+        A distinct class, so its records never mix with ``backend="cublaslt"``
+        tuning. The cache-key extras stay cuBLASLt's (exact shape, compute
+        dtype, bias alignment) because a tactic indexes the heuristic's
+        algorithm list for that exact shape; pdl is ignored, as in cuBLASLt.
+        """
+
+        def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+            a, *_ = inputs
+            return a.shape[0] > _CUTE_DSL_BF16_MAX_M
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return cublaslt_runner.get_cache_key_extras(inputs)
+
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> List[int]:
+            if not self.supports_inputs(inputs):
+                return []
+            return cublaslt_runner.get_valid_tactics(inputs, profile)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            return cublaslt_runner.forward(
+                inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+            )
+
+    return CuteDSLCublasltFallbackBf16Runner(compute_capability)
+
+
+def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
+    """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
+
+    Every runner is listed whatever the real M, so that one autotune call
+    profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
+    fallback on the buckets above (custom ``tuning_buckets`` are assigned the
+    same way). ``[0]`` is the no-autotune default and the autotuner's
+    fallback, so it must serve the real inputs: cuBLASLt above 32; below, the
+    direct kernel where its measured shape heuristic applies, otherwise the
+    warp Split-K kernel whenever eligible (it wins nearly every tuned M <= 32
+    cell on B300), otherwise cluster Split-K. For M <= 32, low-M kernels that
+    cannot serve the real inputs (bias, N, K) are dropped: they serve no
+    bucket either.
+    """
+    from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
+
+    a, b, *_ = inputs
+    m, k = a.shape
+    n = b.shape[1]
+    major, minor = torch.cuda.get_device_capability(a.device)
+    compute_capability = major * 10 + minor
+    direct = _cute_dsl_direct_bf16_gemm_runner(compute_capability)
+    warp_splitk = _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
+    cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
+    fallback = _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability)
+
+    if m > _CUTE_DSL_BF16_MAX_M:
+        return [fallback, warp_splitk, cluster_splitk, direct]
+    prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
+        m, n, k
+    )
+    kernels = (
+        (direct, warp_splitk, cluster_splitk)
+        if prefer_direct
+        else (warp_splitk, cluster_splitk, direct)
+    )
+    return [runner for runner in kernels if runner.supports_inputs(inputs)] + [fallback]
 
 
 def bf16_gemm_sm100(
@@ -1744,8 +1923,8 @@ def bf16_gemm_sm100(
     is_a_k_major = a.stride(-1) == 1
     is_b_k_major = b.stride(-2) == 1
 
+    inputs = [a, b, bias, pdl, out, workspace_buffer]
     runners = []
-    direct_runner = None
     if "cudnn" in runner_names:
         runners.append(
             _cudnn_gemm_bf16_runner(
@@ -1764,28 +1943,9 @@ def bf16_gemm_sm100(
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())
     if "cute-dsl" in runner_names:
-        compute_capability = torch.cuda.get_device_capability(a.device)
-        compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-        splitk_runner = _cute_dsl_splitk_bf16_gemm_runner(compute_capability_number)
-        if bias is None:
-            from .kernels.dense_bf16_gemm_direct import (
-                prefer_direct_bf16_gemm_sm100,
-            )
-
-            direct_runner = _cute_dsl_direct_bf16_gemm_runner(compute_capability_number)
-            prefer_direct = prefer_direct_bf16_gemm_sm100(
-                a.shape[0], b.shape[1], a.shape[1]
-            )
-            runners.extend(
-                (direct_runner, splitk_runner)
-                if prefer_direct
-                else (splitk_runner, direct_runner)
-            )
-        else:
-            runners.append(splitk_runner)
+        runners.extend(_cute_dsl_bf16_runners(inputs))
     assert runners, "No suitable runners found"
 
-    inputs = [a, b, bias, pdl, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
         "bf16_gemm",
         runners,
@@ -1793,10 +1953,12 @@ def bf16_gemm_sm100(
         inputs,
     )
 
-    if (
-        direct_runner is not None
-        and runner is direct_runner
-        and not direct_runner.is_tactic_compatible(inputs, tactic)
+    # A cached cute-dsl entry can come from a bucket on the other side of M=32
+    # (custom tuning buckets, rounding) or carry a tactic illegal for this M
+    # (e.g. a Direct rows_per_block that does not divide M); fall back to the
+    # default runner and tactic, as the autotuner itself does.
+    if isinstance(runner, _CuteDSLBf16Runner) and not (
+        runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
     ):
         runner, tactic = runners[0], -1
 
