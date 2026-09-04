@@ -511,10 +511,6 @@ def test_adv_new_guards_raise():
     good = compute_paged_mqa_logits_schedule(cl)
     fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, schedule_meta=good)
 
-    # (#6/#9) num_epi_subtiles < 1
-    with pytest.raises(ValueError, match="num_epi_subtiles"):
-        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, num_epi_subtiles=0)
-
     # FP4-specific guards: q must be uint8, q_sf must be int32 [B, next_n, H]
     q_bf = torch.randn(B, next_n, 64, 128, device=DEVICE, dtype=torch.bfloat16)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, 128), gran_k=32)

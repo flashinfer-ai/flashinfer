@@ -2912,67 +2912,6 @@ def test_fp4_is_kv_sf_interleaved_guard():
             )
 
 
-@pytest.mark.parametrize(
-    "sub,valid",
-    [
-        (1, True),
-        (2, True),
-        (4, True),
-        (16, True),
-        (0, False),
-        (3, False),
-        (32, False),
-        (64, False),
-    ],
-)
-def test_num_epi_subtiles_guard(sub, valid):
-    """num_epi_subtiles must divide num_heads with the quotient a multiple of 4.
-
-    Previously this escaped to a bare assertion inside kernel construction at
-    JIT time; both APIs now reject it at the boundary.
-    """
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
-    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
-
-    device, B, next_n, H, D, block_size, ctx, max_ml = (
-        "cuda",
-        2,
-        1,
-        64,
-        128,
-        64,
-        512,
-        512,
-    )
-    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
-    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
-    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
-
-    q8 = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
-    kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
-    q4 = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
-    sf4 = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
-    kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
-
-    if valid:
-        fp8_paged_mqa_logits(
-            q8, kv8, w, block_tables, seq_lens, max_ml, num_epi_subtiles=sub
-        )
-        fp4_paged_mqa_logits(
-            q4, sf4, kv4, w, block_tables, seq_lens, max_ml, num_epi_subtiles=sub
-        )
-    else:
-        with pytest.raises(ValueError, match="num_epi_subtiles"):
-            fp8_paged_mqa_logits(
-                q8, kv8, w, block_tables, seq_lens, max_ml, num_epi_subtiles=sub
-            )
-        with pytest.raises(ValueError, match="num_epi_subtiles"):
-            fp4_paged_mqa_logits(
-                q4, sf4, kv4, w, block_tables, seq_lens, max_ml, num_epi_subtiles=sub
-            )
-
-
 def test_next_n_and_weights_contract():
     """weights shape/dtype are validated, and pin next_n without a next_n arg."""
     if not is_sm100a_supported(torch.device("cuda")):

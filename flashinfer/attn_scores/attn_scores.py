@@ -100,44 +100,11 @@ _FP4_MAX_NEXT_N = 4
 # is_kv_sf_interleaved is only implemented for this page size (1 physical
 # block == 1 UTCCP atom); the kernel silently ignores the flag otherwise.
 _FP4_SF_INTERLEAVE_BLOCK_SIZE = 128
-# Epilogue FMA unroll granularity: both kernels assert
-# `num_heads % num_epi_subtiles == 0` and `(num_heads // num_epi_subtiles) % 4 == 0`.
-_EPI_SUBTILE_UNROLL = 4
 # MXFP4 scale-factor block size: one UE8M0 exponent per this many FP4 values.
 _FP4_SF_VEC_SIZE = 32
 # q_sf packs the per-token scale factors of one head into a single int32, so
 # head_dim // sf_vec_size must equal the number of bytes in an int32.
 _SF_PER_INT32 = 4
-
-
-def _validate_num_epi_subtiles(
-    num_epi_subtiles: int, num_heads: int, fn_name: str
-) -> None:
-    """Validate the epilogue subtile count against the kernel's unroll rules.
-
-    Measured on sm_100a at num_heads=64: 1, 2 and 4 are within noise of each
-    other and 8 is 5-11% slower, so the default of 1 is optimal or tied. The
-    knob exists for parity with TensorRT-LLM's op, which also never varies it
-    in production.
-    """
-    if num_epi_subtiles < 1:
-        raise ValueError(
-            f"{fn_name}: num_epi_subtiles must be >= 1, got {num_epi_subtiles}"
-        )
-    if (
-        num_heads % num_epi_subtiles != 0
-        or (num_heads // num_epi_subtiles) % _EPI_SUBTILE_UNROLL != 0
-    ):
-        supported = [
-            s
-            for s in range(1, num_heads + 1)
-            if num_heads % s == 0 and (num_heads // s) % _EPI_SUBTILE_UNROLL == 0
-        ]
-        raise ValueError(
-            f"{fn_name}: num_epi_subtiles must divide num_heads ({num_heads}) with "
-            f"the quotient a multiple of {_EPI_SUBTILE_UNROLL} (epilogue FMA unroll); "
-            f"supported values are {supported}, got {num_epi_subtiles}."
-        )
 
 
 def _validate_weights(
@@ -862,6 +829,13 @@ def _cached_compile_fp8_kernel(
     epi_dtype,  # cutlass dtype object
     acc_dtype,  # cutlass dtype object
     output_dtype,  # cutlass dtype object
+    # num_epi_subtiles is deliberately NOT public: measured on sm_100a at
+    # num_heads=64, subtile counts 1/2/4 tie and 8 is 5-11% slower, so the API
+    # always passes 1 (TensorRT-LLM never varies it in production either). The
+    # parameter and its _sub{n} cache tag stay so a future per-shape policy --
+    # or a reinstated argument, should some geometry ever profit -- can route a
+    # value through without a cache redesign. The kernel constructor validates
+    # the divisibility rules.
     num_epi_subtiles: int,
     arch: str,
 ):
@@ -979,6 +953,13 @@ def _cached_compile_fp4_kernel(
     num_sms: int,
     epi_dtype,  # cutlass dtype object
     output_dtype,  # cutlass dtype object
+    # num_epi_subtiles is deliberately NOT public: measured on sm_100a at
+    # num_heads=64, subtile counts 1/2/4 tie and 8 is 5-11% slower, so the API
+    # always passes 1 (TensorRT-LLM never varies it in production either). The
+    # parameter and its _sub{n} cache tag stay so a future per-shape policy --
+    # or a reinstated argument, should some geometry ever profit -- can route a
+    # value through without a cache redesign. The kernel constructor validates
+    # the divisibility rules.
     num_epi_subtiles: int,
     is_kv_sf_interleaved: bool,
     arch: str,
@@ -1224,7 +1205,6 @@ def _check_fp8_paged_mqa_logits_supported(
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
-    num_epi_subtiles: int = 1,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> bool:
@@ -1233,7 +1213,7 @@ def _check_fp8_paged_mqa_logits_supported(
     This function is the single place that encodes what the *current* kernel
     can run, keeping those limits out of the public signature.  It covers every
     constraint FP8MQALogitsKernel asserts (block_kv % phys_block_kv,
-    num_blocks_per_mma, the num_epi_subtiles divisibility rules) plus three
+    num_blocks_per_mma) plus three
     bounds the kernel does not check and would otherwise fail on obscurely:
     head_dim vs the MMA instruction K, the UMMA N-mode range, and the per-CTA
     SMEM budget.
@@ -1281,7 +1261,6 @@ def _check_fp8_paged_mqa_logits_supported(
             f"fp8_paged_mqa_logits requires q.dtype == float8_e4m3fn; got {q.dtype}. "
             "(e5m2 has a different byte layout and would be silently misread as e4m3.)"
         )
-    _validate_num_epi_subtiles(num_epi_subtiles, H, "fp8_paged_mqa_logits")
     if (
         output_dtype not in _FP8_DTYPES
         or epi_dtype not in _FP8_DTYPES
@@ -1355,7 +1334,6 @@ def fp8_paged_mqa_logits(
     output_dtype: torch.dtype = torch.float32,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
-    num_epi_subtiles: int = 1,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1478,11 +1456,6 @@ def fp8_paged_mqa_logits(
                          |logit| > 65504 -- long-context accumulations can
                          overflow to inf where float32 would not.
         acc_dtype:       MMA accumulator dtype (float32 or float16)
-        num_epi_subtiles: performance knob; numerics unchanged for any legal
-                         value.  Leave at 1: measured on SM100 at num_heads=64,
-                         1/2/4 tie and 8 is 5-11% slower.  Exists for parity
-                         with TensorRT-LLM's op.  Must divide num_heads with
-                         the quotient a multiple of 4.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on q's device.  Omit it (None, recommended) unless
                          profiling shows the per-call schedule computation (one
@@ -1536,8 +1509,6 @@ def fp8_paged_mqa_logits(
         head_dim         must be a multiple of 32.
         next_n*num_heads must be a multiple of 8 in [8, 256].
         block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
-        num_epi_subtiles must divide num_heads, with the quotient a multiple of
-                         4 (at num_heads=64: 1, 2, 4, 8, or 16).
         head_dim, num_heads and next_n together must fit per-CTA shared
                          memory: on SM100, head_dim <= 192 fits at num_heads=64,
                          next_n=1; 256 does not.
@@ -1627,7 +1598,7 @@ def fp8_paged_mqa_logits(
             cutlass_epi,
             cutlass_acc,
             cutlass_out,
-            num_epi_subtiles,
+            1,  # num_epi_subtiles -- fixed; see the compile-layer parameter note
             _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
         )
         compiled(
@@ -1656,7 +1627,6 @@ def _check_fp4_paged_mqa_logits_supported(
     sf_vec_size: int = _FP4_SF_VEC_SIZE,
     output_dtype: torch.dtype = torch.bfloat16,
     epi_dtype: torch.dtype = torch.float32,
-    num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
@@ -1666,8 +1636,8 @@ def _check_fp4_paged_mqa_logits_supported(
     This function is the single place that encodes what the *current* kernel
     can run, keeping those limits out of the public signature.  It covers every
     constraint FP4MQALogitsKernel asserts -- num_heads, head_dim, next_n, the
-    epilogue/output dtypes, block_kv % phys_block_kv, num_blocks_per_mma and
-    the num_epi_subtiles divisibility rules -- plus is_kv_sf_interleaved,
+    epilogue/output dtypes, block_kv % phys_block_kv and num_blocks_per_mma --
+    plus is_kv_sf_interleaved,
     which the kernel silently ignores rather than rejecting.  The kernel's
     remaining asserts (the SF K-mode split and the 512-column TMEM cap) are
     implied once num_heads, head_dim and next_n are fixed.
@@ -1719,7 +1689,6 @@ def _check_fp4_paged_mqa_logits_supported(
             f"q_sf must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
             f"got dtype={q_sf.dtype}, shape={tuple(q_sf.shape)}"
         )
-    _validate_num_epi_subtiles(num_epi_subtiles, H, "fp4_paged_mqa_logits")
     if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
         raise ValueError(
             "fp4_paged_mqa_logits supports output/epi dtype in {float32, "
@@ -1809,7 +1778,6 @@ def fp4_paged_mqa_logits(
     sf_vec_size: int = _FP4_SF_VEC_SIZE,
     output_dtype: torch.dtype = torch.bfloat16,
     epi_dtype: torch.dtype = torch.float32,
-    num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
@@ -1934,11 +1902,6 @@ def fp4_paged_mqa_logits(
         epi_dtype:       epilogue dtype (float32, float16, or bfloat16).  There
                          is no acc_dtype knob: block-scaled FP4 MMA always
                          accumulates in float32.
-        num_epi_subtiles: performance knob; numerics unchanged for any legal
-                         value.  Leave at 1: measured on SM100 at num_heads=64,
-                         1/2/4 tie and 8 is 5-11% slower.  Exists for parity
-                         with TensorRT-LLM's op.  Must divide num_heads with
-                         the quotient a multiple of 4.
         is_kv_sf_interleaved: declares how the scale-factor tail of each
                          kv_fused block is ordered.  False (the default) means
                          token order.  True means the block's scale factors are
@@ -2019,8 +1982,6 @@ def fp4_paged_mqa_logits(
         sf_vec_size      must equal 32 (so head_dim/sf_vec_size = 4 scales per
                          token -- exactly one int32 in q_sf).
         block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
-        num_epi_subtiles must divide num_heads, with the quotient a multiple of
-                         4 (at num_heads=64: 1, 2, 4, 8, or 16).
         is_kv_sf_interleaved may be True only when block_size == 128.
         output size      batch_size*next_n * padded_seq_len(max_seq_len) must
                          be < 2**31 elements -- the kernels index the output
@@ -2161,7 +2122,7 @@ def fp4_paged_mqa_logits(
             num_sms,
             cutlass_epi,
             cutlass_out,
-            num_epi_subtiles,
+            1,  # num_epi_subtiles -- fixed; see the compile-layer parameter note
             is_kv_sf_interleaved,
             _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
             num_atoms,
@@ -2205,7 +2166,7 @@ def precompile_paged_mqa_logits(
     in {32, 64, 128}, next_n 1..4, fp32 epilogue/accumulator (12 kernels);
     fp4 -- num_heads=64, head_dim=128, block_size in {32, 64, 128}, next_n
     1..4, fp32 epilogue (12 kernels per output dtype).  Anything else (fp16
-    epilogue, other head geometry, num_epi_subtiles != 1) still compiles on
+    epilogue, other head geometry) still compiles on
     first use.  Measured on sm_100a: ~1s per fp8 kernel,
     ~3s per output dtype for the 12 fp4.  The fp4 next_n=4 entry compiles the
     decomposition the fixed policy picks on the target device (direct on
