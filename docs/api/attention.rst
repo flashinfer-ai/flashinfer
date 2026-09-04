@@ -4,11 +4,11 @@ FlashInfer Attention Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-Task-Scheduled Attention
-========================
+Experimental Task-Scheduled Attention
+=====================================
 
-The Blackwell task-scheduled FMHA context, FMHA decode, block-sparse FMHA, and
-MLA decode APIs are imported from
+The experimental Blackwell task-scheduled FMHA context, FMHA decode,
+block-sparse FMHA, and MLA decode APIs are imported from
 ``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
 reduction are automatic implementation details; there are no public tuning
 knobs.

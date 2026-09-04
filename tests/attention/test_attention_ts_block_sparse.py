@@ -842,7 +842,7 @@ def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
 
     with pytest.raises(
         ValueError,
-        match=r"requires the bound wrapper's plan state.*flashinfer\.fi_trace",
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
     ):
         wrapper.run.fi_trace(**kwargs)
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
@@ -871,7 +871,7 @@ def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
 
 
 def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
-    """Trace both public paged-cache forms with per-run metadata."""
+    """Trace both public paged-cache forms with live run metadata."""
 
     from flashinfer.fi_trace import fi_trace
 
@@ -890,7 +890,7 @@ def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
 
     with pytest.raises(
         ValueError,
-        match=r"requires the bound wrapper's plan state.*flashinfer\.fi_trace",
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
     ):
         wrapper.run.fi_trace(paged_kv_cache=(k_cache, v_cache), **common_kwargs)
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
@@ -931,8 +931,8 @@ def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
             assert defn["inputs"][name].get("optional") is not True
 
 
-def test_public_paged_wrapper_uses_only_per_run_metadata() -> None:
-    """Paged plans own capacity, while attention consumes per-run lengths."""
+def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
+    """Paged plans own capacity, while attention consumes caller live lengths."""
 
     from flashinfer.attention.prims_ts._block_sparse import (
         compiler as block_sparse_compiler,
@@ -1038,10 +1038,9 @@ def test_reusable_block_sparse_metadata_is_trusted_with_opt_in_assertions() -> N
     assert callable(block_sparse_prepare.runtime_assert)
     assert "--enable-assertions" not in block_sparse_compiler._COMPILE_OPTIONS
     assert (
-        "runtime_seq_len_kv = cutlass.Int32(self.minimum_seq_len_kv)"
-        not in kernel_source
+        "live_seq_len_kv = cutlass.Int32(self.minimum_seq_len_kv)" not in kernel_source
     )
-    assert "runtime_seq_len_kv = raw_seq_len_kv" in kernel_source
+    assert "live_seq_len_kv = raw_seq_len_kv" in kernel_source
     assert all(
         fragment not in publish_source
         for fragment in (
@@ -1124,7 +1123,7 @@ def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
         env=env,
     )
     output = result.stdout + result.stderr
-    assertion_message = "seq_lens_kv is outside the planned length range"
+    assertion_message = "seq_lens_kv is outside the planned live-length range"
     assert result.returncode != 0, output
     assert "UNEXPECTED_SUCCESS" not in output, output
     assert output.count(assertion_message) == 1, output
@@ -1277,7 +1276,7 @@ def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
 
 
 def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None:
-    """Keep native route selection narrow and independent of per-run BSR data."""
+    """Keep the native route selection narrow and independent of live BSR data."""
 
     select = block_sparse_config._select_block_sparse_kv_route_size
     assert (
@@ -2527,7 +2526,7 @@ def test_contiguous_runtime_records_every_launch_tensor_on_the_run_stream() -> N
     tensors = {name: RecordableTensor(name) for name in tensor_names}
     run_args = _BlockSparseRunArgs(
         **tensors,
-        kv_valid_bits_is_active=True,
+        kv_valid_bits_is_live=True,
         sm_scale=1.0,
         paged_kv=None,
     )
@@ -2567,7 +2566,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
     state.compiled = lambda *args: calls.append(args)
     run_args = _BlockSparseRunArgs(
         **values,
-        kv_valid_bits_is_active=True,
+        kv_valid_bits_is_live=True,
         sm_scale=1.25,
         paged_kv=None,
     )
@@ -2595,7 +2594,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
     ]
 
 
-def test_paged_launch_forwards_caller_per_run_lengths_to_attention() -> None:
+def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
     from flashinfer.attention.prims_ts._block_sparse.runtime import (
         _BlockSparseRunArgs,
         _PagedKVLaunchPayload,
@@ -2622,18 +2621,18 @@ def test_paged_launch_forwards_caller_per_run_lengths_to_attention() -> None:
             "kv_valid_bits",
         )
     }
-    runtime_seq_lens_kv = object()
+    live_seq_lens_kv = object()
     paged_kv = _PagedKVLaunchPayload(
         paged_kv_indptr=object(),
         paged_kv_indices=object(),
-        seq_lens_kv=runtime_seq_lens_kv,
+        seq_lens_kv=live_seq_lens_kv,
         num_physical_kv_pages=17,
         k_page_stride=19,
         v_page_stride=23,
     )
     run_args = _BlockSparseRunArgs(
         **values,
-        kv_valid_bits_is_active=True,
+        kv_valid_bits_is_live=True,
         sm_scale=1.25,
         paged_kv=paged_kv,
     )
@@ -2652,7 +2651,7 @@ def test_paged_launch_forwards_caller_per_run_lengths_to_attention() -> None:
             run_args.kv_valid_bits,
             paged_kv.paged_kv_indptr,
             paged_kv.paged_kv_indices,
-            runtime_seq_lens_kv,
+            live_seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             3,
@@ -3281,11 +3280,11 @@ def _fail_if_planned(
         ),
         (
             _PagedOneShotCase((128, 64), (0, 2, 3), (0, 1, 0), bsr=(1, 1)),
-            r"block_indptr/block_indices.*per-run seq_lens_kv",
+            r"block_indptr/block_indices.*live seq_lens_kv",
         ),
     ),
 )
-def test_paged_one_shot_rejects_invalid_per_run_metadata_before_plan(
+def test_paged_one_shot_rejects_invalid_live_metadata_before_plan(
     monkeypatch: pytest.MonkeyPatch,
     case: _PagedOneShotCase,
     message: str,
@@ -3320,10 +3319,10 @@ def test_paged_one_shot_rejects_invalid_per_run_metadata_before_plan(
         "dense-min",
         "dense-max-duplicate",
         "causal-min-spare",
-        "batch-runtime-bounds",
+        "batch-live-bounds",
     ),
 )
-def test_paged_one_shot_accepts_valid_per_run_metadata_capacity(
+def test_paged_one_shot_accepts_valid_live_metadata_capacity(
     monkeypatch: pytest.MonkeyPatch,
     case: _PagedOneShotCase,
 ) -> None:
@@ -4353,7 +4352,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         expected_kv_tile=256,
     )
     page_size = 64
-    runtime_seq_len_kv = 96
+    live_seq_len_kv = 96
     paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
     paged_kv_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
     block_indptr, block_indices = _make_bsr(
@@ -4408,7 +4407,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
                 ((1,),),
             ),
         ),
-        (frozenset(range(runtime_seq_len_kv)),),
+        (frozenset(range(live_seq_len_kv)),),
         sm_scale,
     )
 
@@ -4422,9 +4421,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         case.q_block_size,
         case.kv_block_size,
         max_seq_len_kv=case.seq_len_kv,
-        seq_lens_kv=torch.tensor(
-            [runtime_seq_len_kv], dtype=torch.int32, device=q.device
-        ),
+        seq_lens_kv=torch.tensor([live_seq_len_kv], dtype=torch.int32, device=q.device),
         sm_scale=sm_scale,
     )
     torch.cuda.synchronize()
@@ -4799,8 +4796,10 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
-def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_per_run_metadata() -> None:
-    """One graph reloads every per-run paged input while its plan stays fixed."""
+def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_sparse_routes() -> (
+    None
+):
+    """One graph reloads every live paged input while its plan stays fixed."""
 
     torch.manual_seed(20260814)
     case = _Case(
@@ -4975,20 +4974,20 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_per_run_metadata() -> N
         seq_lens_kv: tuple[int, int],
     ) -> torch.Tensor:
         outputs: list[torch.Tensor] = []
-        for batch_idx, runtime_kv in enumerate(seq_lens_kv):
-            runtime_case = replace(case, batch_size=1, seq_len_kv=runtime_kv)
+        for batch_idx, live_kv in enumerate(seq_lens_kv):
+            live_case = replace(case, batch_size=1, seq_len_kv=live_kv)
             outputs.append(
                 _reference(
-                    runtime_case,
+                    live_case,
                     q[batch_idx : batch_idx + 1],
-                    k[batch_idx : batch_idx + 1, :runtime_kv],
-                    v[batch_idx : batch_idx + 1, :runtime_kv],
+                    k[batch_idx : batch_idx + 1, :live_kv],
+                    v[batch_idx : batch_idx + 1, :live_kv],
                     (patterns[batch_idx],),
                     (
                         frozenset(
                             token
                             for token in valid_by_batch[batch_idx]
-                            if token < runtime_kv
+                            if token < live_kv
                         ),
                     ),
                     sm_scale,

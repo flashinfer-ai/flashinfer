@@ -1,14 +1,14 @@
 # Task-Scheduled FMHA Context
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA context/prefill
-kernel used by FlashInfer's Blackwell APIs. One implementation
+kernel used by FlashInfer's experimental Blackwell APIs. One implementation
 serves fixed contiguous, packed-ragged contiguous, and packed-query paged-KV
 attention with MHA or GQA.
 
 The public API exposes attention semantics, not scheduling controls. Contiguous
 and paged plans select a nonpersistent, static-persistent, or CLC-persistent
-launch from logical work, task topology, per-run metadata requirements, causal
-domain structure, and GPU capacity. Paired, runtime-ragged, and zero-offset
+launch from logical work, task topology, live-metadata requirements, causal
+domain structure, and GPU capacity. Paired, live-ragged, and zero-offset
 triangular contiguous domains use CLC. Immutable single-instance
 bottom-right-offset domains launch directly within one resident wave and use
 static persistence above one wave. Single-instance uniform causal paged plans
@@ -28,12 +28,12 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchPrefillPagedTSWrapper` | Reusable packed-Q, paged-K/V plan. |
 | `batch_prefill_with_paged_kv_cache` | One-shot packed-Q, paged-K/V attention. |
 
-These context entry points are not currently registered with `fi_trace`;
+These experimental context entry points are not currently registered with `fi_trace`;
 tracing support is limited to the PrimTS decode APIs.
 
 `BatchPrefillTSWrapper` keeps the existing tensor-driven lifecycle: planning
 validates Q/K/V and reads cumulative metadata when needed. Packed contiguous
-plans retain `qo_indptr` and `kv_indptr` as per-run inputs; general ragged kernels
+plans retain `qo_indptr` and `kv_indptr` as live inputs; general ragged kernels
 reload their values on every run, while a uniform packed plan may compile its
 fixed offsets into the specialization.
 
@@ -69,7 +69,7 @@ admitted by the runtime architecture guard but remains to be qualified.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every request, both when the plan
-is created and after any per-run cumulative-offset update. All tensor extents and
+is created and after any live cumulative-offset update. All tensor extents and
 packed request lengths must be positive. Total logical Q and K extents—
 `B*Sq`/`B*Sk` for fixed storage and `total_q`/`total_k` for packed storage—must
 be at most `2**31 - 256`; this coordinate-representation limit reserves 255
@@ -126,7 +126,7 @@ representable as positive `float32` values.
 
 For packed contiguous attention, the host reads cumulative metadata once
 during planning to establish the static geometry and maximum Q/K capacities.
-The plan keeps `qo_indptr` and `kv_indptr` as per-run device inputs; their storage
+The plan keeps `qo_indptr` and `kv_indptr` as live device inputs; their storage
 must remain valid and stable. Their values may change between runs while
 preserving the planned batch, zero starting offsets, final packed extents,
 strictly positive deltas, and these per-request capacity bounds. Each capacity
@@ -141,7 +141,7 @@ runtime request:
 
 Every causal replay must additionally satisfy `Sq[b] <= Sk[b]`. The
 request-local bottom-right offset `Sk[b] - Sq[b]` may change; it is derived
-from the per-run offsets. Fixed totals plus the per-request capacity bounds force
+from the live offsets. Fixed totals plus the per-request capacity bounds force
 plan-time uniform Q or K lengths to remain unchanged. In particular, when a
 dense plan compiles away request-local K-tail masking because every K length
 equals the same 128-row-aligned maximum, the replay conditions preserve that

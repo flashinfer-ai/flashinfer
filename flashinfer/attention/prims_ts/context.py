@@ -797,7 +797,7 @@ def _contiguous_context_uses_clc_scheduler(
     heavier work tiles. A bottom-right-offset single-instance fixed or
     uniform-packed plan has a near-uniform immutable domain, so its persistent
     CTAs can advance through the static queue without a CLC request/response
-    on every tile. General packed plans retain CLC because per-run cumulative
+    on every tile. General packed plans retain CLC because live cumulative
     offsets can change the active query-tile domain.
     """
 
@@ -824,7 +824,7 @@ def _contiguous_context_uses_persistent_scheduler(
 ) -> bool:
     """Return whether contiguous work needs a persistent launch.
 
-    Paired, runtime-ragged, and zero-offset triangular task graphs keep dynamic
+    Paired, live-ragged, and zero-offset triangular task graphs keep dynamic
     persistence. Near-uniform bottom-right-offset single-instance domains
     launch directly when they fit in one resident wave and use static
     persistence only when more work remains. Oversized logical Y/Z dimensions
@@ -1988,7 +1988,7 @@ class BatchPrefillTSWrapper:
     graph capture. ``out`` must not overlap any Q, K, V, packed-offset, or
     scale input storage.
 
-    Packed ``qo_indptr`` and ``kv_indptr`` storage is retained as per-run plan
+    Packed ``qo_indptr`` and ``kv_indptr`` storage is retained as live plan
     input, so it must remain alive and at stable addresses. General ragged
     kernels reread the values; a uniform packed plan may compile its fixed
     offsets into the specialization. Values may change while preserving the
@@ -2001,7 +2001,7 @@ class BatchPrefillTSWrapper:
     per-request capacity bounds force plan-time uniform Q or K lengths to
     remain unchanged, preserving a dense aligned-K specialization that
     compiled away request-local K-tail masking. The ``run`` host path trusts
-    current offset values; violating this contract can produce incorrect results
+    live offset values; violating this contract can produce incorrect results
     or out-of-bounds access.
     """
 
@@ -2029,7 +2029,7 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Validate semantics, establish Q/K capacities, and compile once.
 
-        Packed cumulative offsets remain per-run device inputs. Their runtime
+        Packed cumulative offsets remain live device inputs. Their runtime
         values must follow the replay contract documented on this wrapper.
 
         Parameters

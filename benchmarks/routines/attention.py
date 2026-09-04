@@ -80,7 +80,7 @@ def _drop_backend(backends, backend, reason):
 
 
 def _get_prims_ts_module():
-    """Import the PrimTS backend only when a benchmark requests it."""
+    """Import the experimental backend only when a benchmark requests it."""
     from flashinfer.attention import prims_ts
 
     return prims_ts

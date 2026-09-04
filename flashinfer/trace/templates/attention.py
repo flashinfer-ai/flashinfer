@@ -369,7 +369,7 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
             dtype="int32",
             description=(
                 "Runtime KV-block ID capacity; only entries referenced by "
-                "block_indptr are active."
+                "block_indptr are live."
             ),
         ),
         "kv_valid_bits": Tensor(
@@ -420,6 +420,7 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
         tags=[
             "backend:prims-ts",
             "sparse:block",
+            "status:experimental",
         ],
     )
 
@@ -449,7 +450,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "num_page_indices": Var(
                 description=(
                     "Capacity of the runtime physical-page ID tensor; the final "
-                    "active page-table offset may be smaller."
+                    "live page-table offset may be smaller."
                 )
             ),
         }
@@ -494,14 +495,16 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "paged_kv_indptr": Tensor(
                 ["num_page_offsets"],
                 dtype="int32",
-                description=("Per-run request offsets into paged_kv_indices."),
+                description=(
+                    "Live request offsets into paged_kv_indices, read for this call."
+                ),
             ),
             "paged_kv_indices": Tensor(
                 ["num_page_indices"],
                 dtype="int32",
                 description=(
                     "Runtime physical-page ID capacity; only the prefix ending at "
-                    "paged_kv_indptr[-1] is active."
+                    "paged_kv_indptr[-1] is live."
                 ),
             ),
             "max_seq_len_kv": Scalar(
@@ -511,7 +514,9 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
             "seq_lens_kv": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description=("Per-run logical K/V lengths read for this call."),
+                description=(
+                    "Live per-request logical K/V lengths read for this call."
+                ),
             ),
         }
     )
@@ -522,7 +527,7 @@ def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
         description=(
             "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
             f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
-            "and per-run request page tables, K/V lengths, and per-KV-head BSR "
+            "and live request page tables, K/V lengths, and per-KV-head BSR "
             "metadata."
         ),
         axes=axes,
@@ -609,7 +614,7 @@ def _make_block_sparse_wrapper_inputs(
     _copy_tensor_with_description(
         inputs,
         "block_indptr",
-        "Absolute offsets into active block_indices for this wrapper run.",
+        "Absolute offsets into live block_indices for this wrapper run.",
     )
     _copy_tensor_with_description(
         inputs,
@@ -640,7 +645,7 @@ def _make_prims_ts_block_sparse_wrapper_trace() -> TraceTemplate:
         name_prefix="prims_ts_block_sparse_wrapper",
         description=(
             "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            "BSHD Q/K/V and per-run per-KV-head BSR metadata. Block geometry and "
+            "BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and "
             "mask type are retained by plan() and represented as optional "
             "trace context."
         ),
@@ -663,7 +668,7 @@ def _require_prims_ts_block_sparse_wrapper_state(
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            f"Tracing {wrapper_name}.run requires the bound wrapper's plan state. "
+            f"Tracing {wrapper_name}.run requires the live wrapper's plan state. "
             "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
@@ -700,7 +705,7 @@ def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceT
         description=(
             "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
             f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
-            "and per-run page tables, K/V lengths, and per-KV-head BSR metadata. "
+            "and live page tables, K/V lengths, and per-KV-head BSR metadata. "
             "Static K/V capacity, block geometry, and mask type are retained "
             "by plan() and represented as optional trace context."
         ),
@@ -913,7 +918,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
             )
         },
         constraints=constraints,
-        tags=["stage:decode", "backend:prims-ts"],
+        tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
 
 
@@ -1033,7 +1038,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
             )
         },
         constraints=constraints,
-        tags=["stage:decode", "backend:prims-ts"],
+        tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
 
 
@@ -1197,6 +1202,7 @@ def _make_prims_ts_decode_wrapper_trace(
         tags=[
             "stage:decode",
             "backend:prims-ts",
+            "status:experimental",
             f"mask:{mask_type}",
             f"kv-prefix-mode:{kv_prefix_mode}",
             f"kv-lengths-mode:{kv_lengths_mode}",
@@ -1273,7 +1279,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            "Tracing BatchDecodePagedTSWrapper.run requires the bound wrapper's "
+            "Tracing BatchDecodePagedTSWrapper.run requires the live wrapper's "
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
@@ -1410,7 +1416,7 @@ def _make_prims_ts_decode_mla_trace(*, rank4_cache: bool, packed_query: bool):
                 else ["seq_len_q >= 1"]
             ),
         ],
-        tags=["stage:decode", "backend:prims-ts", "mla"],
+        tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
 
 
@@ -1513,7 +1519,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
                 else ["seq_len_q >= 1"]
             ),
         ],
-        tags=["stage:decode", "backend:prims-ts", "mla"],
+        tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
 
 
@@ -1660,6 +1666,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         tags=[
             "stage:decode",
             "backend:prims-ts",
+            "status:experimental",
             "mla",
             f"mask:{mask_type}",
         ],
@@ -1715,7 +1722,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
-            "Tracing BatchMLADecodePagedTSWrapper.run requires the bound wrapper's "
+            "Tracing BatchMLADecodePagedTSWrapper.run requires the live wrapper's "
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )

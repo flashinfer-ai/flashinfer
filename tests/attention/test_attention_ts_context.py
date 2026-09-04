@@ -1701,7 +1701,7 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
     ),
     (
         pytest.param(True, True, True, True, False, id="fixed-causal-static"),
-        pytest.param(True, True, True, False, True, id="runtime-ragged-clc"),
+        pytest.param(True, True, True, False, True, id="live-ragged-clc"),
         pytest.param(True, False, True, True, True, id="paired-clc"),
         pytest.param(True, True, False, False, False, id="dense-static"),
         pytest.param(False, True, True, False, False, id="nonpersistent"),
@@ -1714,7 +1714,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     uniform_packed_lengths: bool,
     expected: bool,
 ):
-    """Paged CLC selection follows topology and runtime-domain requirements."""
+    """Paged CLC selection follows topology and live-domain requirements."""
 
     assert (
         context_module._paged_context_uses_clc_scheduler(
@@ -1740,9 +1740,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     (
         pytest.param(False, False, True, True, True, True, True, id="paired-clc"),
         pytest.param(True, True, False, False, True, True, True, id="head-paired-clc"),
-        pytest.param(
-            True, False, True, False, True, True, True, id="runtime-ragged-clc"
-        ),
+        pytest.param(True, False, True, False, True, True, True, id="live-ragged-clc"),
         pytest.param(True, False, True, True, True, False, True, id="triangular-clc"),
         pytest.param(True, False, True, True, True, True, False, id="offset-static"),
         pytest.param(True, False, True, True, False, False, False, id="dense-static"),
@@ -1786,9 +1784,7 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
     (
         pytest.param(False, False, True, True, 1, True, True, True, id="paired"),
         pytest.param(True, True, False, False, 1, True, True, True, id="head-paired"),
-        pytest.param(
-            True, False, True, False, 1, True, True, True, id="runtime-ragged"
-        ),
+        pytest.param(True, False, True, False, 1, True, True, True, id="live-ragged"),
         pytest.param(True, False, True, True, 1, True, False, True, id="triangular"),
         pytest.param(True, False, True, True, 148, True, True, False, id="one-wave"),
         pytest.param(True, False, True, True, 149, True, True, True, id="multi-wave"),
@@ -1886,10 +1882,10 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
     (Float8E4M3FN, BFloat16),
     ids=("fp8", "bf16"),
 )
-def test_attention_ts_context_d256_runtime_paged_clc_uses_distinct_auxiliary_warps(
+def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
     input_dtype,
 ):
-    """The runtime-ragged D256 CLC and page-ID producers cannot overlap."""
+    """The live-ragged D256 CLC and page-ID producers cannot overlap."""
     kernel = FmhaTs(
         in_dtype=input_dtype,
         out_dtype=Float16,
@@ -3652,12 +3648,12 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_runtime_q_offsets_expand_causal_domain_on_graph_replay(
+def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_replay(
     paged: bool,
     head_dim: int,
     qkv_dtype: torch.dtype,
 ):
-    """Per-run Q offsets must drive the causal K-tile count for each request.
+    """Live Q offsets must drive the causal K-tile count for each request.
 
     Both plans have total_q=564 and max(Sq)=500. Redistributing the same Q
     storage from (500, 64) to (64, 500) raises request zero's bottom-right
@@ -3796,7 +3792,7 @@ def test_attention_ts_context_runtime_q_offsets_expand_causal_domain_on_graph_re
     graph.replay()
     torch.cuda.synchronize()
 
-    # Check graph replay first so this specifically locks down per-run metadata
+    # Check graph replay first so this specifically locks down live metadata
     # behavior under capture; the direct launch must obey the same contract.
     _assert_context_correct(graph_out, runtime_reference, expected=expected)
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
@@ -3804,8 +3800,8 @@ def test_attention_ts_context_runtime_q_offsets_expand_causal_domain_on_graph_re
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_runtime_zero_offset_qk_redistribution_graph_replay():
-    """Per-run Q/K redistribution preserves D128 zero-offset paired semantics."""
+def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
+    """Live Q/K redistribution preserves D128 zero-offset paired semantics."""
 
     plan_lengths = (500, 64)
     replay_lengths = (300, 264)
@@ -3868,8 +3864,8 @@ def test_attention_ts_context_runtime_zero_offset_qk_redistribution_graph_replay
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_runtime_k_redistribution_graph_replay():
-    """Per-run K offsets independently update causal domains and right bounds."""
+def test_attention_ts_context_live_k_redistribution_graph_replay():
+    """Live K offsets independently update causal domains and right bounds."""
 
     q_lengths = (64, 500)
     plan_k_lengths = (1000, 500)
@@ -3925,8 +3921,8 @@ def test_attention_ts_context_runtime_k_redistribution_graph_replay():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_paged_window_runtime_q_redistribution_graph_replay():
-    """Finite-window start and right masks follow per-run packed Q offsets."""
+def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
+    """Finite-window start and right masks follow live packed Q offsets."""
 
     plan_q_lengths = (48, 16)
     replay_q_lengths = (16, 48)

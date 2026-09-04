@@ -1,7 +1,7 @@
 # Task-Scheduled MLA Decode
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
-Attention (MLA) decode kernels used by FlashInfer's Blackwell
+Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
 layout: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
@@ -275,7 +275,7 @@ buffer includes internal FP32 LSE storage, does not require initialization,
 and is exclusive to one in-flight launch or captured graph. It must not overlap
 query, K/V cache, metadata, or output storage. The standalone hot path does not
 copy metadata to the host; callers must maintain all page, length, and
-packed-offset preconditions for every launch. These per-run values are not fully
+packed-offset preconditions for every launch. These live values are not fully
 value-checked by the launch.
 
 For CUDA graph capture, call `plan()` and perform one default-validating

@@ -6,6 +6,7 @@
     "fi_api:flashinfer.attention.prims_ts.mla_decode.prims_ts_batch_decode_with_kv_cache_mla",
     "stage:decode",
     "backend:prims-ts",
+    "status:experimental",
     "mla"
   ],
   "axes": {
