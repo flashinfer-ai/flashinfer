@@ -55,6 +55,13 @@ from .cascade import (
 from .cascade import merge_state as merge_state
 from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
+from .cake_fmha import (
+    cake_batch_context_with_kv_cache as cake_batch_context_with_kv_cache,
+)
+from .cake_fmha import (
+    cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
+)
+from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
 from .decode import (
     BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
 )
@@ -69,8 +76,8 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
-from .cake_dcp import (
+from .dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
+from .dcp import (
     get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
 )
 from .quantization.fp4_quantization import (

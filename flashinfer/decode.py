@@ -3440,7 +3440,9 @@ def trtllm_batch_decode_with_kv_cache(
         When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
 
     backend : str = "auto"
-        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        The implementation backend, could be ``auto``/``xqa``/``trtllm-gen`` or
+        ``cake``. Defaults to ``auto``. ``cake`` selects the separately versioned
+        Cake FMHA product and never participates in automatic backend selection.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
@@ -3538,30 +3540,23 @@ def trtllm_batch_decode_with_kv_cache(
         ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
         enables DCP + speculative decoding without a per-row length tensor.
 
-        The native Cake FMHA path requires BF16 Q/O, causal HND paging, and
-        ``return_lse=True`` (or a caller-owned ``lse``). The D128 profile uses
+        The native Cake FMHA path requires BF16 Q/O, head dimension 128,
+        causal HND paging, ``return_lse=True`` (or a caller-owned ``lse``), and
         head group ratio in ``[1,8]``. BF16 KV uses page size 16 and
-        ``q_len_per_req`` in ``{1,2,4,5,6,8}``; FP8 e4m3 KV uses page size 64
-        and supports every ``q_len_per_req`` from 1 through 8. The D256
-        production profile is FP8/page64 with ``q_len_per_req`` in
-        ``{1,2,3,4,5,6,7,8}``, ``num_qo_heads=16``,
-        ``num_kv_heads=1``, and ``cp_world`` 1 or 4. ``bmm1_scale`` is the
-        fused QK scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV
-        requires ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing
-        TRT-LLM backend contract. Explicit ``enable_pdl=True`` is unsupported;
-        leave it at its default for this path. Here ``max_seq_len`` is the
-        maximum compact rank-local stored length; it may be zero for an
-        entirely empty rank, while ``block_tables`` still supplies one masked
-        physical page slot.
+        ``q_len_per_req`` in ``{1,2,3,4,5,6,8}``; FP8 e4m3 KV uses page size
+        64 and supports the same set.  The route can be selected explicitly
+        with ``backend="cake"``. ``bmm1_scale`` is the fused QK
+        scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV requires
+        ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing TRT-LLM
+        backend contract. Here ``max_seq_len`` is the maximum compact
+        rank-local stored length; it may be zero for an entirely empty rank,
+        while ``block_tables`` still supplies one masked physical page slot.
         Long-context BF16 and underfilled FP8 Split-KV routes use
         ``workspace_buffer`` for partials and require a zero-initialized,
         reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
-        completion tickets after every launch. The D128 FP8 route specializes
-        split1--4 and short-shard K/V retention in its JIT cache key. D256 uses
-        retain0 split1/2/3/4/8/16 bodies and measured B1/B8/B16/B32+ routing.
-        Size its workspace with ``get_dcp_spec_workspace_size_bytes(...,
-        head_dim=256)``. Prewarm a fixed tensor/layout binding before CUDA Graph
-        capture.
+        completion tickets after every launch. The FP8 route specializes
+        split1--4 and short-shard K/V retention in its JIT cache key. Prewarm a
+        fixed tensor/layout binding before CUDA Graph capture.
 
     bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
         Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
@@ -3577,7 +3572,8 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
-    explicit_enable_pdl = enable_pdl is True
+    if causal_seqlens_kv_global is not None and enable_pdl is True:
+        raise ValueError("DCP speculative decode does not support enable_pdl=True")
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
@@ -3628,14 +3624,10 @@ def trtllm_batch_decode_with_kv_cache(
             "DCP speculative decode path"
         )
     if dcp_spec_enabled:
-        if explicit_enable_pdl:
+        if backend not in ("auto", "trtllm-gen", "cake"):
             raise ValueError(
-                "DCP speculative decode does not support an explicit enable_pdl=True"
-            )
-        if backend not in ("auto", "trtllm-gen"):
-            raise ValueError(
-                "DCP speculative decode is only available through backend='auto' "
-                "or backend='trtllm-gen'"
+                "DCP speculative decode is only available through backend='auto', "
+                "backend='trtllm-gen', or the explicit Cake FMHA product backend"
             )
         if kv_layout != "HND":
             raise ValueError(
@@ -3700,7 +3692,7 @@ def trtllm_batch_decode_with_kv_cache(
             if lse is not None
             else torch.empty(lse_shape, dtype=torch.float32, device=query.device)
         )
-        from .cake_dcp import run_dcp_spec_decode
+        from .dcp import run_dcp_spec_decode
 
         run_dcp_spec_decode(
             query=query,
@@ -3719,7 +3711,6 @@ def trtllm_batch_decode_with_kv_cache(
             out=out,
             lse=lse,
             completion_buffer=multi_ctas_kv_counter_buffer,
-            backend="cake",
         )
         return (out, lse) if return_lse else out
 
@@ -3728,8 +3719,10 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-    if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
-        raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
+    if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
+        raise ValueError(
+            "bmm1_scale_log2 is only supported when backend is 'trtllm-gen' or 'cake'"
+        )
     if enable_block_sparse_attention:
         if backend != "trtllm-gen":
             raise ValueError(
@@ -3794,7 +3787,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_scale=o_scale,
             mask=mask,
         )
-    elif backend == "trtllm-gen":
+    elif backend in ("trtllm-gen", "cake"):
         # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
@@ -3810,7 +3803,13 @@ def trtllm_batch_decode_with_kv_cache(
                 k_block_scales = k_block_scales.transpose(-3, -2).contiguous()
                 v_block_scales = v_block_scales.transpose(-3, -2).contiguous()
 
-        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        if backend == "cake":
+            # Route selection needs the finalized output/scales and exact
+            # uniform-query shape, so defer module loading until those values
+            # have been resolved below.
+            run_func = None
+        else:
+            run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
 
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -3959,7 +3958,58 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        run_func(
+        if backend == "cake":
+            from .cake_fmha import (
+                _resolve_cake_fmha_decode_module,
+                select_cake_fmha_decode_route,
+            )
+
+            if skip_softmax_threshold_scale_factor == 1e-30:
+                # The pinned public matrix uses 1e-30 as a numerically inert
+                # skip-softmax probe. Both route selection and launch consume
+                # the disabled form.
+                skip_softmax_threshold_scale_factor = None
+            cake_route = select_cake_fmha_decode_route(
+                query.device,
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                out=out,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                batch_size=batch_size,
+                q_len=q_len_per_req,
+                max_seq_len=max_seq_len,
+                window_left=window_left,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                o_scale=o_scale,
+                sinks=sinks,
+                kv_layout=kv_layout,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                cum_seq_lens_q=cum_seq_lens_q,
+                key_block_scales=k_block_scales,
+                value_block_scales=v_block_scales,
+                skip_softmax_threshold_scale_factor=(
+                    skip_softmax_threshold_scale_factor
+                ),
+                enable_block_sparse_attention=enable_block_sparse_attention,
+                lse=lse,
+            )
+            cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
+                query.device, cake_route
+            )
+            if not optimized_loaded:
+                # compat_v1 takes host scalar scales; only the optimized
+                # scale-pointer specialization preserves the device binding.
+                if isinstance(bmm1_scale, torch.Tensor):
+                    bmm1_scale = float(bmm1_scale.item()) / log2e
+                if isinstance(bmm2_scale, torch.Tensor):
+                    bmm2_scale = float(bmm2_scale.item())
+            run_func = cake_module.cake_paged_attention_decode
+
+        run_args = [
             out,
             out_scale_factor,
             query,
@@ -3993,9 +4043,15 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_heads,
             enable_block_sparse_attention,
             None,  # sparse_mla_top_k_lens
-            bf16q_fp8kv_transform_mode_value,
-            None,  # use_fp16_softmax
-        )
+        ]
+        if backend != "cake":
+            run_args.extend(
+                (
+                    bf16q_fp8kv_transform_mode_value,
+                    None,  # use_fp16_softmax
+                )
+            )
+        run_func(*run_args)
 
         result_out = (
             out
