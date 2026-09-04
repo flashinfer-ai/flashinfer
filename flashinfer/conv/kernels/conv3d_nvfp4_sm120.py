@@ -5,21 +5,22 @@
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 
-from ._sm120_conv3d_descriptor import Sm120BlockScaledConv3dKernel
+from flashinfer.cute_dsl.sm120_blockscaled import (
+    make_sm120_blockscaled_smem_layouts,
+)
+
+from ._sm120_conv3d_descriptor import Sm120Nvfp4Conv3dDescriptor
 from ._sm120_conv3d_mainloop import CompactSfaPingpongMainloop
 
 
 class Sm120Nvfp4Conv3dKernel(
     CompactSfaPingpongMainloop,
-    Sm120BlockScaledConv3dKernel,
+    Sm120Nvfp4Conv3dDescriptor,
 ):
     """Specialized 3x3x3 W4A4 Conv3d for SM120.
 
@@ -30,28 +31,15 @@ class Sm120Nvfp4Conv3dKernel(
     def __init__(
         self,
         *,
-        filter_trs: Tuple[int, int, int] = (3, 3, 3),
-        tile_mnk: Tuple[int, int, int] = (128, 128, 128),
-        epilogue_tile: Tuple[int, int] = (64, 32),
         a_copy_bits: int = 64,
         a_copy_layout: str = "row",
         a_producer_warps: int = 4,
         n_pair: bool = False,
-        parallel_epilogue: bool = False,
         fuse_alpha: bool = True,
         fuse_bias: bool = False,
-        epilogue_mode: str = "fast_fp32",
         raster_order: str = "n",
         swizzle_size: int = 1,
     ):
-        if filter_trs != (3, 3, 3):
-            raise ValueError(f"only a 3x3x3 filter is supported; got {filter_trs}")
-        if tile_mnk != (128, 128, 128):
-            raise ValueError(f"only the 128x128x128 tile is supported; got {tile_mnk}")
-        if epilogue_tile != (64, 32):
-            raise ValueError(
-                f"only the 64x32 epilogue tile is supported; got {epilogue_tile}"
-            )
         if a_copy_bits not in (32, 64, 128):
             raise ValueError(f"a_copy_bits must be 32, 64, or 128; got {a_copy_bits}")
         if a_copy_layout not in ("row", "coalesced"):
@@ -62,14 +50,8 @@ class Sm120Nvfp4Conv3dKernel(
             raise ValueError(
                 f"a_producer_warps must be 1, 2, or 4; got {a_producer_warps}"
             )
-        if parallel_epilogue and not n_pair:
-            raise ValueError("parallel_epilogue requires n_pair")
         if fuse_bias and not fuse_alpha:
             raise ValueError("fuse_bias requires fuse_alpha")
-        if epilogue_mode not in ("strict", "fast_fp32"):
-            raise ValueError(
-                f"epilogue_mode must be 'strict' or 'fast_fp32'; got {epilogue_mode!r}"
-            )
         if raster_order not in ("m", "n"):
             raise ValueError(f"raster_order must be 'm' or 'n'; got {raster_order!r}")
         if swizzle_size not in (1, 2, 4, 8):
@@ -81,38 +63,15 @@ class Sm120Nvfp4Conv3dKernel(
         self.p3_a_copy_layout = a_copy_layout
         self.p3_a_producer_warps = a_producer_warps
         self.p3_n_pair = n_pair
-        self.p3_parallel_epilogue = parallel_epilogue
         self.p3_fuse_alpha = fuse_alpha
         self.p3_fuse_bias = fuse_bias
-        self.p3_epilogue_mode = epilogue_mode
 
         super().__init__(
             acc_dtype=cutlass.Float32,
             sf_vec_size=16,
-            tile_shape_mnk=tile_mnk,
-            epi_tile=epilogue_tile,
-            filter_trs=filter_trs,
-            upper_padding_dhw=(0, 0, 0),
-            lower_padding_dhw=(0, 0, 0),
-            stride_dhw=(1, 1, 1),
-            dilation_dhw=(1, 1, 1),
-            sfa_layout_mode="natural_cpasync_inline",
-            use_conv_owned_kernel=True,
-            a_load_mode="tma",
-            a_copy_bits=a_copy_bits,
-            a_copy_layout_mode=a_copy_layout,
-            sfb_load_mode="tma",
-            epilogue_store_mode="tma",
-            output_z_override=0,
-            output_z_offset=0,
-            scale_exactn_fastpath=True,
+            tile_shape_mnk=(128, 128, 128),
+            epi_tile=(64, 32),
         )
-        if self.p3_parallel_epilogue:
-            self.p3_epilog_sync_barrier_0 = self.epilog_sync_barrier
-            self.p3_epilog_sync_barrier_1 = pipeline.NamedBarrier(
-                barrier_id=3,
-                num_threads=self.num_mma_warps * self.num_threads_per_warp // 2,
-            )
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -120,13 +79,7 @@ class Sm120Nvfp4Conv3dKernel(
             return
 
         self.ab_stage = 3
-        physical_epi_stage = self.epi_stage
-        if self.p3_parallel_epilogue:
-            if self.epi_stage != 4:
-                raise ValueError("parallel epilogue expects four physical stages")
-            self.epi_stage = 2
-            physical_epi_stage = 2 * self.epi_stage
-        single_n_layouts = self._make_smem_layouts(
+        single_n_layouts = make_sm120_blockscaled_smem_layouts(
             self.tile_shape_mnk,
             self.epi_tile,
             self.smem_alloc_a_dtype,
@@ -136,11 +89,11 @@ class Sm120Nvfp4Conv3dKernel(
             self.ab_stage,
             self.c_dtype,
             self.c_layout,
-            physical_epi_stage,
+            self.epi_stage,
             self.sf_vec_size,
             self.tiled_mma,
         )
-        dual_n_layouts = self._make_smem_layouts(
+        dual_n_layouts = make_sm120_blockscaled_smem_layouts(
             self.tile_shape_mnk,
             self.epi_tile,
             self.smem_alloc_a_dtype,
@@ -150,7 +103,7 @@ class Sm120Nvfp4Conv3dKernel(
             2 * self.ab_stage,
             self.c_dtype,
             self.c_layout,
-            physical_epi_stage,
+            self.epi_stage,
             self.sf_vec_size,
             self.tiled_mma,
         )

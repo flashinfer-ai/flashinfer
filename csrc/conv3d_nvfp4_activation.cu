@@ -28,7 +28,7 @@ constexpr DLDataType kUInt8 = DLDataType{kDLUInt, 8, 1};
 
 void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
                                       TensorView packed_output, TensorView scale_output,
-                                      int64_t pad_height, int64_t pad_width, int64_t tile_variant) {
+                                      int64_t pad_height, int64_t pad_width) {
   CHECK_INPUT_AND_TYPE(input, kBFloat16);
   CHECK_INPUT_AND_TYPE(global_scale, kFloat32);
   CHECK_INPUT_AND_TYPE(packed_output, kUInt8);
@@ -44,9 +44,6 @@ void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
   TVM_FFI_ICHECK_EQ(global_scale.size(0), 1) << "global_scale must have shape (1,)";
   TVM_FFI_ICHECK(pad_height == 0 || pad_height == 1) << "pad_height must be zero or one";
   TVM_FFI_ICHECK(pad_width == 0 || pad_width == 1) << "pad_width must be zero or one";
-  TVM_FFI_ICHECK_GE(tile_variant, 0);
-  TVM_FFI_ICHECK_LE(tile_variant, 4);
-
   const int batch = static_cast<int>(input.size(0));
   const int channels = static_cast<int>(input.size(1));
   const int depth = static_cast<int>(input.size(2));
@@ -57,11 +54,8 @@ void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
   TVM_FFI_ICHECK_GT(height, 0);
   TVM_FFI_ICHECK_GT(width, 0);
 
-  const int channel_tile =
-      flashinfer::conv3d_nvfp4::activation_channel_tile(static_cast<int>(tile_variant));
-  TVM_FFI_ICHECK_GT(channel_tile, 0);
-  TVM_FFI_ICHECK_EQ(channels % channel_tile, 0)
-      << "channels must be divisible by the selected activation channel tile " << channel_tile;
+  TVM_FFI_ICHECK_EQ(channels % flashinfer::conv3d_nvfp4::kActivationChannelTile, 0)
+      << "channels must be divisible by " << flashinfer::conv3d_nvfp4::kActivationChannelTile;
 
   const int physical_height = height + 2 * static_cast<int>(pad_height);
   const int physical_width = width + 2 * static_cast<int>(pad_width);
@@ -85,8 +79,7 @@ void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
       static_cast<const float*>(global_scale.data_ptr()),
       static_cast<uint8_t*>(packed_output.data_ptr()),
       static_cast<uint8_t*>(scale_output.data_ptr()), batch, channels, depth, height, width, 0,
-      static_cast<int>(pad_height), static_cast<int>(pad_width), static_cast<int>(tile_variant),
-      stream);
+      static_cast<int>(pad_height), static_cast<int>(pad_width), stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "NVFP4 Conv3d activation quantization failed: " << cudaGetErrorString(status);
 }

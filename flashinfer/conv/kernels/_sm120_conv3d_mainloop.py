@@ -52,7 +52,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 
-from ._sm120_blockscaled_dispatch import make_ldmatrix_atom
+from flashinfer.cute_dsl.sm120_blockscaled import make_sm120_fp4_ldmatrix_atom
 
 
 class CompactSfaPingpongMainloop:
@@ -71,20 +71,15 @@ class CompactSfaPingpongMainloop:
         epi_tile: tuple[int, int]
         epilog_sync_barrier: Any
         load_register_requirement: int
-        mixed_mode: bool
         mma_register_requirement: int
         num_mma_warps: int
         num_threads_per_warp: int
         p3_a_copy_bits: int
         p3_a_copy_layout: str
         p3_a_producer_warps: int
-        p3_epilog_sync_barrier_0: Any
-        p3_epilog_sync_barrier_1: Any
-        p3_epilogue_mode: str
         p3_fuse_alpha: bool
         p3_fuse_bias: bool
         p3_n_pair: bool
-        p3_parallel_epilogue: bool
         sf_dtype: Any
         sf_vec_size: int
         shared_storage: Any
@@ -96,16 +91,6 @@ class CompactSfaPingpongMainloop:
         def make_and_init_order_barrier(
             self, barrier_storage: Any, warp_group_idx: Any
         ) -> Any: ...
-
-    @cute.jit
-    def p3_epilog_sync(self, warp_group_idx):
-        if cutlass.const_expr(self.p3_parallel_epilogue):
-            if warp_group_idx == 0:
-                self.p3_epilog_sync_barrier_0.arrive_and_wait()
-            else:
-                self.p3_epilog_sync_barrier_1.arrive_and_wait()
-        else:
-            self.epilog_sync_barrier.arrive_and_wait()
 
     @cute.kernel
     def conv_kernel(
@@ -645,17 +630,15 @@ class CompactSfaPingpongMainloop:
             cute.arch.setmaxregister_increase(self.mma_register_requirement)
             num_k_blocks = cute.size(tCrA, mode=[2])
 
-            atom_copy_ldmatrix_a = make_ldmatrix_atom(
+            atom_copy_ldmatrix_a = make_sm120_fp4_ldmatrix_atom(
                 self.a_dtype,
                 transpose=self.a_layout.is_m_major_a(),
                 num_matrices=4,
-                mixed_mode=self.mixed_mode,
             )
-            atom_copy_ldmatrix_b = make_ldmatrix_atom(
+            atom_copy_ldmatrix_b = make_sm120_fp4_ldmatrix_atom(
                 self.b_dtype,
                 transpose=self.b_layout.is_n_major_b(),
                 num_matrices=4,
-                mixed_mode=self.mixed_mode,
             )
             smem_tiled_copy_a = cute.make_tiled_copy_A(atom_copy_ldmatrix_a, tiled_mma)
             smem_tiled_copy_b = cute.make_tiled_copy_B(atom_copy_ldmatrix_b, tiled_mma)
@@ -905,8 +888,7 @@ class CompactSfaPingpongMainloop:
                     )
 
                 if cutlass.const_expr(self.p3_n_pair):
-                    if cutlass.const_expr(not self.p3_parallel_epilogue):
-                        math_wg_order_barrier.wait(math_wg_order_state)
+                    math_wg_order_barrier.wait(math_wg_order_state)
                 else:
                     math_wg_order_state = math_wg_order_barrier.arrive(
                         math_wg_order_state
@@ -998,22 +980,10 @@ class CompactSfaPingpongMainloop:
                                         value = cutlass.Float32(
                                             tRS_rAcc_slice[elem_idx]
                                         ) * cutlass.Float32(mA_zero[0])
-                                        if cutlass.const_expr(
-                                            self.p3_epilogue_mode == "strict"
-                                        ):
-                                            value = cutlass.Float32(
-                                                value.to(self.c_dtype)
-                                            )
                                         if cutlass.const_expr(self.p3_fuse_bias):
                                             value = value + cutlass.Float32(
                                                 mA_zero[2 + global_n]
                                             )
-                                            if cutlass.const_expr(
-                                                self.p3_epilogue_mode == "strict"
-                                            ):
-                                                value = cutlass.Float32(
-                                                    value.to(self.c_dtype)
-                                                )
                                         tRS_rD_out_slice[elem_idx] = value.to(
                                             self.c_dtype
                                         )
@@ -1026,16 +996,14 @@ class CompactSfaPingpongMainloop:
                                 )
                             tRS_rD_out.store(epilogue_values.to(self.c_dtype))
                         epi_buffer = (epi_m * epi_rest_n + epi_n) % self.epi_stage
-                        if cutlass.const_expr(self.p3_parallel_epilogue):
-                            epi_buffer += warp_group_idx * self.epi_stage
-                        self.p3_epilog_sync(warp_group_idx)
+                        self.epilog_sync_barrier.arrive_and_wait()
                         cute.copy(
                             tiled_copy_r2s,
                             tRS_rD_out,
                             tRS_sD[(None, None, None, epi_buffer)],
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        self.p3_epilog_sync(warp_group_idx)
+                        self.epilog_sync_barrier.arrive_and_wait()
                         if warp_idx % 4 == 0:
                             cute.copy(
                                 tma_atom_c,
@@ -1050,11 +1018,6 @@ class CompactSfaPingpongMainloop:
                     tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
                 tma_store_pipeline.producer_tail()
-                if cutlass.const_expr(
-                    not self.p3_n_pair or not self.p3_parallel_epilogue
-                ):
-                    math_wg_order_state = math_wg_order_barrier.arrive(
-                        math_wg_order_state
-                    )
+                math_wg_order_state = math_wg_order_barrier.arrive(math_wg_order_state)
 
         return

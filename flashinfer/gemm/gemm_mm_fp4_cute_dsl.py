@@ -31,13 +31,17 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
         dense_blockscaled_gemm_sm103,
+        dense_blockscaled_gemm_sm120_b12x,
     )
+    from ..cute_dsl import sm120_blockscaled
 
     return (
         __file__,
         dense_blockscaled_gemm_sm100.__file__,
         dense_blockscaled_gemm_sm100_common.__file__,
         dense_blockscaled_gemm_sm103.__file__,
+        dense_blockscaled_gemm_sm120_b12x.__file__,
+        sm120_blockscaled.__file__,
     )
 
 

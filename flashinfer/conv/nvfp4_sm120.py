@@ -23,20 +23,20 @@ import torch
 
 
 def _kernel_source_files() -> tuple[str, ...]:
+    from ..cute_dsl import sm120_blockscaled
     from .kernels import (
-        _sm120_blockscaled_dispatch,
-        _sm120_blockscaled_gemm,
         _sm120_conv3d_descriptor,
         _sm120_conv3d_mainloop,
+        _sm120_nvfp4_base,
         conv3d_nvfp4_sm120,
     )
 
     return (
         __file__,
-        _sm120_blockscaled_dispatch.__file__,
-        _sm120_blockscaled_gemm.__file__,
+        sm120_blockscaled.__file__,
         _sm120_conv3d_descriptor.__file__,
         _sm120_conv3d_mainloop.__file__,
+        _sm120_nvfp4_base.__file__,
         conv3d_nvfp4_sm120.__file__,
     )
 
@@ -52,6 +52,7 @@ def _kernel_name(
     a_producer_warps: int,
     n_pair: bool,
     swizzle_size: int,
+    max_active_clusters: int,
 ) -> str:
     n, c, d, h, w = input_shape
     return (
@@ -59,6 +60,7 @@ def _kernel_name(
         f"_alpha{int(fuse_alpha)}_b{int(fuse_bias)}"
         f"_a{a_copy_bits}{a_copy_layout}"
         f"_aw{a_producer_warps}_np{int(n_pair)}_sw{swizzle_size}"
+        f"_mac{max_active_clusters}"
     )
 
 
@@ -102,110 +104,112 @@ def _get_compiled_kernel(
             f"got {input_shape}"
         )
 
-    kernel = Sm120Nvfp4Conv3dKernel(
-        a_copy_bits=a_copy_bits,
-        a_copy_layout=a_copy_layout,
-        a_producer_warps=a_producer_warps,
-        n_pair=n_pair,
-        fuse_alpha=fuse_alpha,
-        fuse_bias=fuse_bias,
-        raster_order="n",
-        swizzle_size=swizzle_size,
-    )
+    device = torch.device("cuda", device_index)
     with torch.cuda.device(device_index):
-        max_active_clusters = get_max_active_clusters(1)
-    weight_scale_bytes = _weight_scale_num_bytes(output_channels, channels)
+        kernel = Sm120Nvfp4Conv3dKernel(
+            a_copy_bits=a_copy_bits,
+            a_copy_layout=a_copy_layout,
+            a_producer_warps=a_producer_warps,
+            n_pair=n_pair,
+            fuse_alpha=fuse_alpha,
+            fuse_bias=fuse_bias,
+            raster_order="n",
+            swizzle_size=swizzle_size,
+        )
+        max_active_clusters = get_max_active_clusters(1, device)
+        weight_scale_bytes = _weight_scale_num_bytes(output_channels, channels)
 
-    def compile_kernel():
-        packed_input = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (
-                batch,
-                physical_depth,
-                physical_height,
-                physical_width,
-                channels // 2,
-            ),
-            stride_order=(4, 3, 2, 1, 0),
-            assumed_align=16,
-        )
-        packed_weight = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (
-                output_channels,
-                filter_t,
-                filter_r,
-                filter_s,
-                channels // 2,
-            ),
-            stride_order=(4, 3, 2, 1, 0),
-            assumed_align=16,
-        )
-        input_scale = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (
-                batch,
-                physical_depth,
-                physical_height,
-                physical_width,
-                channels // 16,
-            ),
-            stride_order=(4, 3, 2, 1, 0),
-            assumed_align=16,
-        )
-        weight_scale = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (weight_scale_bytes,),
-            assumed_align=16,
-        )
-        alpha_and_bias = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (output_channels + 2 if fuse_bias else 1,),
-            assumed_align=4,
-        )
-        output = cute.runtime.make_fake_compact_tensor(
-            cutlass.BFloat16,
-            (
-                batch,
-                output_depth,
-                output_height,
-                output_width,
-                output_channels,
-            ),
-            stride_order=(4, 3, 2, 1, 0),
-            assumed_align=16,
-        )
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        return cute.compile(
-            kernel.wrapper,
-            packed_input,
-            packed_weight,
-            input_scale,
-            weight_scale,
-            alpha_and_bias,
-            output,
-            max_active_clusters,
-            stream,
-            options="--opt-level 3 --enable-tvm-ffi",
-        )
+        def compile_kernel():
+            packed_input = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8,
+                (
+                    batch,
+                    physical_depth,
+                    physical_height,
+                    physical_width,
+                    channels // 2,
+                ),
+                stride_order=(4, 3, 2, 1, 0),
+                assumed_align=16,
+            )
+            packed_weight = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8,
+                (
+                    output_channels,
+                    filter_t,
+                    filter_r,
+                    filter_s,
+                    channels // 2,
+                ),
+                stride_order=(4, 3, 2, 1, 0),
+                assumed_align=16,
+            )
+            input_scale = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8,
+                (
+                    batch,
+                    physical_depth,
+                    physical_height,
+                    physical_width,
+                    channels // 16,
+                ),
+                stride_order=(4, 3, 2, 1, 0),
+                assumed_align=16,
+            )
+            weight_scale = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8,
+                (weight_scale_bytes,),
+                assumed_align=16,
+            )
+            alpha_and_bias = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (output_channels + 2 if fuse_bias else 1,),
+                assumed_align=4,
+            )
+            output = cute.runtime.make_fake_compact_tensor(
+                cutlass.BFloat16,
+                (
+                    batch,
+                    output_depth,
+                    output_height,
+                    output_width,
+                    output_channels,
+                ),
+                stride_order=(4, 3, 2, 1, 0),
+                assumed_align=16,
+            )
+            stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            return cute.compile(
+                kernel.wrapper,
+                packed_input,
+                packed_weight,
+                input_scale,
+                weight_scale,
+                alpha_and_bias,
+                output,
+                max_active_clusters,
+                stream,
+                options="--opt-level 3 --enable-tvm-ffi",
+            )
 
-    name = _kernel_name(
-        input_shape,
-        output_channels,
-        fuse_alpha=fuse_alpha,
-        fuse_bias=fuse_bias,
-        a_copy_bits=a_copy_bits,
-        a_copy_layout=a_copy_layout,
-        a_producer_warps=a_producer_warps,
-        n_pair=n_pair,
-        swizzle_size=swizzle_size,
-    )
-    return build_and_load_cute_dsl_kernel(
-        "conv3d_nvfp4",
-        name,
-        compile_kernel,
-        extra_key_files=_kernel_source_files(),
-    )
+        name = _kernel_name(
+            input_shape,
+            output_channels,
+            fuse_alpha=fuse_alpha,
+            fuse_bias=fuse_bias,
+            a_copy_bits=a_copy_bits,
+            a_copy_layout=a_copy_layout,
+            a_producer_warps=a_producer_warps,
+            n_pair=n_pair,
+            swizzle_size=swizzle_size,
+            max_active_clusters=max_active_clusters,
+        )
+        return build_and_load_cute_dsl_kernel(
+            "conv3d_nvfp4",
+            name,
+            compile_kernel,
+            extra_key_files=_kernel_source_files(),
+        )
 
 
 def _check_runtime_tensor(

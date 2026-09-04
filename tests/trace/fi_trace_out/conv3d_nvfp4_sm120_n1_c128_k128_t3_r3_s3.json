@@ -1,0 +1,164 @@
+{
+  "name": "conv3d_nvfp4_sm120_n1_c128_k128_t3_r3_s3",
+  "description": "SM120 3x3x3 block-scaled NVFP4 Conv3d with dynamic activation quantization, FP32 accumulation, and BF16 output.",
+  "op_type": "conv3d_nvfp4",
+  "tags": [
+    "fi_api:flashinfer.conv.nvfp4.conv3d_nvfp4",
+    "sm120",
+    "nvfp4",
+    "status:verified"
+  ],
+  "axes": {
+    "batch": {
+      "type": "const",
+      "value": 1
+    },
+    "input_channels": {
+      "type": "const",
+      "value": 128
+    },
+    "input_depth": {
+      "type": "var"
+    },
+    "input_height": {
+      "type": "var"
+    },
+    "input_width": {
+      "type": "var"
+    },
+    "output_channels": {
+      "type": "const",
+      "value": 128
+    },
+    "filter_t": {
+      "type": "const",
+      "value": 3
+    },
+    "filter_r": {
+      "type": "const",
+      "value": 3
+    },
+    "filter_s": {
+      "type": "const",
+      "value": 3
+    },
+    "packed_input_channels": {
+      "type": "var"
+    },
+    "weight_scale_bytes": {
+      "type": "var"
+    },
+    "scale_elements": {
+      "type": "const",
+      "value": 1
+    },
+    "output_depth": {
+      "type": "var"
+    },
+    "output_height": {
+      "type": "var"
+    },
+    "output_width": {
+      "type": "var"
+    }
+  },
+  "constraints": [
+    "batch == 1",
+    "input_channels == 2 * packed_input_channels",
+    "input_channels % 128 == 0",
+    "output_channels % 128 == 0",
+    "filter_t == 3",
+    "filter_r == 3",
+    "filter_s == 3",
+    "weight_scale_bytes == ((output_channels + 127) // 128) * (((input_channels * 27 // 16) + 3) // 4) * 512",
+    "scale_elements == 1",
+    "output_depth == input_depth - 2"
+  ],
+  "inputs": {
+    "input": {
+      "shape": [
+        "batch",
+        "input_channels",
+        "input_depth",
+        "input_height",
+        "input_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "packed_weight": {
+      "shape": [
+        "output_channels",
+        "filter_t",
+        "filter_r",
+        "filter_s",
+        "packed_input_channels"
+      ],
+      "dtype": "uint8"
+    },
+    "weight_scale": {
+      "shape": [
+        "weight_scale_bytes"
+      ],
+      "dtype": "uint8"
+    },
+    "input_global_scale": {
+      "shape": [
+        "scale_elements"
+      ],
+      "dtype": "float32"
+    },
+    "weight_global_scale": {
+      "shape": [
+        "scale_elements"
+      ],
+      "dtype": "float32"
+    },
+    "bias": {
+      "shape": [
+        "output_channels"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    },
+    "stride": {
+      "shape": null,
+      "dtype": "int32[3]"
+    },
+    "padding": {
+      "shape": null,
+      "dtype": "int32[3]"
+    },
+    "dilation": {
+      "shape": null,
+      "dtype": "int32[3]"
+    },
+    "groups": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "out": {
+      "shape": [
+        "batch",
+        "output_channels",
+        "output_depth",
+        "output_height",
+        "output_width"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch",
+        "output_channels",
+        "output_depth",
+        "output_height",
+        "output_width"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

@@ -183,7 +183,6 @@ def _quantize_nvfp4_conv3d_activation(
     input_global_scale: torch.Tensor,
     padding: Tuple[int, int, int],
     *,
-    tile_variant: int = 0,
     packed_out: Optional[torch.Tensor] = None,
     scale_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -203,9 +202,6 @@ def _quantize_nvfp4_conv3d_activation(
     )
     if padding not in _SUPPORTED_PADDING:
         raise ValueError(f"padding must be one of {_SUPPORTED_PADDING}; got {padding}")
-    if tile_variant not in range(5):
-        raise ValueError(f"tile_variant must be in [0, 4]; got {tile_variant}")
-
     batch, channels, depth, height, width = map(int, input.shape)
     if channels % 128 != 0:
         raise ValueError(f"input channels must be a multiple of 128; got {channels}")
@@ -278,7 +274,6 @@ def _quantize_nvfp4_conv3d_activation(
         scales,
         pad_height,
         pad_width,
-        tile_variant,
     )
     return packed, scales
 

@@ -43,24 +43,8 @@ namespace conv3d_nvfp4 {
 
 constexpr int kScaleVectorSize = 16;
 constexpr int kActivationThreads = 256;
-
-struct ActivationTileConfig {
-  int spatial;
-  int channels;
-};
-
-constexpr ActivationTileConfig kActivationTileConfigs[] = {
-    {32, 64}, {16, 128}, {8, 256}, {32, 128}, {64, 64},
-};
-constexpr int kNumActivationTileVariants =
-    sizeof(kActivationTileConfigs) / sizeof(kActivationTileConfigs[0]);
-
-inline int activation_channel_tile(int tile_variant) {
-  if (tile_variant < 0 || tile_variant >= kNumActivationTileVariants) {
-    return 0;
-  }
-  return kActivationTileConfigs[tile_variant].channels;
-}
+constexpr int kActivationSpatialTile = 32;
+constexpr int kActivationChannelTile = 64;
 
 __device__ __forceinline__ float reciprocal_approximate_ftz(float value) {
   float result;
@@ -234,7 +218,7 @@ inline cudaError_t launch_activation_quantization(const __nv_bfloat16* input,
                                                   const float* global_scale, uint8_t* packed_output,
                                                   uint8_t* scale_output, int batch, int channels,
                                                   int depth, int height, int width, int pad_depth,
-                                                  int pad_height, int pad_width, int tile_variant,
+                                                  int pad_height, int pad_width,
                                                   cudaStream_t stream) {
   const int physical_depth = depth + 2 * pad_depth;
   const int physical_height = height + 2 * pad_height;
@@ -242,50 +226,16 @@ inline cudaError_t launch_activation_quantization(const __nv_bfloat16* input,
   const int physical_voxels = physical_depth * physical_height * physical_width;
   const bool materialize_halo = pad_depth != 0 || pad_height != 0 || pad_width != 0;
 
-  if (tile_variant < 0 || tile_variant >= kNumActivationTileVariants) {
-    return cudaErrorInvalidValue;
-  }
-  const ActivationTileConfig tile = kActivationTileConfigs[tile_variant];
-  if (channels <= 0 || channels % tile.channels != 0 || channels % kScaleVectorSize != 0) {
+  if (channels <= 0 || channels % kActivationChannelTile != 0 || channels % kScaleVectorSize != 0) {
     return cudaErrorInvalidValue;
   }
 
-  const dim3 grid((physical_voxels + tile.spatial - 1) / tile.spatial, channels / tile.channels,
-                  batch);
-  switch (tile_variant) {
-    case 0:
-      launch_quantize_ncdhw<kActivationTileConfigs[0].spatial, kActivationTileConfigs[0].channels>(
-          materialize_halo, grid, stream, input, global_scale, packed_output, scale_output,
-          channels, depth, height, width, physical_depth, physical_height, physical_width,
-          pad_depth, pad_height, pad_width);
-      break;
-    case 1:
-      launch_quantize_ncdhw<kActivationTileConfigs[1].spatial, kActivationTileConfigs[1].channels>(
-          materialize_halo, grid, stream, input, global_scale, packed_output, scale_output,
-          channels, depth, height, width, physical_depth, physical_height, physical_width,
-          pad_depth, pad_height, pad_width);
-      break;
-    case 2:
-      launch_quantize_ncdhw<kActivationTileConfigs[2].spatial, kActivationTileConfigs[2].channels>(
-          materialize_halo, grid, stream, input, global_scale, packed_output, scale_output,
-          channels, depth, height, width, physical_depth, physical_height, physical_width,
-          pad_depth, pad_height, pad_width);
-      break;
-    case 3:
-      launch_quantize_ncdhw<kActivationTileConfigs[3].spatial, kActivationTileConfigs[3].channels>(
-          materialize_halo, grid, stream, input, global_scale, packed_output, scale_output,
-          channels, depth, height, width, physical_depth, physical_height, physical_width,
-          pad_depth, pad_height, pad_width);
-      break;
-    case 4:
-      launch_quantize_ncdhw<kActivationTileConfigs[4].spatial, kActivationTileConfigs[4].channels>(
-          materialize_halo, grid, stream, input, global_scale, packed_output, scale_output,
-          channels, depth, height, width, physical_depth, physical_height, physical_width,
-          pad_depth, pad_height, pad_width);
-      break;
-    default:
-      return cudaErrorInvalidValue;
-  }
+  const dim3 grid((physical_voxels + kActivationSpatialTile - 1) / kActivationSpatialTile,
+                  channels / kActivationChannelTile, batch);
+  launch_quantize_ncdhw<kActivationSpatialTile, kActivationChannelTile>(
+      materialize_halo, grid, stream, input, global_scale, packed_output, scale_output, channels,
+      depth, height, width, physical_depth, physical_height, physical_width, pad_depth, pad_height,
+      pad_width);
   return cudaGetLastError();
 }
 

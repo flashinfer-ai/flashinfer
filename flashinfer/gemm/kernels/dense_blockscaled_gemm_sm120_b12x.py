@@ -39,7 +39,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-import cutlass.utils.hopper_helpers as sm90_utils
 import logging
 from cutlass import Int32, Int64
 from cutlass.cute.nvgpu import cpasync
@@ -51,6 +50,14 @@ from cutlass._mlir.dialects import llvm
 from flashinfer.cute_dsl.utils import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
+)
+from flashinfer.cute_dsl.sm120_blockscaled import (
+    compute_sm120_blockscaled_stages,
+    make_sm120_blockscaled_smem_layouts,
+    make_sm120_fp4_ldmatrix_atom,
+    make_sm120_fp4_mma_op,
+    make_sm120_tma_load_atom_and_tensor,
+    make_sm120_tma_store_atom_and_tensor,
 )
 
 
@@ -284,10 +291,12 @@ class DenseGemmKernel:
         # FP4-only target (NVF4 sf_vec_size=16 / MXF4 sf_vec_size=32). The MXFP8
         # warp-MMA path was dropped: FlashInfer only drives this kernel for FP4,
         # and cute.nvgpu.warp.MmaMXF8Op is absent in the public cutlass-dsl build.
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+        mma_op = make_sm120_fp4_mma_op(
             self.a_dtype,
+            self.b_dtype,
             self.acc_dtype,
             self.sf_dtype,
+            self.sf_vec_size,
         )
         atom_shape = self.atom_shape
         atom_layout = cute.make_layout(atom_shape)
@@ -1171,22 +1180,22 @@ class DenseGemmKernel:
 
             # Copy atoms for SMEM->RMEM
             if cutlass.const_expr(self.swap_ab):
-                atom_copy_ldmatrix_A = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix8x8x16bOp(self.b_layout.is_n_major_b(), 4),
+                atom_copy_ldmatrix_A = make_sm120_fp4_ldmatrix_atom(
                     self.b_dtype,
+                    transpose=self.b_layout.is_n_major_b(),
                 )
-                atom_copy_ldmatrix_B = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
+                atom_copy_ldmatrix_B = make_sm120_fp4_ldmatrix_atom(
                     self.a_dtype,
+                    transpose=self.a_layout.is_m_major_a(),
                 )
             else:
-                atom_copy_ldmatrix_A = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 4),
+                atom_copy_ldmatrix_A = make_sm120_fp4_ldmatrix_atom(
                     self.a_dtype,
+                    transpose=self.a_layout.is_m_major_a(),
                 )
-                atom_copy_ldmatrix_B = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix8x8x16bOp(self.b_layout.is_n_major_b(), 4),
+                atom_copy_ldmatrix_B = make_sm120_fp4_ldmatrix_atom(
                     self.b_dtype,
+                    transpose=self.b_layout.is_n_major_b(),
                 )
             smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
@@ -2178,30 +2187,18 @@ class DenseGemmKernel:
         smem_capacity: int,
         occupancy: int,
     ) -> tuple:
-        epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
-            tile_shape_mnk[0] // epi_tile[0]
+        raw_ab_stage, epi_stage = compute_sm120_blockscaled_stages(
+            tile_shape_mnk,
+            a_dtype,
+            b_dtype,
+            sf_dtype,
+            sfa_smem_layout,
+            sfb_smem_layout,
+            epi_tile,
+            c_dtype,
+            smem_capacity,
+            occupancy,
         )
-        epi_stage = min(epi_stage_max, 4)
-        c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
-        epi_bytes = c_bytes_per_stage * epi_stage
-
-        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-        b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
-        ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
-            + cute.size(b_shape) * b_dtype.width // 8
-        )
-        sf_bytes_per_stage = (
-            cute.size(cute.filter_zeros(sfa_smem_layout).shape) * sf_dtype.width // 8
-            + cute.size(cute.filter_zeros(sfb_smem_layout).shape) * sf_dtype.width // 8
-        )
-        mbar_helpers_bytes = 1024
-
-        raw_ab_stage = (
-            (smem_capacity - occupancy * 1024) // occupancy
-            - mbar_helpers_bytes
-            - epi_bytes
-        ) // (ab_bytes_per_stage + sf_bytes_per_stage)
         ab_stage = max(1, min(raw_ab_stage, 4))
         if tile_shape_mnk[0] in (16, 64) and tile_shape_mnk[1] == 128:
             ab_stage = max(1, min(raw_ab_stage, 5))
@@ -2222,77 +2219,19 @@ class DenseGemmKernel:
         sf_vec_size: int,
         tiled_mma,
     ) -> tuple:
-        a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-
-        a_is_k_major = a_layout.is_k_major_a()
-        b_is_k_major = b_layout.is_k_major_b()
-        a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
-
-        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                a_layout,
-                a_dtype,
-                a_major_mode_size,
-            ),
+        return make_sm120_blockscaled_smem_layouts(
+            tile_shape_mnk,
+            epi_tile,
             a_dtype,
-        )
-        a_smem_layout_staged = cute.tile_to_shape(
-            a_smem_layout_atom,
-            cute.append(a_smem_shape, ab_stage),
-            order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
-        )
-
-        b_smem_shape = cute.slice_(tile_shape_mnk, (0, None, None))
-        b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
-        b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                b_layout,
-                b_dtype,
-                b_major_mode_size,
-            ),
+            a_layout,
             b_dtype,
-        )
-        b_smem_layout_staged = cute.tile_to_shape(
-            b_smem_layout_atom,
-            cute.append(b_smem_shape, ab_stage),
-            order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
-        )
-
-        sfa_smem_layout_staged = sm120_make_smem_layout_sfa(
-            tiled_mma,
-            tile_shape_mnk,
-            sf_vec_size,
+            b_layout,
             ab_stage,
-        )
-        sfb_smem_layout_staged = sm120_make_smem_layout_sfb(
-            tiled_mma,
-            tile_shape_mnk,
-            sf_vec_size,
-            ab_stage,
-        )
-
-        c_smem_shape = epi_tile
-        c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
-        c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                c_layout,
-                c_dtype,
-                c_major_mode_size,
-            ),
             c_dtype,
-        )
-        epi_smem_layout_staged = cute.tile_to_shape(
-            c_smem_layout_atom,
-            cute.append(c_smem_shape, epi_stage),
-            order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
-        )
-
-        return (
-            a_smem_layout_staged,
-            b_smem_layout_staged,
-            sfa_smem_layout_staged,
-            sfb_smem_layout_staged,
-            epi_smem_layout_staged,
+            c_layout,
+            epi_stage,
+            sf_vec_size,
+            tiled_mma,
         )
 
     @staticmethod
@@ -2324,14 +2263,11 @@ class DenseGemmKernel:
         epi_smem_layout_staged,
         epi_tile: tuple,
     ) -> tuple:
-        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+        return make_sm120_tma_store_atom_and_tensor(
             tensor_c,
-            epi_smem_layout,
+            epi_smem_layout_staged,
             epi_tile,
         )
-        return tma_atom_c, tma_tensor_c
 
     @staticmethod
     def _make_tma_atoms_and_tensors(
@@ -2341,21 +2277,13 @@ class DenseGemmKernel:
         mcast_dim: int,
         internal_type=None,
     ) -> tuple:
-        op = (
-            cpasync.CopyBulkTensorTileG2SOp()
-            if mcast_dim == 1
-            else cpasync.CopyBulkTensorTileG2SMulticastOp()
-        )
-        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
+        return make_sm120_tma_load_atom_and_tensor(
             tensor,
-            smem_layout,
+            smem_layout_staged,
             smem_tile,
-            num_multicast=mcast_dim,
-            internal_type=internal_type,
+            mcast_dim,
+            internal_type,
         )
-        return tma_atom, tma_tensor
 
     @staticmethod
     def can_implement(

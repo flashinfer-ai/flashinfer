@@ -294,6 +294,13 @@ def test_conv3d_nvfp4_matches_exact_quantized_reference(padding, bias_dtype):
             (0, 0, 0),
             id="deep-reduction-c512-k256",
         ),
+        pytest.param(
+            128,
+            128,
+            (4, 96, 133),
+            (0, 1, 1),
+            id="persistent-scheduler-m25536-tail",
+        ),
     ],
 )
 def test_conv3d_nvfp4_shape_matrix(
@@ -353,6 +360,52 @@ def test_conv3d_nvfp4_shape_matrix(
         dim=0,
     )
     assert cosine > 0.99998
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_conv3d_nvfp4_compiles_for_input_device_not_current_device():
+    previous_device = torch.cuda.current_device()
+    input_device = torch.device("cuda:0")
+    other_device = torch.device("cuda:1")
+    try:
+        with torch.cuda.device(input_device):
+            (
+                input,
+                _,
+                packed_weight,
+                weight_scale,
+                input_global_scale,
+                weight_global_scale,
+            ) = _make_problem(spatial_shape=(4, 6, 8))
+            expected = _exact_quantized_reference(
+                input,
+                packed_weight,
+                weight_scale,
+                input_global_scale,
+                weight_global_scale,
+                None,
+                (0, 1, 1),
+            )
+
+        torch.cuda.set_device(other_device)
+        actual = conv3d_nvfp4(
+            input,
+            packed_weight,
+            weight_scale,
+            input_global_scale,
+            weight_global_scale,
+            padding=(0, 1, 1),
+        )
+
+        assert torch.cuda.current_device() == other_device.index
+        torch.testing.assert_close(
+            actual.float(),
+            expected.float(),
+            rtol=0.01,
+            atol=0.03125,
+        )
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 def test_conv3d_nvfp4_out_buffer_and_current_stream():

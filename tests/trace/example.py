@@ -16,6 +16,8 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
+conv3d_nvfp4_sm120_n1_c128_k128_t3_r3_s3.json
+fp4_quantize_k3456.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
@@ -63,6 +65,8 @@ msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+nvfp4_quantize_k3456.json
+prepare_nvfp4_conv3d_weight_sm120_k128_c128_t3_r3_s3.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -992,6 +996,27 @@ if _fp4_moe_args is not None:
             routing_method_type=5,
             **_fp4_moe_common,
         )
+
+# ── NVFP4 Conv3d (Wan2.2 VAE decoder, SM120) ──────────────────────────────────
+with contextlib.suppress(Exception):
+    _conv_input = torch.randn(1, 128, 4, 8, 10, dtype=torch.bfloat16, device=device)
+    _conv_weight = (
+        torch.randn(128, 128, 3, 3, 3, dtype=torch.bfloat16, device=device) * 0.02
+    )
+    _conv_packed_weight, _conv_weight_scale, _conv_weight_global_scale = (
+        flashinfer.prepare_nvfp4_conv3d_weight(_conv_weight)
+    )
+    _conv_input_global_scale = (
+        448.0 * 6.0 / _conv_input.abs().amax().float().clamp(min=1e-8)
+    ).reshape(1)
+    flashinfer.conv3d_nvfp4(
+        _conv_input,
+        _conv_packed_weight,
+        _conv_weight_scale,
+        _conv_input_global_scale,
+        _conv_weight_global_scale,
+        padding=(0, 1, 1),
+    )
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))

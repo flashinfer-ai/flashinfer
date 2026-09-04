@@ -18,6 +18,6 @@
 
 void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
                                       TensorView packed_output, TensorView scale_output,
-                                      int64_t pad_height, int64_t pad_width, int64_t tile_variant);
+                                      int64_t pad_height, int64_t pad_width);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_conv3d_quantize_activation, nvfp4_conv3d_quantize_activation);

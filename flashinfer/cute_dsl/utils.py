@@ -29,7 +29,7 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
-from ..utils import _ensure_user_env
+from ..utils import _ensure_user_env, get_device_index
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -223,53 +223,72 @@ def current_cuda_stream():  # noqa: F811
     return current_cuda_stream()
 
 
-# Cache for HardwareInfo - it's expensive to create on every call
-_hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
+# Cache HardwareInfo per CUDA device because its queries use the current context.
+@functools.cache
+def _get_hardware_info(device_index: int) -> "cutlass.utils.HardwareInfo":
+    with torch.cuda.device(device_index):
+        return cutlass.utils.HardwareInfo()
 
 
-def get_hardware_info() -> "cutlass.utils.HardwareInfo":
-    """Get cached HardwareInfo singleton.
+def get_hardware_info(
+    device: Optional[torch.device] = None,
+) -> "cutlass.utils.HardwareInfo":
+    """Get cached HardwareInfo for a CUDA device.
 
     HardwareInfo queries CUDA device capabilities, which can be expensive.
-    This function caches the singleton to avoid repeated queries.
+    Cache entries are device-specific so heterogeneous GPUs in one process do
+    not share occupancy information.
     """
-    global _hardware_info_cache
-    if _hardware_info_cache is None:
-        _hardware_info_cache = cutlass.utils.HardwareInfo()
-    return _hardware_info_cache
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device_index = get_device_index(device)
+    return _get_hardware_info(device_index)
 
 
 @functools.cache
-def get_max_active_clusters(cluster_size: int) -> int:
-    """Get max active clusters for a given cluster size (cached).
+def _get_max_active_clusters(cluster_size: int, device_index: int) -> int:
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device_index):
+        try:
+            return get_hardware_info(device).get_max_active_clusters(cluster_size)
+        except Exception as exc:
+            # nvidia_cutlass_dsl's hardware probe (cuKernelGetFunction) can fail
+            # in spawned subprocesses (e.g. vLLM EngineCore) when the CUDA driver
+            # API context is not current at first use, even if the PyTorch CUDA
+            # runtime is initialised. Fall back to the GPU's physical SM count,
+            # which is a safe upper bound: callers that clamp to sm_count (such
+            # as the SM120 MoE dispatch's ``min(get_max_active_clusters(1),
+            # sm_count)``) are unaffected; other callers under-parallelize
+            # slightly when per-CTA resources allow more than one cluster per
+            # SM, but never over-request (which could deadlock a resident grid).
+            warnings.warn(
+                f"cutlass.get_max_active_clusters failed "
+                f"({type(exc).__name__}: {exc}); falling back to sm_count. "
+                f"This can happen in spawned subprocesses where the CUDA driver "
+                f"API context is not current.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return get_num_sm(device)
+
+
+def get_max_active_clusters(
+    cluster_size: int,
+    device: Optional[torch.device] = None,
+) -> int:
+    """Get max active clusters for a cluster size and CUDA device.
 
     Args:
         cluster_size: Product of cluster_shape_mn dimensions.
+        device: CUDA device to query. Defaults to the current CUDA device.
 
     Returns:
         Maximum number of active clusters supported by hardware.
     """
-    try:
-        return get_hardware_info().get_max_active_clusters(cluster_size)
-    except Exception as exc:
-        # nvidia_cutlass_dsl's hardware probe (cuKernelGetFunction) can fail
-        # in spawned subprocesses (e.g. vLLM EngineCore) when the CUDA driver
-        # API context is not current at first use, even if the PyTorch CUDA
-        # runtime is initialised. Fall back to the GPU's physical SM count,
-        # which is a safe upper bound: callers that clamp to sm_count (such
-        # as the SM120 MoE dispatch's ``min(get_max_active_clusters(1),
-        # sm_count)``) are unaffected; other callers under-parallelize
-        # slightly when per-CTA resources allow more than one cluster per
-        # SM, but never over-request (which could deadlock a resident grid).
-        warnings.warn(
-            f"cutlass.get_max_active_clusters failed "
-            f"({type(exc).__name__}: {exc}); falling back to sm_count. "
-            f"This can happen in spawned subprocesses where the CUDA driver "
-            f"API context is not current.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return get_num_sm(torch.device("cuda"))
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device_index = get_device_index(device)
+    return _get_max_active_clusters(cluster_size, device_index)
 
 
 # WAR for CuTeDSL make_ptr implementation for flashinfer

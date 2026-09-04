@@ -1,0 +1,97 @@
+{
+  "name": "prepare_nvfp4_conv3d_weight_sm120_k128_c128_t3_r3_s3",
+  "description": "Prepare a BF16 KCTRS Conv3d weight as packed E2M1 data and 128x4-swizzled E4M3 scales for SM120.",
+  "op_type": "prepare_nvfp4_conv3d_weight",
+  "tags": [
+    "fi_api:flashinfer.conv.nvfp4.prepare_nvfp4_conv3d_weight",
+    "sm120",
+    "nvfp4",
+    "weight-preparation",
+    "status:verified"
+  ],
+  "axes": {
+    "output_channels": {
+      "type": "const",
+      "value": 128
+    },
+    "input_channels": {
+      "type": "const",
+      "value": 128
+    },
+    "filter_t": {
+      "type": "const",
+      "value": 3
+    },
+    "filter_r": {
+      "type": "const",
+      "value": 3
+    },
+    "filter_s": {
+      "type": "const",
+      "value": 3
+    },
+    "packed_input_channels": {
+      "type": "var"
+    },
+    "weight_scale_bytes": {
+      "type": "var"
+    },
+    "global_scale_elements": {
+      "type": "var"
+    }
+  },
+  "constraints": [
+    "packed_input_channels * 2 == input_channels",
+    "input_channels % 128 == 0",
+    "output_channels % 128 == 0",
+    "filter_t == 3",
+    "filter_r == 3",
+    "filter_s == 3",
+    "weight_scale_bytes == ((output_channels + 127) // 128) * (((input_channels * 27 // 16) + 3) // 4) * 512",
+    "global_scale_elements == 1"
+  ],
+  "inputs": {
+    "weight": {
+      "shape": [
+        "output_channels",
+        "input_channels",
+        "filter_t",
+        "filter_r",
+        "filter_s"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight_global_scale": {
+      "shape": [
+        "global_scale_elements"
+      ],
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "packed_weight": {
+      "shape": [
+        "output_channels",
+        "filter_t",
+        "filter_r",
+        "filter_s",
+        "packed_input_channels"
+      ],
+      "dtype": "uint8"
+    },
+    "weight_scale": {
+      "shape": [
+        "weight_scale_bytes"
+      ],
+      "dtype": "uint8"
+    },
+    "weight_global_scale": {
+      "shape": [
+        "global_scale_elements"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

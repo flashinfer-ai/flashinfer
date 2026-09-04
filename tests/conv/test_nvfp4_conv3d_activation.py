@@ -20,8 +20,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("padding", [(0, 0, 0), (0, 1, 1)])
-@pytest.mark.parametrize("tile_variant", range(5))
-def test_activation_producer_matches_linear_nvfp4_quantization(padding, tile_variant):
+def test_activation_producer_matches_linear_nvfp4_quantization(padding):
     torch.manual_seed(23)
     channels = 256
     input = torch.randn(
@@ -35,7 +34,6 @@ def test_activation_producer_matches_linear_nvfp4_quantization(padding, tile_var
         input,
         global_scale,
         padding,
-        tile_variant=tile_variant,
     )
     _, pad_height, pad_width = padding
     padded = F.pad(input, (pad_width, pad_width, pad_height, pad_height, 0, 0))
@@ -106,6 +104,7 @@ def test_activation_producer_uses_current_stream():
     with torch.cuda.stream(side_stream):
         packed_nonzero = packed.count_nonzero()
         scales_nonzero = scales.count_nonzero()
+    side_stream.synchronize()
     assert packed_nonzero.item() > 0
     assert scales_nonzero.item() > 0
     default_done.synchronize()
