@@ -1354,15 +1354,15 @@ def fp8_paged_mqa_logits(
     to the newest slot.
 
     Example:
-        Two requests, two draft positions each, 64-token pages::
+        Two requests, three draft positions each, 32-token pages::
 
-            B, next_n, num_heads, head_dim = 2, 2, 64, 128
-            block_size, max_seq_len = 64, 4096
+            B, next_n, num_heads, head_dim = 2, 3, 64, 128
+            block_size, max_seq_len = 32, 8192
             device = "cuda"
 
             # Per-request KV lengths and a page table into the shared KV pool.
-            seq_lens = torch.tensor([3000, 4096], dtype=torch.int32, device=device)
-            pages_per_seq = -(-max_seq_len // block_size)  # 64
+            seq_lens = torch.tensor([3000, 8192], dtype=torch.int32, device=device)
+            pages_per_seq = -(-max_seq_len // block_size)  # 256
             block_tables = torch.arange(
                 B * pages_per_seq, dtype=torch.int32, device=device
             ).view(B, pages_per_seq)
