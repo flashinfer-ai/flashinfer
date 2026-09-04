@@ -22,9 +22,9 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
-| `batch_decode_mla_with_paged_kv_cache` | One-shot convenience interface. |
-| `get_prims_ts_batch_decode_mla_workspace_size` | Size caller-owned standalone scratch. |
-| `prims_ts_batch_decode_with_kv_cache_mla` | Standalone launch with caller-owned scratch. |
+| `batch_mla_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
+| `prims_ts_batch_mla_decode_with_kv_cache` | Standalone launch with caller-owned scratch. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -268,7 +268,7 @@ assert packed_out.shape == (sum(q_lens), H, latent_dim)
 ```
 
 For the standalone API, call
-`get_prims_ts_batch_decode_mla_workspace_size()` with the same shape, dtype,
+`get_prims_ts_batch_mla_decode_workspace_size()` with the same shape, dtype,
 mask, and Q-bound arguments as the launch. Allocate at least that many bytes as
 a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8` tensor. The
 buffer includes internal FP32 LSE storage, does not require initialization,

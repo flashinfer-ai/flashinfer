@@ -43,7 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
-    batch_decode_mla_with_paged_kv_cache,
+    batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
@@ -64,8 +64,8 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
     make_throughput_latency_mla_config,
 )
 from flashinfer.mla import (
-    get_prims_ts_batch_decode_mla_workspace_size,
-    prims_ts_batch_decode_with_kv_cache_mla,
+    get_prims_ts_batch_mla_decode_workspace_size,
+    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -770,7 +770,7 @@ def _run_standalone(
     if resolved_max_seq_len_q is None:
         raise ValueError("packed standalone coverage requires max_seq_len_q")
     num_heads = int(case.query.shape[1] if packed_query else case.query.shape[2])
-    workspace_size = get_prims_ts_batch_decode_mla_workspace_size(
+    workspace_size = get_prims_ts_batch_mla_decode_workspace_size(
         case.block_tables.shape[0],
         num_heads,
         _LATENT_DIM,
@@ -808,7 +808,7 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_decode_with_kv_cache_mla(
+    result = prims_ts_batch_mla_decode_with_kv_cache(
         case.query,
         case.kv_cache,
         workspace,
@@ -1132,9 +1132,9 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.__init__,
         BatchMLADecodePagedTSWrapper.plan,
         BatchMLADecodePagedTSWrapper.run,
-        batch_decode_mla_with_paged_kv_cache,
-        get_prims_ts_batch_decode_mla_workspace_size,
-        prims_ts_batch_decode_with_kv_cache_mla,
+        batch_mla_decode_with_paged_kv_cache,
+        get_prims_ts_batch_mla_decode_workspace_size,
+        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1687,7 +1687,7 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
     """Workspace policy resolution rejects unsafe bounds before CUDA work."""
 
     with pytest.raises(NotImplementedError, match=r"padded MLA K/V coordinates"):
-        get_prims_ts_batch_decode_mla_workspace_size(
+        get_prims_ts_batch_mla_decode_workspace_size(
             1,
             8,
             _LATENT_DIM,
@@ -1700,7 +1700,7 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
         NotImplementedError,
         match=r"batch_size \* max_seq_len_q \* num_heads must fit",
     ):
-        get_prims_ts_batch_decode_mla_workspace_size(
+        get_prims_ts_batch_mla_decode_workspace_size(
             1,
             2,
             _LATENT_DIM,
@@ -1897,7 +1897,7 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
             qo_indptr=qo_indptr,
         )
     with pytest.raises(ValueError, match=match):
-        batch_decode_mla_with_paged_kv_cache(
+        batch_mla_decode_with_paged_kv_cache(
             query,
             kv_cache,
             block_tables,
@@ -1926,7 +1926,7 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_decode_with_kv_cache_mla(
+        prims_ts_batch_mla_decode_with_kv_cache(
             case.query,
             case.kv_cache,
             workspace,
@@ -2066,7 +2066,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -2082,7 +2082,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
-    derived_bound_one_shot = batch_decode_mla_with_paged_kv_cache(
+    derived_bound_one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -2545,7 +2545,11 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
         _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled is wrappers[1]._compiled
+    first_state = wrappers[0]._plan_state
+    second_state = wrappers[1]._plan_state
+    assert first_state is not None
+    assert second_state is not None
+    assert first_state.compiled is second_state.compiled
 
 
 @pytest.mark.parametrize(
@@ -2843,7 +2847,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -2897,7 +2901,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     with pytest.raises(
         ValueError, match="max_seq_len_q is required for an all-empty packed query"
     ):
-        batch_decode_mla_with_paged_kv_cache(
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
             case.block_tables,
@@ -2935,7 +2939,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     _assert_case_correct(standalone, case, policy, qo_indptr=qo_indptr)
 
     one_shot_out = torch.empty_like(eager)
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,

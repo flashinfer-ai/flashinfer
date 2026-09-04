@@ -1181,7 +1181,7 @@ def _get_compiled_mla_decode(
     return compiled
 
 
-def get_prims_ts_batch_decode_mla_workspace_size(
+def get_prims_ts_batch_mla_decode_workspace_size(
     batch_size: int,
     num_heads: int,
     kv_lora_rank: int,
@@ -1200,7 +1200,7 @@ def get_prims_ts_batch_decode_mla_workspace_size(
     """Return caller-workspace bytes for one automatic MLA policy.
 
     The arguments resolve the same policy and private scratch layout as
-    :func:`prims_ts_batch_decode_with_kv_cache_mla`, without compiling a
+    :func:`prims_ts_batch_mla_decode_with_kv_cache`, without compiling a
     kernel. ``max_seq_len_q`` is the
     static per-request Q bound for both fixed and packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
@@ -1416,7 +1416,7 @@ def _launch_mla_decode(
 
 
 @flashinfer_api(trace=prims_ts_decode_mla_trace_dispatch)
-def prims_ts_batch_decode_with_kv_cache_mla(
+def prims_ts_batch_mla_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
@@ -1906,7 +1906,7 @@ class BatchMLADecodePagedTSWrapper:
 
 
 @flashinfer_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
-def batch_decode_mla_with_paged_kv_cache(
+def batch_mla_decode_with_paged_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     block_tables: torch.Tensor,
@@ -2097,7 +2097,7 @@ def batch_decode_mla_with_paged_kv_cache(
 
 __all__ = [
     "BatchMLADecodePagedTSWrapper",
-    "batch_decode_mla_with_paged_kv_cache",
-    "get_prims_ts_batch_decode_mla_workspace_size",
-    "prims_ts_batch_decode_with_kv_cache_mla",
+    "batch_mla_decode_with_paged_kv_cache",
+    "get_prims_ts_batch_mla_decode_workspace_size",
+    "prims_ts_batch_mla_decode_with_kv_cache",
 ]

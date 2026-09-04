@@ -103,22 +103,17 @@ have padded storage.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`.
-- Wrapper and standalone metadata is supplied on every run as contiguous
-  `seq_lens[B]` plus `block_tables[B, C]`. The table has unit inner stride and
-  a non-overlapping row stride of at least `C`; padding between rows is
+- Wrapper, standalone, and one-shot metadata use contiguous logical K/V
+  lengths plus `block_tables[B, C]`. The table has unit inner stride and a
+  non-overlapping row stride of at least `C`; padding between rows is
   supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
-- The one-shot convenience API continues to use FlashInfer CSR metadata with
-  `paged_kv_last_page_len[B]`. It validates and converts that metadata before
-  invoking the fixed-table wrapper, so it is not CUDA-graph-capturable.
-  Equal-width CSR rows can use a zero-copy view; ragged rows require a
-  temporary dense table. The standalone launch uses explicit `seq_lens[B]`
-  and a static `max_seq_len` upper bound.
+  The one-shot argument is named `seq_lens_kv`; wrapper and standalone entry
+  points use `seq_lens`. The standalone launch also takes a static
+  `max_seq_len` upper bound. The one-shot helper reads request metadata to
+  derive its plan bounds and therefore is not CUDA-graph-capturable; reusable
+  graph paths plan the wrapper before capture.
 
-Valid CSR metadata starts `paged_kv_indptr` at zero, increases it strictly,
-and ends it at the number of used page-index entries. Every request owns at
-least one page, every page ID indexes the physical cache, and one-shot
-last-page lengths are in `[1, page_size]`. For every wrapper or standalone
-request `b`, the fixed table must satisfy
+For every request `b`, the fixed table must satisfy
 `ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
 valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
