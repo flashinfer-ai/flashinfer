@@ -1424,6 +1424,12 @@ def backend_requirement(
             return backend in backend_checks
 
         def suitable_auto_backends(cc, *args, **kwargs):
+            # Cleared up front rather than only on the path that computes it: the
+            # "no suitable auto backends" hint reads this attribute after a failed
+            # call, and the common_check early return below would otherwise leave
+            # the previous call's value in place -- reporting a problem-size
+            # failure as an experimental-backend exclusion.
+            wrapper.dropped_experimental_backends = []
             if common_check is not None and not common_check(*args, **kwargs):
                 return False
             suitable_backends = []

@@ -206,6 +206,49 @@ def test_auto_with_only_experimental_candidates_hints_at_env_var():
         api(1)
 
 
+def test_common_check_failure_does_not_reuse_a_stale_experimental_hint():
+    """A common_check failure must not inherit the previous call's dropped list.
+
+    suitable_auto_backends returns early when the common check fails, so the
+    attribute the hint reads has to be cleared before that return -- otherwise a
+    problem-size failure is reported as an experimental-backend exclusion and
+    points the user at an environment variable that will not help.
+    """
+    allowed = {"value": True}
+
+    def _common(x, backend="auto"):
+        return allowed["value"]
+
+    @_any_cc
+    def _check_stable(x, backend="auto"):
+        return True
+
+    @experimental_backend
+    @_any_cc
+    def _check_risky(x, backend="auto"):
+        return True
+
+    @backend_requirement(
+        {"stable": _check_stable, "risky": _check_risky},
+        common_check=_common,
+        heuristic_func=lambda backends, *args, **kwargs: list(backends),
+    )
+    def api(x, backend="auto"):
+        return api.suitable_auto_backends[0] if backend == "auto" else backend
+
+    # First call succeeds and records "risky" as dropped from automatic selection.
+    assert api(1) == "stable"
+    assert api.dropped_experimental_backends == ["risky"]
+
+    # Now the common check is what fails. The experimental gate is irrelevant to
+    # that, so the hint must not appear.
+    allowed["value"] = False
+    with pytest.raises(BackendSupportedError) as excinfo:
+        api(1)
+    assert _EXPERIMENTAL_AUTO_ENV_VAR not in str(excinfo.value)
+    assert api.dropped_experimental_backends == []
+
+
 def test_explicit_experimental_backend_needs_no_env_var_and_warns_once():
     api = _make_api()
     with pytest.warns(ExperimentalWarning, match="risky.*selected for 'api'"):
