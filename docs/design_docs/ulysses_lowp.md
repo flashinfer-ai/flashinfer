@@ -121,8 +121,8 @@ Zero tail     uint8       128                           alignment sentinel
 ```
 
 Where `S` is the local sequence length before A2A, `P` is the world size, and
-`D` is head dim (128). The ABI version is stored as a 32-bit header field
-read by `capability()` at import time.
+`D` is head dim (128). `capability()` verifies at import time that the
+compiled kernel's `Q_GROUP`, `K_GROUP`, and `HEAD_DIM` match these values.
 
 Section offsets and sizes are computed by `payload_spec(B, S, H, P)` so
 callers never hand-compute byte offsets. `payload_buffer(B, S, H, P)` returns
@@ -226,7 +226,7 @@ This module does not provide:
   quantization formats are out of scope.
 - **Hopper (SM 9.0) native WGMMA kernel support.** The scale granularity
   (Q_GROUP=32 / K_GROUP=64) is matched to the `_qattn_sm89`
-  grid used by SageAttention2 on both SM89 and SM120. A future ABI variant
+  grid used by SageAttention2 on both SM89 and SM120. A future layout variant
   targeting the SM90 WGMMA kernel (Q per-16-token, K per-128-token) would
   require new kernel instances and is not part of this PR.
 - **Dynamic sequence lengths within a batch.** All batch entries share the
