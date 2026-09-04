@@ -94,7 +94,17 @@ from flashinfer.fused_moe.runners import (
     _TrtllmPackedInputs,
 )
 from flashinfer.fused_moe.core import _fake_trtllm_moe_output
-from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
+from flashinfer.fused_moe.backends.trtllm.sm100_runner import (
+    MoERunner as TrtllmKernelRunner,
+)
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+from flashinfer.tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    WeightLayout,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -218,6 +228,53 @@ class TestTrtllmFakeOutputContract:
         assert result[0].shape == (4, 32)
         assert result[1].shape == (8,)
         assert result[2].shape == (17, 64)
+
+    def test_extracted_runner_returns_unfinalized_native_result(self):
+        gemm2 = torch.empty((5, 4), dtype=torch.bfloat16)
+        permutation = torch.arange(4, dtype=torch.int32)
+        native_result = [gemm2, torch.empty(0), permutation]
+
+        runner = TrtllmKernelRunner.__new__(TrtllmKernelRunner)
+        runner.moe_op = SimpleNamespace(trtllm_bf16_moe=lambda *args: native_result)
+        runner.num_local_experts = 2
+        runner.top_k = 2
+        runner.intermediate_size = 8
+        runner.dtype_act = DtypeTrtllmGen.Bfloat16
+        runner.dtype_weights = DtypeTrtllmGen.Bfloat16
+        runner.fp8_quantization_type = Fp8QuantizationType.NoneFp8
+        runner.activation_type = ActivationType.Swiglu
+
+        weights = torch.empty((2, 2), dtype=torch.bfloat16)
+        inputs = MoeRunnerInputs(
+            output=torch.empty((2, 0), dtype=torch.bfloat16),
+            routing_logits=None,
+            topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+            expert_weights=weights,
+            hidden_states=torch.empty((2, 4), dtype=torch.bfloat16),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        ).to_list()
+        result = runner.forward(
+            inputs,
+            routing_bias=None,
+            gemm1_weights=torch.empty(0),
+            gemm2_weights=torch.empty(0),
+            num_experts=2,
+            n_group=0,
+            topk_group=0,
+            local_expert_offset=0,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Default,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=False,
+            enable_pdl=False,
+        )
+
+        assert result[0].data_ptr() == gemm2.data_ptr()
+        assert result[1] is weights
+        assert result[2].data_ptr() == permutation.data_ptr()
 
 
 def test_trtllm_synthetic_packed_calls_keep_their_launch_state():
@@ -3597,6 +3654,47 @@ def test_identical_config_shares_cache_key(
     b = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
     assert hash(a) == hash(b)
     assert str(a.get_cache_key_extras([])) == str(b.get_cache_key_extras([]))
+
+
+def test_trtllm_runtime_routing_cache_preserves_runner_hash():
+    """Per-call routing tensor identity must not invalidate a tuned tactic."""
+    moe_op = object()
+
+    def make_runner():
+        return TrtllmKernelRunner(
+            moe_op,
+            top_k=4,
+            num_local_experts=8,
+            dtype_act=DtypeTrtllmGen.E4m3,
+            dtype_weights=DtypeTrtllmGen.E4m3,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=128,
+            intermediate_size=128,
+            num_experts=8,
+        )
+
+    def make_inputs():
+        return MoeRunnerInputs(
+            output=torch.empty(4, 128),
+            routing_logits=None,
+            topk_ids=torch.zeros(4, 4, dtype=torch.int32),
+            expert_weights=torch.empty(4, 4),
+            hidden_states=torch.empty(4, 128),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+    first, second = make_runner(), make_runner()
+    first_inputs, second_inputs = make_inputs(), make_inputs()
+    assert hash(first) == hash(second)
+
+    first._make_tuning_config(first_inputs, tune_max_num_tokens=4)
+    second._make_tuning_config(second_inputs, tune_max_num_tokens=4)
+
+    assert first._topk_initializer_cache[0] is first_inputs.topk_ids
+    assert second._topk_initializer_cache[0] is second_inputs.topk_ids
+    assert hash(first) == hash(second)
 
 
 @pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)

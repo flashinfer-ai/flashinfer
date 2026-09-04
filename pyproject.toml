@@ -42,7 +42,7 @@ nvep = []
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -71,6 +71,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+"flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
 # Workload registry of the experimental fused GDN decode backends, loaded at
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]
@@ -117,6 +118,7 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
+  "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
