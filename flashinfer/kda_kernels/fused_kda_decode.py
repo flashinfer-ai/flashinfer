@@ -22,16 +22,29 @@ heads.
 """
 
 import functools
+import math
 from pathlib import Path
+from threading import Lock
+from typing import Any
+from weakref import ref
 
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass.utils import SmemAllocator
+from torch.cuda import is_current_stream_capturing
 import tvm_ffi  # noqa: F401 -- TVM FFI is required for kernel dispatch
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ..jit.fused_kda_decode_generated import (
+    FusedKDADecodeGeneratedVariant,
+    FusedKDADecodeGeneratedSlotClass,
+    load_fused_kda_decode_generated_module,
+    load_fused_kda_decode_generated_variants,
+    select_fused_kda_decode_generated_variant,
+)
+from ..utils import get_compute_capability
 
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
@@ -46,6 +59,12 @@ _L2_EPS = 1.0e-6
 _SUPPORTED_HEADS = (12, 24, 32, 48, 96)
 _CUTE_DSL_MODULE = "fused_kda_decode"
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
+_STATE_INDICES_CLASSIFICATION_CACHE_CAPACITY = 64
+_STATE_INDICES_CLASSIFICATION_CACHE: dict[
+    tuple[Any, ...], tuple[Any, tuple[bool, bool]]
+] = {}
+_STATE_INDICES_CLASSIFICATION_LRU: list[tuple[Any, ...]] = []
+_STATE_INDICES_CLASSIFICATION_LOCK = Lock()
 
 
 def _aligned_tensor(tensor, alignment):
@@ -60,6 +79,20 @@ def _aligned_tensor(tensor, alignment):
         ),
         tensor.layout,
     )
+
+
+def _copy_to_generated_alignment(tensor, alignment):
+    """Stage a tensor when its storage offset weakens the generated ABI alignment."""
+    if not isinstance(tensor, torch.Tensor) or int(tensor.data_ptr()) % alignment == 0:
+        return tensor
+    staged = torch.empty_strided(
+        tensor.shape,
+        tensor.stride(),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    staged.copy_(tensor)
+    return staged
 
 
 def _sigmoid(value):
@@ -611,6 +644,204 @@ def _check_cuda_tensor(name, tensor, dtype):
         raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
 
 
+def _classify_state_indices(values) -> tuple[bool, bool]:
+    """Return whether positive slots repeat and whether every slot is positive."""
+
+    seen: set[int] = set()
+    repeated = False
+    all_positive = True
+    for raw_value in values:
+        value = int(raw_value)
+        if value <= 0:
+            all_positive = False
+            continue
+        if value in seen:
+            repeated = True
+        seen.add(value)
+    return repeated, all_positive
+
+
+def _state_indices_classification_signature(state_indices) -> tuple[Any, ...]:
+    device = state_indices.device
+    return (
+        id(state_indices),
+        int(state_indices.data_ptr()),
+        int(state_indices.storage_offset()),
+        tuple(int(size) for size in state_indices.shape),
+        tuple(int(stride) for stride in state_indices.stride()),
+        str(state_indices.dtype),
+        str(device.type),
+        -1 if device.index is None else int(device.index),
+        int(state_indices._version),
+    )
+
+
+def _cached_state_indices_classification(state_indices) -> tuple[bool, bool]:
+    """Classify one structural index tensor once per storage/version identity."""
+
+    signature = _state_indices_classification_signature(state_indices)
+    with _STATE_INDICES_CLASSIFICATION_LOCK:
+        entry = _STATE_INDICES_CLASSIFICATION_CACHE.get(signature)
+        if entry is not None and entry[0]() is state_indices:
+            if signature in _STATE_INDICES_CLASSIFICATION_LRU:
+                _STATE_INDICES_CLASSIFICATION_LRU.remove(signature)
+            _STATE_INDICES_CLASSIFICATION_LRU.append(signature)
+            return entry[1]
+        if entry is not None:
+            _STATE_INDICES_CLASSIFICATION_CACHE.pop(signature, None)
+            if signature in _STATE_INDICES_CLASSIFICATION_LRU:
+                _STATE_INDICES_CLASSIFICATION_LRU.remove(signature)
+
+    if is_current_stream_capturing():
+        raise RuntimeError(
+            "state_indices classification cache miss during CUDA Graph capture; "
+            "warm up after every state_indices identity/layout/value change, "
+            "then recapture"
+        )
+
+    expected_version = int(state_indices._version)
+    host_values = state_indices.detach().to(device="cpu", copy=True).tolist()
+    if int(state_indices._version) != expected_version:
+        raise RuntimeError("state_indices changed during host classification")
+    classification = _classify_state_indices(host_values)
+    tensor_ref = ref(state_indices)
+
+    with _STATE_INDICES_CLASSIFICATION_LOCK:
+        if _state_indices_classification_signature(state_indices) != signature:
+            raise RuntimeError("state_indices changed before classification caching")
+        current_entry = _STATE_INDICES_CLASSIFICATION_CACHE.get(signature)
+        if current_entry is not None and current_entry[0]() is state_indices:
+            classification = current_entry[1]
+        else:
+            _STATE_INDICES_CLASSIFICATION_CACHE[signature] = (
+                tensor_ref,
+                classification,
+            )
+        if signature in _STATE_INDICES_CLASSIFICATION_LRU:
+            _STATE_INDICES_CLASSIFICATION_LRU.remove(signature)
+        _STATE_INDICES_CLASSIFICATION_LRU.append(signature)
+        while (
+            len(_STATE_INDICES_CLASSIFICATION_LRU)
+            > _STATE_INDICES_CLASSIFICATION_CACHE_CAPACITY
+        ):
+            evicted = _STATE_INDICES_CLASSIFICATION_LRU.pop(0)
+            _STATE_INDICES_CLASSIFICATION_CACHE.pop(evicted, None)
+    return classification
+
+
+def _select_generated_variant(
+    *,
+    x,
+    conv_state,
+    raw_beta,
+    state_indices,
+    state,
+    output_gate,
+    lower_bound,
+    norm_eps,
+) -> FusedKDADecodeGeneratedVariant | None:
+    variants = load_fused_kda_decode_generated_variants()
+    if not variants or get_compute_capability(x.device) != (10, 0):
+        return None
+    if not math.isfinite(float(norm_eps)) or (
+        lower_bound is not None and not math.isfinite(float(lower_bound))
+    ):
+        return None
+    if int(conv_state.stride(0)) * conv_state.element_size() % 8:
+        return None
+    state_alignment = 16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
+    if int(state.stride(0)) * state.element_size() % state_alignment:
+        return None
+
+    num_rows = int(x.shape[0])
+    num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    state_dtype = "bfloat16" if state.dtype == torch.bfloat16 else "float32"
+    slot_classes: tuple[FusedKDADecodeGeneratedSlotClass, ...] = (
+        "positive_unique",
+        "unique_or_null",
+        "repeated_positive",
+    )
+    eligible_by_slot_class = {
+        slot_class: select_fused_kda_decode_generated_variant(
+            target="sm100a",
+            num_heads=num_heads,
+            num_rows=num_rows,
+            state_dtype=state_dtype,
+            slot_class=slot_class,
+            lower_bound=None if lower_bound is None else float(lower_bound),
+            norm_eps=float(norm_eps),
+            x_row_stride=int(x.stride(0)),
+            conv_slot_stride=int(conv_state.stride(0)),
+            beta_row_stride=int(raw_beta.stride(1)),
+            state_slot_stride=int(state.stride(0)),
+            output_gate_row_stride=int(output_gate.stride(0)),
+            variants=variants,
+        )
+        for slot_class in slot_classes
+    }
+    if not any(eligible_by_slot_class.values()):
+        return None
+
+    repeated, all_positive = _cached_state_indices_classification(state_indices)
+    selected_slot_class: FusedKDADecodeGeneratedSlotClass
+    if repeated:
+        selected_slot_class = "repeated_positive"
+    elif all_positive:
+        selected_slot_class = "positive_unique"
+    else:
+        selected_slot_class = "unique_or_null"
+    return eligible_by_slot_class[selected_slot_class]
+
+
+def _run_generated_variant(
+    variant: FusedKDADecodeGeneratedVariant,
+    *,
+    x,
+    weight,
+    conv_state,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    state_indices,
+    state,
+    output_gate,
+    norm_weight,
+    output,
+    lower_bound,
+    norm_eps,
+) -> None:
+    module = load_fused_kda_decode_generated_module(variant.name, variant.target)
+    generated_conv_state = _copy_to_generated_alignment(conv_state, 8)
+    state_alignment = 16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
+    generated_state = _copy_to_generated_alignment(state, state_alignment)
+    generated_output = _copy_to_generated_alignment(output, 8)
+    module.run(
+        x,
+        weight,
+        generated_conv_state,
+        raw_gate,
+        raw_beta,
+        A_log,
+        dt_bias,
+        state_indices,
+        generated_state,
+        output_gate,
+        norm_weight,
+        generated_output,
+        int(lower_bound is not None),
+        0.0 if lower_bound is None else float(lower_bound),
+        float(norm_eps),
+    )
+    for destination, source in (
+        (conv_state, generated_conv_state),
+        (state, generated_state),
+        (output, generated_output),
+    ):
+        if source is not destination:
+            destination.copy_(source)
+
+
 @torch.no_grad()
 def run_fused_kda_decode(
     x: torch.Tensor,
@@ -739,6 +970,36 @@ def run_fused_kda_decode(
             raise ValueError(
                 "output must be contiguous with shape [1, num_rows, H, 128]"
             )
+
+    generated_variant = _select_generated_variant(
+        x=x,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        state_indices=state_indices,
+        state=state,
+        output_gate=output_gate,
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+    )
+    if generated_variant is not None:
+        _run_generated_variant(
+            generated_variant,
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            output=output,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+        )
+        return output
 
     kernel = _get_compiled_kernel(state.dtype, lower_bound, float(norm_eps))
     kernel(
