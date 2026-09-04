@@ -32,6 +32,9 @@
 #ifndef CAKE_FMHA_USE_SCALE_PTR
 #error "CAKE_FMHA_USE_SCALE_PTR must be supplied by the route-specific JIT"
 #endif
+#ifndef CAKE_FMHA_RETAIN_KV_L2
+#error "CAKE_FMHA_RETAIN_KV_L2 must be supplied by the route-specific JIT"
+#endif
 
 using tvm::ffi::Optional;
 using tvm::ffi::Variant;
@@ -339,12 +342,20 @@ void cake_paged_attention_decode(
   unsigned int grid_y = 1;
   unsigned int grid_z = 1;
   // The exact sink kernel maps one CTA per (query, KV head, batch) tile.
+  // The exact B4 CGA kernel maps one two-CTA cluster per logical tile.
   // Other native-BF16 members use their existing persistent 1-D launch.
 #if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
     CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0
   grid_x = Q_LEN;
   grid_y = NUM_KV_HEADS;
   grid_z = BATCH_SIZE;
+#elif BATCH_SIZE == 4 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
+    CAKE_FMHA_HAS_SINK == 0 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
+    CAKE_FMHA_RETAIN_KV_L2 == 1
+  unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
+  unsigned int logical_grid_x =
+      std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
+  grid_x = 2 * logical_grid_x;
 #else
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
   grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);

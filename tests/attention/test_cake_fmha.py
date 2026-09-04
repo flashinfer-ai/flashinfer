@@ -186,6 +186,7 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
     }
     assert "-DBATCH_SIZE=2" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_RETAIN_KV_L2=1" in spec.extra_cuda_cflags
 
 
 @pytest.mark.parametrize(
@@ -331,6 +332,31 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None
     assert "grid_x = Q_LEN;" in exact_branch
     assert "grid_y = NUM_KV_HEADS;" in exact_branch
     assert "grid_z = BATCH_SIZE;" in exact_branch
+
+
+def test_cake_fmha_decode_native_bf16_exact_b4_grid_matches_cga_selector() -> None:
+    adapter = (
+        get_cake_fmha_csrc_dir()
+        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+    ).read_text(encoding="utf-8")
+    grid_policy = adapter.split("unsigned int grid_z = 1;", 1)[1].split(
+        "cudaError_t status", 1
+    )[0]
+    exact_guard = (
+        "#elif BATCH_SIZE == 4 && Q_LEN == 1 && NUM_Q_HEADS == 32 && "
+        "NUM_KV_HEADS == 4 && \\\n"
+        "    CAKE_FMHA_HAS_SINK == 0 && CAKE_FMHA_HAS_WINDOW == 0 && "
+        "CAKE_FMHA_USE_SCALE_PTR == 0 && \\\n"
+        "    CAKE_FMHA_RETAIN_KV_L2 == 1"
+    )
+    assert adapter.count(exact_guard) == 1
+    exact_branch = grid_policy.split(exact_guard, 1)[1].split("#else", 1)[0]
+    assert (
+        "unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;"
+        in exact_branch
+    )
+    assert "unsigned int logical_grid_x =" in exact_branch
+    assert "grid_x = 2 * logical_grid_x;" in exact_branch
 
 
 def test_cake_fmha_decode_native_bf16_other_grids_stay_persistent() -> None:

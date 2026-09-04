@@ -26,7 +26,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "127eb1b09939cec09bc81de116e49c8a0894c1fca3eca578f390c721700529f1"
+    "7a7f54f5d62c4e55e9666f0e3dd22f841de8db4f5eb002d148c0c1ef35a93052"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -1200,6 +1200,7 @@ def gen_cake_fmha_decode_native_bf16_module(
             f"-DCAKE_FMHA_HAS_SINK={selector['HAS_SINK']}",
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+            f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
