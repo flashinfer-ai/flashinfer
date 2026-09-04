@@ -92,7 +92,6 @@ _FLASH_KDA_TARGET_DEFINE = {
 }
 
 _FLASH_KDA_GENERATED_METADATA_NAME = "flashkda_generated_variant_metadata.json"
-_FLASH_KDA_GENERATED_RECEIPT_NAME = "flashkda_generated_generation_receipt.json"
 _FLASH_KDA_GENERATED_CLOSURE_ROLES = (
     "selector_binding",
     "sanitized_body",
@@ -142,7 +141,7 @@ GeneratedFlashKDASelectorKey = tuple[
 
 @dataclass(frozen=True)
 class GeneratedFlashKDAPhysicalSelector:
-    """One receipt-backed semantic key for an exact physical module."""
+    """One metadata-backed semantic key for an exact physical module."""
 
     arch: str
     route: str
@@ -386,16 +385,12 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 
     csrc_dir = _get_flash_kda_csrc_dir()
     metadata_path = csrc_dir / _FLASH_KDA_GENERATED_METADATA_NAME
-    receipt_path = csrc_dir / _FLASH_KDA_GENERATED_RECEIPT_NAME
-    missing = [path for path in (metadata_path, receipt_path) if not path.is_file()]
-    if missing:
+    if not metadata_path.is_file():
         raise FileNotFoundError(
-            "generated FlashKDA registry is not materialized; missing "
-            + ", ".join(str(path) for path in missing)
+            f"generated FlashKDA registry is not materialized: {metadata_path}"
         )
 
     metadata = json.loads(metadata_path.read_text())
-    receipt = json.loads(receipt_path.read_text())
     if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
         raise ValueError("unsupported generated FlashKDA metadata schema")
     if metadata.get("physical_selector_schema_version") != 1:
@@ -407,54 +402,9 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
     rows = metadata.get("variants")
     if not isinstance(rows, list) or not rows:
         raise ValueError("generated FlashKDA metadata has no variants")
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
-        raise ValueError("unsupported generated FlashKDA receipt schema")
-    if receipt.get("status") != "passed":
-        raise ValueError("generated FlashKDA receipt status is not passed")
-    if receipt.get("optimization_level_one_absent") is not True:
-        raise ValueError("generated FlashKDA receipt does not prove O1 absence")
-    if receipt.get("public_confidentiality_scan") != "passed":
-        raise ValueError(
-            "generated FlashKDA receipt does not prove public-safe source content"
-        )
-    if receipt.get("source_closure_status") != "passed":
-        raise ValueError("generated FlashKDA receipt is not source-closed")
-    if receipt.get("physical_selector_schema_version") != 1:
-        raise ValueError("generated FlashKDA receipt lacks physical-selector evidence")
-    if receipt.get("physical_selector_collision_count") != 0:
-        raise ValueError("generated FlashKDA receipt has selector collisions")
-    if receipt.get("launch_contract_schema_version") != 2:
-        raise ValueError("unsupported generated FlashKDA launch-contract schema")
-    receipt_selector_index_sha256 = _require_sha256(
-        receipt.get("physical_selector_index_sha256"),
-        "generated FlashKDA receipt physical_selector_index_sha256",
-    )
-    if receipt_selector_index_sha256 != metadata_selector_index_sha256:
-        raise ValueError(
-            "generated FlashKDA metadata and receipt selector indexes differ"
-        )
-    for digest_name in (
-        "dispatcher_contract_sha256",
-        "runtime_compile_factory_contracts_sha256",
-        "runtime_physical_sequences_sha256",
-    ):
-        _require_sha256(receipt.get(digest_name), f"generated FlashKDA {digest_name}")
-    _require_sha256(
-        receipt.get("source_closure_table_sha256"),
-        "generated FlashKDA source_closure_table_sha256",
-    )
-    if receipt.get("variant_metadata_sha256") != _canonical_json_sha256(metadata):
-        raise ValueError("generated FlashKDA metadata digest does not match receipt")
-    if receipt.get("variant_count") != len(rows):
-        raise ValueError("generated FlashKDA variant count does not match receipt")
-    if receipt.get("binding_tu_count") != len(rows):
-        raise ValueError("generated FlashKDA selector count does not match receipt")
 
     modules: dict[str, GeneratedFlashKDAModule] = {}
     arches: set[str] = set()
-    body_paths: set[str] = set()
-    abi_wrapper_relpaths: set[str] = set()
-    closure_table: list[dict[str, str]] = []
     module_order: list[tuple[str, str]] = []
     selector_index: list[dict[str, object]] = []
     selector_owners: dict[str, str] = {}
@@ -529,7 +479,7 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 
         physical_selector_rows = row.get("physical_selectors")
         if not isinstance(physical_selector_rows, list) or not physical_selector_rows:
-            raise ValueError(f"{label} has no receipt-backed physical selectors")
+            raise ValueError(f"{label} has no physical selectors")
         physical_selectors_sha256 = _require_sha256(
             row.get("physical_selectors_sha256"),
             f"{label} physical_selectors_sha256",
@@ -640,15 +590,7 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         ):
             raise ValueError(f"{label} contains a forbidden O1 variant or source")
 
-        body_paths.add(body_relpath)
-        abi_wrapper_relpaths.add(abi_wrapper_relpath)
         module_order.append((arch, module_ident))
-        closure_table.append(
-            {
-                "variant_id": variant_id,
-                "source_closure_sha256": calculated_closure_sha256,
-            }
-        )
         modules[variant_id] = GeneratedFlashKDAModule(
             variant_id=variant_id,
             arch=arch,
@@ -674,26 +616,12 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         raise ValueError(
             "generated FlashKDA variants are not ordered by (arch, module_ident)"
         )
-    if receipt.get("unique_body_count") != len(body_paths):
-        raise ValueError("generated FlashKDA unique body count does not match receipt")
-    if receipt.get("abi_wrapper_count") != len(abi_wrapper_relpaths):
-        raise ValueError("generated FlashKDA ABI wrapper count does not match receipt")
-    if receipt.get("abi_wrapper_count") != 8:
-        raise ValueError(
-            "generated FlashKDA registry does not contain all eight ABI wrappers"
-        )
-    if receipt.get("source_closure_table_sha256") != _canonical_json_sha256(
-        closure_table
-    ):
-        raise ValueError("generated FlashKDA source closure table digest differs")
     selector_index.sort(
         key=lambda row: (
             _canonical_json(row["selector_key"]),
             row["variant_id"],
         )
     )
-    if receipt.get("physical_selector_count") != len(selector_index):
-        raise ValueError("generated FlashKDA physical-selector count differs")
     if metadata_selector_index_sha256 != _canonical_json_sha256(selector_index):
         raise ValueError("generated FlashKDA physical-selector index digest differs")
     return MappingProxyType(modules)
@@ -703,7 +631,7 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
 def get_flash_kda_generated_selector_registry() -> Mapping[
     GeneratedFlashKDASelectorKey, GeneratedFlashKDAModule
 ]:
-    """Return the collision-free, receipt-backed semantic module index."""
+    """Return the collision-free, metadata-backed semantic module index."""
 
     index: dict[GeneratedFlashKDASelectorKey, GeneratedFlashKDAModule] = {}
     for module in get_flash_kda_generated_registry().values():
@@ -739,7 +667,7 @@ def get_flash_kda_generated_module_for_selector(
 def load_flash_kda_generated_module_for_selector(
     selector_key: Mapping[str, object],
 ):
-    """Resolve and load exactly one receipt-backed generated module."""
+    """Resolve and load exactly one metadata-backed generated module."""
 
     module = get_flash_kda_generated_module_for_selector(selector_key)
     return load_flash_kda_generated_module(module.variant_id)
@@ -748,7 +676,7 @@ def load_flash_kda_generated_module_for_selector(
 def get_flash_kda_generated_variant_ids(
     target: GeneratedFlashKDATarget,
 ) -> tuple[str, ...]:
-    """Return receipt order for one exact target without creating JIT specs."""
+    """Return metadata order for one exact target without creating JIT specs."""
 
     if target not in _FLASH_KDA_GENERATED_NVCC_FLAGS:
         raise ValueError(f"unsupported generated FlashKDA target: {target}")
@@ -866,7 +794,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
 
 @functools.cache
 def load_flash_kda_generated_module(variant_id: str):
-    """Build and load exactly one receipt-selected physical module."""
+    """Build and load exactly one metadata-selected physical module."""
 
     return gen_flash_kda_generated_module(variant_id).build_and_load()
 

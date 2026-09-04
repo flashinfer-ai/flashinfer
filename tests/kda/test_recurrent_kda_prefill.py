@@ -1367,7 +1367,7 @@ def test_frozen_prefill_compact_and_indexed_state_contracts_match(
 
     This is deliberately a public-API contract test.  It does not name a
     private launcher class or freeze a route that may legitimately differ by
-    physical Blackwell SKU.  The route/source receipt tests separately pin the
+    physical Blackwell SKU.  The route/source metadata tests separately pin the
     selected physical module.
     """
 
@@ -1696,7 +1696,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
         ),
     ),
 )
-def test_generated_prefill_selector_key_uses_receipt_field_order(
+def test_generated_prefill_selector_key_uses_metadata_field_order(
     route, route_role, state_mode, specialization, abi_family
 ):
     selector_key = kda_prefill_api._make_flash_kda_generated_selector_key(
@@ -1735,7 +1735,7 @@ def test_generated_prefill_selector_key_fails_closed():
             state_mode="bf16",
             family_specialization=direct_specialization,
         )
-    with pytest.raises(ValueError, match="no receipt-backed ABI family"):
+    with pytest.raises(ValueError, match="no metadata-backed ABI family"):
         kda_prefill_api._make_flash_kda_generated_selector_key(
             target="sm100a",
             route="benchmark_shape_0",

@@ -769,7 +769,7 @@ def _flash_kda_prefill_is_eligible(
         ):
             return False
         # The exported FP32-state portfolio is the indexed state-pool API.
-        # Compact FP32 state has no receipt-backed product route, so accepting
+        # Compact FP32 state has no metadata-backed product route, so accepting
         # it here would let dispatch invent an unobserved physical contract.
         if initial_state.dtype == torch.float32 and ssm_state_indices is None:
             return False
@@ -3300,7 +3300,7 @@ def _flash_kda_generated_bt16_stage_count(
     sm_count: int,
     use_beta_tma: bool,
 ) -> int:
-    """Resolve the receipt-backed BT16 chain stage specialization."""
+    """Resolve the metadata-backed BT16 chain stage specialization."""
 
     if total_tasks <= 0 or sm_count <= 0:
         raise ValueError("BT16 stage selection requires positive tasks and SMs")
@@ -3581,7 +3581,7 @@ def _flash_kda_affine_token_offsets(
     sm_count: int,
     state_dtype: torch.dtype,
 ) -> Optional[tuple[int, ...]]:
-    """Resolve the receipt-backed affine split, or ``None`` when ineligible."""
+    """Resolve the metadata-backed affine split, or ``None`` when ineligible."""
 
     if (
         total_tokens <= 0
@@ -3683,7 +3683,7 @@ def _make_flash_kda_generated_selector_key(
         abi_family = _FLASH_KDA_GENERATED_ROUTE_ABI_FAMILY[(route, route_role)]
     except KeyError as error:
         raise ValueError(
-            "generated FlashKDA has no receipt-backed ABI family for "
+            "generated FlashKDA has no metadata-backed ABI family for "
             f"route {route!r} role {route_role!r}"
         ) from error
     if state_mode not in (
@@ -3733,7 +3733,7 @@ def _make_flash_kda_generated_selector_key(
 
 
 def _get_flash_kda_generated_module(selector_key: dict[str, object]):
-    """Resolve metadata and load the exact receipt-selected physical module."""
+    """Resolve metadata and load the exact metadata-selected physical module."""
 
     from .jit.flash_kda import (
         get_flash_kda_generated_module_for_selector,
@@ -5933,7 +5933,7 @@ def _run_flash_kda_prefill(
             use_initial_state=initial_state is not None,
             store_final_state=initial_state is not None or output_final_state,
         )
-        # The receipt portfolio has no serving-native BF16 BT16-chain or
+        # The generated portfolio has no serving-native BF16 BT16-chain or
         # small-BH module.  Indexed or padded-slot BF16 calls therefore stay
         # on the exact direct family unless the affine split route is selected
         # below.
@@ -6561,8 +6561,8 @@ def _run_flash_kda_prefill(
             dummy_i64 = _dummy_i64(q.device)
 
         # Retain the established public kernel for valid runtime shapes that
-        # are outside the exact selector portfolio. Receipt-backed selectors
-        # always return above; malformed or conflicting receipts still fail.
+        # are outside the exact selector portfolio. Metadata-backed selectors
+        # always return above; malformed or conflicting metadata still fails.
         signature = _descriptor_signature(
             q=q,
             k=k,
