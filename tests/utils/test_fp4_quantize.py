@@ -1856,5 +1856,59 @@ def test_nvfp4_quantize_global_scale_dtype_regression(m: int, scale_dtype: torch
     )
 
 
+class _StopAfterSelection(Exception):
+    """Raised by the stubbed build_and_load to halt before op registration."""
+
+
+@pytest.mark.parametrize(
+    "backend,aot_names,expected",
+    [
+        # No AOT modules (source install): use the arch-specific module.
+        ("120", frozenset(), "fp4_quantization_120"),
+        ("121", frozenset(), "fp4_quantization_121"),
+        # Only the family module is prebuilt (SM121 release wheels): use it.
+        ("120", frozenset({"fp4_quantization_120f"}), "fp4_quantization_120f"),
+        ("121", frozenset({"fp4_quantization_120f"}), "fp4_quantization_120f"),
+        # Arch module prebuilt: prefer it over the family module.
+        (
+            "121",
+            frozenset({"fp4_quantization_121", "fp4_quantization_120f"}),
+            "fp4_quantization_121",
+        ),
+        # Non-SM12x backends never redirect.
+        ("100", frozenset({"fp4_quantization_120f"}), "fp4_quantization_100"),
+    ],
+)
+def test_fp4_quantization_module_selection(
+    monkeypatch, tmp_path, backend, aot_names, expected
+):
+    """CPU-only check of the SM12x arch-vs-family module selection."""
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import JitSpec
+    from flashinfer.quantization import fp4_quantization as fp4q
+
+    for name in aot_names:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / f"{name}.so").touch()
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", tmp_path)
+
+    selected = []
+
+    def fake_build_and_load(self):
+        selected.append(self.name)
+        raise _StopAfterSelection
+
+    monkeypatch.setattr(JitSpec, "build_and_load", fake_build_and_load)
+
+    fp4q.get_fp4_quantization_module.cache_clear()
+    try:
+        with pytest.raises(_StopAfterSelection):
+            fp4q.get_fp4_quantization_module(backend)
+    finally:
+        fp4q.get_fp4_quantization_module.cache_clear()
+
+    assert selected == [expected]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
