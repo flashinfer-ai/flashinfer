@@ -888,6 +888,8 @@ def test_mla_paged_fi_trace():
     expected_fi_api = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
     assert f"fi_api:{expected_fi_api}" in defn["tags"]
     _check_defn(defn, "mla_paged", expected_fi_api)
+    assert defn["name"].startswith("mla_paged_decode")
+    assert "stage:decode" in defn["tags"]
     axes = defn["axes"]
     assert axes["num_qo_heads"]["value"] == num_qo_heads
     assert axes["head_dim_ckv"]["value"] == head_dim_ckv
@@ -955,6 +957,9 @@ def test_mla_paged_fi_trace_uses_planned_contract_widths():
     from flashinfer.mla._batch_mla._contracts import MLAInputContract
 
     class _PlannedWrapper:
+        _causal = False
+        _all_query_lengths_one = True
+        _planned_total_q = 2
         _input_contract = MLAInputContract(
             lse_mode="none",
             output_dtype=torch.bfloat16,
