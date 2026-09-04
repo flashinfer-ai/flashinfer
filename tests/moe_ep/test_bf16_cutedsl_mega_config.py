@@ -30,10 +30,9 @@ def test_bf16_knobs_only_expose_valid_fixed_geometry():
     )
     assert not is_valid_bf16({**knobs, "force_static_sched": False})
     assert not is_valid_bf16({**knobs, "load_balance_mode": "invalid"})
-    assert bf16_candidates() == [{**knobs, "in_kernel_fc2_reduce": False}]
-    assert bf16_candidates(
-        in_kernel_fc2_reduce=True, token_back_mode="reuse_dispatch_warps"
-    ) == [
+    assert knobs["in_kernel_fc2_reduce"] is False
+    assert bf16_candidates() == [knobs]
+    assert bf16_candidates(enable_in_kernel_fc2_reduce=True) == [
         {
             **knobs,
             "in_kernel_fc2_reduce": True,
@@ -74,18 +73,16 @@ def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     monkeypatch.setattr(bf16, "sym_zeros", fake_zeros)
     knobs = default_knobs(8, dtype="bf16")
     knobs["token_back_mode"] = "reuse_dispatch_warps"
-    with pytest.warns(RuntimeWarning, match="token_back_mode: 'epi_warps'"):
-        buf = bf16.get_symm_buffer_for_bf16_mega_moe(
-            4,
-            8,
-            2,
-            128,
-            128,
-            0,
-            1,
-            token_back_mode="epi_warps",
-            knobs=knobs,
-        )
+    buf = bf16.get_symm_buffer_for_bf16_mega_moe(
+        4,
+        8,
+        2,
+        128,
+        128,
+        0,
+        1,
+        knobs=knobs,
+    )
     try:
         assert buf._frontend.config.token_back_mode == "reuse_dispatch_warps"
         assert buf._frontend.config.in_kernel_fc2_reduce is False
@@ -156,9 +153,7 @@ def test_bf16_autotune_filters_ikr_changing_candidates(monkeypatch):
         lambda _frontend, _launch, candidates, **_kwargs: candidates,
     )
     buffer = SimpleNamespace(_frontend=frontend)
-    with pytest.warns(
-        RuntimeWarning, match="in_kernel_fc2_reduce=True is caller-owned"
-    ):
+    with pytest.warns(RuntimeWarning, match="in_kernel_fc2_reduce=True contradicts"):
         assert autotune.autotune_bf16_mega_moe(
             None,
             None,
@@ -174,30 +169,7 @@ def test_bf16_autotune_filters_ikr_changing_candidates(monkeypatch):
             buffer,
             candidates=[{**valid, "in_kernel_fc2_reduce": True}],
         )
-    assert "in_kernel_fc2_reduce=True is caller-owned" in str(excinfo.value)
-
-
-def test_autotune_reports_a_winner_that_replaces_session_knobs():
-    """A measured winner may flip a correctness knob -- it must say so."""
-    import warnings
-
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
-
-    config = SimpleNamespace(
-        in_kernel_fc2_reduce=True, token_back_mode="reuse_dispatch_warps"
-    )
-    before = autotune._session_correctness_knobs(config)
-    assert before["token_back_mode"] == "reuse_dispatch_warps"
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        autotune._warn_on_overridden_session_knobs(config, before, label="bf16_mega")
-
-    config.token_back_mode = "epi_warps"
-    with pytest.warns(
-        RuntimeWarning, match=r"token_back_mode: 'reuse_dispatch_warps' -> 'epi_warps'"
-    ):
-        autotune._warn_on_overridden_session_knobs(config, before, label="bf16_mega")
+    assert "in_kernel_fc2_reduce=True contradicts" in str(excinfo.value)
 
 
 def test_bf16_autotune_keeps_an_ikr_session_token_back_mode(monkeypatch):
@@ -229,11 +201,7 @@ def test_bf16_autotune_keeps_an_ikr_session_token_back_mode(monkeypatch):
         None, None, None, SimpleNamespace(_frontend=frontend)
     )
     assert candidates == [
-        {
-            **default_knobs(8, dtype="bf16"),
-            "in_kernel_fc2_reduce": True,
-            "token_back_mode": "reuse_dispatch_warps",
-        }
+        default_knobs(8, dtype="bf16", enable_in_kernel_fc2_reduce=True)
     ]
 
 

@@ -355,7 +355,7 @@ def _megakernel_config(problem: dict, *, in_kernel_fc2_reduce: bool = False):
         swap_ab=problem["swap_ab"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

@@ -115,6 +115,7 @@ from .bf16_mxfp8 import (
     MegaMoEBf16Mxfp8Frontend,
     MegaMoEBf16Mxfp8Inputs,
     MegaMoEBf16Mxfp8SymmBuffer,
+    create_dummy_inputs as create_dummy_bf16_mxfp8_inputs,
     get_symm_buffer_for_bf16_mxfp8_mega_moe,
     bf16_mxfp8_mega_launch_thunk,
     bf16_mxfp8_mega_moe,
@@ -126,6 +127,7 @@ from .bf16 import (
     MegaMoEBf16SymmBuffer,
     bf16_mega_launch_thunk,
     bf16_mega_moe,
+    create_dummy_inputs as create_dummy_bf16_inputs,
     get_symm_buffer_for_bf16_mega_moe,
 )
 
@@ -224,6 +226,7 @@ __all__ = [
     "MegaMoEBf16Mxfp8Frontend",
     "MegaMoEBf16Mxfp8Inputs",
     "MegaMoEBf16Mxfp8SymmBuffer",
+    "create_dummy_bf16_mxfp8_inputs",
     "get_symm_buffer_for_bf16_mxfp8_mega_moe",
     "bf16_mxfp8_mega_launch_thunk",
     "bf16_mxfp8_mega_moe",
@@ -234,6 +237,7 @@ __all__ = [
     "MegaMoEBf16SymmBuffer",
     "bf16_mega_launch_thunk",
     "bf16_mega_moe",
+    "create_dummy_bf16_inputs",
     "get_symm_buffer_for_bf16_mega_moe",
     # tuner
     "tuner",

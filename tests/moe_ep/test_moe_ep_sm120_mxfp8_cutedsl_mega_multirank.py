@@ -345,7 +345,7 @@ def _megakernel_config(
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
         knobs=knobs,
     )

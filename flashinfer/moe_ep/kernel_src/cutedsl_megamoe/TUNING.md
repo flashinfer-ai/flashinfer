@@ -318,7 +318,9 @@ misses) — both are the right behavior as long as internal drops carry the
   ~5% slower for MXFP8" reading, which conflated it with fb8).
   BF16 has ONE profile: `dtype="bf16"` returns the single validated fixed
   MMA/cluster geometry regardless of token count (candidate validity via
-  `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.
+  `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.  Its
+  token-back defaults to `epi_warps` when `enable_in_kernel_fc2_reduce=False`,
+  and `reuse_dispatch_warps` when `enable_in_kernel_fc2_reduce=False`.
   Mixed BF16×MXFP8 has per-size measured profiles.  Three legal impl tuples
   (`is_valid_bf16_mxfp8`; others fail at kernel construction):
   - N128/tmem/no-overlap/tk128 + `epi_warps` — recommended <1024 tok/rank
@@ -328,8 +330,9 @@ misses) — both are the right behavior as long as internal drops carry the
   - N256/smem/no-overlap/tk128
   The FI shim default (`dtype="bf16_mxfp8"`) is the N128 small-batch profile;
   `bf16_mxfp8_candidates()` sweeps all three impl tuples × `flag_batch`
-  {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``} (12
-  candidates; per-size winners above are the measured starting point).
+  {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``}, the
+  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates;
+  per-size winners above are the measured starting point).
 - Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
@@ -338,15 +341,20 @@ misses) — both are the right behavior as long as internal drops carry the
   MAX (slowest rank = collective latency), argmin winner applied
   identically everywhere.  Cost: one `cute.compile` per candidate
   (~1-2 min), once per session.  Candidates mirror the tester sweep
-  restriction; for NVFP4 that now INCLUDES `in_kernel_fc2_reduce`
-  (24 candidates — the symm buffer's output is always sym-heap allocated,
-  so the knob flips per-compile).  ikr is ~par with the bf16 wire at the
-  FI default geometry at >=1024 tok/rank and slower at small batch — see
-  "Measured results" below; it stays a sweep candidate rather than a
-  default because the tuner keeps it only if it wins the live problem.  An ikr winner makes the output accumulation
-  order nondeterministic — pin `in_kernel_fc2_reduce=False` via explicit
-  knobs if bit-reproducibility matters.  MXFP8 keeps ikr config-owned
-  (its kernel rejects ikr + dispatch-warp token-back).
+  restriction; for NVFP4 and MXFP8 that INCLUDES `in_kernel_fc2_reduce`
+  whenever the config sets `enable_in_kernel_fc2_reduce=True` (24 and 6
+  candidates respectively — their symm-buffer output is always sym-heap
+  allocated at the same shape, so the knob flips per-compile).  ikr is ~par
+  with the bf16 wire at the FI default geometry at >=1024 tok/rank and slower
+  at small batch — see "Measured results" below; it stays a sweep candidate
+  rather than a default because the tuner keeps it only if it wins the live
+  problem.  An ikr winner makes the output accumulation order
+  nondeterministic — leave `enable_in_kernel_fc2_reduce=False` if
+  bit-reproducibility matters.  BF16 and mixed BF16×MXFP8 force
+  `in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce` (their `combine_output`
+  buffer is sized from it, which also decides whether
+  `forward(return_workspace_view=True)` is available), so their
+  sweeps never vary it, the knob must match enable_in_kernel_fc2_reduce.
 - The kernel-repo tester remains the wide-sweep tool
   (`torchrun -m tester.tester --mode Perf --sweep --use_knob ...`); winners
   transfer via the `knobs=` dict.  Its problems (`nvfp4_perf.jsonl`) are
@@ -405,14 +413,14 @@ sequenceDiagram
 
     Note over L,C: session setup — knobs bind HERE, once,<br/>keyed on num_max_tokens
     L->>B: _allocate_workspace(fleet_params)
-    B->>S: get_symm_buffer_for_mega_moe(..., ikr, combine_dtype, knobs)
+    B->>S: get_symm_buffer_for_mega_moe(..., enable_ikr, combine_dtype, knobs)
     alt knobs is an explicit dict
         S->>T: with_knobs(cfg, knobs) — overrides heuristic ENTIRELY
     else knobs is None (how the backend's auto mode arrives too)
         S->>T: knob-cache lookup (knob_cache.lookup_knobs),<br/>else with_knobs(cfg, default_knobs(num_max_tokens, dtype))
         Note over S,T: a quantized combine_dtype auto-adjusts the default<br/>token_back_mode to reuse_dispatch_warps
     end
-    Note over S: in_kernel_fc2_reduce / combine_dtype are config<br/>params (not knobs) — output_activation always sym-heap
+    Note over S: enable_ikr / combine_dtype are config<br/>params (not knobs) — output_activation always sym-heap
     S-->>B: MegaMoESymmBuffer (frontend + staging tensors)
 
     Note over L,C: every forward (any num_tokens up to capacity)
@@ -434,9 +442,9 @@ sequenceDiagram
 The backend defers tuning to the first `compute()` (weights + staged inputs
 exist there); the symm buffer is built with the heuristic default in the
 meantime.  The default candidate list is session-aware
-(`nvfp4_candidates(combine_format, allow_in_kernel_fc2_reduce)`: 24 for the
-bf16 wire including the ikr axis; quantized wires prune to the valid
-subset).  Candidates are compiled **serially and destructively** — each
+(`nvfp4_candidates(combine_format, enable_in_kernel_fc2_reduce)`: 12 for the
+bf16 wire, 24 with the ikr axis when the config permits it; quantized wires
+prune to the valid subset).  Candidates are compiled **serially and destructively** — each
 `apply_knobs` frees the previous candidate's sym workspace and nulls the
 compiled slot, so nothing accumulates and the winner is recompiled once
 more after the sweep (unless it happened to be timed last).
@@ -527,7 +535,9 @@ Imported from TRT-LLM PR #16190, both idea families are
 plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
 (`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`):
 
-- `in_kernel_fc2_reduce` — in-flight top-k combine via cross-rank REDG
+- `in_kernel_fc2_reduce` (permitted by the config's
+  `enable_in_kernel_fc2_reduce`, selected by the knobs) — in-flight top-k
+  combine via cross-rank REDG
   atomic-add; its main win is that the multi-GB per-topk combine staging
   disappears from `shared_workspace` (latency is geometry-dependent — see
   "Measured results").  Contract:
@@ -586,8 +596,8 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
   default, and in the vLLM e2e runs at DSV4-Flash geometry it lost both
   phases — its value is geometry-dependent (and it deletes the multi-GB
   combine staging region, which can be the point).  An ikr winner makes
-  the output accumulation order nondeterministic — pin
-  `in_kernel_fc2_reduce=False` if bit-reproducibility matters.
+  the output accumulation order nondeterministic — leave
+  `enable_in_kernel_fc2_reduce=False` if bit-reproducibility matters.
 - The quantized wires also did NOT transfer to the vLLM e2e geometry
   (4096 hidden / top-6: the wire-forced dispatch-warp token-back costs
   more than the combine-traffic saving there) — the bf16 wire is the e2e

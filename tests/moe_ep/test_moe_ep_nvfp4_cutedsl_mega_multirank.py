@@ -429,7 +429,7 @@ def _run_mega_layer(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
     config_extra = dict(
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
     )
     kernel = create_mega_kernel(
@@ -809,7 +809,7 @@ def _run_mega_layer_zero_token_ikr_regression(
             fc1_norm_const=fc1_norm_const,
         ),
         epilogue_via_config=True,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
     )
 
     mega = MoEEpMegaLayer(
@@ -1038,7 +1038,7 @@ def _run_mega_torch_oracle(
         _megakernel_config(
             problem,
             epilogue_via_config=True,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_dtype=combine_dtype,
         )
     )
@@ -1058,7 +1058,7 @@ def _run_mega_torch_oracle(
             rank,
             world_size,
             gate_up_clamp=problem["gate_up_clamp"],
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
@@ -1337,7 +1337,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
     )
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
@@ -1363,6 +1363,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
         num_total_experts=8,
         hidden=256,
         intermediate=256,
+        enable_in_kernel_fc2_reduce=True,
     )
     # ikr requires a bf16 combine wire.
     with pytest.raises(ValueError, match="in_kernel_fc2_reduce"):
@@ -1375,6 +1376,12 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
     # ikr requires the topk score folded before fc2.
     with pytest.raises(ValueError, match="apply_topk_in_fc1"):
         MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
+    # ikr also needs the session's permission.
+    with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
+        MegaMoENvfp4Config(
+            **{**base, "enable_in_kernel_fc2_reduce": False},
+            in_kernel_fc2_reduce=True,
+        )
     # quantized combine wires are only wired for dispatch-warp token-back.
     with pytest.raises(ValueError, match="reuse_dispatch_warps"):
         MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
@@ -1408,18 +1415,22 @@ def test_autotune_nvfp4_candidates_cover_ikr():
         nvfp4_candidates,
     )
 
-    cands = nvfp4_candidates()
+    cands = nvfp4_candidates(enable_in_kernel_fc2_reduce=True)
     assert any(k["in_kernel_fc2_reduce"] for k in cands)
     assert any(not k["in_kernel_fc2_reduce"] for k in cands)
 
     # A quantized wire prunes to the valid subset: no ikr, dispatch-warp
     # token-back only.
-    qcands = nvfp4_candidates(combine_format="16e2m1xbf16")
+    qcands = nvfp4_candidates(
+        combine_format="16e2m1xbf16", enable_in_kernel_fc2_reduce=True
+    )
     assert qcands
     assert all(
         not k["in_kernel_fc2_reduce"] and k["token_back_mode"] == "reuse_dispatch_warps"
         for k in qcands
     )
 
-    pinned = nvfp4_candidates(allow_in_kernel_fc2_reduce=False)
+    # Without the session's permission the ikr axis disappears entirely.
+    pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
+    assert len(pinned) * 2 == len(cands)

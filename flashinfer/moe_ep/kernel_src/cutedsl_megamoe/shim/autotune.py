@@ -6,14 +6,15 @@ Times a curated candidate knob set on the live problem and applies the winner
 to the session's frontend, replacing the static two-profile heuristic in
 :mod:`.tuner` with a measured choice.  The candidate space mirrors the
 restricted sweep used with the kernel team's tester
-(``tester.tester --sweep --use_knob ...``).  For NVFP4 it includes
-``in_kernel_fc2_reduce`` (the tester's overall winners at 8 and 2048 tokens
-are in-flight-reduce candidates): the symm buffer's ``output_activation`` is
-always sym-heap allocated, so the knob can flip per-compile.  Note an ikr
-winner makes the session's output nondeterministic in accumulation order;
-callers that need bit-reproducible outputs should pin
-``in_kernel_fc2_reduce=False`` via explicit knobs instead of autotuning.
-For MXFP8 the knob stays owned by the config / caller.
+(``tester.tester --sweep --use_knob ...``).  For NVFP4 and MXFP8 it includes
+``in_kernel_fc2_reduce`` when the session permits it (the tester's overall
+NVFP4 winners at 8 and 2048 tokens are in-flight-reduce candidates): their
+``output_activation`` is always sym-heap allocated at the same shape, so the
+knob can flip per-compile.  Note an ikr winner makes the session's output
+nondeterministic in accumulation order; callers that need bit-reproducible
+outputs should leave ``enable_in_kernel_fc2_reduce=False``.  BF16 and mixed
+BF16xMXFP8 have different behavior (their ``combine_output`` buffer is sized
+from it), so we need distinct sets for each case
 
 The tune is a COLLECTIVE operation: the mega kernel's dispatch/combine spans
 all EP ranks, so every rank must call the autotune entry point in the same
@@ -39,7 +40,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from .tuner import (
-    CORRECTNESS_KNOBS,
     default_knobs,
     describe_invalid_knobs,
     is_valid,
@@ -61,14 +61,14 @@ _SWEEP_BASE: Dict[str, Any] = {
 def nvfp4_candidates(
     *,
     combine_format: str = "bf16",
-    allow_in_kernel_fc2_reduce: bool = True,
+    enable_in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default NVFP4 candidate knob dicts (tile x flag_batch x token-back x ikr).
 
-    24 candidates for the default bf16 combine (the ikr axis doubles the
-    12-candidate sweep and with it the one-time compile cost); quantized
-    ``combine_format`` values prune to the valid subset (dispatch-warp
-    token-back only, no ikr).  Pass ``allow_in_kernel_fc2_reduce=False`` when
+    12 candidates for the default bf16 combine, doubled to 24 (and with them
+    the one-time compile cost) when ``enable_in_kernel_fc2_reduce`` adds the
+    ikr axis; quantized ``combine_format`` values prune to the valid subset
+    (dispatch-warp token-back only, no ikr).  Leave the permission unset when
     the session cannot run ikr (``apply_topk_in_fc1=False``) or must stay
     deterministic.
     """
@@ -80,7 +80,7 @@ def nvfp4_candidates(
                 "standalone_warps",
                 "reuse_dispatch_warps",
             ):
-                for ikr in (False, True) if allow_in_kernel_fc2_reduce else (False,):
+                for ikr in (False, True) if enable_in_kernel_fc2_reduce else (False,):
                     knobs = dict(
                         _SWEEP_BASE,
                         mma_tiler_mnk=tile,
@@ -95,46 +95,44 @@ def nvfp4_candidates(
 
 def mxfp8_candidates(
     *,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Default MXFP8 candidate knob dicts (4: flag_batch x token-back).
+    """Default MXFP8 candidate knob dicts (flag_batch x token-back x ikr).
 
-    The MXFP8 kernel's tile is fixed at ``(256, 256)`` so no tile axis, and its
-    config exposes token-back as the ``token_back_by_dispatch`` bool, so the
-    two dispatch-warp modes collapse to one candidate.  The ikr knob stays
-    owned by the config (unlike NVFP4, the MXFP8 kernel rejects ikr together
-    with dispatch-warp token-back); pass the session's value so those combos
-    are pruned instead of failing at compile.
+    Four candidates, six with the ikr axis.  The MXFP8 kernel's tile is fixed
+    at ``(256, 256)`` so there is no tile axis. ikr is not supported with reuse dispatch warps.
     """
     out: List[Dict[str, Any]] = []
     for flag_batch in (4, 8):
         for token_back in ("epi_warps", "reuse_dispatch_warps"):
-            if in_kernel_fc2_reduce and token_back != "epi_warps":
-                continue
-            knobs = dict(
-                _SWEEP_BASE,
-                flag_batch=flag_batch,
-                token_back_mode=token_back,
-            )
-            if is_valid(knobs):
-                out.append(knobs)
+            for ikr in (False, True) if enable_in_kernel_fc2_reduce else (False,):
+                if ikr and token_back != "epi_warps":
+                    continue
+                knobs = dict(
+                    _SWEEP_BASE,
+                    flag_batch=flag_batch,
+                    token_back_mode=token_back,
+                    in_kernel_fc2_reduce=ikr,
+                )
+                if is_valid(knobs):
+                    out.append(knobs)
     return out
 
 
 def bf16_candidates(
     *,
-    in_kernel_fc2_reduce: bool = False,
-    token_back_mode: str = "epi_warps",
+    enable_in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return supported BF16 candidates for a session's output contract.
 
     This is intentionally a one-entry autotune surface. Keeping the same
     collective autotune lifecycle as the other Mega kernels means additional
     validated geometries can be added without changing the public API.
+
     """
-    knobs = default_knobs(0, dtype="bf16")
-    knobs["in_kernel_fc2_reduce"] = in_kernel_fc2_reduce
-    knobs["token_back_mode"] = token_back_mode
+    knobs = default_knobs(
+        0, dtype="bf16", enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+    )
     return [knobs] if is_valid_bf16(knobs) else []
 
 
@@ -149,7 +147,7 @@ def _bf16_mxfp8_epi_flag_batches(token_back: str) -> Tuple[Tuple[int, int], ...]
 
 def bf16_mxfp8_candidates(
     *,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default BF16/MXFP8 candidate knob dicts (impl tuple x flag_batch x token-back).
 
@@ -157,11 +155,8 @@ def bf16_mxfp8_candidates(
     N256/smem, N256/tmem-overlap) x ``flag_batch`` {1, 4} x
     ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}, with the
     dispatch-warp half also timing ``epi_flag_batch=(1, 1)`` (see
-    :func:`_bf16_mxfp8_epi_flag_batches`).
-    ``standalone_warps`` is unsupported.  ikr stays config-owned (the symm
-    buffer's combine plane is shaped for it), so pass the session's value to
-    stamp it on every candidate; unlike pure MXFP8 the mixed kernel runs ikr
-    with either token-back mode, so it prunes nothing.
+    :func:`_bf16_mxfp8_epi_flag_batches`).  ``standalone_warps`` is
+    unsupported.
     """
     out: List[Dict[str, Any]] = []
     impl_specs = (
@@ -189,6 +184,7 @@ def bf16_mxfp8_candidates(
         "use_2cta_instrs": True,
         "group_hint": 512,
         "load_balance_mode": "static",
+        "in_kernel_fc2_reduce": enable_in_kernel_fc2_reduce,
     }
     for impl in impl_specs:
         for flag_batch in (1, 4):
@@ -200,7 +196,6 @@ def bf16_mxfp8_candidates(
                         flag_batch=flag_batch,
                         epi_flag_batch=epi_flag_batch,
                         token_back_mode=token_back,
-                        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                     )
                     if is_valid_bf16_mxfp8(knobs):
                         out.append(knobs)
@@ -245,40 +240,6 @@ def _session_candidates(
     return kept
 
 
-def _session_correctness_knobs(config: Any) -> Dict[str, Any]:
-    """Snapshot the output-affecting knobs a config currently carries."""
-    # ``token_back_by_dispatch`` is the MXFP8 config's spelling of token-back.
-    return {
-        name: getattr(config, name)
-        for name in (*CORRECTNESS_KNOBS, "token_back_by_dispatch")
-        if hasattr(config, name)
-    }
-
-
-def _warn_on_overridden_session_knobs(
-    config: Any, before: Dict[str, Any], *, label: str
-) -> None:
-    """Warn when the winner replaced an output-affecting session setting.
-
-    The sweep owns the correctness knobs it enumerates, so a winner may
-    legitimately replace what the caller configured; say so rather than let an
-    explicitly requested value disappear into the tuned config.
-    """
-    overridden = [
-        f"{name}: {was!r} -> {getattr(config, name)!r}"
-        for name, was in before.items()
-        if getattr(config, name) != was
-    ]
-    if overridden:
-        warnings.warn(
-            f"[cutedsl-autotune] {label}: the measured winner replaced "
-            f"session-configured output-affecting knobs ({', '.join(overridden)}); "
-            f"pin an explicit knobs dict instead of 'auto' to keep them.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-
-
 def autotune_knobs(
     frontend: Any,
     launch: Callable[[], None],
@@ -304,8 +265,6 @@ def autotune_knobs(
     """
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
-
-    session_knobs = _session_correctness_knobs(frontend.config)
 
     from .comm import ensure_not_capturing
 
@@ -358,7 +317,6 @@ def autotune_knobs(
         )
     winner = candidates[best]
     frontend.apply_knobs(winner)
-    _warn_on_overridden_session_knobs(frontend.config, session_knobs, label=label)
     if on_winner is not None:
         on_winner(winner, float(t[best]))
     if rank == 0:
@@ -411,11 +369,13 @@ def autotune_nvfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     if candidates is None:
-        # Session-aware default sweep: prune ikr when the config can't run it
-        # and quantized-combine-invalid combos up front.
+        # Session-aware default sweep: prune ikr when the session did not
+        # permit it or cannot run it, and quantized-combine-invalid combos.
         candidates = nvfp4_candidates(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
-            allow_in_kernel_fc2_reduce=cfg.apply_topk_in_fc1,
+            enable_in_kernel_fc2_reduce=(
+                cfg.enable_in_kernel_fc2_reduce and cfg.apply_topk_in_fc1
+            ),
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -482,7 +442,7 @@ def autotune_mxfp8_mega_moe(
     cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = mxfp8_candidates(
-            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -551,12 +511,31 @@ def autotune_bf16_mega_moe(
     cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = bf16_candidates(
-            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
-            token_back_mode=cfg.token_back_mode,
+            enable_in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce
         )
     candidates = _session_candidates(
         candidates, cfg, is_valid_bf16_for_config, what="BF16 MegaMoE"
     )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                # If IKR is omitted we use the session one, record this info
+                {**winner, "in_kernel_fc2_reduce": cfg.in_kernel_fc2_reduce},
+                dtype="bf16",
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -565,6 +544,7 @@ def autotune_bf16_mega_moe(
         label="bf16_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
     )
 
 
@@ -597,7 +577,7 @@ def autotune_bf16_mxfp8_mega_moe(
     cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = bf16_mxfp8_candidates(
-            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce
         )
     candidates = _session_candidates(
         candidates,
@@ -606,6 +586,26 @@ def autotune_bf16_mxfp8_mega_moe(
         what="mixed BF16/MXFP8 MegaMoE",
     )
 
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                # If IKR is omitted we use the session one, record this info
+                {**winner, "in_kernel_fc2_reduce": cfg.in_kernel_fc2_reduce},
+                dtype=cfg.kind,
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
+
     return autotune_knobs(
         symm_buffer._frontend,
         launch,
@@ -613,6 +613,7 @@ def autotune_bf16_mxfp8_mega_moe(
         label="bf16_mxfp8_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
     )
 
 

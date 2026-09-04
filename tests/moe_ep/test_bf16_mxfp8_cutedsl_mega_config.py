@@ -67,8 +67,6 @@ def test_mixed_knobs_and_candidates():
     assert not is_valid_bf16_mxfp8({**knobs, "mma_tiler_mnk": (256, 256, 128)})
     assert not is_valid_bf16_mxfp8({**knobs, "token_back_mode": "standalone_warps"})
     assert not is_valid_bf16_mxfp8({**knobs, "clc_bundle_size": 1})
-    # The mixed kernel carries ikr on either token-back mode (unlike pure
-    # MXFP8); run_mega_tests.sh case M05 validates the dispatch-warp pair.
     for token_back in ("epi_warps", "reuse_dispatch_warps"):
         assert is_valid_bf16_mxfp8(
             {
@@ -87,15 +85,11 @@ def test_mixed_knobs_and_candidates():
         "reuse_dispatch_warps",
     }
 
-    # ikr must not shrink the token-back axis: a session that asked for
-    # dispatch-warp token-back still gets it timed.
-    ikr = bf16_mxfp8_candidates(in_kernel_fc2_reduce=True)
-    assert len(ikr) == 18
-    assert all(c["in_kernel_fc2_reduce"] for c in ikr)
-    assert {c["token_back_mode"] for c in ikr} == {
-        "epi_warps",
-        "reuse_dispatch_warps",
-    }
+    assert all(c["in_kernel_fc2_reduce"] is False for c in candidates)
+    assert all(
+        c["in_kernel_fc2_reduce"] is True
+        for c in bf16_mxfp8_candidates(enable_in_kernel_fc2_reduce=True)
+    )
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     frontend.apply_knobs(knobs)
@@ -144,18 +138,16 @@ def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     monkeypatch.setattr(bf16_mxfp8, "sym_zeros", fake_zeros)
     knobs = default_knobs(8, dtype="bf16_mxfp8")
     knobs["token_back_mode"] = "reuse_dispatch_warps"
-    with pytest.warns(RuntimeWarning, match="token_back_mode: 'epi_warps'"):
-        buf = bf16_mxfp8.get_symm_buffer_for_bf16_mxfp8_mega_moe(
-            4,
-            8,
-            2,
-            128,
-            128,
-            0,
-            1,
-            token_back_mode="epi_warps",
-            knobs=knobs,
-        )
+    buf = bf16_mxfp8.get_symm_buffer_for_bf16_mxfp8_mega_moe(
+        4,
+        8,
+        2,
+        128,
+        128,
+        0,
+        1,
+        knobs=knobs,
+    )
     try:
         assert buf._frontend.config.token_back_mode == "reuse_dispatch_warps"
         assert buf._frontend.config.in_kernel_fc2_reduce is False
@@ -184,8 +176,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
         0,
         1,
         in_kernel_fc2_reduce=True,
-        token_back_mode="reuse_dispatch_warps",
-        knobs={"flag_batch": 4},
+        knobs={"flag_batch": 4, "token_back_mode": "reuse_dispatch_warps"},
     )
     try:
         config = buf._frontend.config
@@ -237,9 +228,7 @@ def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
         lambda _frontend, _launch, candidates, **_kwargs: candidates,
     )
     buffer = SimpleNamespace(_frontend=frontend)
-    with pytest.warns(
-        RuntimeWarning, match="in_kernel_fc2_reduce=True is caller-owned"
-    ):
+    with pytest.warns(RuntimeWarning, match="in_kernel_fc2_reduce=True contradicts"):
         assert autotune.autotune_bf16_mxfp8_mega_moe(
             None,
             None,
@@ -255,7 +244,7 @@ def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
             buffer,
             candidates=[{**valid, "in_kernel_fc2_reduce": True}],
         )
-    assert "in_kernel_fc2_reduce=True is caller-owned" in str(excinfo.value)
+    assert "in_kernel_fc2_reduce=True contradicts" in str(excinfo.value)
 
 
 def test_mixed_backend_is_registered():
@@ -273,8 +262,8 @@ def test_mixed_config_inherits_bf16_options():
         intermediate_size=128,
         top_k=2,
         gate_up_clamp=1.5,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
     )
     assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
-    assert config.in_kernel_fc2_reduce
+    assert config.enable_in_kernel_fc2_reduce

@@ -49,7 +49,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         self._autotune_pending = config.knobs == "auto"
         # Only the in-kernel reduce leaves a finished (T, hidden) slice in the
         # workspace; the explicit path's top-k sum needs its own destination.
-        self.supports_output_view = config.in_kernel_fc2_reduce
+        self.supports_output_view = config.enable_in_kernel_fc2_reduce
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
@@ -110,8 +110,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
-            in_kernel_fc2_reduce=config.in_kernel_fc2_reduce,
-            token_back_mode=config.token_back_mode,
+            in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
@@ -216,8 +215,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             _clamp(config),
-            config.in_kernel_fc2_reduce,
-            config.token_back_mode,
+            config.enable_in_kernel_fc2_reduce,
             knobs_pool_key(config.knobs),
         )
 
