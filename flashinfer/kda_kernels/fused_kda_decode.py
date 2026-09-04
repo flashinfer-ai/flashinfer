@@ -818,7 +818,7 @@ def _run_generated_variant(
         norm_weight,
         output,
         int(lower_bound is not None),
-        0.0 if lower_bound is None else float(lower_bound) * math.log2(math.e),
+        0.0 if lower_bound is None else float(lower_bound),
         float(norm_eps),
     )
 
