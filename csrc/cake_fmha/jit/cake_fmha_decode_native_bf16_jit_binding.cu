@@ -349,7 +349,7 @@ void cake_paged_attention_decode(
   grid_x = Q_LEN;
   grid_y = NUM_KV_HEADS;
   grid_z = BATCH_SIZE;
-#elif BATCH_SIZE == 4 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 &&            \
+#elif BATCH_SIZE == 4 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
     CAKE_FMHA_HAS_SINK == 0 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
     CAKE_FMHA_RETAIN_KV_L2 == 1
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;

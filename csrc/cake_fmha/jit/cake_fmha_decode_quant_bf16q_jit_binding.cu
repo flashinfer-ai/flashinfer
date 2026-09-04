@@ -130,20 +130,19 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, tensor.data_ptr(), global_dim, global_strides, box_dim,
-      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, tensor.data_ptr(), global_dim, global_strides,
+      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA " << name << " tensor map";
   return tm;
 }
 
-__global__ void PrepareQuantDecode(const __nv_bfloat16* query, __nv_bfloat16* padded_query,
-                                   int query_items, int group_size, int64_t query_stride_batch,
-                                   int64_t query_stride_head, int64_t query_stride_dim,
-                                   const int* page_table, int* padded_page_table, int page_items,
-                                   int table_rows, int source_pages, int padded_pages,
-                                   float* bmm1_scalar_ptr, float bmm1_scalar,
-                                   float* bmm2_scalar_ptr, float bmm2_scalar) {
+__global__ void PrepareQuantDecode(
+    const __nv_bfloat16* query, __nv_bfloat16* padded_query, int query_items, int group_size,
+    int64_t query_stride_batch, int64_t query_stride_head, int64_t query_stride_dim,
+    const int* page_table, int* padded_page_table, int page_items, int table_rows,
+    int source_pages, int padded_pages, float* bmm1_scalar_ptr, float bmm1_scalar,
+    float* bmm2_scalar_ptr, float bmm2_scalar) {
   int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (padded_query != nullptr && index < query_items) {
     int dim = index % kHeadDim;
@@ -151,17 +150,20 @@ __global__ void PrepareQuantDecode(const __nv_bfloat16* query, __nv_bfloat16* pa
     int kv_head = (index / (kHeadDim * kTileQ)) % NUM_KV_HEADS;
     int batch = index / (kHeadDim * kTileQ * NUM_KV_HEADS);
     int source_head = kv_head * group_size + padded_head;
-    padded_query[index] = padded_head < group_size
-                              ? query[batch * query_stride_batch + source_head * query_stride_head +
-                                      dim * query_stride_dim]
-                              : __float2bfloat16(0.0f);
+    padded_query[index] =
+        padded_head < group_size
+            ? query[batch * query_stride_batch + source_head * query_stride_head +
+                    dim * query_stride_dim]
+            : __float2bfloat16(0.0f);
   }
   if (padded_page_table != nullptr && index < page_items) {
     int column = index % padded_pages;
     int row = (index / padded_pages) % table_rows;
     int batch = index / (padded_pages * table_rows);
     padded_page_table[index] =
-        column < source_pages ? page_table[(batch * table_rows + row) * source_pages + column] : 0;
+        column < source_pages
+            ? page_table[(batch * table_rows + row) * source_pages + column]
+            : 0;
   }
   if (index == 0) {
     if (bmm1_scalar_ptr != nullptr) *bmm1_scalar_ptr = bmm1_scalar;
@@ -329,14 +331,17 @@ void cake_paged_attention_decode(
       << "Cake FMHA BF16Q decode workspace requires " << cursor << " bytes";
   TVM_FFI_ICHECK_GE(workspace_size, cursor);
   auto* workspace = static_cast<uint8_t*>(workspace_buffer.data_ptr());
-  auto* padded_query =
-      needs_query_padding ? reinterpret_cast<__nv_bfloat16*>(workspace + query_offset) : nullptr;
+  auto* padded_query = needs_query_padding
+                           ? reinterpret_cast<__nv_bfloat16*>(workspace + query_offset)
+                           : nullptr;
   auto* padded_page_table =
       needs_page_padding ? reinterpret_cast<int*>(workspace + page_offset) : nullptr;
-  float* bmm1_ptr = bmm1_tensor.has_value() ? static_cast<float*>(bmm1_tensor.value().data_ptr())
-                                            : reinterpret_cast<float*>(workspace + bmm1_offset);
-  float* bmm2_ptr = bmm2_tensor.has_value() ? static_cast<float*>(bmm2_tensor.value().data_ptr())
-                                            : reinterpret_cast<float*>(workspace + bmm2_offset);
+  float* bmm1_ptr = bmm1_tensor.has_value()
+                        ? static_cast<float*>(bmm1_tensor.value().data_ptr())
+                        : reinterpret_cast<float*>(workspace + bmm1_offset);
+  float* bmm2_ptr = bmm2_tensor.has_value()
+                        ? static_cast<float*>(bmm2_tensor.value().data_ptr())
+                        : reinterpret_cast<float*>(workspace + bmm2_offset);
 
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
   cudaStream_t stream = get_stream(query.device());
@@ -347,15 +352,17 @@ void cake_paged_attention_decode(
   auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
       TmaDeviceSlot(h_v, query.device().device_id, stream));
 
-  int64_t page_items = needs_page_padding ? BATCH_SIZE * table_rows * padded_pages : 0;
+  int64_t page_items =
+      needs_page_padding ? BATCH_SIZE * table_rows * padded_pages : 0;
   int64_t prep_items = std::max<int64_t>(needs_query_padding ? padded_query_items : 0, page_items);
   prep_items = std::max<int64_t>(prep_items, 1);
   int const threads = 256;
   int const blocks = static_cast<int>((prep_items + threads - 1) / threads);
   PrepareQuantDecode<<<blocks, threads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(query.data_ptr()), padded_query,
-      static_cast<int>(padded_query_items), group_size, query.stride(0), query.stride(1),
-      query.stride(2), static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
+      static_cast<int>(padded_query_items), group_size, query.stride(0),
+      query.stride(1), query.stride(2),
+      static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
       static_cast<int>(page_items), table_rows, static_cast<int>(source_pages),
       static_cast<int>(padded_pages), bmm1_tensor.has_value() ? nullptr : bmm1_ptr, bmm1_scalar,
       bmm2_tensor.has_value() ? nullptr : bmm2_ptr, bmm2_scalar);
@@ -364,8 +371,9 @@ void cake_paged_attention_decode(
 
   auto* query_ptr = reinterpret_cast<uint32_t*>(
       needs_query_padding ? static_cast<void*>(padded_query) : query.data_ptr());
-  int* page_table_ptr =
-      needs_page_padding ? padded_page_table : static_cast<int*>(block_tables.data_ptr());
+  int* page_table_ptr = needs_page_padding
+                            ? padded_page_table
+                            : static_cast<int*>(block_tables.data_ptr());
   int pt_batch_stride = static_cast<int>(table_rows * padded_pages);
   int pt_v_offset = shared_page_table ? 0 : static_cast<int>(padded_pages);
   int bmm1_is_log2 = bmm1_tensor.has_value() ? 1 : 0;
@@ -379,8 +387,8 @@ void cake_paged_attention_decode(
   cudaError_t status = cake_fmha_launch_decode_quant_bf16q(
       query_ptr, p_k, p_v, static_cast<__nv_bfloat16*>(out.data_ptr()), page_table_ptr,
       static_cast<int*>(seq_lens.data_ptr()), bmm1_ptr, bmm2_ptr, partial_o, partial_max,
-      partial_sum, pt_batch_stride, pt_v_offset, bmm1_is_log2, num_splits, blocks_per_split, grid_x,
-      1, 1, stream);
+      partial_sum, pt_batch_stride, pt_v_offset, bmm1_is_log2, num_splits, blocks_per_split,
+      grid_x, 1, 1, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA BF16Q decode launch failed: " << cudaGetErrorString(status);
 

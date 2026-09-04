@@ -323,9 +323,10 @@ void cake_paged_attention_decode(
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
   unsigned int grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
   cudaError_t status = cake_fmha_launch_decode_native_fp16_hd512(
-      p_q, p_k, p_v, static_cast<__half*>(out.data_ptr()), lse_ptr, page_table, causal_prefix,
-      scale_ptr, max_pages_per_seq, static_cast<int>(max_kv_len), softmax_scale_log2,
-      static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE, grid_x, 1, 1, stream);
+      p_q, p_k, p_v, static_cast<__half*>(out.data_ptr()), lse_ptr, page_table,
+      causal_prefix, scale_ptr, max_pages_per_seq, static_cast<int>(max_kv_len),
+      softmax_scale_log2, static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE,
+      grid_x, 1, 1, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA decode-native FP16 head-dim-512 launch failed: " << cudaGetErrorString(status);
 

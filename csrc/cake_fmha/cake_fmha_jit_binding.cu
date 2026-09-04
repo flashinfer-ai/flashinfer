@@ -49,7 +49,8 @@ int CakeDType(DLDataType dtype, bool allow_nvfp4, const char* tensor_name) {
   if (allow_nvfp4 && dtype == dl_uint8) {
     return kNvFp4;
   }
-  TVM_FFI_THROW(TypeError) << tensor_name << " must use bfloat16, float16, float8_e4m3fn"
+  TVM_FFI_THROW(TypeError) << tensor_name
+                           << " must use bfloat16, float16, float8_e4m3fn"
                            << (allow_nvfp4 ? ", or packed NVFP4 uint8" : "");
   return -1;
 }
@@ -59,8 +60,9 @@ double ScalarScale(Variant<double, ffi::Tensor> scale, const char* name) {
   if (scalar.has_value()) {
     return scalar.value();
   }
-  TVM_FFI_THROW(ValueError) << "Cake FMHA requires " << name
-                            << " to be materialized as a host scalar before the JIT binding";
+  TVM_FFI_THROW(ValueError)
+      << "Cake FMHA requires " << name
+      << " to be materialized as a host scalar before the JIT binding";
   return 0.0;
 }
 
@@ -104,7 +106,8 @@ void LaunchCompat(const CommonArgs& args) {
   TVM_FFI_ICHECK_EQ(args.value_cache.ndim(), 4) << "value cache must be rank 4 HND";
   TVM_FFI_ICHECK_EQ(args.out.ndim(), 3) << "output must be rank 3";
   TVM_FFI_ICHECK_EQ(args.query.stride(2), 1) << "query head dimension must be contiguous";
-  TVM_FFI_ICHECK_EQ(args.key_cache.stride(3), 1) << "key cache head dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(args.key_cache.stride(3), 1)
+      << "key cache head dimension must be contiguous";
   TVM_FFI_ICHECK_EQ(args.value_cache.stride(3), 1)
       << "value cache head dimension must be contiguous";
   TVM_FFI_ICHECK_EQ(args.out.stride(2), 1) << "output head dimension must be contiguous";
@@ -128,7 +131,8 @@ void LaunchCompat(const CommonArgs& args) {
   int const num_q_heads = static_cast<int>(args.query.size(1));
   int const num_kv_heads = static_cast<int>(args.key_cache.size(1));
   int const head_dim = static_cast<int>(args.query.size(2));
-  int const kv_head_dim = static_cast<int>(args.key_cache.size(3)) * (kv_dtype == kNvFp4 ? 2 : 1);
+  int const kv_head_dim =
+      static_cast<int>(args.key_cache.size(3)) * (kv_dtype == kNvFp4 ? 2 : 1);
   int const out_head_dim = static_cast<int>(args.out.size(2)) * (o_dtype == kNvFp4 ? 2 : 1);
   int const page_size = static_cast<int>(args.key_cache.size(2));
   TVM_FFI_ICHECK(head_dim == 128 || head_dim == 256)
@@ -140,7 +144,8 @@ void LaunchCompat(const CommonArgs& args) {
       << "num_q_heads must be divisible by num_kv_heads";
   TVM_FFI_ICHECK(!(!args.is_causal && args.window_left >= 0))
       << "Cake FMHA does not support non-causal sliding-window attention";
-  TVM_FFI_ICHECK(args.block_tables.dtype() == dl_int32 || args.block_tables.dtype() == dl_uint32)
+  TVM_FFI_ICHECK(args.block_tables.dtype() == dl_int32 ||
+                 args.block_tables.dtype() == dl_uint32)
       << "block_tables must be int32 or uint32";
 
   void const* k_scales_ptr = nullptr;
@@ -201,7 +206,8 @@ void LaunchCompat(const CommonArgs& args) {
     TVM_FFI_ICHECK_EQ(lse.size(1), num_q_heads);
     TVM_FFI_ICHECK_EQ(args.lse_stride_tokens, num_q_heads)
         << "Cake FMHA currently requires contiguous LSE";
-    TVM_FFI_ICHECK_EQ(args.lse_stride_heads, 1) << "Cake FMHA currently requires contiguous LSE";
+    TVM_FFI_ICHECK_EQ(args.lse_stride_heads, 1)
+        << "Cake FMHA currently requires contiguous LSE";
     lse_ptr = static_cast<float*>(lse.data_ptr());
   }
 
@@ -235,8 +241,7 @@ void LaunchCompat(const CommonArgs& args) {
     TVM_FFI_ICHECK_EQ(args.query.size(0), args.batch_size * args.uniform_q_len)
         << "uniform decode query rows must equal batch_size * q_len";
     int64_t required_bytes = (args.batch_size + 1) * static_cast<int64_t>(sizeof(int));
-    int64_t workspace_bytes =
-        args.workspace_buffer.numel() * get_element_size(args.workspace_buffer);
+    int64_t workspace_bytes = args.workspace_buffer.numel() * get_element_size(args.workspace_buffer);
     TVM_FFI_ICHECK_GE(workspace_bytes, required_bytes)
         << "workspace is too small for Cake FMHA query indptr";
     q_indptr_ptr = static_cast<int*>(args.workspace_buffer.data_ptr());
@@ -250,12 +255,13 @@ void LaunchCompat(const CommonArgs& args) {
 
   cudaError_t status = cake_fmha_launch_compat_v1(
       args.query.data_ptr(), args.key_cache.data_ptr(), args.value_cache.data_ptr(), k_scales_ptr,
-      v_scales_ptr, args.out.data_ptr(), output_scales_ptr, lse_ptr, table_k, table_v, q_indptr_ptr,
-      static_cast<int*>(args.seq_lens.data_ptr()), sinks_ptr, static_cast<int>(args.batch_size),
-      num_q_heads, num_kv_heads, head_dim, page_size, kHndLayout, q_dtype, kv_dtype, o_dtype,
-      static_cast<int>(args.is_causal), static_cast<int>(args.window_left),
-      static_cast<int>(sinks_ptr != nullptr), static_cast<int>(lse_ptr != nullptr), 1.0f, 1.0f,
-      static_cast<float>(args.bmm2_scale), 1.0f, static_cast<float>(args.bmm1_scale),
+      v_scales_ptr, args.out.data_ptr(), output_scales_ptr, lse_ptr, table_k, table_v,
+      q_indptr_ptr, static_cast<int*>(args.seq_lens.data_ptr()), sinks_ptr,
+      static_cast<int>(args.batch_size), num_q_heads, num_kv_heads, head_dim, page_size, kHndLayout,
+      q_dtype, kv_dtype, o_dtype, static_cast<int>(args.is_causal),
+      static_cast<int>(args.window_left), static_cast<int>(sinks_ptr != nullptr),
+      static_cast<int>(lse_ptr != nullptr), 1.0f, 1.0f, static_cast<float>(args.bmm2_scale), 1.0f,
+      static_cast<float>(args.bmm1_scale),
       o_dtype == kNvFp4 ? static_cast<float>(args.o_sf_scale) : 1.0f,
       static_cast<int>(args.o_sf_start_index), output_scale_columns, args.query.stride(0),
       args.query.stride(1), args.key_cache.stride(0), args.key_cache.stride(1),

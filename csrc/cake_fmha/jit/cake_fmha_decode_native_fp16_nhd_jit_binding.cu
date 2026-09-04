@@ -120,7 +120,8 @@ CUtensorMap EncodeTmaQt(TensorView tensor) {
   TVM_FFI_ICHECK_GT(tensor.stride(1), 0);
   TVM_FFI_ICHECK_EQ(tensor.stride(0), tensor.size(1) * tensor.stride(1));
   uint64_t global_dim[3] = {64u, static_cast<uint64_t>(tensor.size(0) * tensor.size(1)), 2u};
-  uint64_t global_strides[2] = {static_cast<uint64_t>(tensor.stride(1) * sizeof(__half)), 128u};
+  uint64_t global_strides[2] = {
+      static_cast<uint64_t>(tensor.stride(1) * sizeof(__half)), 128u};
   uint32_t box_dim[3] = {64u, 8u, 2u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
@@ -133,7 +134,8 @@ CUtensorMap EncodeTmaQt(TensorView tensor) {
 }
 
 CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
-  TVM_FFI_ICHECK_EQ(tensor.ndim(), 4) << name << " must be the rank-4 normalized NHD paged-KV view";
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), 4)
+      << name << " must be the rank-4 normalized NHD paged-KV view";
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float16);
   TVM_FFI_ICHECK_EQ(tensor.size(2), 32);
   TVM_FFI_ICHECK_EQ(tensor.size(3), 128);
@@ -299,7 +301,8 @@ void cake_paged_attention_decode(
   PrepareDecodeMetadata<<<blocks, threads, 0, stream>>>(
       static_cast<const int*>(seq_lens.data_ptr()), causal_prefix,
       static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
-      static_cast<int>(batch_size), static_cast<int>(source_pages), static_cast<int>(padded_pages));
+      static_cast<int>(batch_size), static_cast<int>(source_pages),
+      static_cast<int>(padded_pages));
   TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
       << "failed to prepare Cake FMHA decode metadata";
 
@@ -348,9 +351,10 @@ void cake_paged_attention_decode(
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
   unsigned int grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
   cudaError_t status = cake_fmha_launch_decode_native_fp16_nhd(
-      p_q, p_k, p_v, static_cast<__half*>(out.data_ptr()), lse_ptr, page_table, causal_prefix,
-      scale_ptr, sinks_ptr, max_pages_per_seq, static_cast<int>(max_kv_len), softmax_scale_log2,
-      static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE, grid_x, 1, 1, stream);
+      p_q, p_k, p_v, static_cast<__half*>(out.data_ptr()), lse_ptr, page_table,
+      causal_prefix, scale_ptr, sinks_ptr, max_pages_per_seq, static_cast<int>(max_kv_len),
+      softmax_scale_log2, static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE,
+      grid_x, 1, 1, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA decode-native FP16 NHD launch failed: " << cudaGetErrorString(status);
 

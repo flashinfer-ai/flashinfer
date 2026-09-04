@@ -130,21 +130,25 @@ CUtensorMap EncodeStagedQ(void* pointer, int64_t total_rows) {
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, dtype, 3, pointer, global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      &tm, dtype, 3, pointer, global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA HD256 staged query map";
+  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
+      << "failed to encode Cake FMHA HD256 staged query map";
   return tm;
 }
 
 CUtensorMap EncodeStagedKv(void* pointer, int64_t total_micro_pages) {
 #if CAKE_FMHA_HD256_FP8
-  uint64_t global_dim[4] = {128u, kMicroPage, 2u, static_cast<uint64_t>(total_micro_pages)};
+  uint64_t global_dim[4] = {
+      128u, kMicroPage, 2u, static_cast<uint64_t>(total_micro_pages)};
   uint64_t global_strides[3] = {256u, 128u, 4096u};
   uint32_t box_dim[4] = {128u, kMicroPage, 1u, 1u};
   CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8;
 #else
-  uint64_t global_dim[4] = {64u, kMicroPage, 4u, static_cast<uint64_t>(total_micro_pages)};
+  uint64_t global_dim[4] = {
+      64u, kMicroPage, 4u, static_cast<uint64_t>(total_micro_pages)};
   uint64_t global_strides[3] = {512u, 128u, 8192u};
   uint32_t box_dim[4] = {64u, kMicroPage, 1u, 1u};
   CUtensorMapDataType dtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
@@ -152,31 +156,40 @@ CUtensorMap EncodeStagedKv(void* pointer, int64_t total_micro_pages) {
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, dtype, 4, pointer, global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      &tm, dtype, 4, pointer, global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA HD256 staged KV map";
+  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
+      << "failed to encode Cake FMHA HD256 staged KV map";
   return tm;
 }
 
 unsigned int SupportGrid(int64_t items) {
-  return static_cast<unsigned int>((items + kSupportThreads - 1) / kSupportThreads);
+  return static_cast<unsigned int>((items + kSupportThreads - 1) /
+                                   kSupportThreads);
 }
 
 }  // namespace
 
 void cake_paged_attention_context(
-    TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
-    TensorView value_cache, TensorView workspace_buffer, TensorView multi_ctas_kv_counter_buffer,
-    TensorView block_tables, TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
-    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
-    double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
-    int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
-    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
-    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
-    Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
-    Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
+    TensorView out, Optional<TensorView> out_scale_factor, TensorView query,
+    TensorView key_cache, TensorView value_cache, TensorView workspace_buffer,
+    TensorView multi_ctas_kv_counter_buffer, TensorView block_tables,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale,
+    Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
+    int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
+    int64_t window_left, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
+    int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<TensorView> key_block_scales,
+    Optional<TensorView> value_block_scales,
+    Optional<float> skip_softmax_threshold_scale_factor,
+    Optional<bool> uses_shared_paged_kv_idx,
+    Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress,
+    bool is_causal, Optional<TensorView> lse, int64_t lse_stride_tokens,
+    int64_t lse_stride_heads) {
 #if CAKE_FMHA_HD256_FP8
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
   TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_float8_e4m3fn);
@@ -197,11 +210,13 @@ void cake_paged_attention_context(
 #endif
   TVM_FFI_ICHECK(!out_scale_factor.has_value());
   TVM_FFI_ICHECK(!attention_sinks.has_value());
-  TVM_FFI_ICHECK(!key_block_scales.has_value() && !value_block_scales.has_value());
+  TVM_FFI_ICHECK(!key_block_scales.has_value() &&
+                 !value_block_scales.has_value());
   TVM_FFI_ICHECK(!lse.has_value());
   TVM_FFI_ICHECK_EQ(lse_stride_tokens, 0);
   TVM_FFI_ICHECK_EQ(lse_stride_heads, 0);
-  TVM_FFI_ICHECK_EQ(skip_softmax_threshold_scale_factor.value_or(0.0f), 0.0f);
+  TVM_FFI_ICHECK_EQ(
+      skip_softmax_threshold_scale_factor.value_or(0.0f), 0.0f);
   TVM_FFI_ICHECK(!use_fp16_softmax.value_or(false));
   TVM_FFI_ICHECK(!uses_spcompress.value_or(false));
   TVM_FFI_ICHECK_EQ(window_left, -1);
@@ -213,7 +228,8 @@ void cake_paged_attention_context(
   TVM_FFI_ICHECK_GT(max_q_len, 0);
   TVM_FFI_ICHECK_GT(max_kv_len, 0);
   TVM_FFI_ICHECK_GT(sm_count, 0);
-  TVM_FFI_ICHECK_EQ((max_q_len + kBlockM - 1) / kBlockM, NUM_M_BLOCKS);
+  TVM_FFI_ICHECK_EQ((max_q_len + kBlockM - 1) / kBlockM,
+                    NUM_M_BLOCKS);
 
   TVM_FFI_ICHECK_EQ(query.ndim(), 3);
   TVM_FFI_ICHECK_EQ(query.size(1), NUM_Q_HEADS);
@@ -238,11 +254,13 @@ void cake_paged_attention_context(
   TVM_FFI_ICHECK_EQ(block_tables.ndim(), 3);
   TVM_FFI_ICHECK_EQ(block_tables.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(block_tables.size(1), 2);
-  TVM_FFI_ICHECK(block_tables.dtype() == dl_int32 || block_tables.dtype() == dl_uint32);
+  TVM_FFI_ICHECK(block_tables.dtype() == dl_int32 ||
+                 block_tables.dtype() == dl_uint32);
   TVM_FFI_ICHECK_EQ(block_tables.stride(2), 1);
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1);
   TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
-  TVM_FFI_ICHECK(seq_lens.dtype() == dl_int32 || seq_lens.dtype() == dl_uint32);
+  TVM_FFI_ICHECK(seq_lens.dtype() == dl_int32 ||
+                 seq_lens.dtype() == dl_uint32);
   TVM_FFI_ICHECK(seq_lens.IsContiguous());
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1);
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.size(0), batch_size + 1);
@@ -257,7 +275,8 @@ void cake_paged_attention_context(
   CheckSameDevice(query, value_cache, "value_cache");
   CheckSameDevice(query, out, "out");
   CheckSameDevice(query, workspace_buffer, "workspace_buffer");
-  CheckSameDevice(query, multi_ctas_kv_counter_buffer, "multi_ctas_kv_counter_buffer");
+  CheckSameDevice(query, multi_ctas_kv_counter_buffer,
+                  "multi_ctas_kv_counter_buffer");
   CheckSameDevice(query, block_tables, "block_tables");
   CheckSameDevice(query, seq_lens, "seq_lens");
   CheckSameDevice(query, cum_seq_lens_q, "cum_seq_lens_q");
@@ -266,7 +285,8 @@ void cake_paged_attention_context(
   int64_t padded_q = NUM_M_BLOCKS * kBlockM;
   int64_t max_micro_pages = (max_kv_len + kMicroPage - 1) / kMicroPage;
   int64_t total_q_rows = batch_size * NUM_Q_HEADS * padded_q;
-  int64_t total_micro_pages = batch_size * NUM_KV_HEADS * max_micro_pages;
+  int64_t total_micro_pages =
+      batch_size * NUM_KV_HEADS * max_micro_pages;
   int64_t cursor = 0;
   int64_t q_offset = cursor;
   cursor += total_q_rows * kInputBytes;
@@ -290,13 +310,15 @@ void cake_paged_attention_context(
   cursor += total_micro_pages * static_cast<int64_t>(sizeof(int));
 
   TVM_FFI_ICHECK(workspace_buffer.IsContiguous());
-  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(workspace_buffer.data_ptr()) % 16, 0);
-  int64_t actual_workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
+  TVM_FFI_ICHECK_EQ(
+      reinterpret_cast<uintptr_t>(workspace_buffer.data_ptr()) % 16, 0);
+  int64_t actual_workspace_bytes =
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
   TVM_FFI_ICHECK_GE(actual_workspace_bytes, cursor)
       << "Cake FMHA HD256 context workspace requires " << cursor << " bytes";
   TVM_FFI_ICHECK_GE(workspace_size, cursor);
-  int64_t counter_bytes =
-      multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer);
+  int64_t counter_bytes = multi_ctas_kv_counter_buffer.numel() *
+                          get_element_size(multi_ctas_kv_counter_buffer);
   TVM_FFI_ICHECK_GE(counter_bytes, static_cast<int64_t>(sizeof(uint32_t)));
 
   auto* workspace = static_cast<uint8_t*>(workspace_buffer.data_ptr());
@@ -308,21 +330,23 @@ void cake_paged_attention_context(
   auto* seq_lens_kv = reinterpret_cast<int*>(workspace + seq_kv_offset);
   auto* cu_seq_lens_q = reinterpret_cast<int*>(workspace + cu_q_offset);
   auto* kernel_page_table = reinterpret_cast<int*>(workspace + page_offset);
-  auto* dynamic_counter = static_cast<uint32_t*>(multi_ctas_kv_counter_buffer.data_ptr());
+  auto* dynamic_counter =
+      static_cast<uint32_t*>(multi_ctas_kv_counter_buffer.data_ptr());
 
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
   cudaStream_t stream = get_stream(query.device());
   unsigned int stage_q_grid = SupportGrid(total_q_rows * kInputBytes);
-  unsigned int stage_kv_grid =
-      SupportGrid(total_micro_pages * kMicroPage * static_cast<int64_t>(kInputBytes));
-  unsigned int metadata_grid =
-      SupportGrid(std::max<int64_t>(batch_size * NUM_Q_HEADS, total_micro_pages));
+  unsigned int stage_kv_grid = SupportGrid(
+      total_micro_pages * kMicroPage * static_cast<int64_t>(kInputBytes));
+  unsigned int metadata_grid = SupportGrid(std::max<int64_t>(
+      batch_size * NUM_Q_HEADS, total_micro_pages));
   unsigned int scatter_grid = SupportGrid(total_q_rows * kOutputBytes);
 
   cudaError_t status = cake_fmha_launch_hd256_stage_q(
       static_cast<const uint8_t*>(query.data_ptr()), q_packed,
-      static_cast<const int*>(cum_seq_lens_q.data_ptr()), static_cast<int>(batch_size), NUM_Q_HEADS,
-      static_cast<int>(padded_q), kInputBytes, query.stride(0) * get_element_size(query),
+      static_cast<const int*>(cum_seq_lens_q.data_ptr()),
+      static_cast<int>(batch_size), NUM_Q_HEADS, static_cast<int>(padded_q),
+      kInputBytes, query.stride(0) * get_element_size(query),
       query.stride(1) * get_element_size(query), stage_q_grid, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA HD256 query staging failed: " << cudaGetErrorString(status);
@@ -330,8 +354,9 @@ void cake_paged_attention_context(
       static_cast<const uint8_t*>(key_cache.data_ptr()),
       static_cast<const uint8_t*>(value_cache.data_ptr()), k_packed, v_packed,
       static_cast<const int*>(block_tables.data_ptr()),
-      static_cast<const int*>(seq_lens.data_ptr()), static_cast<int>(batch_size), NUM_KV_HEADS,
-      CAKE_FMHA_SOURCE_PAGE_SIZE, static_cast<int>(max_micro_pages), kInputBytes,
+      static_cast<const int*>(seq_lens.data_ptr()), static_cast<int>(batch_size),
+      NUM_KV_HEADS, CAKE_FMHA_SOURCE_PAGE_SIZE,
+      static_cast<int>(max_micro_pages), kInputBytes,
       key_cache.stride(0) * get_element_size(key_cache),
       key_cache.stride(2) * get_element_size(key_cache),
       key_cache.stride(1) * get_element_size(key_cache), block_tables.stride(0),
@@ -340,11 +365,14 @@ void cake_paged_attention_context(
       << "Cake FMHA HD256 KV staging failed: " << cudaGetErrorString(status);
   status = cake_fmha_launch_hd256_prepare_metadata(
       static_cast<const int*>(cum_seq_lens_q.data_ptr()),
-      static_cast<const int*>(seq_lens.data_ptr()), seq_lens_q, seq_lens_kv, cu_seq_lens_q,
-      kernel_page_table, dynamic_counter, static_cast<int>(batch_size), NUM_Q_HEADS, NUM_KV_HEADS,
-      static_cast<int>(padded_q), static_cast<int>(max_micro_pages), metadata_grid, stream);
+      static_cast<const int*>(seq_lens.data_ptr()), seq_lens_q, seq_lens_kv,
+      cu_seq_lens_q, kernel_page_table, dynamic_counter,
+      static_cast<int>(batch_size), NUM_Q_HEADS, NUM_KV_HEADS,
+      static_cast<int>(padded_q), static_cast<int>(max_micro_pages),
+      metadata_grid, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA HD256 metadata staging failed: " << cudaGetErrorString(status);
+      << "Cake FMHA HD256 metadata staging failed: "
+      << cudaGetErrorString(status);
 
   CUtensorMap h_q = EncodeStagedQ(q_packed, total_q_rows);
   CUtensorMap h_k = EncodeStagedKv(k_packed, total_micro_pages);
@@ -356,30 +384,40 @@ void cake_paged_attention_context(
   auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
       TmaDeviceSlot(h_v, query.device().device_id, stream));
   float softmax_scale_log2 =
-      static_cast<float>(ScalarScale(bmm1_scale, "bmm1_scale") * 1.4426950408889634);
-  unsigned int total_tiles = static_cast<unsigned int>(NUM_M_BLOCKS * batch_size * NUM_Q_HEADS);
-  unsigned int grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
+      static_cast<float>(ScalarScale(bmm1_scale, "bmm1_scale") *
+                         1.4426950408889634);
+  unsigned int total_tiles = static_cast<unsigned int>(
+      NUM_M_BLOCKS * batch_size * NUM_Q_HEADS);
+  unsigned int grid_x =
+      std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
 #if CAKE_FMHA_HD256_FP8
   status = cake_fmha_launch_context_fp8_hd256(
-      p_q, p_k, p_v, o_packed, kernel_page_table, seq_lens_q, seq_lens_kv, cu_seq_lens_q,
-      softmax_scale_log2, static_cast<float>(ScalarScale(bmm2_scale, "bmm2_scale")),
-      static_cast<int>(batch_size * NUM_Q_HEADS), static_cast<int>(max_micro_pages),
-      dynamic_counter, grid_x, 1, 1, stream);
+      p_q, p_k, p_v, o_packed, kernel_page_table, seq_lens_q, seq_lens_kv,
+      cu_seq_lens_q, softmax_scale_log2,
+      static_cast<float>(ScalarScale(bmm2_scale, "bmm2_scale")),
+      static_cast<int>(batch_size * NUM_Q_HEADS),
+      static_cast<int>(max_micro_pages), dynamic_counter, grid_x, 1, 1,
+      stream);
 #else
   status = cake_fmha_launch_context_fp16_hd256(
-      p_q, p_k, p_v, reinterpret_cast<__half*>(o_packed), kernel_page_table, seq_lens_q,
-      seq_lens_kv, cu_seq_lens_q, softmax_scale_log2, static_cast<int>(batch_size * NUM_Q_HEADS),
-      static_cast<int>(max_micro_pages), dynamic_counter, grid_x, 1, 1, stream);
+      p_q, p_k, p_v, reinterpret_cast<__half*>(o_packed), kernel_page_table,
+      seq_lens_q, seq_lens_kv, cu_seq_lens_q, softmax_scale_log2,
+      static_cast<int>(batch_size * NUM_Q_HEADS),
+      static_cast<int>(max_micro_pages), dynamic_counter, grid_x, 1, 1,
+      stream);
 #endif
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA HD256 context launch failed: " << cudaGetErrorString(status);
+      << "Cake FMHA HD256 context launch failed: "
+      << cudaGetErrorString(status);
   status = cake_fmha_launch_hd256_scatter_o(
       o_packed, static_cast<uint8_t*>(out.data_ptr()),
-      static_cast<const int*>(cum_seq_lens_q.data_ptr()), static_cast<int>(batch_size), NUM_Q_HEADS,
-      static_cast<int>(padded_q), kOutputBytes, out.stride(0) * get_element_size(out),
+      static_cast<const int*>(cum_seq_lens_q.data_ptr()),
+      static_cast<int>(batch_size), NUM_Q_HEADS, static_cast<int>(padded_q),
+      kOutputBytes, out.stride(0) * get_element_size(out),
       out.stride(1) * get_element_size(out), scatter_grid, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA HD256 output scatter failed: " << cudaGetErrorString(status);
+      << "Cake FMHA HD256 output scatter failed: "
+      << cudaGetErrorString(status);
 
   (void)cum_seq_lens_kv;
   (void)enable_pdl;
@@ -388,5 +426,6 @@ void cake_paged_attention_context(
 }  // namespace cake_fmha
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_paged_attention_context,
-                              flashinfer::cake_fmha::cake_paged_attention_context);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    cake_paged_attention_context,
+    flashinfer::cake_fmha::cake_paged_attention_context);
