@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -50,6 +51,7 @@ from ..trace.templates.moe import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -1697,6 +1699,31 @@ class MoeRunnerInputs:
 MoEInputs = MoeRunnerInputs
 
 
+@functools.cache
+def _make_flat_act_sf_numel_inferrer(
+    hidden_states_idx: int, sf_per_token: int
+) -> Callable[[Sequence[Sequence[int]]], int]:
+    """ConstraintSpec callback for a flat (1-D) activation scale buffer.
+
+    A flat scale holds ``num_tokens * sf_per_token`` elements, so its single
+    dimension is *not* a token count.  The autotuner writes a bucket's token
+    count verbatim into a dynamic dim (see ``_generate_optimization_profiles``),
+    which would under-allocate the buffer by a factor of ``sf_per_token`` and
+    make the kernel read out of bounds while profiling.  A ConstraintSpec
+    instead derives the extent from the profiled ``hidden_states`` dim 0, the
+    same approach ``runners.py`` uses for the swizzled MXFP8 activation scale.
+
+    Cached so equal arguments yield the same callable: ConstraintSpec is hashed
+    into AutoTuner._find_nearest_profile's lru_cache key, and a fresh closure
+    per inference call would cause unbounded cache growth.
+    """
+
+    def infer_shape(shapes: Sequence[Sequence[int]]) -> int:
+        return shapes[hidden_states_idx][0] * sf_per_token
+
+    return infer_shape
+
+
 def _alloc_trtllm_moe_output(
     num_tokens: int,
     hidden_size: int,
@@ -1924,10 +1951,66 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
             num_tokens = moe_inputs.hidden_states.shape[0]
 
+            # A flat (1-D) activation scale — the linear layout produced by
+            # mxfp8_quantize(..., is_sf_swizzled_layout=False), and what
+            # TensorRT-LLM passes through — packs num_tokens * sf_per_token
+            # elements into a single dimension, so no dim of it equals
+            # num_tokens.  Resizing it as a dynamic dim would shrink it to the
+            # raw bucket count; drive it with a ConstraintSpec that scales by
+            # sf_per_token instead.  The C++ launcher accepts any rank here (it
+            # derives the SF vector size from numel alone).
+            constraint_specs: Tuple[ConstraintSpec, ...] = ()
+            scale = moe_inputs.hidden_states_scale
+            flat_scale = (
+                scale is not None
+                and self.fp8_quantization_type != Fp8QuantizationType.DeepSeekFp8
+                and scale.dim() == 1
+            )
+            if flat_scale:
+                assert num_tokens > 0 and scale.numel() % num_tokens == 0, (
+                    f"flat hidden_states_scale numel {scale.numel()} is not a "
+                    f"multiple of num_tokens={num_tokens}"
+                )
+                # Require the LINEAR layout, i.e. exactly the vector sizes the
+                # C++ side accepts (it computes
+                # vec_size = num_tokens * hidden_size / numel and only allows
+                # 16 for NvFp4 or 32 for Mx*).  A 128x4-swizzled buffer is
+                # row/col padded, so its numel implies some other vec_size;
+                # inferring sf_per_token from it would size the profiling buffer
+                # against a layout the kernel does not expect.  Reject early
+                # with a clear message rather than silently deriving a bogus
+                # stride.
+                _sf_per_token = scale.numel() // num_tokens
+                assert (
+                    _sf_per_token > 0
+                    and self.hidden_size % _sf_per_token == 0
+                    and self.hidden_size // _sf_per_token in (16, 32)
+                ), (
+                    f"flat hidden_states_scale numel {scale.numel()} implies "
+                    f"{_sf_per_token} scales/token for hidden_size="
+                    f"{self.hidden_size}, i.e. an SF vector size of "
+                    f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
+                    "only the linear layout with vector size 16 (NvFp4) or 32 "
+                    "(Mx*) is supported. Pass a linear scale, e.g. "
+                    "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
+                )
+                constraint_specs = (
+                    ConstraintSpec(
+                        MoeRunnerInputs.idx("hidden_states_scale"),
+                        0,
+                        _make_flat_act_sf_numel_inferrer(
+                            MoeRunnerInputs.idx("hidden_states"),
+                            scale.numel() // num_tokens,
+                        ),
+                    ),
+                )
+
             def _dynamic_dim(name: str) -> int:
                 if name == "hidden_states_scale":
-                    # DeepSeekFp8 uses [hidden_size//128, num_tokens];
-                    # all others (MxFp8, fp4, …) use [num_tokens, ...].
+                    # DeepSeekFp8 uses [hidden_size//128, num_tokens]; all others
+                    # (MxFp8, fp4, …) use [num_tokens, ...] when 2-D.  The flat
+                    # 1-D layout never reaches here — it is filtered out above
+                    # and handled by a ConstraintSpec.
                     t = moe_inputs.hidden_states_scale
                     if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
                         assert t.shape == (self.hidden_size // 128, num_tokens), (
@@ -1936,14 +2019,25 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                             f"(hidden_size//128={self.hidden_size // 128}, num_tokens={num_tokens})"
                         )
                         return 1
-                    assert t.shape[0] == num_tokens, (
+                    assert t.dim() >= 1 and t.shape[0] == num_tokens, (
                         f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                        f"expected layout (num_tokens={num_tokens}, ...)"
+                        f"expected layout (num_tokens={num_tokens}, ...) or flat "
+                        f"(num_tokens * sf_per_token,)"
                     )
                     return 0
                 return MoeRunnerInputs._DYNAMIC_DIM[name]
 
-            dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
+            # The constrained flat scale is excluded from the dynamic spec but
+            # stays in profile_arena_input_indices (set from input_idx above) and
+            # keeps its initializer: a ConstraintSpec also marks the dim dynamic,
+            # so the profiler still synthesizes the tensor at the derived size.
+            dynamic_inputs = tuple(
+                (idx, name)
+                for idx, name, _ in sorted_inputs
+                if not (flat_scale and name == "hidden_states_scale")
+            )
+            dynamic_input_idx = tuple(idx for idx, _ in dynamic_inputs)
+            dim_idx = tuple(_dynamic_dim(name) for _, name in dynamic_inputs)
             tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
             value_aware_names = {"topk_ids", "expert_weights"}
             kwargs.setdefault(
@@ -1957,12 +2051,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             return TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
-                        input_idx,
+                        dynamic_input_idx,
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
                     ),
                 ),
+                constraint_specs=constraint_specs,
                 tensor_initializers=tensor_initializers,
                 **kwargs,
             )
@@ -2108,18 +2203,32 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 "hidden_states's first dimension must be batch size."
             )
             if hidden_states_scale is not None:
-                assert hidden_states_scale.dim() == 2, (
-                    "hidden_states_scale must be a 2D tensor"
-                )
                 if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                    assert hidden_states_scale.shape[1] == num_tokens, (
+                    assert (
+                        hidden_states_scale.dim() == 2
+                        and hidden_states_scale.shape[1] == num_tokens
+                    ), (
                         f"DeepSeekFp8 hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
-                        f"expects num_tokens={num_tokens} at dim 1"
+                        f"expects a 2D tensor with num_tokens={num_tokens} at dim 1"
+                    )
+                elif hidden_states_scale.dim() == 1:
+                    # Flat linear layout, i.e. mxfp8_quantize(...,
+                    # is_sf_swizzled_layout=False): one
+                    # contiguous run of sf_per_token scales per token.
+                    assert (
+                        num_tokens > 0 and hidden_states_scale.numel() % num_tokens == 0
+                    ), (
+                        f"flat hidden_states_scale numel {hidden_states_scale.numel()} "
+                        f"is not a multiple of num_tokens={num_tokens}"
                     )
                 else:
-                    assert hidden_states_scale.shape[0] == num_tokens, (
+                    assert (
+                        hidden_states_scale.dim() == 2
+                        and hidden_states_scale.shape[0] == num_tokens
+                    ), (
                         f"hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
-                        f"expects num_tokens={num_tokens} at dim 0"
+                        f"expects a 2D tensor with num_tokens={num_tokens} at dim 0, "
+                        f"or a flat (num_tokens * sf_per_token,) tensor"
                     )
             # Choose the appropriate operation based on data types
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
@@ -6681,6 +6790,9 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale : Optional[torch.Tensor]
         Block scales for MXFP8 / NVFP4 hidden states of shape
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
+        The equivalent flat ``[seq_len * hidden_size // (32 if mxfp8 else 16)]``
+        buffer returned by :func:`~flashinfer.mxfp8_quantize` with
+        ``is_sf_swizzled_layout=False`` (the linear layout) is also accepted.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
@@ -6927,7 +7039,10 @@ def trtllm_fp4_block_scale_routed_moe(
         MXFP8 (``float8_e4m3fn``), and NVFP4 (packed into ``uint8``).
     hidden_states_scale : Optional[torch.Tensor]
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]`` block scales of
-        the hidden states, float8.
+        the hidden states, float8.  The equivalent flat
+        ``[seq_len * hidden_size // (32 if mxfp8 else 16)]`` buffer returned by
+        :func:`~flashinfer.mxfp8_quantize` with ``is_sf_swizzled_layout=False``
+        (the linear layout) is also accepted.
     gemm1_weights : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
         FP4 FC1 weights, ``uint8``.
