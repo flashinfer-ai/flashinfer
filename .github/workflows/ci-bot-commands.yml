@@ -175,7 +175,7 @@ jobs:
               # branch exists to prevent. Starting CI matters; the courtesy note does not.
               gh pr comment ${{ github.event.issue.number }} \
                 --repo ${{ github.repository }} \
-                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err)" \
+                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err). Note the full suite does NOT cover tests/experimental/, which only runs from a valid scope." \
                 || echo "warning: could not post the scope-ignored note; continuing to label"
             fi
           fi
