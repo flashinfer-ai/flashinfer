@@ -1386,9 +1386,24 @@ class FmhaDecodeConfig:
 
     @property
     def uses_prepared_score_keep_words(self) -> bool:
-        """Whether prepared routes carry BMM1 score-column validity words."""
+        """Whether prepared routes carry BMM1 score-column validity words.
 
-        return self.use_kv_valid_bits or self.use_block_sparse_proxy_routes
+        Dense block-sparse Keeps plans prepare them even without a caller
+        token mask: the streamed max pass trusts the words directly, which is
+        cheaper than deriving each fragment's visible range in the softmax
+        warps. The plan sizes its route storage and the prepare kernels store
+        the words from this same property, via the resolved launch spec.
+        """
+
+        return (
+            self.use_kv_valid_bits
+            or self.use_block_sparse_proxy_routes
+            or (
+                self.use_block_sparse
+                and self.use_keeps_mma_ab
+                and self.mask_type == DENSE
+            )
+        )
 
     @property
     def trusts_prepared_score_words(self) -> bool:

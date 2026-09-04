@@ -92,6 +92,9 @@ class _BlockSparseLaunchSpec:
 
     policy: tuple[tuple[str, object], ...]
     compile_key: _BlockSparseCompileKey
+    # Whether prepared routes carry K32 score-validity words; the decode
+    # config owns this rule and the plan sizes its route storage from it.
+    prepares_score_words: bool
 
 
 _CAPACITY_UNSET = object()
@@ -359,11 +362,13 @@ def _validate_block_sparse_static_profile(
         kv_block_size=kv_block_size,
     )
     if page_size is not None:
+        # Validate the paged route geometry with a capacity-free layout; the
+        # score-word slots do not take part in the page/atom checks.
         _BlockSparseRouteLayout.create(
             kv_route_size=kv_route_size,
             kv_block_size=kv_block_size,
             page_size=page_size,
-            has_token_bits=use_kv_valid_bits,
+            has_token_bits=False,
             route_metadata_capacity=0,
             num_rows=1,
         )
@@ -516,7 +521,7 @@ def _resolve_block_sparse_launch_spec(
         page_size=page_size,
     )
     try:
-        _make_block_sparse_config(compile_key)
+        config = _make_block_sparse_config(compile_key)
     except ValueError:
         if not compile_key.use_persistent_scheduler:
             raise
@@ -530,7 +535,7 @@ def _resolve_block_sparse_launch_spec(
                 use_persistent_scheduler=False,
             ),
         )
-        _make_block_sparse_config(compile_key)
+        config = _make_block_sparse_config(compile_key)
 
     policy_entries: list[tuple[str, object]] = [
         ("tile_size_q", q_tile_size),
@@ -556,6 +561,7 @@ def _resolve_block_sparse_launch_spec(
     return _BlockSparseLaunchSpec(
         policy=tuple(policy_entries),
         compile_key=compile_key,
+        prepares_score_words=config.uses_prepared_score_keep_words,
     )
 
 

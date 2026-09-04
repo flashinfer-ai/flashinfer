@@ -585,6 +585,11 @@ _PROXY_ROUTE_CASES = (
 )
 
 
+def _stub_block_sparse_config(_key):
+    """Stand in for the decode config where only the launch policy matters."""
+    return SimpleNamespace(uses_prepared_score_keep_words=False)
+
+
 def _make_patterns(case: _Case) -> _Patterns:
     num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
     num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
@@ -2463,6 +2468,43 @@ def test_prepared_block_sparse_layout_allows_empty_route_metadata() -> None:
     assert layout.workspace_size_words == layout.route_metadata_base_word_offset
 
 
+def test_dense_keeps_plans_prepare_structural_score_words() -> None:
+    """Dense Keeps plans carry trusted score words; causal and Swaps do not."""
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        CAUSAL,
+        DENSE,
+        FmhaDecodeConfig,
+    )
+
+    def keeps_cfg(mask_type):
+        return FmhaDecodeConfig(
+            use_block_sparse=True,
+            groups_tokens_heads_q=True,
+            q_block_size=128,
+            kv_block_size=64,
+            tile_size_q=128,
+            tile_size_kv=128,
+            use_keeps_mma_ab=True,
+            mask_type=mask_type,
+        )
+
+    dense = keeps_cfg(DENSE)
+    assert dense.uses_prepared_score_keep_words
+    assert dense.trusts_prepared_score_words
+    assert not keeps_cfg(CAUSAL).uses_prepared_score_keep_words
+    swaps = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=32,
+        kv_block_size=32,
+        tile_size_q=32,
+        tile_size_kv=128,
+        use_keeps_mma_ab=False,
+        mask_type=DENSE,
+    )
+    assert not swaps.uses_prepared_score_keep_words
+
+
 def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     metadata = torch.empty((1, 1, 2), dtype=torch.int32)
     indices = torch.empty((0,), dtype=torch.int32)
@@ -3218,7 +3260,7 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3281,7 +3323,7 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3342,7 +3384,7 @@ def test_proxy_routes_share_exact_route_scheduler_selection(
     monkeypatch.setattr(
         block_sparse_config,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3403,7 +3445,7 @@ def test_clc_capacity_gates_control_launch_resolution(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3449,10 +3491,11 @@ def test_static_fallback_reselects_sparse_load_policy(
     )
     config_calls: list[object] = []
 
-    def validate_config(key: object) -> None:
+    def validate_config(key: object) -> SimpleNamespace:
         config_calls.append(key)
         if key.use_persistent_scheduler:
             raise ValueError("reject persistent profile")
+        return _stub_block_sparse_config(key)
 
     monkeypatch.setattr(
         fmha_decode_config,
@@ -3975,7 +4018,8 @@ def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
     route_layout = _BlockSparseRouteLayout.create(
         kv_route_size=policy["tile_size_kv"],
         kv_block_size=256,
-        has_token_bits=False,
+        # Dense Keeps plans store structural score words with every route.
+        has_token_bits=True,
         route_metadata_capacity=12,
         num_rows=6,
     )
