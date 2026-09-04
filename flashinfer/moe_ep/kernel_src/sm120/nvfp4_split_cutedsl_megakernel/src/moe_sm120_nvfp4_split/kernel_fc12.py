@@ -44,6 +44,7 @@ from .sm120_mma import (
     partition_fragment_sfa_for_sm120_mma,
     partition_fragment_sfb_for_sm120_mma,
 )
+from .sm120_ptx_helpers import clamp_gate_upper_f32, clamp_symmetric_f32
 from .split_timestamp import (
     FIELD_FIRST_WORK,
     FIELD_FIRST_TILE_ID,
@@ -2110,6 +2111,16 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         up1 = acc0[3] * fc1_alpha_value
                         up2 = acc1[2] * fc1_alpha_value
                         up3 = acc1[3] * fc1_alpha_value
+                        if cutlass.const_expr(self.gate_up_clamp is not None):
+                            limit = cutlass.Float32(self.gate_up_clamp)
+                            gate0 = clamp_gate_upper_f32(gate0, limit)
+                            gate1 = clamp_gate_upper_f32(gate1, limit)
+                            gate2 = clamp_gate_upper_f32(gate2, limit)
+                            gate3 = clamp_gate_upper_f32(gate3, limit)
+                            up0 = clamp_symmetric_f32(up0, limit)
+                            up1 = clamp_symmetric_f32(up1, limit)
+                            up2 = clamp_symmetric_f32(up2, limit)
+                            up3 = clamp_symmetric_f32(up3, limit)
                         val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)
@@ -4778,14 +4789,14 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         up3 = acc1[3] * fc1_alpha_value
                         if cutlass.const_expr(self.gate_up_clamp is not None):
                             limit = cutlass.Float32(self.gate_up_clamp)
-                            gate0 = cute.arch.fmin(gate0, limit)
-                            gate1 = cute.arch.fmin(gate1, limit)
-                            gate2 = cute.arch.fmin(gate2, limit)
-                            gate3 = cute.arch.fmin(gate3, limit)
-                            up0 = cute.arch.fmax(-limit, cute.arch.fmin(up0, limit))
-                            up1 = cute.arch.fmax(-limit, cute.arch.fmin(up1, limit))
-                            up2 = cute.arch.fmax(-limit, cute.arch.fmin(up2, limit))
-                            up3 = cute.arch.fmax(-limit, cute.arch.fmin(up3, limit))
+                            gate0 = clamp_gate_upper_f32(gate0, limit)
+                            gate1 = clamp_gate_upper_f32(gate1, limit)
+                            gate2 = clamp_gate_upper_f32(gate2, limit)
+                            gate3 = clamp_gate_upper_f32(gate3, limit)
+                            up0 = clamp_symmetric_f32(up0, limit)
+                            up1 = clamp_symmetric_f32(up1, limit)
+                            up2 = clamp_symmetric_f32(up2, limit)
+                            up3 = clamp_symmetric_f32(up3, limit)
                         val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)

@@ -22,8 +22,10 @@ from .heuristic import (
 from .jit_config import Sm120JitConfig
 
 
-# Bump when a generated-kernel ABI or opaque workspace layout changes.
-KERNEL_CACHE_ABI = 3
+# Bump when a generated-kernel ABI or opaque workspace layout changes. Version
+# 4 applies gate_up_clamp in the SM120 inline K1 epilogue; older cached inline
+# kernels accepted the parameter but performed unclamped SwiGLU.
+KERNEL_CACHE_ABI = 4
 
 
 @dataclass(frozen=True)
