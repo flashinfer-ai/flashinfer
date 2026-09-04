@@ -148,7 +148,7 @@ def test_batch_prefill_with_ragged_kv_cache_fp8(
     # Validates the ragged FP8 KV dequant kernel path (BF16 repack for hd128/256,
     # in-loop dequant for the k64B hd64 case) against the equivalent 16-bit kernel
     # run on the *same* dequantized values -- so no dependence on k/v scale
-    # plumbing (the fa2 ragged wrapper does not apply k_scale/v_scale).
+    # plumbing (calibration scales are tested separately below).
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     torch.manual_seed(42)
@@ -426,6 +426,69 @@ def test_single_prefill_fp8_h512_long_q():
     )
     o_fp8 = flashinfer.single_prefill_with_kv_cache(q, k_fp8, v_fp8)
     torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "k_scale,v_scale",
+    [(None, None), (1.0, 1.0), (0.25, None), (None, 0.5), (0.25, 0.5)],
+)
+def test_ragged_fp8_calibration_scales(q_dtype, kv_dtype, causal, k_scale, v_scale):
+    # Regression for #4979: compare against the actual quantized values, so
+    # quantization error cannot hide missing K/V calibration.
+    torch.manual_seed(0)
+    batch, qo_len, kv_len, heads, kv_heads, dim = 2, 53, 97, 8, 2, 128
+    q = torch.randn(batch * qo_len, heads, dim, dtype=q_dtype, device="cuda")
+    k = torch.randn(batch * kv_len, kv_heads, dim, device="cuda").to(kv_dtype)
+    v = torch.randn(batch * kv_len, kv_heads, dim, device="cuda").to(kv_dtype)
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * qo_len
+    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * kv_len
+    workspace = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        heads,
+        kv_heads,
+        dim,
+        causal=causal,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
+        logits_soft_cap=3.0,
+    )
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device="cuda")
+    actual, actual_lse = wrapper.run(
+        q, k, v, k_scale=k_scale, v_scale=v_scale, out=out, lse=lse, return_lse=True
+    )
+    assert actual.data_ptr() == out.data_ptr()
+    assert actual_lse.data_ptr() == lse.data_ptr()
+
+    q_ref = q.float().reshape(batch, qo_len, heads, dim).transpose(1, 2)
+    k_ref = k.float().reshape(batch, kv_len, kv_heads, dim).transpose(1, 2)
+    v_ref = v.float().reshape(batch, kv_len, kv_heads, dim).transpose(1, 2)
+    k_ref = k_ref.repeat_interleave(heads // kv_heads, dim=1)
+    v_ref = v_ref.repeat_interleave(heads // kv_heads, dim=1)
+    logits = (q_ref @ k_ref.transpose(-1, -2)) * (
+        (1.0 if k_scale is None else k_scale) / dim**0.5
+    )
+    logits = 3.0 * torch.tanh(logits / 3.0)
+    if causal:
+        mask = torch.arange(kv_len, device="cuda")[None, :] > (
+            torch.arange(qo_len, device="cuda")[:, None] + kv_len - qo_len
+        )
+        logits.masked_fill_(mask, float("-inf"))
+    expected = (logits.softmax(-1) @ v_ref) * (1.0 if v_scale is None else v_scale)
+    expected = expected.transpose(1, 2).reshape_as(actual)
+    expected_lse = logits.logsumexp(-1).transpose(1, 2).reshape_as(actual_lse)
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_lse).all()
+    torch.testing.assert_close(actual.float(), expected, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":
