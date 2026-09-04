@@ -209,6 +209,14 @@ struct DequantAttentionKernelTraits
                                DTypeKVMma, DTypeO_, typename Base::SmemLayoutQ,
                                typename Base::SmemLayoutK, typename Base::SmemLayoutV,
                                typename Base::SmemLayoutO, SmemLayoutKStaging, SmemLayoutVStaging>;
+  // The dense head_dim 128 and 256 configurations sit 2 KB under the SM90 limit.
+  static_assert(sizeof(SharedStorage) <= 227 * 1024, "shared storage exceeds the SM90 limit");
+  // The dequantizer (DequantKVSchedule::convert_tile) steps through a tile in multiples of 8
+  // rows and relies on every swizzle atom spanning exactly 8 rows, so that the step is a
+  // constant offset that leaves the XOR pattern unchanged.
+  static_assert(size<0>(SmemLayoutAtomKStaging{}) == 8 && size<0>(SmemLayoutAtomVStaging{}) == 8);
+  static_assert(size<0>(typename Base::SmemLayoutAtomK{}) == 8 &&
+                size<0>(typename Base::SmemLayoutAtomV{}) == 8);
 };
 
 }  // namespace flashinfer

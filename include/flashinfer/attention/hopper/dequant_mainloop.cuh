@@ -67,8 +67,10 @@ struct StagingPipelinesFor<CollectiveMainloop, true> {
 
 // Exact FP8 -> 16-bit conversion of 16 packed elements (four 32-bit words holding four FP8
 // values each). Every finite FP8 value is representable in both fp16 and bf16, so all variants
-// produce the same values as vec_cast (and hence the FA2 mixed-precision kernels); the bit
-// tricks are the ones from fast_dequant_f8f16x4 with the byte placement folded into one PRMT.
+// produce the same values as vec_cast (and hence the FA2 mixed-precision kernels) and use the
+// same per-path instructions on sm_90 (hardware cvt for e4m3 -> fp16, byte placement for
+// e5m2 -> fp16, the fast_dequant_f8f16x4 bit trick for bf16 with the byte placement folded into
+// one PRMT); non-finite codes therefore also match vec_cast path by path.
 template <typename DTypeKV, typename DTypeKVMma>
 struct Fp8x16Dequantizer {
   static constexpr bool kE5M2 = std::is_same_v<DTypeKV, cutlass::float_e5m2_t>;
@@ -471,6 +473,9 @@ struct DequantCollectiveMainloop {
     return num_kv_tiles;
   }
 
+  // The multi-item-scoring arguments only exist so that the kernel can call every FP8-KV
+  // mainloop the same way; dense K/V has no multi-item-scoring mode. TMA zero-fills the rows
+  // past kv_len of a partial tile, so maybe_partial is not needed either.
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
             typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
@@ -480,8 +485,8 @@ struct DequantCollectiveMainloop {
                            typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx,
-                           const int num_kv_tiles_outside_items_window = 0,
-                           const int num_kv_tiles_prefix = 0) {
+                           const int /*num_kv_tiles_outside_items_window*/ = 0,
+                           const int /*num_kv_tiles_prefix*/ = 0) {
     const int thread_idx = threadIdx.x;
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK =
@@ -578,7 +583,11 @@ struct DequantCollectiveMainloop {
 };
 
 // Paged K/V: the staging buffers are filled by a cp.async gather through the page table, issued
-// by all producer threads. The gather mirrors SparseCollectiveMainloop (sparse_mainloop.cuh).
+// by all producer threads. The gather mirrors SparseCollectiveMainloop (sparse_mainloop.cuh),
+// except that the page-table offsets are recomputed for K and V (they are staged at different
+// times) and that the last V tile staged is V(first_tile) rather than V(0). With a sliding
+// window both are fully masked, so either choice is correct; the former keeps the schedule
+// uniform.
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct SparseDequantCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
@@ -824,6 +833,8 @@ struct SparseDequantCollectiveMainloop {
     constexpr int THREADS_PER_GROUP = NUM_COPY_THREADS / NUM_GROUPS;
     constexpr int NUM_ITERS_PER_GROUP = NUM_KV_PER_ITER;
     static_assert(NUM_ITERS_PER_GROUP <= THREADS_PER_GROUP);
+    // The page offsets are exchanged with __shfl_sync, so a group must stay inside one warp.
+    static_assert(THREADS_PER_GROUP <= cutlass::NumThreadsPerWarp);
 
     const int group_id = thread_idx / THREADS_PER_GROUP;
     const int thread_in_group = thread_idx % THREADS_PER_GROUP;

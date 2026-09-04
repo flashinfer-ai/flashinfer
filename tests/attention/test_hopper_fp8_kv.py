@@ -281,7 +281,13 @@ def test_batch_paged_prefill_fp8_kv(
     qo_indptr_t = torch.tensor(qo_indptr, dtype=torch.int32, device="cuda")
 
     outs = {}
-    for backend in ["fa3", "fa2"]:
+    for name, backend, (kc, vc) in [
+        ("fa3", "fa3", (k_cache, v_cache)),
+        ("fa2", "fa2", (k_cache, v_cache)),
+        # The paged fp8-KV kernel uses the tiles of the 16-bit kernel, so on the dequantized
+        # cache the two must agree bit for bit.
+        ("fa3_16bit", "fa3", (k_cache.to(q_dtype), v_cache.to(q_dtype))),
+    ]:
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             _workspace(), kv_layout, backend=backend
         )
@@ -296,11 +302,13 @@ def test_batch_paged_prefill_fp8_kv(
             page_size,
             causal=causal,
             q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
+            kv_data_type=kc.dtype,
         )
-        outs[backend] = wrapper.run_return_lse(q, (k_cache, v_cache))
+        outs[name] = wrapper.run_return_lse(q, (kc, vc))
     o_ref = _reference(q, k, v, qo_indptr, kv_indptr_tokens, causal)
 
+    torch.testing.assert_close(outs["fa3"][1], outs["fa3_16bit"][1], rtol=0, atol=0)
+    torch.testing.assert_close(outs["fa3"][0], outs["fa3_16bit"][0], rtol=0, atol=0)
     torch.testing.assert_close(outs["fa3"][1], outs["fa2"][1], **_lse_tol(q_dtype))
     torch.testing.assert_close(outs["fa3"][0], outs["fa2"][0], **_tol(q_dtype))
     torch.testing.assert_close(outs["fa3"][0].float(), o_ref, **_tol(q_dtype))
@@ -429,9 +437,11 @@ def test_fp8_kv_sliding_window_and_soft_cap(
         torch.testing.assert_close(outs["fa3"], outs["fa2"], **_tol(q_dtype))
 
 
-@pytest.mark.parametrize("paged", [False, True])
+# The ragged wrapper only applies k_scale / v_scale for an NVFP4 cache (issue #4979), so the
+# ragged path is not covered here.
+@pytest.mark.parametrize("mode", ["single", "paged"])
 @pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_fp8_kv_calibration_scale(paged, kv_dtype):
+def test_fp8_kv_calibration_scale(mode, kv_dtype):
     """k_scale / v_scale keep their fa2 semantics: fp8 attention over a scaled cache
     matches 16-bit attention over the unscaled one."""
     _skip_unless_sm90a()
@@ -463,7 +473,8 @@ def test_fp8_kv_calibration_scale(paged, kv_dtype):
         "f16": (k16, v16, {}),
         "fp8": (k8, v8, dict(k_scale=k_scale, v_scale=v_scale)),
     }.items():
-        if paged:
+        qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device="cuda")
+        if mode == "paged":
             k_cache, v_cache, kv_indptr, kv_indices, last_page_len = _paged_cache(
                 kk, vv, [0, kv_len], page_size, "NHD", gen
             )
@@ -471,7 +482,7 @@ def test_fp8_kv_calibration_scale(paged, kv_dtype):
                 _workspace(), "NHD", backend="fa3"
             )
             wrapper.plan(
-                torch.tensor([0, qo_len], dtype=torch.int32, device="cuda"),
+                qo_indptr,
                 kv_indptr,
                 kv_indices,
                 last_page_len,
@@ -484,6 +495,21 @@ def test_fp8_kv_calibration_scale(paged, kv_dtype):
                 kv_data_type=kk.dtype,
             )
             outs[name] = wrapper.run(q, (k_cache, v_cache), **scales)
+        elif mode == "ragged":
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                _workspace(), "NHD", backend="fa3"
+            )
+            wrapper.plan(
+                qo_indptr,
+                torch.tensor([0, kv_len], dtype=torch.int32, device="cuda"),
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                causal=True,
+                q_data_type=q_dtype,
+                kv_data_type=kk.dtype,
+            )
+            outs[name] = wrapper.run(q, kk, vv, **scales)
         else:
             outs[name] = flashinfer.single_prefill_with_kv_cache(
                 q, kk, vv, causal=True, backend="fa3", **scales
@@ -691,12 +717,14 @@ def test_fp8_kv_multi_item_scoring(page_size, num_qo_heads, q_dtype, kv_dtype):
     the consumer visits."""
     _skip_unless_sm90a()
     torch.manual_seed(0)
-    kv_len, qo_len, num_kv_heads, head_dim = 97, 81, 4, 128
+    # kv_len - qo_len - max_item_len = 50 gives a non-empty outside-items window, so the
+    # producer's tile cursor has to take the same jump the consumer takes.
+    kv_len, qo_len, num_kv_heads, head_dim = 1000, 900, 4, 128
     prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr = (
-        16,
-        list(range(80)) + [0],
-        97,
-        79,
+        100,
+        (list(range(50)) * 18)[:900] + [0],
+        1000,
+        50,
     )
     q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=q_dtype, device="cuda")
     num_pages = (kv_len + page_size - 1) // page_size
