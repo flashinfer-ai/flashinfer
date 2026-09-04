@@ -1467,6 +1467,77 @@ def test_moe_fp8_block_scaling(
         torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="DeepSeek FP8 block scaling requires Hopper",
+)
+def test_moe_fp8_block_scaling_tiny_fc1_output():
+    """Regression test for #2595: tiny FC1 outputs must stay finite and nonzero."""
+    num_tokens, hidden_size, intermediate_size = 4, 128, 128
+    num_experts, top_k = 2, 2
+
+    x = torch.ones(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    w31 = torch.ones(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.float32,
+        device="cuda",
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.ones(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.float32,
+        device="cuda",
+    ).to(torch.float8_e4m3fn)
+    selected_experts = torch.tensor(
+        [[0, 1]] * num_tokens, dtype=torch.int32, device="cuda"
+    )
+    routing_weights = torch.full(
+        (num_tokens, top_k), 0.5, dtype=torch.float32, device="cuda"
+    )
+    w31_scales = torch.full(
+        (num_experts, 2, 1), 1e-20, dtype=torch.float32, device="cuda"
+    )
+    w2_scales = torch.ones((num_experts, 1, 1), dtype=torch.float32, device="cuda")
+    w31_reference = w31.float() * w31_scales.repeat_interleave(128, dim=1)
+    w2_reference = w2.float() * w2_scales.repeat_interleave(128, dim=1)
+    reference = compute_with_experts(
+        num_experts,
+        x.float(),
+        w31_reference,
+        w2_reference,
+        selected_experts,
+        routing_weights,
+    )
+
+    output = torch.empty_like(x)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w31,
+        w2,
+        torch.bfloat16,
+        quant_scales=[w31_scales, w2_scales],
+        output=output,
+        use_deepseek_fp8_block_scale=True,
+        enable_pdl=False,
+    )
+
+    assert torch.isfinite(reference).all()
+    assert torch.count_nonzero(reference) == reference.numel()
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output) == output.numel()
+    torch.testing.assert_close(
+        output.float(),
+        reference,
+        rtol=1e-1,
+        atol=0,
+    )
+
+
 def quant_mxfp4_batches(a, num_experts):
     quant_a = []
     sfs = []
