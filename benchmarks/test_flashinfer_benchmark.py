@@ -437,9 +437,8 @@ def test_prims_ts_paged_context_adapter_contract(
     assert k_cache.stride() == v_cache.stride() == (2048, 2048, 128, 1)
     assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
     assert run_args[3].tolist() == [0, 2, 4]
-    assert run_args[4].tolist() == [0, 1, 2]
-    assert run_args[5].tolist() == [0, 1]
-    assert run_args[6].tolist() == [16, 16]
+    assert run_args[4].tolist() == [[0], [1]]
+    assert run_args[5].tolist() == [16, 16]
     # With deterministic identical Q/K/V input, all three dequantization
     # scales match. This relation proves both Q and K scales are folded into
     # softmax scale, while V is forwarded as the output scale.
@@ -591,15 +590,13 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
         runtime_q,
         runtime_kv_cache,
         runtime_seq_lens,
-        runtime_kv_indptr,
-        runtime_kv_indices,
+        runtime_block_tables,
     ) = run_args
     assert runtime_q.shape == (2, 3, 2, 128)
     assert runtime_kv_cache.shape == (2, 2, 1, 16, 128)
     assert runtime_kv_cache.is_contiguous()
     assert runtime_seq_lens.tolist() == [16, 16]
-    assert runtime_kv_indptr.tolist() == [0, 1, 2]
-    assert runtime_kv_indices.tolist() == [0, 1]
+    assert runtime_block_tables.tolist() == [[0], [1]]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128))
     assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == runtime_q.shape

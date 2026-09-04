@@ -196,6 +196,80 @@ def test_uses_explicit_seq_lens_instead_of_page_derived_lengths():
         delegate.plan.call_args.kwargs["seq_lens"], seq_lens.cpu().to(torch.int64)
     )
     torch.testing.assert_close(wrapper._kv_lens_buffer[:2], seq_lens)
+    assert wrapper._block_tables.tolist() == [[0, 1, -1], [2, 3, 4]]
+
+
+@requires_cuda
+def test_plan_converts_padded_csr_rows_from_their_actual_offsets():
+    """Explicit lengths may use only a prefix of each canonical CSR row."""
+
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    wrapper._prims_ts_wrapper = delegate
+    indptr = torch.tensor((0, 4, 8), dtype=torch.int32, device="cuda")
+    indices = torch.tensor(
+        (0, -101, -102, -103, 4, 5, -104, -105),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    last_page_len = torch.full((2,), PAGE_SIZE, dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor((16, 32), dtype=torch.int32, device="cuda")
+
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        PAGE_SIZE,
+        q_data_type=torch.bfloat16,
+        seq_lens=seq_lens,
+    )
+
+    assert wrapper._block_tables.tolist() == [[0, -1], [4, 5]]
+
+
+@requires_cuda
+def test_plan_retains_explicit_row_strided_block_table():
+    """An explicit native table remains the stable plan-owned run binding."""
+
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    wrapper._prims_ts_wrapper = delegate
+    backing = torch.full((2, 8), -101, dtype=torch.int32, device="cuda")
+    block_tables = backing[:, :4]
+    block_tables[0, :2] = torch.tensor((0, 1), dtype=torch.int32, device="cuda")
+    block_tables[1, :3] = torch.tensor((2, 3, 4), dtype=torch.int32, device="cuda")
+
+    wrapper.plan(
+        *_plan_args([32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+        block_tables=block_tables,
+    )
+
+    assert wrapper._block_tables is block_tables
+    assert wrapper._block_tables.stride() == (8, 1)
+
+
+@requires_cuda
+def test_run_forwards_fixed_table_to_native_delegate():
+    """The general wrapper never forwards CSR tensors to the native kernel."""
+
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    delegate.run.side_effect = lambda *_args, **kwargs: kwargs["out"]
+    wrapper._prims_ts_wrapper = delegate
+    wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
+    q = torch.empty((2, NUM_QO_HEADS, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    k_cache, v_cache = _make_cache([32, 48], torch.bfloat16, "cuda")
+
+    wrapper.run(q, (k_cache, v_cache))
+
+    native_args = delegate.run.call_args.args
+    assert len(native_args) == 4
+    assert native_args[2].data_ptr() == wrapper._kv_lens_buffer.data_ptr()
+    assert native_args[3] is wrapper._block_tables
 
 
 @requires_cuda

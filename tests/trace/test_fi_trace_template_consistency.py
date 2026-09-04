@@ -565,6 +565,16 @@ def test_attention_ts_trace_constraints_match_cache_axes():
                 assert "seq_len_q >= 2" in template.constraints
             assert "seq_len_q in (2, 4, 8)" not in template.constraints
             assert "max_seq_len <= 16384" not in template.constraints
+    for dispatch, static_bound in (
+        (prims_ts_decode_trace_dispatch, "max_seq_len"),
+        (prims_ts_decode_wrapper_trace_dispatch, "max_kv_len"),
+    ):
+        for template in dispatch.templates:
+            assert (
+                "max_pages_per_seq * page_size >= max(seq_lens)" in template.constraints
+            )
+            assert "min(seq_lens) >= 1" in template.constraints
+            assert f"max(seq_lens) <= {static_bound}" in template.constraints
     for dispatch in mla_dispatches:
         for template in dispatch.templates:
             assert ("kv_pad_dim == 1" in template.constraints) == (
@@ -703,6 +713,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         dtype=torch.int32,
     )
     kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    fmha_block_tables = kv_indices.reshape(batch_size, pages_per_request)
     last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
     workspace = torch.empty(4096, dtype=torch.uint8)
@@ -720,8 +731,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         "query": q,
         "kv_cache": (k_cache, v_cache),
         "workspace_buffer": workspace,
-        "paged_kv_indptr": kv_indptr,
-        "paged_kv_indices": kv_indices,
+        "block_tables": fmha_block_tables,
         "seq_lens": seq_lens,
         "max_seq_len": seq_len_k,
         "seq_len_q": seq_len_q,
@@ -748,8 +758,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             q=q,
             paged_kv_cache=(k_cache, v_cache),
             seq_lens=seq_lens,
-            paged_kv_indptr=kv_indptr,
-            paged_kv_indices=kv_indices,
+            block_tables=fmha_block_tables,
             validate=False,
         ),
     )
@@ -809,16 +818,12 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     )
     definitions = (*fmha_definitions, *mla_definitions)
     assert tuple(definition["name"] for definition in definitions) == expected_names
-    assert {
-        "paged_kv_indptr",
-        "paged_kv_indices",
-        "seq_lens",
-    } <= fmha_definitions[2]["inputs"].keys()
+    assert {"block_tables", "seq_lens"} <= fmha_definitions[2]["inputs"].keys()
     assert {"block_tables", "seq_lens"} <= mla_definitions[2]["inputs"].keys()
     for definition, required_metadata in (
         (
             fmha_definitions[2],
-            ("paged_kv_indptr", "paged_kv_indices", "seq_lens"),
+            ("block_tables", "seq_lens"),
         ),
         (mla_definitions[2], ("block_tables", "seq_lens")),
     ):
@@ -866,8 +871,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     )
     v_cache = torch.empty_like(k_cache)
     seq_lens = torch.full((batch_size,), page_size, dtype=torch.int32)
-    paged_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
-    paged_kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(batch_size, -1)
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
@@ -885,8 +889,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
         q=q,
         paged_kv_cache=(k_cache, v_cache),
         seq_lens=seq_lens,
-        paged_kv_indptr=paged_kv_indptr,
-        paged_kv_indices=paged_kv_indices,
+        block_tables=block_tables,
     )
 
     assert definition["name"] == (
@@ -926,14 +929,12 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
         ),
         "seq_lens": seq_lens,
-        "paged_kv_indptr": torch.tensor((0, 1, 3), dtype=torch.int32),
-        "paged_kv_indices": torch.tensor((0, 1, 2), dtype=torch.int32),
+        "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
         "qo_indptr": qo_indptr,
     }
     for missing_name in (
         "seq_lens",
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         "qo_indptr",
     ):
         incomplete_kwargs = dict(fmha_kwargs)
@@ -987,8 +988,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
         ),
         "seq_lens": seq_lens,
-        "paged_kv_indptr": torch.tensor((0, 1, 3), dtype=torch.int32),
-        "paged_kv_indices": torch.tensor((0, 1, 2), dtype=torch.int32),
+        "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
         "qo_indptr": qo_indptr,
     }
     fmha_base = {

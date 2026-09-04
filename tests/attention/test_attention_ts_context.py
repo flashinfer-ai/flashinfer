@@ -101,11 +101,10 @@ class _PagedContextCase:
 
 @dataclass(frozen=True)
 class _NativePagedMetadata:
-    """Per-run CSR metadata accepted directly by the context kernel."""
+    """Per-run fixed-table metadata accepted directly by the context kernel."""
 
     qo_indptr: torch.Tensor
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    block_tables: torch.Tensor
     seq_lens_kv: torch.Tensor
 
 
@@ -455,14 +454,34 @@ def _assert_context_correct(
 
 def _make_native_paged_metadata(
     case: _PagedContextCase,
+    *,
+    extra_page_columns: int = 0,
+    row_stride_multiplier: int = 1,
 ) -> _NativePagedMetadata:
-    """Pair test CSR storage with explicit logical K/V lengths."""
+    """Convert canonical test CSR storage to the native fixed table."""
 
     device = case.reference.q.device
+    page_offsets = tuple(int(value) for value in case.paged_kv_indptr.tolist())
+    page_ids = tuple(int(value) for value in case.paged_kv_indices.tolist())
+    page_counts = tuple(end - begin for begin, end in itertools.pairwise(page_offsets))
+    page_columns = max(page_counts) + extra_page_columns
+    row_stride = page_columns * row_stride_multiplier
+    backing = torch.full(
+        (len(page_counts), row_stride),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    block_tables = backing[:, :page_columns]
+    for batch_idx, (begin, end) in enumerate(itertools.pairwise(page_offsets)):
+        block_tables[batch_idx, : end - begin] = torch.tensor(
+            page_ids[begin:end],
+            dtype=torch.int32,
+            device=device,
+        )
     return _NativePagedMetadata(
         qo_indptr=case.qo_indptr,
-        paged_kv_indptr=case.paged_kv_indptr,
-        paged_kv_indices=case.paged_kv_indices,
+        block_tables=block_tables,
         seq_lens_kv=torch.tensor(
             case.reference.k_lengths,
             dtype=torch.int32,
@@ -492,13 +511,19 @@ def _plan_paged_wrapper(
     *,
     max_seq_len_q: Optional[int] = None,
     max_kv_len: Optional[int] = None,
+    extra_page_columns: int = 0,
+    row_stride_multiplier: int = 1,
 ) -> _NativePagedMetadata:
     """Compile a conservative paged plan and return its per-run metadata."""
 
     reference = case.reference
     max_seq_len_q = max(reference.q_lengths) if max_seq_len_q is None else max_seq_len_q
     max_kv_len = max(reference.k_lengths) if max_kv_len is None else max_kv_len
-    metadata = _make_native_paged_metadata(case)
+    metadata = _make_native_paged_metadata(
+        case,
+        extra_page_columns=extra_page_columns,
+        row_stride_multiplier=row_stride_multiplier,
+    )
     wrapper.plan(
         device=reference.q.device,
         batch_size=len(reference.q_lengths),
@@ -532,8 +557,7 @@ def _run_paged_wrapper(
         case.k_cache,
         case.v_cache,
         metadata.qo_indptr,
-        metadata.paged_kv_indptr,
-        metadata.paged_kv_indices,
+        metadata.block_tables,
         metadata.seq_lens_kv,
         out=out,
         validate=validate,
@@ -558,8 +582,7 @@ def _capture_context_graph(
             k,
             v,
             paged_metadata.qo_indptr,
-            paged_metadata.paged_kv_indptr,
-            paged_metadata.paged_kv_indices,
+            paged_metadata.block_tables,
             paged_metadata.seq_lens_kv,
             out=out,
             validate=False,
@@ -689,8 +712,7 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
         "k_cache",
         "v_cache",
         "qo_indptr",
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         "seq_lens_kv",
     )
     plan_owned_names = (
@@ -726,8 +748,7 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
                 arguments["k_cache"],
                 arguments["v_cache"],
                 arguments["qo_indptr"],
-                arguments["paged_kv_indptr"],
-                arguments["paged_kv_indices"],
+                arguments["block_tables"],
                 arguments["seq_lens_kv"],
                 out=out,
             )
@@ -853,8 +874,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "k_cache",
         "v_cache",
         "qo_indptr",
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         "seq_lens_kv",
         "out",
         "scale_softmax_log2",
@@ -869,10 +889,10 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
 
 
-def test_attention_ts_context_paged_one_shot_forwards_csr_to_wrapper(
+def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
     monkeypatch,
 ) -> None:
-    """The convenience API derives lengths but never materializes a dense table."""
+    """The convenience API adapts canonical CSR above the fixed native wrapper."""
 
     calls = {}
 
@@ -899,7 +919,10 @@ def test_attention_ts_context_paged_one_shot_forwards_csr_to_wrapper(
         q_dtype=torch.float16,
         output_dtype=torch.float16,
     )
-    metadata = context_module._PagedContextOneShotMetadata(seq_lens=(33, 65))
+    metadata = context_module._PagedContextOneShotMetadata(
+        seq_lens=(33, 65),
+        block_tables=((3, 1, -1), (7, 0, 2)),
+    )
     monkeypatch.setattr(
         context_module,
         "_resolve_paged_one_shot_inputs",
@@ -932,17 +955,55 @@ def test_attention_ts_context_paged_one_shot_forwards_csr_to_wrapper(
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
-    assert run_args[4] is paged_kv_indptr
-    assert run_args[5] is paged_kv_indices
-    torch.testing.assert_close(run_args[6], torch.tensor((33, 65), dtype=torch.int32))
+    torch.testing.assert_close(
+        run_args[4],
+        torch.tensor(((3, 1, -1), (7, 0, 2)), dtype=torch.int32),
+    )
+    torch.testing.assert_close(run_args[5], torch.tensor((33, 65), dtype=torch.int32))
     assert tuple(run_kwargs) == ("out",)
     assert run_kwargs["out"] is out
+
+
+def test_attention_ts_context_paged_one_shot_builds_rectangular_table(
+    monkeypatch,
+) -> None:
+    """Ragged canonical CSR rows are padded only in the compatibility layer."""
+
+    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
+    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
+    )
+    q = torch.empty((3, 4, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((5, 2, 32, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+
+    geometry, metadata = context_module._resolve_paged_one_shot_inputs(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr=torch.tensor((0, 1, 3), dtype=torch.int32),
+        paged_kv_indptr=torch.tensor((0, 1, 4), dtype=torch.int32),
+        paged_kv_indices=torch.tensor((4, 1, 3, 0), dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor((17, 1), dtype=torch.int32),
+        page_size=32,
+        mask_type="dense",
+        window_left=-1,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert geometry.max_kv_len == 65
+    assert metadata.seq_lens == (17, 65)
+    assert metadata.block_tables == ((4, -1, -1), (1, 3, 0))
 
 
 def test_attention_ts_context_paged_one_shot_ignores_aggregate_kv_extent(
     monkeypatch,
 ) -> None:
-    """Native CSR needs only per-request K/V lengths to fit in Int32."""
+    """One-shot CSR adaptation needs only per-request K/V Int32 extents."""
 
     batch_size = 17
     monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
@@ -979,7 +1040,51 @@ def test_attention_ts_context_paged_one_shot_ignores_aggregate_kv_extent(
 
     assert geometry.max_kv_len == 33
     assert metadata.seq_lens == (33,) * batch_size
+    assert metadata.block_tables == ((0, 1),) * batch_size
     assert sum(metadata.seq_lens) > context_module._CONTEXT_PADDED_EXTENT_MAX
+
+
+def test_attention_ts_context_paged_one_shot_bounds_rectangular_table(
+    monkeypatch,
+) -> None:
+    """Reject an oversized rectangular expansion before materializing it."""
+
+    batch_size = 17
+    monkeypatch.setattr(context_module, "_INT32_MAX", 33)
+    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
+    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
+    monkeypatch.setattr(
+        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
+    )
+
+    q = torch.empty((batch_size, 4, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((2, 4, 32, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
+    paged_kv_indptr = 2 * qo_indptr
+    paged_kv_indices = torch.tensor((0, 1) * batch_size, dtype=torch.int32)
+    paged_kv_last_page_len = torch.ones(batch_size, dtype=torch.int32)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="block_tables elements must fit in a signed int32",
+    ):
+        context_module._resolve_paged_one_shot_inputs(
+            q,
+            k_cache,
+            v_cache,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            page_size=32,
+            mask_type="dense",
+            window_left=-1,
+            output_dtype=torch.bfloat16,
+        )
 
 
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
@@ -1033,8 +1138,8 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     k_cache = torch.empty((6, 2, 32, 128), dtype=torch.float16)
     v_cache = torch.empty_like(k_cache)
     out = torch.empty_like(q)
-    first_metadata = tuple(torch.empty(1) for _ in range(4))
-    second_metadata = tuple(torch.empty(2) for _ in range(4))
+    first_metadata = tuple(torch.empty(1) for _ in range(3))
+    second_metadata = tuple(torch.empty(2) for _ in range(3))
 
     wrapper.run(
         q,
@@ -1062,11 +1167,11 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     assert launch_calls[1][5] is first_state.output_scale
     assert all(
         actual is expected
-        for actual, expected in zip(launch_calls[0][6:10], first_metadata, strict=True)
+        for actual, expected in zip(launch_calls[0][6:9], first_metadata, strict=True)
     )
     assert all(
         actual is expected
-        for actual, expected in zip(launch_calls[1][6:10], second_metadata, strict=True)
+        for actual, expected in zip(launch_calls[1][6:9], second_metadata, strict=True)
     )
     assert wrapper._plan_state is not None
     assert wrapper._plan_state.geometry.uniform_packed_lengths is False
@@ -1136,7 +1241,7 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
         compiled=lambda *args: launched.append(args),
         policy=(),
     )
-    inputs = tuple(torch.empty(1) for _ in range(7))
+    inputs = tuple(torch.empty(1) for _ in range(6))
     scale_softmax_log2 = torch.empty(1)
     output_scale = torch.empty(1)
 
@@ -1159,7 +1264,6 @@ def test_attention_ts_context_paged_run_keeps_lifecycle_check_without_validation
 
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called"):
         wrapper.run(
-            placeholder,
             placeholder,
             placeholder,
             placeholder,
@@ -1189,7 +1293,6 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
             placeholder,
             placeholder,
             placeholder,
-            placeholder,
             validate=1,
         )
 
@@ -1198,19 +1301,17 @@ def _validate_paged_metadata_on_cpu(
     monkeypatch,
     *,
     qo_indptr: tuple[int, ...] = (0, 2, 5),
-    paged_kv_indptr: tuple[int, ...] = (0, 3, 6),
-    paged_kv_indices: tuple[int, ...] = (0, 1, -1, 2, 3, -1),
+    block_tables: tuple[tuple[int, ...], ...] = (
+        (0, 1, -1),
+        (2, 3, -1),
+    ),
     seq_lens_kv: tuple[int, ...] = (33, 64),
     max_kv_len: int = 65,
+    row_stride_extra: int = 0,
 ) -> None:
     """Exercise metadata value checks without requiring a CUDA device."""
 
-    monkeypatch.setattr(
-        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
-    )
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
@@ -1219,10 +1320,23 @@ def _validate_paged_metadata_on_cpu(
         page_size=32,
         mask_type="causal",
     )
+    compact_block_tables = torch.tensor(block_tables, dtype=torch.int32)
+    if row_stride_extra:
+        backing = torch.full(
+            (
+                compact_block_tables.shape[0],
+                compact_block_tables.shape[1] + row_stride_extra,
+            ),
+            -123,
+            dtype=torch.int32,
+        )
+        backing[:, : compact_block_tables.shape[1]].copy_(compact_block_tables)
+        runtime_block_tables = backing[:, : compact_block_tables.shape[1]]
+    else:
+        runtime_block_tables = compact_block_tables
     context_module._validate_paged_runtime_metadata(
         torch.tensor(qo_indptr, dtype=torch.int32),
-        torch.tensor(paged_kv_indptr, dtype=torch.int32),
-        torch.tensor(paged_kv_indices, dtype=torch.int32),
+        runtime_block_tables,
         torch.tensor(seq_lens_kv, dtype=torch.int32),
         geometry,
         total_q=qo_indptr[-1],
@@ -1241,34 +1355,76 @@ def test_attention_ts_context_paged_validation_allows_arbitrary_padding_ids(
 def test_attention_ts_context_paged_validation_allows_fixed_stride_extra_padding(
     monkeypatch,
 ) -> None:
-    """CSR row width may exceed the page count implied by ``max_kv_len``."""
+    """Fixed table rows may have inactive columns and a larger storage stride."""
 
     _validate_paged_metadata_on_cpu(
         monkeypatch,
-        paged_kv_indptr=(0, 4, 8),
-        paged_kv_indices=(0, 1, -1, -1, 2, -1, -1, -1),
+        block_tables=((0, 1, -1, 91), (2, -1, 92, -1)),
         seq_lens_kv=(33, 32),
         max_kv_len=33,
+        row_stride_extra=4,
     )
+
+
+def test_attention_ts_context_paged_validation_enforces_row_strided_table(
+    monkeypatch,
+) -> None:
+    """The native table admits row padding but rejects overlapping rows."""
+
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+    backing = torch.zeros((2, 2, 3), dtype=torch.int32)
+    row_padded = backing[:, 0, :]
+    context_module._validate_block_tables_tensor(
+        row_padded,
+        device=torch.device("cpu"),
+        batch_size=2,
+        required_page_columns=3,
+    )
+    assert row_padded.stride() == (6, 1)
+
+    overlapping_rows = torch.as_strided(
+        torch.zeros(5, dtype=torch.int32),
+        size=(2, 3),
+        stride=(2, 1),
+    )
+    with pytest.raises(ValueError, match=r"stride\(0\) >= C"):
+        context_module._validate_block_tables_tensor(
+            overlapping_rows,
+            device=torch.device("cpu"),
+            batch_size=2,
+            required_page_columns=3,
+        )
+
+    nonunit_columns = torch.zeros((3, 2), dtype=torch.int32).transpose(0, 1)
+    with pytest.raises(ValueError, match=r"stride\(1\) == 1"):
+        context_module._validate_block_tables_tensor(
+            nonunit_columns,
+            device=torch.device("cpu"),
+            batch_size=2,
+            required_page_columns=3,
+        )
+
+    oversized_row_stride = torch.as_strided(
+        torch.zeros(3, dtype=torch.int32),
+        size=(1, 3),
+        stride=(context_module._INT32_MAX + 1, 1),
+    )
+    with pytest.raises(NotImplementedError, match="row stride must fit"):
+        context_module._validate_block_tables_tensor(
+            oversized_row_stride,
+            device=torch.device("cpu"),
+            batch_size=1,
+            required_page_columns=3,
+        )
 
 
 @pytest.mark.parametrize(
     ("overrides", "match"),
     (
         pytest.param(
-            {"paged_kv_indptr": (0, 0, 6)},
-            "strictly increasing",
-            id="empty-row",
-        ),
-        pytest.param(
-            {"paged_kv_indptr": (0, 1, 6)},
-            "needs 2, got 1",
-            id="short-row",
-        ),
-        pytest.param(
-            {"paged_kv_indptr": (0, 3, 5)},
-            "final paged_kv_indptr offset",
-            id="wrong-final-offset",
+            {"block_tables": ((0, 1), (2, 3))},
+            "at least ceil\\(max_kv_len / page_size\\)",
+            id="short-fixed-table",
         ),
         pytest.param(
             {"seq_lens_kv": (66, 64)},
@@ -1281,15 +1437,15 @@ def test_attention_ts_context_paged_validation_allows_fixed_stride_extra_padding
             id="causal-q-longer-than-kv",
         ),
         pytest.param(
-            {"paged_kv_indices": (4, 1, -1, 2, 3, -1)},
-            "active paged_kv_indices",
+            {"block_tables": ((4, 1, -1), (2, 3, -1))},
+            "active block_tables",
             id="active-page-out-of-range",
         ),
     ),
 )
-def test_attention_ts_context_paged_validation_rejects_unsafe_csr_values(
+def test_attention_ts_context_paged_validation_rejects_unsafe_fixed_values(
     monkeypatch,
-    overrides: dict[str, tuple[int, ...]],
+    overrides: dict[str, object],
     match: str,
 ) -> None:
     with pytest.raises(ValueError, match=match):
@@ -1370,7 +1526,6 @@ def test_attention_ts_context_run_requires_plan(wrapper_type):
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called"):
         if wrapper_type is BatchPrefillPagedTSWrapper:
             wrapper.run(
-                placeholder,
                 placeholder,
                 placeholder,
                 placeholder,
@@ -1706,8 +1861,8 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128,
-            g_paged_kv_indptr=None,
-            g_paged_kv_indices=None,
+            g_block_tables=None,
+            block_table_row_stride=0,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -1763,8 +1918,8 @@ def test_attention_ts_context_d256_runtime_paged_clc_uses_distinct_auxiliary_war
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128,
-            g_paged_kv_indptr=None,
-            g_paged_kv_indices=None,
+            g_block_tables=None,
+            block_table_row_stride=0,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -1847,8 +2002,8 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=128 if has_q_offset else 0,
-            g_paged_kv_indptr=None,
-            g_paged_kv_indices=None,
+            g_block_tables=None,
+            block_table_row_stride=0,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
@@ -2174,7 +2329,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
 
 
 def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypatch):
-    """Large static K/V capacity does not constrain small native-CSR rows."""
+    """Fixed-table plans bound each row, not aggregate batch K/V storage."""
 
     batch_size = 17
     monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
@@ -2206,17 +2361,11 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
         > context_module._CONTEXT_PADDED_EXTENT_MAX
     )
 
-    monkeypatch.setattr(
-        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
-    )
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
     runtime_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
     context_module._validate_paged_runtime_metadata(
         runtime_indptr,
-        runtime_indptr.clone(),
-        torch.zeros(batch_size, dtype=torch.int32),
+        torch.zeros((batch_size, 3), dtype=torch.int32),
         torch.ones(batch_size, dtype=torch.int32),
         geometry,
         total_q=batch_size,
@@ -2889,7 +3038,7 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
     head_dim: int,
     stages_page_offsets: bool,
 ) -> None:
-    """Both page-ID lookup paths ignore invalid fixed-stride CSR padding."""
+    """Both lookup paths ignore poisoned columns in a noncompact table."""
 
     case = _make_paged_context_case(
         q_lengths=(17, 17),
@@ -2902,39 +3051,24 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
         output_scale=1.0,
         seed=2026090303 + head_dim,
     )
-    active_indptr = case.paged_kv_indptr.tolist()
-    active_page_ids = case.paged_kv_indices.tolist()
-    fixed_stride = (
-        max(end - begin for begin, end in itertools.pairwise(active_indptr)) + 2
-    )
     invalid_page_id = int(case.k_cache.shape[0]) + 17
-    padded_page_ids = []
-    for begin, end in itertools.pairwise(active_indptr):
-        row = active_page_ids[begin:end]
-        padding = tuple(
-            (-1, invalid_page_id)[offset % 2]
-            for offset in range(fixed_stride - len(row))
-        )
-        padded_page_ids.extend((*row, *padding))
-        assert -1 in padding
-        assert invalid_page_id in padding
-
-    metadata = _NativePagedMetadata(
-        qo_indptr=case.qo_indptr,
-        paged_kv_indptr=torch.arange(
-            0,
-            (len(case.reference.k_lengths) + 1) * fixed_stride,
-            fixed_stride,
+    metadata = _make_native_paged_metadata(
+        case,
+        extra_page_columns=2,
+        row_stride_multiplier=2,
+    )
+    page_counts = tuple(
+        math.ceil(length / case.page_size) for length in case.reference.k_lengths
+    )
+    for batch_idx, page_count in enumerate(page_counts):
+        padding_count = metadata.block_tables.shape[1] - page_count
+        metadata.block_tables[batch_idx, page_count:] = torch.tensor(
+            tuple((-1, invalid_page_id)[offset % 2] for offset in range(padding_count)),
             dtype=torch.int32,
             device="cuda",
-        ),
-        paged_kv_indices=torch.tensor(
-            padded_page_ids, dtype=torch.int32, device="cuda"
-        ),
-        seq_lens_kv=torch.tensor(
-            case.reference.k_lengths, dtype=torch.int32, device="cuda"
-        ),
-    )
+        )
+    assert metadata.block_tables.stride(0) == 2 * metadata.block_tables.shape[1]
+    assert metadata.block_tables.stride(1) == 1
     wrapper = BatchPrefillPagedTSWrapper()
     _plan_paged_wrapper(wrapper, case)
 
@@ -3309,11 +3443,11 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
         pytest.param(256, (1057, 1025), id="d256-staged-page-window"),
     ),
 )
-def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
+def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     head_dim: int,
     plan_k_lengths: tuple[int, int],
 ) -> None:
-    """Captured runs reload CSR rows, page IDs, and K/V lengths in place."""
+    """Captured runs reload noncompact page-table rows and lengths in place."""
 
     case = _make_paged_context_case(
         q_lengths=(17, 17),
@@ -3327,7 +3461,12 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
         seed=2026090302 + head_dim,
     )
     wrapper = BatchPrefillPagedTSWrapper()
-    metadata = _plan_paged_wrapper(wrapper, case)
+    metadata = _plan_paged_wrapper(
+        wrapper,
+        case,
+        extra_page_columns=1,
+        row_stride_multiplier=2,
+    )
     assert wrapper._plan_state is not None
     assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
@@ -3359,11 +3498,11 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
     metadata_ptrs = tuple(
         tensor.data_ptr()
         for tensor in (
-            metadata.paged_kv_indptr,
-            metadata.paged_kv_indices,
+            metadata.block_tables,
             metadata.seq_lens_kv,
         )
     )
+    metadata_stride = metadata.block_tables.stride()
 
     runtime_k_lengths = tuple(reversed(plan_k_lengths))
     runtime_page_counts = tuple(
@@ -3371,26 +3510,25 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
     )
     runtime_page_indptr = _cumulative(runtime_page_counts)
     runtime_page_indices = tuple(range(1, runtime_page_indptr[-1] + 1))
-    assert runtime_page_indptr[-1] == metadata.paged_kv_indices.numel()
+    runtime_block_tables = torch.full_like(metadata.block_tables, -911)
+    for batch_idx, (begin, end) in enumerate(itertools.pairwise(runtime_page_indptr)):
+        runtime_block_tables[batch_idx, : end - begin] = torch.tensor(
+            runtime_page_indices[begin:end], dtype=torch.int32, device="cuda"
+        )
     if head_dim == 256:
         assert max(runtime_page_counts) > cfg.page_table_window_entries
-    metadata.paged_kv_indptr.copy_(
-        torch.tensor(runtime_page_indptr, dtype=torch.int32, device="cuda")
-    )
-    metadata.paged_kv_indices.copy_(
-        torch.tensor(runtime_page_indices, dtype=torch.int32, device="cuda")
-    )
+    metadata.block_tables.copy_(runtime_block_tables)
     metadata.seq_lens_kv.copy_(
         torch.tensor(runtime_k_lengths, dtype=torch.int32, device="cuda")
     )
     assert metadata_ptrs == tuple(
         tensor.data_ptr()
         for tensor in (
-            metadata.paged_kv_indptr,
-            metadata.paged_kv_indices,
+            metadata.block_tables,
             metadata.seq_lens_kv,
         )
     )
+    assert metadata.block_tables.stride() == metadata_stride
 
     def gather_logical_cache(cache: torch.Tensor) -> torch.Tensor:
         requests = []
@@ -3430,8 +3568,8 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_csr_metadata(
         case.k_cache,
         case.v_cache,
         metadata.qo_indptr,
-        metadata.paged_kv_indptr,
-        metadata.paged_kv_indices,
+        torch.tensor(runtime_page_indptr, dtype=torch.int32, device="cuda"),
+        torch.tensor(runtime_page_indices, dtype=torch.int32, device="cuda"),
         last_page_len,
         page_size=case.page_size,
         mask_type=case.reference.mask_type,
@@ -3650,8 +3788,7 @@ def test_attention_ts_context_runtime_q_offsets_expand_causal_domain_on_graph_re
             k,
             v,
             paged_metadata.qo_indptr,
-            paged_metadata.paged_kv_indptr,
-            paged_metadata.paged_kv_indices,
+            paged_metadata.block_tables,
             paged_metadata.seq_lens_kv,
             out=direct_out,
         )

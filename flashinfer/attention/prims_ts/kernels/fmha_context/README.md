@@ -40,9 +40,9 @@ fixed offsets into the specialization.
 `BatchPrefillPagedTSWrapper` uses a static-spec lifecycle. `plan()` receives
 only device, capacity, head, dtype, page, mask, and scale information and may
 compile; it does not bind Q, cache, or request metadata and allocates no
-workspace. Every `run()` supplies Q, K/V cache, Q offsets, CSR page-table
-offsets and indices, and per-run K/V lengths. Runtime structural validation
-is enabled by default and reads request metadata back to the host, which may
+workspace. Every `run()` supplies Q, K/V cache, Q offsets, fixed page-table
+rows, and per-run K/V lengths. Runtime structural validation is enabled by
+default and reads request metadata back to the host, which may
 synchronize. `validate=False` skips those checks and host readback for a
 previously validated steady-state or CUDA Graph launch; the caller then owns
 every value, bounds, aliasing, and lifetime precondition.
@@ -97,14 +97,15 @@ Paged inputs:
 
 - Q/O: `[total_q, Hq, D]`.
 - Separate K and V pools: `[num_pages, Hkv, page_size, D]`.
-- Reusable-wrapper metadata: `qo_indptr[B + 1]`,
-  `paged_kv_indptr[B + 1]`, `paged_kv_indices[num_page_indices]`, and
+- Reusable-wrapper metadata: `qo_indptr[B + 1]`, `block_tables[B, C]`, and
   `seq_lens_kv[B]`, all CUDA `int32`.
-- CSR rows may be compact or fixed-stride/padded. Request `b` owns the entries
-  in `[paged_kv_indptr[b], paged_kv_indptr[b + 1])` and must provide at least
-  `ceil(seq_lens_kv[b] / page_size)` entries. `seq_lens_kv` defines the active
-  pages and partial tail; additional row capacity is outside the logical
-  sequence. K and V pools use the same physical page IDs.
+- `block_tables` has unit column stride and a row stride at least `C`; compact
+  `[B, C]` storage and padded views such as `[B, 2, C][:, 0, :]` are both
+  accepted. `C` must be at least `ceil(max_kv_len / page_size)`.
+  `seq_lens_kv` defines each row's active prefix and partial tail. Entries
+  after `ceil(seq_lens_kv[b] / page_size)` are padding and are never
+  dereferenced, so they need not contain valid page IDs. K and V pools use the
+  same physical page IDs.
 - The one-shot API continues to accept FlashInfer CSR metadata:
   `qo_indptr[B + 1]`, `paged_kv_indptr[B + 1]`,
   `paged_kv_indices[num_used_pages]`, and `paged_kv_last_page_len[B]`.
@@ -113,9 +114,9 @@ Paged inputs:
 Every cumulative-offset vector starts at zero and increases strictly.
 `qo_indptr[-1]` equals `total_q`; every per-run length is positive and no
 greater than `max_kv_len`; and every page ID selected for an active page
-indexes the physical cache. `paged_kv_indptr[-1]` equals the number of
-page-index entries. For the one-shot CSR API, each last-page length is in
-`[1, page_size]`.
+indexes the physical cache. For the one-shot CSR API,
+`paged_kv_indptr[-1]` equals the number of page-index entries and each
+last-page length is in `[1, page_size]`.
 
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
@@ -147,21 +148,22 @@ equals the same 128-row-aligned maximum, the replay conditions preserve that
 specialization.
 
 Paged wrapper planning fixes only static capacities and compile-time semantics.
-Each run may provide different valid Q offsets, CSR rows, K/V lengths, and
-physical page IDs without another plan. The batch remains exact; Q deltas stay
-positive and within `max_seq_len_q`, K/V lengths stay within `max_kv_len`, and
-the final Q offset matches the packed Q/O extent. For causal attention, every
-per-run `Sq[b]` is no greater than `Sk[b]`. The kernel derives the
-request-local causal offset and active page range from per-run metadata.
+Each run may provide different valid Q offsets, block-table rows, K/V lengths,
+and physical page IDs without another plan. The batch remains exact; Q deltas
+stay positive and within `max_seq_len_q`, K/V lengths stay within
+`max_kv_len`, and the final Q offset matches the packed Q/O extent. For causal
+attention, every per-run `Sq[b]` is no greater than `Sk[b]`. The kernel derives
+the request-local causal offset and active page range from per-run metadata.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
-dtypes, devices, scales, output, aliasing, CSR offsets, sequence lengths, and
-active page IDs. Those metadata checks read device values back to the host and
-may synchronize. `validate=False` skips validation and host readback; callers
-using that path must enforce the complete contract because invalid offsets,
+dtypes, devices, scales, output, aliasing, page-table strides, sequence
+lengths, and active page IDs. Those metadata checks read device values back to
+the host and may synchronize. `validate=False` skips validation and host
+readback; callers using that path must enforce the complete contract because
+invalid offsets,
 lengths, or page IDs can produce incorrect results or out-of-bounds access.
-CUDA Graph capture requires `validate=False` plus stable tensor shapes and
-addresses, although values may change between completed replays.
+CUDA Graph capture requires `validate=False` plus stable tensor shapes,
+strides, and addresses, although values may change between completed replays.
 
 ## Dataflow and source map
 
@@ -232,8 +234,9 @@ k_cache = torch.randn(
 )
 v_cache = torch.randn_like(k_cache)
 qo_indptr = torch.tensor((0, 32, 80), device=device, dtype=torch.int32)
-paged_kv_indptr = torch.tensor((0, 2, 5), device=device, dtype=torch.int32)
-paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
+block_tables = torch.tensor(
+    ((0, 1, -1), (2, 3, 4)), device=device, dtype=torch.int32
+)
 seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
 wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
@@ -256,8 +259,7 @@ out = wrapper.run(
     k_cache,
     v_cache,
     qo_indptr,
-    paged_kv_indptr,
-    paged_kv_indices,
+    block_tables,
     seq_lens_kv,
 )
 assert out.shape == q.shape
@@ -265,8 +267,8 @@ assert out.shape == q.shape
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
-run-time tensor at a stable address, and pass a preallocated, non-overlapping
-`out`.
+run-time tensor shape, stride, and address stable, and pass a preallocated,
+non-overlapping `out`.
 
 ## Limitations
 

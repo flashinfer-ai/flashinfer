@@ -24,7 +24,7 @@ the backend column indicates which kernel the API wraps.
 | ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
 | ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
 | ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
-| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
+| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | block tables + seq/qo   | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
 | ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
@@ -951,8 +951,9 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
         "workspace_size": Var(description="Caller workspace size in bytes."),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
         "max_seq_len": Const(
             abbrev="s", description="Exact compiled maximum KV sequence length."
@@ -971,8 +972,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
                 dtype="uint8",
                 description="Exclusive caller-owned int8/uint8 scratch buffer.",
             ),
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+            "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
             "seq_lens": Tensor(["batch_size"], dtype="int32"),
             "max_seq_len": Scalar("int32"),
             "seq_len_q": Scalar("int32", optional=True),
@@ -991,7 +991,9 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        "max_pages_per_seq * page_size >= max(seq_lens)",
+        "min(seq_lens) >= 1",
+        "max(seq_lens) <= max_seq_len",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "kv_layout == 'HND'",
@@ -1015,7 +1017,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         op_type="gqa_paged",
         name_prefix=f"prims_ts_batch_decode_{cache_form}{output_suffix}{q_suffix}",
         description=(
-            "Standalone PrimTS GQA decode over FlashInfer native CSR page "
+            "Standalone PrimTS GQA decode over a fixed row-strided page "
             f"metadata using the {cache_form} HND cache form and caller-owned "
             "workspace. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses "
             "[total_q,Hq,D] with cumulative qo_indptr offsets."
@@ -1111,8 +1113,9 @@ def _make_prims_ts_decode_wrapper_trace(
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_indptr": Var(description="Length of the per-run native CSR indptr."),
-        "num_kv_indices": Var(description="Number of active page IDs."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
@@ -1121,15 +1124,12 @@ def _make_prims_ts_decode_wrapper_trace(
     )
     inputs.update(
         {
-            "paged_kv_indptr": Tensor(
-                ["len_indptr"],
+            "block_tables": Tensor(
+                ["batch_size", "max_pages_per_seq"],
                 dtype="int32",
-                description="Required native CSR offsets supplied to run().",
-            ),
-            "paged_kv_indices": Tensor(
-                ["num_kv_indices"],
-                dtype="int32",
-                description="Required physical page IDs supplied to run().",
+                description=(
+                    "Required fixed row-strided physical page table supplied to run()."
+                ),
             ),
             "seq_lens": Tensor(
                 ["batch_size"],
@@ -1156,7 +1156,9 @@ def _make_prims_ts_decode_wrapper_trace(
         "page_size in (16, 32, 64, 128)",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
-        "len_indptr == batch_size + 1",
+        "max_pages_per_seq * page_size >= max(seq_lens)",
+        "min(seq_lens) >= 1",
+        "max(seq_lens) <= max_kv_len",
         *(
             [
                 "len_qo_indptr == batch_size + 1",
@@ -1177,8 +1179,9 @@ def _make_prims_ts_decode_wrapper_trace(
         ),
         description=(
             "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, "
-            "static bounds, and exact batch size. Every run supplies native "
-            "CSR metadata and K/V lengths; packed-Q runs also supply Q offsets."
+            "static bounds, and exact batch size. Every run supplies a fixed "
+            "row-strided page table and K/V lengths; packed-Q runs also supply "
+            "Q offsets."
         ),
         axes=axes,
         inputs=inputs,
@@ -1279,8 +1282,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         raise RuntimeError("plan() must be called before run()")
     required_metadata = (
         "seq_lens",
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         *(("qo_indptr",) if bool(state.use_packed_q) else ()),
     )
     _require_bound_trace_tensors(

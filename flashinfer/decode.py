@@ -1,5 +1,5 @@
 """
-Copyright (c) 2023 by FlashInfer team.
+Copyright (c) 2023-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -1375,7 +1375,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor]
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         block_tables: Optional[torch.Tensor]
-            A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
+            A 2D block table with shape
+            ``[batch_size, max_num_blocks_per_seq]``. For ``prims-ts`` this is
+            an int32 CUDA tensor with unit inner stride and row stride at least
+            the column count. It is retained as the stable native run binding;
+            when omitted, the canonical CSR inputs are converted during
+            planning. Other backends retain their existing dtype and layout
+            requirements.
         fixed_split_size : Optional[int],
             The fixed split size for FA2 split-kv decode, in pages. Only supported by tensor core decode for now.
             Recommend setting to the average sequence length of your workload.
@@ -1587,7 +1593,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
-        self._block_tables: Optional[torch.Tensor] = block_tables
+        next_block_tables: Optional[torch.Tensor] = block_tables
+        if self._backend != "prims-ts":
+            self._block_tables = block_tables
         self._max_kv_len: Optional[int] = None
 
         if seq_lens is None:
@@ -1772,6 +1780,36 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 next_kv_lens_buffer = torch.empty(
                     (required_size,), dtype=torch.int32, device=self.device
                 )
+            from .attention.prims_ts.decode import (
+                _csr_to_block_tables,
+                _validate_block_table_metadata,
+            )
+
+            if next_block_tables is None:
+                indptr_values = tuple(int(value) for value in indptr_host.tolist())
+                seq_len_values = tuple(
+                    int(value) for value in kv_lens_arr_host.tolist()
+                )
+                next_block_tables = _csr_to_block_tables(
+                    self._paged_kv_indices_buf[: len(indices)],
+                    indptr_values,
+                    seq_len_values,
+                    page_size=page_size,
+                )
+            _validate_block_table_metadata(
+                next_block_tables,
+                next_kv_lens_buffer[:required_size],
+            )
+            required_page_capacity = max(
+                (int(seq_len) + page_size - 1) // page_size
+                for seq_len in kv_lens_arr_host
+            )
+            if int(next_block_tables.shape[1]) < required_page_capacity:
+                raise ValueError(
+                    "prims-ts block_tables does not have enough columns for "
+                    f"the planned sequence lengths: need {required_page_capacity}, "
+                    f"got {next_block_tables.shape[1]}"
+                )
             self._prims_ts_wrapper.plan(
                 self.device,
                 batch_size,
@@ -1794,6 +1832,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             self._kv_lens_buffer = next_kv_lens_buffer
+            self._block_tables = next_block_tables
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
@@ -2389,8 +2428,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 q,
                 (k_cache, v_cache),
                 self._kv_lens_buffer[:actual_batch_size],
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
+                self._block_tables,
                 qo_indptr=(self._qo_indptr_buf if q_len_per_req > 1 else None),
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0 if v_scale is None else float(v_scale),
