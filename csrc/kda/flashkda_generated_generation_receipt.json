@@ -37,7 +37,6 @@
     "status": "passed"
   },
   "dispatcher_contract_sha256": "0d26bf6cbb06e8da0f5dc6644e165f6373c68645f513345c3f61c010fa0852c9",
-  "expected_jit_macros_sha256": "190af213f6f96f3709f7e7aa8276cb9badb6f286012a135fd7444f6dd308a29b",
   "generator_sha256": "98311c9a0e88a1905525638e0cc1ad2ce4a6b399d313541af9b033b1f4acefee",
   "input_audit_sha256": "bbcfde3c8b06d49c5a19522dc6ebd607fc675d5767099310c4431d4bc2b27a21",
   "input_completeness": "passed",
@@ -47,7 +46,7 @@
   "launch_contract_schema_version": 2,
   "launch_contracts_sha256": "dbcae79fcb1e4f0467890768bbba091938e34fbf3d4b651a3fe9736c9f28b396",
   "materialized_context_module_count": 0,
-  "metadata_file_count": 3,
+  "metadata_file_count": 2,
   "optimization_level_one_absent": true,
   "physical_selector_collision_count": 0,
   "physical_selector_count": 106,
@@ -65,7 +64,7 @@
   "source_closure_status": "passed",
   "source_closure_table_sha256": "acb8b125667250b7374b9cb098862db674842c00edf66a46774ea18da54de69d",
   "status": "passed",
-  "total_file_count": 177,
+  "total_file_count": 176,
   "unique_body_count": 59,
   "variant_count": 104,
   "variant_metadata_sha256": "0670bf11abe45d87641fa94f885507a23d74d8f103db8f092c2debb788d9392c"
