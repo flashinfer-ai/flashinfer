@@ -430,7 +430,6 @@ def _distributed_moe_config(
         RoutingConfig,
     )
 
-    per_token_scale = args.use_per_token_activation and variant.use_nvfp4_activations
     return MoEConfig(
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
@@ -438,7 +437,9 @@ def _distributed_moe_config(
             activation=(
                 QuantFormat.NVFP4 if variant.use_nvfp4_activations else QuantFormat.BF16
             ),
-            per_token_scale=per_token_scale,
+            per_token_scale=(
+                args.use_per_token_activation and variant.use_nvfp4_activations
+            ),
         ),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,

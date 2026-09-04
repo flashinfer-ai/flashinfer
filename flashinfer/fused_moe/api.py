@@ -335,6 +335,13 @@ class QuantConfig:
         SM90). Pass ``w4a16_weight=QuantFormat.NVFP4`` for CuTe-DSL / b12x.
         """
         if variant is QuantVariant.W4A16:
+            warnings.warn(
+                "QuantConfig.from_variant(QuantVariant.W4A16) is deprecated; pass "
+                "weight=QuantFormat.MXFP4 or QuantFormat.NVFP4 with "
+                "activation=QuantFormat.BF16 instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             if w4a16_weight not in (QuantFormat.MXFP4, QuantFormat.NVFP4):
                 raise ValueError(
                     "w4a16_weight must be QuantFormat.MXFP4 or QuantFormat.NVFP4, "

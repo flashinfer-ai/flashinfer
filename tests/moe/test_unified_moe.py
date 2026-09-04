@@ -580,6 +580,10 @@ class TestQuantConfig:
     def test_variant_emits_deprecation_warning(self):
         with pytest.warns(DeprecationWarning, match="deprecated"):
             QuantConfig(variant=QuantVariant.NVFP4)
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            QuantConfig.from_variant(QuantVariant.NVFP4)
+        with pytest.warns(DeprecationWarning, match="from_variant"):
+            QuantConfig.from_variant(QuantVariant.W4A16, w4a16_weight=QuantFormat.NVFP4)
 
     def test_replace_on_w4a16_pair_and_pair_change(self):
         w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
