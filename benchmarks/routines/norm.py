@@ -31,6 +31,17 @@ from .flashinfer_benchmark_utils import (
 )
 
 
+def _fp8_refcheck_rtol(out_dtype: torch.dtype) -> float:
+    """Tolerate one fp8 ULP (12.5% e4m3 / 25% e5m2), which a fixed rtol=1e-1 cannot."""
+    mantissa_bits = {
+        torch.float8_e4m3fn: 3,
+        torch.float8_e5m2: 2,
+    }.get(out_dtype)
+    if mantissa_bits is None:
+        return 1e-1
+    return 2.0**-mantissa_bits * 1.05
+
+
 def run_norm_test(args):
     """
     Run a norm test.
@@ -968,7 +979,12 @@ def testRmsnormQuant(args):
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                ) = is_close_stats(
+                    ref_float,
+                    out_float,
+                    rtol=_fp8_refcheck_rtol(out_dtype),
+                    atol=1e-1,
+                )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
@@ -1159,7 +1175,12 @@ def testLayernormQuant(args):
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                ) = is_close_stats(
+                    ref_float,
+                    out_float,
+                    rtol=_fp8_refcheck_rtol(out_dtype),
+                    atol=1e-1,
+                )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
@@ -1361,7 +1382,12 @@ def testFusedAddRmsnormQuant(args):
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                ) = is_close_stats(
+                    ref_float,
+                    out_float,
+                    rtol=_fp8_refcheck_rtol(out_dtype),
+                    atol=1e-1,
+                )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
@@ -1935,6 +1961,7 @@ def testFusedDitLayernorm(args):
     hidden_dim = 3072
     eps = args.eps
     mode = args.dit_mode
+    is_cuda_graph_compatible = not args.no_cuda_graph
 
     torch.manual_seed(42)
     input_t = torch.randn(
@@ -1969,7 +1996,7 @@ def testFusedDitLayernorm(args):
 
     if mode == "gate_residual_gamma_beta":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_gamma_beta(
                 input_t,
                 residual,
@@ -1980,14 +2007,14 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (gate.float() + gate_bias.float())
             n = torch.layer_norm(r, [hidden_dim], weight=gamma, bias=beta, eps=eps)
             return r.to(torch.bfloat16), n.to(torch.bfloat16)
 
     elif mode == "gate_residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_scale_shift(
                 input_t,
                 residual,
@@ -2000,7 +2027,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (
                 c_gate.float() + c_gate_bias.float()
             )
@@ -2012,7 +2039,7 @@ def testFusedDitLayernorm(args):
 
     elif mode == "residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_residual_layernorm_scale_shift(
                 input_t,
                 c_scale,
@@ -2023,7 +2050,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float()
             n = torch.layer_norm(r, [hidden_dim], eps=eps)
             n = n * (1 + c_scale.float() + c_scale_bias.float()) + (
@@ -2036,10 +2063,20 @@ def testFusedDitLayernorm(args):
 
     # Warmup + benchmark
     fused_times = bench_gpu_time(
-        fused_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        fused_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
     eager_times = bench_gpu_time(
-        eager_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        eager_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
 
     fused_ms = float(np.median(fused_times))
@@ -2047,8 +2084,8 @@ def testFusedDitLayernorm(args):
 
     # Reference check
     if args.refcheck:
-        r_fused, n_fused = fused_fn()
-        r_eager, n_eager = eager_fn()
+        r_fused, n_fused = fused_fn(input_t, residual)
+        r_eager, n_eager = eager_fn(input_t, residual)
         torch.testing.assert_close(
             r_fused.float(), r_eager.float(), rtol=1.6e-2, atol=1e-5
         )
@@ -2163,7 +2200,7 @@ def testFusedQkRmsnormRope(args):
         is_qk_norm=True,
     )
 
-    def run_fused():
+    def run_fused(qkv=qkv):
         return fused_qk_rmsnorm_rope(qkv, q_weight, k_weight, **kwargs)
 
     # Reference check
@@ -2200,6 +2237,7 @@ def testFusedQkRmsnormRope(args):
         repeat_iters=args.num_iters,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(qkv,),
     )
 
     if len(backend_times) > 0:
