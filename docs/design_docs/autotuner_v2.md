@@ -238,8 +238,8 @@ Neither justifies permanent coexistence, which is what section 5 exists to preve
 **The problem this section addresses**: `autotune_v2` is a version number in a public symbol
 name. If graduation is left implicit, the number becomes permanent API surface and the next
 iteration is structurally forced to be `autotune_v3`. That outcome arrives by inertia unless the
-end state is written down *before* downstream code adopts the name — and
-`framework_patches/vllm_autotune_v2.patch` in #3861 asks vLLM to adopt it by name now.
+end state is written down *before* downstream code adopts the name — and the vLLM migration
+draft posted on #3861 asks vLLM to adopt it by name now.
 
 ### 4.1 End state
 
