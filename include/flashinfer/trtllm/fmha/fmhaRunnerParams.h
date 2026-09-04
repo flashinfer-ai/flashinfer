@@ -454,9 +454,8 @@ struct TllmGenSelectKernelParams {
         mHeadDimPerCtaV(params.mHeadDimV)
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         ,
-        mMultiCtasKvMode((params.mMultiCtasKvMode && !params.mFusesDsv4InvRopeFp8Quant)
-                             ? MultiCtasKvMode::GmemReduction
-                             : MultiCtasKvMode::Disabled),
+        mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction
+                                                 : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
@@ -467,8 +466,7 @@ struct TllmGenSelectKernelParams {
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
         mFusesDsv4InvRopeFp8Quant(params.mFusesDsv4InvRopeFp8Quant),
-        mTileScheduler(params.mFusesDsv4InvRopeFp8Quant ? TileScheduler::Persistent
-                                                        : params.mTileScheduler),
+        mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),

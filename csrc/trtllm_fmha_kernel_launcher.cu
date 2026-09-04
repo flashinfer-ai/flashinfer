@@ -377,14 +377,6 @@ void trtllm_paged_attention_launcher(
   runner_params.mUsesSpcompress = uses_spcompress;
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
-  if (!foundKernels && runner_params.mFusesDsv4InvRopeFp8Quant) {
-    // If the normal sparse-MLA heuristic has no matching fused cubin, run its BF16 split-KV
-    // carrier and let the separate reduction kernel apply the same output epilogue.
-    fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type,
-                                              Data_type::DATA_TYPE_BF16);
-    runner_params.mFusesDsv4InvRopeFp8Quant = false;
-    std::tie(foundKernels, kinfo) = fmha_runner->isSupportedWithInfo(runner_params);
-  }
   if (!foundKernels) {
     std::ostringstream err_msg;
     err_msg << "Missing TRTLLM-GEN kernel ("

@@ -1218,28 +1218,6 @@ def test_dsv4_rope_quant_output_layout(num_tokens):
         (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
     )
     assert torch.all(scale_storage[..., num_tokens:] == 0)
-    mla_core._check_dsv4_rope_quant_outputs(
-        out,
-        out_scale,
-        num_tokens=num_tokens,
-        num_heads=128,
-        device=torch.device("cpu"),
-    )
-
-
-def test_dsv4_rope_quant_rejects_contiguous_output_layout():
-    out = torch.empty((3, 16, 4096), dtype=torch.float8_e4m3fn)
-    _, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
-        3, 128, torch.device("cpu")
-    )
-    with pytest.raises(ValueError, match="group-major strides"):
-        mla_core._check_dsv4_rope_quant_outputs(
-            out,
-            out_scale,
-            num_tokens=3,
-            num_heads=128,
-            device=torch.device("cpu"),
-        )
 
 
 def test_dsv4_output_scale_does_not_enable_rope_quant(monkeypatch):
@@ -1252,50 +1230,6 @@ def test_dsv4_output_scale_does_not_enable_rope_quant(monkeypatch):
             backend="trtllm-gen",
             dsv4_output_scale=torch.empty((1, 16, 8), dtype=torch.int32),
         )
-
-
-def _dsv4_rope_quant_cpu_inputs(num_tokens=3, cache_rows=4):
-    out, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
-        num_tokens, 128, torch.device("cpu")
-    )
-    return {
-        "query": torch.empty((1, num_tokens, 128, 512), dtype=torch.float8_e4m3fn),
-        "swa_kv_cache": torch.empty((1, 1, 128, 512), dtype=torch.float8_e4m3fn),
-        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
-        "sparse_indices": torch.zeros((num_tokens, 128), dtype=torch.int32),
-        "compressed_kv_cache": torch.empty((1, 1, 1, 512), dtype=torch.float8_e4m3fn),
-        "sparse_topk_lens": torch.full((num_tokens,), 128, dtype=torch.int32),
-        "seq_lens": torch.tensor([num_tokens + 1], dtype=torch.int32),
-        "out": out,
-        "backend": "trtllm-gen",
-        "enable_pdl": False,
-        "dsv4_inv_rope_cos_sin_cache": torch.empty(
-            (cache_rows, 64), dtype=torch.float32
-        ),
-        "dsv4_output_scale": out_scale,
-    }
-
-
-def test_dsv4_rope_quant_validates_cos_sin_cache_bounds(monkeypatch):
-    args = _dsv4_rope_quant_cpu_inputs(cache_rows=3)
-    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(mla_core, "_validate_dsv4_sync_checks", lambda _device: True)
-    with pytest.raises(ValueError, match="does not cover all derived query positions"):
-        trtllm_batch_decode_sparse_mla_dsv4(**args)
-
-
-def test_dsv4_rope_quant_validates_zero_scale_padding(monkeypatch):
-    args = _dsv4_rope_quant_cpu_inputs()
-    out_scale = args["dsv4_output_scale"]
-    scale_buf_m = out_scale.stride(2)
-    scale_storage = out_scale.as_strided(
-        (16, 8, scale_buf_m), (8 * scale_buf_m, scale_buf_m, 1)
-    )
-    scale_storage[..., 3:].fill_(1)
-    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(mla_core, "_validate_dsv4_sync_checks", lambda _device: True)
-    with pytest.raises(ValueError, match="padded token rows must be zero-initialized"):
-        trtllm_batch_decode_sparse_mla_dsv4(**args)
 
 
 def _unpack_ue8m0_scales(packed: torch.Tensor) -> torch.Tensor:
@@ -1321,7 +1255,7 @@ def _inverse_rope_reference(
     return reference
 
 
-# q=1 batches 1/4/8 cover reduction spans 128/256/512; batch 16 and q>1 use the fused cubin.
+# Cover the fixed 128-head fused schedule across decode shapes, top-k values, and varlen input.
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("batch_size", "q_len", "topk", "is_varlen"),
@@ -1470,8 +1404,6 @@ def test_trtllm_gen_dsv4_rope_quant_correctness(batch_size, q_len, topk, is_varl
     # boundary may therefore select either neighboring exponent.
     assert torch.all((torch.log2(scales) - torch.log2(reference_scales)).abs() <= 1)
 
-    # The fallback intentionally changes the attention reduction topology by
-    # forcing a KV split; use the established FP8 attention tolerance.
     torch.testing.assert_close(dequant, reference_blocks, rtol=0.1, atol=0.1)
 
     if (batch_size, q_len, topk, is_varlen) != (2, 3, 128, False):

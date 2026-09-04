@@ -778,61 +778,6 @@ def _allocate_dsv4_rope_quant_outputs(
     )
 
 
-def _check_dsv4_rope_quant_outputs(
-    out: torch.Tensor,
-    out_scale: torch.Tensor,
-    *,
-    num_tokens: int,
-    num_heads: int,
-    device: torch.device,
-) -> None:
-    """Validate the two fixed-layout output views required by the cubin ABI."""
-    num_groups, heads_per_group, group_width = _dsv4_rope_quant_group_layout(num_heads)
-    check_shape_dtype_device(
-        out,
-        (num_tokens, num_groups, group_width),
-        torch.float8_e4m3fn,
-        device,
-        "out",
-    )
-    expected_out_strides = (group_width, num_tokens * group_width, 1)
-    if out.stride() != expected_out_strides:
-        raise ValueError(
-            "DSv4 RopeQuant out must have group-major strides "
-            f"{expected_out_strides}, got {out.stride()}"
-        )
-
-    check_shape_dtype_device(
-        out_scale,
-        (num_tokens, num_groups, heads_per_group),
-        torch.int32,
-        device,
-        "dsv4_output_scale",
-    )
-    scale_buf_m = out_scale.stride(2)
-    if (
-        out_scale.stride(0) != 1
-        or scale_buf_m < num_tokens
-        or scale_buf_m % _DSV4_ROPE_QUANT_SCALE_ALIGNMENT != 0
-        or out_scale.stride(1) != heads_per_group * scale_buf_m
-    ):
-        raise ValueError(
-            "dsv4_output_scale must use packed UE8M0 group-major strides "
-            "(1, 8 * scale_buf_m, scale_buf_m), with scale_buf_m a multiple "
-            f"of 4 covering {num_tokens} tokens; got {out_scale.stride()}"
-        )
-    required_scale_elements = num_groups * heads_per_group * scale_buf_m
-    available_scale_bytes = (
-        out_scale.untyped_storage().nbytes()
-        - out_scale.storage_offset() * out_scale.element_size()
-    )
-    if available_scale_bytes < required_scale_elements * out_scale.element_size():
-        raise ValueError(
-            "dsv4_output_scale storage must include the full padded physical "
-            f"layout of {required_scale_elements} int32 values"
-        )
-
-
 def _check_sm120_dsv4_kv_cache_layout(
     kv_cache: torch.Tensor,
     kv_layout: Literal["HND", "NHD"],
@@ -1753,8 +1698,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Enables the TRTLLM-GEN DSv4 RopeQuant epilogue. Must be a contiguous
         FP32 tensor shaped ``[max_position, 64]`` with each row laid out as
         ``[cos(32), sin(32)]`` for interleaved RoPE. The kernel derives each
-        query position as ``seq_len - q_len + local_query_index``. This mode
-        requires FP8 E4M3 Q/K/V, 128 query heads, and
+        query position as ``seq_len - q_len + local_query_index``; the cache
+        must cover every derived position. This mode requires FP8 E4M3 Q/K/V,
+        128 query heads, and
         ``backend="trtllm-gen"``.
     dsv4_output_scale : Optional[torch.Tensor]
         Optional preallocated packed UE8M0 scale output. Shape must be
@@ -2031,52 +1977,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     )
 
     if rope_quant:
-        if query.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                "DSv4 RopeQuant requires FP8 E4M3 query and KV inputs, "
-                f"got {query.dtype}"
-            )
-        assert dsv4_inv_rope_cos_sin_cache is not None
-        if (
-            dsv4_inv_rope_cos_sin_cache.ndim != 2
-            or dsv4_inv_rope_cos_sin_cache.shape[1] != 64
-        ):
-            raise ValueError(
-                "dsv4_inv_rope_cos_sin_cache must have shape [max_position, 64], "
-                f"got {tuple(dsv4_inv_rope_cos_sin_cache.shape)}"
-            )
-        check_shape_dtype_device(
-            dsv4_inv_rope_cos_sin_cache,
-            None,
-            torch.float32,
-            query.device,
-            "dsv4_inv_rope_cos_sin_cache",
-        )
-        if not dsv4_inv_rope_cos_sin_cache.is_contiguous():
-            raise ValueError("dsv4_inv_rope_cos_sin_cache must be contiguous")
-
         num_tokens, num_heads = query_flat.shape[:2]
-        if out is None and dsv4_output_scale is None:
-            out, dsv4_output_scale = _allocate_dsv4_rope_quant_outputs(
+        if out is None:
+            out = _allocate_dsv4_rope_quant_output(num_tokens, num_heads, query.device)
+        if dsv4_output_scale is None:
+            dsv4_output_scale = _allocate_dsv4_rope_quant_output_scale(
                 num_tokens, num_heads, query.device
             )
-        else:
-            if out is None:
-                out = _allocate_dsv4_rope_quant_output(
-                    num_tokens, num_heads, query.device
-                )
-            if dsv4_output_scale is None:
-                dsv4_output_scale = _allocate_dsv4_rope_quant_output_scale(
-                    num_tokens, num_heads, query.device
-                )
-        assert out is not None and dsv4_output_scale is not None
-        _check_dsv4_rope_quant_outputs(
-            out,
-            dsv4_output_scale,
-            num_tokens=num_tokens,
-            num_heads=num_heads,
-            device=query.device,
-        )
     elif out is None:
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
 
@@ -2087,32 +1994,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
     else:
         q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-    if _validate_dsv4_sync_checks(query.device):
-        if torch.any(seq_lens < q_lens).item():
-            raise ValueError(
-                "seq_lens must be greater than or equal to the per-request query "
-                "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
-            )
-        if rope_quant:
-            assert dsv4_inv_rope_cos_sin_cache is not None
-            assert dsv4_output_scale is not None
-            if torch.any(seq_lens > dsv4_inv_rope_cos_sin_cache.shape[0]).item():
-                raise ValueError(
-                    "dsv4_inv_rope_cos_sin_cache does not cover all derived query "
-                    "positions"
-                )
-            scale_buf_m = dsv4_output_scale.stride(2)
-            if scale_buf_m > query_flat.size(0):
-                num_groups = dsv4_output_scale.size(1)
-                heads_per_group = dsv4_output_scale.size(2)
-                scale_storage = dsv4_output_scale.as_strided(
-                    (num_groups, heads_per_group, scale_buf_m),
-                    (heads_per_group * scale_buf_m, scale_buf_m, 1),
-                )
-                if torch.any(scale_storage[..., query_flat.size(0) :] != 0).item():
-                    raise ValueError(
-                        "dsv4_output_scale padded token rows must be zero-initialized"
-                    )
+    if _validate_dsv4_sync_checks(query.device) and torch.any(seq_lens < q_lens).item():
+        raise ValueError(
+            "seq_lens must be greater than or equal to the per-request query "
+            "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
+        )
 
     primary_kv_cache = compressed_kv_cache
     sparse_indices = sparse_indices.reshape(query_flat.size(0), -1).contiguous()
