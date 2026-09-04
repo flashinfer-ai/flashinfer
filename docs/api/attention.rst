@@ -266,6 +266,7 @@ PageAttention for MLA
     xqa_batch_decode_with_kv_cache_mla
     supported_sparse_mla_sm120_configs
     SparseMLASm120DecodeConfig
+    SparseMLASm120Wrapper
 
 .. note::
 

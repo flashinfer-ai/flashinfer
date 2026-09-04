@@ -19,15 +19,12 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.autotuner import OptimizationProfile
 from flashinfer.mla import (
     nvfp4_quantize_append_sparse_mla_cache,
     nvfp4_quantize_pack_sparse_mla_cache,
 )
 from flashinfer.mla._core import _nvfp4_sparse_mla_workspace
 from flashinfer.mla._sparse_mla_nvfp4_sm120 import (
-    _SparseMlaNvfp4DecodeRunner,
-    _decode_token_bucket,
     _nvfp4_sparse_mla_decode,
     _nvfp4_sparse_mla_prefill,
     _nvfp4_sparse_mla_m16n8k64_candidate_major,
@@ -54,36 +51,11 @@ def test_nvfp4_sparse_mla_reuses_fp8_public_api() -> None:
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default == "fp8"
 
-
-def test_nvfp4_sparse_mla_decode_autotune_contract() -> None:
-    """The NVFP4 tuner covers live batch buckets and every split-K tactic."""
-    inputs = [
-        torch.empty((8, 64, 512), dtype=torch.bfloat16, device="meta"),
-        torch.empty((8, 128), dtype=torch.int32, device="meta"),
-        torch.empty((8, 64, 10, 512), dtype=torch.bfloat16, device="meta"),
-        torch.empty((8, 64, 10), dtype=torch.float32, device="meta"),
-        torch.empty((8, 64, 512), dtype=torch.bfloat16, device="meta"),
-        torch.empty((8, 64), dtype=torch.float32, device="meta"),
-        torch.empty((8,), dtype=torch.int32, device="meta"),
-        torch.empty((64,), dtype=torch.float32, device="meta"),
-        torch.empty((8, 512), dtype=torch.int32, device="meta"),
-        torch.empty((8,), dtype=torch.int32, device="meta"),
-    ]
-    runner = _SparseMlaNvfp4DecodeRunner(
-        object(), primary_page_size=64, extra_page_size=2
-    )
-    profile = OptimizationProfile(shapes=[], tensor_initializers=[])
-
-    assert runner.get_valid_tactics(inputs, profile) == list(range(1, 11))
-    assert runner.get_cache_key_extras(inputs) == (True, True, 512, True, 64, 2)
-    assert [_decode_token_bucket(tokens) for tokens in (1, 2, 8, 9, 33, 65)] == [
-        1,
-        4,
-        8,
-        16,
-        64,
-        64,
-    ]
+    wrapper_parameter = inspect.signature(
+        flashinfer.mla.SparseMLASm120Wrapper.__init__
+    ).parameters["kv_cache_format"]
+    assert wrapper_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert wrapper_parameter.default == "fp8"
 
 
 def _require_sm120() -> None:
@@ -609,6 +581,49 @@ def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
     )
     torch.testing.assert_close(prefill_output, reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 65])
+def test_nvfp4_sparse_mla_shared_wrapper_matches_reference(num_tokens: int) -> None:
+    """The existing SM120 wrapper routes NVFP4 through its independent planner."""
+    _require_sm120()
+    torch.manual_seed(20260911 + num_tokens)
+    num_heads, topk = 16, 128
+    kv_bf16 = (
+        torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+    output = torch.empty_like(q)
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_cache_format="nvfp4",
+        device=q.device,
+    )
+    lse = runner.run(
+        q,
+        cache,
+        indices,
+        output,
+        512**-0.5,
+        return_lse=True,
+    )
+
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+    )
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512)])

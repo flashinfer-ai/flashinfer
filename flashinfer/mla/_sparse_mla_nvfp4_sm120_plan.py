@@ -63,9 +63,6 @@ _CROSSOVER_MARGIN = 0.95
 _POOL_BYTES_TARGET = 2 << 30
 _POOL_BYTES_MIN = 512 << 20
 _MIN_POOL_PER_SEGMENT = 128 << 20
-_WARMUP_ITERS = 3
-_TIMED_BATCHES = 5
-_MIN_BATCH_CALLS = 8
 _MAX_BATCH_CALLS = 256
 
 
@@ -398,16 +395,12 @@ def _make_index_sets(
     extra_slots: int,
     device: torch.device,
 ) -> list[tuple[torch.Tensor, Optional[torch.Tensor]]]:
-    props = torch.cuda.get_device_properties(device)
-    l2_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
-    footprint = max(1, num_tokens * (topk + extra_topk) * _BYTES_PER_TOKEN)
-    count = (
-        _MIN_BATCH_CALLS
-        if not l2_bytes
-        else min(
-            _MAX_BATCH_CALLS,
-            max(_MIN_BATCH_CALLS, l2_bytes // footprint + 2),
-        )
+    count = _cpb.calibration_batch_count(
+        num_tokens,
+        topk + extra_topk,
+        _BYTES_PER_TOKEN,
+        device,
+        max_batch_calls=_MAX_BATCH_CALLS,
     )
     result = []
     for _ in range(count):
@@ -437,20 +430,7 @@ def _time_indexed_calls(
     call: Callable[[torch.Tensor, Optional[torch.Tensor]], None],
     index_sets: list[tuple[torch.Tensor, Optional[torch.Tensor]]],
 ) -> float:
-    for i in range(_WARMUP_ITERS):
-        call(*index_sets[i % len(index_sets)])
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    best = float("inf")
-    for _ in range(_TIMED_BATCHES):
-        start.record()
-        for indices in index_sets:
-            call(indices[0], indices[1])
-        end.record()
-        torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(end) / len(index_sets))
-    return best * 1e3  # CUDA events report milliseconds.
+    return _cpb.time_calibration_calls(call, index_sets) * 1e6
 
 
 def _make_calibration_calls(

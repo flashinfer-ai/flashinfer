@@ -20,90 +20,47 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <flashinfer/math.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/common/nvfp4_quantization.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/model/nvfp4_cache_traits.cuh>
 
+#include "sparse_mla_sm120_nvfp4_common.h"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
-constexpr int kDNope = 448;
-constexpr int kDRope = 64;
+using Cache = NVFP4CacheTraits<ModelType::DSV4>;
+
+constexpr int kDNope = Cache::D_NOPE;
+constexpr int kDRope = Cache::D_ROPE;
 constexpr int kDLatent = kDNope + kDRope;
-constexpr int kSFVecSize = 16;
-constexpr int kNumScaleGroups = kDNope / kSFVecSize;
-constexpr int kPackedNopeBytes = kDNope / 2;
-constexpr int kRopeBytes = kDRope * sizeof(__nv_bfloat16);
-constexpr int kDataBytesPerToken = kPackedNopeBytes + kRopeBytes;
-constexpr int kScaleBytesPerToken = 32;
-constexpr int kBytesPerToken = kDataBytesPerToken + kScaleBytesPerToken;
+constexpr int kNumScaleGroups = Cache::NUM_SCALES;
+constexpr int kPackedNopeBytes = Cache::PACKED_NOPE_BYTES;
+constexpr int kDataBytesPerToken = Cache::DATA_BYTES_PER_TOKEN;
+constexpr int kScaleBytesPerToken = Cache::SCALE_BYTES_PER_TOKEN;
+constexpr int kBytesPerToken = Cache::BYTES_PER_TOKEN;
 constexpr int kThreadsPerToken = 32;
 
 static_assert(kNumScaleGroups == 28);
+static_assert(Cache::SCALE_GROUP_SIZE == SF_VEC_SIZE);
 static_assert(kPackedNopeBytes == 224);
 static_assert(kDataBytesPerToken == 352);
 static_assert(kBytesPerToken == 384);
-
-template <typename T>
-__device__ __forceinline__ float to_float(T value);
-
-template <>
-__device__ __forceinline__ float to_float<half>(half value) {
-  return __half2float(value);
-}
-
-template <>
-__device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 value) {
-  return __bfloat162float(value);
-}
-
-template <typename T>
-__device__ __forceinline__ void quantize_nope_group(const T* input, uint8_t* packed_output,
-                                                    uint8_t* scale_output) {
-  float values[kSFVecSize];
-  float amax = 0.0f;
-
-#pragma unroll
-  for (int i = 0; i < kSFVecSize; ++i) {
-    const float value = to_float(input[i]);
-    values[i] = value;
-    amax = fmaxf(amax, fabsf(value));
-  }
-
-  __nv_fp8_e4m3 scale_fp8 = __nv_fp8_e4m3(amax / 6.0f);
-  *scale_output = scale_fp8.__x;
-  const float scale = static_cast<float>(scale_fp8);
-  const float scale_inv = scale == 0.0f ? 0.0f : 1.0f / scale;
-
-  float normalized[kSFVecSize];
-#pragma unroll
-  for (int i = 0; i < kSFVecSize; ++i) {
-    normalized[i] = values[i] * scale_inv;
-  }
-
-  const uint2 packed = make_uint2(
-      math::fp32_vec_to_e2m1(normalized[0], normalized[1], normalized[2], normalized[3],
-                             normalized[4], normalized[5], normalized[6], normalized[7]),
-      math::fp32_vec_to_e2m1(normalized[8], normalized[9], normalized[10], normalized[11],
-                             normalized[12], normalized[13], normalized[14], normalized[15]));
-  *reinterpret_cast<uint2*>(packed_output) = packed;
-}
 
 template <typename T>
 __device__ __forceinline__ void quantize_token(const T* input, uint8_t* data_output,
                                                uint8_t* scale_output) {
   const int tid = threadIdx.x;
   if (tid < kNumScaleGroups) {
-    quantize_nope_group(input + tid * kSFVecSize, data_output + tid * (kSFVecSize / 2),
-                        scale_output + tid);
+    quantize_group16_to_nvfp4(input + tid * SF_VEC_SIZE, data_output + tid * FP4_PACKED_PER_GROUP,
+                              scale_output + tid);
     return;
   }
 
-  // Four threads copy 16 BF16/FP16 RoPE elements (32 bytes) each. The cache
+  // Four threads copy 16 BF16 RoPE elements (32 bytes) each. The cache
   // stores the source bits unchanged; the attention ABI interprets them with
   // the same 16-bit dtype as the source model path.
   const int rope_lane = tid - kNumScaleGroups;
@@ -155,39 +112,6 @@ __global__ void QuantizeAppendKernel(const T* input, const IdType* slot_mapping,
 
 namespace {
 
-struct CacheShape {
-  int num_pages;
-  int page_size;
-  size_t page_stride_bytes;
-};
-
-CacheShape parse_cache_shape(const TensorView& cache) {
-  TVM_FFI_ICHECK(cache.ndim() == 3 || cache.ndim() == 4)
-      << "cache must be [num_pages, page_size, 384], HND "
-         "[num_pages, 1, page_size, 384], or NHD "
-         "[num_pages, page_size, 1, 384]";
-  TVM_FFI_ICHECK_EQ(cache.dtype(), dl_uint8) << "cache must have dtype uint8";
-  TVM_FFI_ICHECK_EQ(cache.size(cache.ndim() - 1), kBytesPerToken)
-      << "cache last dimension must be " << kBytesPerToken;
-  int page_dim;
-  if (cache.ndim() == 3) {
-    page_dim = 1;
-  } else if (cache.size(1) == 1) {
-    page_dim = 2;
-  } else {
-    TVM_FFI_ICHECK_EQ(cache.size(2), 1)
-        << "cache must have a singleton latent-head dimension at axis 1 or 2";
-    page_dim = 1;
-  }
-  const int page_size = static_cast<int>(cache.size(page_dim));
-  TVM_FFI_ICHECK_EQ(cache.stride(cache.ndim() - 1), 1) << "cache byte dimension must be contiguous";
-  TVM_FFI_ICHECK_EQ(cache.stride(page_dim), kBytesPerToken)
-      << "cache entries inside a page must have stride " << kBytesPerToken;
-  TVM_FFI_ICHECK_GE(cache.stride(0), static_cast<int64_t>(page_size) * kBytesPerToken)
-      << "cache page stride is smaller than its logical page payload";
-  return {static_cast<int>(cache.size(0)), page_size, static_cast<size_t>(cache.stride(0))};
-}
-
 void check_input(const TensorView& input, int expected_tokens) {
   TVM_FFI_ICHECK(input.ndim() == 2 || input.ndim() == 3 || input.ndim() == 4)
       << "latent_kv must be 2D, 3D, or 4D";
@@ -210,7 +134,7 @@ void SparseMlaSm120NVFP4QuantizePack(TensorView latent_kv, TensorView cache) {
   TVM_FFI_ICHECK_EQ(latent_kv.device().device_id, cache.device().device_id)
       << "latent_kv and cache must be on the same CUDA device";
 
-  const CacheShape shape = parse_cache_shape(cache);
+  const PagedLayout shape = parse_nvfp4_paged_layout(cache);
   check_input(latent_kv, shape.num_pages * shape.page_size);
   if (shape.num_pages == 0 || shape.page_size == 0) return;
   ffi::CUDADeviceGuard device_guard(latent_kv.device().device_id);
@@ -243,7 +167,7 @@ void SparseMlaSm120NVFP4QuantizeAppend(TensorView latent_kv, TensorView slot_map
       << "slot_mapping must have dtype int32 or int64";
   TVM_FFI_ICHECK(slot_mapping.IsContiguous()) << "slot_mapping must be contiguous";
 
-  const CacheShape shape = parse_cache_shape(cache);
+  const PagedLayout shape = parse_nvfp4_paged_layout(cache);
   const int num_tokens = static_cast<int>(slot_mapping.size(0));
   check_input(latent_kv, num_tokens);
   if (num_tokens == 0) return;

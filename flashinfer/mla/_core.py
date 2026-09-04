@@ -500,6 +500,10 @@ def _run_nvfp4_sparse_mla_sm120(
             "NVFP4 sparse MLA workspace unexpectedly truncated the batch"
         )
 
+    # The shared public wrapper delegates to this same allocation-free op.
+    # This facade has already planned the phase in order to partition its
+    # caller-owned byte workspace, so pass that result through instead of
+    # constructing a wrapper and planning the call a second time.
     from ._sparse_mla_nvfp4_sm120 import (
         _sparse_mla_nvfp4_sm120_paged_attention,
     )
@@ -642,9 +646,9 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
         )
 
-    from ._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+    from ._sparse_mla_sm120 import SparseMLASm120Wrapper
 
-    runner = _SparseMLAPagedAttentionRunner(
+    runner = SparseMLASm120Wrapper(
         max_num_tokens=query_flat.shape[0],
         max_num_heads=num_heads,
         kv_scale_format=kv_scale_format,
@@ -1810,11 +1814,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     length for the SWA validity window.
 
     On SM120/SM121, this calls the packed sparse backend. ``swa_kv_cache`` is
-    the required packed uint8 SWA pool with 584 bytes per token. ``sparse_indices``
-    and ``swa_topk_lens`` describe the active SWA segment. To add a compressed
-    segment, pass ``compressed_kv_cache`` as another packed uint8 pool and pass
-    ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
-    path accepts BF16 query tensors and produces BF16 output.
+    the required packed uint8 SWA pool: 584 bytes per token for FP8 or 384
+    bytes per token for group-16 NVFP4, selected by ``kv_cache_format``.
+    ``sparse_indices`` and ``swa_topk_lens`` describe the active SWA segment.
+    To add a compressed segment, pass ``compressed_kv_cache`` as another pool
+    in the same format and pass ``extra_sparse_indices`` with
+    ``extra_sparse_topk_lens``. The SM120/SM121 path accepts BF16 query tensors
+    and produces BF16 output.
 
     With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
@@ -1830,8 +1836,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q`` is provided. SM100/SM103 accepts BF16 or FP8 E4M3;
         SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
-        SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
-        uint8 head dim 584. Layout follows ``kv_layout``.
+        SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
+        packed uint8 record with last dimension 584 (FP8) or 384 (NVFP4).
+        Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
         Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
         TRTLLM-GEN multi-CTA KV counters are managed in a separate internal

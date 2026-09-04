@@ -23,7 +23,8 @@
 #include "arch/mma_sm120_nvfp4.cuh"
 #include "common/d2_load_b_nvfp4.cuh"
 #include "common/nvfp4_quant.cuh"
-#include "model/kv_cache_traits.cuh"
+#include "common/nvfp4_vt.cuh"
+#include "model/nvfp4_cache_traits.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
@@ -32,20 +33,20 @@ constexpr int DECODE_IO_WARPS = 2;
 constexpr int DECODE_BLOCK_THREADS = (DECODE_N_WARPS + DECODE_IO_WARPS) * 32;
 constexpr int DECODE_MATH_THREADS = DECODE_N_WARPS * 32;
 constexpr int DECODE_MERGE2_THREADS = 512;
-constexpr int DECODE_CAND_WINDOW = 64;
+constexpr int DECODE_CAND_WINDOW = NVFP4_VT_CANDIDATES;
 constexpr int DECODE_KV_BUF_COUNT = 2;
 constexpr int DECODE_ENTRIES_PER_WARP = DECODE_CAND_WINDOW / DECODE_N_WARPS;
 constexpr int DECODE_QK_N_TILES = DECODE_ENTRIES_PER_WARP / 8;
-constexpr int DECODE_PACKED_NOPE_BYTES = 448 / 2;
-constexpr int DECODE_DATA_BYTES_PER_TOKEN = DECODE_PACKED_NOPE_BYTES + 64 * sizeof(bf16);
-constexpr int DECODE_SCALE_BYTES_PER_TOKEN = 32;
-constexpr int DECODE_BYTES_PER_TOKEN = DECODE_DATA_BYTES_PER_TOKEN + DECODE_SCALE_BYTES_PER_TOKEN;
-constexpr int DECODE_KV_SMEM_STRIDE = DECODE_PACKED_NOPE_BYTES + 16;
+constexpr int DECODE_PACKED_NOPE_BYTES = DSV4NVFP4Cache::PACKED_NOPE_BYTES;
+constexpr int DECODE_DATA_BYTES_PER_TOKEN = DSV4NVFP4Cache::DATA_BYTES_PER_TOKEN;
+constexpr int DECODE_SCALE_BYTES_PER_TOKEN = DSV4NVFP4Cache::SCALE_BYTES_PER_TOKEN;
+constexpr int DECODE_BYTES_PER_TOKEN = DSV4NVFP4Cache::BYTES_PER_TOKEN;
+constexpr int DECODE_KV_SMEM_STRIDE = DSV4NVFP4Cache::KV_SMEM_STRIDE;
 constexpr int DECODE_W_PACKED_STRIDE = DECODE_CAND_WINDOW / 2 + 16;
-constexpr int DECODE_VT_PACKED_K_BYTES = DECODE_CAND_WINDOW / 2;
-constexpr int DECODE_VT_SCALE_GROUPS = DECODE_CAND_WINDOW / SF_VEC_SIZE;
-constexpr int DECODE_VT_DATA_BYTES = 448 * DECODE_VT_PACKED_K_BYTES;
-constexpr int DECODE_VT_SCALE_BYTES = 448 * DECODE_VT_SCALE_GROUPS;
+constexpr int DECODE_VT_PACKED_K_BYTES = NVFP4_VT_PACKED_K_BYTES;
+constexpr int DECODE_VT_SCALE_GROUPS = NVFP4_VT_SCALE_GROUPS;
+constexpr int DECODE_VT_DATA_BYTES = NVFP4_VT_DATA_BYTES;
+constexpr int DECODE_VT_SCALE_BYTES = NVFP4_VT_SCALE_BYTES;
 
 static_assert(DECODE_DATA_BYTES_PER_TOKEN == 352);
 static_assert(DECODE_BYTES_PER_TOKEN == 384);
@@ -136,120 +137,6 @@ struct DecodeNVFP4Smem {
     return reinterpret_cast<uint8_t*>(base + OFF_VT_SC);
   }
 };
-
-__device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
-  constexpr float magnitude[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-  const float value = magnitude[code & 7];
-  return (code & 8) ? -value : value;
-}
-
-// Decode two packed E2M1 values with the native SM100+ conversion.  The
-// prepare kernel consumes two source candidates at a time, so this avoids two
-// independent scalar LUT lookups while preserving the low-/high-nibble order.
-__device__ __forceinline__ float2 e2m1x2_code_to_float2(uint8_t codes) {
-  uint32_t fp16x2;
-  const uint32_t packed = codes;
-  asm volatile(
-      "{\n"
-      ".reg .b8 fp4_byte;\n"
-      "mov.b32 {fp4_byte, _, _, _}, %1;\n"
-      "cvt.rn.f16x2.e2m1x2 %0, fp4_byte;\n"
-      "}"
-      : "=r"(fp16x2)
-      : "r"(packed));
-  const __half2 h2 = *reinterpret_cast<const __half2*>(&fp16x2);
-  return __half22float2(h2);
-}
-
-__device__ __forceinline__ uint64_t transpose_e2m1_16x16_stage(uint64_t packed, int lane_in_group,
-                                                               int distance, uint64_t low_mask) {
-  const uint32_t packed_lo = static_cast<uint32_t>(packed);
-  const uint32_t packed_hi = static_cast<uint32_t>(packed >> 32);
-  const uint64_t partner =
-      static_cast<uint64_t>(__shfl_xor_sync(0xffffffffu, packed_lo, distance, SF_VEC_SIZE)) |
-      (static_cast<uint64_t>(__shfl_xor_sync(0xffffffffu, packed_hi, distance, SF_VEC_SIZE)) << 32);
-  const int shift = distance * 4;
-  if (lane_in_group & distance) {
-    return ((partner & ~low_mask) >> shift) | (packed & ~low_mask);
-  }
-  return (packed & low_mask) | ((partner & low_mask) << shift);
-}
-
-// Transpose one 16-candidate x 16-dimension E2M1 tile entirely in registers.
-// Four butterfly stages replace the per-output-lane gather of all 16 packed
-// source values (8 shuffles per lane instead of 32).
-__device__ __forceinline__ uint64_t transpose_e2m1_16x16(uint64_t packed, int lane_in_group) {
-  packed = transpose_e2m1_16x16_stage(packed, lane_in_group, 8, 0x00000000ffffffffULL);
-  packed = transpose_e2m1_16x16_stage(packed, lane_in_group, 4, 0x0000ffff0000ffffULL);
-  packed = transpose_e2m1_16x16_stage(packed, lane_in_group, 2, 0x00ff00ff00ff00ffULL);
-  return transpose_e2m1_16x16_stage(packed, lane_in_group, 1, 0x0f0f0f0f0f0f0f0fULL);
-}
-
-// Convert one token-major 64-candidate shared-memory tile into the
-// candidate-reduction layout consumed by block-scaled P x V.  The conversion
-// stays inside the CTA: source scales are absorbed, the 16x16 E2M1 tiles are
-// transposed in registers, and the result is requantized into the ephemeral
-// V^T operand.  KV_SMEM_STRIDE allows decode's padded source rows and
-// prefill's compact rows to share the same implementation.
-template <int WORKER_THREADS, int KV_SMEM_STRIDE, int THREAD_BASE = 0>
-__device__ __forceinline__ void prepare_nvfp4_vt_from_smem(const uint8_t* __restrict__ kv_fp4,
-                                                           const uint8_t* __restrict__ kv_sc,
-                                                           uint8_t* __restrict__ vt_data,
-                                                           uint8_t* __restrict__ vt_sc) {
-  constexpr int NUM_DIM_GROUPS = 448 / SF_VEC_SIZE;
-  constexpr int DIM_GROUPS_PER_ITER = WORKER_THREADS / 64;
-  static_assert(WORKER_THREADS >= 64 && WORKER_THREADS % 64 == 0);
-
-  const int worker_tid = threadIdx.x - THREAD_BASE;
-  const int warp = worker_tid / 32;
-  const int lane = worker_tid & 31;
-  const int lane_in_group = lane & (SF_VEC_SIZE - 1);
-  const int half_warp = lane / SF_VEC_SIZE;
-  const int warp_cand_pair = warp & 1;
-  const int cand_group = warp_cand_pair * 2 + half_warp;
-  const int cand = cand_group * SF_VEC_SIZE + lane_in_group;
-
-  for (int dim_group = warp / 2; dim_group < NUM_DIM_GROUPS; dim_group += DIM_GROUPS_PER_ITER) {
-    const uint64_t packed = *reinterpret_cast<const uint64_t*>(
-        kv_fp4 + (size_t)cand * KV_SMEM_STRIDE + dim_group * FP4_PACKED_PER_GROUP);
-    const float source_scale =
-        e4m3_byte_to_float(kv_sc[(size_t)cand * DECODE_SCALE_BYTES_PER_TOKEN + dim_group]);
-    const uint64_t transposed = transpose_e2m1_16x16(packed, lane_in_group);
-
-    float values[SF_VEC_SIZE];
-#pragma unroll
-    for (int source_pair = 0; source_pair < SF_VEC_SIZE / 2; ++source_pair) {
-      const int source_lane0 = source_pair * 2;
-      const int source_lane1 = source_lane0 + 1;
-      const uint8_t codes = static_cast<uint8_t>(transposed >> (source_pair * 8));
-      const float2 decoded = e2m1x2_code_to_float2(codes);
-      const float scale0 = __shfl_sync(0xffffffffu, source_scale, source_lane0, SF_VEC_SIZE);
-      const float scale1 = __shfl_sync(0xffffffffu, source_scale, source_lane1, SF_VEC_SIZE);
-      values[source_lane0] = decoded.x * scale0;
-      values[source_lane1] = decoded.y * scale1;
-    }
-
-    const int dim = dim_group * SF_VEC_SIZE + lane_in_group;
-    uint2 quantized;
-    uint8_t quantized_scale;
-    quantize_fp32_group16_to_nvfp4_regs(values, quantized, quantized_scale);
-
-    // Adjacent half-warps cover adjacent candidate groups.  Merge their
-    // 8-byte results into one aligned 16-byte transaction; paired warps fill
-    // the complete 64-candidate row.
-    const int peer_lane = lane_in_group + SF_VEC_SIZE;
-    const uint32_t peer_lo = __shfl_sync(0xffffffffu, quantized.x, peer_lane);
-    const uint32_t peer_hi = __shfl_sync(0xffffffffu, quantized.y, peer_lane);
-    const uint32_t peer_scale =
-        __shfl_sync(0xffffffffu, static_cast<uint32_t>(quantized_scale), peer_lane);
-    if (half_warp == 0) {
-      *reinterpret_cast<uint4*>(vt_data + dim * DECODE_VT_PACKED_K_BYTES + warp_cand_pair * 16) =
-          make_uint4(quantized.x, quantized.y, peer_lo, peer_hi);
-      *reinterpret_cast<uint16_t*>(vt_sc + dim * DECODE_VT_SCALE_GROUPS + warp_cand_pair * 2) =
-          static_cast<uint16_t>(quantized_scale) | static_cast<uint16_t>(peer_scale << 8);
-    }
-  }
-}
 
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, bool DUAL_CACHE = false>
 __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_nvfp4_kernel(
@@ -647,7 +534,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     for (int task = threadIdx.x; task < HPB * DECODE_VT_SCALE_GROUPS; task += DECODE_MATH_THREADS) {
       const int head = task / DECODE_VT_SCALE_GROUPS;
       const int cand_group = task % DECODE_VT_SCALE_GROUPS;
-      quantize_bf16_group16_to_nvfp4(
+      quantize_group16_to_nvfp4(
           &sm_p_full[head][cand_group * SF_VEC_SIZE],
           sm.w_fp4() + head * DECODE_W_PACKED_STRIDE + cand_group * FP4_PACKED_PER_GROUP,
           sm.w_sc() + head * DECODE_VT_SCALE_GROUPS + cand_group);
