@@ -2724,11 +2724,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         prims_ts_output_scale = _v_scale
         backend_wrappers["prims-ts"] = prims_ts.BatchPrefillTSWrapper()
         backend_wrappers["prims-ts"].plan(
-            q,
-            k,
-            v,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
+            device=q.device,
+            batch_size=batch_size,
+            max_seq_len_q=s_qo,
+            max_kv_len=s_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+            packed=True,
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
             output_scale=prims_ts_output_scale,
@@ -2894,7 +2899,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 out_dtype=out_dtype,
             )
         elif backend == "prims-ts":
-            return backend_wrappers[backend].run(q, k, v, out=out)
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                out=out,
+                validate=False,
+            )
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
@@ -2999,7 +3012,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     q,
                     k,
                     v,
+                    qo_indptr,
+                    kv_indptr,
                     out=prims_ts_out,
+                    validate=False,
                 ),
                 prims_ts_out,
             )

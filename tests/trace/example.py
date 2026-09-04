@@ -1772,27 +1772,16 @@ with contextlib.suppress(Exception):
         device=device,
     )
     _pts_v = torch.randn_like(_pts_k)
-    _pts_indptr = torch.arange(
-        0,
-        _pts_num_pages + 1,
-        _pts_pages_per_request,
-        dtype=torch.int32,
-        device=device,
-    )
     _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
     _pts_block_tables = _pts_indices.view(_pts_B, _pts_pages_per_request)
-    _pts_last_page_len = torch.full(
-        (_pts_B,), _pts_PS, dtype=torch.int32, device=device
-    )
     _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
     _pts_cache = (_pts_k, _pts_v)
 
     _attention_ts_decode(
         _pts_q,
         _pts_cache,
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_block_tables,
+        _pts_seq_lens,
         seq_len_q=_pts_SQ,
         mask_type="causal",
     )
@@ -1853,9 +1842,9 @@ with contextlib.suppress(Exception):
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
-        batch_decode_mla_with_paged_kv_cache as _attention_ts_mla_decode,
-        get_prims_ts_batch_decode_mla_workspace_size as _prims_ts_mla_ws_size,
-        prims_ts_batch_decode_with_kv_cache_mla as _prims_ts_mla_decode,
+        batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
+        get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
+        prims_ts_batch_mla_decode_with_kv_cache as _prims_ts_mla_decode,
     )
 
     _pmla_B, _pmla_SQ, _pmla_SK, _pmla_PS = 4, 4, 2048, 32

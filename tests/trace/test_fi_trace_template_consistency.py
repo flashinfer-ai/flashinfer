@@ -404,11 +404,11 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     ): 12,
     (
         "flashinfer.attention.prims_ts.mla_decode",
-        "batch_decode_mla_with_paged_kv_cache",
+        "batch_mla_decode_with_paged_kv_cache",
     ): 4,
     (
         "flashinfer.attention.prims_ts.mla_decode",
-        "prims_ts_batch_decode_with_kv_cache_mla",
+        "prims_ts_batch_mla_decode_with_kv_cache",
     ): 4,
     (
         "flashinfer.attention.prims_ts.mla_decode",
@@ -504,6 +504,17 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             )
             assert "min(seq_lens) >= 1" in template.constraints
             assert f"max(seq_lens) <= {static_bound}" in template.constraints
+    for template in attention_ts_decode_trace_dispatch.templates:
+        assert {"block_tables", "seq_lens_kv"} <= template.inputs.keys()
+        assert {
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "paged_kv_last_page_len",
+        }.isdisjoint(template.inputs)
+        assert (
+            "max_pages_per_seq * page_size >= max(seq_lens_kv)" in template.constraints
+        )
+        assert "min(seq_lens_kv) >= 1" in template.constraints
     for dispatch in mla_dispatches:
         for template in dispatch.templates:
             assert ("kv_pad_dim == 1" in template.constraints) == (
@@ -621,8 +632,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     )
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
-        batch_decode_mla_with_paged_kv_cache,
-        prims_ts_batch_decode_with_kv_cache_mla,
+        batch_mla_decode_with_paged_kv_cache,
+        prims_ts_batch_mla_decode_with_kv_cache,
     )
     from flashinfer.fi_trace import fi_trace
 
@@ -635,24 +646,16 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16
     )
     v_cache = torch.empty_like(k_cache)
-    kv_indptr = torch.arange(
-        0,
-        num_pages + 1,
-        pages_per_request,
-        dtype=torch.int32,
-    )
     kv_indices = torch.arange(num_pages, dtype=torch.int32)
     fmha_block_tables = kv_indices.reshape(batch_size, pages_per_request)
-    last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
     workspace = torch.empty(4096, dtype=torch.uint8)
 
     fmha_kwargs = {
         "q": q,
         "paged_kv_cache": (k_cache, v_cache),
-        "paged_kv_indptr": kv_indptr,
-        "paged_kv_indices": kv_indices,
-        "paged_kv_last_page_len": last_page_len,
+        "block_tables": fmha_block_tables,
+        "seq_lens_kv": seq_lens,
         "seq_len_q": seq_len_q,
         "mask_type": "causal",
     }
@@ -719,8 +722,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         qk_rope_head_dim=rope_dim,
     )
     mla_definitions = (
-        batch_decode_mla_with_paged_kv_cache.fi_trace(**mla_common),
-        prims_ts_batch_decode_with_kv_cache_mla.fi_trace(
+        batch_mla_decode_with_paged_kv_cache.fi_trace(**mla_common),
+        prims_ts_batch_mla_decode_with_kv_cache.fi_trace(
             **mla_common,
             workspace_buffer=workspace,
             max_seq_len=seq_len_k,
@@ -747,6 +750,9 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     )
     definitions = (*fmha_definitions, *mla_definitions)
     assert tuple(definition["name"] for definition in definitions) == expected_names
+    assert {"block_tables", "seq_lens_kv"} <= fmha_definitions[0]["inputs"].keys()
+    for input_name in ("block_tables", "seq_lens_kv"):
+        assert "optional" not in fmha_definitions[0]["inputs"][input_name]
     assert {"block_tables", "seq_lens"} <= fmha_definitions[2]["inputs"].keys()
     assert {"block_tables", "seq_lens"} <= mla_definitions[2]["inputs"].keys()
     for definition, required_metadata in (

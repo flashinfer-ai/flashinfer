@@ -1831,6 +1831,22 @@ _DECODE_PUBLIC_SURFACES = (
 def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     """Freeze the compile-oriented plan/run split."""
 
+    assert tuple(inspect.signature(batch_decode_with_paged_kv_cache).parameters) == (
+        "q",
+        "paged_kv_cache",
+        "block_tables",
+        "seq_lens_kv",
+        "seq_len_q",
+        "qo_indptr",
+        "max_seq_len_q",
+        "mask_type",
+        "window_left",
+        "kv_layout",
+        "bmm1_scale",
+        "bmm2_scale",
+        "out",
+        "out_dtype",
+    )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
         "kv_layout",
@@ -2936,6 +2952,11 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     )
     monkeypatch.setattr(
         decode_module,
+        "_make_decode_compile_spec",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        decode_module,
         "_get_compiled_decode",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic compile failure")),
     )
@@ -3198,25 +3219,22 @@ def test_attention_ts_decode_csr_conversion_uses_actual_padded_row_starts() -> N
 
 
 @pytest.mark.parametrize(
-    ("indptr", "indices_count", "last_page_lens", "message"),
+    ("seq_lens", "table_values", "message"),
     (
-        ((1, 2, 3), 3, (1, 1), "must start at zero"),
-        ((0, 1, 1), 1, (1, 1), "must be strictly increasing"),
-        ((0, 2, 1), 1, (1, 1), "must be strictly increasing"),
-        ((0, 1, 3), 2, (1, 1), "must equal paged_kv_indices.numel"),
-        ((0, 1, 2), 2, (0, 1), r"must be in \[1, 32\]"),
-        ((0, 1, 2), 2, (1, 33), r"must be in \[1, 32\]"),
+        ((0, 1), ((0, -101), (1, -102)), "values must be positive"),
+        ((65, 1), ((0, 1), (2, -102)), "does not have enough columns"),
+        ((1, 1), ((0, -101), (8, -102)), "must index the physical K/V cache"),
     ),
+    ids=("sequence-empty", "table-too-narrow", "active-page-id-out-of-range"),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_canonical_one_shot_rejects_malformed_csr(
-    indptr,
-    indices_count,
-    last_page_lens,
+def test_attention_ts_decode_one_shot_rejects_malformed_fixed_metadata(
+    seq_lens,
+    table_values,
     message,
 ) -> None:
-    """The compatibility surface retains canonical CSR value validation."""
+    """The one-shot surface validates fixed-table values before planning."""
 
     device = torch.device("cuda")
     q = torch.empty((2, 8, 64), dtype=torch.float16, device=device)
@@ -3225,27 +3243,25 @@ def test_attention_ts_decode_canonical_one_shot_rejects_malformed_csr(
         batch_decode_with_paged_kv_cache(
             q,
             kv_cache,
-            torch.tensor(indptr, dtype=torch.int32, device=device),
-            torch.arange(indices_count, dtype=torch.int32, device=device),
-            torch.tensor(last_page_lens, dtype=torch.int32, device=device),
+            torch.tensor(table_values, dtype=torch.int32, device=device),
+            torch.tensor(seq_lens, dtype=torch.int32, device=device),
         )
 
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_canonical_one_shot_rejects_graph_capture(
+def test_attention_ts_decode_one_shot_rejects_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CSR conversion is explicitly outside the capture-safe native path."""
+    """Host-derived plan bounds are explicitly outside graph capture."""
 
     device = torch.device("cuda")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="cannot convert CSR metadata"):
+    with pytest.raises(RuntimeError, match="cannot derive host plan bounds"):
         batch_decode_with_paged_kv_cache(
             torch.empty((1, 8, 64), dtype=torch.float16, device=device),
             torch.empty((1, 2, 1, 32, 64), dtype=torch.float16, device=device),
-            torch.tensor((0, 1), dtype=torch.int32, device=device),
-            torch.tensor((0,), dtype=torch.int32, device=device),
+            torch.tensor(((0,),), dtype=torch.int32, device=device),
             torch.tensor((1,), dtype=torch.int32, device=device),
         )
 
@@ -3260,9 +3276,8 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
 
     device = torch.device("cuda")
     page_size = 16
-    paged_kv_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
-    paged_kv_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    paged_kv_last_page_len = torch.tensor([4, 16], dtype=torch.int32, device=device)
+    block_tables = torch.tensor(((0,), (1,)), dtype=torch.int32, device=device)
+    seq_lens = torch.tensor((4, 16), dtype=torch.int32, device=device)
     qo_indptr = (
         torch.tensor([0, 5, 6], dtype=torch.int32, device=device) if packed_q else None
     )
@@ -3276,12 +3291,6 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
     kv_cache = torch.empty((2, 2, 1, page_size, 64), dtype=torch.float16, device=device)
     match = r"request 0 has Q=(5|8) and K/V=4"
 
-    seq_lens = _seq_lens_from_csr(
-        paged_kv_indptr,
-        paged_kv_last_page_len,
-        page_size,
-    )
-    block_tables = paged_kv_indices.view(2, 1)
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(
         device,
@@ -3307,9 +3316,8 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
         batch_decode_with_paged_kv_cache(
             q,
             kv_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+            block_tables,
+            seq_lens,
             seq_len_q=seq_len_q,
             qo_indptr=qo_indptr,
             max_seq_len_q=max_seq_len_q,
@@ -3322,7 +3330,7 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
 
     from contextlib import nullcontext
 
-    from flashinfer.mla import get_prims_ts_batch_decode_mla_workspace_size
+    from flashinfer.mla import get_prims_ts_batch_mla_decode_workspace_size
 
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(
@@ -3338,7 +3346,7 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
             max_seq_len=128,
             device="cuda:0",
         ),
-        lambda: get_prims_ts_batch_decode_mla_workspace_size(
+        lambda: get_prims_ts_batch_mla_decode_workspace_size(
             batch_size=1,
             num_heads=8,
             kv_lora_rank=512,
@@ -4410,9 +4418,8 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
     one_shot = batch_decode_with_paged_kv_cache(
         case.q,
         case.paged_kv_cache,
-        case.paged_kv_indptr,
-        case.paged_kv_indices,
-        case.paged_kv_last_page_len,
+        case.block_tables,
+        seq_lens,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
         mask_type=case.mask_type,
@@ -4877,8 +4884,10 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
         _assert_case_correct(output, case)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled_main is wrappers[1]._compiled_main
-    assert wrappers[0]._compiled_reducer is wrappers[1]._compiled_reducer
+    first_state = wrappers[0]._require_plan_state()
+    second_state = wrappers[1]._require_plan_state()
+    assert first_state.compiled_main is second_state.compiled_main
+    assert first_state.compiled_reducer is second_state.compiled_reducer
 
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")

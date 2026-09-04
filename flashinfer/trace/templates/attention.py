@@ -849,8 +849,9 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
@@ -859,9 +860,8 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     )
     inputs.update(
         {
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
-            "paged_kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+            "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
+            "seq_lens_kv": Tensor(["batch_size"], dtype="int32"),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
@@ -878,7 +878,8 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+        "min(seq_lens_kv) >= 1",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
@@ -902,8 +903,8 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{output_suffix}{q_suffix}",
         description=(
-            "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV "
-            f"metadata using the {cache_form} HND cache form. Fixed multi-Q "
+            "One-shot PrimTS GQA decode over a fixed row-strided page table "
+            f"using the {cache_form} HND cache form. Fixed multi-Q "
             "uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative "
             "qo_indptr offsets."
         ),

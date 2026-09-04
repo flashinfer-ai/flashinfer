@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import inspect
 import itertools
@@ -492,16 +493,38 @@ def _make_native_paged_metadata(
 
 def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
     wrapper.plan(
-        case.q,
-        case.k,
-        case.v,
-        qo_indptr=case.qo_indptr,
-        kv_indptr=case.kv_indptr,
+        device=case.q.device,
+        batch_size=len(case.q_lengths),
+        max_seq_len_q=max(case.q_lengths),
+        max_kv_len=max(case.k_lengths),
+        num_qo_heads=int(case.q.shape[-2]),
+        num_kv_heads=int(case.k.shape[-2]),
+        head_dim=int(case.q.shape[-1]),
+        q_dtype=case.q.dtype,
+        kv_dtype=case.k.dtype,
+        packed=case.packed,
         mask_type=case.mask_type,
         window_left=case.window_left,
         sm_scale=case.sm_scale,
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
+    )
+
+
+def _run_wrapper(
+    wrapper: BatchPrefillTSWrapper,
+    case: _ContextCase,
+    **kwargs,
+) -> torch.Tensor:
+    """Launch a contiguous plan with the request metadata owned by ``case``."""
+
+    return wrapper.run(
+        case.q,
+        case.k,
+        case.v,
+        case.qo_indptr,
+        case.kv_indptr,
+        **kwargs,
     )
 
 
@@ -571,12 +594,23 @@ def _capture_context_graph(
     v: torch.Tensor,
     out: torch.Tensor,
     paged_metadata: Optional[_NativePagedMetadata] = None,
+    *,
+    qo_indptr: Optional[torch.Tensor] = None,
+    kv_indptr: Optional[torch.Tensor] = None,
 ) -> torch.cuda.CUDAGraph:
     """Warm up and capture one wrapper run into caller-owned output."""
 
     def launch() -> torch.Tensor:
         if paged_metadata is None:
-            return wrapper.run(q, k, v, out=out)
+            return wrapper.run(
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                out=out,
+                validate=False,
+            )
         return wrapper.run(
             q,
             k,
@@ -618,6 +652,90 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 
 
+class _FakeCudaStream:
+    """Minimal CUDA-stream stand-in for allocation-free CPU contract tests."""
+
+    def __init__(self, *, handle: int = 17) -> None:
+        self.device = torch.device("cpu")
+        self.cuda_stream = handle
+        self.waited_events: list[object] = []
+
+    def wait_event(self, event: object) -> None:
+        self.waited_events.append(event)
+
+
+def _enable_context_cpu_lifecycle(monkeypatch):
+    """Substitute stream/event bookkeeping while retaining wrapper behavior."""
+
+    stream = _FakeCudaStream()
+    ready_events = []
+    recorded_tensor_calls = []
+
+    def record_ready_event(actual_stream):
+        assert actual_stream is stream
+        event = object()
+        ready_events.append(event)
+        return event
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_context_plan_stream",
+        lambda _device, *, api_name: stream,
+    )
+    monkeypatch.setattr(
+        context_module, "_record_context_plan_ready_event", record_ready_event
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_record_context_tensors",
+        lambda *args: recorded_tensor_calls.append(args),
+    )
+    return stream, ready_events, recorded_tensor_calls
+
+
+def test_attention_ts_context_plan_ready_event_is_external_and_recorded(
+    monkeypatch,
+) -> None:
+    calls = {}
+
+    class FakeEvent:
+        def record(self, stream) -> None:
+            calls["record_stream"] = stream
+
+    event = FakeEvent()
+
+    def make_event(**kwargs):
+        calls["event_kwargs"] = kwargs
+        return event
+
+    monkeypatch.setattr(torch.cuda, "Event", make_event)
+    stream = _FakeCudaStream()
+
+    assert context_module._record_context_plan_ready_event(stream) is event
+    assert calls == {
+        "event_kwargs": {"external": True},
+        "record_stream": stream,
+    }
+
+
+def test_attention_ts_context_plan_ready_wait_is_cross_stream_only() -> None:
+    ready_event = object()
+    state = SimpleNamespace(
+        geometry=SimpleNamespace(device=torch.device("cpu")),
+        ready_event=ready_event,
+        ready_stream_handle=17,
+    )
+    plan_stream = _FakeCudaStream(handle=17)
+    other_stream = _FakeCudaStream(handle=23)
+
+    context_module._wait_for_context_plan(state, plan_stream)
+    context_module._wait_for_context_plan(state, other_stream)
+
+    assert plan_stream.waited_events == []
+    assert other_stream.waited_events == [ready_event]
+
+
 def test_attention_ts_context_storage_span_includes_stride_and_offset() -> None:
     storage = torch.empty(64, dtype=torch.bfloat16)
     tensor = storage.as_strided((2, 3), (10, 2), storage_offset=3)
@@ -648,46 +766,70 @@ def test_attention_ts_context_disjoint_storage_slices_do_not_overlap() -> None:
 def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
     monkeypatch,
 ) -> None:
-    """The fixed wrapper checks every retained non-Q launch allocation."""
+    """The contiguous wrapper checks runtime metadata and plan-owned scales."""
 
-    monkeypatch.setattr(context_module, "_validate_runtime_inputs", lambda *_: None)
+    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
+    monkeypatch.setattr(
+        context_module, "_validate_runtime_inputs", lambda *_a, **_k: None
+    )
     monkeypatch.setattr(
         context_module,
         "_prepare_out",
         lambda out, *, q, output_dtype: out,
     )
-    argument_names = ("k", "v")
-    retained_names = (
+    argument_names = (
+        "k",
+        "v",
         "qo_indptr",
         "kv_indptr",
+    )
+    plan_owned_names = (
         "scale_softmax_log2",
         "output_scale",
-        "variable_window_token_starts",
-        "variable_window_token_ends",
-        "variable_window_cta_starts",
     )
 
-    for aliased_name in (*argument_names, *retained_names):
+    for aliased_name in (*argument_names, *plan_owned_names):
         out = torch.empty(8)
         q = torch.empty(8)
         arguments = {name: torch.empty(8) for name in argument_names}
-        wrapper = BatchPrefillTSWrapper()
-        wrapper._planned = True
-        wrapper._geometry = SimpleNamespace(output_dtype=out.dtype)
-        wrapper._compiled = lambda *_: None
-        for name in retained_names:
-            setattr(wrapper, f"_{name}", torch.empty(8))
+        plan_owned = {name: torch.empty(8) for name in plan_owned_names}
+        empty_i32 = torch.empty(1)
 
         if aliased_name in arguments:
             arguments[aliased_name] = out
         else:
-            setattr(wrapper, f"_{aliased_name}", out)
+            plan_owned[aliased_name] = out
+        wrapper = BatchPrefillTSWrapper()
+        wrapper._plan_state = context_module._ContextPlanState(
+            geometry=SimpleNamespace(
+                device=torch.device("cpu"),
+                output_dtype=out.dtype,
+                packed=True,
+                mask_type="dense",
+            ),
+            scale_softmax_log2=plan_owned["scale_softmax_log2"],
+            output_scale=plan_owned["output_scale"],
+            empty_i32=empty_i32,
+            variable_window_padded_starts=None,
+            variable_window_cta_starts=empty_i32,
+            compiled=lambda *_: None,
+            policy=(),
+            ready_event=object(),
+            ready_stream_handle=run_stream.cuda_stream,
+        )
 
         with pytest.raises(
             ValueError,
             match=rf"out must not overlap {aliased_name} storage",
         ):
-            wrapper.run(q, arguments["k"], arguments["v"], out=out)
+            wrapper.run(
+                q,
+                arguments["k"],
+                arguments["v"],
+                arguments["qo_indptr"],
+                arguments["kv_indptr"],
+                out=out,
+            )
 
 
 def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
@@ -695,6 +837,7 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
 ) -> None:
     """The paged wrapper checks every per-run and plan-owned allocation."""
 
+    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
     monkeypatch.setattr(
         context_module, "_validate_paged_runtime_inputs", lambda *_: None
     )
@@ -732,11 +875,15 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
             plan_owned[aliased_name] = out
         wrapper = BatchPrefillPagedTSWrapper()
         wrapper._plan_state = context_module._PagedContextPlanState(
-            geometry=SimpleNamespace(output_dtype=out.dtype),
+            geometry=SimpleNamespace(
+                device=torch.device("cpu"), output_dtype=out.dtype
+            ),
             scale_softmax_log2=plan_owned["scale_softmax_log2"],
             output_scale=plan_owned["output_scale"],
             compiled=lambda *_: None,
             policy=(),
+            ready_event=object(),
+            ready_stream_handle=run_stream.cuda_stream,
         )
 
         with pytest.raises(
@@ -889,10 +1036,173 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
 
 
-def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
+def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contract():
+    plan_parameters = inspect.signature(BatchPrefillTSWrapper.plan).parameters
+    run_parameters = inspect.signature(BatchPrefillTSWrapper.run).parameters
+
+    assert tuple(plan_parameters) == (
+        "self",
+        "device",
+        "batch_size",
+        "max_seq_len_q",
+        "max_kv_len",
+        "num_qo_heads",
+        "num_kv_heads",
+        "head_dim",
+        "q_dtype",
+        "kv_dtype",
+        "out_dtype",
+        "packed",
+        "mask_type",
+        "window_left",
+        "sm_scale",
+        "output_scale",
+    )
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for name, parameter in plan_parameters.items()
+        if name != "self"
+    )
+    assert tuple(run_parameters) == (
+        "self",
+        "q",
+        "k",
+        "v",
+        "qo_indptr",
+        "kv_indptr",
+        "variable_window_token_starts",
+        "variable_window_token_ends",
+        "out",
+        "scale_softmax_log2",
+        "output_scale",
+        "validate",
+    )
+    assert run_parameters["qo_indptr"].default is None
+    assert run_parameters["kv_indptr"].default is None
+    assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["validate"].default is True
+    assert context_module._ContextPlanState.__dataclass_params__.frozen is True
+
+
+@pytest.mark.parametrize(
+    ("wrapper_type", "compile_name"),
+    (
+        (BatchPrefillTSWrapper, "_get_compiled_context"),
+        (BatchPrefillPagedTSWrapper, "_get_compiled_paged_context"),
+    ),
+    ids=("contiguous", "paged"),
+)
+def test_attention_ts_context_reusable_plan_rejects_capture_before_side_effects(
+    monkeypatch,
+    wrapper_type,
+    compile_name: str,
+) -> None:
+    """Capture rejection precedes plan-owned allocations and kernel JIT."""
+
+    wrapper = wrapper_type()
+    stream = _FakeCudaStream()
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def fail_after_capture_check(*_args, **_kwargs):
+        pytest.fail("capture rejection occurred after a plan side effect")
+
+    monkeypatch.setattr(torch, "tensor", fail_after_capture_check)
+    monkeypatch.setattr(torch, "empty", fail_after_capture_check)
+    monkeypatch.setattr(context_module, compile_name, fail_after_capture_check)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{wrapper_type.__name__} planning is unsupported during CUDA Graph capture",
+    ):
+        wrapper.plan(
+            device="cuda:0",
+            batch_size=1,
+            max_seq_len_q=1,
+            max_kv_len=1,
+            num_qo_heads=1,
+            num_kv_heads=1,
+            head_dim=128,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+        )
+
+
+def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
+    parameters = inspect.signature(batch_prefill_with_paged_kv_cache).parameters
+    required_parameters = (
+        "q",
+        "k_cache",
+        "v_cache",
+        "qo_indptr",
+        "block_tables",
+        "seq_lens_kv",
+    )
+    keyword_only_defaults = {
+        "page_size": 32,
+        "kv_layout": "HND",
+        "mask_type": "dense",
+        "window_left": -1,
+        "sm_scale": None,
+        "output_scale": 1.0,
+        "out_dtype": None,
+        "out": None,
+    }
+
+    assert tuple(parameters) == (*required_parameters, *keyword_only_defaults)
+    assert all(
+        parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and parameters[name].default is inspect.Parameter.empty
+        for name in required_parameters
+    )
+    assert all(
+        parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        for name in keyword_only_defaults
+    )
+    assert {
+        name: parameters[name].default for name in keyword_only_defaults
+    } == keyword_only_defaults
+
+
+def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
     monkeypatch,
 ) -> None:
-    """The convenience API adapts canonical CSR above the fixed native wrapper."""
+    """One-shot planning must not perform host metadata reads during capture."""
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    q = torch.empty((1, 1, 2, 128), dtype=torch.float16)
+    k = torch.empty((1, 1, 1, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    with pytest.raises(RuntimeError, match="cannot derive host plan bounds"):
+        batch_prefill(q, k, v)
+
+    paged_q = q.reshape(1, 2, 128)
+    k_cache = torch.empty((1, 1, 32, 128), dtype=torch.float16)
+    v_cache = torch.empty_like(k_cache)
+    qo_indptr = torch.tensor((0, 1), dtype=torch.int32)
+    block_tables = torch.tensor(((0,),), dtype=torch.int32)
+    seq_lens_kv = torch.tensor((1,), dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="cannot derive host plan bounds"):
+        batch_prefill_with_paged_kv_cache(
+            paged_q,
+            k_cache,
+            v_cache,
+            qo_indptr,
+            block_tables,
+            seq_lens_kv,
+        )
+
+
+def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
+    monkeypatch,
+) -> None:
+    """The convenience API preserves caller-owned fixed metadata tensors."""
 
     calls = {}
 
@@ -907,7 +1217,7 @@ def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
             calls["run"] = (args, kwargs)
             return kwargs["out"]
 
-    geometry = context_module._PagedContextOneShotGeometry(
+    geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
         max_seq_len_q=8,
@@ -917,16 +1227,18 @@ def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
         num_kv_heads=2,
         head_dim=128,
         q_dtype=torch.float16,
+        kv_dtype=torch.float16,
         output_dtype=torch.float16,
     )
-    metadata = context_module._PagedContextOneShotMetadata(
-        seq_lens=(33, 65),
-        block_tables=((3, 1, -1), (7, 0, 2)),
-    )
+
+    def resolve(*args, **kwargs):
+        calls["resolve"] = (args, kwargs)
+        return geometry
+
     monkeypatch.setattr(
         context_module,
         "_resolve_paged_one_shot_inputs",
-        lambda *_args, **_kwargs: (geometry, metadata),
+        resolve,
     )
     monkeypatch.setattr(context_module, "BatchPrefillPagedTSWrapper", StubWrapper)
 
@@ -934,9 +1246,8 @@ def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
     k_cache = torch.empty((8, 2, 32, 128), dtype=torch.float16)
     v_cache = torch.empty_like(k_cache)
     qo_indptr = torch.tensor((0, 4, 9), dtype=torch.int32)
-    paged_kv_indptr = torch.tensor((0, 2, 5), dtype=torch.int32)
-    paged_kv_indices = torch.tensor((3, 1, 7, 0, 2), dtype=torch.int32)
-    last_page_len = torch.tensor((1, 1), dtype=torch.int32)
+    block_tables = torch.tensor(((3, 1, -1), (7, 0, 2)), dtype=torch.int32)
+    seq_lens_kv = torch.tensor((33, 65), dtype=torch.int32)
     out = torch.empty_like(q)
 
     returned = batch_prefill_with_paged_kv_cache(
@@ -944,51 +1255,68 @@ def test_attention_ts_context_paged_one_shot_converts_csr_for_wrapper(
         k_cache,
         v_cache,
         qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        last_page_len,
+        block_tables,
+        seq_lens_kv,
         out=out,
     )
 
     assert returned is out
+    resolve_args, resolve_kwargs = calls["resolve"]
+    assert resolve_args == (q, k_cache, v_cache)
+    assert resolve_kwargs["qo_indptr"] is qo_indptr
+    assert resolve_kwargs["block_tables"] is block_tables
+    assert resolve_kwargs["seq_lens_kv"] is seq_lens_kv
     assert calls["plan"]["max_kv_len"] == 65
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
-    torch.testing.assert_close(
-        run_args[4],
-        torch.tensor(((3, 1, -1), (7, 0, 2)), dtype=torch.int32),
-    )
-    torch.testing.assert_close(run_args[5], torch.tensor((33, 65), dtype=torch.int32))
+    assert run_args[4] is block_tables
+    assert run_args[5] is seq_lens_kv
     assert tuple(run_kwargs) == ("out",)
     assert run_kwargs["out"] is out
 
 
-def test_attention_ts_context_paged_one_shot_builds_rectangular_table(
-    monkeypatch,
-) -> None:
-    """Ragged canonical CSR rows are padded only in the compatibility layer."""
+def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
+    """Retain value validation while substituting CPU storage in unit tests."""
 
     monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
     monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
     monkeypatch.setattr(
         context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
     )
     monkeypatch.setattr(
         context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
     )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
+    )
+
+
+def test_attention_ts_context_paged_one_shot_validates_fixed_table(
+    monkeypatch,
+) -> None:
+    """One-shot planning derives bounds from direct fixed-table metadata."""
+
+    _enable_paged_one_shot_cpu_validation(monkeypatch)
     q = torch.empty((3, 4, 128), dtype=torch.bfloat16)
     k_cache = torch.empty((5, 2, 32, 128), dtype=torch.bfloat16)
     v_cache = torch.empty_like(k_cache)
+    block_tables = torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32)
+    seq_lens_kv = torch.tensor((17, 65), dtype=torch.int32)
 
-    geometry, metadata = context_module._resolve_paged_one_shot_inputs(
+    geometry = context_module._resolve_paged_one_shot_inputs(
         q,
         k_cache,
         v_cache,
         qo_indptr=torch.tensor((0, 1, 3), dtype=torch.int32),
-        paged_kv_indptr=torch.tensor((0, 1, 4), dtype=torch.int32),
-        paged_kv_indices=torch.tensor((4, 1, 3, 0), dtype=torch.int32),
-        paged_kv_last_page_len=torch.tensor((17, 1), dtype=torch.int32),
+        block_tables=block_tables,
+        seq_lens_kv=seq_lens_kv,
         page_size=32,
         mask_type="dense",
         window_left=-1,
@@ -996,90 +1324,38 @@ def test_attention_ts_context_paged_one_shot_builds_rectangular_table(
     )
 
     assert geometry.max_kv_len == 65
-    assert metadata.seq_lens == (17, 65)
-    assert metadata.block_tables == ((4, -1, -1), (1, 3, 0))
+    assert geometry.max_seq_len_q == 2
+    assert geometry.batch_size == 2
 
 
-def test_attention_ts_context_paged_one_shot_ignores_aggregate_kv_extent(
+@pytest.mark.parametrize(
+    ("block_tables", "seq_lens_kv", "match"),
+    (
+        (((4, -1), (1, 3)), (17, 65), "at least ceil"),
+        (((5, -1, -1), (1, 3, 0)), (17, 65), "active block_tables"),
+        (((4, -1, -1), (1, 3, 0)), (0, 65), "entries must be positive"),
+    ),
+    ids=("short-row", "invalid-active-page", "nonpositive-kv-length"),
+)
+def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
     monkeypatch,
+    block_tables: tuple[tuple[int, ...], ...],
+    seq_lens_kv: tuple[int, ...],
+    match: str,
 ) -> None:
-    """One-shot CSR adaptation needs only per-request K/V Int32 extents."""
-
-    batch_size = 17
-    monkeypatch.setattr(context_module, "_CONTEXT_PADDED_EXTENT_MAX", 128)
-    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
-    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
-    monkeypatch.setattr(
-        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
-    )
-
-    q = torch.empty((batch_size, 4, 128), dtype=torch.bfloat16)
-    k_cache = torch.empty((2, 4, 32, 128), dtype=torch.bfloat16)
+    _enable_paged_one_shot_cpu_validation(monkeypatch)
+    q = torch.empty((3, 4, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((5, 2, 32, 128), dtype=torch.bfloat16)
     v_cache = torch.empty_like(k_cache)
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
-    paged_kv_indptr = 2 * qo_indptr
-    paged_kv_indices = torch.tensor((0, 1) * batch_size, dtype=torch.int32)
-    paged_kv_last_page_len = torch.ones(batch_size, dtype=torch.int32)
 
-    geometry, metadata = context_module._resolve_paged_one_shot_inputs(
-        q,
-        k_cache,
-        v_cache,
-        qo_indptr=qo_indptr,
-        paged_kv_indptr=paged_kv_indptr,
-        paged_kv_indices=paged_kv_indices,
-        paged_kv_last_page_len=paged_kv_last_page_len,
-        page_size=32,
-        mask_type="dense",
-        window_left=-1,
-        output_dtype=torch.bfloat16,
-    )
-
-    assert geometry.max_kv_len == 33
-    assert metadata.seq_lens == (33,) * batch_size
-    assert metadata.block_tables == ((0, 1),) * batch_size
-    assert sum(metadata.seq_lens) > context_module._CONTEXT_PADDED_EXTENT_MAX
-
-
-def test_attention_ts_context_paged_one_shot_bounds_rectangular_table(
-    monkeypatch,
-) -> None:
-    """Reject an oversized rectangular expansion before materializing it."""
-
-    batch_size = 17
-    monkeypatch.setattr(context_module, "_INT32_MAX", 33)
-    monkeypatch.setattr(context_module, "_validate_base_tensors", lambda *_a: None)
-    monkeypatch.setattr(context_module, "_validate_device", lambda _device: 0)
-    monkeypatch.setattr(
-        context_module, "_validate_indptr_tensor", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module, "_validate_paged_metadata_tensor", lambda *_a, **_k: None
-    )
-
-    q = torch.empty((batch_size, 4, 128), dtype=torch.bfloat16)
-    k_cache = torch.empty((2, 4, 32, 128), dtype=torch.bfloat16)
-    v_cache = torch.empty_like(k_cache)
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32)
-    paged_kv_indptr = 2 * qo_indptr
-    paged_kv_indices = torch.tensor((0, 1) * batch_size, dtype=torch.int32)
-    paged_kv_last_page_len = torch.ones(batch_size, dtype=torch.int32)
-
-    with pytest.raises(
-        NotImplementedError,
-        match="block_tables elements must fit in a signed int32",
-    ):
+    with pytest.raises(ValueError, match=match):
         context_module._resolve_paged_one_shot_inputs(
             q,
             k_cache,
             v_cache,
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=paged_kv_last_page_len,
+            qo_indptr=torch.tensor((0, 1, 3), dtype=torch.int32),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32),
+            seq_lens_kv=torch.tensor(seq_lens_kv, dtype=torch.int32),
             page_size=32,
             mask_type="dense",
             window_left=-1,
@@ -1087,11 +1363,195 @@ def test_attention_ts_context_paged_one_shot_bounds_rectangular_table(
         )
 
 
+def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
+    monkeypatch,
+) -> None:
+    compile_calls = []
+    launch_calls = []
+    run_stream, ready_events, _ = _enable_context_cpu_lifecycle(monkeypatch)
+
+    def compiled(*args):
+        launch_calls.append(args)
+
+    def fake_compile(*key):
+        compile_calls.append(key)
+        return compiled, (("scheduler", "test"),)
+
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(context_module, "_get_compiled_context", fake_compile)
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device="cuda:0",
+        batch_size=2,
+        max_seq_len_q=8,
+        max_kv_len=10,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        packed=True,
+    )
+    state = wrapper._plan_state
+    assert state is not None
+    assert state.ready_event is ready_events[0]
+    assert state.ready_stream_handle == run_stream.cuda_stream
+
+    first = (
+        torch.empty((8, 4, 128), dtype=torch.float16),
+        torch.empty((10, 2, 128), dtype=torch.float16),
+        torch.empty((10, 2, 128), dtype=torch.float16),
+        torch.tensor((0, 3, 8), dtype=torch.int32),
+        torch.tensor((0, 4, 10), dtype=torch.int32),
+    )
+    second = (
+        torch.empty((7, 4, 128), dtype=torch.float16),
+        torch.empty((9, 2, 128), dtype=torch.float16),
+        torch.empty((9, 2, 128), dtype=torch.float16),
+        torch.tensor((0, 6, 7), dtype=torch.int32),
+        torch.tensor((0, 2, 9), dtype=torch.int32),
+    )
+    first_out = torch.empty_like(first[0])
+    second_out = torch.empty_like(second[0])
+    scale_softmax_log2 = torch.tensor((0.25,), dtype=torch.float32)
+    output_scale = torch.tensor((0.5,), dtype=torch.float32)
+
+    wrapper.run(*first, out=first_out, validate=False)
+    wrapper.run(
+        *second,
+        out=second_out,
+        scale_softmax_log2=scale_softmax_log2,
+        output_scale=output_scale,
+        validate=False,
+    )
+
+    assert len(compile_calls) == 1
+    assert len(launch_calls) == 2
+    assert launch_calls[0][0].shape[0] == 8
+    assert launch_calls[1][0].shape[0] == 7
+    assert launch_calls[0][6] is first[3]
+    assert launch_calls[0][7] is first[4]
+    assert launch_calls[1][6] is second[3]
+    assert launch_calls[1][7] is second[4]
+    assert launch_calls[0][4] is state.scale_softmax_log2
+    assert launch_calls[0][5] is state.output_scale
+    assert launch_calls[1][4] is scale_softmax_log2
+    assert launch_calls[1][5] is output_scale
+    assert state.geometry.uniform_packed_lengths is False
+    assert state.geometry.packed_dense_k_mask is True
+    for request_name in (
+        "q",
+        "k",
+        "v",
+        "qo_indptr",
+        "kv_indptr",
+        "variable_window_token_starts",
+        "variable_window_token_ends",
+    ):
+        assert not hasattr(state, request_name)
+
+
+def test_attention_ts_context_variable_window_bounds_are_runtime_state(
+    monkeypatch,
+) -> None:
+    launch_calls = []
+    run_stream, _, recorded_tensor_calls = _enable_context_cpu_lifecycle(monkeypatch)
+
+    def compiled(*args):
+        assert len(recorded_tensor_calls) == 1
+        launch_calls.append(args)
+
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_get_compiled_context",
+        lambda *_key: (compiled, ()),
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device="cuda:0",
+        batch_size=2,
+        max_seq_len_q=3,
+        max_kv_len=4,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        head_dim=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        mask_type="variable_window",
+    )
+    state = wrapper._plan_state
+    assert state is not None
+    refresh = context_module._refresh_variable_window_cta_starts
+
+    def refresh_after_lifetime_record(*args, **kwargs):
+        assert len(recorded_tensor_calls) == 1
+        return refresh(*args, **kwargs)
+
+    monkeypatch.setattr(
+        context_module,
+        "_refresh_variable_window_cta_starts",
+        refresh_after_lifetime_record,
+    )
+    q = torch.empty((2, 3, 2, 128), dtype=torch.float16)
+    k = torch.empty((2, 4, 1, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    starts = torch.tensor(((0, 1, 1), (0, 0, 2)), dtype=torch.int32)
+    ends = torch.tensor(((1, 2, 3), (0, 2, 3)), dtype=torch.int32)
+    scale_softmax_log2 = torch.tensor((0.25,), dtype=torch.float32)
+    output_scale = torch.tensor((0.5,), dtype=torch.float32)
+
+    returned = wrapper.run(
+        q,
+        k,
+        v,
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        out=out,
+        scale_softmax_log2=scale_softmax_log2,
+        output_scale=output_scale,
+        validate=False,
+    )
+
+    assert returned is out
+    assert len(launch_calls) == 1
+    launch = launch_calls[0]
+    assert launch[4] is scale_softmax_log2
+    assert launch[5] is output_scale
+    assert launch[8].data_ptr() == starts.data_ptr()
+    assert launch[9].data_ptr() == ends.data_ptr()
+    assert launch[10] is state.variable_window_cta_starts
+    assert state.variable_window_padded_starts is not None
+    assert len(recorded_tensor_calls) == 1
+    recorded_stream, *recorded_tensors = recorded_tensor_calls[0]
+    assert recorded_stream is run_stream
+    expected_recorded_tensors = (state.variable_window_padded_starts, *launch)
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            recorded_tensors, expected_recorded_tensors, strict=True
+        )
+    )
+    assert not hasattr(state, "variable_window_token_starts")
+    assert not hasattr(state, "variable_window_token_ends")
+
+
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     monkeypatch,
 ) -> None:
     compile_calls = []
     launch_calls = []
+    run_stream, ready_events, _ = _enable_context_cpu_lifecycle(monkeypatch)
 
     def compiled(*args):
         launch_calls.append(args)
@@ -1120,6 +1580,9 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         kv_dtype=torch.float16,
     )
     first_state = wrapper._plan_state
+    assert first_state is not None
+    assert first_state.ready_event is ready_events[0]
+    assert first_state.ready_stream_handle == run_stream.cuda_stream
     with pytest.raises(ValueError, match="max_kv_len must be positive"):
         wrapper.plan(
             device="cuda:0",
@@ -1183,6 +1646,7 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
     monkeypatch,
 ) -> None:
     compile_count = 0
+    _enable_context_cpu_lifecycle(monkeypatch)
 
     def fake_compile(*_key):
         nonlocal compile_count
@@ -1219,9 +1683,62 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
     assert compile_count == 2
 
 
+def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
+    monkeypatch,
+) -> None:
+    compile_count = 0
+    launch_count = 0
+    _enable_context_cpu_lifecycle(monkeypatch)
+
+    def fake_compile(*_key):
+        nonlocal compile_count
+        compile_count += 1
+        if compile_count == 2:
+            raise RuntimeError("synthetic compile failure")
+
+        def launch(*_args):
+            nonlocal launch_count
+            launch_count += 1
+
+        return launch, (("scheduler", "test"),)
+
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(context_module, "_get_compiled_context", fake_compile)
+    plan_kwargs = dict(
+        device="cuda:0",
+        batch_size=2,
+        max_seq_len_q=3,
+        max_kv_len=4,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        head_dim=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(**plan_kwargs)
+    previous_state = wrapper._plan_state
+
+    with pytest.raises(RuntimeError, match="synthetic compile failure"):
+        wrapper.plan(**plan_kwargs, output_scale=0.5)
+
+    assert wrapper._plan_state is previous_state
+    q = torch.empty((2, 3, 2, 128), dtype=torch.float16)
+    k = torch.empty((2, 4, 1, 128), dtype=torch.float16)
+    wrapper.run(q, k, torch.empty_like(k), out=torch.empty_like(q), validate=False)
+    assert compile_count == 2
+    assert launch_count == 1
+
+
 def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     monkeypatch,
 ) -> None:
+    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
+
     def fail(*_args, **_kwargs):
         pytest.fail("validate=False reached an explicit runtime validator")
 
@@ -1235,11 +1752,13 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     launched = []
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
-        geometry=SimpleNamespace(output_dtype=out.dtype),
+        geometry=SimpleNamespace(device=torch.device("cpu"), output_dtype=out.dtype),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *args: launched.append(args),
         policy=(),
+        ready_event=object(),
+        ready_stream_handle=run_stream.cuda_stream,
     )
     inputs = tuple(torch.empty(1) for _ in range(6))
     scale_softmax_log2 = torch.empty(1)
@@ -1256,6 +1775,159 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
         is out
     )
     assert len(launched) == 1
+
+
+@pytest.mark.parametrize("scale_name", ("scale_softmax_log2", "output_scale"))
+@pytest.mark.parametrize(
+    "invalid_value",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+    ),
+)
+def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
+    monkeypatch,
+    scale_name: str,
+    invalid_value: float,
+) -> None:
+    """Value checks remain active for each validated per-run scale override."""
+
+    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_metadata", lambda *_a, **_k: None
+    )
+    # Substitute CPU storage for the CUDA-only structure check; dtype, shape,
+    # layout, alignment, device matching, and scalar-value checks remain real.
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+
+    launched = []
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper._plan_state = context_module._PagedContextPlanState(
+        geometry=SimpleNamespace(
+            device=torch.device("cpu"), output_dtype=torch.float32
+        ),
+        scale_softmax_log2=torch.tensor((0.25,), dtype=torch.float32),
+        output_scale=torch.tensor((0.5,), dtype=torch.float32),
+        compiled=lambda *args: launched.append(args),
+        policy=(),
+        ready_event=object(),
+        ready_stream_handle=run_stream.cuda_stream,
+    )
+    inputs = tuple(torch.empty(1) for _ in range(6))
+    invalid_scale = torch.tensor((invalid_value,), dtype=torch.float32)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{scale_name} must be finite and positive",
+    ):
+        wrapper.run(
+            *inputs,
+            **{scale_name: invalid_scale},
+            validate=True,
+        )
+
+    assert launched == []
+
+
+def test_attention_ts_context_paged_run_forwards_valid_scales_and_lifecycle(
+    monkeypatch,
+) -> None:
+    """Validated overrides are forwarded after the plan/event lifetime fence."""
+
+    run_stream, _, recorded_tensor_calls = _enable_context_cpu_lifecycle(monkeypatch)
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        context_module, "_validate_paged_runtime_metadata", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
+
+    launched = []
+    ready_event = object()
+
+    def compiled(*args):
+        assert run_stream.waited_events == [ready_event]
+        assert len(recorded_tensor_calls) == 1
+        launched.append(args)
+
+    plan_scale_softmax_log2 = torch.tensor((0.125,), dtype=torch.float32)
+    plan_output_scale = torch.tensor((0.75,), dtype=torch.float32)
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper._plan_state = context_module._PagedContextPlanState(
+        geometry=SimpleNamespace(
+            device=torch.device("cpu"), output_dtype=torch.float32
+        ),
+        scale_softmax_log2=plan_scale_softmax_log2,
+        output_scale=plan_output_scale,
+        compiled=compiled,
+        policy=(),
+        ready_event=ready_event,
+        ready_stream_handle=run_stream.cuda_stream + 1,
+    )
+    q, k_cache, v_cache, qo_indptr, block_tables, seq_lens_kv = (
+        torch.empty(1) for _ in range(6)
+    )
+    out = torch.empty_like(q)
+    scale_softmax_log2 = torch.tensor((0.25,), dtype=torch.float32)
+    output_scale = torch.tensor((0.5,), dtype=torch.float32)
+
+    returned = wrapper.run(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr,
+        block_tables,
+        seq_lens_kv,
+        out=out,
+        scale_softmax_log2=scale_softmax_log2,
+        output_scale=output_scale,
+        validate=True,
+    )
+
+    assert returned is out
+    assert run_stream.waited_events == [ready_event]
+    assert len(recorded_tensor_calls) == 1
+    recorded_stream, *recorded_tensors = recorded_tensor_calls[0]
+    assert recorded_stream is run_stream
+    expected_recorded_tensors = (
+        q,
+        k_cache,
+        v_cache,
+        out,
+        qo_indptr,
+        block_tables,
+        seq_lens_kv,
+        scale_softmax_log2,
+        output_scale,
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            recorded_tensors, expected_recorded_tensors, strict=True
+        )
+    )
+    assert len(launched) == 1
+    expected_launch = (
+        q,
+        k_cache,
+        v_cache,
+        out,
+        scale_softmax_log2,
+        output_scale,
+        qo_indptr,
+        block_tables,
+        seq_lens_kv,
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(launched[0], expected_launch, strict=True)
+    )
 
 
 def test_attention_ts_context_paged_run_keeps_lifecycle_check_without_validation():
@@ -1277,11 +1949,15 @@ def test_attention_ts_context_paged_run_keeps_lifecycle_check_without_validation
 def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
-        geometry=SimpleNamespace(output_dtype=torch.float32),
+        geometry=SimpleNamespace(
+            device=torch.device("cpu"), output_dtype=torch.float32
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),
+        ready_event=object(),
+        ready_stream_handle=0,
     )
     placeholder = torch.empty(0)
 
@@ -2045,7 +2721,6 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
 
     q = torch.empty((1, 8, 4, 128), dtype=torch.bfloat16, device="cuda")
     k = torch.empty((1, 8, 2, 128), dtype=torch.bfloat16, device="cuda")
-    v = torch.empty_like(k)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (9, 0)
     )
@@ -2053,7 +2728,17 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
         NotImplementedError,
         match=r"requires an SM100a/B200.*GPU.*\(9, 0\)",
     ):
-        BatchPrefillTSWrapper().plan(q, k, v)
+        BatchPrefillTSWrapper().plan(
+            device=q.device,
+            batch_size=1,
+            max_seq_len_q=8,
+            max_kv_len=8,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2089,17 +2774,26 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
     head_dim = 64 if invalid_contract == "head-dim" else _HEAD_DIM
     num_qo_heads = 3 if invalid_contract == "head-ratio" else 4
     num_kv_heads = 2
-    plan_kwargs = {}
+    plan_kwargs = dict(
+        device=device,
+        batch_size=1,
+        max_seq_len_q=8,
+        max_kv_len=8,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+    )
 
     if invalid_contract == "packed-offset":
         q = torch.empty((2, num_qo_heads, head_dim), dtype=dtype, device=device)
         k = torch.empty((2, num_kv_heads, head_dim), dtype=dtype, device=device)
         v = torch.empty_like(k)
         # The terminal Q offset must cover both packed query rows.
-        plan_kwargs.update(
-            qo_indptr=torch.tensor((0, 1), dtype=torch.int32, device=device),
-            kv_indptr=torch.tensor((0, 2), dtype=torch.int32, device=device),
-        )
+        qo_indptr = torch.tensor((0, 1), dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor((0, 2), dtype=torch.int32, device=device)
+        plan_kwargs.update(batch_size=1, max_seq_len_q=2, max_kv_len=2, packed=True)
     else:
         q = torch.empty((1, 8, num_qo_heads, head_dim), dtype=dtype, device=device)
         k = torch.empty((1, 8, num_kv_heads, head_dim), dtype=dtype, device=device)
@@ -2108,7 +2802,10 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         plan_kwargs["window_left"] = 1
 
     with pytest.raises(error_type, match=message):
-        BatchPrefillTSWrapper().plan(q, k, v, **plan_kwargs)
+        if invalid_contract == "packed-offset":
+            batch_prefill(q, k, v, qo_indptr=qo_indptr, kv_indptr=kv_indptr)
+        else:
+            BatchPrefillTSWrapper().plan(**plan_kwargs)
 
 
 @pytest.mark.parametrize("page_size", (16, 32, 64, 128))
@@ -2191,7 +2888,7 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
 @pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_plan_rejects_causal_q_longer_than_kv(paged: bool):
+def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
     """Bottom-right causal attention requires Sq <= Sk for every request."""
 
     if paged:
@@ -2223,26 +2920,21 @@ def test_attention_ts_context_plan_rejects_causal_q_longer_than_kv(paged: bool):
         match=r"batch 1: Sq=3, Sk=2",
     ):
         if paged:
+            metadata = _make_native_paged_metadata(case)
             batch_prefill_with_paged_kv_cache(
                 case.reference.q,
                 case.k_cache,
                 case.v_cache,
                 case.qo_indptr,
-                case.paged_kv_indptr,
-                case.paged_kv_indices,
-                case.paged_kv_last_page_len,
+                metadata.block_tables,
+                metadata.seq_lens_kv,
                 page_size=32,
                 mask_type="causal",
             )
         else:
-            BatchPrefillTSWrapper().plan(
-                case.q,
-                case.k,
-                case.v,
-                qo_indptr=case.qo_indptr,
-                kv_indptr=case.kv_indptr,
-                mask_type="causal",
-            )
+            wrapper = BatchPrefillTSWrapper()
+            _plan_wrapper(wrapper, case)
+            _run_wrapper(wrapper, case)
 
 
 def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
@@ -2599,7 +3291,7 @@ def test_attention_ts_context_bounded_public_correctness_matrix(
     if use_wrapper:
         wrapper = BatchPrefillTSWrapper()
         _plan_wrapper(wrapper, case)
-        actual = wrapper.run(case.q, case.k, case.v)
+        actual = _run_wrapper(wrapper, case)
     else:
         actual = _run_one_shot(case)
     _assert_context_correct(actual, case)
@@ -2673,18 +3365,13 @@ def test_attention_ts_context_variable_window_t1_i1_t2_i2(
     ]
 
     wrapper = BatchPrefillTSWrapper()
-    wrapper.plan(
-        case.q,
-        case.k,
-        case.v,
-        mask_type="variable_window",
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(
+        wrapper,
+        case,
         variable_window_token_starts=starts,
         variable_window_token_ends=ends,
-        sm_scale=case.sm_scale,
-        output_scale=case.output_scale,
-        out_dtype=case.output_dtype,
     )
-    actual = wrapper.run(case.q, case.k, case.v)
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(actual, case, expected=expected)
 
@@ -2716,18 +3403,13 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
     ends = torch.full((1, seq_len_q), seq_len_k - 1, dtype=torch.int32, device="cuda")
 
     wrapper = BatchPrefillTSWrapper()
-    wrapper.plan(
-        case.q,
-        case.k,
-        case.v,
-        mask_type="variable_window",
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(
+        wrapper,
+        case,
         variable_window_token_starts=starts,
         variable_window_token_ends=ends,
-        sm_scale=case.sm_scale,
-        output_scale=case.output_scale,
-        out_dtype=case.output_dtype,
     )
-    actual = wrapper.run(case.q, case.k, case.v)
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(actual, case, expected=expected)
 
@@ -2759,18 +3441,13 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
     starts = torch.clamp(ends - 7, min=0)
 
     wrapper = BatchPrefillTSWrapper()
-    wrapper.plan(
-        case.q,
-        case.k,
-        case.v,
-        mask_type="variable_window",
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(
+        wrapper,
+        case,
         variable_window_token_starts=starts,
         variable_window_token_ends=ends,
-        sm_scale=case.sm_scale,
-        output_scale=case.output_scale,
-        out_dtype=case.output_dtype,
     )
-    actual = wrapper.run(case.q, case.k, case.v)
     expected = _variable_window_reference(case, starts, ends)
     _assert_context_correct(actual, case, expected=expected)
 
@@ -2799,11 +3476,15 @@ def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
         )
         wrapper = BatchPrefillTSWrapper()
         _plan_wrapper(wrapper, case)
-        actual = wrapper.run(case.q, case.k, case.v)
+        actual = _run_wrapper(wrapper, case)
         _assert_context_correct(actual, case)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled is wrappers[1]._compiled
+    first_state = wrappers[0]._plan_state
+    second_state = wrappers[1]._plan_state
+    assert first_state is not None
+    assert second_state is not None
+    assert first_state.compiled is second_state.compiled
 
 
 @pytest.mark.arch_blackwell
@@ -2825,25 +3506,77 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
             seed=2026071430 + batch_size,
         )
         wrapper = BatchPrefillPagedTSWrapper()
-        wrapper.plan(
-            case.reference.q,
-            case.k_cache,
-            case.v_cache,
-            case.qo_indptr,
-            case.paged_kv_indptr,
-            case.paged_kv_indices,
-            case.paged_kv_last_page_len,
-            page_size=case.page_size,
-            mask_type=case.reference.mask_type,
-            sm_scale=case.reference.sm_scale,
-            output_scale=case.reference.output_scale,
-            out_dtype=case.reference.output_dtype,
-        )
-        actual = wrapper.run(case.reference.q, case.k_cache, case.v_cache)
+        metadata = _plan_paged_wrapper(wrapper, case)
+        actual = _run_paged_wrapper(wrapper, case, metadata)
         _assert_context_correct(actual, case.reference)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled is wrappers[1]._compiled
+    first_state = wrappers[0]._plan_state
+    second_state = wrappers[1]._plan_state
+    assert first_state is not None
+    assert second_state is not None
+    assert first_state.compiled is second_state.compiled
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
+    """Graph replay refreshes CTA minima from in-place-updated window bounds."""
+
+    seq_len = 129
+    case = _make_context_case(
+        q_lengths=(seq_len,),
+        k_lengths=(seq_len,),
+        num_qo_heads=2,
+        num_kv_heads=1,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=128,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026090401,
+    )
+    starts = torch.full((1, seq_len), 128, dtype=torch.int32, device="cuda")
+    ends = torch.full((1, seq_len), seq_len - 1, dtype=torch.int32, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+
+    assert (
+        _run_wrapper(
+            wrapper,
+            case,
+            variable_window_token_starts=starts,
+            variable_window_token_ends=ends,
+            out=graph_out,
+        )
+        is graph_out
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_wrapper(
+            wrapper,
+            case,
+            variable_window_token_starts=starts,
+            variable_window_token_ends=ends,
+            out=graph_out,
+            validate=False,
+        )
+    assert captured is graph_out
+    assert wrapper._plan_state is not None
+    assert wrapper._plan_state.variable_window_cta_starts.tolist() == [128]
+
+    starts.zero_()
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert wrapper._plan_state.variable_window_cta_starts.tolist() == [0]
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(graph_out, case, expected=expected)
 
 
 @pytest.mark.arch_blackwell
@@ -2937,8 +3670,9 @@ def test_attention_ts_context_uniform_aligned_packed_dense_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["uniform_packed_lengths"] is False
-    _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
 @pytest.mark.arch_blackwell
@@ -2959,8 +3693,9 @@ def test_attention_ts_context_uniform_packed_offsets_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["uniform_packed_lengths"] is True
-    _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
 @pytest.mark.arch_blackwell
@@ -2982,8 +3717,9 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["uniform_packed_lengths"] is True
-    _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
@@ -3157,7 +3893,7 @@ def test_attention_ts_context_fixed_window_tail_excludes_left_marker():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    actual = wrapper.run(case.q, case.k, case.v)
+    actual = _run_wrapper(wrapper, case)
     _assert_context_correct(actual, case)
     assert torch.count_nonzero(actual) == 0
 
@@ -3217,7 +3953,7 @@ def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    output = wrapper.run(case.q, case.k, case.v)
+    output = _run_wrapper(wrapper, case)
     _assert_context_correct(output, case)
     assert torch.count_nonzero(output[0, 0]) == 0
 
@@ -3242,9 +3978,11 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
 
     for _ in range(2):
-        output = wrapper.run(case.q, case.k, case.v)
+        output = _run_wrapper(wrapper, case)
         _assert_context_correct(output, case)
 
 
@@ -3554,19 +4292,13 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     graph.replay()
     torch.cuda.synchronize()
 
-    last_page_len = torch.tensor(
-        tuple((length - 1) % case.page_size + 1 for length in runtime_k_lengths),
-        dtype=torch.int32,
-        device="cuda",
-    )
     one_shot_out = batch_prefill_with_paged_kv_cache(
         case.reference.q,
         case.k_cache,
         case.v_cache,
         metadata.qo_indptr,
-        torch.tensor(runtime_page_indptr, dtype=torch.int32, device="cuda"),
-        torch.tensor(runtime_page_indices, dtype=torch.int32, device="cuda"),
-        last_page_len,
+        metadata.block_tables,
+        metadata.seq_lens_kv,
         page_size=case.page_size,
         mask_type=case.reference.mask_type,
         sm_scale=case.reference.sm_scale,
@@ -3596,8 +4328,9 @@ def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["scheduler"] == "clc_dynamic_persistent"
-    output = wrapper.run(case.q, case.k, case.v)
+    assert wrapper._plan_state is not None
+    assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
+    output = _run_wrapper(wrapper, case)
     _assert_context_correct(output, case)
 
 
@@ -3617,15 +4350,15 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
         seed=2026071520,
     )
     _poison_invalid_paged_v_tails(case)
+    metadata = _make_native_paged_metadata(case)
     output = torch.full_like(case.reference.q, float("inf"))
     returned = batch_prefill_with_paged_kv_cache(
         case.reference.q,
         case.k_cache,
         case.v_cache,
         case.qo_indptr,
-        case.paged_kv_indptr,
-        case.paged_kv_indices,
-        case.paged_kv_last_page_len,
+        metadata.block_tables,
+        metadata.seq_lens_kv,
         page_size=32,
         mask_type="causal",
         sm_scale=case.reference.sm_scale,
@@ -3750,12 +4483,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
         assert reference.qo_indptr is not None
         qo_indptr = reference.qo_indptr
 
-    policy = (
-        wrapper._plan_state.policy
-        if isinstance(wrapper, BatchPrefillPagedTSWrapper)
-        and wrapper._plan_state is not None
-        else wrapper._policy
-    )
+    assert wrapper._plan_state is not None
+    policy = wrapper._plan_state.policy
     assert dict(policy)["scheduler"] == "clc_dynamic_persistent"
     graph_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
     graph = _capture_context_graph(
@@ -3765,6 +4494,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
         v,
         graph_out,
         paged_metadata,
+        qo_indptr=qo_indptr,
+        kv_indptr=reference.kv_indptr,
     )
 
     qo_indptr.copy_(runtime_qo_indptr)
@@ -3777,7 +4508,14 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
 
     direct_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
     if paged_metadata is None:
-        wrapper.run(q, k, v, out=direct_out)
+        wrapper.run(
+            q,
+            k,
+            v,
+            qo_indptr,
+            reference.kv_indptr,
+            out=direct_out,
+        )
     else:
         wrapper.run(
             q,
@@ -3832,12 +4570,21 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._geometry.has_q_offset is False
-    assert dict(wrapper._policy)["pairing"] == "query"
-    assert dict(wrapper._policy)["uniform_packed_lengths"] is False
+    assert wrapper._plan_state is not None
+    assert wrapper._plan_state.geometry.has_q_offset is True
+    assert dict(wrapper._plan_state.policy)["pairing"] == "query"
+    assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
 
     graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
-    graph = _capture_context_graph(wrapper, case.q, case.k, case.v, graph_out)
+    graph = _capture_context_graph(
+        wrapper,
+        case.q,
+        case.k,
+        case.v,
+        graph_out,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
 
     runtime_indptr = torch.tensor(
         _cumulative(replay_lengths), dtype=torch.int32, device="cuda"
@@ -3853,7 +4600,7 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
     expected = _context_reference(runtime_reference)
 
     direct_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
-    wrapper.run(case.q, case.k, case.v, out=direct_out)
+    _run_wrapper(wrapper, case, out=direct_out)
     graph_out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -3900,7 +4647,15 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
     graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
-    graph = _capture_context_graph(wrapper, case.q, case.k, case.v, graph_out)
+    graph = _capture_context_graph(
+        wrapper,
+        case.q,
+        case.k,
+        case.v,
+        graph_out,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
 
     assert case.kv_indptr is not None
     case.kv_indptr.copy_(
@@ -3910,7 +4665,7 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
     expected = _context_reference(runtime_reference)
 
     direct_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
-    wrapper.run(case.q, case.k, case.v, out=direct_out)
+    _run_wrapper(wrapper, case, out=direct_out)
     graph_out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -4003,6 +4758,141 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     _assert_context_correct(output, case.reference)
 
 
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_plan_ready_event_orders_cross_stream_run(
+    monkeypatch,
+    paged: bool,
+) -> None:
+    """A run stream consumes plan state without explicitly waiting on its stream."""
+
+    if paged:
+        paged_case = _make_paged_context_case(
+            q_lengths=(33, 17),
+            k_lengths=(129, 97),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            qkv_dtype=torch.bfloat16,
+            mask_type="causal",
+            page_size=32,
+            output_dtype=torch.bfloat16,
+            output_scale=1.0,
+            seed=2026090402,
+        )
+        reference = paged_case.reference
+        metadata = _make_native_paged_metadata(paged_case)
+        wrapper_type = BatchPrefillPagedTSWrapper
+        compile_name = "_get_compiled_paged_context"
+        plan_kwargs = dict(
+            device=reference.q.device,
+            batch_size=len(reference.q_lengths),
+            max_seq_len_q=max(reference.q_lengths),
+            max_kv_len=max(reference.k_lengths),
+            num_qo_heads=int(reference.q.shape[1]),
+            num_kv_heads=int(paged_case.k_cache.shape[1]),
+            head_dim=int(reference.q.shape[2]),
+            q_dtype=reference.q.dtype,
+            kv_dtype=paged_case.k_cache.dtype,
+            out_dtype=reference.output_dtype,
+            page_size=paged_case.page_size,
+            mask_type=reference.mask_type,
+            window_left=reference.window_left,
+            sm_scale=reference.sm_scale,
+            output_scale=reference.output_scale,
+        )
+        run_args = (
+            reference.q,
+            paged_case.k_cache,
+            paged_case.v_cache,
+            metadata.qo_indptr,
+            metadata.block_tables,
+            metadata.seq_lens_kv,
+        )
+    else:
+        reference = _make_context_case(
+            q_lengths=(65,),
+            k_lengths=(65,),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="causal",
+            output_dtype=torch.bfloat16,
+            output_scale=1.0,
+            device="cuda",
+            seed=2026090403,
+        )
+        wrapper_type = BatchPrefillTSWrapper
+        compile_name = "_get_compiled_context"
+        plan_kwargs = dict(
+            device=reference.q.device,
+            batch_size=len(reference.q_lengths),
+            max_seq_len_q=max(reference.q_lengths),
+            max_kv_len=max(reference.k_lengths),
+            num_qo_heads=int(reference.q.shape[-2]),
+            num_kv_heads=int(reference.k.shape[-2]),
+            head_dim=int(reference.q.shape[-1]),
+            q_dtype=reference.q.dtype,
+            kv_dtype=reference.k.dtype,
+            out_dtype=reference.output_dtype,
+            packed=False,
+            mask_type=reference.mask_type,
+            window_left=reference.window_left,
+            sm_scale=reference.sm_scale,
+            output_scale=reference.output_scale,
+        )
+        run_args = (
+            reference.q,
+            reference.k,
+            reference.v,
+            reference.qo_indptr,
+            reference.kv_indptr,
+        )
+
+    # Compile the exact specialization before introducing the plan-stream
+    # delay, so the delayed plan performs no JIT work that could synchronize.
+    warmup_wrapper = wrapper_type()
+    warmup_wrapper.plan(**plan_kwargs)
+    output = torch.full_like(reference.q, float("nan"), dtype=reference.output_dtype)
+    torch.cuda.synchronize()
+
+    get_compiled = getattr(context_module, compile_name)
+
+    def get_compiled_after_plan_stream_delay(*args):
+        compiled = get_compiled(*args)
+        torch.cuda._sleep(1_000_000_000)
+        return compiled
+
+    monkeypatch.setattr(
+        context_module, compile_name, get_compiled_after_plan_stream_delay
+    )
+    plan_stream = torch.cuda.Stream()
+    run_stream = torch.cuda.Stream()
+    wrapper = wrapper_type()
+
+    with torch.cuda.stream(plan_stream):
+        wrapper.plan(**plan_kwargs)
+    state = wrapper._plan_state
+    assert state is not None
+    assert state.ready_stream_handle == plan_stream.cuda_stream
+    assert state.ready_stream_handle != run_stream.cuda_stream
+    assert not state.ready_event.query()
+
+    complete = torch.cuda.Event()
+    with torch.cuda.stream(run_stream):
+        returned = wrapper.run(*run_args, out=output, validate=False)
+        complete.record()
+
+    assert returned is output
+    complete.synchronize()
+    # No run_stream.wait_stream(plan_stream) was issued above. Completion of
+    # the run therefore proves that the wrapper consumed its plan-ready event.
+    assert state.ready_event.query()
+    _assert_context_correct(output, reference)
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
@@ -4034,10 +4924,10 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, first)
     with pytest.raises(ValueError, match="out must not overlap q storage"):
-        wrapper.run(first.q, first.k, first.v, out=first.q)
+        _run_wrapper(wrapper, first, out=first.q)
 
     shared_out = torch.full_like(first.q, float("nan"), dtype=first.output_dtype)
-    returned = wrapper.run(first.q, first.k, first.v, out=shared_out)
+    returned = _run_wrapper(wrapper, first, out=shared_out)
     assert returned is shared_out
     _assert_context_correct(shared_out, first)
     first_result = shared_out.clone()
@@ -4047,7 +4937,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     worker_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(worker_stream):
         shared_out.fill_(float("nan"))
-        returned = wrapper.run(second.q, second.k, second.v, out=shared_out)
+        returned = _run_wrapper(wrapper, second, out=shared_out)
         assert returned is shared_out
         complete.record()
     torch.cuda.current_stream().wait_event(complete)
@@ -4055,11 +4945,11 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     assert not torch.equal(shared_out, first_result)
 
     graph_out = torch.full_like(second.q, float("nan"), dtype=second.output_dtype)
-    wrapper.run(second.q, second.k, second.v, out=graph_out)
+    _run_wrapper(wrapper, second, out=graph_out)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = wrapper.run(second.q, second.k, second.v, out=graph_out)
+        captured = _run_wrapper(wrapper, second, out=graph_out, validate=False)
     assert captured is graph_out
     graph_out.fill_(float("nan"))
     graph.replay()

@@ -489,25 +489,83 @@ def test_prims_ts_ragged_context_adapter_contract(
     assert wrapper.constructor_call == ((), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    q, k, v = plan_args
-    assert q.shape == (6, 2, 128)
-    assert k.shape == v.shape == (6, 1, 128)
-    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
-    assert plan_kwargs["qo_indptr"].tolist() == [0, 3, 6]
-    assert plan_kwargs["kv_indptr"].tolist() == [0, 3, 6]
+    assert plan_args == ()
+    assert plan_kwargs["device"] == torch.device("cpu")
+    assert plan_kwargs["batch_size"] == 2
+    assert plan_kwargs["max_seq_len_q"] == 3
+    assert plan_kwargs["max_kv_len"] == 3
+    assert plan_kwargs["num_qo_heads"] == 2
+    assert plan_kwargs["num_kv_heads"] == 1
+    assert plan_kwargs["head_dim"] == 128
+    assert plan_kwargs["q_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["kv_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["packed"] is True
     assert plan_kwargs["mask_type"] == "causal"
     assert plan_kwargs["out_dtype"] == torch.float8_e4m3fn
     assert plan_kwargs["sm_scale"] == pytest.approx((1.0 / 256) ** 2 / math.sqrt(128))
     assert plan_kwargs["output_scale"] == pytest.approx(1.0 / 256)
 
     run_args, run_kwargs = wrapper.run_calls[0]
-    assert all(
-        runtime_tensor is planned_tensor
-        for runtime_tensor, planned_tensor in zip(run_args, (q, k, v), strict=True)
-    )
+    q, k, v = run_args[:3]
+    assert q.shape == (6, 2, 128)
+    assert k.shape == v.shape == (6, 1, 128)
+    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+    assert run_args[3].tolist() == [0, 3, 6]
+    assert run_args[4].tolist() == [0, 3, 6]
     assert run_kwargs["out"].shape == q.shape
     assert run_kwargs["out"].dtype == torch.float8_e4m3fn
+    assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == q.shape
+
+
+def test_prims_ts_ragged_context_graph_refcheck_binds_runtime_metadata(
+    monkeypatch, mocked_prims_ts_benchmark
+):
+    """The explicit graph-refcheck launch uses the allocation-free run contract."""
+
+    install_wrapper, _ = mocked_prims_ts_benchmark
+    wrapper = install_wrapper("BatchPrefillTSWrapper")
+    _use_deterministic_ones(monkeypatch)
+    monkeypatch.setattr(
+        attention_routine,
+        "_replay_cuda_graph_once",
+        lambda launch, _out: launch(),
+    )
+    monkeypatch.setattr(
+        attention_routine,
+        "_validate_prims_ts_context_samples",
+        lambda **_kwargs: (1, 0.0),
+    )
+    args = _parse_prims_ts_case(
+        "BatchPrefillWithRaggedKVCacheWrapper",
+        [
+            "--batch_size",
+            "2",
+            "--s_qo",
+            "3",
+            "--s_kv",
+            "3",
+            "--num_qo_heads",
+            "2",
+            "--num_kv_heads",
+            "1",
+            "--head_dim_qk",
+            "128",
+            "--head_dim_vo",
+            "128",
+            "--causal",
+        ],
+    )
+    args.no_cuda_graph = False
+    args.refcheck = True
+
+    attention_routine.testBatchPrefillWithRaggedKVCacheWrapper(args)
+
+    assert len(wrapper.run_calls) == 3
+    replay_args, replay_kwargs = wrapper.run_calls[-1]
+    assert replay_args[3].tolist() == [0, 3, 6]
+    assert replay_args[4].tolist() == [0, 3, 6]
+    assert replay_kwargs["validate"] is False
 
 
 @pytest.mark.parametrize(
