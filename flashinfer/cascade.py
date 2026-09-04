@@ -29,7 +29,21 @@ from .trace.templates.cascade import (
     merge_state_trace,
     merge_states_trace,
 )
-from .utils import register_custom_op, register_fake_op
+from .utils import (
+    backend_requirement,
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
+
+
+_CASCADE_SUPPORTED_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
+
+
+@supported_compute_capability(_CASCADE_SUPPORTED_CCS)
+def _cascade_merge_requirement(*_args, **_kwargs) -> bool:
+    """Cascade merge kernels use the generic CUDA path on supported SM tiers."""
+    return True
 
 
 @functools.cache
@@ -38,6 +52,7 @@ def get_cascade_module():
 
 
 @flashinfer_api(trace=merge_state_trace)
+@backend_requirement(backend_checks={}, common_check=_cascade_merge_requirement)
 @register_custom_op("flashinfer::merge_state", mutates_args=())
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
@@ -105,6 +120,7 @@ def _fake_merge_state(
 
 
 @flashinfer_api(trace=merge_state_in_place_trace)
+@backend_requirement(backend_checks={}, common_check=_cascade_merge_requirement)
 @register_custom_op("flashinfer::merge_state_in_place", mutates_args=("v", "s"))
 def merge_state_in_place(
     v: torch.Tensor,
@@ -166,6 +182,7 @@ def _fake_merge_state_in_place(
 
 
 @flashinfer_api(trace=merge_states_trace)
+@backend_requirement(backend_checks={}, common_check=_cascade_merge_requirement)
 @register_custom_op("flashinfer::merge_states", mutates_args=())
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
