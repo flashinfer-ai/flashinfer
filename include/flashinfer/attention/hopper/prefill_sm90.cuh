@@ -23,6 +23,7 @@
 #include "../mask.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "dequant_mainloop.cuh"
 #include "epilogue.cuh"
 #include "kernel_traits.cuh"
 #include "mainloop.cuh"
@@ -156,6 +157,16 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
       PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
       PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+      // FP8 KV cache: the staging pipelines are owned by this warpgroup alone (it both stages and
+      // dequantizes), so they are set up here rather than with the K/V pipelines above. Empty for
+      // the 16-bit kernels.
+      typename StagingPipelinesFor<CollectiveMainloop, Ktraits::KV_DEQUANT>::type staging(
+          shared_storage, warp_group_thread_idx);
+      if constexpr (Ktraits::KV_DEQUANT) {
+        // Make the barrier initialization by warp 0 visible to the whole producer warpgroup.
+        cutlass::arch::NamedBarrier::sync(NUM_COPY_THREADS,
+                                          static_cast<int>(NamedBarriers::kProducerWG));
+      }
 
       int work_idx = 0;
 
@@ -188,7 +199,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
-        if constexpr (MULTIITEMSCORING) {
+        if constexpr (Ktraits::KV_DEQUANT) {
+          collective_mainloop.template load<LEFT_SLIDING_WINDOW>(
+              mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+              staging, shared_storage, scheduler, scheduler_params, work_tile_info, block_coord,
+              work_idx, num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
+        } else if constexpr (MULTIITEMSCORING) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
@@ -200,7 +216,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         }
         ++work_idx;
       }
-      collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
+      if constexpr (Ktraits::KV_DEQUANT) {
+        collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+                                      staging);
+      } else {
+        collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
+      }
     }
   } else {  // Consumer
     if constexpr (use_tma_load_kv) {
@@ -295,8 +316,10 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
   using DTypeKV = typename KernelTraits::DTypeKV;
   using DTypeO = typename KernelTraits::DTypeO;
 
-  using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+  using CollectiveMainloop = std::conditional_t<
+      KernelTraits::KV_DEQUANT,
+      DequantCollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>,
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
@@ -360,8 +383,12 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using DTypeO = typename KernelTraits::DTypeO;
   using IdType = typename KernelTraits::IdType;
 
-  using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+  using CollectiveMainloop =
+      std::conditional_t<KernelTraits::KV_DEQUANT,
+                         SparseDequantCollectiveMainloop<typename Params::AdditionalParams,
+                                                         KernelTraits, CAUSAL, MULTIITEMSCORING>,
+                         SparseCollectiveMainloop<typename Params::AdditionalParams, KernelTraits,
+                                                  CAUSAL, MULTIITEMSCORING>>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -437,8 +464,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   using DTypeO = typename KernelTraits::DTypeO;
   using IdType = typename KernelTraits::IdType;
 
-  using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+  using CollectiveMainloop = std::conditional_t<
+      KernelTraits::KV_DEQUANT,
+      DequantCollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>,
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -524,6 +553,30 @@ constexpr auto getCTATileSize() {
   }
 }
 
+// Tile configuration (CTA_Q, CTA_KV, NUM_STAGES_KV_STAGING) of the dense FP8-KV kernels, whose
+// shared memory holds the 16-bit K/V stages of getCTATileSize plus the 8-bit staging buffers:
+// CTA_KV is capped at 128 (the non-causal head_dim 128 tile of 192 does not fit next to its
+// staging buffers), head_dim 256 keeps a single staging stage, and the DeepSeek prefill pair
+// halves CTA_KV.
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO>
+constexpr auto getDequantCTATileSize() {
+  if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
+    if constexpr (HEAD_DIM_QK == 64) {
+      return std::make_tuple(192, 128, 2);
+    } else if constexpr (HEAD_DIM_QK == 128) {
+      return std::make_tuple(128, 128, 2);
+    } else {
+      return std::make_tuple(128, 64, 1);
+    }
+  } else {
+    static_assert(HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128);
+    return std::make_tuple(128, 64, 2);
+  }
+}
+
+template <typename Params>
+constexpr bool kv_cache_is_fp8_v = cutlass::sizeof_bits_v<typename Params::DTypeKV> == 8;
+
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
@@ -532,14 +585,28 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-  SinglePrefillWithKVCacheKernelTraitsDispatched<
-      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  if constexpr (kv_cache_is_fp8_v<Params>) {
+    constexpr auto CTA_TILE_SIZE = getDequantCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO>();
+    SinglePrefillWithKVCacheKernelTraitsDispatched<
+        DequantAttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                                     /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                                     /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                                     /*NUM_STAGES_=*/2,
+                                     /*NUM_STAGES_KV_STAGING_=*/get<2>(CTA_TILE_SIZE),
+                                     typename Params::DTypeQ, typename Params::DTypeKV,
+                                     typename Params::DTypeO, typename Params::IdType,
+                                     AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  } else {
+    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+    SinglePrefillWithKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  }
   cudaError_t status = cudaGetLastError();
   return status;
 }
@@ -553,14 +620,28 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-  BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  if constexpr (kv_cache_is_fp8_v<Params>) {
+    constexpr auto CTA_TILE_SIZE = getDequantCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO>();
+    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+        DequantAttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                                     /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                                     /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                                     /*NUM_STAGES_=*/2,
+                                     /*NUM_STAGES_KV_STAGING_=*/get<2>(CTA_TILE_SIZE),
+                                     typename Params::DTypeQ, typename Params::DTypeKV,
+                                     typename Params::DTypeO, typename Params::IdType,
+                                     AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  } else {
+    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  }
   cudaError_t status = cudaGetLastError();
   return status;
 }
@@ -576,7 +657,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
-    if constexpr (HEAD_DIM_VO == 64) {
+    if constexpr (kv_cache_is_fp8_v<Params>) {
+      // Same 16-bit tiles as below; the 8-bit staging buffers fit next to them at every head dim.
+      constexpr int CTA_Q = HEAD_DIM_VO == 64 ? 192 : 128;
+      constexpr int CTA_KV = HEAD_DIM_VO == 256 ? 32 : 96;
+      // Two staging stages: deeper staging (3, 4) measured within noise of 2 on a GH200.
+      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+          DequantAttentionKernelTraits<
+              /*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO, CTA_Q, CTA_KV, /*NUM_STAGES_=*/2,
+              /*NUM_STAGES_KV_STAGING_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+          params, stream);
+    } else if constexpr (HEAD_DIM_VO == 64) {
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
