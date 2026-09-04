@@ -29,6 +29,10 @@ from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
 
+from .api_logging import (
+    experimental_auto_backends_allowed,
+    warn_experimental_backend_once,
+)
 from .jit.spdlog import gen_spdlog_module
 
 logger = logging.getLogger(__name__)
@@ -1182,6 +1186,39 @@ def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
     return decorator
 
 
+def experimental_backend(checker: Callable) -> Callable:
+    """Mark a ``@backend_requirement`` checker as belonging to an experimental backend.
+
+    Stacks with :func:`supported_compute_capability`. Inside
+    :func:`backend_requirement` the marker has three effects:
+
+    - ``backend="auto"`` skips the backend unless
+      ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. Autotuning is covered
+      by the same filter, because it tunes over the candidate list this
+      produces (``<api>.suitable_auto_backends``).
+    - Explicit ``backend="<name>"`` always works -- naming the backend *is* the
+      opt-in -- and emits an ``ExperimentalWarning`` once per (API, backend).
+    - The backend is listed in ``<api>.experimental_backends``.
+
+    A checker whose module lives under ``flashinfer.experimental`` must carry
+    this marker: ``backend_requirement`` raises ``ValueError`` at decoration
+    time otherwise, so a forgotten marker fails at import rather than by
+    silently entering automatic selection.
+
+    See ``flashinfer/experimental/README.md`` for the policy and a full
+    worked example.
+
+    Examples
+    --------
+    >>> @experimental_backend
+    ... @supported_compute_capability([120, 121])
+    ... def check_sm12x_cute(a, b, out=None, backend="auto"):
+    ...     return a.dtype == torch.bfloat16 and a.shape[-1] % 64 == 0
+    """
+    checker.is_experimental = True  # type: ignore[attr-defined]
+    return checker
+
+
 def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
@@ -1222,6 +1259,15 @@ def backend_requirement(
     decorator : callable
         A decorator function that wraps the target function with validation logic, and inserts
         the "skip_check" keyword argument to the function.
+
+    Experimental backends
+    ---------------------
+    Checkers marked with :func:`experimental_backend` are excluded from
+    ``backend="auto"`` selection (and therefore from autotuning) unless
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. Selecting one explicitly
+    with ``backend="<name>"`` always works and emits an ``ExperimentalWarning``
+    once per (API, backend). Their names are exposed as
+    ``<api>.experimental_backends``.
 
     Attributes Added to Decorated Function
     ---------------------------------------
@@ -1293,6 +1339,27 @@ def backend_requirement(
         # Get the function signature once for reuse
         sig = inspect.signature(func)
 
+        # Backends whose checker carries @experimental_backend. Placement is the
+        # backstop: a checker defined under flashinfer.experimental without the
+        # marker is a policy violation, caught here at import time rather than
+        # by silently entering automatic selection.
+        experimental_backends = frozenset(
+            name
+            for name, checker in backend_checks.items()
+            if getattr(checker, "is_experimental", False)
+        )
+        for name, checker in backend_checks.items():
+            module = getattr(checker, "__module__", "") or ""
+            if (
+                module.startswith("flashinfer.experimental")
+                and name not in experimental_backends
+            ):
+                raise ValueError(
+                    f"@backend_requirement on {func.__name__}: checker for backend "
+                    f"'{name}' is defined under flashinfer.experimental but is not "
+                    f"marked @experimental_backend"
+                )
+
         def is_backend_supported(backend, cc=None):
             # No backend-specific checks
             if not has_backend_choices():
@@ -1357,6 +1424,12 @@ def backend_requirement(
             return backend in backend_checks
 
         def suitable_auto_backends(cc, *args, **kwargs):
+            # Cleared up front rather than only on the path that computes it: the
+            # "no suitable auto backends" hint reads this attribute after a failed
+            # call, and the common_check early return below would otherwise leave
+            # the previous call's value in place -- reporting a problem-size
+            # failure as an experimental-backend exclusion.
+            wrapper.dropped_experimental_backends = []
             if common_check is not None and not common_check(*args, **kwargs):
                 return False
             suitable_backends = []
@@ -1370,11 +1443,25 @@ def backend_requirement(
                         suitable_backends.append(backend)
                 except ValueError:
                     continue
+            # Experimental backends enter automatic selection only with the
+            # explicit opt-in. Autotuning tunes over this same list, so the
+            # filter covers it too. Remember what was dropped for the error hint.
+            dropped = [b for b in suitable_backends if b in experimental_backends]
+            if dropped and not experimental_auto_backends_allowed():
+                suitable_backends = [
+                    b for b in suitable_backends if b not in experimental_backends
+                ]
+            else:
+                dropped = []
+            wrapper.dropped_experimental_backends = dropped
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
             assert heuristic_func is not None, "Heuristic function must be provided"
             suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
+            for b in suitable_backends:
+                if b in experimental_backends:
+                    warn_experimental_backend_once(func.__name__, b, automatic=True)
             wrapper.suitable_auto_backends = suitable_backends
             return True
 
@@ -1425,8 +1512,17 @@ def backend_requirement(
                         if not suitable_auto_backends(
                             capability, **kwargs_with_defaults
                         ):
+                            dropped = wrapper.dropped_experimental_backends
+                            hint = (
+                                f" (experimental backend(s) {sorted(dropped)} were "
+                                f"excluded from automatic selection; set "
+                                f"FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1 to "
+                                f"include them, or pass backend= explicitly)"
+                                if dropped
+                                else ""
+                            )
                             raise BackendSupportedError(
-                                f"No suitable auto backends found for {func.__name__}"
+                                f"No suitable auto backends found for {func.__name__}{hint}"
                             )
                     else:
                         if not is_backend_supported(backend, capability):
@@ -1440,6 +1536,9 @@ def backend_requirement(
                             raise ValueError(
                                 f"Problem size is not supported for {func.__name__}"
                             )
+                        if backend in experimental_backends:
+                            # Explicit selection is the opt-in; just make it visible.
+                            warn_experimental_backend_once(func.__name__, backend)
                 else:
                     # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
@@ -1450,11 +1549,14 @@ def backend_requirement(
                         raise ValueError(
                             f"Problem size is not supported for {func.__name__}"
                         )
-            elif skip_check and heuristic_func is not None:
-                if kwargs.get("backend") == "auto":
+            elif skip_check:
+                backend = kwargs.get("backend")
+                if backend == "auto" and heuristic_func is not None:
                     # This needs to be called for heuristic function
                     capability = _get_capability(*args, **kwargs)
                     suitable_auto_backends(capability, *args, **kwargs)
+                elif backend in experimental_backends:
+                    warn_experimental_backend_once(func.__name__, backend)
 
             return func(*args, **kwargs)
 
@@ -1462,6 +1564,8 @@ def backend_requirement(
         wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.has_backend = has_backend
         wrapper.has_backend_choices = has_backend_choices
+        wrapper.experimental_backends = experimental_backends
+        wrapper.dropped_experimental_backends = []
         return wrapper
 
     return decorator

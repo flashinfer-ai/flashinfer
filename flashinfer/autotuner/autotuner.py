@@ -485,6 +485,11 @@ class TuningConfig:
         profiling_repeat (int | None): Per-operation profiling repeat override.
             ``None`` uses the autotuner default. This affects measurement
             precision, not tactic compatibility or persisted cache identity.
+        use_cold_l2_graph_replay (bool): Replay the captured graph once untimed
+            (absorbing first-launch initialization), then evict L2 so the timed
+            replay starts from a cold L2, and give every launch in the graph its
+            own input copy. Requires ``use_cuda_graph``; the eviction also
+            requires ``use_cold_l2_cache``.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -512,6 +517,7 @@ class TuningConfig:
     use_cuda_graph: bool = False
     cuda_graph_profile_replays: int = 1
     profiling_repeat: int | None = None
+    use_cold_l2_graph_replay: bool = False
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
@@ -1647,6 +1653,7 @@ class AutoTuner:
                 else tuning_config.cuda_graph_profile_replays
             ),
             profiling_repeat=tuning_config.profiling_repeat,
+            use_cold_l2_graph_replay=tuning_config.use_cold_l2_graph_replay,
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
@@ -2272,6 +2279,17 @@ class AutoTuner:
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
+            l2_eviction_buffer = None
+            if (
+                tuning_config.use_cold_l2_cache
+                and tuning_config.use_cuda_graph
+                and tuning_config.use_cold_l2_graph_replay
+            ):
+                l2_eviction_buffer = torch.empty(
+                    2 * self._get_l2_cache_size_in_bytes(),
+                    dtype=torch.uint8,
+                    device=stream.device,
+                )
 
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device="cuda")
@@ -2314,6 +2332,16 @@ class AutoTuner:
                         _run_kernels()
 
                 stream.synchronize()
+                if (
+                    tuning_config.use_cuda_graph
+                    and tuning_config.use_cold_l2_graph_replay
+                ):
+                    # Exclude first-replay initialization from the timed sample.
+                    graph.replay()
+                    if l2_eviction_buffer is not None:
+                        # Restore cold-L2 state after graph initialization.
+                        l2_eviction_buffer.zero_()
+                    stream.synchronize()
 
                 # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
                 delay_kernel_time_usec = (
@@ -3130,6 +3158,9 @@ class AutoTuner:
 
         num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
         num_buffers = min(num_buffers, profiling_repeat + 1)
+        # Avoid reusing a warmed batch within the timed graph.
+        if tuning_config.use_cuda_graph and tuning_config.use_cold_l2_graph_replay:
+            num_buffers = max(num_buffers, profiling_repeat)
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):

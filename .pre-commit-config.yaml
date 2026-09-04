@@ -64,7 +64,7 @@ repos:
       -   id: mypy
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
-          exclude: ^(flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py)
+          exclude: ^(flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py))
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
@@ -75,3 +75,18 @@ repos:
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]
+
+  - repo: local
+    hooks:
+      # The scope validator is the security boundary for `@flashinfer-bot run
+      # <paths>`: its charset check is what keeps comment text from reaching a
+      # shell as anything other than a test path. Its selftest covers exactly
+      # that (metacharacters, command substitution, traversal, smuggled pytest
+      # flags), so it runs whenever the script changes. No third-party imports,
+      # so it needs no environment.
+      - id: experimental-test-scope-selftest
+        name: experimental test scope selftest
+        entry: python3 scripts/pr_checks/experimental_test_scope.py --selftest
+        language: system
+        pass_filenames: false
+        files: ^scripts/pr_checks/experimental_test_scope\.py$
