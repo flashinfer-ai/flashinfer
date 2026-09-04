@@ -7,7 +7,7 @@ in a fenced block tagged ``experimental-tests`` (see
 
     ```experimental-tests
     tests/experimental/test_foo.py
-    tests/experimental/test_bar.py::test_baz
+    tests/experimental/test_bar.py
     ```
 
 Running the whole ``tests/experimental/`` tree gets slower and less relevant as
@@ -115,6 +115,17 @@ def validate(targets: list[str], root: str = ROOT) -> list[str]:
     ]
     if bad:
         raise ValueError(f"targets outside {root}: {', '.join(bad)}")
+    # scripts/test_sharding/runner.py cannot take a pytest ::selector. It checks
+    # Path(target).exists() (false for "file.py::test_x") and, in collection, branches
+    # on is_file() and otherwise rglobs the target as a directory -- so a selector
+    # reaches neither branch usefully. The lane would claim GPU runners and then die
+    # with "test path does not exist", deep and unactionable. Refuse it here instead.
+    selectors = [x for x in targets if "::" in x]
+    if selectors:
+        raise ValueError(
+            "pytest ::selectors are not supported by the test runner; name the file "
+            "instead of a single test: " + ", ".join(selectors)
+        )
     # Counted after de-duplication, matching how the runner counts.
     unique = len(set(targets))
     if unique > MAX_TARGETS:
@@ -182,8 +193,8 @@ def _selftest() -> int:
             ["tests/experimental/"],
         ),
         (
-            "```experimental-tests\ntests/experimental/t.py::test_x  # why\n```",
-            ["tests/experimental/t.py::test_x"],
+            "```experimental-tests\ntests/experimental/t.py  # why\n```",
+            ["tests/experimental/t.py"],
         ),
         (
             "```experimental-tests\n\ntests/experimental/a.py\ntests/experimental/b.py\n\n```",
@@ -219,6 +230,10 @@ def _selftest() -> int:
             "two blocks",
         ),
         ("```\ntests/experimental/a.py\n```", "untagged fence"),
+        (
+            "```experimental-tests\ntests/experimental/a.py::test_x\n```",
+            "pytest ::selector the runner cannot consume",
+        ),
     ]
     failures = 0
     # check_exists is covered separately: parse() is shape-only by design, so the

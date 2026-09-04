@@ -168,9 +168,15 @@ jobs:
               # suppresses re-triggering for GITHUB_TOKEN. Quoting the phrase here made
               # the bot answer itself, re-apply run-ci, and start a second full GPU run
               # for every rejected scope.
+              #
+              # Best-effort: the step runs under `bash -e`, so an unguarded failure here
+              # (rate limit, transient 5xx) would abort before the run-ci label is
+              # applied -- reinstating exactly the "comment starts no CI" bug this
+              # branch exists to prevent. Starting CI matters; the courtesy note does not.
               gh pr comment ${{ github.event.issue.number }} \
                 --repo ${{ github.repository }} \
-                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err)"
+                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err)" \
+                || echo "warning: could not post the scope-ignored note; continuing to label"
             fi
           fi
 

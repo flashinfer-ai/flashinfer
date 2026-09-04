@@ -41,11 +41,11 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
      Do not delete the fence or change its `experimental-tests` tag — CI reads it verbatim. -->
 
 ```experimental-tests
-# One target per line: a directory, a file, or file::test. Must be under
+# One target per line: a directory or a file. (A pytest ::selector is not
+# supported -- the sharding runner cannot consume one.) Must be under
 # tests/experimental/ and must exist. Delete these comment lines and add yours, e.g.
 #
 #   tests/experimental/test_my_backend.py
-#   tests/experimental/test_my_backend.py::test_specific_case
 #   tests/experimental/my_backend/
 #
 # Declaring the whole tree (tests/experimental/) is allowed but means every
