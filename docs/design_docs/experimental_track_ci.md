@@ -55,6 +55,29 @@ green.
 A watcher driving the PR cannot detect this, because a degraded run and an honoured one both
 end green.
 
+## Watcher responsibilities
+
+The watcher is the component that turns a declared scope into a CI request. Two of its
+obligations are not enforceable anywhere else, and should be covered by its own tests.
+
+**Verify that every declared path exists at the PR head before issuing a command.** The
+handler cannot do this — it holds a write token and so deliberately does not check out the
+pull request, leaving it with no files to inspect (see
+[`ci_bot_and_targeted_testing.md`](ci_bot_and_targeted_testing.md)). A well-formed path that
+does not exist is therefore accepted, published, and only rejected much later by the test
+runner, after every lane has pulled an image and installed. The watcher holds the PR's file
+list and can settle this instantly.
+
+Suggested test: declare a scope naming a path that does not exist at the head commit, and
+assert the watcher reports the missing path and issues **no** command.
+
+**Do not reproduce the bot's trigger phrase in any comment it posts.** The trigger is matched
+anywhere in a comment body, so a status update that quotes the command re-enters the handler,
+re-applies the CI label, and cancels the run the watcher is shepherding.
+
+Suggested test: have the watcher post each of its status messages on a pull request and
+assert none of them causes the handler to fire.
+
 ## Scope of testing, and what it does not prove
 
 A green targeted run means the declared tests passed on the declared hardware. It is not

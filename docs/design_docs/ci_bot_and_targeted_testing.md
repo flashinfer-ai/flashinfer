@@ -66,6 +66,19 @@ that shrinks re-publishes its leftover chunks as empty.
 reaches a shell, so "starts with `tests/` and has no `..`" is not sufficient — a legal
 filename can still carry shell metacharacters.
 
+**Existence is deliberately not checked.** The handler validates shape — charset, root,
+count — but not whether the paths exist. It cannot: the job holds a write token, so it does
+not check out the pull request, and it therefore has no files to look at. A well-formed path
+that does not exist is accepted and published.
+
+The cost of that lands later and is not small. The lanes start, pull the image and install,
+and only then does the runner's selection check reject the path, failing every lane. The
+failure is loud rather than silent, so nothing merges on a false green — but it consumes
+several minutes on each of the on-demand runners to say "that file is not there".
+
+Whoever *issues* the command is the right place to catch this, because unlike the handler it
+has the files.
+
 ## Reject, do not degrade
 
 When a requested scope does not validate, the command is rejected. The tempting alternative
