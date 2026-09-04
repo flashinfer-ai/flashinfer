@@ -132,6 +132,8 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    *,
+    backend: Literal["auto", "cudnn"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -237,6 +239,11 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
+    backend : Literal["auto", "cudnn"], optional
+        ``"auto"`` (default) routes among FlashInfer's own SM90/SM100/SM120
+        kernels.  ``"cudnn"`` runs cuDNN's fused SM100 linear-attention engine
+        through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_rule`.
+
 
     Returns
     -------
@@ -298,6 +305,40 @@ def chunk_gated_delta_rule(
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+
+    if backend not in ("auto", "cudnn"):
+        raise ValueError(f'backend must be "auto" or "cudnn", got {backend!r}')
+    if backend == "cudnn":
+        from .cudnn import cudnn_chunk_gated_delta_rule
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("use_cp", use_cp is True or _cp_chunk_len is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("state_indices", state_indices is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                'chunk_gated_delta_rule(backend="cudnn") does not support '
+                + ", ".join(unsupported)
+            )
+        return cudnn_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+        )
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
