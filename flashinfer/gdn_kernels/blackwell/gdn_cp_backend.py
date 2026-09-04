@@ -71,6 +71,13 @@ def _resolve_max_seqlen(
         raise ValueError("max_seqlen must be a nonnegative integer")
     if total_tokens and resolved == 0:
         raise ValueError("max_seqlen must be positive when q is nonempty")
+    minimum = _ceil_div(total_tokens, num_seqs)
+    if resolved < minimum:
+        raise ValueError(
+            "max_seqlen cannot be smaller than ceil(total_tokens / num_seqs)"
+        )
+    if resolved > total_tokens:
+        raise ValueError("max_seqlen cannot exceed total_tokens")
     return resolved
 
 

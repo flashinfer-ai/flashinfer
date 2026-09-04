@@ -312,7 +312,8 @@ def chunk_gated_delta_rule(
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
     max_seqlen : int, optional
-        Maximum logical sequence length. CP kernels use this host-side hint to
+        Safe upper bound on the maximum logical sequence length, no larger
+        than ``total_seq_len``. CP kernels use this host-side hint to
         bound their per-sequence launch grids without reading ``cu_seqlens``
         back from the GPU. Pass the exact maximum for variable-length or
         imbalanced batches. When omitted, CP assumes a balanced batch and uses
@@ -389,6 +390,13 @@ def chunk_gated_delta_rule(
         raise ValueError("max_seqlen must be a nonnegative integer")
     if total_seq_len and cp_max_seqlen == 0:
         raise ValueError("max_seqlen must be positive when q is nonempty")
+    minimum_cp_max_seqlen = (total_seq_len + num_seqs - 1) // num_seqs
+    if cp_max_seqlen < minimum_cp_max_seqlen:
+        raise ValueError(
+            "max_seqlen cannot be smaller than ceil(total_seq_len / num_seqs)"
+        )
+    if cp_max_seqlen > total_seq_len:
+        raise ValueError("max_seqlen cannot exceed total_seq_len")
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)

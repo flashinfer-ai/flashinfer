@@ -1397,6 +1397,45 @@ def test_max_seqlen_resolution_matches_public_cp_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    ("total_tokens", "num_seqs", "max_seqlen", "message"),
+    [
+        (17, 4, 4, "smaller than ceil"),
+        (17, 4, 18, "cannot exceed total_tokens"),
+        (0, 3, 1, "cannot exceed total_tokens"),
+    ],
+)
+def test_max_seqlen_resolution_rejects_impossible_host_bounds(
+    total_tokens: int,
+    num_seqs: int,
+    max_seqlen: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        gdn_cp._resolve_max_seqlen(
+            total_tokens=total_tokens,
+            num_seqs=num_seqs,
+            max_seqlen=max_seqlen,
+        )
+
+
+@pytest.mark.parametrize("max_seqlen", [4, 18])
+def test_public_dispatch_rejects_impossible_max_seqlen_without_cuda_reads(
+    max_seqlen: int,
+) -> None:
+    q = torch.zeros((17, 1, 128), dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, 4, 8, 12, 17], dtype=torch.int32)
+    with pytest.raises(ValueError, match="max_seqlen cannot"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            q,
+            q,
+            cu_seqlens=cu_seqlens,
+            use_cp=False,
+            max_seqlen=max_seqlen,
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
