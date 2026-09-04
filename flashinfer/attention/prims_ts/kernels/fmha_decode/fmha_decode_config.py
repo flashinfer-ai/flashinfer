@@ -102,6 +102,19 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (BFloat16, BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
     (Float16, Float16, Float16, Float16, 256, 128, 1, 1),
 }
+# Mixed k_dtype != v_dtype feature compatibility is validated by
+# ``_validate_mixed_kv_dtype_profile``. This profile selects the Keeps MMA
+# resource recipe qualified for that already-validated launch domain.
+_GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE: _GroupedKeepsProfileKey = (
+    BFloat16,
+    BFloat16,
+    Float8E4M3FN,
+    BFloat16,
+    128,
+    0,
+    2,
+    2,
+)
 
 # Per-thread register budgets for the Q64/KV256 warp groups once the launch
 # bound enables ``setmaxnreg``. The MMA, load, and scheduler warps keep 56, so
@@ -1167,7 +1180,9 @@ class FmhaDecodeConfig:
         """Return packed P registers stored by each softmax producer lane."""
         if self.use_keeps_mma_ab:
             values_per_reg = (
-                FP8_VALUES_PER_REG if self.use_fp8_qkv else FP16_VALUES_PER_REG
+                FP8_VALUES_PER_REG
+                if (self.use_fp8_qkv or self.v_dtype_bytes == 1)
+                else FP16_VALUES_PER_REG
             )
             return max(self.num_s_regs_per_thread // values_per_reg, 1)
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
@@ -1224,7 +1239,7 @@ class FmhaDecodeConfig:
     @property
     def keeps_p_smem_vector_elements(self) -> int:
         """Return P elements in one aligned 16-byte SMEM store."""
-        return 16 // self.q_dtype_bytes
+        return 16 // self.v_dtype_bytes
 
     @property
     def static_local_kv_tiles(self) -> int:
@@ -2015,7 +2030,7 @@ class FmhaDecodeConfig:
                     )
                 )
             )
-        if profile != _GROUPED_KEEPS_MAIN_PROFILE:
+        if profile not in (_GROUPED_KEEPS_MAIN_PROFILE, _GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE):
             return False
 
         if self.tile_size_q == 128:

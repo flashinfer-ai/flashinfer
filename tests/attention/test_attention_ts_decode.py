@@ -48,8 +48,10 @@ from flashinfer.attention.prims_ts.decode import (
     _DecodePlanState,
     _DecodeRuntime,
     _csr_to_block_tables,
+    _get_compiled_decode,
     _make_decode_workspace_layout,
     _planned_kv_domain_has_unpaired_tail,
+    _resolve_decode_launch_spec,
     _validate_decode_query_head_extent,
     _validate_decode_output_aliasing,
     _validate_decode_policy_kv_tile_size,
@@ -62,6 +64,7 @@ from flashinfer.attention.prims_ts._tensor_aliasing import (
     _validate_tensor_does_not_overlap_inputs,
 )
 from flashinfer.attention.prims_ts.split_kv_mode_policy import select_split_kv_modes
+from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
     FmhaDecodeConfig,
     make_decode_config,
@@ -1056,6 +1059,7 @@ def _plan_case(
         packed_query=qo_indptr is not None,
         q_data_type=case.q.dtype,
         k_data_type=case.k_cache.dtype,
+        v_data_type=case.v_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
         window_left=case.window_left,
@@ -4256,6 +4260,85 @@ def test_attention_ts_decode_config_mixed_kv_dtype_profile_gate(
 
     bf16_cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, v_dtype=BFloat16)
     assert cfg.smem_p_tile_bytes == bf16_cfg.smem_p_tile_bytes // 2
+
+
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+def test_attention_ts_decode_mixed_kv_dtype_resources_build(tile_size_q: int) -> None:
+    """Build K/V SMEM resources and pipelines for k_dtype != v_dtype case."""
+
+    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q)
+    resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+
+    assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
+    assert cfg.smem_k_tile_bytes == cfg.smem_v_tile_bytes * 2
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    (
+        pytest.param(8, 1, id="mqa"),
+        pytest.param(32, 8, id="gqa"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_mixed_kv_dtype_accuracy(
+    monkeypatch: pytest.MonkeyPatch,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> None:
+    """KeepsMmaAb + KV128 grouped kernel compile and run stays accurate for QK-BF16/PV-FP8."""
+
+    case = _make_decode_case(
+        kv_lens=(200, 300),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=2026090301 + num_qo_heads,
+    )
+    v_scale = 0.75
+    v_cache = _stored(case.v_cache.float(), _FP8, v_scale)
+    case = _with_reference(
+        replace(
+            case,
+            v_cache=v_cache,
+            paged_kv_cache=(case.k_cache, v_cache),
+            v_scale=v_scale,
+            bmm2_scale=v_scale / case.o_scale,
+        )
+    )
+
+    original_make_decode_config = fmha_decode_config.make_decode_config
+    explicit_profile = {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": 64,
+        "tile_size_kv": 128,
+        "groups_tokens_heads_q": True,
+    }
+
+    def _make_explicit_config(*args, **kwargs):
+        source = kwargs.get("args")
+        kwargs["args"] = (
+            explicit_profile if source is None else (source, explicit_profile)
+        )
+        return original_make_decode_config(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", _make_explicit_config)
+    _resolve_decode_launch_spec.cache_clear()
+    _get_compiled_decode.cache_clear()
+    try:
+        _exercise_auto_case(case)
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+        _get_compiled_decode.cache_clear()
 
 
 @pytest.mark.parametrize(

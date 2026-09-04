@@ -934,8 +934,6 @@ def _normalize_paged_kv_cache(
         raise ValueError("K/V cache views must be rank-4 HND tensors")
     if k_cache.shape != v_cache.shape:
         raise ValueError("K and V cache views must have identical logical shapes")
-    if k_cache.dtype != v_cache.dtype:
-        raise ValueError("K and V cache views must have identical dtypes")
     if k_cache.device != v_cache.device:
         raise ValueError("K and V cache views must be on the same device")
 
