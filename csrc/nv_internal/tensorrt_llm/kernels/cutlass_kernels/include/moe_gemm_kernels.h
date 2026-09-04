@@ -209,6 +209,19 @@ struct TmaWarpSpecializedGroupedGemmInput {
     const SFA** ptr_z_a = nullptr;  // Unused
     const SFB** ptr_s_b = nullptr;  // Unused
     const SFB** ptr_z_b = nullptr;  // Unused
+    // Per-block (K group=32) MXFP8 activation scale for the SM90 post-MMA block-scaled path
+    // (Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act). Per-expert array of [num_tokens, K/32] bf16,
+    // consumed by the mainloop as ptr_AS. Null for every other mode so legacy paths are unaffected.
+    constexpr static int act_block_scale_group_size = 32;
+    using StrideActBlockScale = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+    // Runtime gate mirroring the compile-time Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act selection so
+    // the (mode-agnostic) stride/pointer assembly kernel can fill the per-expert arrays below.
+    bool use_act_block_scale = false;
+    // Flat contiguous [expanded_num_tokens, K/32] bf16 buffer produced during row expansion; the
+    // assembly kernel slices it per expert into ptr_act_block_scale.
+    const SFA* act_block_scale_flat = nullptr;
+    StrideActBlockScale* stride_act_block_scale = nullptr;
+    const SFA** ptr_act_block_scale = nullptr;
     ProblemShapeInt shape{};
   };
 
@@ -223,7 +236,7 @@ struct TmaWarpSpecializedGroupedGemmInput {
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
 
-  static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+  static std::array<size_t, 22> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 

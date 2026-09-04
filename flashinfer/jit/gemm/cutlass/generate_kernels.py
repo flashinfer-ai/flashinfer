@@ -122,6 +122,7 @@ CudaTypeName = {
 
 MixedInputScaleModeTag = {
     "post_mma": "cutlass::gemm::collective::MixedInputScaleMode::kPostMma",
+    "post_mma_act_block_scale": "cutlass::gemm::collective::MixedInputScaleMode::kPostMmaActBlockScale",
     "pre_mma_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0",
 }
 
@@ -803,6 +804,51 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                     EpilogueScheduleType.TmaWarpSpecializedCooperative,
                     mixed_input_scale_mode="pre_mma_e8m0",
                     sm90_mixed_input_kernel_type=kernel_type,
+                )
+            )
+
+    # Append the activation-block-scale variants after all existing operations so
+    # adding this mode does not reshuffle the generated translation units above.
+    block_scale_args = product(
+        [
+            dtype_combo
+            for dtype_combo in supported_dtypes_fp4
+            if dtype_combo[0] == DataType.e4m3
+        ],
+        quant_ops,
+        epi_tags,
+        [
+            cta_shape_mnk
+            for cta_shape_mnk in cta_shapes_mnk_fp4
+            if (cta_shape_mnk[2] // 32) * DataTypeSize[DataType.bf16] % 128 == 0
+        ],
+        cga_shapes,
+    )
+    for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in block_scale_args:
+        use_coop = cta_shape_mnk[0] >= 128
+        mainloop_schedules = (
+            [
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                KernelScheduleType.TmaWarpSpecializedPingpong,
+            ]
+            if use_coop
+            else [KernelScheduleType.TmaWarpSpecializedPingpong]
+        )
+        for mainloop_schedule in mainloop_schedules:
+            operations.append(
+                TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    *dtype_combo,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    EpilogueScheduleType.TmaWarpSpecializedCooperative,
+                    mixed_input_scale_mode="post_mma_act_block_scale",
                 )
             )
     return operations

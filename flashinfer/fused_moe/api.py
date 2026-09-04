@@ -1310,6 +1310,49 @@ class CutlassHummingConfig:
 
 
 @dataclass(frozen=True)
+class CutlassHummingBlockScaleConfig:
+    """CUTLASS Humming MXFP4-weight x MXFP8-activation (per-block) backend for SM90.
+
+    Same online-quant Humming contract as :class:`CutlassHummingConfig` (BF16 inputs, uint8-packed
+    MXFP4 weights, folded weight scales) and byte-identical weight preparation, but the FP8
+    activation additionally carries a per-block (K group=32) dequant scale applied after each K-chunk
+    MMA. That scale is produced internally by the row-expand / activation kernels, so no extra host
+    tensor is required. Weights are registered under the shared ``"cutlass_humming"`` view key.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_HUMMING_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into the shared Humming mixed-input layout."""
+        from .prepare import prepare_cutlass_humming_weights
+
+        return prepare_cutlass_humming_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassHummingBlockScaleConfig()"
+
+
+@dataclass(frozen=True)
 class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
@@ -1457,6 +1500,7 @@ BackendConfigType = Union[
     CutlassMxfp8Config,
     CutlassW4A8Config,
     CutlassHummingConfig,
+    CutlassHummingBlockScaleConfig,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -1480,6 +1524,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassMxfp8Config,
     CutlassW4A8Config,
     CutlassHummingConfig,
+    CutlassHummingBlockScaleConfig,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,

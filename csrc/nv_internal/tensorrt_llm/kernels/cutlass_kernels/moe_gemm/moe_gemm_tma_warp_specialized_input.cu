@@ -23,7 +23,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
-std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+std::array<size_t, 22> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type) {
   size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
   size_t stride_act_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
@@ -48,6 +48,13 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
   size_t int4_groupwise_sf_a_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
   size_t int4_groupwise_stride_sf_a_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
 
+  // Per-block (K group=32) MXFP8 activation scale (SM90 post-MMA block-scaled path). Per-expert
+  // pointer array + per-expert stride. Sized unconditionally (num_experts) so the workspace layout
+  // stays fixed; the buffers stay null for every mode except kPostMmaMxfp8Act.
+  size_t act_block_scale_ptr_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
+  size_t act_block_scale_stride_size =
+      sizeof(INT4GroupwiseParams::StrideActBlockScale) * num_experts;
+
   size_t ptr_token_map_size = sizeof(int**) * num_experts;
 
   return std::array{problem_shape_size,
@@ -67,6 +74,8 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
                     int4_groupwise_problem_shape_size,
                     int4_groupwise_sf_a_size,
                     int4_groupwise_stride_sf_a_size,
+                    act_block_scale_ptr_size,
+                    act_block_scale_stride_size,
                     ptr_buf_size,
                     scale_buf_size,
                     ptr_token_map_size};
@@ -83,7 +92,7 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
     void* precomputed_scheduler_workspace, size_t precomputed_scheduler_workspace_size,
     FpXBlockScalingType scaling_type) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
-  std::array<int8_t*, 20> pointers{};
+  std::array<int8_t*, 22> pointers{};
   TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(),
                        "Mismatching workspace size and number of buffers");
   for (int i = 0; i < buffers.size(); i++) {
@@ -119,9 +128,15 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
   int4_groupwise_params.stride_s_a =
       reinterpret_cast<INT4GroupwiseParams::StrideSFA*>(pointers[16]);
 
-  fused_finalize_epilogue.ptr_bias = reinterpret_cast<void const**>(pointers[17]);
-  fused_finalize_epilogue.ptr_router_scales = reinterpret_cast<float const**>(pointers[18]);
-  fused_finalize_epilogue.ptr_source_token_index = reinterpret_cast<int const**>(pointers[19]);
+  // Per-block (K group=32) MXFP8 activation scale (SM90 post-MMA block-scaled path).
+  int4_groupwise_params.ptr_act_block_scale =
+      reinterpret_cast<INT4GroupwiseParams::SFA const**>(pointers[17]);
+  int4_groupwise_params.stride_act_block_scale =
+      reinterpret_cast<INT4GroupwiseParams::StrideActBlockScale*>(pointers[18]);
+
+  fused_finalize_epilogue.ptr_bias = reinterpret_cast<void const**>(pointers[19]);
+  fused_finalize_epilogue.ptr_router_scales = reinterpret_cast<float const**>(pointers[20]);
+  fused_finalize_epilogue.ptr_source_token_index = reinterpret_cast<int const**>(pointers[21]);
 
   this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
   this->gemm_workspace_size = gemm_workspace_size;
