@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "description": "Capability surface of the NVFP4 paged-KV MSA decode kernel on compute capability 10.0/10.3. Each field is a compile-time constant of the kernel body -- the shared-memory map, the warp-to-query-head map and the page addressing are derived from them -- so a geometry that is not listed here must never reach the kernel. Batch size, per-request KV length, block-table width, query length, causality, TOP-K and the two outer strides of the selection tensor are NOT listed: the kernel is parametric in all of them and restricting them would make the capability unreachable rather than route it somewhere faster.",
+  "fields": [
+    "num_qo_heads",
+    "num_kv_heads",
+    "head_dim",
+    "page_size"
+  ],
+  "workloads": [
+    [
+      64,
+      4,
+      128,
+      128
+    ]
+  ],
+  "parametric_axes": {
+    "batch_size": "any positive value; the cluster width is a pure function of batch_size * num_kv_heads and all four widths are precompiled",
+    "seqlen_q": "any positive divisor of the q row count; seqlen_q == 1 gets its own instantiation, everything else shares the general one",
+    "seqused_k": "any non-negative per-request length, heterogeneous across the batch, including partial final blocks and zero",
+    "max_blocks": "the block-table row width is a runtime argument",
+    "causal": "both, applied as a right-aligned limit",
+    "topk": "any value in [1, 32]. The ceiling is structural, not a policy: every selection slot is one lane of warp 0's compaction ballot in the parametric family (general::kSelectedCapacity), so a 33rd slot would be owned by a thread outside the ballot and dropped without a diagnostic. topk 16 additionally selects the pinned family and the CuTe-DSL scored_geom fast path; every other value is served by the parametric family.",
+    "q2k_indices_outer_strides": "any non-negative strides; only the innermost (top-k) dimension must be dense. Both kernel families take the head and token strides as arguments, so the transposed view of a token-major (total_q, num_kv_heads, topk) selection buffer is read in place and no consumer has to materialise a contiguous copy per step."
+  },
+  "kv_cache_layout": {
+    "page_bytes": 73728,
+    "regions": [
+      [
+        "k_data",
+        0,
+        32768
+      ],
+      [
+        "k_scale",
+        32768,
+        4096
+      ],
+      [
+        "v_data",
+        36864,
+        32768
+      ],
+      [
+        "v_scale",
+        69632,
+        4096
+      ]
+    ],
+    "data_head_stride": 8192,
+    "scale_head_stride": 1024,
+    "k_scale_layout": "linear",
+    "v_scale_layout": "swizzled_4x4",
+    "note": "The four inputs are strided views over one packed page pool and are consumed in place; the byte offsets between their base pointers are asserted, because shape, dtype and stride cannot tell four views of one page apart from four unrelated allocations, and the V-scale swizzle is invisible to all three."
+  },
+  "instantiation_families": {
+    "note": "The translation unit holds two families that compute the same function. This is a LATENCY split, not a capability one: nothing below narrows what the API accepts, and a call that misses the pinned envelope is served by the parametric family rather than refused.",
+    "parametric": {
+      "instantiations": 24,
+      "reads_at_runtime": [
+        "num_qo_heads",
+        "num_kv_heads",
+        "page_size",
+        "topk",
+        "q2k_indices_outer_strides",
+        "max_blocks",
+        "batch_size",
+        "seqlen_q",
+        "seqused_k",
+        "causal"
+      ],
+      "compile_time_in_both_families": {
+        "head_dim": "general::kHeadDim sizes the MMA K extent, the 128B shared-memory swizzle, the output row stride and the whole shared-memory map; it is a constant of both kernel bodies, not an argument"
+      },
+      "read_at_runtime_but_pinned_by_the_binding": {
+        "page_size": "the kernel body reads it and handles a partial page tile, but the binding requires 128 because the packed page map (page_bytes 73728) is derived from it -- widening this needs the CACHE WRITER to move, not the kernel"
+      }
+    },
+    "pinned": {
+      "instantiations": 6,
+      "resolved_at_compile_time": {
+        "num_qo_heads": 64,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "page_size": 128,
+        "topk": 16,
+        "max_blocks": 128,
+        "seqlen_q": 1
+      },
+      "additional_runtime_condition": "a batch of exactly 32 whose page pool holds fewer than 32 pages per request takes the parametric family; a serving pool is millions of pages, so this only separates undersized test pools",
+      "mirrored_in_python_as": "flashinfer.msa_ops._nvfp4_decode_sm100.selects_pinned_path, which the binding cross-checks against its own derivation so the two copies cannot drift apart in silence"
+    }
+  }
+}

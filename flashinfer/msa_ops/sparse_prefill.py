@@ -70,8 +70,13 @@ def msa_sparse_attention(
     Packed NVFP4 stores two values per byte, so its K/V last dimension is
     ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
     ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
-    Packed NVFP4 is SM120/SM121-only; compute capability 10.0/10.3 supports
-    bf16/fp16 K/V and E4M3 K/V with bf16 Q, and requires ``topk == 16``.
+    Compute capability 10.0/10.3 supports bf16/fp16 K/V and E4M3 K/V with bf16
+    Q, plus exactly one packed-NVFP4 route -- paged K/V read in place as strided
+    views of a planar page, with ``k_scale``/``v_scale`` and both global scales,
+    causal, without an LSE and with ``seqused_k`` rather than ``cu_seqlens_k``
+    (see the ``k``, ``k_scale``, ``seqused_k`` and ``k_global_scale``
+    parameters below) -- and requires ``topk == 16``. Every other packed-NVFP4
+    layout remains SM120/SM121-only.
 
     Parameters
     ----------
@@ -93,7 +98,11 @@ def msa_sparse_attention(
         Int32 cumulative query sequence lengths of shape ``(batch_size + 1,)``.
     cu_seqlens_k : Optional[torch.Tensor], default=None
         Int32 cumulative KV sequence lengths of shape ``(batch_size + 1,)`` for
-        the dense path. May be omitted when ``seqused_k`` is provided.
+        the dense path. May be omitted when ``seqused_k`` is provided. The
+        compute-capability 10.0/10.3 packed-NVFP4 paged route takes
+        ``seqused_k`` as the sole source of per-request KV length and declines a
+        call that also supplies ``cu_seqlens_k``, rather than silently
+        preferring one of two possibly disagreeing sources.
     causal : bool, default=False
         Whether to apply causal masking.
     softmax_scale : Optional[float], default=None
@@ -105,7 +114,14 @@ def msa_sparse_attention(
         from a cache that packs K and V in one ``2 * head_dim`` content dim
         per token on SM120/SM121 (see ``supports_packed_kv``). Compute
         capability 10.0/10.3 requires separate contiguous K and V tensors and
-        never copies packed views implicitly.
+        never copies packed views implicitly, with one exception: packed NVFP4
+        paged K/V (uint8, ``(num_pages, 4, 128, 64)``) is consumed in place as
+        strided views of a planar ``[K data | K scale | V data | V scale]``
+        page, together with ``k_scale``/``v_scale`` and the two global scales.
+        On that route the block-table width is unconstrained in practice: the
+        per-tile block union is a hash table sized by ``8 * topk``, not a bitmap
+        indexed by block id, so a 2048-wide table costs the same per block as a
+        128-wide one.
     seqused_k : Optional[torch.Tensor], default=None
         Int32 tensor of shape ``(batch_size,)`` giving the valid KV length per
         sequence in the paged path.
@@ -118,18 +134,24 @@ def msa_sparse_attention(
         :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
         swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
         multiple of 128). Scale rows follow ``(token, head)`` order for flat K
-        and ``(page, head, token)`` order for paged K. Packed NVFP4, and thus
-        this argument, is supported only on SM120/SM121.
+        and ``(page, head, token)`` order for paged K. SM120/SM121 only.
+        On compute capability 10.0/10.3 the paged NVFP4 prefill route instead
+        takes the block-scale regions of the packed page as
+        ``(num_pages, num_kv_heads, page_size, head_dim // 16)`` views, either
+        uint8 or float8_e4m3fn: K scales linear, V scales ``(4, 4)``-swizzled
+        inside ``(token, scale index)``.
     v_scale : Optional[torch.Tensor], default=None
         NVFP4 block scales for V, with the same dtype, layout, and row-order
         contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
         Global dequant scale for K; folds into the softmax scale (NVFP4 K
-        only). SM100/SM103 prefill does not support global K/V scales.
+        only). On SM100/SM103 it is supported by, and required for, the paged
+        NVFP4 KV prefill route, and by nothing else.
     v_global_scale : Optional[float], default=None
         Global dequant scale applied to the output on SM120/SM121, for any KV
-        dtype (e.g. an fp8 per-tensor V descale). SM100/SM103 prefill does not
-        support global K/V scales.
+        dtype (e.g. an fp8 per-tensor V descale). On SM100/SM103 it is
+        supported by, and required for, the paged NVFP4 KV prefill route, and
+        by nothing else.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False

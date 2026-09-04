@@ -71,6 +71,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+# Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
+# importlib.resources.
+"flashinfer.msa_ops" = ["*.json"]
 # Workload registry of the experimental fused GDN decode backends, loaded at
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]
@@ -135,6 +138,9 @@ exclude = [
   # Self-sampling GVR V2: verbatim TRT-LLM drops (see the ruff exclude note).
   "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
+  # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
+  # kernel-level numbers were measured on.
+  "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
   "build/",
 ]
 

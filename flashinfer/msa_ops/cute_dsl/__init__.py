@@ -15,7 +15,9 @@
 MSA CuTe-DSL Kernels (internal)
 ===============================
 
-Internal module containing the SM120/SM121 MSA kernel implementations.
+Internal module containing CuTe-DSL MSA kernel implementations: the SM120/SM121
+family, and ``sparse_decode_nvfp4_sm100``, which is one of the two kernels the
+compute-capability 10.0/10.3 NVFP4 decode route dispatches between.
 Import from ``flashinfer.msa_ops`` for the public API; wrappers import
 kernel classes from the submodules directly (and lazily).
 """
