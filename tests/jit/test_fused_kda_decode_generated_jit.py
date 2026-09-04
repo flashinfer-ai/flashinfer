@@ -121,14 +121,16 @@ def _write_complete_manifest(
     return body, manifest_path
 
 
-def test_checked_in_manifest_keeps_generated_route_disabled():
+def test_checked_in_manifest_enables_all_generated_routes():
     csrc_dir = generated.get_kda_csrc_dir()
     variants = generated.load_fused_kda_decode_generated_variants(
         manifest_path=csrc_dir / generated._MANIFEST_FILENAME,
         csrc_dir=csrc_dir,
     )
-    assert variants == ()
-    assert not generated.fused_kda_decode_generated_is_available()
+    assert len(variants) == 16
+    assert len({variant.name for variant in variants}) == 16
+    assert {variant.target for variant in variants} == {"sm100a"}
+    assert generated.fused_kda_decode_generated_is_available()
 
 
 def test_complete_manifest_verifies_source_identity_abi_and_launch(tmp_path):
