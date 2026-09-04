@@ -1,6 +1,7 @@
 # Experimental APIs and Backends in FlashInfer
 
 This document records the motivation and design decision; the normative policy is [`flashinfer/experimental/README.md`](../../flashinfer/experimental/README.md).*
+How an experimental PR is tested and lands is covered in [`experimental_track_ci.md`](experimental_track_ci.md); the general CI triggering design it builds on is [`ci_bot_and_targeted_testing.md`](ci_bot_and_targeted_testing.md).
 
 ## Overview
 

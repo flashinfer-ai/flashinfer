@@ -157,12 +157,8 @@ jobs:
             # it runs must be the trusted copy from the base branch. Whoever issues the
             # trigger can check existence up front, and pytest errors on a missing path.
             #
-            # An unparseable scope degrades to the full suite; it never withholds CI.
-            # `@flashinfer-bot run` is this repo's primary CI trigger and predates
-            # scoping, so trailing prose ("run please", "run thanks!"), a -k selector,
-            # or a backticked path must still start the full suite the way it always
-            # did. Failing closed here would turn the trigger into a no-op and the
-            # only signal would be a red bot job on a PR with no test checks at all.
+            # A scope that does not validate is rejected, not degraded -- see the
+            # else branch below for why.
             #
             # Both calls are inside the same condition on purpose. `mapfile < <(...)`
             # reports the status of mapfile, never of the child, so chunking used to
@@ -177,21 +173,34 @@ jobs:
                   2>>/tmp/scope_err); then
               mapfile -t CHUNKS <<< "$CHUNKED"
             else
-              # This body must NOT contain the bot's own trigger phrase. The job guard
-              # is `contains(comment.body, '@flashinfer-bot')` with no bot-author
-              # exclusion, and this comment is posted with a PAT -- GitHub only
-              # suppresses re-triggering for GITHUB_TOKEN. Quoting the phrase here made
-              # the bot answer itself, re-apply run-ci, and start a second full GPU run
-              # for every rejected scope.
+              # A malformed scope is a malformed command, and this repo already answers
+              # those one way: react 'confused' and do nothing (see "Unauthorized
+              # user"). Reject rather than degrade, to match.
               #
-              # Best-effort: the step runs under `bash -e`, so an unguarded failure here
-              # (rate limit, transient 5xx) would abort before the run-ci label is
-              # applied -- reinstating exactly the "comment starts no CI" bug this
-              # branch exists to prevent. Starting CI matters; the courtesy note does not.
+              # Degrading to the full suite looked safer and is not. The experimental
+              # track exists to land features same-day via *targeted* CI; silently
+              # substituting the full matrix drops the PR off the fast lane, takes
+              # hours instead of minutes, tests none of what was asked for, and still
+              # reports green. The caller is usually an automated watcher, which can
+              # retry a loud rejection and cannot detect a quiet one.
+              #
+              # The body must not contain the bot's own trigger phrase: the job guard
+              # is contains(comment.body, '<handle>') with no bot-author exclusion, and
+              # this is posted with a PAT, which GitHub does not suppress. Quoting it
+              # made the bot answer itself and restart CI.
+              #
+              # Both calls are best-effort under `bash -e`; neither a failed note nor a
+              # failed reaction should change the outcome, which is "no label, no CI".
               gh pr comment ${{ github.event.issue.number }} \
                 --repo ${{ github.repository }} \
-                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err). Note the full suite does NOT cover tests/experimental/, which only runs from a valid scope." \
-                || echo "warning: could not post the scope-ignored note; continuing to label"
+                --body "Rejected: not a valid test scope -- $(cat /tmp/scope_err). Re-issue with a corrected path list, or with no arguments for the full suite." \
+                || echo "warning: could not post the rejection note"
+              gh api -X POST \
+                "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+                -f content='confused' > /dev/null \
+                || echo "warning: could not react"
+              echo "Rejected malformed scope; run-ci not applied."
+              exit 0
             fi
           fi
 
