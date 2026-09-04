@@ -3396,6 +3396,15 @@ def trtllm_batch_decode_with_kv_cache(
         (kv head, sequence) pairs (the dense maximum is a safe upper bound).
         Not compatible with sliding window (``window_left != -1``),
         ``skip_softmax_threshold_scale_factor``, or ``uses_shared_paged_kv_idx=False``.
+        ``mUseBlockSparseAttention`` is a pure runtime parameter of the paged-KV
+        generation cubins, so it composes with every KV cache dtype those cubins
+        support, including the NVFP4 KV cache: pass the packed uint8 ``kv_cache``
+        together with ``kv_cache_sf`` exactly as in the dense case. The kernel
+        addresses the block scales with the same per-KV-head page indices it uses
+        for the KV data, and the V-scale 4-token swizzle is internal to each
+        (page, kv head) tile, so page-level gathering leaves it intact. NVFP4 KV
+        requires an FP8 e4m3 query; the currently pinned cubin pack only ships
+        FP8 e4m3 *output* for the generation phase.
 
     cp_world : int = 1
         Decode-context-parallel world size. The DCP speculative path is enabled
@@ -3489,6 +3498,15 @@ def trtllm_batch_decode_with_kv_cache(
         ):
             raise TypeError(
                 "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+            )
+        # Every trtllm-gen E2m1-KV cubin is exported with dtypeQ=e4m3 (the FP4->FP8
+        # dequant relies on an E4M3-specific SASS patch), so an FP8 query is a hard
+        # requirement rather than a kernel-selection preference. Checking it here
+        # turns an opaque "Missing TRTLLM-GEN kernel" into an actionable message.
+        if query.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "NVFP4 KV cache requires an FP8 e4m3 query for the trtllm-gen "
+                f"backend, got query dtype {query.dtype}."
             )
         k_block_scales, v_block_scales = kv_cache_sf
         assert (
