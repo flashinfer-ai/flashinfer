@@ -30,6 +30,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from .device_target import gdn_compile_options, gdn_device_target
+
 # ============================================================================
 # Constants for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
@@ -896,6 +898,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -961,7 +964,9 @@ def run_pretranspose_decode(
         )
     else:
         stride1 = stride2 = stride3 = 0
+    target = gdn_device_target(q.device)
     cache_key = (
+        target.compile_key,
         T,
         H,
         HV,
@@ -997,7 +1002,7 @@ def run_pretranspose_decode(
         h0_out_indices = h0_indices
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
             # Pool capacity and the distance between slots do not affect codegen.
@@ -1039,7 +1044,7 @@ def run_pretranspose_decode(
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
+        compiled = cute.compile[gdn_compile_options(q.device, cute.EnableTVMFFI(True))](
             run_func,
             h0_source_tensor,
             A_log_tensor,
@@ -1066,14 +1071,13 @@ def run_pretranspose_decode(
             use_pool_indexing=use_pool_indexing,
             is_varlen=False,
             stream=stream,
-            options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     cache["compiled"](
         h0_source,
         A_log,
