@@ -701,11 +701,10 @@ def get_flash_kda_generated_uri(variant_id: str) -> str:
         f"{module.cache_ident}"
     )
     if module.abi_family == "direct_m128" and module.abi_variant == "serving":
-        # Serving direct-M128 links the audited body into its selector DSO so
-        # the dependent runtime launch has the same direct kernel-symbol path
-        # as the source implementation. Keep it distinct from older embedded
-        # cubin artifacts in the process-wide JIT cache.
-        uri += "_direct_source_v1"
+        # Serving direct-M128 retains its native prepared-launch ABI while the
+        # audited kernel body is compiled by the same NVRTC path as the source.
+        # Keep it distinct from older direct-source artifacts in the JIT cache.
+        uri += "_direct_nvrtc_v1"
     return uri
 
 
@@ -720,12 +719,12 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             f"unsupported generated FlashKDA variant: {variant_id}"
         ) from error
     csrc_dir = _get_flash_kda_csrc_dir()
-    direct_source = (
+    direct_serving = (
         module.abi_family == "direct_m128" and module.abi_variant == "serving"
     )
     torch_include_paths: list[Path] = []
     torch_ldflags: list[str] | None = None
-    if direct_source:
+    if direct_serving:
         from torch.utils.cpp_extension import include_paths, library_paths
 
         torch_include_paths = [Path(path) for path in include_paths()]
@@ -738,15 +737,11 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             "-ltorch",
             "-ltorch_python",
         ]
-    embedded_flags = (
-        []
-        if direct_source
-        else [
-            "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1",
-            "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1",
-            f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}",
-        ]
-    )
+    embedded_flags = [
+        "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1",
+        "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1",
+        f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}",
+    ]
     spec = gen_jit_spec(
         name=get_flash_kda_generated_uri(variant_id),
         sources=[_resolve_generated_source(csrc_dir, module.binding_relpath)],
@@ -759,7 +754,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
                     "-DFLASHKDA_GENERATED_DIRECT_SOURCE_ABI=1",
                     "-UPy_LIMITED_API",
                 ]
-                if direct_source
+                if direct_serving
                 else []
             ),
         ],
@@ -770,18 +765,12 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             *torch_include_paths,
         ],
         extra_ldflags=torch_ldflags,
-        embedded_cubin_factory=(
-            None
-            if direct_source
-            else functools.partial(
-                prepare_generated_flash_kda_cubin,
-                selector_path=_resolve_generated_source(
-                    csrc_dir, module.binding_relpath
-                ),
-                body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
-                module_ident=module.module_ident,
-                target=module.target,
-            )
+        embedded_cubin_factory=functools.partial(
+            prepare_generated_flash_kda_cubin,
+            selector_path=_resolve_generated_source(csrc_dir, module.binding_relpath),
+            body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
+            module_ident=module.module_ident,
+            target=module.target,
         ),
     )
     logger.info(
