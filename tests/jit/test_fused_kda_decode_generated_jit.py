@@ -75,7 +75,7 @@ def _manifest(
                 "kernel_symbol": kernel_symbol,
                 "abi_kind": abi_kind,
                 "state_dtype": state_dtype,
-                "extra_cuda_cflags": ["--maxrregcount=128"],
+                "extra_cuda_cflags": ["--use_fast_math", "--maxrregcount=128"],
                 "launch": {
                     "threads": 256,
                     "dynamic_smem_bytes": 2320,
@@ -147,7 +147,7 @@ def test_complete_manifest_verifies_source_identity_abi_and_launch(tmp_path):
     assert variant.kernel_symbol == "kernel_fused_kda_decode_test"
     assert variant.abi_kind == "standard"
     assert variant.state_dtype == "float32"
-    assert variant.extra_cuda_cflags == ("--maxrregcount=128",)
+    assert variant.extra_cuda_cflags == ("--use_fast_math", "--maxrregcount=128")
     assert variant.eligibility[0].heads == (12, 24, 32, 48, 96)
     assert variant.eligibility[0].slot_classes == (
         "positive_unique",
@@ -389,7 +389,10 @@ def test_jit_spec_uses_verified_source_identity_and_binding(
     )
     assert spec.name == expected_uri
     assert calls[0]["target"] == "sm100a"
-    assert calls[0]["extra_cuda_cflags"] == ("--maxrregcount=128",)
+    assert calls[0]["extra_cuda_cflags"] == (
+        "--use_fast_math",
+        "--maxrregcount=128",
+    )
     (binding_path,) = calls[0]["sources"]
     assert binding_path.read_text(encoding="utf-8") == generated._render_binding(
         variant

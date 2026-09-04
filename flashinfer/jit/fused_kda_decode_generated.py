@@ -49,6 +49,7 @@ _SLUG = re.compile(r"[a-z0-9][a-z0-9_]*")
 _C_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAXRREGCOUNT = re.compile(r"--maxrregcount=([1-9][0-9]{1,2})")
+_FIXED_GENERATED_CUDA_CFLAGS = frozenset({"--use_fast_math"})
 
 # These are the two physical parameter orders of the generated CUDA entry
 # points. The repeated-slot-safe schedule also consumes the row count. The host
@@ -334,6 +335,10 @@ def _validate_extra_cuda_cflags(value: object, label: str) -> tuple[str, ...]:
     for index, flag in enumerate(value):
         _require(isinstance(flag, str), f"{label}[{index}] must be a string")
         assert isinstance(flag, str)
+        if flag in _FIXED_GENERATED_CUDA_CFLAGS:
+            _require(flag not in flags, f"{label} contains duplicate flag {flag!r}")
+            flags.append(flag)
+            continue
         match = _MAXRREGCOUNT.fullmatch(flag)
         _require(match is not None, f"{label}[{index}] is not an allowed generated-kernel flag")
         assert match is not None

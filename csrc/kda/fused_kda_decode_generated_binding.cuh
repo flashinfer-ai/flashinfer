@@ -58,17 +58,9 @@ static_assert(sizeof(FLASHINFER_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
 #define uint64_t flashinfer_fused_kda_generated_uint64_t
 #define int32_t flashinfer_fused_kda_generated_int32_t
 #define int16_t flashinfer_fused_kda_generated_int16_t
-#define CakeTensorMap flashinfer_fused_kda_generated_TensorMap
-#define CakeTensorMapPack flashinfer_fused_kda_generated_TensorMapPack
-#define CakeKDATensorMap flashinfer_fused_kda_generated_KDATensorMap
-#define CakeKDATensorMapPack flashinfer_fused_kda_generated_KDATensorMapPack
 #define CUtensorMap flashinfer_fused_kda_generated_CUtensorMap
 #include FLASHINFER_FUSED_KDA_DECODE_BODY_FILE
 #undef CUtensorMap
-#undef CakeKDATensorMapPack
-#undef CakeKDATensorMap
-#undef CakeTensorMapPack
-#undef CakeTensorMap
 #undef int16_t
 #undef int32_t
 #undef uint64_t
