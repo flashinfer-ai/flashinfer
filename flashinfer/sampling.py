@@ -1887,14 +1887,8 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-    buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_renorm_probs_row_states_{probs.device}",
-        buffer_bytes,
-        probs.device,
-        zero_init=True,
-    )
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=probs.device)
 
     return get_sampling_module().top_k_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_k), row_states_buffer
@@ -1959,17 +1953,10 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-    buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_mask_logits_row_states_{logits.device}",
-        buffer_bytes,
-        logits.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        1024 * 1024, dtype=torch.uint8, device=logits.device
     )
-
-    # Note: row_states_buffer is zero-initialized on first allocation by _get_cache_buf
-    # Kernel will reset arrival_counter to 0 at the end of each launch
 
     return get_sampling_module().top_k_mask_logits(
         logits, *_to_tensor_scalar_tuple(top_k), row_states_buffer

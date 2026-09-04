@@ -846,6 +846,69 @@ def test_radix_multi_cta_regime(dtype, top_k, N, batch_size):
     _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+def test_multi_cta_row_states_not_shared_across_streams(backend):
+    """Concurrent multi-CTA varlen calls keep row-state scratch disjoint."""
+    device = torch.device("cuda")
+    if backend == "radix":
+        major, minor = get_compute_capability(device)
+        if not (
+            flashinfer.top_k_varlen.is_backend_supported("radix", major * 10 + minor)
+            and is_cute_dsl_available()
+        ):
+            pytest.skip("radix backend requires Blackwell+ CuTe DSL")
+
+    dtype, top_k, N = torch.float32, 512, 65536
+    if backend == "radix":
+        assert _radix_ctas(N, dtype, 1) > 1
+    seq_lens = torch.full((1,), N, dtype=torch.int32, device=device)
+    base = torch.arange(N, dtype=dtype, device=device)
+    logits_a = base.unsqueeze(0).contiguous()
+    logits_b = (-base).unsqueeze(0).contiguous()
+
+    def run(logits):
+        return flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            backend=backend,
+            return_values=True,
+        )
+
+    # Warm JIT and references on the default stream before concurrent launches.
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    outs_a, outs_b = [], []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    def assert_matches(actual, expected):
+        actual_i, actual_v = actual
+        expected_i, expected_v = expected
+        actual_order = actual_i.argsort(dim=-1)
+        expected_order = expected_i.argsort(dim=-1)
+        actual_i = torch.gather(actual_i, 1, actual_order)
+        actual_v = torch.gather(actual_v, 1, actual_order)
+        expected_i = torch.gather(expected_i, 1, expected_order)
+        expected_v = torch.gather(expected_v, 1, expected_order)
+        assert torch.equal(actual_i, expected_i)
+        torch.testing.assert_close(actual_v, expected_v)
+
+    for out in outs_a:
+        assert_matches(out, ref_a)
+    for out in outs_b:
+        assert_matches(out, ref_b)
+
+
 @requires_blackwell
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("top_k", [512, 1024])
