@@ -349,6 +349,44 @@ def _consume_staged_qk_mma(
     tmem_s.commit()
 
 
+def _consume_streamed_pv_fragments(
+    smem_kv: MemoryResource,
+    tmem_p: MemoryResource,
+    tmem_o: MemoryResource,
+    v_desc_label: str,
+    vp_mma_label: str,
+    cfg: FmhaDecodeConfig,
+) -> None:
+    """Issue one PV wave as its K32 P fragments become ready.
+
+    P fragment 0 is the earliest dependency: wait for it and for the
+    correction credit before holding the V stage. Later fragments may become
+    ready while the previous PV fragment is already executing; every slot
+    stays live through the complete async UMMA wave so the producer cannot
+    overwrite an operand prematurely.
+    """
+    assert cfg.num_head_dim_stages_kv == 1
+    fragment_label = f"{vp_mma_label}_fragment"
+    p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=0)
+    tmem_o.acquire()
+    smem_kv.wait()
+    v_desc = getattr(smem_kv, v_desc_label)()
+    getattr(tmem_o, fragment_label)(
+        v_desc=v_desc,
+        p_tmem_addr=p_tmem_addr,
+        fragment_idx=0,
+    )
+    for fragment_idx in range(1, cfg.num_softmax_score_fragments):
+        p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=fragment_idx)
+        getattr(tmem_o, fragment_label)(
+            v_desc=v_desc,
+            p_tmem_addr=p_tmem_addr,
+            fragment_idx=fragment_idx,
+        )
+    smem_kv.release()
+    tmem_o.commit()
+
+
 def _consume_staged_pv_mma(
     smem_kv: MemoryResource,
     tmem_p: MemoryResource,
@@ -362,33 +400,9 @@ def _consume_staged_pv_mma(
     """Consume all V head-dim stages for one PV MMA wave."""
     _ = section
     if cutlass.const_expr(cfg.streams_tmem_p_fragments):
-        assert cfg.num_head_dim_stages_kv == 1
-        fragment_label = f"{vp_mma_label}_fragment"
-
-        # P fragment 0 is the earliest dependency. Wait for it and for the
-        # correction credit before holding the shared V FIFO stage.
-        p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=0)
-        tmem_o.acquire()
-        smem_kv.wait()
-        v_desc = getattr(smem_kv, v_desc_label)()
-        getattr(tmem_o, fragment_label)(
-            v_desc=v_desc,
-            p_tmem_addr=p_tmem_addr,
-            fragment_idx=0,
+        _consume_streamed_pv_fragments(
+            smem_kv, tmem_p, tmem_o, v_desc_label, vp_mma_label, cfg
         )
-
-        # Later P fragments may become ready while the previous PV fragment is
-        # already executing. Keep every slot live through the complete async
-        # UMMA wave so the producer cannot overwrite an operand prematurely.
-        for fragment_idx in range(1, cfg.num_softmax_score_fragments):
-            p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=fragment_idx)
-            getattr(tmem_o, fragment_label)(
-                v_desc=v_desc,
-                p_tmem_addr=p_tmem_addr,
-                fragment_idx=fragment_idx,
-            )
-        smem_kv.release()
-        tmem_o.commit()
         return
 
     tmem_p.wait()
@@ -2081,6 +2095,11 @@ def create_mma_task_split_kv(
         ) -> None:
             """Issue one scheduled PV wave using the selected phase work."""
             _ = section
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+                _consume_streamed_pv_fragments(
+                    smem_kv, tmem_p, tmem_o, "v_desc", vp_mma_label, cfg
+                )
+                return
             tmem_p.wait()
             p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1 = tmem_p.p_operands()
             tmem_o.acquire()

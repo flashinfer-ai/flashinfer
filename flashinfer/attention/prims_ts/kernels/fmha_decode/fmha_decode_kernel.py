@@ -1768,13 +1768,15 @@ def _build_decode_gen_schedule(
         p0_alloc = smem_p0.get_tmem_requirements()[0]
         p1_alloc = smem_p1.get_tmem_requirements()[0]
         o_alloc = tmem_o.get_tmem_requirements()[0]
-        if cfg.tile_size_kv == 256:
-            # KV256 keeps O in the low 256 columns and overlays packed P on
-            # each S region from its first column. Softmax streams K32
-            # fragments in order, so every 16-column P store only overwrites
-            # scores that have already been consumed. Starting P after the
-            # nominal stats columns would instead clobber the next unread S
-            # fragment; KV256 keeps its softmax stats in SMEM.
+        if cfg.streams_tmem_p_fragments:
+            # Streamed profiles keep O in the low 256 columns and overlay
+            # packed P on each S region from its first column. Softmax streams
+            # K32 fragments in order, so every 16-column P store only
+            # overwrites scores that have already been consumed. Starting P
+            # after the nominal stats columns would instead clobber the next
+            # unread S fragment; streamed profiles keep their softmax stats in
+            # SMEM.
+            assert cfg.keeps_stats_via_smem
             o_alloc.offset = 0
             s0_alloc.offset = 2 * cfg.tmem_o_stage_cols
             s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols

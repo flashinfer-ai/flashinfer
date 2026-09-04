@@ -564,6 +564,24 @@ _PROXY_ROUTE_CASES = (
         expected_q_tile=128,
         expected_kv_tile=128,
     ),
+    # A 128-token KV block spans two K64 route atoms; the fragment-to-origin
+    # mapping must follow the atom, not the block.
+    _Case(
+        "proxy_bk128_keeps",
+        1,
+        1,
+        64,
+        269,
+        64,
+        128,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=64,
+        expected_kv_tile=256,
+    ),
 )
 
 
@@ -4073,7 +4091,7 @@ def test_public_block_sparse_correctness(
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
-    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128"),
+    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128", "bk128-keeps"),
 )
 @torch.no_grad()
 def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(

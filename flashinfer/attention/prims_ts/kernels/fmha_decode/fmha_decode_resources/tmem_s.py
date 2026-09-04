@@ -41,7 +41,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ...._block_sparse.common import _MAX_KV_ATOM_SIZE
+from ...._block_sparse.common import _MAX_KV_ATOM_SIZE, _block_sparse_kv_atom_size
 from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from ..fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
@@ -1452,11 +1452,11 @@ class TmemSResource(DecodeGenResourceBase):
             tile_is_unmasked,
         ) = self._resolve_keeps_tile_context(stage_info)
 
-        if cutlass.const_expr(cfg.tile_size_kv == 256):
-            # KV256 owns four physical K32 fragments per lane. Reduce the max
-            # one fragment at a time so only one native LDTM atom is live; the
-            # P pass reloads the same fragments after the reference max is
-            # known.
+        if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            # Streamed profiles own four physical K32 fragments per lane.
+            # Reduce the max one fragment at a time so only one native LDTM
+            # atom is live; the P pass reloads the same fragments after the
+            # reference max is known.
             tile_max = _neg_max_f32()
             for fragment_idx in cutlass.range_constexpr(
                 cfg.num_softmax_score_fragments
@@ -2321,7 +2321,7 @@ class TmemSResource(DecodeGenResourceBase):
         return sum_arr
 
     @cute.jit
-    def _compute_softmax_loop_sparse_keeps_kv256(
+    def _compute_softmax_loop_sparse_keeps_fragments(
         self,
         stage_info: StageInfo,
         *,
@@ -2337,10 +2337,23 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_token_word2: Uint32,
         sparse_token_word3: Uint32,
     ) -> tuple[object, object, object, object]:
-        """Preserve the established KV256 online-softmax state update."""
+        """Mask streamed K32 score fragments in place and reduce their max.
+
+        Each lane owns two K64 route atoms as ``num_softmax_score_fragments``
+        fragments: the first atom's fragments start at ``origin0`` and the
+        second atom's at ``origin1``. Masked fragments are written back to
+        TMEM so the P pass can reload them without any mask logic.
+        """
 
         cfg = self.cfg
-        assert cfg.tile_size_kv == 256
+        assert cfg.streams_tmem_p_fragments
+        num_fragments = cfg.num_softmax_score_fragments
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragments_per_origin = (
+            _block_sparse_kv_atom_size(cfg.kv_block_size) // fragment_regs
+        )
+        # The seven-slot softmax metadata ABI carries exactly four token words.
+        assert num_fragments == 4 and fragment_regs == 32
         task_cache = _decode_gen_task_cache(stage_info)
         token_words = (
             sparse_token_word0,
@@ -2348,7 +2361,9 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_token_word2,
             sparse_token_word3,
         )
-        keep_words = cutlass.Array(Uint32, 4, space=cutlass.AddressSpace.rmem)
+        keep_words = cutlass.Array(
+            Uint32, num_fragments, space=cutlass.AddressSpace.rmem
+        )
         warp_group_thread_idx = Int32(task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX])
         tile_row_idx = _keeps_row_idx(cfg, warp_group_thread_idx)
         logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
@@ -2377,11 +2392,12 @@ class TmemSResource(DecodeGenResourceBase):
         origin1 = Int32(sparse_origin1)
         valid0 = sparse_route_flags & Int32(1)
         valid1 = (sparse_route_flags >> Int32(1)) & Int32(1)
-        for fragment_idx in cutlass.range_constexpr(4):
-            fragment_origin = origin0 + Int32((fragment_idx % 2) * 32)
+        for fragment_idx in cutlass.range_constexpr(num_fragments):
+            atom_offset = Int32((fragment_idx % fragments_per_origin) * fragment_regs)
+            fragment_origin = origin0 + atom_offset
             fragment_valid = valid0
-            if cutlass.const_expr(fragment_idx >= 2):
-                fragment_origin = origin1 + Int32((fragment_idx % 2) * 32)
+            if cutlass.const_expr(fragment_idx >= fragments_per_origin):
+                fragment_origin = origin1 + atom_offset
                 fragment_valid = valid1
             if cutlass.const_expr(cfg.trusts_prepared_score_words):
                 prepared_keep_word = Uint32(0)
@@ -2401,7 +2417,7 @@ class TmemSResource(DecodeGenResourceBase):
                 )
 
         warp_scores_are_unmasked = cutlass.Boolean(True)
-        for fragment_idx in cutlass.range_constexpr(4):
+        for fragment_idx in cutlass.range_constexpr(num_fragments):
             warp_scores_are_unmasked = cutlass.Boolean(
                 warp_scores_are_unmasked
                 and keep_words[fragment_idx] == Uint32(0xFFFFFFFF)
@@ -2419,17 +2435,17 @@ class TmemSResource(DecodeGenResourceBase):
             max_chains[chain_idx] = _neg_max_f32()
 
         if warp_scores_are_unmasked:
-            for fragment_idx in cutlass.range_constexpr(4):
+            for fragment_idx in cutlass.range_constexpr(num_fragments):
                 loaded = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(
-                        score_tmem_addr + Int32(fragment_idx * 32), Float32
+                        score_tmem_addr + Int32(fragment_idx * fragment_regs), Float32
                     ),
-                    num=32,
+                    num=fragment_regs,
                     offset=cfg.tile_size_kv // 2,
                 )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                for score_idx in cutlass.range_constexpr(32):
+                for score_idx in cutlass.range_constexpr(fragment_regs):
                     chain_idx: Constexpr[int] = score_idx % 4
                     max_chains[chain_idx] = cute.math.max(
                         max_chains[chain_idx],
@@ -2437,19 +2453,19 @@ class TmemSResource(DecodeGenResourceBase):
                         ftz=True,
                     )
         else:
-            for fragment_idx in cutlass.range_constexpr(4):
-                fragment_addr = score_tmem_addr + Int32(fragment_idx * 32)
+            for fragment_idx in cutlass.range_constexpr(num_fragments):
+                fragment_addr = score_tmem_addr + Int32(fragment_idx * fragment_regs)
                 loaded = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(fragment_addr, Float32),
-                    num=32,
+                    num=fragment_regs,
                     offset=cfg.tile_size_kv // 2,
                 )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
                 masked_scores = cutlass.Array(
-                    Float32, 32, space=cutlass.AddressSpace.rmem
+                    Float32, fragment_regs, space=cutlass.AddressSpace.rmem
                 )
-                for score_idx in cutlass.range_constexpr(32):
+                for score_idx in cutlass.range_constexpr(fragment_regs):
                     score = Float32(loaded[score_idx])
                     score_is_kept = (
                         (keep_words[fragment_idx] >> Int32(score_idx)) & Uint32(1)
@@ -2464,7 +2480,7 @@ class TmemSResource(DecodeGenResourceBase):
                 _keeps_tcgen05_st(
                     cfg,
                     prims.make_tmem_ptr(fragment_addr, Float32),
-                    masked_scores.data_ptr().load(count=32, alignment=4),
+                    masked_scores.data_ptr().load(count=fragment_regs, alignment=4),
                     offset=cfg.tile_size_kv // 2,
                 )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
@@ -2503,8 +2519,8 @@ class TmemSResource(DecodeGenResourceBase):
 
         assert self.cfg.use_block_sparse
         if cutlass.const_expr(self.cfg.use_keeps_mma_ab):
-            if cutlass.const_expr(self.cfg.tile_size_kv == 256):
-                return self._compute_softmax_loop_sparse_keeps_kv256(
+            if cutlass.const_expr(self.cfg.streams_tmem_p_fragments):
+                return self._compute_softmax_loop_sparse_keeps_fragments(
                     stage_info,
                     old_max_arr=old_max_arr,
                     sum_arr=sum_arr,

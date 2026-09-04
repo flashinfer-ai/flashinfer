@@ -234,14 +234,16 @@ class TmemOResource(DecodeGenResourceBase):
         fragment_idx: Constexpr[int],
         initial_scale_d,
     ) -> None:
-        """Issue the two WS MMA steps covered by one KV256 P fragment.
+        """Issue the two MMA K-steps covered by one streamed P fragment.
 
         ``p_tmem_addr`` is already the base of the fragment selected by
         ``wait_p_fragment``. Only the two local K-step offsets are added here;
-        ``fragment_idx`` must not be applied to the TMEM address again.
+        ``fragment_idx`` must not be applied to the TMEM address again. KV256
+        issues the WS 2x2 instruction over its two spatial halves; KV128 issues
+        the plain M=128 instruction and advances V by one K16 slice per step.
         """
         cfg = self.cfg
-        assert cfg.tile_size_kv == 256 and cfg.uses_two_inst_tmem_p
+        assert cfg.streams_tmem_p_fragments and not cfg.use_fp8_qkv
         v_desc = _freeze_smem_descriptor(v_desc)
 
         task_cache = _decode_gen_task_cache(stage_info)
@@ -268,17 +270,32 @@ class TmemOResource(DecodeGenResourceBase):
                 p_operand = prims.make_tmem_ptr(
                     p_tmem_addr + Int32(local_k_step * 8), Int32
                 )
-                iter_v_desc = v_desc + Int32(
-                    (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
-                )
-                tcgen05_mma_ws(
-                    _mma_kind_for_qkv(cfg),
-                    tmem_col,
-                    p_operand,
-                    iter_v_desc,
-                    idesc,
-                    initial_scale_d or fragment_idx != 0 or local_k_step != 0,
-                )
+                scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
+                if cutlass.const_expr(cfg.tile_size_kv == 256):
+                    # V holds four K64 atoms; jump between atoms every four
+                    # K16 steps.
+                    iter_v_desc = v_desc + Int32(
+                        (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
+                    )
+                    tcgen05_mma_ws(
+                        _mma_kind_for_qkv(cfg),
+                        tmem_col,
+                        p_operand,
+                        iter_v_desc,
+                        idesc,
+                        scale_d,
+                    )
+                else:
+                    iter_v_desc = v_desc + Int32(k_step * 128)
+                    prims.tcgen05_mma(
+                        _mma_kind_for_qkv(cfg),
+                        prims.CTAGroup.CTA_1,
+                        tmem_col,
+                        p_operand,
+                        iter_v_desc,
+                        idesc,
+                        scale_d,
+                    )
 
     @cute.jit
     def _vp_mma(

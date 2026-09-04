@@ -2119,9 +2119,18 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
             assert stats._alloc is None
         else:
             assert stats._alloc is not None
-    if cfg.keeps_stats_via_smem:
+    if cfg.streams_tmem_p_fragments:
+        # Streamed P fragments overlay S from its first column so every
+        # 16-column P store lands on consumed scores; O leads the layout.
+        assert cfg.keeps_stats_via_smem
+        assert output.offset == 0
+        assert s0.offset == output.offset + output.num_columns
+        assert p0.offset == s0.offset
+        assert p1.offset == s1.offset
+    elif cfg.keeps_stats_via_smem:
         assert p0.offset == s0.offset + cfg.tmem_stats_cols
         assert p1.offset == s1.offset + cfg.tmem_stats_cols
+        assert output.offset >= s1.offset + s1.num_columns
     else:
         stats0 = resources["tmemSoftmaxLocal0"]._alloc
         stats1 = resources["tmemSoftmaxLocal1"]._alloc
@@ -2137,7 +2146,6 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     assert p0.offset + p0.num_columns <= s0.offset + s0.num_columns
     assert s1.offset <= p1.offset
     assert p1.offset + p1.num_columns <= s1.offset + s1.num_columns
-    assert output.offset >= s1.offset + s1.num_columns
     assert resources["smemP0"]._alloc is None
     assert resources["smemP1"]._alloc is None
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
@@ -2181,12 +2189,12 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
 def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     persistent: bool,
 ) -> None:
-    """Only KV256 splits its scores into streamed K32 P fragments.
+    """KV256 and 16-bit Q128/KV128 split their scores into streamed fragments.
 
     Streamed profiles share one rolled fragment loop whose geometry follows
     the fragment register count, so the profile property and the fragment
-    count are pinned together. Single-fragment profiles keep the complete
-    score row and never stream.
+    count are pinned together. They also run their two softmax groups
+    unordered. FP8 Q128 publishes a complete packed row and never streams.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -2194,11 +2202,19 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert kv256.softmax_score_fragment_regs == 32
     assert kv256.num_softmax_score_fragments == 4
     assert kv256.kv_block_size % kv256.softmax_score_fragment_regs == 0
+    assert not kv256.uses_ordered_softmax_barrier
 
-    kv128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
-    assert kv128.tile_size_kv != 256
-    assert kv128.num_softmax_score_fragments == 1
-    assert not kv128.streams_tmem_p_fragments
+    q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
+    assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
+    assert q128.streams_tmem_p_fragments
+    assert q128.softmax_score_fragment_regs == 32
+    assert q128.num_softmax_score_fragments == 4
+    assert not q128.uses_ordered_softmax_barrier
+
+    q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
+    assert q128_fp8.uses_two_inst_tmem_p
+    assert q128_fp8.num_softmax_score_fragments == 1
+    assert not q128_fp8.streams_tmem_p_fragments
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (

@@ -1080,12 +1080,21 @@ class FmhaDecodeConfig:
     def softmax_score_fragment_regs(self) -> int:
         """Return the maximum score fragment kept live in registers.
 
-        KV256 owns 128 score values per lane but streams them as four native
-        32-register LDTM atoms. Other profiles retain their complete score
-        fragment, so this property is intentionally distinct from
-        ``num_s_regs_per_thread`` (the total logical ownership).
+        Streamed profiles own 128 score values per lane but process them as
+        four native 32-register LDTM atoms: Q64/KV256 and the 16-bit
+        Q128/KV128 two-instance TMEM-P profiles share that geometry. Other
+        profiles retain their complete score fragment, so this property is
+        intentionally distinct from ``num_s_regs_per_thread`` (the total
+        logical ownership). FP8 Q128 keeps the complete row because its P
+        publication packs four values per column in one x16/x32 store.
         """
         if self.tile_size_kv == 256:
+            return 32
+        if (
+            self.tile_size_q == 128
+            and self.uses_two_inst_tmem_p
+            and not self.use_fp8_qkv
+        ):
             return 32
         return self.num_s_regs_per_thread
 
@@ -1474,10 +1483,10 @@ class FmhaDecodeConfig:
     @property
     def uses_ordered_softmax_barrier(self) -> bool:
         """Whether this profile selects the ordered P0/P1 softmax barrier."""
-        if self.tile_size_kv == 256:
-            # KV256 uses independent four-stage P-fragment pipelines. Ordering
-            # the two softmax groups would serialize fragment production and
-            # defeat the intended P/PV overlap.
+        if self.streams_tmem_p_fragments:
+            # Streamed profiles use independent per-fragment P pipelines.
+            # Ordering the two softmax groups would serialize fragment
+            # production and defeat the intended P/PV overlap.
             return False
         if self.ordered_softmax_barrier_mode == 2:
             return True

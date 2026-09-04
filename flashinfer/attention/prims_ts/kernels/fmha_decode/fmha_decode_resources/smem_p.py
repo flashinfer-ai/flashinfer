@@ -42,7 +42,10 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ...._block_sparse.common import _block_sparse_proxy_summary_geometry
+from ...._block_sparse.common import (
+    _block_sparse_kv_atom_size,
+    _block_sparse_proxy_summary_geometry,
+)
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     Constexpr,
@@ -472,18 +475,20 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> Int32:
         """Return the token origin of a fragment selected at runtime.
 
-        Each lane's fragments cover two KV blocks in order: the first block's
-        fragments start at ``route_origin0``, the second block's at
-        ``route_origin1``, and consecutive fragments within a block advance by
+        Each lane's fragments cover two K64 route atoms in order: the first
+        atom's fragments start at ``route_origin0``, the second atom's at
+        ``route_origin1``, and consecutive fragments within an atom advance by
         one fragment width.
         """
         cfg = self.cfg
         fragment_regs = cfg.softmax_score_fragment_regs
-        fragments_per_block = cfg.kv_block_size // fragment_regs
+        fragments_per_origin = (
+            _block_sparse_kv_atom_size(cfg.kv_block_size) // fragment_regs
+        )
         fragment_origin = Int32(route_origin0)
-        if fragment >= Int32(fragments_per_block):
+        if fragment >= Int32(fragments_per_origin):
             fragment_origin = Int32(route_origin1)
-        return fragment_origin + (fragment % Int32(fragments_per_block)) * Int32(
+        return fragment_origin + (fragment % Int32(fragments_per_origin)) * Int32(
             fragment_regs
         )
 
