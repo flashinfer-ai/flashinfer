@@ -110,10 +110,12 @@ def _skip_if_not_sm90_or_later():
         pytest.skip(f"GDN ucache requires SM90+, got SM{cc[0]}{cc[1]}")
 
 
-def _load_flush(arm: str):
-    """Load one module copy per dtype arm (dtype is chosen at import time)."""
-    if arm in _MODULE_CACHE:
-        return _MODULE_CACHE[arm]
+def _load_flush(arm: str, path: str = _FLUSH_PATH):
+    """Load one module copy per (dtype arm, module path); the dtype set is
+    chosen at import time via the GDN_UCACHE_* env vars."""
+    cache_key = (arm, path)
+    if cache_key in _MODULE_CACHE:
+        return _MODULE_CACHE[cache_key]
     io_env, state_env, ring_env, _, _, _ = ARMS[arm]
     old = {
         k: os.environ.pop(k, None)
@@ -130,7 +132,9 @@ def _load_flush(arm: str):
     if ring_env:
         os.environ["GDN_UCACHE_RING_DTYPE"] = ring_env
     try:
-        spec = importlib.util.spec_from_file_location(f"uc_flush_{arm}", _FLUSH_PATH)
+        spec = importlib.util.spec_from_file_location(
+            f"uc_{Path(path).stem}_{arm}", path
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     finally:
@@ -139,7 +143,7 @@ def _load_flush(arm: str):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    _MODULE_CACHE[arm] = mod
+    _MODULE_CACHE[cache_key] = mod
     return mod
 
 
@@ -166,8 +170,9 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     # 2) run the T new draft tokens through the exact delta-rule recurrence
     khat = F.normalize(k.to(f), dim=-1)
     qhat = F.normalize(q.to(f), dim=-1) * SCALE
-    y = torch.zeros(T, HV, V, dtype=f, device=q.device)
-    for t in range(T):
+    n_tok = q.shape[0]  # T-generic: the STP (T=1) tests below reuse this oracle
+    y = torch.zeros(n_tok, HV, V, dtype=f, device=q.device)
+    for t in range(n_tok):
         la = -torch.exp(A_log.to(f)) * F.softplus(a[t].to(f) + dt_bias.to(f))
         beta = torch.sigmoid(b[t].to(f))  # [HV]
         k_hv = khat[t].repeat_interleave(grp, dim=0)  # [HV, K]
@@ -183,24 +188,38 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
 # ---------------------------------------------------------------------------
 # Case builder: consistent inputs + rings for B requests.
 # ---------------------------------------------------------------------------
-def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases=None):
+def _make_case(
+    B,
+    hist_lens,
+    io_dtype,
+    state_dtype,
+    seed,
+    ring_dtype=None,
+    bases=None,
+    t_tokens=T,
+    ring_slots=RING,
+):
     ring_dtype = ring_dtype or io_dtype
     g = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
         return (torch.randn(*s, generator=g, device=DEV) * sc).to(io_dtype)
 
-    q, k = rn(B, T, H, K), rn(B, T, H, K)
-    v, a, b = rn(B, T, HV, V, sc=0.5), rn(B, T, HV, sc=0.5), rn(B, T, HV)
+    q, k = rn(B, t_tokens, H, K), rn(B, t_tokens, H, K)
+    v, a, b = (
+        rn(B, t_tokens, HV, V, sc=0.5),
+        rn(B, t_tokens, HV, sc=0.5),
+        rn(B, t_tokens, HV),
+    )
     A_log = (
         torch.full((HV,), -3.0, device=DEV)
         + torch.rand(HV, generator=g, device=DEV) * 0.3
     ).to(io_dtype)
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
-    kc = torch.zeros(B, H, RING, K, dtype=ring_dtype, device=DEV)
-    uc = torch.zeros(B, HV, RING, V, dtype=ring_dtype, device=DEV)
-    gc = torch.zeros(B, HV, RING, dtype=torch.float32, device=DEV)
+    kc = torch.zeros(B, H, ring_slots, K, dtype=ring_dtype, device=DEV)
+    uc = torch.zeros(B, HV, ring_slots, V, dtype=ring_dtype, device=DEV)
+    gc = torch.zeros(B, HV, ring_slots, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
     cb = torch.tensor(bases, dtype=torch.int32, device=DEV)
@@ -210,7 +229,9 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None, bases
             continue
         # logical history rows j land at PHYSICAL ring rows (base + j) % RING
         rows = torch.tensor(
-            [(bases[r] + j) % RING for j in range(P)], dtype=torch.long, device=DEV
+            [(bases[r] + j) % ring_slots for j in range(P)],
+            dtype=torch.long,
+            device=DEV,
         )
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(ring_dtype)
@@ -809,3 +830,756 @@ def test_verify_only_rejects_non_bf16_activations():
             hist_len=hl.clone(),
             scale=SCALE,
         )
+
+
+# ===========================================================================
+# STP (T=1, single-token-prediction) fold-absorb kernel
+# (flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_stp.py — read its module
+# docstring; it is a fork of the T=4 flush kernel above with vLLM-ReplaySSM-
+# compatible flush semantics).
+#
+# Reuses this file's fp32 oracle / dtype arms / case builder. STP-specific
+# risks pinned below:
+#   - FOLD-ABSORB: a flush commits S_new = a0*S_h + u0 (x) k0^T (the
+#     POST-token state; the oracle's S_after_history plus one token step) —
+#     checked at fm=15 (full window) AND mid-window fm (weight-0 tail rows);
+#   - SINGLE-ROW appends: exactly one (k, u, g) entry per verify step, no
+#     T=4 filler entries (FLAT 16-slot buffer, slot P <= 15, base pinned 0);
+#   - fused commit: flush -> hist_len = 0 (window restarts EMPTY), verify ->
+#     P + 1;
+#   - exhaustive P in [0, 15]; shuffled non-identity state indices; 200-step
+#     drift vs a never-resynced fp32 reference; 16-token-cycle multistep;
+#     prepadded [B,4] zero-copy path bitwise == the staging path.
+# ===========================================================================
+_STP_PATH = str(
+    Path(__file__).resolve().parents[2]
+    / "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_stp.py"
+)
+STP_RING = 16  # flat physical buffer (fork's RING_SLOTS)
+STP_FM = 15  # default flush_min == vLLM's flush-at-(L-1)
+
+
+def _stp_case(B, hist_lens, arm, seed):
+    """T=1 case on the fork's flat 16-slot buffer (live entries at [0, P))."""
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
+    return _make_case(
+        B,
+        hist_lens,
+        io_dtype,
+        state_dtype,
+        seed,
+        ring_dtype=ring_dtype,
+        t_tokens=1,
+        ring_slots=STP_RING,
+    )
+
+
+def _stp_token_step(S_hist, q1, k1, v1, a1, b1, A_log, dt_bias):
+    """One fp32 delta-rule step from the oracle's replayed (pre-token) state.
+    Supplements _ref_fp32 for the fold-absorb check: the fork's flush commits
+    the POST-token state, which _ref_fp32 does not return."""
+    f = torch.float32
+    grp = HV // H
+    khat = F.normalize(k1.to(f), dim=-1).repeat_interleave(grp, dim=0)
+    qhat = (F.normalize(q1.to(f), dim=-1) * SCALE).repeat_interleave(grp, dim=0)
+    la = -torch.exp(A_log.to(f)) * F.softplus(a1.to(f) + dt_bias.to(f))
+    beta = torch.sigmoid(b1.to(f))
+    S = S_hist * torch.exp(la)[:, None, None]
+    pred = torch.einsum("hvk,hk->hv", S, khat)
+    u_t = (v1.to(f) - pred) * beta[:, None]
+    S = S + u_t[:, :, None] * khat[:, None, :]
+    y = torch.einsum("hvk,hk->hv", S, qhat)
+    return y, S, u_t, khat
+
+
+STP_HISTORIES = {
+    "empty_P0": [0, 0, 0, 0],
+    "replay_P14": [14, 14, 14, 14],  # deepest verify at fm=15
+    "fold_mixed": [15, 14, 15, 0],  # rows 0 and 2 fold (absorb)
+}
+
+
+@pytest.mark.parametrize("arm", list(ARMS))
+@pytest.mark.parametrize("history", list(STP_HISTORIES))
+def test_stp_output_and_absorbed_fold_match_fp32_reference(arm, history):
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush(arm, _STP_PATH)
+    assert mod.RING_SLOTS == STP_RING
+    B = 4
+    hist = STP_HISTORIES[history]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, hist, arm, seed=1234
+    )
+    pool_before, uc0 = pool.clone(), uc.clone()
+
+    y = mod.gated_delta_rule_stp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=STP_FM,
+    )
+
+    for r in range(B):
+        P = hist[r]
+        y_ref, S_hist = _ref_fp32(
+            q[r],
+            k[r],
+            v[r],
+            a[r],
+            b[r],
+            A_log,
+            dt_bias,
+            pool_before[r],
+            kc[r],
+            uc0[r],
+            gc[r],
+            P,
+        )
+        err = (y[r].float() - y_ref).abs().max().item()
+        assert err < Y_TOL, f"row {r} ({history}, {arm}): |y - ref| = {err:.2e}"
+        if P >= STP_FM:
+            # fold-absorb: the committed state is the POST-token state
+            _, S_tok, _, _ = _stp_token_step(
+                S_hist,
+                q[r, 0],
+                k[r, 0],
+                v[r, 0],
+                a[r, 0],
+                b[r, 0],
+                A_log,
+                dt_bias,
+            )
+            serr = (pool[r].float() - S_tok).abs().max().item()
+            assert serr < STATE_TOL, f"row {r} ({arm}): |absorbed - ref| = {serr:.2e}"
+            assert int(hl[r]) == 0, "flush must restart the window EMPTY"
+        else:
+            assert torch.equal(pool[r], pool_before[r])
+            assert int(hl[r]) == P + 1
+        assert int(cb[r]) == 0  # flat: base pinned at 0
+
+
+def test_stp_single_row_appends_no_filler():
+    """Exactly one (k, u, g) entry written per verify call, at slot P; every
+    other slot bitwise-untouched (the parent T=4 kernel would have written 3
+    filler rows at P+1..P+3)."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B = 4
+    hist = [0, 5, 10, 14]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, hist, "bf16", seed=7
+    )
+    kc0, uc0, gc0 = kc.clone(), uc.clone(), gc.clone()
+
+    mod.gated_delta_rule_stp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=STP_FM,
+    )
+
+    for r in range(B):
+        P = hist[r]
+        for s in range(STP_RING):
+            same = (
+                torch.equal(kc[r, :, s], kc0[r, :, s])
+                and torch.equal(uc[r, :, s], uc0[r, :, s])
+                and torch.equal(gc[r, :, s], gc0[r, :, s])
+            )
+            if s == P:
+                assert not same, f"row {r}: append slot {s} not written"
+            else:
+                assert same, f"row {r}: slot {s} modified (filler leak)"
+
+
+def test_stp_mid_window_flush_min():
+    """fm=10 (predictive flushing): the fold's weight-0 tail rows (P < r <
+    16) must not contaminate the absorbed state even though the token row P
+    is live in the same GEMM."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B = 4
+    hist = [10, 10, 9, 0]  # rows 0,1 fold at fm=10 (self-commit cap); 2,3 verify
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, hist, "bf16", seed=99
+    )
+    pool_before, uc0 = pool.clone(), uc.clone()
+
+    y = mod.gated_delta_rule_stp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=10,
+    )
+
+    for r in range(B):
+        P = hist[r]
+        y_ref, S_hist = _ref_fp32(
+            q[r],
+            k[r],
+            v[r],
+            a[r],
+            b[r],
+            A_log,
+            dt_bias,
+            pool_before[r],
+            kc[r],
+            uc0[r],
+            gc[r],
+            P,
+        )
+        assert (y[r].float() - y_ref).abs().max().item() < Y_TOL
+        if P >= 10:
+            _, S_tok, _, _ = _stp_token_step(
+                S_hist,
+                q[r, 0],
+                k[r, 0],
+                v[r, 0],
+                a[r, 0],
+                b[r, 0],
+                A_log,
+                dt_bias,
+            )
+            serr = (pool[r].float() - S_tok).abs().max().item()
+            assert serr < STATE_TOL, f"row {r}: |absorbed - ref| = {serr:.2e}"
+            assert int(hl[r]) == 0
+        else:
+            assert torch.equal(pool[r], pool_before[r])
+            assert int(hl[r]) == P + 1
+
+
+@pytest.mark.parametrize("flush_min", [15, 8])
+def test_stp_exhaustive_history_depths(flush_min):
+    """One batch row per legal P in [0, flush_min]: every replay depth AND
+    every legal fold depth checked against the oracle."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    hist = list(range(flush_min + 1))  # P == fm folds
+    B = len(hist)
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, hist, "bf16", seed=101
+    )
+    pool0, uc0 = pool.clone(), uc.clone()
+
+    y = mod.gated_delta_rule_stp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=flush_min,
+    )
+
+    for r in range(B):
+        P = hist[r]
+        y_ref, S_hist = _ref_fp32(
+            q[r],
+            k[r],
+            v[r],
+            a[r],
+            b[r],
+            A_log,
+            dt_bias,
+            pool0[r],
+            kc[r],
+            uc0[r],
+            gc[r],
+            P,
+        )
+        err = (y[r].float() - y_ref).abs().max().item()
+        assert err < Y_TOL, f"P={P} (fm={flush_min}): |y - ref| = {err:.2e}"
+        if flush_min <= P:
+            _, S_tok, _, _ = _stp_token_step(
+                S_hist,
+                q[r, 0],
+                k[r, 0],
+                v[r, 0],
+                a[r, 0],
+                b[r, 0],
+                A_log,
+                dt_bias,
+            )
+            serr = (pool[r].float() - S_tok).abs().max().item()
+            assert serr < STATE_TOL, f"P={P}: |absorbed - ref| = {serr:.2e}"
+            assert int(hl[r]) == 0
+        else:
+            assert torch.equal(pool[r], pool0[r])
+            assert int(hl[r]) == P + 1
+
+
+@pytest.mark.parametrize("B", [1, 3, 16])
+def test_stp_nonidentity_state_indices(B):
+    """Shuffled state-slot indices into a pool of 2B+3 slots: pool reads,
+    fold writes, AND all three ring streams must follow the indices (the
+    other tests use arange). Non-indexed slots must be untouched."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    pool_n = 2 * B + 3
+    perm = torch.randperm(pool_n, generator=torch.Generator().manual_seed(7))
+    idx = perm[:B].to(torch.int32).to(DEV)
+    hist_by_row = [[15, 7, 0, 12, 15, 3, 14, 15][r % 8] for r in range(B)]
+    # build a pool-sized case, then place each row's history at its SLOT
+    case = _stp_case(pool_n, [0] * pool_n, "bf16", seed=202 + B)
+    _, _, _, _, _, A_log, dt_bias, pool, kc, uc, gc, _, _, _ = case
+    gsrc = torch.Generator(device=DEV).manual_seed(400 + B)
+    for r in range(B):
+        s, P = int(idx[r]), hist_by_row[r]
+        if P == 0:
+            continue
+        kh = torch.randn(H, P, K, generator=gsrc, device=DEV)
+        kc[s, :, :P] = F.normalize(kh, dim=-1).to(kc.dtype)
+        uc[s, :, :P] = (torch.randn(HV, P, V, generator=gsrc, device=DEV) * 0.3).to(
+            uc.dtype
+        )
+        la = -(torch.rand(HV, P, generator=gsrc, device=DEV) * 0.3 + 0.003)
+        gc[s, :, :P] = torch.cumsum(la, dim=-1)
+    q = (torch.randn(B, 1, H, K, generator=gsrc, device=DEV)).to(torch.bfloat16)
+    k = (torch.randn(B, 1, H, K, generator=gsrc, device=DEV)).to(torch.bfloat16)
+    v = (torch.randn(B, 1, HV, V, generator=gsrc, device=DEV) * 0.5).to(torch.bfloat16)
+    a = (torch.randn(B, 1, HV, generator=gsrc, device=DEV) * 0.5).to(torch.bfloat16)
+    b = (torch.randn(B, 1, HV, generator=gsrc, device=DEV)).to(torch.bfloat16)
+    hl = torch.tensor(hist_by_row, dtype=torch.int32, device=DEV)
+    cb = torch.zeros(B, dtype=torch.int32, device=DEV)
+    pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
+
+    y = mod.gated_delta_rule_stp_ucache_flush(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=idx,
+        k_cache=kc,
+        u_cache=uc,
+        g_cache=gc,
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=STP_FM,
+    )
+
+    used = {int(s) for s in idx}
+    for s in range(pool_n):
+        if s not in used:
+            assert torch.equal(pool[s], pool0[s]), f"unindexed pool slot {s} touched"
+            assert torch.equal(uc[s], uc0[s]) and torch.equal(kc[s], kc0[s])
+            assert torch.equal(gc[s], gc0[s]), f"unindexed ring slot {s} touched"
+    for r in range(B):
+        s, P = int(idx[r]), hist_by_row[r]
+        y_ref, S_hist = _ref_fp32(
+            q[r],
+            k[r],
+            v[r],
+            a[r],
+            b[r],
+            A_log,
+            dt_bias,
+            pool0[s],
+            kc0[s],
+            uc0[s],
+            gc0[s],
+            P,
+        )
+        err = (y[r].float() - y_ref).abs().max().item()
+        assert err < Y_TOL, f"row {r} slot {s} P={P}: |y - ref| = {err:.2e}"
+        _, S_tok, u_ref, _ = _stp_token_step(
+            S_hist, q[r, 0], k[r, 0], v[r, 0], a[r, 0], b[r, 0], A_log, dt_bias
+        )
+        if P >= STP_FM:
+            serr = (pool[s].float() - S_tok).abs().max().item()
+            assert serr < STATE_TOL, f"row {r} slot {s}: fold err {serr:.2e}"
+        else:
+            du = (uc[s, :, P].float() - u_ref).abs().max().item()
+            dk = (
+                (kc[s, :, P].float() - F.normalize(k[r, 0].float(), dim=-1))
+                .abs()
+                .max()
+                .item()
+            )
+            assert du < 2e-2 and dk < 8e-3, f"row {r} slot {s}: append errs {du} {dk}"
+
+
+def test_stp_multistep_decode_16_token_cycles():
+    """40 real STP steps at fm=15: hist cycles 0..14 -> fold -> 0 (16-token
+    cycles, exactly 2 folds per request), each step oracle-checked from the
+    kernel's own ring/pool state."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B, n_steps = 4, 40
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, [0, 0, 0, 0], "bf16", seed=55
+    )
+
+    g = torch.Generator(device=DEV).manual_seed(777)
+    bf = torch.bfloat16
+    n_folds = 0
+    for step in range(n_steps):
+        qs = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        ks = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        vs = (torch.randn(B, 1, HV, V, generator=g, device=DEV) * 0.5).to(bf)
+        as_ = (torch.randn(B, 1, HV, generator=g, device=DEV) * 0.5).to(bf)
+        bs = (torch.randn(B, 1, HV, generator=g, device=DEV)).to(bf)
+
+        pool_before, uc_before, hl_before = pool.clone(), uc.clone(), hl.clone()
+
+        y = mod.gated_delta_rule_stp_ucache_flush(
+            A_log,
+            as_,
+            dt_bias,
+            q=qs,
+            k=ks,
+            v=vs,
+            b=bs,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+
+        for r in range(B):
+            P = int(hl_before[r])
+            y_ref, S_hist = _ref_fp32(
+                qs[r],
+                ks[r],
+                vs[r],
+                as_[r],
+                bs[r],
+                A_log,
+                dt_bias,
+                pool_before[r],
+                kc[r],
+                uc_before[r],
+                gc[r],
+                P,
+            )
+            err = (y[r, 0].float() - y_ref[0]).abs().max().item()
+            assert err < Y_TOL, f"step {step} row {r}: |y - ref| = {err:.2e}"
+            if P >= STP_FM:
+                n_folds += 1
+                _, S_tok, _, _ = _stp_token_step(
+                    S_hist,
+                    qs[r, 0],
+                    ks[r, 0],
+                    vs[r, 0],
+                    as_[r, 0],
+                    bs[r, 0],
+                    A_log,
+                    dt_bias,
+                )
+                serr = (pool[r].float() - S_tok).abs().max().item()
+                assert serr < STATE_TOL, (
+                    f"step {step} row {r}: |absorbed - ref| = {serr:.2e}"
+                )
+                assert int(hl[r]) == 0
+            else:
+                assert torch.equal(pool[r], pool_before[r])
+                assert int(hl[r]) == P + 1
+        assert int(cb.max()) == 0
+    assert n_folds == 2 * B, f"expected {2 * B} folds, saw {n_folds}"
+
+
+def test_stp_long_run_drift_200_steps():
+    """200 real decode steps (12 full fold cycles) against a fp32 reference
+    state that is NEVER resynced from the kernel — bounds the accumulated
+    rounding of the absorbed-fold chain. MEASURED: max drift 6.5e-4 and FLAT
+    across all 200 steps (the delta rule's contractive decay washes out
+    per-fold rounding); 5e-2 is ~77x that."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B, n_steps = 2, 200
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, [0, 0], "bf16", seed=303
+    )
+    S_ref = pool.float().clone()  # continuous fp32 reference, per row
+
+    g = torch.Generator(device=DEV).manual_seed(777)
+    bf = torch.bfloat16
+    max_drift = 0.0
+    for _step in range(n_steps):
+        qs = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        ks = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        vs = (torch.randn(B, 1, HV, V, generator=g, device=DEV) * 0.5).to(bf)
+        as_ = (torch.randn(B, 1, HV, generator=g, device=DEV) * 0.5).to(bf)
+        bs = (torch.randn(B, 1, HV, generator=g, device=DEV)).to(bf)
+        y = mod.gated_delta_rule_stp_ucache_flush(
+            A_log,
+            as_,
+            dt_bias,
+            q=qs,
+            k=ks,
+            v=vs,
+            b=bs,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+        for r in range(B):
+            y_ref, S_new, _, _ = _stp_token_step(
+                S_ref[r],
+                qs[r, 0],
+                ks[r, 0],
+                vs[r, 0],
+                as_[r, 0],
+                bs[r, 0],
+                A_log,
+                dt_bias,
+            )
+            S_ref[r] = S_new
+            max_drift = max(max_drift, (y[r, 0].float() - y_ref).abs().max().item())
+    assert max_drift < 5e-2, f"max output drift over {n_steps} steps: {max_drift:.3e}"
+
+
+def test_stp_prepadded_matches_staging_path():
+    """The zero-copy prepadded [B,4,...] path (rows 1..3 zero) must be
+    bitwise identical to the default [B,1,...] staging path."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B = 4
+    hist = [15, 14, 0, 7]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, hist, "bf16", seed=31
+    )
+
+    def pad4(t):
+        buf = torch.zeros(
+            (t.shape[0], 4) + tuple(t.shape[2:]), dtype=t.dtype, device=DEV
+        )
+        buf[:, 0] = t[:, 0]
+        return buf
+
+    results = {}
+    for mode in ("staged", "prepadded"):
+        p2, kc2, uc2, gc2 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
+        hl2, cb2 = hl.clone(), cb.clone()
+        if mode == "prepadded":
+            kw = dict(q=pad4(q), k=pad4(k), v=pad4(v), prepadded=True)
+            aa, bb = pad4(a), pad4(b)
+        else:
+            kw = dict(q=q, k=k, v=v)
+            aa, bb = a, b
+        y = mod.gated_delta_rule_stp_ucache_flush(
+            A_log,
+            aa,
+            dt_bias,
+            b=bb,
+            **kw,
+            initial_state_source=p2,
+            initial_state_indices=idx,
+            k_cache=kc2,
+            u_cache=uc2,
+            g_cache=gc2,
+            hist_len=hl2,
+            cache_base=cb2,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+        results[mode] = (y.clone(), p2, kc2, uc2, gc2, hl2)
+
+    names = ["y", "pool", "k_cache", "u_cache", "g_cache", "hist_len"]
+    for name, st_, pp_ in zip(
+        names, results["staged"], results["prepadded"], strict=True
+    ):
+        assert torch.equal(st_, pp_), f"prepadded vs staged mismatch on {name}"
+
+
+def test_stp_contract_guards():
+    """32-deep rings, hist_len = 16, and flush_min = 16 must be rejected
+    loudly (the flat-16 buffer's bounds) rather than corrupting."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16", _STP_PATH)
+    B = 2
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _stp_case(
+        B, [0, 0], "bf16", seed=9
+    )
+
+    def call(**over):
+        kw = dict(
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+        kw.update(over)
+        return mod.gated_delta_rule_stp_ucache_flush(A_log, a, dt_bias, **kw)
+
+    with pytest.raises(AssertionError):  # 32-deep ring rejected
+        call(k_cache=torch.zeros(B, H, 32, K, dtype=kc.dtype, device=DEV))
+    with pytest.raises(AssertionError, match="flush_min"):
+        call(flush_min=16)
+    with pytest.raises(AssertionError, match="hist_len"):
+        call(hist_len=torch.full((B,), 16, dtype=torch.int32, device=DEV))
+
+
+def test_stp_lockstep_equivalence_vs_vllm_triton():
+    """64 steps of the SAME token stream through this kernel and vLLM PR
+    #48792's Triton ReplaySSM kernel at identical cadence (fm=15 <->
+    is_flush at write_pos 15): outputs must agree every step and the
+    committed pool states after every fold. Requires the reference kernel
+    (benchmarks/gdn_vllm_replayssm_triton.py, vendored locally from that PR;
+    not shipped) — SKIPS when absent."""
+    _skip_if_not_sm90_or_later()
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    vllm_mod = pytest.importorskip(
+        "gdn_vllm_replayssm_triton",
+        reason="reference vLLM Triton ReplaySSM kernel not vendored locally",
+    )
+    vllm_fn = vllm_mod.fused_recurrent_gated_delta_rule_replayssm
+
+    mod = _load_flush("bf16", _STP_PATH)
+    B, n_steps = 4, 64
+    bf = torch.bfloat16
+    g = torch.Generator(device=DEV).manual_seed(404)
+    A_log = (
+        torch.full((HV,), -3.0, device=DEV)
+        + torch.rand(HV, generator=g, device=DEV) * 0.3
+    ).to(bf)
+    dt_bias = (torch.randn(HV, generator=g, device=DEV) * 0.5).to(bf)
+    pool_init = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(bf)
+
+    # --- STP kernel state ---
+    pool_s = pool_init.clone()
+    kc_s = torch.zeros(B, H, STP_RING, K, dtype=bf, device=DEV)
+    uc_s = torch.zeros(B, HV, STP_RING, V, dtype=bf, device=DEV)
+    gc_s = torch.zeros(B, HV, STP_RING, dtype=torch.float32, device=DEV)
+    hl = torch.zeros(B, dtype=torch.int32, device=DEV)
+    cb = torch.zeros(B, dtype=torch.int32, device=DEV)
+    idx_s = torch.arange(B, dtype=torch.int32, device=DEV)
+
+    # --- vLLM kernel state (slot 0 = padding sentinel; per-step g cache) ---
+    pool_v = torch.cat([torch.zeros_like(pool_init[:1]), pool_init]).contiguous()
+    dc_v = torch.zeros(B + 1, HV, STP_RING, V, dtype=bf, device=DEV)
+    kc_v = torch.zeros(B + 1, H, STP_RING, K, dtype=bf, device=DEV)
+    gc_v = torch.zeros(B + 1, HV, STP_RING, dtype=torch.float32, device=DEV)
+    idx_v = torch.arange(1, B + 1, dtype=torch.int32, device=DEV)
+    out_v = torch.empty(B, HV * V, dtype=bf, device=DEV)
+
+    for step in range(n_steps):
+        qs = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        ks = (torch.randn(B, 1, H, K, generator=g, device=DEV)).to(bf)
+        vs = (torch.randn(B, 1, HV, V, generator=g, device=DEV) * 0.5).to(bf)
+        as_ = (torch.randn(B, 1, HV, generator=g, device=DEV) * 0.5).to(bf)
+        bs = (torch.randn(B, 1, HV, generator=g, device=DEV)).to(bf)
+
+        wp = step % 16
+        is_flush_step = wp == 15
+
+        y_s = mod.gated_delta_rule_stp_ucache_flush(
+            A_log,
+            as_,
+            dt_bias,
+            q=qs,
+            k=ks,
+            v=vs,
+            b=bs,
+            initial_state_source=pool_s,
+            initial_state_indices=idx_s,
+            k_cache=kc_s,
+            u_cache=uc_s,
+            g_cache=gc_s,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+        assert int(hl[0]) == (0 if is_flush_step else wp + 1)
+
+        mixed = torch.cat(
+            [qs.reshape(B, -1), ks.reshape(B, -1), vs.reshape(B, -1)], dim=1
+        ).contiguous()
+        wp_t = torch.full((B,), wp, dtype=torch.int32, device=DEV)
+        fl_t = torch.full((B,), 1 if is_flush_step else 0, dtype=torch.int8, device=DEV)
+        vllm_fn(
+            mixed,
+            as_[:, 0],
+            bs[:, 0],
+            A_log,
+            dt_bias,
+            SCALE,
+            pool_v,
+            dc_v,
+            kc_v,
+            gc_v,
+            out_v,
+            idx_v,
+            wp_t,
+            fl_t,
+            use_qk_l2norm_in_kernel=True,
+        )
+        torch.cuda.synchronize()
+
+        d = (y_s[:, 0].float() - out_v.view(B, HV, V).float()).abs().max().item()
+        assert d < 2e-2, f"step {step}: |y_stp - y_vllm| = {d:.3e}"
+        if is_flush_step:
+            dp = (pool_s.float() - pool_v[1:].float()).abs().max().item()
+            assert dp < 4e-2, f"step {step}: |pool_stp - pool_vllm| = {dp:.3e}"
