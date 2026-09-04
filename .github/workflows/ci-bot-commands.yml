@@ -149,16 +149,23 @@ jobs:
             # deliberately does not check out -- it holds a write token, so the validator
             # it runs must be the trusted copy from the base branch. Whoever issues the
             # trigger can check existence up front, and pytest errors on a missing path.
-            if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
+            #
+            # An unparseable scope degrades to the full suite; it never withholds CI.
+            # `@flashinfer-bot run` is this repo's primary CI trigger and predates
+            # scoping, so trailing prose ("run please", "run thanks!"), a -k selector,
+            # or a backticked path must still start the full suite the way it always
+            # did. Failing closed here would turn the trigger into a no-op and the
+            # only signal would be a red bot job on a PR with no test checks at all.
+            if SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
                   --targets "$ARGS" --root tests/ --no-check-exists --test-path \
                   2>/tmp/scope_err); then
+              mapfile -t CHUNKS < <(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140)
+            else
               gh pr comment ${{ github.event.issue.number }} \
                 --repo ${{ github.repository }} \
-                --body "Requested test scope rejected: $(cat /tmp/scope_err)"
-              exit 1
+                --body "Ignoring the text after \`@flashinfer-bot run\` and running the full suite -- it is not a valid test scope: $(cat /tmp/scope_err)"
             fi
-            mapfile -t CHUNKS < <(python3 scripts/pr_checks/experimental_test_scope.py \
-              --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140)
           fi
 
           # There is no DELETE for statuses, but re-posting a context supersedes it, so
