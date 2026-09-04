@@ -69,15 +69,20 @@ _LEASE_HEARTBEAT_SECONDS = 10.0
 _LEASE_CLOSE_SECONDS = 2.0
 _CONTROLLER_PROGRESS_SECONDS = 60.0
 
-# The SM90 pull-style and SM100 MegaMoE drops both import vendored modules such
-# as ``common`` as top-level packages, so they cannot be imported by one pytest
-# collection process. Keep the smaller SM90 family isolated for now. Long term,
-# namespace both vendored trees and use package-relative imports; once they can
-# coexist in ``sys.modules``, remove this collection partition.
+# The SM90 pull-style, SM120 swap-AB, and SM100 MegaMoE drops all import
+# vendored modules such as ``common`` as top-level packages, so no two of them
+# can be imported by one pytest collection process. Keep the SM100 family in
+# the primary scope and give each smaller arch family its own partition. Long
+# term, namespace the vendored trees and use package-relative imports; once
+# they can coexist in ``sys.modules``, remove these collection partitions.
 _COLLECTION_ISOLATION_GROUPS = (
     (
         "sm90-pull-style-cutedsl-megakernel",
         ("test_moe_ep_sm90_pull_*_mega_multirank.py",),
+    ),
+    (
+        "sm120-swapab-cutedsl-megakernel",
+        ("test_moe_ep_sm120_*_mega_multirank.py",),
     ),
 )
 
@@ -551,9 +556,6 @@ def _write_new_manifest(
                 selection=request.selection.to_dict(),
                 planning_options=request.planning.to_dict(),
                 pytest_command_prefix=request.pytest_command_prefix,
-                estimate_files=_estimate_checksums(
-                    request.duration_estimates, request.overhead_estimates
-                ),
             )
             _verify_collection(concurrent, nodes)
             return concurrent, Plan.from_dict(concurrent["plan"]), False
@@ -580,9 +582,6 @@ def prepare_manifest(
     junit_dir.mkdir(parents=True, exist_ok=True)
     source_git_sha = source_git_sha_from_env()
     selection_value = selection.to_dict()
-    estimate_files = _estimate_checksums(
-        request.duration_estimates, request.overhead_estimates
-    )
     existing = load_manifest(junit_dir)
     existing_plan: Plan | None = None
     if existing is not None:
@@ -594,7 +593,6 @@ def prepare_manifest(
             selection=selection_value,
             planning_options=planning.to_dict(),
             pytest_command_prefix=request.pytest_command_prefix,
-            estimate_files=estimate_files,
         )
         existing_plan = Plan.from_dict(existing["plan"])
     if existing is None:
@@ -652,6 +650,9 @@ def prepare_manifest(
             error.record_deadline_clock(deadline_clock)
         raise
     nodes = _selected_nodes(raw_nodes, selection)
+    estimate_files = _estimate_checksums(
+        request.duration_estimates, request.overhead_estimates
+    )
     estimates = EstimateBook.from_files(
         request.duration_estimates,
         request.overhead_estimates,

@@ -212,3 +212,51 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
 
     assert torch.equal(out_without, out_with)
     assert torch.equal(lse_without, lse_with)
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
+def test_cudnn_prefill_lse_is_base2(num_kv_heads):
+    """cuDNN returns base-2 LSE (log2 sum exp scores), matching every other
+    FlashInfer backend. cuDNN's frontend emits natural-log stats, so the prefill
+    path folds them to base-2; verify against a float reference."""
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    from flashinfer.utils import log2e
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    s_q, s_kv, num_qo_heads, head_dim = 37, 64, 8, 128
+    scale = float(head_dim**-0.5)
+
+    q = torch.randn(s_q, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(s_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(s_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    # batch_size == 1: packed q starts at token 0, so no ragged offsets needed.
+    _, lse = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        scale=scale,
+        workspace_buffer=workspace_buffer,
+        max_token_per_sequence=s_q,
+        max_sequence_kv=s_kv,
+        actual_seq_lens_q=torch.tensor([s_q], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        actual_seq_lens_kv=torch.tensor([s_kv], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        causal=False,
+        return_lse=True,
+    )
+
+    # Float reference LSE in base-2. GQA: broadcast each kv head to its q group.
+    kf = k.float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), kf) * scale  # [h_qo, s_q, s_kv]
+    lse_ref = torch.logsumexp(scores, dim=-1) * log2e  # base-2, [h_qo, s_q]
+
+    lse_cudnn = lse[0, :s_q, :].transpose(0, 1)  # [h_qo, s_q]
+    torch.testing.assert_close(lse_cudnn, lse_ref, atol=1e-2, rtol=1e-2)

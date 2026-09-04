@@ -26,6 +26,21 @@ Kernels for block sparse flashattention.
     .. automethod:: __init__
 
 
+Cake VSA
+--------
+
+.. currentmodule:: flashinfer.cake_vsa
+
+.. autosummary::
+    :toctree: ../generated
+
+    plan_cake_vsa
+    run_cake_vsa
+
+
+.. currentmodule:: flashinfer.sparse
+
+
 flashinfer.msa_ops
 ==================
 

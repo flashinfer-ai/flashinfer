@@ -609,7 +609,12 @@ def prepare_trtllm_fp4_weights(
             )
         )
 
-        p = get_w2_permute_indices_with_cache(permute_cache, g2_w[i], epilogue_tile_m)
+        p = get_w2_permute_indices_with_cache(
+            permute_cache,
+            g2_w[i],
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
+        )
         g2_w_sh.append(g2_w[i][p.to(device)].contiguous())
 
         p_sf = get_w2_permute_indices_with_cache(
@@ -617,6 +622,7 @@ def prepare_trtllm_fp4_weights(
             g2_s[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=activation.is_gated,
         )
         g2_s_sh.append(
             block_scale_interleave(
@@ -858,13 +864,17 @@ def prepare_trtllm_fp8_block_weights(
             q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
             sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
             permute = get_w2_permute_indices_with_cache(
-                _TRTLLM_FP8_PERMUTE_CACHE, q.view(torch.uint8), 128
+                _TRTLLM_FP8_PERMUTE_CACHE,
+                q.view(torch.uint8),
+                128,
+                is_gated_act_gemm=activation.is_gated,
             )
             permute_sf = get_w2_permute_indices_with_cache(
                 _TRTLLM_FP8_PERMUTE_CACHE,
                 sf,
                 128,
                 num_elts_per_sf=32,
+                is_gated_act_gemm=activation.is_gated,
             )
             w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
             w2_sf.append(
@@ -1017,6 +1027,7 @@ def prepare_trtllm_fp8_per_tensor_weights(
             _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
             w2_q[expert].view(torch.uint8),
             128,
+            is_gated_act_gemm=activation.is_gated,
         )
         w2_shuffled.append(
             w2_q[expert]
@@ -1164,7 +1175,10 @@ def prepare_trtllm_mxint4_weights(
             is_gated_act_gemm=activation.is_gated,
         )
         w2_permute = get_w2_permute_indices_with_cache(
-            permute_cache, w2_q[expert], epilogue_tile_m
+            permute_cache,
+            w2_q[expert],
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
         )
         # Keep the established flat-test MxInt4 scale permutation contract;
         # preparation parity tests cover this asymmetric GEMM1/GEMM2 setting.
@@ -1173,6 +1187,7 @@ def prepare_trtllm_mxint4_weights(
             w2_sf[expert],
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=activation.is_gated,
         )
 
         w1_views.append(
@@ -1297,7 +1312,12 @@ def prepare_trtllm_bf16_weights(
         )
 
         w2_u8 = w2_bf16[i].view(torch.uint8)
-        p2 = get_w2_permute_indices_with_cache(permute_cache, w2_u8, epilogue_tile_m)
+        p2 = get_w2_permute_indices_with_cache(
+            permute_cache,
+            w2_u8,
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
+        )
         w2_views.append(
             convert_to_block_layout(w2_u8[p2.to(device)].contiguous(), block_k)
         )
@@ -1397,12 +1417,11 @@ def prepare_cutile_nvfp4_weights(
     logical dimensions while their scaled-MMA layout pads outer scale rows to
     a multiple of 128.
     """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
     activation_type = ActivationType(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
-        raise ValueError(
-            f"unsupported cuTile NVFP4 activation {activation_type!r}; expected "
-            "Swiglu or Relu2."
-        )
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile NVFP4 activation {activation_type!r}.")
     if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
         raise ValueError(
             "cuTile W4A4 requires hidden_size and intermediate_size divisible by 64."
@@ -1513,6 +1532,8 @@ def prepare_cutile_bf16_weights(
     Non-gated weights use ``[E, I, H]`` and need only the transpose. GEMM2
     changes from ``[E, H, I]`` to ``[E, I, H]`` for both activation families.
     """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
     if device is None:
         device = w1_bf16.device
     device = torch.device(device)
@@ -1522,11 +1543,8 @@ def prepare_cutile_bf16_weights(
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
     activation_type = ActivationType(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
-        raise ValueError(
-            f"unsupported cuTile BF16 activation {activation_type!r}; expected "
-            "Swiglu or Relu2."
-        )
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile BF16 activation {activation_type!r}.")
     expected_w1 = (
         num_local_experts,
         intermediate_size * (2 if activation_type.is_gated else 1),

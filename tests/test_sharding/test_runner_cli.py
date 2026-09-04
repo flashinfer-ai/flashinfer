@@ -410,7 +410,7 @@ def test_optional_timing_files_use_first_matching_rows(tmp_path: Path) -> None:
     assert set(manifest["estimate_files"]) == {"duration", "overhead"}
 
 
-def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
+def test_manifest_resume_does_not_depend_on_timing_inputs(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
@@ -428,8 +428,8 @@ def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
     assert created.returncode == 0, created.stdout
     assert reused.returncode == 0, reused.stdout
     assert "Using plan" in reused.stdout
-    assert changed.returncode == 3
-    assert "estimate_files" in changed.stdout
+    assert changed.returncode == 0, changed.stdout
+    assert "Using plan" in changed.stdout
 
 
 def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> None:
@@ -562,6 +562,55 @@ def test_sm90():
     assert [node["nodeid"] for node in isolated_nodes] == [
         f"{isolated.name}::test_sm90"
     ]
+    assert [node["order"] for node in isolated_nodes] == [0]
+
+
+def test_collection_isolates_sm120_swapab_multirank_modules(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    for backend in ("sm100", "sm90", "sm120"):
+        tree = suite / backend
+        tree.mkdir()
+        (tree / "common.py").write_text(f"BACKEND = {backend!r}\n", encoding="utf-8")
+
+    def _write(name: str, backend: str, test_name: str) -> Path:
+        path = suite / name
+        path.write_text(
+            f"""\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "{backend}"))
+import common
+
+if common.BACKEND != "{backend}":
+    raise RuntimeError("vendored common modules cannot share one process")
+
+def {test_name}():
+    pass
+""",
+            encoding="utf-8",
+        )
+        return path
+
+    _write("test_aaa_sm100.py", "sm100", "test_sm100")
+    sm90 = _write("test_moe_ep_sm90_pull_fp8_mega_multirank.py", "sm90", "test_sm90")
+    sm120 = _write(
+        "test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py", "sm120", "test_sm120"
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 20, 0)
+
+    assert [node["nodeid"] for node in nodes] == [
+        "test_aaa_sm100.py::test_sm100",
+        f"{sm90.name}::test_sm90",
+        f"{sm120.name}::test_sm120",
+    ]
+    assert [node["order"] for node in nodes] == [0, 1, 2]
+
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, sm120, 15, 0)
+
+    assert [node["nodeid"] for node in isolated_nodes] == [f"{sm120.name}::test_sm120"]
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
