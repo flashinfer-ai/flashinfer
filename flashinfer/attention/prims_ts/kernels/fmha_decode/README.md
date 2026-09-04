@@ -1,7 +1,7 @@
 # Task-Scheduled FMHA Decode
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA kernel used by
-FlashInfer's paged decode APIs on NVIDIA Blackwell GPUs. It
+FlashInfer's experimental paged decode APIs on NVIDIA Blackwell GPUs. It
 supports token-at-a-time decode, small fixed speculative-query batches, and
 packed variable-length queries over a paged K/V cache.
 
@@ -266,7 +266,7 @@ enough table columns for every request, and keep all active page IDs valid.
 Sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution
-that reads them. These per-run values are not host-synchronized or fully
+that reads them. These live values are not host-synchronized or fully
 value-checked at launch; invalid lengths or IDs may cause incorrect results or
 out-of-bounds access.
 
@@ -284,7 +284,7 @@ preallocated compact, 16-byte-aligned `out` tensor.
 - Runtime K lengths must be positive and no greater than the static plan bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks
   them; `validate=False` and the standalone hot path trust them to preserve a
-  synchronization-free launch. Per-run causal metadata must preserve
+  synchronization-free launch. Live causal metadata must preserve
   `q_len[b] <= kv_len[b]`.
 
 ## Validation

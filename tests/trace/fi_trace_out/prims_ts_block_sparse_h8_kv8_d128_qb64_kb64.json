@@ -5,7 +5,8 @@
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
     "backend:prims-ts",
-    "sparse:block"
+    "sparse:block",
+    "status:experimental"
   ],
   "axes": {
     "batch_size": {
@@ -106,7 +107,7 @@
         "num_block_indices"
       ],
       "dtype": "int32",
-      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are active."
+      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are live."
     },
     "kv_valid_bits": {
       "shape": [

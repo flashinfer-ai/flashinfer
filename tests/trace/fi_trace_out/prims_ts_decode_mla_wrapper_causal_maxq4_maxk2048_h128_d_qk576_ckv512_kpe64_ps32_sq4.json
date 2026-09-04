@@ -6,6 +6,7 @@
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchMLADecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
+    "status:experimental",
     "mla",
     "mask:causal"
   ],

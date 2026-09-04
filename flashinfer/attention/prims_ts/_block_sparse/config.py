@@ -475,7 +475,7 @@ def _resolve_block_sparse_launch_spec(
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
-    ``max_row_route_capacity`` is a conservative prepared-route bound. Per-run
+    ``max_row_route_capacity`` is a conservative prepared-route bound. Live
     index values and physical-tail morphology never specialize this cache
     entry. Proxy and exact routes share one scheduler selection. An
     unsupported persistent profile falls back to its valid static
