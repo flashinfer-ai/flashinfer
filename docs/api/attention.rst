@@ -259,6 +259,8 @@ PageAttention for MLA
 
     trtllm_batch_decode_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
+    nvfp4_quantize_pack_sparse_mla_cache
+    nvfp4_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
