@@ -77,7 +77,7 @@ def test_prepare_backend_forwards_exact_binding(monkeypatch, backend):
         calls.append((actual_inp, actual_weight, actual_group, verbose))
         return launcher
 
-    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4 = fake_prepare
+    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103 = fake_prepare
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
 
     assert (
@@ -98,7 +98,7 @@ def test_prepare_unsupported_input_failure_propagates(monkeypatch):
     def reject(*args, **kwargs):
         raise ValueError("unsupported prepared configuration")
 
-    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4 = reject
+    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103 = reject
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
 
     with pytest.raises(ValueError, match="unsupported prepared configuration"):

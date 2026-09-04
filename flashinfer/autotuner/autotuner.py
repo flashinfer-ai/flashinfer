@@ -482,6 +482,9 @@ class TuningConfig:
             back-to-back replays and measure sustained execution. With
             ``use_cold_l2_cache=True`` every replay is independently preceded
             by a full L2 flush.
+        profiling_repeat (int | None): Per-operation profiling repeat override.
+            ``None`` uses the autotuner default. This affects measurement
+            precision, not tactic compatibility or persisted cache identity.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -508,6 +511,7 @@ class TuningConfig:
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
     cuda_graph_profile_replays: int = 1
+    profiling_repeat: int | None = None
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
     # Optional callback invoked once per profile bucket, after dynamic
@@ -648,7 +652,7 @@ class ValueProfileArena:
     def inputs_for_iteration(self, iteration: int) -> list[Any]:
         """Return A/B-alternating inputs and cycle lanes by invocation index."""
         arena_index = iteration % 2
-        lane_index = iteration % self._num_ring_lanes
+        lane_index = (iteration // 2) % self._num_ring_lanes
         return self._lane_inputs[arena_index][lane_index]
 
     def iteration_inputs(self, num_iterations: int) -> list[list[Any]]:
@@ -1642,6 +1646,7 @@ class AutoTuner:
                 if profile_replays is not None
                 else tuning_config.cuda_graph_profile_replays
             ),
+            profiling_repeat=tuning_config.profiling_repeat,
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
@@ -2186,6 +2191,7 @@ class AutoTuner:
                 if uses_profile_arena or not tuning_config.use_cold_l2_cache
                 else [inputs]
             )
+        profiling_repeat = self._get_profiling_repeat(tuning_config)
 
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
@@ -2369,9 +2375,9 @@ class AutoTuner:
                     runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
                 avg_time = (
-                    cold_l2_profile(stream, self.repeat)
+                    cold_l2_profile(stream, profiling_repeat)
                     if tuning_config.use_cold_l2_cache
-                    else pure_profile(stream, self.repeat)
+                    else pure_profile(stream, profiling_repeat)
                 )
         except BaseException as e:  # noqa: BLE001
             # Catch everything (incl. KeyboardInterrupt / SystemExit): this
@@ -3051,6 +3057,8 @@ class AutoTuner:
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
+        profiling_repeat = self._get_profiling_repeat(tuning_config)
+
         arena_indices = (
             tuning_config.profile_arena_input_indices
             or tuning_config.value_aware_input_indices
@@ -3061,16 +3069,50 @@ class AutoTuner:
                     "value-aware inputs must be assigned to the profile arena "
                     "when cold-L2 profiling is enabled"
                 )
+            l2_cache_size_bytes = self._get_l2_cache_size_in_bytes()
+            lane_payload_bytes = 0
+            for input_index in arena_indices:
+                if input_index < 0 or input_index >= len(inputs):
+                    raise IndexError(
+                        f"profile-arena input index {input_index} is invalid"
+                    )
+                tensor = inputs[input_index]
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(
+                        f"profile-arena input {input_index} must be a torch.Tensor"
+                    )
+                lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
+                lane_payload_bytes += tensor.numel() * tensor.element_size()
+            lane_payload_bytes = ValueProfileArena._align(lane_payload_bytes)
+            target_working_set_bytes = (
+                2 * l2_cache_size_bytes + ValueProfileArena._ALIGNMENT_BYTES
+            )
+            # Each lane is visited once in both the A and B arenas, so a
+            # repeat-length schedule can reach at most repeat // 2 lanes per
+            # arena. Do not allocate lanes that the timed replay cannot touch.
+            reachable_ring_lanes = max(profiling_repeat // 2, 1)
+            num_ring_lanes = min(
+                reachable_ring_lanes,
+                max(
+                    1,
+                    (target_working_set_bytes + lane_payload_bytes - 1)
+                    // lane_payload_bytes,
+                ),
+            )
             arena = ValueProfileArena(
                 inputs,
                 arena_indices,
-                num_ring_lanes=max(self.repeat, 1),
-                l2_cache_size_bytes=self._get_l2_cache_size_in_bytes(),
+                num_ring_lanes=num_ring_lanes,
+                l2_cache_size_bytes=l2_cache_size_bytes,
             )
-            batches = arena.iteration_inputs(max(self.repeat, 1))
+            # Keep the full measurement schedule while cycling through only
+            # enough physical lanes to evict L2. Profiling precision therefore
+            # does not multiply the arena's state/cache allocation.
+            batches = arena.iteration_inputs(profiling_repeat)
             logger.debug(
                 "[Autotuner] profile-arena cold-L2 profiling uses two "
-                f"{arena.arena_size_bytes}-byte arenas and {len(batches)} ordered lanes"
+                f"{arena.arena_size_bytes}-byte arenas, {num_ring_lanes} physical "
+                f"lanes, and {len(batches)} scheduled iterations"
             )
             return batches
 
@@ -3087,7 +3129,7 @@ class AutoTuner:
             return [inputs]
 
         num_buffers = self._get_l2_cache_size_in_bytes() * 3 // one_buffer_bytes + 1
-        num_buffers = min(num_buffers, self.repeat + 1)
+        num_buffers = min(num_buffers, profiling_repeat + 1)
 
         inputs_list = [inputs]
         for _ in range(num_buffers - 1):
@@ -3099,6 +3141,14 @@ class AutoTuner:
             f"[Autotuner] use_cold_l2_cache={tuning_config.use_cold_l2_cache}, use {num_buffers} different tensors for profiling"
         )
         return inputs_list
+
+    def _get_profiling_repeat(self, tuning_config: TuningConfig) -> int:
+        profiling_repeat = tuning_config.profiling_repeat
+        if profiling_repeat is None:
+            profiling_repeat = self.repeat
+        if profiling_repeat <= 0:
+            raise ValueError("profiling_repeat must be positive")
+        return profiling_repeat
 
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
