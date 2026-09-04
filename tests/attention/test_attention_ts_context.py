@@ -58,6 +58,12 @@ _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     reason="PrimTS context attention requires SM100 or SM103",
 )
 
+_REQUIRES_LDTM_STAT = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not context_module._default_uses_ldtm_stat(torch.cuda.current_device()),
+    reason="requires _default_uses_ldtm_stat",
+)
+
 _HEAD_DIM = 128
 _FP8 = torch.float8_e4m3fn
 
@@ -946,6 +952,7 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
     )
 
 
+@_REQUIRES_LDTM_STAT
 def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
     """uses_ldtm_stat=True still builds the non-masked FMHA task graph."""
     kernel = FmhaTs(
@@ -958,7 +965,28 @@ def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
         uses_ldtm_stat=True,
     )
     assert kernel.cfg.uses_ldtm_stat is True
-    build_fmha_task_manager(kernel.cfg)
+    cfg = kernel.cfg
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        task_manager, *_ = build_fmha_task_manager(
+            cfg,
+            tile_sched_params=None,
+            tma_q_desc=None,
+            tma_k_desc=None,
+            tma_v_desc=None,
+            tma_o_desc=None,
+            cum_seqlen_q=None,
+            cum_seqlen_k=None,
+            num_kv_tiles=2,
+            q_offset=0,
+            g_page_idx_kv=None,
+            g_seq_lens_kv=None,
+            max_seq_len_kv=256,
+            is_persistent=True,
+            is_clc_dynamic=False,
+            exhaustive_deadlock_race_check=True,
+        )
+    assert task_manager is not None
 
 
 @pytest.mark.parametrize(
