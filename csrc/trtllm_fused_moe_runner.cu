@@ -56,10 +56,35 @@ btg::Dtype getPerTokenScaleDtype(btg::Dtype dtypeAct, bool usePerTokenScaling,
 //   2. MxFp4 x Fp8 mmaType requires bespoke TMA load which requires hiddenDim % 128 == 0
 //   3. TMA requires 16B alignment for each row
 // 128 satisfies all three for every dtype this MoE runner supports (sfBlockSize is 32 for
-// mx* and 16 for nvfp4, so 4*sfBlockSize is 128 or 64; the 16B row rule needs at most 16
-// elements; the shuffled-matrix and DeepSeek-FP8 rules also want 128). Rather than encode a
-// per-dtype table that has to track trtllm-gen, use the single conservative value: at most
-// 127 extra elements are contracted, which is negligible next to the padding we skip.
+// mx* and 16 for nvfp4, so 4*sfBlockSize is 128 or 64 -- the 64 case needs sparse A, which
+// this runner never uses, see GemmOptions.h "isSparseA ? 64 : 32"; the 16B row rule needs at
+// most 16 elements; the shuffled-matrix and DeepSeek-FP8 rules also want 128). Rather than
+// encode a per-dtype table that has to track trtllm-gen, use the single conservative value:
+// at most 127 extra elements are contracted, which is negligible next to the padding we skip.
+//
+// Why this is 128 and not 512, unlike TensorRT-LLM
+// -----------------------------------------------
+// TRT-LLM rounds validHiddenSize to 512 in PermuteGemm1::run (blockScaleMoe/runner.cu), gated
+// on MxE2m1 weights x MxE4m3 activations, citing an unhandled OOB read in routeAct -- and our
+// GEMM1 does set routeAct=true. That looks like it should apply here, so record why it does not:
+//
+//   * validM/validN/validK never reach the device. They are consumed in exactly one place, as
+//     the TMA descriptor's *shape*, while the *stride* comes from the padded dims
+//     (KernelParams.h: "Uses padded dimensions for strides and valid dimensions for shapes").
+//     TMA clamps at globalDim, so a smaller valid dim can only ever read *less*.
+//   * The routed activation load is not bounded by validK at all: it is predicated only on the
+//     token dimension (SmemAb.h, "isValidMn = gmemRowIdxCoord < gmemRowLimit") and its K
+//     addressing uses params.k = options.mK, i.e. the *padded* K. Rounding validK from 128 to
+//     512 therefore changes zero bytes of those reads; it can neither cause nor cure an OOB.
+//   * The real K-side constraint in that path is K % tileK == 0 on the *padded* K, which
+//     trtllm-gen checks host-side and fails loudly on. TRT-LLM's 512 keeps validHiddenSize on
+//     the same grid its input_hidden_alignment already pads hidden to, so for them it is
+//     effectively a no-op clamp rather than a kernel requirement.
+//
+// If you are here because you hit a TMA-descriptor failure or suspect an OOB on the routed
+// path, re-check those three points before raising this constant: raising it to 512 would
+// contract 384 extra elements per token in the worst case and would not fix a read that does
+// not depend on validK.
 constexpr int32_t kValidDimAlignment = 128;
 
 // Round a valid dim up to the alignment the TMA descriptor requires, clamped to the padded
