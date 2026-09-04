@@ -3253,14 +3253,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank == nope_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
     )
-    if is_nope_mla and sparse_mla_top_k <= 0:
-        raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
-        )
-    if is_nope_mla and sparse_mla_top_k_lens is None:
-        raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
-        )
     if sparse_mla_top_k_lens is not None:
         if not is_nope_mla:
             raise ValueError(
@@ -3302,6 +3294,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+
+    # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
+    # active top-k length; the SM120 sparse backend bounds each row by its
+    # -1 entries instead and does not consume sparse_mla_top_k_lens.
+    if is_nope_mla and backend != "sparse":
+        if sparse_mla_top_k <= 0:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+            )
+        if sparse_mla_top_k_lens is None:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+            )
+    if sparse_mla_top_k_lens is not None and backend == "sparse":
+        raise ValueError(
+            "sparse_mla_top_k_lens is not supported by the SM120 sparse MLA "
+            "backend; pass per-token active top-k lengths via seq_lens instead"
+        )
 
     if backend == "xqa":
         if multi_ctas_kv_counter_buffer is not None:
