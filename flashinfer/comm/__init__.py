@@ -66,11 +66,11 @@ from .ulysses import ulysses_a2a as ulysses_a2a
 # Low-precision (INT8/FP8) Ulysses A2A payload ops (V2-G global grid).
 # NOTE: never export a function named exactly 'ulysses_lowp' here — it would
 # shadow the flashinfer.comm.ulysses_lowp submodule (see ulysses.py's
-# ulysses_a2a merge note). Generic names (abi_version/capability) are exported
+# ulysses_a2a merge note). Generic names (capability) are exported
 # with the ulysses_lowp_ prefix, following the vllm_meta_size precedent.
 from .ulysses_lowp import StatsContext as StatsContext
+from .ulysses_lowp import UlyssesLowpSageLayout as UlyssesLowpSageLayout
 from .ulysses_lowp import V2GStats as V2GStats
-from .ulysses_lowp import abi_version as ulysses_lowp_abi_version
 from .ulysses_lowp import aligned_length as aligned_length
 from .ulysses_lowp import capability as ulysses_lowp_capability
 from .ulysses_lowp import finalize_stats as finalize_stats
