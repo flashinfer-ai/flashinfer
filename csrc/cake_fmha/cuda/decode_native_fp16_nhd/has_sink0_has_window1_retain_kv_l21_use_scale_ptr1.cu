@@ -538,6 +538,8 @@ kernel_cake_fmha_decode_native_fp16_nhd(CakeFmhaTensorMap const* Qt, CakeFmhaTen
             unsigned int* my_exch_u32_ptr = ((is_wg1 != 0) ? smem_exch1_u32 : smem_exch0_u32);
             float* my_corr_ptr = ((is_wg1 != 0) ? smem_corr1 : smem_corr0);
             __half* my_p_base = ((is_wg1 != 0) ? smem_p1 : smem_p0);
+            unsigned int p_release_phase_0 = 1;
+            unsigned int p_release_phase_1 = 1;
             float smx_scale = softmax_scale_log2;
             {
                 smx_scale = scale_log2_ptr[0];
@@ -705,6 +707,11 @@ kernel_cake_fmha_decode_native_fp16_nhd(CakeFmhaTensorMap const* Qt, CakeFmhaTen
                     uint32_t _amf_mask_4 = ((_amf_u_4 >> 31) - 1u) | 0x80000000u;
                     float _amf_dec_1 = __uint_as_float(_amf_u_4 ^ _amf_mask_4);
                     new_max_pair[1] = _amf_dec_1;
+                    if (is_wg1 != 0) {
+                        asm volatile("barrier.sync 9, 128;" ::: "memory");
+                    } else {
+                        asm volatile("barrier.sync 8, 128;" ::: "memory");
+                    }
                     float acc_scale_pair[2];
                     #pragma unroll
                     for (int c_3 = 0; c_3 < 2; c_3++) {
@@ -800,6 +807,14 @@ kernel_cake_fmha_decode_native_fp16_nhd(CakeFmhaTensorMap const* Qt, CakeFmhaTen
                         __half2 _h2 = __float22half2_rn(make_float2(exp_vals[_lp*2 + 0], exp_vals[_lp*2+1 + 0]));
                         regs_p[_lp] = *(uint32_t*)&_h2;
                     }
+                    if (is_wg1 != 0) {
+                        mbarrier_wait(o_ready_1_addr, p_release_phase_1);
+                        p_release_phase_1 ^= 1;
+                    } else {
+                        mbarrier_wait(o_ready_0_addr, p_release_phase_0);
+                        p_release_phase_0 ^= 1;
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     int slice_idx = warp_in_wg / 2;
                     int warp_idx_in_slice = warp_in_wg % 2;
                     int mtx_idx = lane / 8;
