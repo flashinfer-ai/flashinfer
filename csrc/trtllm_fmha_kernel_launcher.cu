@@ -1080,13 +1080,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
 
     TVM_FFI_ICHECK_EQ(cos_sin_cache.dtype(), dl_float32)
         << "dsv4_inv_rope_cos_sin_cache must be float32";
-    TVM_FFI_ICHECK_EQ(cos_sin_cache.ndim(), 2)
-        << "dsv4_inv_rope_cos_sin_cache must have shape [max_position, 64]";
-    TVM_FFI_ICHECK_EQ(cos_sin_cache.size(1), 64);
-    TVM_FFI_ICHECK(cos_sin_cache.IsContiguous())
-        << "dsv4_inv_rope_cos_sin_cache must be contiguous";
-    TVM_FFI_ICHECK_EQ(cos_sin_cache.device().device_type, query.device().device_type);
-    TVM_FFI_ICHECK_EQ(cos_sin_cache.device().device_id, query.device().device_id);
+    TVM_FFI_ICHECK(cos_sin_cache.ndim() == 2 && cos_sin_cache.size(1) == 64 &&
+                   cos_sin_cache.IsContiguous())
+        << "dsv4_inv_rope_cos_sin_cache must be contiguous [max_position, 64]";
 
     TVM_FFI_ICHECK_EQ(output_scale.dtype(), dl_int32)
         << "dsv4_output_scale must contain packed UE8M0 values in int32 storage";
@@ -1101,8 +1097,12 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
                    dsv4_scale_buf_m % 4 == 0)
         << "dsv4_output_scale token stride must be a multiple of 4 and cover sum_q";
     TVM_FFI_ICHECK_EQ(output_scale.stride(1), heads_per_group * dsv4_scale_buf_m);
-    TVM_FFI_ICHECK_EQ(output_scale.device().device_type, query.device().device_type);
-    TVM_FFI_ICHECK_EQ(output_scale.device().device_id, query.device().device_id);
+
+    for (auto const& tensor : {out, output_scale, cos_sin_cache}) {
+      TVM_FFI_ICHECK(tensor.device().device_type == query.device().device_type &&
+                     tensor.device().device_id == query.device().device_id)
+          << "RopeQuant outputs and cos/sin cache must be on the same device as query";
+    }
 
     dsv4_inv_rope_cos_sin_cache_ptr = static_cast<float const*>(cos_sin_cache.data_ptr());
     dsv4_output_scale_ptr = static_cast<float*>(output_scale.data_ptr());
