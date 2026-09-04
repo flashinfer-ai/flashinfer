@@ -1994,10 +1994,20 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
     else:
         q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-    if _validate_dsv4_sync_checks(query.device) and torch.any(seq_lens < q_lens).item():
+    validate_sync_inputs = _validate_dsv4_sync_checks(query.device)
+    if validate_sync_inputs and torch.any(seq_lens < q_lens).item():
         raise ValueError(
             "seq_lens must be greater than or equal to the per-request query "
             "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
+        )
+    if (
+        validate_sync_inputs
+        and dsv4_inv_rope_cos_sin_cache is not None
+        and dsv4_inv_rope_cos_sin_cache.ndim == 2
+        and torch.any(seq_lens > dsv4_inv_rope_cos_sin_cache.size(0)).item()
+    ):
+        raise ValueError(
+            "dsv4_inv_rope_cos_sin_cache does not cover all derived query positions"
         )
 
     primary_kv_cache = compressed_kv_cache

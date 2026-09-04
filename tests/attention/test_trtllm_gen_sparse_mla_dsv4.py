@@ -1232,6 +1232,33 @@ def test_dsv4_output_scale_does_not_enable_rope_quant(monkeypatch):
         )
 
 
+def test_dsv4_rope_quant_rejects_undersized_cos_sin_cache(monkeypatch):
+    num_tokens = 3
+    out, out_scale = mla_core._allocate_dsv4_rope_quant_outputs(
+        num_tokens, 128, torch.device("cpu")
+    )
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 0))
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+
+    with pytest.raises(ValueError, match="does not cover all derived query positions"):
+        trtllm_batch_decode_sparse_mla_dsv4(
+            query=torch.empty((1, num_tokens, 128, 512), dtype=torch.float8_e4m3fn),
+            swa_kv_cache=torch.empty((1, 1, 128, 512), dtype=torch.float8_e4m3fn),
+            workspace_buffer=torch.empty(1, dtype=torch.uint8),
+            sparse_indices=torch.zeros((num_tokens, 128), dtype=torch.int32),
+            compressed_kv_cache=torch.empty((1, 1, 1, 512), dtype=torch.float8_e4m3fn),
+            sparse_topk_lens=torch.full((num_tokens,), 128, dtype=torch.int32),
+            seq_lens=torch.tensor([num_tokens + 1], dtype=torch.int32),
+            out=out,
+            backend="trtllm-gen",
+            enable_pdl=False,
+            dsv4_inv_rope_cos_sin_cache=torch.empty(
+                (num_tokens, 64), dtype=torch.float32
+            ),
+            dsv4_output_scale=out_scale,
+        )
+
+
 def _unpack_ue8m0_scales(packed: torch.Tensor) -> torch.Tensor:
     shifts = torch.arange(4, dtype=torch.int32, device=packed.device) * 8
     exponent_bytes = (packed.unsqueeze(-1) >> shifts) & 0xFF
