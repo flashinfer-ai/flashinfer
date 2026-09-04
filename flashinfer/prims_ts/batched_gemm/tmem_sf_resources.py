@@ -781,11 +781,10 @@ class TmemCastAResource(MemoryResource):
         byte_lane: Constexpr[int],
         scale_lane: Constexpr[int],
     ) -> Int32:
-        # CUDA through 13.0 libNVVM rejects E2M1-to-BF16 PTX for Blackwell.
-        # Decode the E2M1 values with integer operations there, while retaining
-        # the safe UE8M0 conversion and packed BF16 multiply. CUDA 13.1+ keeps
-        # the fused conversion below.
-        if cutlass.target_version(max_version="13.0"):
+        # E2M1-to-BF16x2 conversion was introduced in PTX ISA 9.2 (CUDA 13.2).
+        # Decode the E2M1 values with integer operations on older toolchains,
+        # while retaining the safe UE8M0 conversion and packed BF16 multiply.
+        if cutlass.target_version(max_version="13.1"):
             packed_byte = (packed_word >> Int32(byte_lane * 8)) & Int32(0xFF)
             scale_byte = (packed_scale_word >> Int32(scale_lane * 8)) & Int32(0xFF)
             value = self._decode_cast_pair(packed_byte)
