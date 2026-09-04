@@ -46,11 +46,20 @@ from flashinfer.prims_ts import is_prims_ts_available
 assert isinstance(is_prims_ts_available(), bool)
 assert "cutlass.experimental.task_scheduling" not in sys.modules
 assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
+
+assert callable(flashinfer.prims_ts_bf16_moe)
+assert "cutlass.experimental.task_scheduling" not in sys.modules
+assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
+
+from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+assert DType.BF16
+assert "cutlass.experimental.task_scheduling" not in sys.modules
+assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
 """
     )
 
 
-def test_prims_ts_bootstrap_preserves_flat_and_nested_work_tile_coordinates():
+def test_prims_ts_bootstrap_scopes_work_tile_info_customization():
     from flashinfer.prims_ts import is_prims_ts_available
 
     if not is_prims_ts_available():
@@ -58,20 +67,50 @@ def test_prims_ts_bootstrap_preserves_flat_and_nested_work_tile_coordinates():
 
     _run_isolated(
         """
-from flashinfer.prims_ts.cutlass_dsl import require_cutlass_dsl_experimental
-require_cutlass_dsl_experimental()
-
 from cutlass import Boolean, Int32
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+from flashinfer.prims_ts.cutlass_dsl import (
+    require_cutlass_dsl_experimental,
+    task_scheduling_scope,
+)
+
+original_init = WorkTileInfo.__init__
+require_cutlass_dsl_experimental()
+assert WorkTileInfo.__init__ is original_init
 
 flat = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
 nested = WorkTileInfo(
     (Int32(1), Int32(0), (Int32(2), Int32(3))), Boolean(True)
 )
-
-assert not hasattr(flat, "_tile_idx")
+assert hasattr(flat, "_tile_idx")
 assert hasattr(nested, "_tile_idx")
 assert isinstance(nested.tile_idx[2], tuple)
 assert len(nested.tile_idx[2]) == 2
+
+with task_scheduling_scope():
+    assert WorkTileInfo.__init__ is not original_init
+    task_tile = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
+    assert not hasattr(task_tile, "_tile_idx")
+
+assert WorkTileInfo.__init__ is original_init
+
+try:
+    with task_scheduling_scope():
+        raise RuntimeError("scope restoration probe")
+except RuntimeError:
+    pass
+assert WorkTileInfo.__init__ is original_init
+
+nested_after = WorkTileInfo(
+    (Int32(1), Int32(0), (Int32(2), Int32(3))), Boolean(True)
+)
+assert isinstance(nested_after.tile_idx[2], tuple)
+
+from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+    build_batched_gemm_task_manager,
+)
+assert WorkTileInfo.__init__ is original_init
+build_batched_gemm_task_manager(verbose=False)
+assert WorkTileInfo.__init__ is original_init
 """
     )

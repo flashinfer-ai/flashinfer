@@ -23,6 +23,10 @@ Entry points:
 import os
 from typing import Any
 
+from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
+
+require_cutlass_dsl_experimental()
+
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
@@ -1300,6 +1304,26 @@ def build_batched_gemm_task_manager(
     **cfg_overrides,
 ) -> TaskManager:
     """Build and validate the TaskManager (no GPU needed)."""
+    with task_scheduling_scope():
+        return _build_batched_gemm_task_manager(
+            num_experts=num_experts,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            early_exit_max_token_ctas=early_exit_max_token_ctas,
+            verbose=verbose,
+            **cfg_overrides,
+        )
+
+
+def _build_batched_gemm_task_manager(
+    *,
+    num_experts=2,
+    num_tokens=128,
+    top_k=1,
+    early_exit_max_token_ctas=0,
+    verbose=True,
+    **cfg_overrides,
+) -> TaskManager:
     _ = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,

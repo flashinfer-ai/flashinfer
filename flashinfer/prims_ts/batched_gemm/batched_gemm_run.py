@@ -26,6 +26,8 @@ import gc
 import math
 import os
 
+from ..cutlass_dsl import task_scheduling_scope
+
 
 def _cute_compile_options() -> str:
     return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2")
@@ -3453,7 +3455,7 @@ def _compile_for_launch(io: dict, stream) -> object:
     if _generate_line_info_enabled():
         compile_entry = cute.compile[cute.GenerateLineInfo(True)]
 
-    with BaseDSL.enable_pyir():
+    with task_scheduling_scope(), BaseDSL.enable_pyir():
         compiled = compile_entry(
             gemm,
             *_compile_arg_tuple(io, stream),
