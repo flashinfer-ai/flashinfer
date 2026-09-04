@@ -27,11 +27,19 @@ Three APIs are provided:
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 """
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 
 from .jit.core import logger
+
+try:
+    from .jit import gdn_noncp as _gdn_noncp
+
+    _GDN_NONCP_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _gdn_noncp = None
+    _GDN_NONCP_AVAILABLE = False
 
 try:
     from .api_logging import flashinfer_api
@@ -109,6 +117,366 @@ except (ImportError, RuntimeError):
 TILE_V = 8  # pretranspose tile size
 
 
+def _gdn_noncp_assert_state_slots(
+    indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
+) -> None:
+    """Validate CUDA-resident state slots without a host synchronization."""
+
+    in_pool = (indices >= 0) & (indices < pool_size)
+    valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
+    torch._assert_async(
+        valid.all(),
+        f"{name} must contain "
+        + ("-1 or " if allow_minus_one else "")
+        + f"slots in [0, {pool_size})",
+    )
+
+
+def _run_gdn_noncp_decode_pretranspose(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+    output: Optional[torch.Tensor],
+    initial_state_indices: torch.Tensor,
+    output_state_indices: Optional[torch.Tensor],
+    intermediate_states_buffer: Optional[torch.Tensor],
+    disable_state_update: bool,
+) -> torch.Tensor:
+    """Launch one exact manifest-backed GDN non-CP decode row or fail closed."""
+
+    if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+        raise RuntimeError("the source-only GDN non-CP GDN backend is not installed")
+    if q.device.type != "cuda":
+        raise _gdn_noncp.GDNNonCPUnsupportedError("GDN non-CP GDN requires CUDA tensors")
+    if q.dtype != torch.bfloat16:
+        raise _gdn_noncp.GDNNonCPUnsupportedError("GDN non-CP decode requires BF16 I/O")
+    if (
+        k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or a.dtype != torch.bfloat16
+        or b.dtype != torch.bfloat16
+        or A_log.dtype != torch.float32
+        or dt_bias.dtype != torch.float32
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires BF16 Q/K/V/gates and FP32 A_log/dt_bias"
+        )
+    if state_pool.dtype not in (torch.bfloat16, torch.float32):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires BF16 or FP32 state"
+        )
+    batch_size, seq_len, num_q_heads, head_size = q.shape
+    num_v_heads, value_size = int(v.shape[2]), int(v.shape[3])
+    if (
+        k.shape != q.shape
+        or v.shape != (batch_size, seq_len, num_v_heads, value_size)
+        or head_size != 128
+        or value_size != 128
+        or a.shape != (batch_size, seq_len, num_v_heads)
+        or b.shape != (batch_size, seq_len, num_v_heads)
+        or A_log.shape != (num_v_heads,)
+        or dt_bias.shape != (num_v_heads,)
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires exact [B,T,H,128] Q/K, [B,T,HV,128] V, "
+            "and [B,T,HV] gate shapes"
+        )
+    tensors = (q, k, v, state_pool, A_log, a, dt_bias, b, initial_state_indices)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires all tensors on one CUDA device"
+        )
+    if (
+        initial_state_indices.shape != (batch_size,)
+        or not initial_state_indices.is_contiguous()
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires contiguous [B] state indices"
+        )
+    if int(state_pool.shape[0]) <= 0 or state_pool.shape[1:] != (
+        num_v_heads,
+        128,
+        128,
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires a [pool, HV, 128, 128] state pool"
+        )
+    if state_pool.dtype == torch.bfloat16 and state_pool.stride()[1:] != (
+        128 * 128,
+        128,
+        1,
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP BF16 decode requires packed inner state dimensions"
+        )
+    if state_pool.dtype == torch.float32 and seq_len == 1 and not all(
+        tensor.is_contiguous()
+        for tensor in (q, k, v, state_pool, A_log, a, dt_bias, b)
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP FP32 T=1 decode requires contiguous inputs and state"
+        )
+    if initial_state_indices.dtype != torch.int32:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires int32 state indices"
+        )
+    write_indices = (
+        initial_state_indices
+        if output_state_indices is None
+        else output_state_indices
+    )
+    if write_indices.dtype != torch.int32:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires int32 output state indices"
+        )
+    if write_indices.shape != (batch_size,) or not write_indices.is_contiguous():
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires contiguous [B] output state indices"
+        )
+    if write_indices.device != q.device:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires output state indices on the input CUDA device"
+        )
+    if output is None:
+        output = torch.empty(
+            (q.shape[0], q.shape[1], v.shape[2], v.shape[3]),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+    elif output.dtype != torch.bfloat16 or not output.is_contiguous():
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires a contiguous BF16 output"
+        )
+    if output.device != q.device:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP decode requires output on the input CUDA device"
+        )
+    if intermediate_states_buffer is not None:
+        if (
+            intermediate_states_buffer.dtype != state_pool.dtype
+            or not intermediate_states_buffer.is_contiguous()
+            or intermediate_states_buffer.ndim != 5
+            or intermediate_states_buffer.shape[0] != q.shape[0]
+            or intermediate_states_buffer.shape[1] < q.shape[1]
+            or intermediate_states_buffer.device != q.device
+        ):
+            raise _gdn_noncp.GDNNonCPUnsupportedError(
+                "GDN non-CP checkpoint buffer must be contiguous [B, >=T, HV, V, K] "
+                "with the state dtype"
+            )
+        cache_steps = int(intermediate_states_buffer.shape[1])
+    else:
+        cache_steps = 0
+    pool_size = int(state_pool.shape[0])
+    _gdn_noncp_assert_state_slots(
+        initial_state_indices,
+        pool_size,
+        name="GDN non-CP decode initial_state_indices",
+        allow_minus_one=True,
+    )
+    _gdn_noncp_assert_state_slots(
+        write_indices,
+        pool_size,
+        name="GDN non-CP decode output_state_indices",
+        allow_minus_one=True,
+    )
+    strided_inputs = not all(
+        tensor.is_contiguous() for tensor in (q, k, v, a, b)
+    )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _gdn_noncp.arch_for_compute_capability(major, minor)
+    route = _gdn_noncp.select_gdn_noncp_decode_variant(
+        arch=arch,
+        batch_size=int(q.shape[0]),
+        io_dtype="bfloat16",
+        state_dtype=("bfloat16" if state_pool.dtype == torch.bfloat16 else "float32"),
+        head_size=int(q.shape[3]),
+        layout="pretranspose",
+        num_k_heads=int(k.shape[2]),
+        num_q_heads=int(q.shape[2]),
+        num_v_heads=int(v.shape[2]),
+        scale=scale,
+        seq_len=int(q.shape[1]),
+        use_qk_l2norm=use_qk_l2norm,
+        strided_inputs=strided_inputs,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=intermediate_states_buffer is not None,
+        cache_steps=cache_steps,
+    )
+    entry = _gdn_noncp.load_gdn_noncp_kernel(route.variant_name, arch)
+    batch_size, seq_len = int(q.shape[0]), int(q.shape[1])
+    num_v_heads = int(v.shape[2])
+    if state_pool.dtype == torch.bfloat16:
+        state_heads = batch_size * num_v_heads
+        tile_v = (
+            16
+            if q.shape[2] == 4 and num_v_heads == 8
+            else 128
+            if state_heads >= 1024
+            else 64
+            if state_heads >= 512
+            else 32
+        )
+        entry(
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            intermediate_states_buffer
+            if intermediate_states_buffer is not None
+            else output,
+            initial_state_indices,
+            write_indices,
+            batch_size * num_v_heads * (128 // tile_v),
+            1,
+            1,
+        )
+    elif seq_len == 1:
+        entry(
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            initial_state_indices,
+            write_indices,
+            batch_size * num_v_heads * 8,
+            1,
+            1,
+        )
+    else:
+        if intermediate_states_buffer is None:
+            raise _gdn_noncp.GDNNonCPUnsupportedError(
+                "GDN non-CP FP32 MTP requires a caller-owned checkpoint buffer"
+            )
+        args = (
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            intermediate_states_buffer,
+            initial_state_indices,
+        )
+        if seq_len == 4:
+            args += (write_indices,)
+        grid_scale = 512 if seq_len == 2 else 256 if batch_size == 4 else 64
+        entry(*args, batch_size * grid_scale, 1, 1)
+    return output
+
+
+def _run_gdn_noncp_decode_nontranspose(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: float,
+    output: torch.Tensor,
+    use_qk_l2norm: bool,
+) -> torch.Tensor:
+    """Launch one exact manifest-backed GDN non-CP nontranspose T=1 row."""
+
+    if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+        raise RuntimeError("the source-only GDN non-CP GDN backend is not installed")
+    batch_size, seq_len, num_q_heads, head_size = q.shape
+    num_v_heads, value_size = int(v.shape[2]), int(v.shape[3])
+    tensors = (q, k, v, state, A_log, a, dt_bias, b, output)
+    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP nontranspose decode requires one CUDA device"
+        )
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or a.dtype != torch.bfloat16
+        or b.dtype != torch.bfloat16
+        or state.dtype != torch.float32
+        or A_log.dtype != torch.float32
+        or dt_bias.dtype != torch.float32
+        or output.dtype != torch.bfloat16
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP nontranspose decode requires BF16 I/O/gates and FP32 state/decay"
+        )
+    if (
+        seq_len != 1
+        or head_size != 128
+        or value_size != 128
+        or k.shape != q.shape
+        or v.shape != (batch_size, 1, num_v_heads, 128)
+        or state.shape != (batch_size, num_v_heads, 128, 128)
+        or a.shape != (batch_size, 1, num_v_heads)
+        or b.shape != (batch_size, 1, num_v_heads)
+        or A_log.shape != (num_v_heads,)
+        or dt_bias.shape != (num_v_heads,)
+        or output.shape != (batch_size, 1, num_v_heads, 128)
+        or not all(tensor.is_contiguous() for tensor in tensors)
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
+        )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _gdn_noncp.arch_for_compute_capability(major, minor)
+    route = _gdn_noncp.select_gdn_noncp_decode_variant(
+        arch=arch,
+        batch_size=int(batch_size),
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        head_size=128,
+        layout="nontranspose",
+        num_k_heads=int(k.shape[2]),
+        num_q_heads=int(num_q_heads),
+        num_v_heads=int(num_v_heads),
+        scale=scale,
+        seq_len=1,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    entry = _gdn_noncp.load_gdn_noncp_kernel(route.variant_name, arch)
+    blocks_per_state = 8 if batch_size < 32 else 1
+    entry(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        output,
+        batch_size * num_v_heads * blocks_per_state,
+        1,
+        1,
+    )
+    return output
+
+
 # ============================================================================
 # API: Pretranspose Decode (V-major / K-last state layout)
 # ============================================================================
@@ -130,6 +498,9 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    backend: Literal["auto", "flashinfer", "gdn_noncp"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -184,6 +555,16 @@ def gated_delta_rule_decode_pretranspose(
         Requires ``initial_state`` to be provided.  If ``None``, the kernel
         writes the updated state back to the same slot it read from (i.e.
         ``initial_state_indices``).
+    intermediate_states_buffer : torch.Tensor, optional
+        Caller-owned checkpoint buffer of shape ``[B, >=T, HV, V, K]``.
+        Supported only for ``T > 1``; its dtype must match the state dtype.
+    disable_state_update : bool
+        Skip final-state writeback for verify calls. Supported only for
+        ``T > 1``. Default: ``False``.
+    backend : {"auto", "flashinfer", "gdn_noncp"}
+        ``auto`` selects GDN non-CP only for an exact frozen manifest row and
+        otherwise uses the existing FlashInfer implementation. Explicit
+        ``gdn_noncp`` requests fail closed when the contract is unsupported.
 
         **Padding / inactive sequences**: set the index to ``-1`` for any
         batch entry that should be treated as padding.  The two backends
@@ -227,6 +608,13 @@ def gated_delta_rule_decode_pretranspose(
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
 
+    if T == 1 and intermediate_states_buffer is not None:
+        raise ValueError(
+            "intermediate_states_buffer is supported only for T > 1"
+        )
+    if T == 1 and disable_state_update:
+        raise ValueError("disable_state_update is supported only for T > 1")
+
     use_pool = initial_state is not None
     assert use_pool == (initial_state_indices is not None), (
         "initial_state and initial_state_indices must be provided together"
@@ -263,6 +651,42 @@ def gated_delta_rule_decode_pretranspose(
 
     # Backend: BF16 state kernel when bf16 state, K=V=128
     state_dtype = initial_state.dtype if use_pool else state.dtype
+    if backend not in ("auto", "flashinfer", "gdn_noncp"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend != "flashinfer":
+        if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+            if backend == "gdn_noncp":
+                raise RuntimeError(
+                    "the source-only GDN non-CP GDN backend is not installed"
+                )
+        elif not use_pool:
+            if backend == "gdn_noncp":
+                raise _gdn_noncp.GDNNonCPUnsupportedError(
+                    "GDN non-CP pretranspose decode requires an indexed state pool"
+                )
+        else:
+            try:
+                gdn_noncp_output = _run_gdn_noncp_decode_pretranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state_pool=initial_state,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=K**-0.5 if scale is None else scale,
+                    use_qk_l2norm=use_qk_l2norm,
+                    output=output,
+                    initial_state_indices=initial_state_indices,
+                    output_state_indices=output_state_indices,
+                    intermediate_states_buffer=intermediate_states_buffer,
+                    disable_state_update=disable_state_update,
+                )
+                return gdn_noncp_output, initial_state
+            except _gdn_noncp.GDNNonCPUnsupportedError:
+                if backend == "gdn_noncp":
+                    raise
     use_bf16_state = (
         _GDN_DECODE_BF16_STATE_AVAILABLE
         and state_dtype == torch.bfloat16
@@ -335,6 +759,8 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=disable_state_update,
             )
         if forward_output is not None:
             # Kernel wrote directly into the user's buffer.
@@ -382,8 +808,8 @@ def gated_delta_rule_decode_pretranspose(
             b=b,
             scale=scale,
             output=output,
-            intermediate_states_buffer=None,
-            disable_state_update=False,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
             output_state_indices=output_state_indices,
         )
@@ -493,6 +919,7 @@ def gated_delta_rule_decode(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm: bool = True,
+    backend: Literal["auto", "flashinfer", "gdn_noncp"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel (K-major layout, no transpose needed).
 
@@ -529,6 +956,9 @@ def gated_delta_rule_decode(
         automatically when ``None``.
     use_qk_l2norm : bool
         Whether to apply L2 normalization to q and k.  Default: ``True``.
+    backend : {"auto", "flashinfer", "gdn_noncp"}
+        ``auto`` selects GDN non-CP only for an exact frozen manifest row;
+        explicit ``gdn_noncp`` requests fail closed.
 
     Returns
     -------
@@ -588,6 +1018,34 @@ def gated_delta_rule_decode(
     if output is None:
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
+
+    if backend not in ("auto", "flashinfer", "gdn_noncp"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend != "flashinfer":
+        if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+            if backend == "gdn_noncp":
+                raise RuntimeError(
+                    "the source-only GDN non-CP GDN backend is not installed"
+                )
+        else:
+            try:
+                gdn_noncp_output = _run_gdn_noncp_decode_nontranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=state,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=scale,
+                    output=output,
+                    use_qk_l2norm=use_qk_l2norm,
+                )
+                return gdn_noncp_output, state
+            except _gdn_noncp.GDNNonCPUnsupportedError:
+                if backend == "gdn_noncp":
+                    raise
 
     # State is in K-major layout [B, HV, K, V]
     # Flatten to [B*HV, K, V] to ensure proper alignment for SIMT async copy

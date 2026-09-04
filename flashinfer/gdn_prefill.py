@@ -16,11 +16,20 @@ limitations under the License.
 
 import math
 import warnings
+import weakref
 from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
+
+try:
+    from .jit import gdn_noncp as _gdn_noncp
+
+    _GDN_NONCP_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _gdn_noncp = None
+    _GDN_NONCP_AVAILABLE = False
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
     chunk_gated_delta_rule_sm90,
@@ -43,6 +52,355 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float8_e4m3fn,
     torch.float8_e5m2,
 )
+
+
+_GDN_NONCP_PREFILL_SEQ_LENS: dict[
+    tuple[int, int, int, int], tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]]
+] = {}
+
+
+def _gdn_noncp_prefill_seq_lens(
+    cu_seqlens: torch.Tensor, total_seq_len: int
+) -> tuple[int, ...]:
+    """Resolve immutable launch metadata once, outside CUDA Graph capture."""
+
+    key = (
+        int(cu_seqlens.device.index or 0),
+        int(cu_seqlens.data_ptr()),
+        int(cu_seqlens._version),
+        int(cu_seqlens.numel()),
+    )
+    cached = _GDN_NONCP_PREFILL_SEQ_LENS.get(key)
+    if cached is not None and cached[0]() is cu_seqlens:
+        return cached[1]
+    if torch.cuda.is_current_stream_capturing():
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires one eager metadata resolution before CUDA Graph capture"
+        )
+    offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+    if (
+        len(offsets) < 2
+        or offsets[0] != 0
+        or offsets[-1] != total_seq_len
+        or any(
+            end < start
+            for start, end in zip(offsets, offsets[1:], strict=False)
+        )
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
+        )
+    seq_lens = tuple(
+        end - start for start, end in zip(offsets, offsets[1:], strict=False)
+    )
+    _GDN_NONCP_PREFILL_SEQ_LENS[key] = (weakref.ref(cu_seqlens), seq_lens)
+    return seq_lens
+
+
+def _gdn_noncp_assert_state_slots(
+    indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
+) -> None:
+    """Validate CUDA-resident state slots without a host synchronization."""
+
+    in_pool = (indices >= 0) & (indices < pool_size)
+    valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
+    torch._assert_async(
+        valid.all(),
+        f"{name} must contain "
+        + ("-1 or " if allow_minus_one else "")
+        + f"slots in [0, {pool_size})",
+    )
+
+
+def _gdn_noncp_prefill_dtype_name(dtype: torch.dtype) -> str:
+    names = {
+        torch.float32: "float32",
+        torch.bfloat16: "bfloat16",
+        torch.float16: "float16",
+        torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.float8_e5m2: "float8_e5m2",
+    }
+    try:
+        return names[dtype]
+    except KeyError as exc:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            f"unsupported GDN non-CP prefill dtype {dtype}"
+        ) from exc
+
+
+def _run_gdn_noncp_prefill(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor],
+    beta: Optional[torch.Tensor],
+    scale: float,
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+    output: torch.Tensor,
+    output_state: Optional[torch.Tensor],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_indices: Optional[torch.Tensor],
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Launch one exact manifest-backed GDN non-CP non-CP prefill row."""
+
+    if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+        raise RuntimeError("the source-only GDN non-CP GDN backend is not installed")
+    if use_qk_l2norm_in_kernel:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP non-CP prefill requires caller-normalized Q/K"
+        )
+    tensors = tuple(
+        tensor
+        for tensor in (
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            output,
+            output_state,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            state_indices,
+        )
+        if tensor is not None
+    )
+    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires all tensors on one CUDA device"
+        )
+    if q.dtype not in (torch.float16, torch.bfloat16) or any(
+        tensor.dtype != q.dtype for tensor in (k, v, output)
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires matching FP16 or BF16 Q/K/V/output"
+        )
+    if any(not tensor.is_contiguous() for tensor in (q, k, v, output)):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires contiguous Q/K/V/output"
+        )
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or output.ndim != 3:
+        raise _gdn_noncp.GDNNonCPUnsupportedError("GDN non-CP prefill tensors must be rank 3")
+    total_seq_len, num_q_heads, head_size = map(int, q.shape)
+    num_k_heads, num_v_heads = int(k.shape[1]), int(v.shape[1])
+    num_o_heads = max(num_q_heads, num_v_heads)
+    if (
+        total_seq_len <= 0
+        or head_size != 128
+        or tuple(k.shape) != (total_seq_len, num_k_heads, 128)
+        or tuple(v.shape) != (total_seq_len, num_v_heads, 128)
+        or tuple(output.shape) != (total_seq_len, num_o_heads, 128)
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires exact [tokens,heads,128] tensors"
+        )
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.dtype not in (torch.int32, torch.int64)
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires contiguous int32/int64 cu_seqlens"
+        )
+    seq_lens = _gdn_noncp_prefill_seq_lens(cu_seqlens, total_seq_len)
+    num_seqs = len(seq_lens)
+    gates_present = g is not None and beta is not None
+
+    gate = g
+    if gate is None:
+        gate = torch.ones(
+            (total_seq_len, num_o_heads), dtype=torch.float32, device=q.device
+        )
+    update_gate = beta
+    if update_gate is None:
+        update_gate = torch.ones_like(gate)
+    for name, tensor in (("g", gate), ("beta", update_gate)):
+        if (
+            tensor.dtype != torch.float32
+            or tuple(tensor.shape) != (total_seq_len, num_o_heads)
+            or not tensor.is_contiguous()
+        ):
+            raise _gdn_noncp.GDNNonCPUnsupportedError(
+                f"GDN non-CP prefill requires contiguous FP32 {name} [tokens,heads]"
+            )
+
+    if output_final_state and output_state is None:
+        output_state = torch.empty(
+            (num_seqs, num_o_heads, 128, 128),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    active_states = [
+        tensor
+        for tensor in (
+            initial_state,
+            output_state if output_final_state else None,
+            state_checkpoints if checkpoint_every_n_tokens else None,
+        )
+        if tensor is not None
+    ]
+    state_dtype = active_states[0].dtype if active_states else torch.float32
+    if any(tensor.dtype != state_dtype for tensor in active_states):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires one state dtype across initial/final/checkpoints"
+        )
+    state_dtype_name = _gdn_noncp_prefill_dtype_name(state_dtype)
+    for name, tensor in (
+        ("initial_state", initial_state),
+        ("output_state", output_state if output_final_state else None),
+    ):
+        if tensor is None:
+            continue
+        if (
+            tensor.ndim != 4
+            or tuple(tensor.shape[1:]) != (num_o_heads, 128, 128)
+            or tuple(tensor.stride()[1:]) != (16384, 128, 1)
+        ):
+            raise _gdn_noncp.GDNNonCPUnsupportedError(
+                f"GDN non-CP prefill requires {name} with contiguous [H,V,K] rows"
+            )
+    if state_indices is not None and (
+        state_indices.ndim != 1
+        or int(state_indices.numel()) != num_seqs
+        or state_indices.dtype not in (torch.int32, torch.int64)
+        or not state_indices.is_contiguous()
+    ):
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "GDN non-CP prefill requires one contiguous integer state index per sequence"
+        )
+    if state_indices is not None:
+        indexed_pools = tuple(
+            tensor
+            for tensor in (
+                initial_state,
+                output_state if output_final_state else None,
+            )
+            if tensor is not None
+        )
+        if indexed_pools:
+            _gdn_noncp_assert_state_slots(
+                state_indices,
+                min(int(tensor.shape[0]) for tensor in indexed_pools),
+                name="GDN non-CP prefill state_indices",
+                allow_minus_one=False,
+            )
+    if checkpoint_every_n_tokens:
+        if (
+            state_checkpoints is None
+            or checkpoint_cu_starts is None
+            or not state_checkpoints.is_contiguous()
+            or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or not checkpoint_cu_starts.is_contiguous()
+        ):
+            raise _gdn_noncp.GDNNonCPUnsupportedError(
+                "GDN non-CP checkpoint prefill requires contiguous state/cumulative buffers"
+            )
+
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _gdn_noncp.arch_for_compute_capability(major, minor)
+    route = _gdn_noncp.select_gdn_noncp_prefill_variant(
+        arch=arch,
+        io_dtype=_gdn_noncp_prefill_dtype_name(q.dtype),
+        state_dtype=state_dtype_name,
+        num_seqs=num_seqs,
+        total_seq_len=total_seq_len,
+        max_seq_len=max(seq_lens),
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        use_initial_state=initial_state is not None,
+        store_final_state=output_final_state,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        use_state_indices=state_indices is not None,
+        gates_present=gates_present,
+        seq_lens=seq_lens,
+    )
+    entry = _gdn_noncp.load_gdn_noncp_kernel(route.variant_name, arch)
+    active_clusters = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
+    dvsplit = route.route_id.endswith(".dvsplit")
+    total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
+    if dvsplit or total_tiles <= 128:
+        grid_x = min(active_clusters, total_tiles)
+    else:
+        max_chunks = max((length + 63) // 64 for length in seq_lens)
+        if max_chunks <= 8:
+            grid_x = min(128, total_tiles)
+        elif active_clusters in (148, 160) and total_tiles == 256:
+            grid_x = 128
+        else:
+            grid_x = min(active_clusters, total_tiles)
+
+    empty_i32 = torch.empty(1, dtype=torch.int32, device=q.device)
+    cu_seqlens_i32 = (
+        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
+    )
+    state_indices_i32 = (
+        empty_i32
+        if state_indices is None
+        else state_indices
+        if state_indices.dtype == torch.int32
+        else state_indices.to(torch.int32)
+    )
+    empty_state = torch.empty(1, dtype=state_dtype, device=q.device)
+    launch_initial_state = initial_state if initial_state is not None else empty_state
+    launch_output_state = (
+        output_state if output_final_state and output_state is not None else empty_state
+    )
+    launch_checkpoints = (
+        state_checkpoints
+        if checkpoint_every_n_tokens and state_checkpoints is not None
+        else empty_state
+    )
+    cu_checkpoints_i32 = (
+        empty_i32
+        if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
+        else checkpoint_cu_starts
+        if checkpoint_cu_starts.dtype == torch.int32
+        else checkpoint_cu_starts.to(torch.int32)
+    )
+    tensormap_workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=q.device)
+    entry(
+        q,
+        k,
+        v,
+        output,
+        gate,
+        update_gate,
+        cu_seqlens_i32,
+        state_indices_i32,
+        launch_initial_state,
+        launch_output_state,
+        launch_checkpoints,
+        cu_checkpoints_i32,
+        tensormap_workspace,
+        int(initial_state.stride(0))
+        if initial_state is not None
+        else num_o_heads * 16384,
+        int(output_state.stride(0))
+        if output_final_state and output_state is not None
+        else num_o_heads * 16384,
+        checkpoint_every_n_tokens,
+        scale,
+        num_seqs,
+        num_q_heads,
+        num_v_heads,
+        total_tiles,
+        grid_x,
+        1,
+        1,
+    )
+    if output_final_state:
+        assert output_state is not None
+        return output, output_state
+    return output
 
 
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
@@ -132,6 +490,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    backend: Literal["auto", "flashinfer", "gdn_noncp"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -235,6 +594,10 @@ def chunk_gated_delta_rule(
         host sync); the caller's slot allocator is expected to guarantee it.
 
 
+    backend : {"auto", "flashinfer", "gdn_noncp"}
+        ``auto`` selects GDN non-CP only for an exact frozen non-CP manifest row;
+        explicit ``gdn_noncp`` requests fail closed.
+
     Returns
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
@@ -256,6 +619,16 @@ def chunk_gated_delta_rule(
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
     """
+    if backend not in ("auto", "flashinfer", "gdn_noncp"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend == "gdn_noncp" and (not _GDN_NONCP_AVAILABLE or _gdn_noncp is None):
+        raise RuntimeError(
+            "the source-only GDN non-CP GDN backend is not installed"
+        )
+    if backend == "gdn_noncp" and use_cp is True:
+        raise _gdn_noncp.GDNNonCPUnsupportedError(
+            "forced context-parallel prefill is outside the GDN non-CP non-CP backend"
+        )
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
     if checkpoint_every_n_tokens < 0:
@@ -360,7 +733,9 @@ def chunk_gated_delta_rule(
         _device_name,
         device_capability=_device_capability,
     )
-    will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
+    will_use_cp = backend != "gdn_noncp" and (
+        use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
+    )
     if state_indices is not None:
         if not is_integer_dtype(state_indices.dtype):
             raise ValueError(
@@ -473,6 +848,36 @@ def chunk_gated_delta_rule(
             if output_final_state:
                 return output, output_state
             return output
+    if backend != "flashinfer":
+        if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
+            if backend == "gdn_noncp":
+                raise RuntimeError(
+                    "the source-only GDN non-CP GDN backend is not installed"
+                )
+        else:
+            try:
+                return _run_gdn_noncp_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    scale=_scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    output=output,
+                    output_state=output_state,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    state_indices=state_indices,
+                )
+            except _gdn_noncp.GDNNonCPUnsupportedError:
+                if backend == "gdn_noncp":
+                    raise
+
     if _arch_major == 10:
         if _cuda_major < 13:
             raise NotImplementedError(
