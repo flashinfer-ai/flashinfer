@@ -775,13 +775,14 @@ def _select_generated_variant(
         return None
 
     repeated, all_positive = _cached_state_indices_classification(state_indices)
+    selected_slot_class: FusedKDADecodeGeneratedSlotClass
     if repeated:
-        slot_class = "repeated_positive"
+        selected_slot_class = "repeated_positive"
     elif all_positive:
-        slot_class = "positive_unique"
+        selected_slot_class = "positive_unique"
     else:
-        slot_class = "unique_or_null"
-    return eligible_by_slot_class[slot_class]
+        selected_slot_class = "unique_or_null"
+    return eligible_by_slot_class[selected_slot_class]
 
 
 def _run_generated_variant(

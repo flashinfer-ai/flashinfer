@@ -23,9 +23,7 @@ fused = importlib.import_module("flashinfer.kda_kernels.fused_kda_decode")
 
 
 class _FakeTensor:
-    def __init__(
-        self, shape, strides, dtype, *, contiguous=False, data_ptr=0x100000
-    ):
+    def __init__(self, shape, strides, dtype, *, contiguous=False, data_ptr=0x100000):
         self.shape = tuple(shape)
         self._strides = tuple(strides)
         self.dtype = dtype
@@ -62,9 +60,7 @@ def _fake_inputs():
         "weight": _FakeTensor(
             (3, 4, hidden), (4 * hidden, hidden, 1), torch.float32, contiguous=True
         ),
-        "conv_state": _FakeTensor(
-            (slots, qkv, 3), (3 * qkv, 1, qkv), torch.bfloat16
-        ),
+        "conv_state": _FakeTensor((slots, qkv, 3), (3 * qkv, 1, qkv), torch.bfloat16),
         "raw_gate": _FakeTensor(
             (1, rows, heads, 128),
             (rows * hidden, hidden, 128, 1),
@@ -76,9 +72,7 @@ def _fake_inputs():
         ),
         "A_log": _FakeTensor((heads,), (1,), torch.float32, contiguous=True),
         "dt_bias": _FakeTensor((hidden,), (1,), torch.float32, contiguous=True),
-        "state_indices": _FakeTensor(
-            (rows,), (1,), torch.int32, contiguous=True
-        ),
+        "state_indices": _FakeTensor((rows,), (1,), torch.int32, contiguous=True),
         "state": _FakeTensor(
             (slots, heads, 128, 128),
             (heads * 128 * 128, 128 * 128, 128, 1),
@@ -180,6 +174,7 @@ def test_generated_selector_receives_exact_runtime_facts(monkeypatch):
     monkeypatch.setattr(
         fused, "_cached_state_indices_classification", lambda tensor: (False, True)
     )
+
     def select_variant(**kwargs):
         calls.append(kwargs)
         return variant if kwargs["slot_class"] == "positive_unique" else None
@@ -239,7 +234,9 @@ def test_generated_selector_skips_index_copy_when_no_route_matches(monkeypatch):
     monkeypatch.setattr(
         fused,
         "_cached_state_indices_classification",
-        lambda tensor: pytest.fail("manifest gaps must fall back before classification"),
+        lambda tensor: pytest.fail(
+            "manifest gaps must fall back before classification"
+        ),
     )
 
     assert (
@@ -272,7 +269,9 @@ def test_generated_selector_falls_back_for_nonfinite_public_scalars(
     monkeypatch.setattr(
         fused,
         "_cached_state_indices_classification",
-        lambda tensor: pytest.fail("unsupported scalars must fall back before classification"),
+        lambda tensor: pytest.fail(
+            "unsupported scalars must fall back before classification"
+        ),
     )
 
     assert (
@@ -305,7 +304,9 @@ def test_generated_selector_falls_back_for_unaligned_state(monkeypatch):
     monkeypatch.setattr(
         fused,
         "_cached_state_indices_classification",
-        lambda tensor: pytest.fail("unaligned inputs must fall back before classification"),
+        lambda tensor: pytest.fail(
+            "unaligned inputs must fall back before classification"
+        ),
     )
 
     assert (

@@ -73,9 +73,9 @@ static_assert(sizeof(FLASHINFER_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -161,13 +161,12 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
     CheckCudaTensor(*named.first, named.second, device_id);
   }
 
-  for (const auto& named :
-       {std::pair<const TensorView*, const char*>(&x, "x"),
-        std::pair<const TensorView*, const char*>(&conv_state, "conv_state"),
-        std::pair<const TensorView*, const char*>(&raw_gate, "raw_gate"),
-        std::pair<const TensorView*, const char*>(&raw_beta, "raw_beta"),
-        std::pair<const TensorView*, const char*>(&output_gate, "output_gate"),
-        std::pair<const TensorView*, const char*>(&output, "output")}) {
+  for (const auto& named : {std::pair<const TensorView*, const char*>(&x, "x"),
+                            std::pair<const TensorView*, const char*>(&conv_state, "conv_state"),
+                            std::pair<const TensorView*, const char*>(&raw_gate, "raw_gate"),
+                            std::pair<const TensorView*, const char*>(&raw_beta, "raw_beta"),
+                            std::pair<const TensorView*, const char*>(&output_gate, "output_gate"),
+                            std::pair<const TensorView*, const char*>(&output, "output")}) {
     CheckDtype(*named.first, named.second, dl_bfloat16);
   }
   for (const auto& named :
@@ -185,9 +184,8 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
 #endif
   TVM_FFI_ICHECK(use_lower_bound == 0 || use_lower_bound == 1)
       << "use_lower_bound must be zero or one";
-  TVM_FFI_ICHECK(std::isfinite(lower_bound) &&
-                 ((use_lower_bound == 1 && lower_bound < 0.0) ||
-                  (use_lower_bound == 0 && lower_bound == 0.0)))
+  TVM_FFI_ICHECK(std::isfinite(lower_bound) && ((use_lower_bound == 1 && lower_bound < 0.0) ||
+                                                (use_lower_bound == 0 && lower_bound == 0.0)))
       << "lower_bound must be finite and negative when enabled, or zero when disabled";
   TVM_FFI_ICHECK(std::isfinite(norm_eps) && norm_eps >= 0.0)
       << "norm_eps must be finite and non-negative";
@@ -216,17 +214,14 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
   TVM_FFI_ICHECK(conv_state.stride(0) % 4 == 0)
       << "conv_state slot stride must preserve eight-byte alignment";
 
-  TVM_FFI_ICHECK(raw_gate.ndim() == 4 && raw_gate.size(0) == 1 &&
-                 raw_gate.size(1) == rows && raw_gate.size(2) == num_heads &&
-                 raw_gate.size(3) == kHeadDim)
+  TVM_FFI_ICHECK(raw_gate.ndim() == 4 && raw_gate.size(0) == 1 && raw_gate.size(1) == rows &&
+                 raw_gate.size(2) == num_heads && raw_gate.size(3) == kHeadDim)
       << "raw_gate must have shape [1, rows, H, 128]";
   CheckContiguous(raw_gate, "raw_gate");
-  TVM_FFI_ICHECK(raw_beta.ndim() == 3 && raw_beta.size(0) == 1 &&
-                 raw_beta.size(1) == rows && raw_beta.size(2) == num_heads &&
-                 raw_beta.stride(2) == 1)
+  TVM_FFI_ICHECK(raw_beta.ndim() == 3 && raw_beta.size(0) == 1 && raw_beta.size(1) == rows &&
+                 raw_beta.size(2) == num_heads && raw_beta.stride(2) == 1)
       << "raw_beta must have shape [1, rows, H] with unit head stride";
-  TVM_FFI_ICHECK(A_log.ndim() == 1 && A_log.size(0) == num_heads)
-      << "A_log must have shape [H]";
+  TVM_FFI_ICHECK(A_log.ndim() == 1 && A_log.size(0) == num_heads) << "A_log must have shape [H]";
   CheckContiguous(A_log, "A_log");
   TVM_FFI_ICHECK(dt_bias.ndim() == 1 && dt_bias.size(0) == hidden)
       << "dt_bias must have shape [H * 128]";
@@ -237,8 +232,8 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
 
   TVM_FFI_ICHECK(state.ndim() == 4 && state.size(0) == conv_state.size(0) &&
                  state.size(1) == num_heads && state.size(2) == kHeadDim &&
-                 state.size(3) == kHeadDim && state.stride(3) == 1 &&
-                 state.stride(2) == kHeadDim && state.stride(1) == kHeadDim * kHeadDim &&
+                 state.size(3) == kHeadDim && state.stride(3) == 1 && state.stride(2) == kHeadDim &&
+                 state.stride(1) == kHeadDim * kHeadDim &&
                  state.stride(0) >= num_heads * kHeadDim * kHeadDim)
       << "state must have shape [slots, H, 128, 128] with contiguous slot contents";
 #if FLASHINFER_FUSED_KDA_DECODE_STATE_IS_BFLOAT16
@@ -246,8 +241,7 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
 #else
   CheckAlignment(state, "state", 32);
 #endif
-  TVM_FFI_ICHECK(state.stride(0) % 8 == 0)
-      << "state slot stride must preserve 32-byte alignment";
+  TVM_FFI_ICHECK(state.stride(0) % 8 == 0) << "state slot stride must preserve 32-byte alignment";
 
   TVM_FFI_ICHECK(output_gate.ndim() == 3 && output_gate.size(0) == rows &&
                  output_gate.size(1) == num_heads && output_gate.size(2) == kHeadDim &&
@@ -322,9 +316,9 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
 
 #if FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES > 49152
   int max_dynamic_smem = 0;
-  CheckCuda(cudaDeviceGetAttribute(&max_dynamic_smem,
-                                   cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
-            "cudaDeviceGetAttribute(max dynamic shared memory)");
+  CheckCuda(
+      cudaDeviceGetAttribute(&max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
+      "cudaDeviceGetAttribute(max dynamic shared memory)");
   TVM_FFI_ICHECK(FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES <= max_dynamic_smem)
       << "fused KDA decode dynamic shared memory exceeds device capacity";
   CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -332,9 +326,9 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
             "cudaFuncSetAttribute(fused KDA decode)");
 #endif
 
-  CheckCuda(cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES,
-                             stream),
-            "fused KDA decode launch");
+  CheckCuda(
+      cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES, stream),
+      "fused KDA decode launch");
 }
 
 }  // namespace fused_kda_decode_generated

@@ -81,9 +81,7 @@ _RUNTIME_CONFIG_ABI: tuple[tuple[str, str, str], ...] = (
     ("parameter", "lower_bound_log2", "float32_scalar"),
     ("parameter", "norm_eps", "float32_scalar"),
 )
-FUSED_KDA_DECODE_GENERATED_ABIS: dict[
-    str, tuple[tuple[str, str, str], ...]
-] = {
+FUSED_KDA_DECODE_GENERATED_ABIS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "standard": _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _RUNTIME_CONFIG_ABI,
     "repeated_safe": (
         _COMMON_BUFFER_ABI
@@ -93,7 +91,7 @@ FUSED_KDA_DECODE_GENERATED_ABIS: dict[
     ),
 }
 
-_CONTRACT = {
+_CONTRACT: dict[str, Any] = {
     "head_dim": 128,
     "convolution_width": 4,
     "activation_dtype": "bfloat16",
@@ -228,24 +226,35 @@ def _exact_keys(value: object, expected: frozenset[str], label: str) -> None:
     assert isinstance(value, dict)
     missing = sorted(expected - set(value))
     unknown = sorted(set(value) - expected)
-    _require(not missing and not unknown, f"{label} fields: missing={missing}, unknown={unknown}")
+    _require(
+        not missing and not unknown,
+        f"{label} fields: missing={missing}, unknown={unknown}",
+    )
 
 
-def _source_parameter_declarations(source: str, kernel_symbol: str) -> list[tuple[str, str]]:
+def _source_parameter_declarations(
+    source: str, kernel_symbol: str
+) -> list[tuple[str, str]]:
     signature = re.search(
         rf"\b__global__\s+(?:__launch_bounds__\s*\([^)]*\)\s+)?void\s+"
         rf"{re.escape(kernel_symbol)}\s*\((?P<parameters>.*?)\)\s*\{{",
         source,
         flags=re.DOTALL,
     )
-    _require(signature is not None, f"body does not define CUDA kernel {kernel_symbol!r}")
+    _require(
+        signature is not None, f"body does not define CUDA kernel {kernel_symbol!r}"
+    )
     assert signature is not None
     declarations: list[tuple[str, str]] = []
     for index, raw in enumerate(signature.group("parameters").split(",")):
         declaration = re.sub(r"\b(?:const|volatile|__restrict__)\b", "", raw)
         declaration = " ".join(declaration.split())
-        match = re.fullmatch(r"(?P<type>.*?\*?)\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)", declaration)
-        _require(match is not None, f"kernel parameter {index} is not a simple C declaration")
+        match = re.fullmatch(
+            r"(?P<type>.*?\*?)\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)", declaration
+        )
+        _require(
+            match is not None, f"kernel parameter {index} is not a simple C declaration"
+        )
         assert match is not None
         normalized_type = re.sub(r"\s*\*\s*", "*", match.group("type").strip())
         declarations.append((match.group("name"), normalized_type))
@@ -311,7 +320,9 @@ def _verify_source_launch(
 
 
 def _resolve_body(csrc_dir: Path, relative_value: object, label: str) -> Path:
-    _require(isinstance(relative_value, str) and bool(relative_value), f"{label} is missing")
+    _require(
+        isinstance(relative_value, str) and bool(relative_value), f"{label} is missing"
+    )
     assert isinstance(relative_value, str)
     relative = PurePosixPath(relative_value)
     _require(
@@ -340,10 +351,16 @@ def _validate_extra_cuda_cflags(value: object, label: str) -> tuple[str, ...]:
             flags.append(flag)
             continue
         match = _MAXRREGCOUNT.fullmatch(flag)
-        _require(match is not None, f"{label}[{index}] is not an allowed generated-kernel flag")
+        _require(
+            match is not None,
+            f"{label}[{index}] is not an allowed generated-kernel flag",
+        )
         assert match is not None
         count = int(match.group(1))
-        _require(16 <= count <= 255, f"{label}[{index}] max register count is outside [16, 255]")
+        _require(
+            16 <= count <= 255,
+            f"{label}[{index}] max register count is outside [16, 255]",
+        )
         _require(flag not in flags, f"{label} contains duplicate flag {flag!r}")
         flags.append(flag)
     return tuple(flags)
@@ -376,6 +393,7 @@ def _finite_float(value: object, label: str) -> float:
         and float("-inf") < float(value) < float("inf"),
         f"{label} must be finite",
     )
+    assert isinstance(value, (int, float))
     return float(value)
 
 
@@ -388,7 +406,10 @@ def _parse_exact_values(
 ) -> tuple[float | None, ...] | None:
     if value == "any":
         return None
-    _require(isinstance(value, list) and bool(value), f"{label} must be 'any' or a non-empty list")
+    _require(
+        isinstance(value, list) and bool(value),
+        f"{label} must be 'any' or a non-empty list",
+    )
     assert isinstance(value, list)
     result: list[float | None] = []
     for index, item in enumerate(value):
@@ -412,7 +433,9 @@ def _parse_eligibility(
     *,
     abi_kind: str,
 ) -> tuple[FusedKDADecodeGeneratedEligibility, ...]:
-    _require(isinstance(value, list) and bool(value), f"{label} must be a non-empty list")
+    _require(
+        isinstance(value, list) and bool(value), f"{label} must be a non-empty list"
+    )
     assert isinstance(value, list)
     result: list[FusedKDADecodeGeneratedEligibility] = []
     for index, item in enumerate(value):
@@ -542,7 +565,11 @@ def load_fused_kda_decode_generated_variants(
     """
 
     source_dir = get_kda_csrc_dir() if csrc_dir is None else Path(csrc_dir)
-    path = source_dir / _MANIFEST_FILENAME if manifest_path is None else Path(manifest_path)
+    path = (
+        source_dir / _MANIFEST_FILENAME
+        if manifest_path is None
+        else Path(manifest_path)
+    )
     try:
         payload: Any = json.loads(
             path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
@@ -570,11 +597,17 @@ def load_fused_kda_decode_generated_variants(
     )
     if payload["status"] == "pending_generated_sources":
         _require(not variants, "pending manifest must not list variants")
-        _require(bool(remaining), "pending manifest must name its remaining generated inputs")
+        _require(
+            bool(remaining), "pending manifest must name its remaining generated inputs"
+        )
         return ()
-    _require(payload["status"] == "complete", f"unsupported status {payload['status']!r}")
+    _require(
+        payload["status"] == "complete", f"unsupported status {payload['status']!r}"
+    )
     _require(bool(variants), "complete manifest must list at least one variant")
-    _require(not remaining, "complete manifest must not list remaining generated inputs")
+    _require(
+        not remaining, "complete manifest must not list remaining generated inputs"
+    )
 
     observed: set[tuple[str, str]] = set()
     result: list[FusedKDADecodeGeneratedVariant] = []
@@ -588,14 +621,18 @@ def load_fused_kda_decode_generated_variants(
         source_sha256 = item["source_sha256"]
         abi_kind = item["abi_kind"]
         state_dtype = item["state_dtype"]
-        _require(isinstance(name, str) and _SLUG.fullmatch(name) is not None, f"{label}.name")
+        _require(
+            isinstance(name, str) and _SLUG.fullmatch(name) is not None, f"{label}.name"
+        )
         _require(target in _TARGETS, f"{label}.target must be one of {_TARGETS}")
         _require(
-            isinstance(kernel_symbol, str) and _C_IDENT.fullmatch(kernel_symbol) is not None,
+            isinstance(kernel_symbol, str)
+            and _C_IDENT.fullmatch(kernel_symbol) is not None,
             f"{label}.kernel_symbol must be a C identifier",
         )
         _require(
-            isinstance(source_sha256, str) and _SHA256.fullmatch(source_sha256) is not None,
+            isinstance(source_sha256, str)
+            and _SHA256.fullmatch(source_sha256) is not None,
             f"{label}.source_sha256 must be one lowercase SHA-256",
         )
         _require(
@@ -632,7 +669,9 @@ def load_fused_kda_decode_generated_variants(
         launch = item["launch"]
         _exact_keys(launch, _LAUNCH_KEYS, f"{label}.launch")
         assert isinstance(launch, dict)
-        threads = _positive_int(launch["threads"], f"{label}.launch.threads", maximum=1024)
+        threads = _positive_int(
+            launch["threads"], f"{label}.launch.threads", maximum=1024
+        )
         _require(threads % 32 == 0, f"{label}.launch.threads must be warp-aligned")
         dynamic_smem_bytes = _positive_int(
             launch["dynamic_smem_bytes"],
@@ -700,8 +739,7 @@ def _eligibility_matches(
     if rule.norm_eps_values is not None and norm_eps not in rule.norm_eps_values:
         return False
     return all(
-        expected is None or strides[name] == expected
-        for name, expected in rule.strides
+        expected is None or strides[name] == expected for name, expected in rule.strides
     )
 
 
@@ -749,10 +787,15 @@ def select_fused_kda_decode_generated_variant(
         "output_gate_row_stride": output_gate_row_stride,
     }
     _require(
-        all(isinstance(value, int) and not isinstance(value, bool) for value in strides.values()),
+        all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in strides.values()
+        ),
         "strides must be integers",
     )
-    _require(all(value >= 0 for value in strides.values()), "strides must be non-negative")
+    _require(
+        all(value >= 0 for value in strides.values()), "strides must be non-negative"
+    )
     if num_rows > 2**31 - 1 or any(value > 2**31 - 1 for value in strides.values()):
         return None
     available = (
@@ -791,7 +834,9 @@ def get_fused_kda_decode_generated_variant(
     for variant in load_fused_kda_decode_generated_variants():
         if variant.name == name and variant.target == target:
             return variant
-    raise RuntimeError(f"fused KDA decode generated source is unavailable for {name}/{target}")
+    raise RuntimeError(
+        f"fused KDA decode generated source is unavailable for {name}/{target}"
+    )
 
 
 def get_fused_kda_decode_generated_uri(
@@ -845,9 +890,13 @@ def gen_fused_kda_decode_generated_module(
     csrc_dir = get_kda_csrc_dir()
     binding_header = csrc_dir / _BINDING_HEADER
     if not binding_header.is_file():
-        raise FileNotFoundError(f"fused KDA decode generated binding not found: {binding_header}")
+        raise FileNotFoundError(
+            f"fused KDA decode generated binding not found: {binding_header}"
+        )
     uri = get_fused_kda_decode_generated_uri(name, target)
-    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "fused_kda_decode_generated_binding.cu"
+    binding = (
+        jit_env.FLASHINFER_GEN_SRC_DIR / uri / "fused_kda_decode_generated_binding.cu"
+    )
     write_if_different(binding, _render_binding(variant))
     spec = gen_kda_jit_spec(
         name=uri,

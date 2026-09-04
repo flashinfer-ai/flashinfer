@@ -115,9 +115,7 @@ def _write_complete_manifest(
     )
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
-        json.dumps(
-            _manifest(body, abi_kind=abi_kind, state_dtype=state_dtype)
-        ),
+        json.dumps(_manifest(body, abi_kind=abi_kind, state_dtype=state_dtype)),
         encoding="utf-8",
     )
     return body, manifest_path
@@ -177,17 +175,13 @@ def test_complete_manifest_verifies_source_identity_abi_and_launch(tmp_path):
         ),
     ],
 )
-def test_manifest_rejects_contract_source_and_launch_drift(
-    tmp_path, mutation, message
-):
+def test_manifest_rejects_contract_source_and_launch_drift(tmp_path, mutation, message):
     body, manifest_path = _write_complete_manifest(tmp_path)
     payload = _manifest(body)
     mutation(payload)
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(
-        generated.FusedKDADecodeGeneratedManifestError, match=message
-    ):
+    with pytest.raises(generated.FusedKDADecodeGeneratedManifestError, match=message):
         generated.load_fused_kda_decode_generated_variants(
             manifest_path=manifest_path,
             csrc_dir=tmp_path,
@@ -216,12 +210,8 @@ def test_repeated_safe_bfloat16_abi_includes_rows(tmp_path):
     body, manifest_path = _write_complete_manifest(
         tmp_path, abi_kind="repeated_safe", state_dtype="bfloat16"
     )
-    payload = _manifest(
-        body, abi_kind="repeated_safe", state_dtype="bfloat16"
-    )
-    payload["variants"][0]["eligibility"][0]["slot_classes"].append(
-        "repeated_positive"
-    )
+    payload = _manifest(body, abi_kind="repeated_safe", state_dtype="bfloat16")
+    payload["variants"][0]["eligibility"][0]["slot_classes"].append("repeated_positive")
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     (variant,) = generated.load_fused_kda_decode_generated_variants(
@@ -240,9 +230,7 @@ def test_repeated_safe_bfloat16_abi_includes_rows(tmp_path):
 def test_manifest_rejects_repeated_slots_for_standard_abi(tmp_path):
     body, manifest_path = _write_complete_manifest(tmp_path)
     payload = _manifest(body)
-    payload["variants"][0]["eligibility"][0]["slot_classes"].append(
-        "repeated_positive"
-    )
+    payload["variants"][0]["eligibility"][0]["slot_classes"].append("repeated_positive")
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(
@@ -296,9 +284,7 @@ def test_manifest_selector_matches_exact_rules_and_falls_back_for_gaps(tmp_path)
 
     assert generated.select_fused_kda_decode_generated_variant(**facts) is variants[0]
     assert (
-        generated.select_fused_kda_decode_generated_variant(
-            **{**facts, "num_rows": 65}
-        )
+        generated.select_fused_kda_decode_generated_variant(**{**facts, "num_rows": 65})
         is None
     )
     assert (
@@ -341,20 +327,17 @@ def test_binding_renderer_preserves_verified_launch_and_source_contract(tmp_path
     binding = generated._render_binding(variant)
 
     assert (
-        '#define FLASHINFER_FUSED_KDA_DECODE_BODY_FILE '
+        "#define FLASHINFER_FUSED_KDA_DECODE_BODY_FILE "
         '"fused_kda_decode_generated_single_cta.cu"'
     ) in binding
     assert (
-        "#define FLASHINFER_FUSED_KDA_DECODE_KERNEL "
-        "kernel_fused_kda_decode_test"
+        "#define FLASHINFER_FUSED_KDA_DECODE_KERNEL kernel_fused_kda_decode_test"
     ) in binding
     assert "#define FLASHINFER_FUSED_KDA_DECODE_THREADS 256" in binding
     assert generated._ARG_PLAN_SHA256["standard"] in binding
 
 
-def test_jit_spec_uses_verified_source_identity_and_binding(
-    tmp_path, monkeypatch
-):
+def test_jit_spec_uses_verified_source_identity_and_binding(tmp_path, monkeypatch):
     body, manifest_path = _write_complete_manifest(tmp_path)
     (variant,) = generated.load_fused_kda_decode_generated_variants(
         manifest_path=manifest_path,
@@ -365,7 +348,9 @@ def test_jit_spec_uses_verified_source_identity_and_binding(
     calls = []
 
     monkeypatch.setattr(
-        generated, "get_fused_kda_decode_generated_variant", lambda name, target: variant
+        generated,
+        "get_fused_kda_decode_generated_variant",
+        lambda name, target: variant,
     )
     monkeypatch.setattr(generated, "get_kda_csrc_dir", lambda: tmp_path)
     monkeypatch.setattr(generated, "get_flashinfer_include_dir", lambda: tmp_path)
@@ -377,9 +362,7 @@ def test_jit_spec_uses_verified_source_identity_and_binding(
     )
     generated.gen_fused_kda_decode_generated_module.cache_clear()
     try:
-        spec = generated.gen_fused_kda_decode_generated_module(
-            "single_cta", "sm100a"
-        )
+        spec = generated.gen_fused_kda_decode_generated_module("single_cta", "sm100a")
     finally:
         generated.gen_fused_kda_decode_generated_module.cache_clear()
 
@@ -400,9 +383,9 @@ def test_jit_spec_uses_verified_source_identity_and_binding(
 
 
 def test_binding_header_packs_the_exact_physical_argument_count():
-    header = (
-        generated.get_kda_csrc_dir() / generated._BINDING_HEADER
-    ).read_text(encoding="utf-8")
+    header = (generated.get_kda_csrc_dir() / generated._BINDING_HEADER).read_text(
+        encoding="utf-8"
+    )
 
     assert "CheckArgumentCount<21>(args);" in header
     assert "CheckArgumentCount<22>(args);" in header
