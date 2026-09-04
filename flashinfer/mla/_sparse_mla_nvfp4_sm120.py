@@ -229,6 +229,20 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
     return int(num_pages), int(page_size), layout
 
 
+def _validate_unique_slots(slot_mapping: torch.Tensor, capacity: int) -> None:
+    """Reject write races when defensive MLA input checks are enabled."""
+    from ._core import _validate_dsv4_sync_checks
+
+    if slot_mapping.numel() < 2 or not _validate_dsv4_sync_checks(slot_mapping.device):
+        return
+    ordered = torch.sort(slot_mapping).values
+    duplicate_valid = (
+        (ordered[1:] == ordered[:-1]) & (ordered[1:] >= 0) & (ordered[1:] < capacity)
+    )
+    if duplicate_valid.any().item():
+        raise ValueError("valid slot_mapping entries must be unique")
+
+
 @supported_compute_capability([120, 121])
 def nvfp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
@@ -296,8 +310,10 @@ def nvfp4_quantize_append_sparse_mla_cache(
     addition to the public 4D HND/NHD layouts. ``slot_mapping[i]`` is
     ``page_id * page_size + entry_id``. Page-strided views are accepted so the
     cache can live inside vLLM's packed physical block allocation. Negative and
-    out-of-range slots are padding and are ignored. Only the addressed data row
-    and scale slot are written, so prefill history is reused directly by decode.
+    out-of-range slots are padding and are ignored. Valid slots must be unique;
+    set ``FLASHINFER_VALIDATE_INPUTS=1`` to check that invariant eagerly outside
+    CUDA Graph capture. Only the addressed data row and scale slot are written,
+    so prefill history is reused directly by decode.
     """
     num_pages, page_size, _ = _cache_shape(cache)
     if not slot_mapping.is_cuda:
@@ -317,6 +333,7 @@ def nvfp4_quantize_append_sparse_mla_cache(
     _check_latent_kv(latent_kv, expected_rows=slot_mapping.numel())
     if num_pages * page_size == 0 and slot_mapping.numel() != 0:
         raise ValueError("cannot append to an empty cache")
+    _validate_unique_slots(slot_mapping, num_pages * page_size)
 
     get_sparse_mla_nvfp4_sm120_module().sparse_mla_sm120_nvfp4_quantize_append(
         latent_kv, slot_mapping, cache

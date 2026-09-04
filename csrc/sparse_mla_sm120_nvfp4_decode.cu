@@ -63,8 +63,8 @@ void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, 
     // Repeating Q quantization and the CTA-local V conversion for additional
     // split waves is materially more expensive than leaving a fraction of the
     // final wave empty. Select the fullest grid in the minimum feasible number
-    // of waves; for the common B=8/16/32,H=64,K=640 shapes this yields
-    // cpb=1/2/4 and keeps roughly 80--96 CTAs resident in one wave.
+    // of waves; representative B=8/16/32,H=64 supported shapes select the
+    // CPB that keeps roughly 80--96 CTAs resident in one wave.
     const int target_waves = (per_token_head + sm_count - 1) / sm_count;
     chunks_per_block = 1;
     float best_gap = static_cast<float>(target_waves) + 1.f;

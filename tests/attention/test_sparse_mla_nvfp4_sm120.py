@@ -335,6 +335,54 @@ def test_nvfp4_sparse_mla_append_writes_only_selected_slots(page_size):
         assert torch.all(scales[0, 1] == 0xA5)
 
 
+@pytest.mark.parametrize("misaligned", ["input", "cache_base", "page_stride"])
+def test_nvfp4_sparse_mla_append_rejects_misaligned_vector_accesses(
+    misaligned: str,
+) -> None:
+    """Vectorized BF16/uint4 accesses require a 16-byte-aligned cache ABI."""
+    _require_sm120()
+    latent_kv = torch.empty(1, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    cache = torch.empty(2, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+    expected_error = "kv_cache"
+
+    if misaligned == "input":
+        input_storage = torch.empty(513, dtype=torch.bfloat16, device="cuda")
+        latent_kv = input_storage[1:].view(1, 512)
+        expected_error = "latent_kv"
+    elif misaligned == "cache_base":
+        cache_storage = torch.empty(cache.numel() + 1, dtype=torch.uint8, device="cuda")
+        cache = cache_storage[1:].view_as(cache)
+    else:
+        page_stride = 2 * _BYTES_PER_TOKEN + 1
+        cache_storage = torch.empty(
+            page_stride + 2 * _BYTES_PER_TOKEN,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        cache = torch.as_strided(
+            cache_storage,
+            size=(2, 2, _BYTES_PER_TOKEN),
+            stride=(page_stride, _BYTES_PER_TOKEN, 1),
+        )
+
+    with pytest.raises(RuntimeError, match=rf"{expected_error}.*16"):
+        nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+
+
+def test_nvfp4_sparse_mla_append_rejects_duplicate_valid_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_sm120()
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    latent_kv = torch.empty(2, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(2, dtype=torch.int32, device="cuda")
+    cache = torch.empty(1, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+
+    with pytest.raises(ValueError, match="must be unique"):
+        nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+
+
 def test_nvfp4_sparse_mla_pack_rejects_wrong_dtype():
     _require_sm120()
     latent_kv = torch.empty(1, 2, 512, dtype=torch.float16, device="cuda")
@@ -624,6 +672,62 @@ def test_nvfp4_sparse_mla_shared_wrapper_matches_reference(num_tokens: int) -> N
     )
     torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 65])
+def test_nvfp4_sparse_mla_shared_wrapper_normalizes_singleton_indices(
+    num_tokens: int,
+) -> None:
+    """The shared FP8/NVFP4 ABI accepts [T, 1, topk] for both cache sections."""
+    _require_sm120()
+    torch.manual_seed(20260912 + num_tokens)
+    num_heads, topk = 16, 128
+    main_kv = torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10
+    extra_kv = torch.randn(64, 2, 512, dtype=torch.bfloat16, device="cuda") / 10
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10
+    )
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    extra_indices = torch.randint(
+        0, 64 * 2, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    main_cache = nvfp4_quantize_pack_sparse_mla_cache(main_kv)
+    extra_cache = nvfp4_quantize_pack_sparse_mla_cache(extra_kv)
+    output_2d = torch.empty_like(q)
+    output_3d = torch.empty_like(q)
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_cache_format="nvfp4",
+        device=q.device,
+    )
+
+    lse_2d = runner.run(
+        q,
+        main_cache,
+        indices,
+        output_2d,
+        512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        return_lse=True,
+    ).clone()
+    lse_3d = runner.run(
+        q,
+        main_cache,
+        indices.unsqueeze(1),
+        output_3d,
+        512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices.unsqueeze(1),
+        return_lse=True,
+    )
+
+    torch.testing.assert_close(output_3d, output_2d, atol=0, rtol=0)
+    torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512)])
@@ -1086,3 +1190,67 @@ def test_nvfp4_sparse_mla_decode_zero_topk_length(with_sink: bool) -> None:
         assert torch.all(lse < -1e29)
     else:
         torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_invalid_nonempty_chunks_have_zero_probability(
+    with_sink: bool,
+) -> None:
+    """Negative candidates stay masked when topk_length itself is nonzero."""
+    _require_sm120()
+    torch.manual_seed(20260913 + int(with_sink))
+    num_heads, topk = 16, 128
+    kv = torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(1, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.full((1, topk), -1, dtype=torch.int32, device="cuda")
+    attn_sink = (
+        torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device="cuda")
+        if with_sink
+        else None
+    )
+
+    for attention in (_nvfp4_sparse_mla_decode, _nvfp4_sparse_mla_prefill):
+        output, lse = attention(
+            q,
+            cache,
+            indices,
+            512**-0.5,
+            attn_sink=attn_sink,
+        )
+        assert torch.count_nonzero(output) == 0
+        if attn_sink is None:
+            assert torch.all(lse < -1e29)
+        else:
+            torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
+
+
+@pytest.mark.parametrize("invalid_chunk", ["first", "last"])
+def test_nvfp4_sparse_mla_skips_fully_invalid_chunk_in_nonempty_row(
+    invalid_chunk: str,
+) -> None:
+    """An invalid tile must not change the online softmax around a valid tile."""
+    _require_sm120()
+    torch.manual_seed(20260915 + int(invalid_chunk == "last"))
+    num_heads, topk = 16, 128
+    kv = (torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda") / 10).clamp(
+        -1, 1
+    )
+    q = (
+        torch.randn(1, num_heads, 512, dtype=torch.bfloat16, device="cuda") / 10
+    ).clamp(-1, 1)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.randint(0, 128, (1, topk), dtype=torch.int32, device="cuda")
+    invalid_slice = slice(0, 64) if invalid_chunk == "first" else slice(64, 128)
+    indices[:, invalid_slice] = -1
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+    )
+
+    for attention in (_nvfp4_sparse_mla_decode, _nvfp4_sparse_mla_prefill):
+        output, lse = attention(q, cache, indices, 512**-0.5)
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
