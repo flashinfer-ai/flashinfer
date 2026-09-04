@@ -448,10 +448,13 @@ void trtllm_paged_attention_launcher(
 
   // Only callers that request the LSE merge partial attention states, and only a merge can
   // observe an empty-KV row, so the fixup is skipped (zero cost) on the plain decode path.
-  // Block-sparse attention carries per-head lengths and sparse MLA has no empty-row contract, so
-  // both are left untouched.
-  if (mode == TllmPagedAttentionMode::ForGen && lse != nullptr && seq_lens != nullptr &&
-      !enable_block_sparse_attention && sparse_mla_top_k <= 0) {
+  // Scope: dense MLA decode without attention sinks. A sink contributes to the softmax
+  // denominator, so an empty-KV row with sinks has a finite LSE that must not be overwritten with
+  // -inf. Block-sparse attention carries per-head lengths and sparse MLA has no empty-row
+  // contract, so both are left untouched as well.
+  if (mode == TllmPagedAttentionMode::ForGen && is_mla_decode && lse != nullptr &&
+      seq_lens != nullptr && attention_sinks == nullptr && !enable_block_sparse_attention &&
+      sparse_mla_top_k <= 0) {
     int64_t const out_row_bytes = num_qo_heads * head_dim_vo * get_size_in_bits(o_data_type) / 8;
     int64_t const q_len_per_request = cum_seq_lens_q == nullptr ? sum_seq_q / batch_size : 0;
     launch_fixup_empty_kv_rows(out, out_row_bytes, lse, lse_stride_tokens, lse_stride_heads,
