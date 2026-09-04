@@ -21,6 +21,7 @@ the backend column indicates which kernel the API wraps.
 +---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
 | Template                        | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
 +=================================+===================+===========================+=========================+=========+=================+
+| ``wan_hybrid_attention``        | fixed B1/S4800    | contiguous NHD            | none                    | prefill | Wan hybrid      |
 | ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
 | ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
 | ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
@@ -46,6 +47,101 @@ import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import make_paged_kv_indices
+
+
+# ── Wan hybrid fixed-shape attention ────────────────────────────────────────
+
+
+def _wan_hybrid_attention_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    import torch
+
+    from flashinfer.trace import default_check
+
+    rtol = 0.1 if rtol is None else rtol
+    atol = 1.0 if atol is None else atol
+    min_cos_sim = 0.995 if min_cos_sim is None else min_cos_sim
+    if not default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    ):
+        return False
+    reference = (
+        reference_outputs[0]
+        if isinstance(reference_outputs, (list, tuple))
+        else reference_outputs
+    )
+    actual = (
+        actual_outputs[0]
+        if isinstance(actual_outputs, (list, tuple))
+        else actual_outputs
+    )
+    if not isinstance(reference, torch.Tensor) or not isinstance(actual, torch.Tensor):
+        return False
+    return bool(
+        torch.isfinite(actual).all().item()
+        and (actual.float() - reference.float()).abs().mean().item() <= 0.025
+    )
+
+
+wan_hybrid_attention_trace = TraceTemplate(
+    op_type="wan_hybrid_attention",
+    name_prefix="wan_hybrid_attention",
+    description=(
+        "Explicit Wan VideoGen BF16 Q/K with internally quantized NVFP4 P/V "
+        "attention for the fixed B1/S4800/H40/D128 noncausal NHD contract."
+    ),
+    axes={
+        "batch_size": Const(abbrev="b", value=1),
+        "seq_len": Const(abbrev="s", value=4800),
+        "num_heads": Const(abbrev="h", value=40),
+        "head_dim": Const(abbrev="d", value=128),
+    },
+    inputs={
+        "q": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "k": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "v": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "workspace": Scalar(
+            "int64",
+            description=(
+                "Opaque caller-owned WanHybridAttentionWorkspace handle; its "
+                "storage is implementation-specific."
+            ),
+        ),
+        "sm_scale": Scalar("float32", optional=True),
+        "qkv_layout": Scalar("string", optional=True),
+        "causal": Scalar("bool", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            dtype_from="q",
+            param="out",
+            description="Caller-owned contiguous BF16 output.",
+        )
+    },
+    constraints=[
+        "batch_size == 1",
+        "seq_len == 4800",
+        "num_heads == 40",
+        "head_dim == 128",
+        "qkv_layout is None or qkv_layout == 'NHD'",
+        "causal is None or causal == False",
+    ],
+    tags=["stage:prefill", "backend:wan-hybrid", "status:experimental"],
+    check=_wan_hybrid_attention_check,
+)
 
 
 def _attention_check(

@@ -531,6 +531,7 @@ def gen_jit_spec(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
+    use_fast_math: bool = True,
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
 ) -> JitSpec:
     check_cuda_arch()
@@ -551,9 +552,10 @@ def gen_jit_spec(
     if not cflags_has_std:
         cflags.insert(0, "-std=c++17")
 
-    cuda_cflags = [
-        *get_nvcc_parallelism_flags(),
-        "-use_fast_math",
+    cuda_cflags = [*get_nvcc_parallelism_flags()]
+    if use_fast_math:
+        cuda_cflags.append("-use_fast_math")
+    cuda_cflags += [
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
         "--compress-mode=size",
         "-DFLASHINFER_ENABLE_F16",
