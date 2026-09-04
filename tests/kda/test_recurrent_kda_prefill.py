@@ -35,6 +35,32 @@ kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
 cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
 
+@pytest.fixture(autouse=True)
+def _legacy_module_stubs_select_the_legacy_fallback(monkeypatch):
+    """Keep legacy ABI stubs on the selector-miss fallback they exercise."""
+
+    from flashinfer.jit.flash_kda import _GeneratedFlashKDASelectorNotFoundError
+
+    original_legacy_resolver = kda_prefill_api._get_flash_kda_prefill_module
+    original_generated_resolver = kda_prefill_api._get_flash_kda_generated_module
+
+    def resolve_generated(selector_key):
+        if (
+            kda_prefill_api._get_flash_kda_prefill_module
+            is not original_legacy_resolver
+        ):
+            raise _GeneratedFlashKDASelectorNotFoundError(
+                "legacy test module stub requests the selector-miss fallback"
+            )
+        return original_generated_resolver(selector_key)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        resolve_generated,
+    )
+
+
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
     assert flashinfer.recurrent_kda is kda_api.recurrent_kda
     assert (
@@ -699,6 +725,7 @@ def _make_inputs(
     num_heads: int,
     packed: bool,
     initial_state: bool = False,
+    state_dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     torch.manual_seed(seed)
@@ -736,7 +763,7 @@ def _make_inputs(
                 dtype=torch.float32,
                 device="cuda",
             )
-        ).to(torch.bfloat16)
+        ).to(state_dtype)
     return {
         "q": q,
         "k": k,
@@ -1004,9 +1031,9 @@ def flash_kda_device(cuda_device):
     ("compute_capability", "cuda_version", "expected_target", "error_match"),
     [
         ((10, 0), "12.8", "sm100a", None),
-        ((10, 0), "12.9", "sm100f", None),
+        ((10, 0), "12.9", "sm100a", None),
         ((10, 3), "12.8", None, "10.3 requires CUDA 12.9"),
-        ((10, 3), "12.9", "sm100f", None),
+        ((10, 3), "12.9", "sm103a", None),
         ((12, 0), "13.0", None, "requires compute capability 10.0"),
         ((10, 0), "12.7", None, "10.0 requires CUDA 12.8"),
     ],
@@ -1058,6 +1085,427 @@ def test_flash_kda_sm_count_is_cached_per_device(monkeypatch):
         assert calls == [torch.device("cuda:0"), torch.device("cuda:1")]
     finally:
         kda_prefill_api._flash_kda_device_sm_count.cache_clear()
+
+
+def _make_padded_state_pool(*, slots, num_heads, dtype, device):
+    slot_numel = num_heads * 128 * 128
+    storage = torch.empty(
+        (slots, slot_numel + 64),
+        dtype=dtype,
+        device=device,
+    )
+    return storage.as_strided(
+        (slots, num_heads, 128, 128),
+        (storage.stride(0), 128 * 128, 128, 1),
+    )
+
+
+def _frozen_prefill_eligibility_kwargs(inputs, *, output, state_indices=None):
+    return {
+        "q": inputs["q"],
+        "k": inputs["k"],
+        "v": inputs["v"],
+        "g": inputs["g"],
+        "beta": inputs["beta"],
+        "A_log": inputs["A_log"],
+        "dt_bias": inputs["dt_bias"],
+        "initial_state": inputs["initial_state"],
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "cu_seqlens": inputs["cu_seqlens"],
+        "ssm_state_indices": state_indices,
+        "num_spec_tokens": None,
+        "num_accepted_tokens": None,
+        "output": output,
+        "initial_state_source": None,
+        "initial_state_indices": None,
+        "beta_is_logit": True,
+        "state_checkpoints": None,
+        "checkpoint_cu_starts": None,
+        "checkpoint_every_n_tokens": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "state_mode"),
+    [
+        (torch.bfloat16, "compact"),
+        (torch.bfloat16, "indexed"),
+        (torch.float32, "indexed"),
+    ],
+)
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [6, 12], ids=["h6", "h12"])
+def test_frozen_prefill_state_pool_eligibility_accepts_supported_contracts(
+    flash_kda_device,
+    state_dtype,
+    state_mode,
+    packed,
+    num_heads,
+):
+    seq_lens = [17, 33] if packed else [33, 33]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        state_dtype=state_dtype,
+        seed=23_000 + num_heads + int(packed),
+    )
+    compact_seed = inputs["initial_state"]
+    state_indices = None
+    if state_mode == "compact":
+        state_pool = _make_padded_state_pool(
+            slots=len(seq_lens),
+            num_heads=num_heads,
+            dtype=state_dtype,
+            device=flash_kda_device,
+        )
+        state_pool.copy_(compact_seed)
+    else:
+        state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+        state_pool = _make_padded_state_pool(
+            slots=5,
+            num_heads=num_heads,
+            dtype=state_dtype,
+            device=flash_kda_device,
+        )
+        state_pool.index_copy_(0, state_indices.to(torch.int64), compact_seed)
+    inputs["initial_state"] = state_pool
+
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(
+        **_frozen_prefill_eligibility_kwargs(
+            inputs,
+            output=torch.empty_like(inputs["q"]),
+            state_indices=state_indices,
+        )
+    )
+
+
+def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_state(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_058,
+    )
+
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=eligibility_kwargs["output"],
+            output_final_state=True,
+            backend="cake",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        "state_dtype",
+        "state_inner_stride",
+        "compact_slot_count",
+        "index_dtype",
+        "index_length",
+        "index_contiguity",
+        "index_without_state",
+    ],
+)
+def test_frozen_prefill_state_pool_eligibility_rejects_invalid_contracts(
+    flash_kda_device,
+    invalid_contract,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        seed=23_106,
+    )
+    state_indices = None
+    if invalid_contract == "state_dtype":
+        inputs["initial_state"] = inputs["initial_state"].to(torch.float16)
+    elif invalid_contract == "state_inner_stride":
+        inputs["initial_state"] = inputs["initial_state"].transpose(-1, -2)
+    elif invalid_contract == "compact_slot_count":
+        inputs["initial_state"] = _make_padded_state_pool(
+            slots=3,
+            num_heads=6,
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+        )
+    elif invalid_contract == "index_without_state":
+        inputs["initial_state"] = None
+        state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    else:
+        state_pool = _make_padded_state_pool(
+            slots=5,
+            num_heads=6,
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+        )
+        inputs["initial_state"] = state_pool
+        if invalid_contract == "index_dtype":
+            state_indices = torch.tensor(
+                [3, 1], dtype=torch.int64, device=flash_kda_device
+            )
+        elif invalid_contract == "index_length":
+            state_indices = torch.tensor(
+                [3], dtype=torch.int32, device=flash_kda_device
+            )
+        else:
+            state_indices = torch.tensor(
+                [3, 0, 1, 0], dtype=torch.int32, device=flash_kda_device
+            )[::2]
+            assert not state_indices.is_contiguous()
+
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+        state_indices=state_indices,
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            ssm_state_indices=state_indices,
+            output=eligibility_kwargs["output"],
+            backend="cake",
+        )
+
+
+def test_frozen_prefill_auto_falls_back_only_when_state_contract_is_ineligible(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        seed=23_206,
+    )
+    inputs["initial_state"] = inputs["initial_state"].to(torch.float16)
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: pytest.fail("an ineligible state must not enter Cake prefill"),
+    )
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", lambda **kwargs: sentinel)
+
+    assert recurrent_kda(**_strict_prefill_kwargs(inputs)) is sentinel
+
+
+@pytest.mark.parametrize("backend", ["auto", "cake"])
+def test_frozen_prefill_missing_selected_module_is_fail_closed(
+    flash_kda_device,
+    monkeypatch,
+    backend,
+):
+    inputs = _make_inputs(
+        seq_lens=[33, 33],
+        num_heads=6,
+        packed=False,
+        initial_state=True,
+        seed=23_306,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_decode_api,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail("an eligible Cake route must not fall back"),
+    )
+
+    def missing_module(variant, target):
+        raise FileNotFoundError(
+            f"selected generated module is not materialized: {variant}/{target}"
+        )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        missing_module,
+    )
+
+    with pytest.raises(FileNotFoundError, match="not materialized"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            backend=backend,
+        )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [6, 12], ids=["h6", "h12"])
+def test_frozen_prefill_compact_and_indexed_state_contracts_match(
+    flash_kda_device,
+    packed,
+    num_heads,
+):
+    """Selected pool slots must behave exactly like compact in-place state.
+
+    This is deliberately a public-API contract test.  It does not name a
+    private launcher class or freeze a route that may legitimately differ by
+    physical Blackwell SKU.  The route/source receipt tests separately pin the
+    selected physical module.
+    """
+
+    seq_lens = [17, 33] if packed else [33, 33]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        state_dtype=torch.bfloat16,
+        seed=24_000 + num_heads + int(packed),
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = state_seed.clone()
+    compact_output, compact_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = (
+        0.1
+        * torch.randn(
+            (5, num_heads, 128, 128),
+            dtype=torch.float32,
+            device=flash_kda_device,
+        )
+    ).to(torch.bfloat16)
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    indexed_state_before = indexed_state.clone()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": indexed_state}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert compact_final is compact_state
+    assert indexed_final is indexed_state
+    assert compact_final.dtype == indexed_final.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        indexed_output.float(), compact_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
+        compact_final.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    unselected = torch.tensor([0, 2, 4], dtype=torch.int64, device=flash_kda_device)
+    assert torch.equal(
+        indexed_state.index_select(0, unselected),
+        indexed_state_before.index_select(0, unselected),
+    )
+
+
+def test_frozen_prefill_rejects_fp32_state_checkpoints_explicitly(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=6,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=24_106,
+    )
+    checkpoints = torch.empty(
+        (1, 6, 128, 128), dtype=torch.float32, device=flash_kda_device
+    )
+    checkpoint_cu_starts = torch.tensor(
+        [0, 1], dtype=torch.int64, device=flash_kda_device
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"(?i)(fp32.*checkpoint|checkpoint.*fp32)",
+    ):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=32,
+            backend="cake",
+        )
+
+
+def test_affine_launch_plan_reads_mutated_state_indices_each_call(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[65_536],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.bfloat16,
+        seed=24_204,
+    )
+    compact_state = inputs.pop("initial_state")
+    state_pool = torch.cat(
+        (compact_state, compact_state + 0.25, compact_state - 0.25), dim=0
+    )
+    state_indices = torch.tensor([0], dtype=torch.int32, device=flash_kda_device)
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    first_output = torch.empty_like(inputs["q"])
+    first_result, first_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        ssm_state_indices=state_indices,
+        output=first_output,
+        output_final_state=True,
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+    assert first_result is first_output
+    assert first_state is state_pool
+
+    state_before_second = state_pool.clone()
+    state_indices.fill_(2)
+    second_output = torch.empty_like(inputs["q"])
+    second_result, second_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        ssm_state_indices=state_indices,
+        output=second_output,
+        output_final_state=True,
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+    assert second_result is second_output
+    assert second_state is state_pool
+    assert torch.equal(state_pool[0], state_before_second[0])
+    assert torch.equal(state_pool[1], state_before_second[1])
+    assert not torch.equal(state_pool[2], state_before_second[2])
+    assert not torch.equal(first_output, second_output)
 
 
 def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
@@ -1130,6 +1578,920 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("route", "route_role", "state_mode", "specialization", "abi_family"),
+    (
+        (
+            "direct_m128",
+            "main",
+            "bf16",
+            {
+                "chunk": 32,
+                "serving_native_abi": False,
+                "gate_kind": "lower_bound",
+                "checkpoint_tma": False,
+                "pair_packed_beta": False,
+                "scalar_beta": False,
+                "early_n32_state_pack": False,
+                "generic_register_inverse": False,
+                "n32_prediction_first": False,
+                "tensor_state_decay": False,
+                "state_dtype_is_fp32": False,
+                "n32_ft_slab": False,
+                "pdl_wait_initial_state_f32": False,
+                "pdl_publish_final_state": False,
+                "affine_main_indexed_initial": False,
+                "affine_main_indexed_initial_bf16": False,
+            },
+            "direct_m128",
+        ),
+        (
+            "source599_vtile_m128",
+            "main",
+            "bf16",
+            {
+                "full_n32_chunks": True,
+                "num_heads": 96,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "persistent_mode": True,
+                "persistent_six_task_schedule": True,
+                "persistent_stride_head_aligned": False,
+                "state_dtype_is_fp32": False,
+            },
+            "vtile_m128",
+        ),
+        (
+            "bt16_prepare_chain_m64",
+            "bt16_prepare",
+            "none",
+            {},
+            "bt16_prepare",
+        ),
+        (
+            "bt16_prepare_chain_m64",
+            "main",
+            "bf16",
+            {
+                "bt16_stage_count": 8,
+                "state_dtype_is_fp32": False,
+                "serving_native_abi": False,
+            },
+            "bt16_chain",
+        ),
+        (
+            "independent_dvsplit_m64",
+            "main",
+            "bf16",
+            {
+                "full_n32_chunks": True,
+                "num_heads": 64,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "state_dtype_is_fp32": False,
+            },
+            "m64",
+        ),
+        (
+            "scalar_chunk_lpt_m128",
+            "main",
+            "bf16",
+            {
+                "num_heads": 96,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "persistent_schedule": True,
+                "state_dtype_is_fp32": False,
+            },
+            "scalar_lpt_m128",
+        ),
+        (
+            "piece_persistent_m128",
+            "main",
+            "fp32",
+            {"piece_tasks": True, "state_dtype_is_fp32": True},
+            "taskized_persistent_m128",
+        ),
+        (
+            "small_bh_owner_helper_m128",
+            "main",
+            "fp32",
+            {"serving_native_abi": True, "state_dtype_is_fp32": True},
+            "small_bh_m128",
+        ),
+        (
+            "affine_split_m128",
+            "affine_scan",
+            "none",
+            {"use_pdl": True},
+            "affine_scan",
+        ),
+    ),
+)
+def test_generated_prefill_selector_key_uses_receipt_field_order(
+    route, route_role, state_mode, specialization, abi_family
+):
+    selector_key = kda_prefill_api._make_flash_kda_generated_selector_key(
+        target="sm103a",
+        route=route,
+        route_role=route_role,
+        state_mode=state_mode,
+        family_specialization=specialization,
+    )
+    assert selector_key["arch"] == "sm_103a"
+    assert selector_key["route"] == route
+    assert selector_key["route_role"] == route_role
+    assert selector_key["abi_family"] == abi_family
+    assert selector_key["state_mode"] == state_mode
+    assert selector_key["family_specialization_vector"] == [
+        [field, specialization[field]]
+        for field in kda_prefill_api._FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS[
+            abi_family
+        ]
+    ]
+
+
+def test_generated_prefill_selector_key_fails_closed():
+    direct_specialization = {
+        field: False
+        for field in kda_prefill_api._FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS[
+            "direct_m128"
+        ]
+    }
+    direct_specialization["chunk"] = 32
+    with pytest.raises(ValueError, match="no exact architecture"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100f",
+            route="direct_m128",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization=direct_specialization,
+        )
+    with pytest.raises(ValueError, match="no receipt-backed ABI family"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="benchmark_shape_0",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization={},
+        )
+    with pytest.raises(ValueError, match="specialization fields differ"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="direct_m128",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization={"chunk": 32},
+        )
+    with pytest.raises(ValueError, match="requires state_mode=none"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="bt16_prepare_chain_m64",
+            route_role="bt16_prepare",
+            state_mode="bf16",
+            family_specialization={},
+        )
+
+
+def test_generated_affine_selector_construction_is_cached(monkeypatch):
+    direct_cache = kda_prefill_api._flash_kda_generated_affine_direct_selector_key
+    scan_cache = kda_prefill_api._flash_kda_generated_affine_scan_selector_key
+    direct_cache.cache_clear()
+    scan_cache.cache_clear()
+    calls = []
+
+    def fake_selector(**selector_fields):
+        calls.append(selector_fields)
+        return selector_fields
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_make_flash_kda_generated_selector_key", fake_selector
+    )
+    direct_kwargs = {
+        "target": "sm103a",
+        "role": "affine_map",
+        "num_heads": 4,
+        "num_sequences": 4,
+        "uniform_sequences": True,
+        "max_sequence_length": 16384,
+        "pair_packed_beta": False,
+        "external_state_is_fp32": False,
+    }
+    try:
+        first = direct_cache(**direct_kwargs)
+        assert direct_cache(**direct_kwargs) is first
+        assert len(calls) == 1
+        assert first["state_mode"] == "bf16"
+
+        direct_cache(**{**direct_kwargs, "max_sequence_length": 32768})
+        assert len(calls) == 2
+
+        scan = scan_cache(target="sm103a")
+        assert scan_cache(target="sm103a") is scan
+        assert len(calls) == 3
+
+        bf16_main = direct_cache(
+            **{
+                **direct_kwargs,
+                "role": "affine_main",
+                "external_state_is_fp32": False,
+            }
+        )
+        bf16_main_specialization = bf16_main["family_specialization"]
+        assert bf16_main_specialization["affine_main_indexed_initial"]
+        assert bf16_main_specialization["affine_main_indexed_initial_bf16"]
+        assert bf16_main["state_mode"] == "bf16_f32_dependency"
+
+        fp32_main = direct_cache(
+            **{
+                **direct_kwargs,
+                "role": "affine_main",
+                "external_state_is_fp32": True,
+            }
+        )
+        fp32_main_specialization = fp32_main["family_specialization"]
+        assert fp32_main_specialization["affine_main_indexed_initial"]
+        assert not fp32_main_specialization["affine_main_indexed_initial_bf16"]
+        assert fp32_main["state_mode"] == "fp32"
+    finally:
+        direct_cache.cache_clear()
+        scan_cache.cache_clear()
+
+
+def test_generated_affine_carriers_are_workspace_cached(monkeypatch):
+    calls = []
+
+    def fake_dummy(name):
+        def make(_device):
+            value = object()
+            calls.append((name, None, value))
+            return value
+
+        return make
+
+    def fake_empty(_device, dtype):
+        value = object()
+        calls.append(("empty", dtype, value))
+        return value
+
+    for name in ("bf16", "i32", "i64", "f32", "u32"):
+        monkeypatch.setattr(
+            kda_prefill_api,
+            f"_dummy_{name}",
+            fake_dummy(name),
+        )
+    monkeypatch.setattr(kda_prefill_api, "_empty_cuda_tensor", fake_empty)
+
+    first_workspace = SimpleNamespace(_generated_affine_carriers=None)
+    first = kda_prefill_api._generated_affine_carriers(
+        workspace=first_workspace,
+        device=torch.device("cuda:0"),
+    )
+    assert (
+        kda_prefill_api._generated_affine_carriers(
+            workspace=first_workspace,
+            device=torch.device("cuda:0"),
+        )
+        is first
+    )
+    assert len(calls) == 9
+    assert [name for name, _dtype, _value in calls] == [
+        "bf16",
+        "i32",
+        "i64",
+        "f32",
+        "u32",
+        "empty",
+        "empty",
+        "empty",
+        "empty",
+    ]
+    assert [dtype for name, dtype, _value in calls if name == "empty"] == [
+        torch.bfloat16,
+        torch.float32,
+        torch.int64,
+        torch.uint8,
+    ]
+
+    second_workspace = SimpleNamespace(_generated_affine_carriers=None)
+    second = kda_prefill_api._generated_affine_carriers(
+        workspace=second_workspace,
+        device=torch.device("cuda:0"),
+    )
+    assert second is not first
+    assert len(calls) == 18
+
+
+def test_generated_affine_module_bundle_resolves_cold_and_observes_hot(monkeypatch):
+    roles = ("affine_main", "affine_map", "affine_scan", "affine_correction")
+    selector_keys = {role: {"role": role, "shape": 32} for role in roles}
+    resolver_calls = []
+
+    def resolve(selector_key):
+        resolver_calls.append(selector_key)
+        role = selector_key["role"]
+        return SimpleNamespace(variant_id=f"{role}_test"), _RecorderModule()
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_generated_module", resolve)
+    workspace = SimpleNamespace(_generated_affine_module_bundle=None)
+
+    def get_bundle(keys, *, capturing=False):
+        return kda_prefill_api._generated_affine_module_bundle(
+            workspace=workspace,
+            main_selector_key=keys["affine_main"],
+            map_selector_key=keys["affine_map"],
+            scan_selector_key=keys["affine_scan"],
+            correction_selector_key=keys["affine_correction"],
+            capturing=capturing,
+        )
+
+    cold = get_bundle(selector_keys)
+    assert resolver_calls == [selector_keys[role] for role in roles]
+    assert get_bundle(selector_keys) is cold
+    assert get_bundle(selector_keys, capturing=True) is cold
+    assert len(resolver_calls) == 4
+
+    observed = []
+
+    def observer(role, selector_key, metadata, module):
+        observed.append((role, selector_key, metadata, module))
+
+    entries = (cold.main, cold.map, cold.scan, cold.correction)
+    with kda_prefill_api._observe_generated_affine_launches(observer):
+        launch_observer = kda_prefill_api._generated_affine_launch_observer.get()
+        for entry in entries:
+            kda_prefill_api._generated_affine_module_for_launch(
+                entry, launch_observer
+            ).run()
+        hot = get_bundle(selector_keys)
+        for entry in (hot.main, hot.map, hot.scan, hot.correction):
+            kda_prefill_api._generated_affine_module_for_launch(
+                entry, launch_observer
+            ).run()
+
+    assert [row[0] for row in observed] == list(roles) * 2
+    for row, entry in zip(observed[:4], entries, strict=True):
+        assert row[1] is entry.selector_key
+        assert row[2] is entry.metadata
+        assert row[3] is entry.module
+        assert entry.module.calls == [(), ()]
+    assert len(resolver_calls) == 4
+
+    changed_keys = dict(selector_keys)
+    changed_keys["affine_main"] = {"role": "affine_main", "shape": 64}
+    changed = get_bundle(changed_keys)
+    assert changed is not cold
+    assert workspace._generated_affine_module_bundle is changed
+    assert len(resolver_calls) == 8
+    assert [row["role"] for row in resolver_calls[4:]] == list(roles)
+
+    cold_workspace = SimpleNamespace(_generated_affine_module_bundle=None)
+    workspace = cold_workspace
+    with pytest.raises(RuntimeError, match="not warmed for CUDA graph capture"):
+        get_bundle(selector_keys, capturing=True)
+    assert cold_workspace._generated_affine_module_bundle is None
+    assert len(resolver_calls) == 8
+
+
+def test_generated_affine_launch_plan_caches_only_workspace_views(monkeypatch):
+    buffer_calls = []
+    buffers = {}
+    zeroed_buffers = set()
+
+    def workspace_buffer(*, name, shape, dtype, zero_on_allocate=False, **_kwargs):
+        buffer_calls.append((name, shape, dtype))
+        if zero_on_allocate:
+            zeroed_buffers.add(name)
+        tensor = torch.zeros(shape, dtype=dtype)
+        buffers[name] = tensor
+        return tensor
+
+    modules = object()
+    monkeypatch.setattr(kda_prefill_api, "_affine_workspace_buffer", workspace_buffer)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_cached_tensor",
+        lambda key, _factory, **_kwargs: ("metadata", key),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_stream_cache_key",
+        lambda _device: (0, 17),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_identity_seq_order",
+        lambda **kwargs: ("seq_order", kwargs["num_sequences"]),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_generated_affine_module_bundle",
+        lambda **_kwargs: modules,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_affine_descriptor_storage",
+        lambda **kwargs: ("descriptor", kwargs["role"]),
+    )
+    workspace = SimpleNamespace(
+        _generated_affine_launch_plan=None,
+        _affine_map_identity_data_ptr=None,
+    )
+
+    def get_plan(token_offsets, *, capturing=False):
+        return kda_prefill_api._generated_affine_launch_plan(
+            workspace=workspace,
+            target="sm100a",
+            device=torch.device("cuda:0"),
+            token_offsets=token_offsets,
+            num_heads=4,
+            state_dtype=torch.bfloat16,
+            beta_layouts=("padded", "padded", "padded"),
+            capturing=capturing,
+        )
+
+    cold = get_plan((0, 4096, 8192))
+    assert len(buffer_calls) == 14
+    assert get_plan((0, 4096, 8192)) is cold
+    assert get_plan((0, 4096, 8192), capturing=True) is cold
+    assert len(buffer_calls) == 14
+    assert cold.modules is modules
+    assert all(not isinstance(value, torch.Tensor) for value in vars(cold.key).values())
+    assert set(buffers) == {
+        "main_final_fp32",
+        "map_identity_bfloat16",
+        "map_state_bfloat16",
+        "carry_float32",
+        "correction_final_float32",
+        "final_compact_float32",
+        "zero_v",
+        "map_out",
+        "correction_out",
+        "state_indices_i64",
+        "final_external",
+        "beta_tma_main",
+        "beta_tma_map",
+        "beta_tma_correction",
+    }
+    assert {
+        "beta_tma_main",
+        "beta_tma_map",
+        "beta_tma_correction",
+    } <= zeroed_buffers
+
+    changed = get_plan((0, 4096, 8192, 12288))
+    assert changed is not cold
+    assert workspace._generated_affine_launch_plan is changed
+    assert len(buffer_calls) == 28
+
+    workspace._generated_affine_launch_plan = None
+    with pytest.raises(RuntimeError, match="not warmed for CUDA graph capture"):
+        get_plan((0, 4096, 8192), capturing=True)
+    assert workspace._generated_affine_launch_plan is None
+    assert len(buffer_calls) == 28
+
+
+def test_generated_affine_state_indices_carrier_is_warmed_and_invalidated():
+    source = torch.tensor([2], dtype=torch.int32)
+    destination = torch.empty(1, dtype=torch.int64)
+    plan = SimpleNamespace(state_indices_i64=destination)
+    workspace = SimpleNamespace(
+        _generated_affine_state_indices_tensor=None,
+        _generated_affine_state_indices_version=None,
+        _generated_affine_state_indices_destination_ptr=None,
+    )
+
+    first = kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=plan,
+        state_indices=source,
+        capturing=False,
+    )
+    assert first is destination
+    assert destination.tolist() == [2]
+
+    destination.fill_(7)
+    kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=plan,
+        state_indices=source,
+        capturing=False,
+    )
+    assert destination.tolist() == [7]
+
+    source.fill_(3)
+    kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=plan,
+        state_indices=source,
+        capturing=False,
+    )
+    assert destination.tolist() == [3]
+
+    destination.fill_(7)
+    kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=plan,
+        state_indices=source,
+        capturing=True,
+    )
+    assert destination.tolist() == [3]
+
+    replacement = torch.tensor([4], dtype=torch.int32)
+    kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=plan,
+        state_indices=replacement,
+        capturing=False,
+    )
+    assert destination.tolist() == [4]
+
+    replacement_destination = torch.empty(1, dtype=torch.int64)
+    replacement_plan = SimpleNamespace(state_indices_i64=replacement_destination)
+    kda_prefill_api._generated_affine_state_indices_i64(
+        workspace=workspace,
+        plan=replacement_plan,
+        state_indices=replacement,
+        capturing=False,
+    )
+    assert replacement_destination.tolist() == [4]
+
+
+def test_affine_route_skips_general_metadata_and_dummy_materialization(monkeypatch):
+    q = torch.empty((1, 256, 4, 128), dtype=torch.bfloat16)
+    beta = torch.empty((1, 256, 4), dtype=torch.bfloat16)
+    state = torch.empty((3, 4, 128, 128), dtype=torch.bfloat16)
+    state_indices = torch.tensor([2], dtype=torch.int32)
+    output = torch.empty_like(q)
+    workspace = SimpleNamespace(_lock=threading.Lock())
+    launches = []
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=17),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_select_flash_kda_prefill_target", lambda _device: "sm100a"
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda _device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_flash_kda_device_sm_count", lambda _device: 148
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_stream_workspace", lambda _device: workspace
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_affine_token_offsets",
+        lambda **_kwargs: (0, 128, 256),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_bind_workspace", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_generated_affine_route",
+        lambda **kwargs: launches.append(kwargs),
+    )
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("affine fast path materialized general route metadata")
+
+    for name in (
+        "select_bf16_schedule_route",
+        "_fixed_cu_seqlens",
+        "_validate_prefill_seq_order",
+        "_dummy_bf16",
+        "_dummy_i32",
+        "_dummy_i64",
+    ):
+        monkeypatch.setattr(kda_prefill_api, name, unexpected)
+
+    result = kda_prefill_api._run_flash_kda_prefill(
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=beta,
+        A_log=torch.empty(4, dtype=torch.float32),
+        dt_bias=torch.empty((4, 128), dtype=torch.float32),
+        scale=0.125,
+        initial_state=state,
+        output_final_state=True,
+        lower_bound=-5.0,
+        cu_seqlens=None,
+        output=output,
+        seq_order=None,
+        prefill_workspace=None,
+        state_indices=state_indices,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+
+    assert result[0] is output
+    assert result[1] is state
+    assert len(launches) == 1
+    assert launches[0]["state_indices"] is state_indices
+    assert launches[0]["token_offsets"] == (0, 128, 256)
+
+
+def test_generated_affine_launch_observer_scope_is_context_local_and_resets():
+    def outer(*_args):
+        return None
+
+    def inner(*_args):
+        return None
+
+    observer_context = kda_prefill_api._generated_affine_launch_observer
+    assert observer_context.get() is None
+
+    child_values = []
+    with kda_prefill_api._observe_generated_affine_launches(outer):
+        assert observer_context.get() is outer
+        thread = threading.Thread(
+            target=lambda: child_values.append(observer_context.get())
+        )
+        thread.start()
+        thread.join()
+        with kda_prefill_api._observe_generated_affine_launches(inner):
+            assert observer_context.get() is inner
+        assert observer_context.get() is outer
+    assert child_values == [None]
+    assert observer_context.get() is None
+
+    with (
+        pytest.raises(RuntimeError, match="observer scope failure"),
+        kda_prefill_api._observe_generated_affine_launches(outer),
+    ):
+        raise RuntimeError("observer scope failure")
+    assert observer_context.get() is None
+
+    module = _RecorderModule()
+    resolved = kda_prefill_api._GeneratedAffineModule(
+        "affine_main", {"role": "affine_main"}, object(), module
+    )
+
+    def failing_observer(*_args):
+        raise RuntimeError("observer callback failure")
+
+    with (
+        pytest.raises(RuntimeError, match="observer callback failure"),
+        kda_prefill_api._observe_generated_affine_launches(failing_observer),
+    ):
+        kda_prefill_api._generated_affine_module_for_launch(
+            resolved, observer_context.get()
+        ).run()
+    assert module.calls == []
+    assert observer_context.get() is None
+
+
+def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
+    def unexpected_lookup(*_args, **_kwargs):
+        pytest.fail("affine role repeated a global dummy/empty carrier lookup")
+
+    for helper in (
+        "_dummy_bf16",
+        "_dummy_i32",
+        "_dummy_i64",
+        "_dummy_f32",
+        "_dummy_u32",
+        "_empty_cuda_tensor",
+    ):
+        monkeypatch.setattr(kda_prefill_api, helper, unexpected_lookup)
+
+    module = _RecorderModule()
+    metadata = SimpleNamespace(variant_id="affine_map_test")
+    selector_key = {"selector": "affine_map_test"}
+    resolved_module = kda_prefill_api._GeneratedAffineModule(
+        "affine_map", selector_key, metadata, module
+    )
+    descriptor_storage = object()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_affine_descriptor_storage",
+        lambda **_kwargs: descriptor_storage,
+    )
+
+    carrier_values = {
+        name: object()
+        for name in (
+            "dummy_bf16",
+            "dummy_i32",
+            "dummy_i64",
+            "dummy_f32",
+            "dummy_u32",
+            "empty_bf16",
+            "empty_f32",
+            "empty_i64",
+            "empty_u8",
+        )
+    }
+    carriers = kda_prefill_api._GeneratedAffineCarriers(**carrier_values)
+    workspace = SimpleNamespace(_descriptor_signatures={})
+    q = torch.empty((1, 32, 4, 128), dtype=torch.bfloat16)
+    beta = torch.empty((1, 32, 4), dtype=torch.bfloat16)
+    state = torch.empty((1, 4, 128, 128), dtype=torch.bfloat16)
+    dependency = torch.empty((1, 4, 128, 128), dtype=torch.float32)
+    observed = []
+
+    def run(role_q, *, capturing, role="affine_map", role_state=state):
+        kda_prefill_api._run_generated_affine_direct_role(
+            workspace=workspace,
+            carriers=carriers,
+            resolved_module=resolved_module,
+            descriptor_storage=descriptor_storage,
+            launch_observer=lambda *args: observed.append(args),
+            role=role,
+            q=role_q,
+            k=role_q,
+            v=role_q,
+            g=role_q,
+            beta=beta,
+            beta_tma=beta,
+            A_log=torch.empty(4, dtype=torch.float32),
+            dt_bias=torch.empty((4, 128), dtype=torch.float32),
+            cu_seqlens=torch.tensor([0, 32], dtype=torch.int64),
+            seq_order=torch.tensor([0], dtype=torch.int32),
+            state_indices=carriers.dummy_i32,
+            initial_state=role_state,
+            out=role_q,
+            final_state=role_state,
+            initial_state_f32_dependency=dependency,
+            sequence_lengths=(32,),
+            num_heads=4,
+            use_state_indices=False,
+            state_slot_stride=4 * 128 * 128,
+            scale=0.125,
+            lower_bound=-5.0,
+            grid_x=4,
+            stream_ptr=17,
+            capturing=capturing,
+        )
+
+    run(q, capturing=False)
+
+    assert observed == [("affine_map", selector_key, metadata, module)]
+    (args,) = module.calls
+    assert len(args) == 49
+    assert args[14] is carriers.empty_bf16
+    assert args[15] is carriers.empty_i64
+    assert args[16] is carriers.dummy_i64
+    assert args[17] is carriers.dummy_bf16
+    assert args[18] is carriers.dummy_u32
+    assert args[30] is carriers.dummy_u32
+    assert args[31] is carriers.empty_u8
+    assert args[32] is descriptor_storage
+
+    run(q, capturing=False, role="affine_main")
+    assert module.calls[1][14] is carriers.empty_bf16
+    fp32_state = torch.empty((1, 4, 128, 128), dtype=torch.float32)
+    run(q, capturing=False, role="affine_main", role_state=fp32_state)
+    assert module.calls[2][14] is carriers.empty_f32
+
+    with pytest.raises(RuntimeError, match="descriptors are not warmed"):
+        run(torch.empty_like(q), capturing=True)
+    assert observed == [("affine_map", selector_key, metadata, module)] * 3
+    assert len(module.calls) == 3
+
+
+def test_generated_prefill_runtime_specialization_helpers():
+    assert not kda_prefill_api._flash_kda_generated_serving_native_abi(
+        use_state_indices=False,
+        checkpoint_every_n_tokens=0,
+        beta_token_stride=64,
+        num_heads=64,
+        state_slot_stride=64 * 128 * 128,
+    )
+    assert kda_prefill_api._flash_kda_generated_serving_native_abi(
+        use_state_indices=True,
+        checkpoint_every_n_tokens=0,
+        beta_token_stride=64,
+        num_heads=64,
+        state_slot_stride=64 * 128 * 128,
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=96, sm_count=148, use_beta_tma=False
+        )
+        == 7
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=8, sm_count=148, use_beta_tma=False
+        )
+        == 9
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=64, sm_count=148, use_beta_tma=False
+        )
+        == 8
+    )
+    assert kda_prefill_api._flash_kda_generated_full_n32_chunks((32, 64))
+    assert not kda_prefill_api._flash_kda_generated_full_n32_chunks((32, 63))
+
+    direct = kda_prefill_api._flash_kda_generated_direct_specialization(
+        target="sm103a",
+        route="direct_m128",
+        num_heads=96,
+        num_sequences=1,
+        uniform_sequences=True,
+        max_sequence_length=512,
+        serving_native_abi=False,
+        gate_kind="lower_bound",
+        checkpoint_every_n_tokens=0,
+        pair_packed_beta=False,
+        state_dtype_is_fp32=False,
+    )
+    assert direct["chunk"] == 32
+    assert direct["generic_register_inverse"]
+    assert direct["n32_prediction_first"]
+    assert direct["tensor_state_decay"]
+
+    with pytest.raises(
+        ValueError, match="affine indexed initial state requires FP32 state I/O"
+    ):
+        kda_prefill_api._flash_kda_generated_direct_specialization(
+            target="sm103a",
+            route="affine_split_m128",
+            num_heads=96,
+            num_sequences=1,
+            uniform_sequences=True,
+            max_sequence_length=512,
+            serving_native_abi=False,
+            gate_kind="lower_bound",
+            checkpoint_every_n_tokens=0,
+            pair_packed_beta=False,
+            state_dtype_is_fp32=False,
+            affine_main_indexed_initial=True,
+        )
+
+    vtile = kda_prefill_api._flash_kda_generated_vtile_specialization(
+        sequence_lengths=(512,) * 8,
+        num_heads=96,
+        fixed_layout=False,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=False,
+    )
+    assert vtile["full_n32_chunks"]
+    assert vtile["persistent_mode"]
+    assert vtile["persistent_six_task_schedule"]
+    assert not vtile["persistent_stride_head_aligned"]
+
+    assert kda_prefill_api._flash_kda_generated_bt16_prepare_specialization() == {}
+    assert kda_prefill_api._flash_kda_generated_bt16_chain_specialization(
+        total_tasks=64,
+        sm_count=148,
+        use_beta_tma=False,
+        state_dtype_is_fp32=False,
+        serving_native_abi=False,
+    ) == {
+        "bt16_stage_count": 8,
+        "state_dtype_is_fp32": False,
+        "serving_native_abi": False,
+    }
+    assert kda_prefill_api._flash_kda_generated_m64_specialization(
+        sequence_lengths=(512,),
+        num_heads=64,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=False,
+    )["full_n32_chunks"]
+    assert kda_prefill_api._flash_kda_generated_scalar_lpt_specialization(
+        num_heads=96,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=True,
+    )["persistent_schedule"]
+    assert kda_prefill_api._flash_kda_generated_taskized_persistent_specialization(
+        piece_tasks=True, state_dtype_is_fp32=False
+    ) == {"piece_tasks": True, "state_dtype_is_fp32": False}
+    assert kda_prefill_api._flash_kda_generated_small_bh_specialization(
+        serving_native_abi=True, state_dtype_is_fp32=True
+    ) == {"serving_native_abi": True, "state_dtype_is_fp32": True}
+    assert kda_prefill_api._flash_kda_generated_affine_scan_specialization() == {
+        "use_pdl": True
+    }
 
 
 @pytest.mark.parametrize(
@@ -1313,6 +2675,32 @@ def test_bt16_route_policy_matches_measured_crossovers(
             max_sequence_length=max_sequence_length,
         )
         == expected_route
+    )
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "sm_count"),
+    [((10, 0), 148), ((10, 3), 148)],
+)
+def test_fp32_small_bh_route_precedes_overlapping_bt16_policy(
+    compute_capability, sm_count
+):
+    route_args = {
+        "compute_capability": compute_capability,
+        "sm_count": sm_count,
+        "fixed_layout": False,
+        "sequence_lengths": (131_072,),
+        "num_heads": 1,
+    }
+    assert (
+        kda_prefill_api.select_bf16_schedule_route(**route_args)
+        == "bt16_prepare_chain_m64"
+    )
+    assert (
+        kda_prefill_api.select_bf16_schedule_route(
+            **route_args, state_dtype_is_fp32=True
+        )
+        == "small_bh_owner_helper_m128"
     )
 
 
@@ -1734,7 +3122,17 @@ def test_h96_uniform_n128_keeps_n16_on_148_sm():
                 num_sequences=128,
                 num_heads=96,
                 uniform_sequences=True,
+                checkpoint_every_n_tokens=0,
             ) is (sm_count == 148)
+            assert not kda_prefill_api._requires_exact_n16_recurrence(
+                compute_capability=compute_capability,
+                sm_count=sm_count,
+                fixed_layout=False,
+                num_sequences=128,
+                num_heads=96,
+                uniform_sequences=True,
+                checkpoint_every_n_tokens=64,
+            )
 
 
 class _RecorderModule:
@@ -1829,13 +3227,14 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
     [
         (False, 64, "m128_n16_short"),
         (True, 64, "m128_n16_short"),
+        (True, 4, "m128_n16_short"),
         (True, 2, "m128_n16_short"),
         (False, 12, "m128_n16"),
     ],
 )
 @pytest.mark.parametrize(
     ("compute_capability", "expected_target"),
-    [((10, 0), "sm100f"), ((10, 3), "sm100f")],
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
 )
 def test_frozen_route_and_ffi_abi(
     cuda_device,
@@ -1886,8 +3285,7 @@ def test_frozen_route_and_ffi_abi(
     assert set(modules) == {expected_variant}
     assert routes == [(expected_variant, expected_target)]
     (args,) = modules[expected_variant].calls
-    expected_arg_count = 21 if expected_variant == "m64" else 28
-    assert len(args) == expected_arg_count
+    assert len(args) == 28
     assert args[0].data_ptr() == inputs["q"].data_ptr()
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
     assert args[5].shape == (
@@ -1971,7 +3369,7 @@ def test_h12_n32_specializations_reach_ffi(
         backend="cake",
     )
 
-    assert routes == [(expected_variant, "sm100f")]
+    assert routes == [(expected_variant, "sm103a")]
     (args,) = module.calls
     assert len(args) == 28
     assert tuple(args[5].shape) == expected_beta_tma_shape
@@ -2007,7 +3405,7 @@ def test_sm103_uniform_n32_tensor_state_decay_reaches_m128_ffi(
         backend="cake",
     )
 
-    assert routes == [("m128_tensor_state_decay", "sm100f")]
+    assert routes == [("m128_tensor_state_decay", "sm103a")]
     assert len(module.calls[0]) == 28
 
 
@@ -2081,6 +3479,37 @@ def test_pair_packed_h12_beta_requires_an_even_dense_carrier(cuda_device):
     assert paired.data_ptr() == dense.data_ptr()
     odd = torch.empty((1, 129, 12), dtype=torch.bfloat16, device=cuda_device)
     assert kda_prefill_api._pair_packed_beta_tma_source(odd) is None
+
+
+def test_generated_beta_tma_copy_matches_source_chunk_predicate():
+    beta = torch.empty((1, 120, 4), dtype=torch.bfloat16)
+    padded = torch.empty((120, 8), dtype=torch.bfloat16)
+    n16 = {"chunk": 16, "pair_packed_beta": False, "scalar_beta": False}
+
+    assert not kda_prefill_api._generated_beta_tma_copy_required(
+        beta=beta,
+        beta_tma=padded,
+        sequence_lengths=tuple(range(1, 16)),
+        specialization=n16,
+    )
+    assert kda_prefill_api._generated_beta_tma_copy_required(
+        beta=beta,
+        beta_tma=padded,
+        sequence_lengths=(16,),
+        specialization=n16,
+    )
+    assert not kda_prefill_api._generated_beta_tma_copy_required(
+        beta=beta,
+        beta_tma=padded,
+        sequence_lengths=(16,),
+        specialization={**n16, "scalar_beta": True},
+    )
+    assert not kda_prefill_api._generated_beta_tma_copy_required(
+        beta=beta,
+        beta_tma=beta[0],
+        sequence_lengths=(16,),
+        specialization=n16,
+    )
 
 
 @pytest.mark.parametrize(
@@ -2380,7 +3809,7 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     )
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("persistent_m128", "sm100f")]
+    assert routes == [("persistent_m128", "sm100a")]
     (args,) = module.calls
     assert len(args) == 23
     assert args[9].tolist() == [0, 1]
@@ -2450,7 +3879,7 @@ def test_uniform_piece_prefill_reaches_extended_worker_abi(
 
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("piece_persistent_m128", "sm100f")]
+    assert routes == [("piece_persistent_m128", "sm103a")]
     (args,) = module.calls
     assert len(args) == 29
     assert args[9].tolist() == list(range(8))
@@ -2513,7 +3942,7 @@ def test_explicit_workspace_keeps_uniform_piece_candidate_on_direct_abi(
         backend="cake",
     )
 
-    assert routes == [("m128", "sm100f")]
+    assert routes == [("m128", "sm103a")]
     assert len(module.calls[0]) == 28
 
 
@@ -2637,7 +4066,7 @@ def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
         backend="cake",
     )
 
-    assert routes == [("m128", "sm100f")]
+    assert routes == [("m128", "sm100a")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[9].data_ptr() == seq_order.data_ptr()
@@ -2679,20 +4108,21 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
         output=torch.empty_like(inputs["q"]),
         backend="cake",
     )
-    assert routes == [("m128_n16_short", "sm100f")]
+    assert routes == [("m128_n16_short", "sm100a")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
 
 
 @pytest.mark.parametrize(
-    ("compute_capability", "sm_count"),
-    [((10, 0), 148), ((10, 3), 152)],
+    ("compute_capability", "sm_count", "expected_target"),
+    [((10, 0), 148, "sm100a"), ((10, 3), 152, "sm103a")],
 )
 def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     cuda_device,
     monkeypatch,
     compute_capability,
     sm_count,
+    expected_target,
 ):
     monkeypatch.setattr(
         kda_prefill_api,
@@ -2733,7 +4163,7 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     assert output.shape == inputs["q"].shape
     assert state is not None
     assert torch.all(state == 0.5)
-    assert routes == [("small_bh_m128", "sm100f")]
+    assert routes == [("small_bh_m128", expected_target)]
     (args,) = module.calls
     assert len(args) == 25
     assert args[13].dtype == torch.uint8
@@ -2928,7 +4358,7 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     assert output.shape == inputs["q"].shape
     assert returned_state is state_pool
     assert returned_checkpoints is state_checkpoints
-    assert routes == [("m128_n16_checkpoint", "sm100f")]
+    assert routes == [("m128_n16_checkpoint", "sm100a")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
@@ -3532,6 +4962,86 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
     )
 
 
+def test_frozen_bt16_policy_routes_padded_compact_state_to_direct(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        seed=2051,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    slot_numel = 4 * 128 * 128
+    state_storage = torch.empty(
+        (1, slot_numel + 64),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    state_pool = state_storage.as_strided(
+        (1, 4, 128, 128),
+        (state_storage.stride(0), 128 * 128, 128, 1),
+    )
+    state_pool.copy_(initial_state_seed)
+    state_storage[:, slot_numel:].fill_(3.25)
+    padding_seed = state_storage[:, slot_numel:].clone()
+    inputs["initial_state"] = state_pool
+
+    routes = []
+    run_generated = kda_prefill_api._run_generated_single_route
+
+    def recording_run_generated(*args, **kwargs):
+        routes.append(kwargs["route"])
+        return run_generated(*args, **kwargs)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_generated_single_route",
+        recording_run_generated,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: True,
+    )
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    actual_output = actual_output.clone()
+    actual_state = actual_state.clone()
+
+    inputs["initial_state"] = initial_state_seed.clone()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_bt16_prepare_chain",
+        lambda **kwargs: False,
+    )
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert routes[0] == kda_prefill_api._direct_m128_route(
+        num_heads=4,
+        max_sequence_length=32,
+    )
+    assert routes[0] != kda_prefill_api._FLASH_KDA_ROUTE_BT16_M64
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(state_storage[:, slot_numel:], padding_seed)
+
+
 def test_frozen_bt16_combined_h12_fixed512_matches_cute(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[512],
@@ -3752,15 +5262,18 @@ def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_
     )
 
 
-def test_frozen_prefill_h96_short_beta_workspace_matches_reference(flash_kda_device):
+@pytest.mark.parametrize(("packed", "seed"), ((False, 11018), (True, 11019)))
+def test_frozen_prefill_h96_short_beta_workspace_matches_reference(
+    flash_kda_device, packed, seed
+):
     """Cover token-padded beta TMA storage when H is already eight-aligned."""
 
     inputs = _make_inputs(
         seq_lens=[16],
         num_heads=96,
-        packed=False,
+        packed=packed,
         initial_state=True,
-        seed=11018,
+        seed=seed,
     )
     reference_inputs = {
         **inputs,

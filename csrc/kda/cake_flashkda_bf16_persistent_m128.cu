@@ -515,9 +515,9 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-// FLASHINFER INTEGRATION BEGIN: allow exact state alias
-kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap const* q_tma, __nv_bfloat16* __restrict__ k, FlashKDATensorMap const* k_tma, __nv_bfloat16* __restrict__ v, FlashKDATensorMap const* v_tma, __nv_bfloat16* __restrict__ g, FlashKDATensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, FlashKDATensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, int* __restrict__ task_ids, int* __restrict__ task_offsets, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, FlashKDATensorMap const* out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
-// FLASHINFER INTEGRATION END: allow exact state alias
+// FLASHINFER INTEGRATION BEGIN: support separate initial/final state storage
+kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap const* q_tma, __nv_bfloat16* __restrict__ k, FlashKDATensorMap const* k_tma, __nv_bfloat16* __restrict__ v, FlashKDATensorMap const* v_tma, __nv_bfloat16* __restrict__ g, FlashKDATensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, FlashKDATensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, int* __restrict__ task_ids, int* __restrict__ task_offsets, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, FlashKDATensorMap const* out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
+// FLASHINFER INTEGRATION END: support separate initial/final state storage
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -939,8 +939,8 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                 _pk[5] = __floats2bfloat162_rn(_tmem_load_3[0 + 10], _tmem_load_3[0 + 11]);
                                 _pk[6] = __floats2bfloat162_rn(_tmem_load_3[0 + 12], _tmem_load_3[0 + 13]);
                                 _pk[7] = __floats2bfloat162_rn(_tmem_load_3[0 + 14], _tmem_load_3[0 + 15]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state + (state_base + (long long)(state_col_block_2 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state + (state_base + (long long)(state_col_block_2 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                             }
                             {
                                 __nv_bfloat162 _pk[8];
@@ -952,8 +952,8 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                 _pk[5] = __floats2bfloat162_rn(_tmem_load_3[16 + 10], _tmem_load_3[16 + 11]);
                                 _pk[6] = __floats2bfloat162_rn(_tmem_load_3[16 + 12], _tmem_load_3[16 + 13]);
                                 _pk[7] = __floats2bfloat162_rn(_tmem_load_3[16 + 14], _tmem_load_3[16 + 15]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(/* FLASHINFER INTEGRATION: persistent in-place state */ initial_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_2 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                             }
                         }
                     }
