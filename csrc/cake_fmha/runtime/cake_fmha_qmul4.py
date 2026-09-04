@@ -40,22 +40,14 @@ def marker_counts_from_source(source: str) -> dict[int, int]:
     }
 
 
-def _validated_expected_counts(
-    expected_counts: Mapping[int | str, int],
-) -> dict[int, int]:
-    normalized = {
-        int(marker_id): int(count) for marker_id, count in expected_counts.items()
-    }
+def _validated_expected_counts(expected_counts: Mapping[int | str, int]) -> dict[int, int]:
+    normalized = {int(marker_id): int(count) for marker_id, count in expected_counts.items()}
     if not normalized:
-        raise RuntimeError(
-            "native QMUL4 loading requires nonempty expected marker counts"
-        )
+        raise RuntimeError("native QMUL4 loading requires nonempty expected marker counts")
     unknown = set(normalized).difference(QMUL4_RECIPES)
     if unknown:
         raise RuntimeError(f"unknown native QMUL4 marker ids: {sorted(unknown)}")
-    invalid = {
-        marker_id: count for marker_id, count in normalized.items() if count <= 0
-    }
+    invalid = {marker_id: count for marker_id, count in normalized.items() if count <= 0}
     if invalid:
         raise RuntimeError(f"native QMUL4 marker counts must be positive: {invalid}")
     return normalized
@@ -93,7 +85,13 @@ def patch_qmul4_cubin(
             rd = (low >> 16) & 0xFF
             ra = (low >> 24) & 0xFF
             rb = high & 0xFF
-            qmul_low = (b_swizzle << 59) | (rb << 32) | (ra << 24) | (rd << 16) | 0x727C
+            qmul_low = (
+                (b_swizzle << 59)
+                | (rb << 32)
+                | (ra << 24)
+                | (rd << 16)
+                | 0x727C
+            )
             qmul_semantic_high = 0x0501A000 | (a_swizzle << 10)
             schedule = high >> 32
             # FFMA's Rc reuse bit is QMUL4's Rb reuse bit.  Preserve all other
@@ -171,9 +169,7 @@ def patch_and_load_qmul4_cubin(
         )
     status, module = driver.cuModuleLoadData(patched)
     if status != 0:
-        raise RuntimeError(
-            f"cuModuleLoadData failed for patched native QMUL4 cubin: CUresult={status}"
-        )
+        raise RuntimeError(f"cuModuleLoadData failed for patched native QMUL4 cubin: CUresult={status}")
     return module
 
 

@@ -75,6 +75,7 @@ repos:
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]
+        exclude: ^csrc/cake_fmha/runtime/cake_fmha_qmul4\.py$
 
   - repo: local
     hooks:
