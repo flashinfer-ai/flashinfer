@@ -574,6 +574,12 @@ match what the code uses today; values are strings unless noted.
 
 ##### Cubin / Artifact Loader
 
+Runtime artifact loads raise `RuntimeError` when a download fails or the
+downloaded file does not match its checksum. The error identifies the artifact
+and recommends installing the matching `flashinfer-cubin` package. The ctypes
+handoff clears its previous result before every callback, and the native loader
+rejects an empty result, so a failed callback cannot reuse a stale cubin.
+
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_CUBIN_DIR` | `<FLASHINFER_WORKSPACE_BASE>/.cache/flashinfer/cubins` | `flashinfer/jit/env.py` (exposed via `flashinfer/__main__.py show-config`) | Local directory used to cache downloaded cubins. Override to share a cache between users. |
