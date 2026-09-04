@@ -100,6 +100,7 @@ def _make_layer(rank: int, world_size: int, problem: dict):
             megakernel=Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["top_k"],
+                gate_up_clamp=10.0,
             ),
             quantize_input=True,
             preprocess_weights=True,

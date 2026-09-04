@@ -82,12 +82,13 @@ def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
         token_hidden_size=4096,
     )
 
-    def key(*, norm_const: float = 1.0):
+    def key(*, norm_const: float = 1.0, gate_up_clamp: float | None = None):
         backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
             Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=4096,
                 top_k=6,
                 input_norm_const=norm_const,
+                gate_up_clamp=gate_up_clamp,
             )
         )
         backend.bind_ep_bootstrap(
@@ -97,6 +98,7 @@ def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
 
     assert key() == key()
     assert key(norm_const=2.0) != key()
+    assert key(gate_up_clamp=10.0) != key()
 
 
 def test_production_modules_do_not_import_mega_runner() -> None:
