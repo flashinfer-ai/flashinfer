@@ -15,7 +15,17 @@ on:
       - 'ci/cuda-versions.json'
       - 'ci/validate_cuda_versions.py'
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
+      - 'scripts/build_patched_sccache.sh'
       - 'scripts/jit_cache_build_common.sh'
+
+concurrency:
+  # Superseded PR dry-runs only waste runner time; real release dispatches use
+  # unique groups so they remain independent and are never auto-cancelled.
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
   setup:
@@ -219,6 +229,24 @@ jobs:
           repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
+      - name: Build patched sccache (${{ matrix.arch }})
+        if: ${{ matrix.cuda.label == 'cu134' }}
+        env:
+          CUDA_VERSION: ${{ matrix.cuda.version }}
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
+          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-cache"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
+            -e CUDA_VERSION \
+            -e SCCACHE_PATCHED_BINARY_PATH \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash /workspace/scripts/build_patched_sccache.sh
+        timeout-minutes: 30
+
       - name: Build wheel in container
         env:
           ARCH: ${{ matrix.arch }}
@@ -231,8 +259,9 @@ jobs:
           FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
           PYTORCH_INDEX: ${{ matrix.cuda.pytorch_index }}
-          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
-          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
         run: |
           # Extract CUDA major and minor versions
           IFS=. read -r CUDA_MAJOR CUDA_MINOR <<< "${CUDA_VERSION}"
@@ -254,6 +283,7 @@ jobs:
             -e FLASHINFER_CUDA_ARCH_LIST \
             -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
             -e SCCACHE_BUCKET \
+            -e SCCACHE_PATCHED_BINARY_PATH \
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_REGION \
@@ -324,6 +354,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout code

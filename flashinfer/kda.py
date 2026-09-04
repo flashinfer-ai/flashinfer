@@ -79,6 +79,9 @@ def recurrent_kda(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     *,
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
     backend: Literal["auto", "cute-dsl", "cake"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -199,6 +202,19 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        disable_state_update (bool):
+            Frozen / speculative-verify mode: compute outputs for up to 16
+            tokens per sequence from the committed state and never write any
+            state back (``final_state`` is ``None``). See
+            :func:`flashinfer.kda_decode.recurrent_kda` for the full mode
+            contract, including the optional slot-indexed
+            ``correction_cache`` / ``kg_cache`` verify outputs.
+        correction_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed float32 per-token delta-rule
+            corrections ``[num_slots, HV, T_max, V]``.
+        kg_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
+            cache ``[num_slots, HV, T_max, 2*K]``.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
             permutation of shape ``[N]``. For eager CuTe DSL packed engine
@@ -332,6 +348,67 @@ def recurrent_kda(
             sm120_rejection = _kda_prefill._sm120_kda_prefill_rejection_reason(
                 **sm120_prefill_kwargs
             )
+
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        # Frozen / speculative-verify mode (mirrors GDN's
+        # gated_delta_rule_mtp flag): outputs only, no state writes,
+        # optional slot-indexed correction/kg caches. Handled ahead of the
+        # prefill routing — none of the prefill-only features apply.
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if output_final_state:
+            raise ValueError(
+                "output_final_state=True is incompatible with "
+                "disable_state_update=True (no state is produced)"
+            )
+        if num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens applies to the state-updating fused "
+                "spec path, not the frozen-verify mode"
+            )
+        if (
+            seq_order is not None
+            or prefill_workspace is not None
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or checkpoint_every_n_tokens != 0
+        ):
+            raise ValueError(
+                "prefill-only arguments are incompatible with disable_state_update=True"
+            )
+        return _kda_decode._run_frozen_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            output=output,
+            initial_state=initial_state,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+        )
 
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens

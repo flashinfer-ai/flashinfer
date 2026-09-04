@@ -60,3 +60,30 @@ def test_explicit_backend_does_not_warn(_cc, buf):
 )
 def test_no_warn_on_hopper(_cc, buf):
     assert _make(buf, "auto") == []
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_backend", "unexpected_backend"),
+    [
+        ((10, 0), "backend='cutile'", "backend='cutlass'"),
+        ((11, 0), "backend='cutlass'", "backend='cutile'"),
+    ],
+)
+def test_auto_warning_recommends_an_architecture_supported_backend(
+    monkeypatch, capability, expected_backend, unexpected_backend
+):
+    """The fallback warning must not recommend a backend that rejects the GPU."""
+    monkeypatch.setattr(
+        "flashinfer.mla._batch_mla._wrapper._get_compute_capability",
+        lambda _device: capability,
+    )
+    _fresh_state()
+
+    with pytest.warns(UserWarning, match=WARN_TAG) as caught:
+        BatchMLAPagedAttentionWrapper._maybe_warn_blackwell_auto_fallback(
+            torch.device("cuda"), "fa2"
+        )
+
+    message = str(caught[0].message)
+    assert expected_backend in message
+    assert unexpected_backend not in message
