@@ -14,14 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from .cake_selective_state_update import cake_selective_state_update
 from .selective_state_update import selective_state_update
-from .checkpointing_ssu import checkpointing_ssu
+from .checkpointing_ssu import (
+    allocate_checkpointing_ssu_scratch,
+    checkpointing_ssu,
+)
 
-__all__ = ["selective_state_update", "checkpointing_ssu"]
+__all__ = [
+    "cake_selective_state_update",
+    "selective_state_update",
+    "checkpointing_ssu",
+    "allocate_checkpointing_ssu_scratch",
+]
 
 try:
-    from .ssd_combined import SSDCombined
+    from .ssd_combined import SSDCombined, ssd_combined_fwd
 
-    __all__.append("SSDCombined")
+    __all__.extend(("SSDCombined", "ssd_combined_fwd"))
 except ImportError:
     pass

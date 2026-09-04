@@ -363,6 +363,42 @@ def _context_reference(case: _ContextCase) -> torch.Tensor:
     return torch.cat(outputs) if case.packed else torch.stack(outputs)
 
 
+@torch.no_grad()
+def _variable_window_reference(
+    case: _ContextCase,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+) -> torch.Tensor:
+    """Independent FP32 oracle for fixed per-Q inclusive window bounds."""
+
+    if case.packed:
+        raise ValueError("variable-window test reference requires fixed storage")
+    outputs = []
+    for batch_idx in range(len(case.q_lengths)):
+        q = case.q[batch_idx].float()
+        k = case.k[batch_idx].float()
+        v = case.v[batch_idx].float()
+        head_ratio = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(head_ratio, dim=1)
+        v = v.repeat_interleave(head_ratio, dim=1)
+
+        scores = torch.einsum("qhd,khd->hqk", q, k)
+        key_positions = torch.arange(
+            k.shape[0], dtype=torch.int32, device=k.device
+        ).unsqueeze(0)
+        valid = (key_positions >= starts[batch_idx].unsqueeze(1)) & (
+            key_positions <= ends[batch_idx].unsqueeze(1)
+        )
+        probabilities = torch.softmax(
+            scores.masked_fill(~valid.unsqueeze(0), -torch.inf) * case.sm_scale,
+            dim=-1,
+        )
+        outputs.append(
+            torch.einsum("hqk,khd->qhd", probabilities, v) * case.output_scale
+        )
+    return torch.stack(outputs)
+
+
 def _assert_context_correct(
     actual: torch.Tensor,
     case: _ContextCase,
@@ -486,6 +522,9 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
         "kv_indptr",
         "scale_softmax_log2",
         "output_scale",
+        "variable_window_token_starts",
+        "variable_window_token_ends",
+        "variable_window_cta_starts",
     )
 
     for aliased_name in (*argument_names, *retained_names):
@@ -1229,7 +1268,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
     )
     with pytest.raises(
         NotImplementedError,
-        match=r"requires an SM100a/B200 or SM103a/B300 GPU.*\(9, 0\)",
+        match=r"requires an SM100a/B200.*GPU.*\(9, 0\)",
     ):
         BatchPrefillTSWrapper().plan(q, k, v)
 
@@ -1409,7 +1448,7 @@ def test_attention_ts_context_plan_rejects_causal_q_longer_than_kv(paged: bool):
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key():
+def test_attention_ts_context_paged_uniform_geometry_has_distinct_compile_spec():
     """Only max-filled Q and uniform snapshotted K select uniform offsets."""
 
     uniform_case = _make_paged_context_case(
@@ -1462,12 +1501,47 @@ def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key()
     assert redistributable_metadata.seq_lens == uniform_metadata.seq_lens
     assert redistributable_geometry.uniform_packed_lengths is False
 
-    uniform_key = context_module._paged_semantic_key(uniform_geometry)
-    redistributable_key = context_module._paged_semantic_key(redistributable_geometry)
-    assert uniform_key != redistributable_key
-    assert uniform_key == context_module._paged_semantic_key(
+    uniform_spec = context_module._paged_context_compile_spec(uniform_geometry)
+    redistributable_spec = context_module._paged_context_compile_spec(
+        redistributable_geometry
+    )
+    assert uniform_spec != redistributable_spec
+    assert uniform_spec == context_module._paged_context_compile_spec(
         replace(redistributable_geometry, uniform_packed_lengths=True)
     )
+
+
+def test_attention_ts_context_paged_rejects_variable_window_before_compile(
+    monkeypatch,
+):
+    """Paged context must not silently dispatch variable windows as dense."""
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"variable-window masking.*not supported for paged context",
+    ):
+        FmhaTs(has_variable_window=True, use_paged_kv=True)
+
+    def fail_compile(*args, **kwargs):
+        pytest.fail("paged variable-window validation reached kernel compilation")
+
+    monkeypatch.setattr(context_module, "_get_compiled_paged_context", fail_compile)
+    wrapper = BatchPrefillPagedTSWrapper()
+    with pytest.raises(
+        NotImplementedError,
+        match=r"variable_window.*not supported for paged context",
+    ):
+        wrapper.plan(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            mask_type="variable_window",
+            out_dtype=torch.float16,
+        )
 
 
 @pytest.mark.arch_blackwell
@@ -1743,6 +1817,247 @@ def test_attention_ts_context_bounded_public_correctness_matrix(
     else:
         actual = _run_one_shot(case)
     _assert_context_correct(actual, case)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_t1_i1_t2_i2(
+    head_dim: int,
+):
+    """Exercise the 2560-token text/image variable-window mask."""
+
+    seq_len = 2560
+    left_window = 128
+    right_window = 128
+    image_segments = ((256, 1280), (1536, 2560))
+    case = _make_context_case(
+        q_lengths=(seq_len,),
+        k_lengths=(seq_len,),
+        num_qo_heads=2,
+        num_kv_heads=1,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=head_dim,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026073001 + head_dim,
+    )
+
+    query_positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+    starts = torch.clamp(query_positions - left_window, min=0)
+    ends = query_positions.clone()
+    for segment_start, segment_end in image_segments:
+        in_segment = (query_positions >= segment_start) & (
+            query_positions < segment_end
+        )
+        image_end = torch.clamp(
+            query_positions + right_window,
+            max=segment_end - 1,
+        )
+        ends = torch.where(in_segment, image_end, ends)
+    starts = starts.unsqueeze(0).contiguous()
+    ends = ends.unsqueeze(0).contiguous()
+
+    # T1[0:256], I1[256:1280], T2[1280:1536], I2[1536:2560].
+    assert starts[0, (0, 255, 256, 1279, 1280, 1535, 1536, 2559)].tolist() == [
+        0,
+        127,
+        128,
+        1151,
+        1152,
+        1407,
+        1408,
+        2431,
+    ]
+    end_checkpoints = (0, 255, 256, 1151, 1279, 1280, 1535, 1536, 2431, 2559)
+    assert ends[0, end_checkpoints].tolist() == [
+        0,
+        255,
+        384,
+        1279,
+        1279,
+        1280,
+        1535,
+        1664,
+        2559,
+        2559,
+    ]
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type="variable_window",
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+    )
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(actual, case, expected=expected)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: int):
+    """A later Q row may extend into a K tile earlier than the CTA's first row."""
+
+    seq_len_q = 256
+    seq_len_k = 256
+    case = _make_context_case(
+        q_lengths=(seq_len_q,),
+        k_lengths=(seq_len_k,),
+        num_qo_heads=2,
+        num_kv_heads=1,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=head_dim,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026081901 + head_dim,
+    )
+    starts = torch.full((1, seq_len_q), 128, dtype=torch.int32, device="cuda")
+    starts[0, 160] = 0
+    ends = torch.full((1, seq_len_q), seq_len_k - 1, dtype=torch.int32, device="cuda")
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type="variable_window",
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+    )
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(actual, case, expected=expected)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int):
+    """Padded Q rows must not read past flattened per-row window bounds."""
+
+    seq_len = 33
+    case = _make_context_case(
+        q_lengths=(seq_len, seq_len),
+        k_lengths=(seq_len, seq_len),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=head_dim,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026082701 + head_dim,
+    )
+
+    query_positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+    ends = query_positions.unsqueeze(0).expand(2, -1).contiguous()
+    starts = torch.clamp(ends - 7, min=0)
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type="variable_window",
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+    )
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(actual, case, expected=expected)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
+    packed: bool,
+):
+    """One resolved context topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_context_case(
+            q_lengths=(33,) * batch_size,
+            k_lengths=(65,) * batch_size,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.float16,
+            packed=packed,
+            mask_type="dense",
+            output_dtype=torch.float16,
+            device="cuda",
+            seed=2026071420 + batch_size,
+        )
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, case)
+        actual = wrapper.run(case.q, case.k, case.v)
+        _assert_context_correct(actual, case)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes():
+    """One paged-context topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_paged_context_case(
+            q_lengths=(33,) * batch_size,
+            k_lengths=(65,) * batch_size,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            qkv_dtype=torch.float16,
+            mask_type="dense",
+            output_dtype=torch.float16,
+            seed=2026071430 + batch_size,
+        )
+        wrapper = BatchPrefillPagedTSWrapper()
+        wrapper.plan(
+            case.reference.q,
+            case.k_cache,
+            case.v_cache,
+            case.qo_indptr,
+            case.paged_kv_indptr,
+            case.paged_kv_indices,
+            case.paged_kv_last_page_len,
+            page_size=case.page_size,
+            mask_type=case.reference.mask_type,
+            sm_scale=case.reference.sm_scale,
+            output_scale=case.reference.output_scale,
+            out_dtype=case.reference.output_dtype,
+        )
+        actual = wrapper.run(case.reference.q, case.k_cache, case.v_cache)
+        _assert_context_correct(actual, case.reference)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
 
 
 @pytest.mark.arch_blackwell
@@ -2082,11 +2397,9 @@ def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
-    # Dense query pairing carries S/P state between work tiles and publishes
-    # correction stats through SMEM.  BF16 is the largest input footprint and
-    # therefore guards the B200 dynamic-SMEM launch limit for the static
-    # persistent single-instance schedule.
+def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
+    # BF16 D256 is the largest fixed-input footprint and therefore guards the
+    # B200 dynamic-SMEM launch limit independently of automatic scheduling.
     case = _make_context_case(
         q_lengths=(129,),
         k_lengths=(257,),
@@ -2102,7 +2415,6 @@ def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert dict(wrapper._policy)["scheduler"] == "static_persistent"
 
     for _ in range(2):
         output = wrapper.run(case.q, case.k, case.v)

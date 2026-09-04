@@ -5,8 +5,10 @@
 import argparse
 import os
 import sys
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Literal, Optional, Tuple
 
+import numpy as np
 import torch
 
 # Ensure absolute package imports work when this file is run as a script.
@@ -406,6 +408,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         enable_iket=args.enable_iket,
         seed=args.seed,
         verbose=args.verbose,
+        perf_warmup=args.perf_warmup,
+        perf_iters=args.perf_iters,
     )
 
     tester = SwapABSwigluFp4Fc12Tester(problem, impl, misc)

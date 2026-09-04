@@ -23,6 +23,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -47,7 +48,6 @@ DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
 
 @dataclass
 class _W4A16Workspace:
-    num_tokens_capacity: int
     moe_sort_buffers: Dict[str, torch.Tensor]
     hidden_workspace: torch.Tensor
     intermediate: torch.Tensor
@@ -63,46 +63,32 @@ def _get_workspace(
     num_local_experts: int,
     intermediate_size: int,
     route_tile: int,
-    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
         num_tokens, top_k, num_local_experts, route_tile
     )
-    key = (
-        x.device,
-        top_k,
-        int(x.size(1)),
-        int(intermediate_size),
-        int(num_experts),
-        int(num_local_experts),
-        route_tile,
+    return _W4A16Workspace(
+        moe_sort_buffers=allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            tile_tokens_dim=route_tile,
+            device=x.device,
+        ),
+        # Match the established W4A4 wrapper path: scratch tensors are local to
+        # one invocation, so PyTorch's caching allocator can reuse them across
+        # sequential layers and its private graph pool owns captured addresses.
+        hidden_workspace=torch.empty(
+            (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
+        ),
+        intermediate=torch.empty(
+            (route_slots, intermediate_size),
+            dtype=torch.bfloat16,
+            device=x.device,
+        ),
     )
-    workspace = workspace_cache.get(key) if workspace_cache is not None else None
-    if workspace is None or workspace.num_tokens_capacity < num_tokens:
-        workspace = _W4A16Workspace(
-            num_tokens_capacity=num_tokens,
-            moe_sort_buffers=allocate_moe_sort_buffers(
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=num_local_experts,
-                tile_tokens_dim=route_tile,
-                device=x.device,
-            ),
-            # Permuted input is dead before GEMM2 writes its output.
-            hidden_workspace=torch.empty(
-                (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
-            ),
-            intermediate=torch.empty(
-                (route_slots, intermediate_size),
-                dtype=torch.bfloat16,
-                device=x.device,
-            ),
-        )
-        if workspace_cache is not None:
-            workspace_cache[key] = workspace
-    return workspace
 
 
 def _get_compiled_kernel(
@@ -128,6 +114,8 @@ def _get_compiled_kernel(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
     use_fused_finalize: bool,
     enable_pdl: bool,
     use_clc_scheduler: bool,
@@ -146,6 +134,8 @@ def _get_compiled_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
         use_fused_finalize,
         enable_pdl,
         use_clc_scheduler,
@@ -170,6 +160,8 @@ def _get_compiled_kernel(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             use_clc_scheduler=use_clc_scheduler,
@@ -214,6 +206,8 @@ def _run_grouped_gemm(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
     use_fused_finalize: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
@@ -332,6 +326,8 @@ def _run_grouped_gemm(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
         use_fused_finalize,
         enable_pdl,
         use_clc_scheduler,
@@ -379,13 +375,15 @@ def launch_w4a16_moe(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     tactic: Optional[W4A16MoeTactic] = None,
-    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
     gemm1_output_size = intermediate_size * (2 if gated else 1)
     if int(w1_weight.size(1)) != gemm1_output_size:
         raise ValueError(
@@ -405,7 +403,6 @@ def launch_w4a16_moe(
         num_local_experts,
         intermediate_size,
         route_tile,
-        workspace_cache,
     )
 
     (
@@ -462,6 +459,8 @@ def launch_w4a16_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         use_fused_finalize=False,
         permuted_idx_to_expanded_idx=None,
         token_final_scales=None,
@@ -485,6 +484,8 @@ def launch_w4a16_moe(
         swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
         swiglu_beta=DEFAULT_SWIGLU_BETA,
         swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+        situ_beta=None,
+        situ_linear_beta=None,
         use_fused_finalize=use_fused_finalize,
         permuted_idx_to_expanded_idx=(
             permuted_idx_to_expanded_idx if use_fused_finalize else None

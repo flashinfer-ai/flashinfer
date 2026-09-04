@@ -442,6 +442,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         enable_iket=args.enable_iket,
         seed=args.seed,
         verbose=args.verbose,
+        perf_warmup=args.perf_warmup,
+        perf_iters=args.perf_iters,
     )
 
     tester = SwigluMxfp8Fc12Tester(problem, impl, misc)

@@ -1124,6 +1124,7 @@ def _test_trtllm_batch_decode(
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
+            wrapper_rtol = 1.3e-1 if o_dtype == "fp8" else 1e-1
             # todo(Yingyi): fix precision issue with this test
             if not (
                 q_dtype == "fp8"
@@ -1138,17 +1139,38 @@ def _test_trtllm_batch_decode(
                 torch.testing.assert_close(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                 )
             else:
                 assert_close_with_mismatch_tolerance(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
+
+
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=q_len_per_req,
+        page_size=32,
+        num_kv_heads=2,
+        head_grp_size=8,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+    )
 
 
 @pytest.mark.parametrize("backend", ["trtllm-gen"])

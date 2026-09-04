@@ -22,6 +22,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
@@ -30,9 +31,11 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
 from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
 from common.megamoe_constants import (
     Mxfp8BlockSize,
+    Nvfp4BlockSize,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
+from common.host_utils import get_cutedsl_target_arch
 from moe_nvfp4_swapab.moe_utils import spin_wait
 
 
@@ -84,7 +87,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_by_dispatch: bool = False,
-        epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        epi_flag_batch: Tuple[int, int] = (1, 1),
         gate_up_clamp: Optional[float] = None,
         apply_topk_in_fc1: bool = False,
         generate_c: bool = False,
@@ -162,7 +165,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         self.sf_vec_size = sf_vec_size
         self.scenario = scenario
-        self.arch = "sm_100"
+        self.arch = get_cutedsl_target_arch()
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -209,7 +212,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -1470,6 +1473,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.arch,
         )
 
         # Sched

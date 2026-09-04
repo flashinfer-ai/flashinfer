@@ -6,11 +6,11 @@
 // buffered with per-buffer mbarrier pairs, static grid (num_tokens × HBLOCKS
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
 //
-// Supports the full V32-family dispatch grid:
+// Supports the V32-family dispatch grid: dedicated instantiations at
 //   num_heads ∈ {8, 16, 32, 64, 128}
-//   topk      ∈ {128, 512, 1024, 2048}
-//   pbs       = 64
-// = 20 instantiations.
+// plus one runtime-H instantiation (any num_heads <= 128 off the grid) and
+// GLM53_NOPE dedicated 32/64 + runtime-H. topk is a runtime argument — one
+// instantiation serves every indices-row width.
 
 #include <cuda_runtime.h>
 
@@ -30,16 +30,21 @@ namespace flashinfer::sparse_mla_sm120 {
     }                                                                       \
   } while (0)
 
-template <ModelType MT, int NUM_HEADS, int TOPK>
-static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
-                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
-                                      const int* topk_length, bf16* output, float* out_lse,
-                                      const float* attn_sink, int num_tokens, int num_splits,
-                                      int chunks_per_block_override, float sm_scale,
-                                      size_t stride_kv_block, cudaStream_t stream) {
+template <ModelType MT, int NUM_HEADS>
+static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
+                                      const uint8_t* KV_cache, const int32_t* indices,
+                                      bf16* mid_out, float* mid_lse, const int* topk_length,
+                                      bf16* output, float* out_lse, const float* attn_sink,
+                                      int num_tokens, int num_splits, int chunks_per_block_override,
+                                      float sm_scale, size_t stride_kv_block,
+                                      size_t stride_indices_token, int stride_kv_row,
+                                      size_t stride_out_lse, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
-  static_assert(KV::D_QK == 576);
-  constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
+  static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
+  // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
+  // comes from the argument and the mid scratch is HPB-aligned.
+  const int h_blocks = (NUM_HEADS == 0) ? (num_heads + HPB - 1) / HPB : (NUM_HEADS + HPB - 1) / HPB;
+  const int q_heads = (NUM_HEADS == 0) ? num_heads : NUM_HEADS;
 
   // Dynamic smem layout (must match decode_dsv3_2_kernel.cuh exactly).
   //   sm_q_rope    HPB * D_ROPE * 2B               = 2 KB
@@ -66,13 +71,15 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                      // sm_w_head_sc
       + 2 * HPB * (DSV3_2_BI + 16);                                       // sm_w_fp8 ×2
 
-  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, TOPK, 64>;
+  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, 64>;
   DSV3_2_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
   // chunks_per_block heuristic identical to decode-dsv4: among cpb candidates
   // with at most CEIL_WAVES_MAX integer waves, minimize the last-wave tail
   // gap; ties broken by largest cpb (fewer launched blocks contending on L2).
+  // chunks_per_block_override: calibrated-model or explicit caller choice;
+  // the heuristic is the fallback when no override is given.
   int chunks_per_block;
   if (chunks_per_block_override >= 1 && chunks_per_block_override <= num_splits) {
     chunks_per_block = chunks_per_block_override;
@@ -81,9 +88,12 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
     int device = 0;
     DSV3_2_CUDA_CHECK(cudaGetDevice(&device));
     DSV3_2_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-    if (sm_count <= 0) sm_count = 188;
+    if (sm_count <= 0) {
+      printf("CUDA %s:%d invalid SM count %d\n", __FILE__, __LINE__, sm_count);
+      return false;
+    }
     constexpr int CEIL_WAVES_MAX = 3;
-    const int per_token_head = num_tokens * H_BLOCKS;
+    const int per_token_head = num_tokens * h_blocks;
     chunks_per_block = 1;
     float best_gap = 2.0f;
     for (int cpb = 1; cpb <= num_splits; ++cpb) {
@@ -101,13 +111,13 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   }
 
   // Launch the full Python-allocated num_splits grid. Inactive splits return
-  // early after marking LSE = -inf — keeps mid_out/mid_lse stride aligned with
-  // wrapper allocation.
-  dim3 grid1(num_tokens, H_BLOCKS, num_splits);
+  // early after marking LSE = -1e30f — keeps mid_out/mid_lse stride aligned
+  // with wrapper allocation.
+  dim3 grid1(num_tokens, h_blocks, num_splits);
   dim3 block1(DSV3_2_BLOCK_THREADS);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, KV_cache, indices, mid_out, mid_lse,
-                                                    topk_length, num_tokens, num_splits,
-                                                    chunks_per_block, sm_scale, stride_kv_block);
+  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
+      Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
+      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -115,59 +125,76 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   constexpr int MERGE_DIMS_PER_THREAD = KV::D_V / MERGE_BLOCK_THREADS;
   auto merge_kernel = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_BLOCK_THREADS,
                                                           MERGE_DIMS_PER_THREAD>;
-  dim3 grid2(num_tokens, NUM_HEADS);
+  dim3 grid2(num_tokens, q_heads);
   dim3 block2(MERGE_BLOCK_THREADS);
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
-  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(mid_out, mid_lse, output, out_lse,
-                                                            attn_sink, num_tokens, num_splits);
+  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
+      mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
+      stride_out_lse);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
   return true;
 }
 
-// Public surface: V32-family (DSv3.2 / GLM_NSA) decode.
+// Public surface: V32-family (DSv3.2 / GLM_NSA / GLM53_NOPE) decode.
+// topk is a runtime kernel argument (the indices-row width); dispatch
+// switches on num_heads only. The production grid {8, 16, 32, 64, 128} keeps
+// dedicated instantiations (measured 0.9-2.5% faster than runtime-H on hot
+// shapes); every other num_heads <= 128 falls back to one runtime-H
+// instantiation.
 // Returns false if (num_heads, topk) is outside the dispatch envelope.
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
                                      bf16* output, float* out_lse, const int* topk_length,
                                      const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
+                                     float sm_scale, size_t stride_kv_block,
+                                     size_t stride_indices_token, int stride_kv_row,
+                                     size_t stride_out_lse, cudaStream_t stream) {
   if (num_splits <= 0) return false;
-#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                     \
-  if (num_heads == (H) && topk == (K)) {                                                       \
-    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                      \
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
-        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
+  if (num_heads < 1 || num_heads > 128) return false;
+  if (topk < 1) return false;
+#define DSV3_2_DISPATCH_MT(MT_VALUE, H)                                                          \
+  if (num_heads == (H)) {                                                                        \
+    return launch_decode_dsv3_2_impl<MT_VALUE, (H)>(                                             \
+        num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
+        attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
   }
-#define DSV3_2_DISPATCH(H, K)                      \
-  do {                                             \
-    if (mt == ModelType::DSV3_2) {                 \
-      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)  \
-    } else if (mt == ModelType::GLM_NSA) {         \
-      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K) \
-    }                                              \
+#define DSV3_2_DISPATCH_RT_MT(MT_VALUE)                                                          \
+  {                                                                                              \
+    return launch_decode_dsv3_2_impl<MT_VALUE, 0>(                                               \
+        num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
+        attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
+  }
+#define DSV3_2_DISPATCH(H)                      \
+  do {                                          \
+    if (mt == ModelType::DSV3_2) {              \
+      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H)  \
+    } else if (mt == ModelType::GLM_NSA) {      \
+      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H) \
+    }                                           \
   } while (0);
-  DSV3_2_DISPATCH(8, 128)
-  DSV3_2_DISPATCH(8, 512)
-  DSV3_2_DISPATCH(8, 1024)
-  DSV3_2_DISPATCH(8, 2048)
-  DSV3_2_DISPATCH(16, 128)
-  DSV3_2_DISPATCH(16, 512)
-  DSV3_2_DISPATCH(16, 1024)
-  DSV3_2_DISPATCH(16, 2048)
-  DSV3_2_DISPATCH(32, 128)
-  DSV3_2_DISPATCH(32, 512)
-  DSV3_2_DISPATCH(32, 1024)
-  DSV3_2_DISPATCH(32, 2048)
-  DSV3_2_DISPATCH(64, 128)
-  DSV3_2_DISPATCH(64, 512)
-  DSV3_2_DISPATCH(64, 1024)
-  DSV3_2_DISPATCH(64, 2048)
-  DSV3_2_DISPATCH(128, 128)
-  DSV3_2_DISPATCH(128, 512)
-  DSV3_2_DISPATCH(128, 1024)
-  DSV3_2_DISPATCH(128, 2048)
+  DSV3_2_DISPATCH(8)
+  DSV3_2_DISPATCH(16)
+  DSV3_2_DISPATCH(32)
+  DSV3_2_DISPATCH(64)
+  DSV3_2_DISPATCH(128)
+  if (mt == ModelType::DSV3_2) {
+    DSV3_2_DISPATCH_RT_MT(ModelType::DSV3_2)
+  } else if (mt == ModelType::GLM_NSA) {
+    DSV3_2_DISPATCH_RT_MT(ModelType::GLM_NSA)
+  }
+  // GLM-5.3 combines its 2048 sparse selection with the 128-token
+  // indexer window. The TP1 (64-head) and TP2 (32-head) shapes keep
+  // dedicated instantiations; any other shard rides the runtime-H fallback.
+  if (mt == ModelType::GLM53_NOPE) {
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32)
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 64)
+    DSV3_2_DISPATCH_RT_MT(ModelType::GLM53_NOPE)
+  }
 #undef DSV3_2_DISPATCH
+#undef DSV3_2_DISPATCH_RT_MT
 #undef DSV3_2_DISPATCH_MT
   return false;
 }

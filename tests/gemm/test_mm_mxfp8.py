@@ -195,25 +195,36 @@ def test_mm_mxfp8_large_dimensions(m, n, k, input_dtype, out_dtype, backend):
 
 
 @pytest.mark.parametrize(
-    "m,n,k",
+    "m,n,k,backend",
     [
-        (4, 6144, 4096),
-        (8, 6144, 4096),
-        (16, 6144, 4096),
-        (32, 2688, 1856),
-        (32, 1856, 2688),
-        (32, 2688, 4096),
-        (32, 5376, 4096),
+        (4, 6144, 4096, "cutlass"),
+        (8, 6144, 4096, "cutlass"),
+        (16, 6144, 4096, "cutlass"),
+        (32, 2688, 1856, "cutlass"),
+        (32, 1856, 2688, "cutlass"),
+        (32, 2688, 4096, "cutlass"),
+        (32, 5376, 4096, "cutlass"),
+        # GPT-OSS-120B (K padded to 128)
+        (1, 1280, 2944, "cutedsl_low_latency"),
+        (8, 1280, 2944, "cutedsl_low_latency"),
+        (1, 2880, 1024, "cutedsl_low_latency"),
+        (8, 2880, 1024, "cutedsl_low_latency"),
+        # DeepSeek-V3
+        (1, 7168, 2048, "cutedsl_low_latency"),
+        (8, 7168, 2048, "cutedsl_low_latency"),
+        (1, 3072, 1536, "cutedsl_low_latency"),
+        (7, 3072, 1536, "cutedsl_low_latency"),
+        (3, 129, 384, "cutedsl_low_latency"),
     ],
 )
-def test_mm_mxfp8_small_m(m, n, k):
+def test_mm_mxfp8_small_m(m, n, k, backend):
     _run_mm_mxfp8(
         m,
         n,
         k,
         torch.bfloat16,
         torch.bfloat16,
-        "cutlass",
+        backend,
         auto_tuning=False,
         provide_out=True,
     )

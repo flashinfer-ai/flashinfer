@@ -255,10 +255,11 @@ def _vsa_run_core(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
 
+    q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
     o_bsa, lse_bsa = fwd_fn(
-        q.unsqueeze(0).contiguous(),
-        k.unsqueeze(0).contiguous(),
-        v.unsqueeze(0).contiguous(),
+        q_b,
+        k_b,
+        v_b,
         q2k_block_index=vsa_q2k_index,
         block_sparse_num=1,  # ignored when q2k_block_nums is provided
         block_sizes=None,
@@ -267,18 +268,96 @@ def _vsa_run_core(
         return_lse=True,
     )
 
+    return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
+
+
+def _vsa_reshape_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """NHD (no batch dim) -> BSHD with an implicit batch size of 1."""
+    return (
+        q.unsqueeze(0).contiguous(),
+        k.unsqueeze(0).contiguous(),
+        v.unsqueeze(0).contiguous(),
+    )
+
+
+def _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse):
     output = o_bsa[0]  # [1, M, H, D] -> [M, H, D]
     if out is not None:
+        check_shape_dtype_device(out, output.shape, output.dtype, output.device, "out")
         out.copy_(output)
         output = out
 
     if return_lse:
         lse_out = lse_bsa[0].permute(1, 0).contiguous()  # [1, H, M] -> [M, H]
         if lse is not None:
+            check_shape_dtype_device(
+                lse, lse_out.shape, lse_out.dtype, lse_out.device, "lse"
+            )
             lse.copy_(lse_out)
             lse_out = lse
         return output, lse_out
     return output
+
+
+def _vsa_run_core_blk64(
+    fwd_fn,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    vsa_q2k_index: torch.Tensor,
+    vsa_q2k_num: torch.Tensor,
+    sm_scale: Optional[float],
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+    kv_splits: Optional[Union[int, str]],
+    use_clc: Optional[bool],
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    sage_fp8_block_sparse_num: Optional[int],
+):
+    """blk64-specific variant of :func:`_vsa_run_core` with kv_splits/use_clc/Sage-FP8 passthrough.
+
+    Kept separate from ``_vsa_run_core`` (used by the blk128/sm120_blk64
+    backends) rather than adding blk64-only kwargs there, so those backends'
+    call sites do not carry always-None dead parameters.
+    """
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+    q_b, k_b, v_b = _vsa_reshape_qkv(q, k, v)
+
+    is_sage_fp8 = q_scale is not None
+    if is_sage_fp8:
+        # Sage FP8 requires a uniform (dense) top-k: the underlying kernel
+        # only accepts q2k_block_nums=None with a fixed block_sparse_num.
+        # The uniform value is validated and cached in plan() (which already
+        # syncs on vsa_q2k_num once) so run() never has to sync on it.
+        block_nums_arg = None
+        block_sparse_num_arg = sage_fp8_block_sparse_num
+    else:
+        block_nums_arg = vsa_q2k_num
+        block_sparse_num_arg = 1  # ignored when q2k_block_nums is provided
+
+    o_bsa, lse_bsa = fwd_fn(
+        q_b,
+        k_b,
+        v_b,
+        q2k_block_index=vsa_q2k_index,
+        block_sparse_num=block_sparse_num_arg,
+        block_sizes=None,
+        q2k_block_nums=block_nums_arg,
+        softmax_scale=sm_scale,
+        return_lse=True,
+        kv_splits=1 if kv_splits is None else kv_splits,
+        use_clc=use_clc,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
 
 
 class BlockSparseAttentionWrapper:
@@ -341,7 +420,7 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
         """
@@ -350,19 +429,34 @@ class BlockSparseAttentionWrapper:
         self._workspace_size = (
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
-        self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-        )
-
-        self._kv_lens_buffer = torch.empty(
-            (32768,), dtype=torch.int32, device=self.device
-        )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=torch.uint8,
-            pin_memory=True,
-            device="cpu",
-        )
+        self._backend = _BACKEND_ALIASES.get(backend, backend)
+        if self._backend == "cake":
+            # Cake consumes the caller's direct VSA metadata and never invokes
+            # the generic sparse planner. Avoid allocating its per-wrapper 8 MiB
+            # device/host workspaces: video diffusion creates one wrapper per
+            # transformer layer.
+            self._int_workspace_buffer = torch.empty(
+                (0,), dtype=torch.uint8, device=self.device
+            )
+            self._kv_lens_buffer = torch.empty(
+                (0,), dtype=torch.int32, device=self.device
+            )
+            self._pin_memory_int_workspace_buffer = torch.empty(
+                (0,), dtype=torch.uint8, device="cpu"
+            )
+        else:
+            self._int_workspace_buffer = torch.empty(
+                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+            )
+            self._kv_lens_buffer = torch.empty(
+                (32768,), dtype=torch.int32, device=self.device
+            )
+            self._pin_memory_int_workspace_buffer = torch.empty(
+                self._int_workspace_buffer.shape,
+                dtype=torch.uint8,
+                pin_memory=True,
+                device="cpu",
+            )
         self._use_cuda_graph = False
         self._kv_layout = "NHD"
         self._qo_indptr: Optional[torch.Tensor] = None
@@ -375,7 +469,7 @@ class BlockSparseAttentionWrapper:
         self.C: Optional[int] = None
         self.M: Optional[int] = None
         self.N: Optional[int] = None
-        self._backend = _BACKEND_ALIASES.get(backend, backend)
+        self._cake_vsa_plan: Optional[dict] = None
 
     def reset_workspace_buffer(
         self,
@@ -431,6 +525,14 @@ class BlockSparseAttentionWrapper:
         o_data_type: Union[str, torch.dtype] = "float16",
         non_blocking: bool = True,
         block_mask: Optional[torch.Tensor] = None,
+        kv_block_lens: Optional[torch.Tensor] = None,
+        q2k_indices: Optional[torch.Tensor] = None,
+        q2k_num: Optional[torch.Tensor] = None,
+        kv_splits: Optional[Union[int, str]] = None,
+        use_clc: Optional[bool] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -439,12 +541,14 @@ class BlockSparseAttentionWrapper:
         indptr : torch.Tensor, optional
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
-            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``cake``, ``vsa_sm100_blk128``,
+            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
-            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``cake``, ``vsa_sm100_blk128``,
+            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -506,8 +610,45 @@ class BlockSparseAttentionWrapper:
             for head ``h``.  For GQA (``num_qo_heads > num_kv_heads``), when providing
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
-            Only supported for the ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` backends.  When provided,
+            Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
+            and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
+        kv_block_lens : torch.Tensor, optional
+            Number of valid tokens in every KV block, shape ``(NB,)``. Entries
+            must be in ``[1, C]``. Supported by the ``cake`` block-64 route;
+            when omitted, every block is treated as having ``C`` valid tokens.
+        q2k_indices : torch.Tensor, optional
+            Direct per-head KV-block selections, contiguous int32 with shape
+            ``(num_qo_heads, MB, topk)``. Supported by the ``cake`` block-64
+            route and mutually exclusive with ``block_mask`` and BSR metadata.
+        q2k_num : torch.Tensor, optional
+            Number of valid entries in each direct selection row, contiguous
+            int32 with shape ``(num_qo_heads, MB)``. When omitted, every direct
+            row uses the full ``topk`` dimension.
+        kv_splits : Optional[Union[int, str]]
+            Number of KV splits for the split-KV combine path, or ``"auto"`` to pick a
+            split count from the sparsity heuristics. Only supported for the
+            ``vsa_sm100_blk64`` backend; must be ``None`` for all other backends.
+            ``None`` (default) disables splitting, equivalent to passing ``1``
+            explicitly. Pass ``"auto"`` to select the split count automatically via
+            a sparsity heuristic.
+        use_clc : Optional[bool]
+            Override the SM100 blk64 scheduler: ``True`` forces the CLC persistent
+            scheduler, ``False`` forces the static scheduler, ``None`` (default) uses
+            the shape-based heuristic. Only supported for the ``vsa_sm100_blk64`` backend.
+        q_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``q``, shape ``(1, num_qo_heads, seqlen_q)``,
+            float32. Only supported for the ``vsa_sm100_blk64`` backend, and only when
+            ``q``/``k``/``v`` are ``float8_e4m3fn``. Must be provided together with
+            ``k_scale``/``v_scale``, or not at all. The Sage FP8 path additionally
+            requires ``batch_size == 1``, ``num_qo_heads in (4, 8)``, and dense
+            (non-variable) block sparsity -- see :func:`bsa_attn_sm100_blk64_fwd`.
+        k_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``k``, shape
+            ``(1, num_qo_heads, ceil(seqlen_k / 16))``, float32. See ``q_scale``.
+        v_scale : torch.Tensor, optional
+            Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
+            float32. See ``q_scale``.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -526,6 +667,177 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        if self._backend != "vsa_sm100_blk64" and (
+            kv_splits is not None
+            or use_clc is not None
+            or q_scale is not None
+            or k_scale is not None
+            or v_scale is not None
+        ):
+            raise ValueError(
+                "kv_splits/use_clc/q_scale/k_scale/v_scale are only supported "
+                f"for backend='vsa_sm100_blk64', got backend={self._backend!r}"
+            )
+
+        if self._backend == "cake":
+            from flashinfer.cake_vsa import plan_cake_vsa
+
+            _vsa_common_checks(
+                "cake",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
+            )
+            if kv_data_type != q_data_type:
+                raise ValueError("cake backend requires matching Q/K/V dtypes")
+            self._cake_vsa_plan = plan_cake_vsa(
+                indptr,
+                indices,
+                block_mask,
+                kv_block_lens,
+                q2k_indices,
+                q2k_num,
+                M=M,
+                N=N,
+                R=R,
+                C=C,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_data_type=q_data_type,
+                sm_scale=sm_scale,
+                device=self.device,
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+
+        # ---- cuTile backend (pure cuda.tile Python kernel) ------------------------
+        # No C++ module to JIT: just stash the BSR plan state. run() reconstructs a
+        # dense block table from (indptr/indices) and treats each block-row as one
+        # variable-length prefill "batch" with page_size == C.
+        if self._backend == "cutile":
+            if indptr is None or indices is None:
+                raise ValueError(
+                    "cuTile block-sparse backend requires indptr and indices."
+                )
+            if N % C != 0:
+                raise ValueError(
+                    f"cuTile block-sparse backend requires N % C == 0 (N={N}, C={C})."
+                )
+            if mask is not None or packed_mask is not None:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support per-element "
+                    "intra-block masks (mask/packed_mask)."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support logits_soft_cap."
+                )
+            if pos_encoding_mode != "NONE":
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not apply position encoding "
+                    "(pos_encoding_mode must be 'NONE')."
+                )
+            if M % R != 0:
+                # run() forces each block-row batch to exactly R query rows; a
+                # non-multiple M would slice past the query buffer -> OOB.
+                raise ValueError(
+                    f"cuTile block-sparse backend requires M % R == 0 (M={M}, R={R})."
+                )
+            if C < 16:
+                # Prefill autotune's minimum BLOCK_N is 16 (32 on SM90); a smaller
+                # C yields an empty search space -> opaque exhaustive_search error.
+                raise ValueError(
+                    "cuTile block-sparse backend requires C >= 16 (the minimum "
+                    f"prefill BLOCK_N); got C={C}."
+                )
+            if causal:
+                # The BSR->paged mapping gathers arbitrary column-blocks, so the
+                # kernel's packed (gathered-block) position mask does NOT equal
+                # global row/column causality. (The standalone prefill kernel
+                # supports causal for contiguous paged/ragged inputs; only this
+                # block-sparse mapping cannot express it correctly.)
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support causal masking "
+                    "under the block-sparse (gathered-block) mapping."
+                )
+            if num_qo_heads % num_kv_heads != 0:
+                # run() maps each (block-row, kv-head) onto QUERY_GROUP_SIZE =
+                # num_qo_heads // num_kv_heads query heads; a non-multiple would
+                # silently drop the remainder heads.
+                raise ValueError(
+                    "cuTile block-sparse backend requires num_qo_heads % "
+                    f"num_kv_heads == 0 (num_qo_heads={num_qo_heads}, "
+                    f"num_kv_heads={num_kv_heads})."
+                )
+            num_col_blocks = N // C
+            if indices.numel() > 0:
+                # Each index selects a column-block gathered as a page; an
+                # out-of-range value would issue an invalid page load.
+                idx_min = int(indices.min().item())
+                idx_max = int(indices.max().item())
+                if idx_min < 0 or idx_max >= num_col_blocks:
+                    raise ValueError(
+                        "cuTile block-sparse backend requires all indices in "
+                        f"[0, N // C) = [0, {num_col_blocks}); got "
+                        f"[{idx_min}, {idx_max}]."
+                    )
+            self._R = R
+            self._C = C
+            self._M = M
+            self._N = N
+            self._num_qo_heads = num_qo_heads
+            self._num_kv_heads = num_kv_heads
+            self._head_dim = head_dim
+            self._causal = causal
+            self._sm_scale = sm_scale
+            indptr = indptr.to(self.device, non_blocking=non_blocking)
+            indices = indices.to(self.device, non_blocking=non_blocking)
+            self._sparse_indptr = indptr
+            self._sparse_indices = indices
+
+            # Materialize the dense block table and the per-batch length/offset
+            # arrays now (at plan time) so run() is CUDA-graph-capturable:
+            # everything here derives only from (indptr, indices, R, C), which
+            # are fixed at plan time. Reconstructing it in run() -- as an earlier
+            # version did -- forced a host `.item()` sync on max_pages plus ~6
+            # tensor allocations on every call, breaking graph capture (mirrors
+            # the plan-time block-table build in decode.py's cuTile backend).
+            num_block_rows = indptr.numel() - 1
+            nnz_per_row = (indptr[1:] - indptr[:-1]).to(torch.int32)
+            actual_seq_lens_q = torch.full(
+                (num_block_rows,), R, dtype=torch.int32, device=self.device
+            )
+            max_pages = int(nnz_per_row.max().item()) if num_block_rows > 0 else 0
+            block_tables = torch.zeros(
+                (num_block_rows, max_pages), dtype=torch.int32, device=self.device
+            )
+            col = torch.arange(max_pages, device=self.device)
+            valid = col[None, :] < nnz_per_row[:, None]
+            block_tables[valid] = indices.to(torch.int32)
+            actual_seq_offset = torch.nn.functional.pad(
+                actual_seq_lens_q.cumsum(0), (1, 0)
+            ).to(torch.int32)
+
+            self._sparse_num_block_rows = num_block_rows
+            self._sparse_actual_seq_lens_q = actual_seq_lens_q
+            self._sparse_actual_seq_lens_kv = (nnz_per_row * C).to(torch.int32)
+            self._sparse_block_tables = block_tables
+            self._sparse_actual_seq_offset = actual_seq_offset
+            return
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
@@ -621,7 +933,7 @@ class BlockSparseAttentionWrapper:
             self._sm_scale = sm_scale
             return
 
-        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
+        # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
         if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
@@ -639,10 +951,39 @@ class BlockSparseAttentionWrapper:
                 raise ValueError(
                     f"vsa_sm100_blk64 backend requires head_dim=128 (got {head_dim})"
                 )
-            if q_data_type != torch.bfloat16:
-                raise ValueError(
-                    "vsa_sm100_blk64 backend only supports bfloat16 inputs"
-                )
+            if kv_splits is not None and not isinstance(kv_splits, str):
+                if not (1 <= int(kv_splits) <= 256):
+                    raise ValueError(
+                        f"vsa_sm100_blk64 kv_splits must be in [1, 256], got {kv_splits}"
+                    )
+            is_sage_fp8 = q_scale is not None
+            if is_sage_fp8:
+                if k_scale is None or v_scale is None:
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires q_scale/k_scale/v_scale "
+                        "to all be provided together"
+                    )
+                if q_data_type != torch.float8_e4m3fn:
+                    raise ValueError(
+                        "vsa_sm100_blk64 backend requires q_data_type=float8_e4m3fn "
+                        "when q_scale is provided"
+                    )
+                if num_qo_heads not in (4, 8):
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires num_qo_heads in (4, 8) "
+                        f"(upstream kernel limit), got {num_qo_heads}"
+                    )
+            else:
+                if k_scale is not None or v_scale is not None:
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires q_scale/k_scale/v_scale "
+                        "to all be provided together"
+                    )
+                if q_data_type != torch.bfloat16:
+                    raise ValueError(
+                        "vsa_sm100_blk64 backend only supports bfloat16 inputs "
+                        "unless q_scale/k_scale/v_scale (Sage FP8) are provided"
+                    )
             # blk64 has no KV-head mapping: the launcher sizes K/V by the Q head
             # count, so num_qo_heads must equal num_kv_heads.
             _vsa_common_checks(
@@ -689,12 +1030,39 @@ class BlockSparseAttentionWrapper:
                     "(Q-blocks with zero KV blocks). All Q-blocks must attend to "
                     "at least one KV block."
                 )
+            # Note: the underlying blk64 CuTe-DSL kernel supports
+            # allow_empty_block_nums=True, but FlashInfer keeps rejecting empty
+            # sparse rows here to preserve existing behavior. Lifting this
+            # restriction only requires removing the check above and passing
+            # allow_empty_block_nums=True through to the kernel.
+
+            # Sage FP8 requires a uniform (dense) top-k across the whole
+            # sparsity pattern. Validate and cache the uniform value here
+            # (plan()-time, already synchronizing above on the same tensor)
+            # so run() doesn't need to sync on vsa_q2k_num on every call.
+            self._vsa_sage_fp8_block_sparse_num = None
+            if is_sage_fp8:
+                uniform_num = int(self._vsa_q2k_num[0, 0, 0].item())
+                if not torch.all(self._vsa_q2k_num == uniform_num):
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires a uniform number of "
+                        "KV blocks per Q-block across the whole sparsity "
+                        "pattern (upstream kernel limit: only a fixed "
+                        "block_sparse_num is supported, not per-row "
+                        "q2k_block_nums)."
+                    )
+                self._vsa_sage_fp8_block_sparse_num = uniform_num
 
             self.M = M
             self.N = N
             self.R = R
             self.C = C
             self._sm_scale = sm_scale
+            self._vsa_kv_splits = kv_splits
+            self._vsa_use_clc = use_clc
+            self._vsa_q_scale = q_scale
+            self._vsa_k_scale = k_scale
+            self._vsa_v_scale = v_scale
             return
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
@@ -779,7 +1147,7 @@ class BlockSparseAttentionWrapper:
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
-        if indices.max().item() * C > N:
+        if indices.numel() > 0 and indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
             (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
@@ -1023,6 +1391,80 @@ class BlockSparseAttentionWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
 
+        if self._backend == "cake":
+            from flashinfer.cake_vsa import run_cake_vsa
+
+            if scale_q is not None or scale_k is not None or scale_v is not None:
+                raise ValueError("cake backend does not accept FP8 scale tensors")
+            if self._cake_vsa_plan is None:
+                raise RuntimeError("plan() must be called before run()")
+            return run_cake_vsa(
+                self._cake_vsa_plan,
+                q,
+                k,
+                v,
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+                backend="cake",
+            )
+
+        # ---- cuTile backend (pure cuda.tile Python kernel) ------------------------
+        # Map the BSR plan onto a paged prefill: each block-row (R query rows) is one
+        # variable-length batch whose KV pages are the selected column-blocks (width C).
+        if self._backend == "cutile":
+            if return_lse:
+                raise NotImplementedError(
+                    "cuTile block-sparse backend does not support return_lse."
+                )
+            from .attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: PLC0415
+                prefill_attention_kv_paged_cutile,
+            )
+
+            R, C = self._R, self._C
+            num_block_rows = self._sparse_num_block_rows
+
+            # KV as page_size==C paged cache: [N, H_kv, D] -> [N // C, C, H_kv, D].
+            k_cache = k.reshape(self._N // C, C, self._num_kv_heads, self._head_dim)
+            v_cache = v.reshape(self._N // C, C, self._num_kv_heads, v.shape[-1])
+
+            # Block table + per-batch length/offset arrays were materialized at
+            # plan() time (they derive only from indptr/indices/R/C), so run()
+            # does no host sync or allocation here and stays graph-capturable.
+            actual_seq_lens_q = self._sparse_actual_seq_lens_q
+            actual_seq_lens_kv = self._sparse_actual_seq_lens_kv
+            block_tables = self._sparse_block_tables
+            actual_seq_offset = self._sparse_actual_seq_offset
+
+            # The kernel folds the softmax scale into k_scale (qk_scale =
+            # k_scale * INV_LOG_2), so k_scale must carry the 1/sqrt(head_dim)
+            # softmax scale, matching single_prefill_with_kv_cache's default.
+            sm_scale = self._sm_scale
+            if sm_scale is None:
+                sm_scale = 1.0 / math.sqrt(self._head_dim)
+
+            out, _ = prefill_attention_kv_paged_cutile(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                actual_seq_lens_q=actual_seq_lens_q,
+                actual_seq_lens_kv=actual_seq_lens_kv,
+                actual_seq_offset=actual_seq_offset,
+                block_tables=block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0,
+                num_batch=num_block_rows,
+                # Each block-row is one variable-length batch of exactly R query
+                # rows, so the per-batch max query length is R (not the global M).
+                # Passing R sizes the grid / LPT tile count to exactly ceil(R/
+                # BLOCK_M) tiles instead of ceil(M/BLOCK_M), avoiding the ~M/R x
+                # over-launch of CTAs that would otherwise early-return.
+                max_seq_len=R,
+                is_causal=self._causal,
+                outputs=out,
+            )
+            return out
+
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------
         if self._backend == "vsa_sm100_blk128":
             from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import (
@@ -1042,13 +1484,13 @@ class BlockSparseAttentionWrapper:
                 return_lse,
             )
 
-        # ---- VSA blk64 backend (BSA C++ kernel, SM100/SM103) ----------------------
+        # ---- VSA blk64 backend (BSA CuTe-DSL kernel, SM100/SM103) -----------------
         if self._backend == "vsa_sm100_blk64":
             from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
                 bsa_attn_sm100_blk64_fwd,
             )  # noqa: PLC0415
 
-            return _vsa_run_core(
+            return _vsa_run_core_blk64(
                 bsa_attn_sm100_blk64_fwd,
                 q,
                 k,
@@ -1059,6 +1501,12 @@ class BlockSparseAttentionWrapper:
                 out,
                 lse,
                 return_lse,
+                self._vsa_kv_splits,
+                self._vsa_use_clc,
+                self._vsa_q_scale,
+                self._vsa_k_scale,
+                self._vsa_v_scale,
+                self._vsa_sage_fp8_block_sparse_num,
             )
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
