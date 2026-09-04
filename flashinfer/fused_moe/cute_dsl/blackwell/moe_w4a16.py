@@ -48,7 +48,6 @@ DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
 
 @dataclass
 class _W4A16Workspace:
-    num_tokens_capacity: int
     moe_sort_buffers: Dict[str, torch.Tensor]
     hidden_workspace: torch.Tensor
     intermediate: torch.Tensor
@@ -64,46 +63,32 @@ def _get_workspace(
     num_local_experts: int,
     intermediate_size: int,
     route_tile: int,
-    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> _W4A16Workspace:
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
         num_tokens, top_k, num_local_experts, route_tile
     )
-    key = (
-        x.device,
-        top_k,
-        int(x.size(1)),
-        int(intermediate_size),
-        int(num_experts),
-        int(num_local_experts),
-        route_tile,
+    return _W4A16Workspace(
+        moe_sort_buffers=allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            tile_tokens_dim=route_tile,
+            device=x.device,
+        ),
+        # Match the established W4A4 wrapper path: scratch tensors are local to
+        # one invocation, so PyTorch's caching allocator can reuse them across
+        # sequential layers and its private graph pool owns captured addresses.
+        hidden_workspace=torch.empty(
+            (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
+        ),
+        intermediate=torch.empty(
+            (route_slots, intermediate_size),
+            dtype=torch.bfloat16,
+            device=x.device,
+        ),
     )
-    workspace = workspace_cache.get(key) if workspace_cache is not None else None
-    if workspace is None or workspace.num_tokens_capacity < num_tokens:
-        workspace = _W4A16Workspace(
-            num_tokens_capacity=num_tokens,
-            moe_sort_buffers=allocate_moe_sort_buffers(
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=num_local_experts,
-                tile_tokens_dim=route_tile,
-                device=x.device,
-            ),
-            # Permuted input is dead before GEMM2 writes its output.
-            hidden_workspace=torch.empty(
-                (route_slots, x.size(1)), dtype=torch.bfloat16, device=x.device
-            ),
-            intermediate=torch.empty(
-                (route_slots, intermediate_size),
-                dtype=torch.bfloat16,
-                device=x.device,
-            ),
-        )
-        if workspace_cache is not None:
-            workspace_cache[key] = workspace
-    return workspace
 
 
 def _get_compiled_kernel(
@@ -393,7 +378,6 @@ def launch_w4a16_moe(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     tactic: Optional[W4A16MoeTactic] = None,
-    workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
@@ -419,7 +403,6 @@ def launch_w4a16_moe(
         num_local_experts,
         intermediate_size,
         route_tile,
-        workspace_cache,
     )
 
     (

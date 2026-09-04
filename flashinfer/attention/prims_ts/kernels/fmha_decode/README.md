@@ -55,7 +55,7 @@ graph. This is not a public knob.
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
 | Page size | 16, 32, 64, or 128 tokens |
-| Maximum K/V length | `2,147,483,520` (`INT32_MAX - 127`), reserving the padded endpoint of a 128-token K/V tile |
+| Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
 | Scheduling | Automatic direct or CLC-persistent launch; eligible underfilled fixed-Q grids may use split-KV. Packed-Q and sliding-window grids remain nonsplit. No public tuning knob. |
@@ -230,13 +230,14 @@ For the standalone workflow, call
 `get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
 window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
-tensor. Zero it before first use and re-zero it whenever an argument that
-contributes to the semantic JIT key changes, because the internal workspace
-section offsets can change with that key. Do not share it between concurrent
-launches or captured graphs. It must not overlap Q, K/V cache, metadata, or
-output storage. The standalone hot path trusts CSR, `seq_lens`, and packed-Q
-values: keep lengths positive and within their static bounds, keep enough page
-entries in every CSR row for its live length, and keep all page IDs valid. CSR
+tensor. Zero it before first use and re-zero it whenever any workspace-layout
+input, including batch size, changes because the internal workspace section
+offsets can move even when the compiled callable is reused. Do not share it
+between concurrent launches or captured graphs. It must not overlap Q, K/V
+cache, metadata, or output storage. The standalone hot path trusts CSR,
+`seq_lens`, and packed-Q values: keep lengths positive and within their static
+bounds, keep enough page entries in every CSR row for its live length, and keep
+all page IDs valid. CSR
 offsets, sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution

@@ -472,8 +472,6 @@ def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
             (128, 32, 128),
             (128, 64, 128),
             (128, 128, 128),
-            (256, 128, 128),
-            (128, 256, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
@@ -721,16 +719,10 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
-    gemm_path = (
-        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_GEMM
-    )
-    gemm_checksum = (
-        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_GEMM
-    )
+    # One GEMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    gemm_path = ArtifactPath.TRTLLM_GEN_GEMM
+    gemm_checksum = CheckSumHash.TRTLLM_GEN_GEMM
     module_name = "trtllm_gemm_sm107" if enable_rubin else "trtllm_gemm"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{gemm_path}/include"
@@ -908,16 +900,10 @@ def gen_gemm_sm90_module() -> JitSpec:
 
 
 def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
-    gemm_path = (
-        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_GEMM
-    )
-    gemm_checksum = (
-        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_GEMM
-    )
+    # One GEMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    gemm_path = ArtifactPath.TRTLLM_GEN_GEMM
+    gemm_checksum = CheckSumHash.TRTLLM_GEN_GEMM
     module_name = (
         "trtllm_low_latency_gemm_sm107" if enable_rubin else "trtllm_low_latency_gemm"
     )

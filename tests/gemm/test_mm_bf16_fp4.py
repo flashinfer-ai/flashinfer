@@ -278,8 +278,10 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     Shapes cover even and uneven K splits plus padded M rows."""
     _skip_if_backend_unavailable("cute-dsl")
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _SM100_BF16_FP4_TACTICS,
         _bf16_fp4_cute_dsl_tactic_configs,
         _cute_dsl_bf16_fp4_runner,
+        _cute_dsl_sm100_bf16_fp4_runner,
         _prepare_bf16_fp4_alpha,
     )
     from flashinfer.utils import get_device_sm_count
@@ -295,25 +297,39 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
 
-    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
-    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    cc_major = get_compute_capability(device)[0]
+    if cc_major == 10:
+        runner = _cute_dsl_sm100_bf16_fp4_runner(enable_pdl=True)
+        tactics = tuple(enumerate(_SM100_BF16_FP4_TACTICS))
+        sf_for_launch = sf_p
+    else:
+        runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
+        tactics = tuple(
+            enumerate(
+                _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
+            )
+        )
+        sf_for_launch = sf_p.view(torch.uint8).contiguous()
+
     alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
-    for tactic, cfg in enumerate(
-        _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
-    ):
-        if cfg[7] == "gemv" and (m != 1 or get_compute_capability(device)[0] != 12):
+    for tactic_index, cfg in tactics:
+        if cc_major == 12 and cfg[7] == "gemv" and m != 1:
             continue
+        tactic = cfg if cc_major == 10 else tactic_index
         outs = []
         for _ in range(2):
             out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
             runner.forward(
-                [a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=tactic
+                [a, b_p, sf_for_launch, alpha_l, torch.bfloat16, out, 16],
+                tactic=tactic,
             )
             outs.append(out)
         torch.cuda.synchronize()
-        _assert_close_to_reference(outs[0], ref, f"cute-dsl tactic {tactic} {cfg}")
+        _assert_close_to_reference(
+            outs[0], ref, f"cute-dsl tactic {tactic_index} {cfg}"
+        )
         assert torch.equal(outs[0], outs[1]), (
-            f"tactic {tactic} {cfg} is not deterministic across runs"
+            f"tactic {tactic_index} {cfg} is not deterministic across runs"
         )
 
 
@@ -486,6 +502,25 @@ def test_backend_shape_mismatch_raises(backend):
             alpha_p,
             backend=backend,
         )
+
+
+def test_cute_dsl_prepare_uses_architecture_specific_layout():
+    """SM100 keeps 128x4 SF storage; SM12x uses the legacy linear repack."""
+    _skip_if_backend_unavailable("cute-dsl")
+    device = torch.device("cuda")
+    n, k = 192, 192
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cute-dsl")
+    major, minor = get_compute_capability(device)
+    if major * 10 + minor in (100, 103):
+        assert b_p.dtype == torch.uint8
+        assert b_p.shape == b_fp4.shape
+        assert sf_p.data_ptr() == b_sf.data_ptr()
+        assert sf_p.dim() == 6
+    else:
+        assert b_p.dtype == torch.int32
+        assert sf_p.shape == (k // 16, n)
 
 
 # =============================================================================

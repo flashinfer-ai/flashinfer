@@ -59,6 +59,7 @@ from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
+    f32_reciprocal,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
@@ -1987,7 +1988,10 @@ class Sm100W4A16GroupedGemmKernel:
                                 self.activation_type == ActivationType.Swiglu.value
                                 and self.situ_beta is not None
                             ):
-                                situ_beta = cutlass.Float32(self.situ_beta)
+                                # Keep the Python float so situ_f32 can fold
+                                # 1 / beta at trace time instead of emitting a
+                                # per-element div.rn.f32.
+                                situ_beta = self.situ_beta
                                 situ_gate_pair = (
                                     situ_f32(gate_pair[0], situ_beta, fastmath=True),
                                     situ_f32(gate_pair[1], situ_beta, fastmath=True),
@@ -1996,14 +2000,17 @@ class Sm100W4A16GroupedGemmKernel:
                                     self.situ_linear_beta is not None
                                 ):
                                     linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                    inv_linear_beta = cutlass.Float32(
+                                        f32_reciprocal(self.situ_linear_beta)
+                                    )
                                     up_pair = (
                                         linear_beta
                                         * tanh_f32(
-                                            up_pair[0] / linear_beta, fastmath=True
+                                            up_pair[0] * inv_linear_beta, fastmath=True
                                         ),
                                         linear_beta
                                         * tanh_f32(
-                                            up_pair[1] / linear_beta, fastmath=True
+                                            up_pair[1] * inv_linear_beta, fastmath=True
                                         ),
                                     )
                                 result = cute.arch.mul_packed_f32x2(

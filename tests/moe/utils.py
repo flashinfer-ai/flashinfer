@@ -23,7 +23,20 @@ import torch
 from torch.nn import functional as F
 
 from flashinfer import is_gated_activation
-from flashinfer.fused_moe import WeightLayout
+from flashinfer.fused_moe import (
+    ActivationConfig,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU,
+    ReLU2,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    WeightLayout,
+)
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
@@ -37,6 +50,17 @@ from flashinfer.tllm_enums import (
 from flashinfer.utils import get_compute_capability
 
 
+def assert_trtllm_packed_call_contract(runner, inputs) -> None:
+    """Check the metadata contract shared by TRTLLM unified runner packers."""
+    from flashinfer.fused_moe.runners import _TrtllmPackedInputs
+
+    assert isinstance(inputs, _TrtllmPackedInputs)
+    assert runner.tuning_config_for(inputs) is inputs.tuning_config
+    assert runner.launch_kwargs_for(inputs) == {"launch_state": inputs.launch_state}
+    with pytest.raises(RuntimeError, match="pack_inputs must return"):
+        runner.tuning_config_for(list(inputs))
+
+
 class QuantMode(IntEnum):
     """Supported quantization modes for MoE testing."""
 
@@ -48,6 +72,127 @@ class QuantMode(IntEnum):
     FP8_PER_TENSOR = 6
     BF16 = 7
     MXINT4_BF16_BF16 = 8
+    FP8_PER_CHANNEL = 9
+
+
+def compute_reference_activation(
+    values: torch.Tensor,
+    activation: ActivationConfig,
+    intermediate_size: int,
+) -> torch.Tensor:
+    """Apply the typed unified-MoE activation with its BF16 precision boundary."""
+    if activation.is_gated:
+        up, gate = values.split(intermediate_size, dim=-1)
+        gate = gate.float()
+        up = up.float()
+        if isinstance(activation, SwiGLU):
+            gate = gate.clamp(max=activation.limit)
+            up = up.clamp(min=-activation.limit, max=activation.limit)
+            result = (
+                gate * torch.sigmoid(activation.alpha * gate) * (up + activation.beta)
+            )
+        elif isinstance(activation, SwiGLUStep):
+            result = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                min=-activation.limit, max=activation.limit
+            )
+        elif isinstance(activation, GeGLU):
+            result = F.gelu(gate, approximate="none") * up
+        elif isinstance(activation, GeGLUTanh):
+            result = F.gelu(gate, approximate="tanh") * up
+        elif isinstance(activation, SiTU):
+            if activation.clamp_limit is not None:
+                gate = gate.clamp(max=activation.clamp_limit)
+                up = up.clamp(min=-activation.clamp_limit, max=activation.clamp_limit)
+            gate = (
+                activation.gate_scale
+                * torch.tanh(gate / activation.gate_scale)
+                * torch.sigmoid(gate)
+            )
+            if activation.linear_scale is not None:
+                up = activation.linear_scale * torch.tanh(up / activation.linear_scale)
+            result = gate * up
+        else:
+            raise ValueError(f"unsupported gated activation {activation!r}")
+    else:
+        values = values.float()
+        if isinstance(activation, ReLU2):
+            result = F.relu(values).square()
+        elif isinstance(activation, Identity):
+            result = values
+        elif isinstance(activation, GELU):
+            result = F.gelu(values, approximate="none")
+        elif isinstance(activation, ReLU):
+            result = F.relu(values)
+        elif isinstance(activation, SiLU):
+            result = F.silu(values)
+        else:
+            raise ValueError(f"unsupported non-gated activation {activation!r}")
+    return result.to(torch.bfloat16)
+
+
+def compute_reference_moe(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: ActivationConfig,
+) -> torch.Tensor:
+    """Torch reference for pre-routed BF16-activation MoE execution."""
+    num_tokens, hidden_size = hidden_states.shape
+    intermediate_size = w2.shape[2]
+    result = torch.zeros(
+        num_tokens, hidden_size, dtype=torch.float32, device=hidden_states.device
+    )
+    top_k = topk_ids.shape[1]
+    flat_experts = topk_ids.reshape(-1).to(torch.int64)
+    flat_tokens = torch.arange(
+        num_tokens, dtype=torch.int64, device=hidden_states.device
+    ).repeat_interleave(top_k)
+    flat_weights = topk_weights.reshape(-1)
+
+    # Sorting once lets experts with the same assignment count share a batched
+    # GEMM. Chunking bounds temporary converted-weight storage for realistic
+    # models while replacing hundreds of tiny per-expert launches.
+    order = torch.argsort(flat_experts, stable=True)
+    sorted_experts = flat_experts[order]
+    sorted_tokens = flat_tokens[order]
+    sorted_weights = flat_weights[order]
+    active_experts, counts = torch.unique_consecutive(
+        sorted_experts, return_counts=True
+    )
+    starts = counts.cumsum(0) - counts
+    expert_batch_size = 32
+    for assignment_count in torch.unique(counts).tolist():
+        count_group = torch.where(counts == assignment_count)[0]
+        assignment_offsets = torch.arange(
+            assignment_count, dtype=torch.int64, device=hidden_states.device
+        )
+        for batch_start in range(0, count_group.numel(), expert_batch_size):
+            active_indices = count_group[batch_start : batch_start + expert_batch_size]
+            expert_ids = active_experts[active_indices]
+            assignment_indices = starts[active_indices, None] + assignment_offsets
+            token_ids = sorted_tokens[assignment_indices]
+            routing_weights = sorted_weights[assignment_indices]
+
+            expert_inputs = hidden_states[token_ids].float()
+            gemm1 = torch.bmm(
+                expert_inputs,
+                w1[expert_ids].float().transpose(1, 2),
+            ).to(torch.bfloat16)
+            intermediate = compute_reference_activation(
+                gemm1, activation, intermediate_size
+            )
+            expert_output = torch.bmm(
+                intermediate,
+                w2[expert_ids].transpose(1, 2),
+            ).float()
+            result.index_add_(
+                0,
+                token_ids.reshape(-1),
+                (expert_output * routing_weights[..., None]).reshape(-1, hidden_size),
+            )
+    return result.to(torch.bfloat16)
 
 
 @contextmanager
@@ -103,6 +248,7 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
     QuantMode.BF16,
+    QuantMode.FP8_PER_CHANNEL,
 ]
 
 GEGLU_SUPPORTED_QUANT_MODES = [
@@ -341,6 +487,7 @@ def compute_reference_moe_fp4(
     swiglu_limit: float | None = None,
     situ_beta: float | None = None,
     situ_linear_beta: float | None = None,
+    wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -481,7 +628,15 @@ def compute_reference_moe_fp4(
                         * (linear + swiglu_beta)
                     )
             else:
-                act_out = torch.relu(gemm1_out) ** 2
+                # wrong_formula drops the square, giving a genuinely different
+                # non-gated activation over identical weights. Used as a
+                # negative control to prove a tolerance can distinguish
+                # activation formulas rather than just output magnitude.
+                act_out = (
+                    torch.relu(gemm1_out)
+                    if wrong_formula
+                    else torch.relu(gemm1_out) ** 2
+                )
 
             if fc2_input_scale is not None:
                 if use_per_token_activation:
@@ -997,6 +1152,7 @@ def compute_reference_moe_relu2(
     hidden_size: int,
     intermediate_size: int,
     fc2_input_scale: torch.Tensor | None,
+    wrong_formula: bool = False,
 ) -> torch.Tensor:
     """Reference ReLU2 MoE: output = relu(FC1(x))^2, then FC2."""
     output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
@@ -1013,7 +1169,14 @@ def compute_reference_moe_relu2(
 
             w1 = fc1_weights[expert_idx]
             fc1_out = token_input @ w1.T
-            activated = torch.square(torch.relu(fc1_out))
+            # wrong_formula drops the square: a genuinely different non-gated
+            # activation over the same weights, used as a negative control to
+            # prove a tolerance can distinguish activation formulas.
+            activated = (
+                torch.relu(fc1_out)
+                if wrong_formula
+                else torch.square(torch.relu(fc1_out))
+            )
 
             if fc2_input_scale is not None:
                 activated = quant_dequant_fp4_reference(

@@ -36,6 +36,7 @@ from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+import cutlass
 from cutlass.utils import HardwareInfo
 
 from moe_nvfp4_swapab.epilogue import (
@@ -94,7 +95,14 @@ class ProblemDesc:
     gate_up_clamp: Optional[float] = None
 
     scenario: Literal["2Dx3D"] = "2Dx3D"
-    kind: Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"] = "nvfp4"
+    kind: Literal[
+        "nvfp4",
+        "mxfp8_e4m3",
+        "mxfp8_e5m2",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "bf16",
+    ] = "nvfp4"
     acc_dtype: torch.dtype = torch.float32
     fc1_activation_layout: Literal["k_major"] = "k_major"
     fc1_weight_layout: Literal["k_major"] = "k_major"
@@ -146,9 +154,17 @@ class ProblemDesc:
             raise ValueError(
                 f"Only scenario='2Dx3D' is supported in v1, got {self.scenario!r}."
             )
-        if self.kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):
+        if self.kind not in (
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "bf16",
+        ):
             raise ValueError(
-                f"kind must be one of 'nvfp4', 'mxfp8_e4m3', 'mxfp8_e5m2'; "
+                f"kind must be one of 'nvfp4', 'mxfp8_e4m3', 'mxfp8_e5m2', "
+                f"'fp8_e4m3', 'fp8_e5m2', 'bf16'; "
                 f"got {self.kind!r}."
             )
         if self.fc2_output_dtype not in (torch.bfloat16, torch.float16):
@@ -202,27 +218,28 @@ class ProblemDesc:
             check_tma_leading_dim_align as _check_tma_leading_dim_align,
         )
 
+        _ab_tma_dtype = kind_data_dtype(self.kind)
         _check_tma_leading_dim_align(
             "activation",
             {"k_major": self.hidden}[self.fc1_activation_layout],
-            Nvfp4DataDtype,
+            _ab_tma_dtype,
         )
         _check_tma_leading_dim_align(
             "fc1_weight",
             {"k_major": self.hidden}[self.fc1_weight_layout],
-            Nvfp4DataDtype,
+            _ab_tma_dtype,
         )
         _check_tma_leading_dim_align(
             "fc2_weight",
             {"k_major": self.intermediate // 2, "n_major": self.hidden}[
                 self.fc2_weight_layout
             ],
-            Nvfp4DataDtype,
+            _ab_tma_dtype,
         )
         _check_tma_leading_dim_align(
             "fc1_output (kernel-internal, fixed k_major)",
             self.intermediate // 2,
-            Nvfp4DataDtype,
+            _ab_tma_dtype,
         )
         _check_tma_leading_dim_align(
             "fc2_output",
@@ -291,6 +308,13 @@ class ImplDesc:
     flag_batch: int = 4
     epi_flag_batch: Optional[Tuple[int, int]] = (1, 1)
 
+    def _validate_mma_cta_mode(self, m: int) -> None:
+        if self.use_2cta_instrs != (m == 256):
+            raise ValueError(
+                f"use_2cta_instrs ({self.use_2cta_instrs}) must equal "
+                f"(mma_tiler_m == 256), got mma_tiler_m={m}."
+            )
+
     def __post_init__(self) -> None:
         m, n, _k = self.mma_tiler_mnk
         cm, cn, cl = self.cluster_shape_mnk
@@ -312,11 +336,7 @@ class ImplDesc:
                 f"cluster_m must be in [1, 16] and cluster_m*cluster_n <=16, "
                 f"got cluster=({cm},{cn})."
             )
-        if self.use_2cta_instrs != (m == 256):
-            raise ValueError(
-                f"use_2cta_instrs ({self.use_2cta_instrs}) must equal "
-                f"(mma_tiler_m == 256), got mma_tiler_m={m}."
-            )
+        self._validate_mma_cta_mode(m)
         if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
                 f"load_balance_mode must be 'static' or 'atomic_counter' "
@@ -424,6 +444,8 @@ class MiscDesc:
     # this runner via DKG_IKET_INSTRUMENTATION_METHOD.
     enable_iket: bool = False
     verbose: bool = False
+    perf_warmup: int = 0
+    perf_iters: int = 1
 
     @property
     def profile_friendly(self) -> bool:
@@ -436,6 +458,8 @@ class MiscDesc:
                 f"ref_compute_graph must be 'transformers' or 'deepgemm', "
                 f"got {self.ref_compute_graph!r}."
             )
+        self.perf_warmup = max(0, int(self.perf_warmup))
+        self.perf_iters = max(1, int(self.perf_iters))
 
     def __str__(self) -> str:
         return (
@@ -1098,7 +1122,7 @@ class Fc12TesterBase:
 
     def _partition_workspace(
         self,
-        mma_tiler_n: int,
+        counter_token_tile: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Slice the opaque byte ``self.workspace`` into per-section views.
 
@@ -1119,11 +1143,9 @@ class Fc12TesterBase:
         further wrap each into a ``cute.Tensor`` via
         ``cutlass_torch.from_dlpack`` before passing to the kernel.
 
-        ``mma_tiler_n`` is the token-axis CTA tile size under swap-AB
-        (= ``mma_tiler_mnk[1]``).  Drives the fc1_done counter sizing
-        because the counter is indexed along the token axis: slot =
-        ``cumulative_token_block_count + tile_n_idx``, and each
-        token-block covers ``mma_tiler_n`` consecutive tokens.
+        ``counter_token_tile`` is the token-axis cluster tile size used by
+        the kernel's fc1_done counter.  NVFP4 swap-AB uses the user N tile;
+        MXFP8 non-swap uses the user M tile adjusted for the 2CTA split.
         """
         problem = self.problem
         experts = problem.experts
@@ -1142,8 +1164,8 @@ class Fc12TesterBase:
         sf_total_rows_upper = data_total_rows + experts * SfPaddingBlock
         sf_block_cols = ((intermediate_downproj // sf_vec_size) + 3) // 4 * 4
         counter_slots_upper = (
-            data_total_rows + mma_tiler_n - 1
-        ) // mma_tiler_n + experts
+            data_total_rows + counter_token_tile - 1
+        ) // counter_token_tile + experts
 
         fc1_output_byte_count = data_total_rows * intermediate_downproj * elem_bits // 8
         fc1_output_sf_byte_count = sf_total_rows_upper * sf_block_cols
@@ -1293,17 +1315,25 @@ class Fc12TesterBase:
 
         # -- 3. Workspace partition (torch views) --
         #
-        # ``mma_tiler_n`` is the token-axis CTA tile size under swap-AB
-        # (see ``_partition_workspace`` docstring); it drives the
-        # fc1_done counter slot count via the same formula the kernel
-        # side uses in ``get_workspace_size_in_bytes``.
-        mma_tiler_n = self.impl.mma_tiler_mnk[1]
+        # Counter slots must match the kernel's fc1_done_counter indexing.
+        # NVFP4 swap-AB indexes token blocks by the user N tile.  MXFP8
+        # non-swap indexes token blocks by the cluster M tile: per-CTA M is
+        # halved only for 2CTA instructions, then multiplied by cluster_m.
+        if self.problem.kind == "nvfp4":
+            counter_token_tile = self.impl.mma_tiler_mnk[1]
+        else:
+            atom_thr_size = 2 if self.impl.use_2cta_instrs else 1
+            counter_token_tile = (
+                self.impl.mma_tiler_mnk[0]
+                // atom_thr_size
+                * self.impl.cluster_shape_mnk[0]
+            )
         (
             fc1_output_torch,
             fc1_output_sf_torch,
             fc1_done_counter_torch,
             load_balance_counter_torch,
-        ) = self._partition_workspace(mma_tiler_n)
+        ) = self._partition_workspace(counter_token_tile)
 
         # -- 4. Torch -> cute --
         def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
@@ -1366,6 +1396,7 @@ class Fc12TesterBase:
             runtime_kwargs["fc1_alpha"] = _to_cute(self.fc1_alpha, assumed_align=4)
         if self.fc2_alpha is not None:
             runtime_kwargs["fc2_alpha"] = _to_cute(self.fc2_alpha, assumed_align=4)
+        runtime_kwargs.update(self._extra_kernel_runtime_kwargs(_to_cute))
 
         # Subclass hook: inject extra tensor kwargs (e.g. generate_c output).
         for k, v in self._extra_runtime_kwargs().items():
@@ -1389,19 +1420,83 @@ class Fc12TesterBase:
         self._launch_runtime_kwargs = runtime_kwargs
 
         # -- 6. Launch --
-        if not self.misc.run_target_kernel_only:
-            with torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-            ) as prof:
-                compiled_kernel(**runtime_kwargs)
-                torch.cuda.synchronize()
-            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=-1))
-        else:
+        if self.misc.run_target_kernel_only:
             compiled_kernel(**runtime_kwargs)
             torch.cuda.synchronize()
+        else:
+            self._launch_compiled_kernel_with_torch_profiler(
+                compiled_kernel,
+                runtime_kwargs,
+            )
+
+    @staticmethod
+    def _profiler_event_cuda_time_us(event) -> float:
+        """Return CUDA/device time in microseconds from a torch profiler event."""
+        for attr_name in ("device_time_total", "cuda_time_total"):
+            value = getattr(event, attr_name, None)
+            if value is not None:
+                return float(value)
+        return 0.0
+
+    def _reset_workspace_for_relaunch(self) -> None:
+        """Reset per-launch counters before reusing the compiled kernel."""
+        if self.workspace is not None:
+            self.workspace.zero_()
+
+    def _report_torch_profiler_kernel_time(self, prof, num_iters: int) -> None:
+        """Print per-launch CUDA time for the fused fc12 kernel."""
+        kernel_time_us = 0.0
+        matched_event_names = []
+        for event in prof.events():
+            event_name = getattr(event, "key", "")
+            if not event_name.startswith("kernel_cutlass"):
+                continue
+            matched_event_names.append(event_name)
+            kernel_time_us += self._profiler_event_cuda_time_us(event)
+
+        if matched_event_names:
+            kernel_time_us /= max(1, num_iters)
+        else:
+            kernel_time_us = float("nan")
+
+        def _fmt(time_us: float) -> str:
+            return f"{time_us:.2f} us" if np.isfinite(time_us) else "n/a"
+
+        print("---- torch profiler standalone fc12 CUDA time ----")
+        print(
+            f"  warmup={self.misc.perf_warmup} "
+            f"timed_iters={num_iters} "
+            f"kernel_cutlass_per_launch={_fmt(kernel_time_us)}"
+        )
+        if not matched_event_names:
+            print("  warning: no kernel_cutlass* events matched")
+
+    def _launch_compiled_kernel_with_torch_profiler(
+        self,
+        compiled_kernel,
+        runtime_kwargs,
+    ) -> None:
+        """Warm up outside profiler, then report timed kernel CUDA time."""
+        for _ in range(self.misc.perf_warmup):
+            self._reset_workspace_for_relaunch()
+            compiled_kernel(**runtime_kwargs)
+        torch.cuda.synchronize()
+
+        n_iters = max(1, self.misc.perf_iters)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        ) as prof:
+            for _ in range(n_iters):
+                self._reset_workspace_for_relaunch()
+                compiled_kernel(**runtime_kwargs)
+            torch.cuda.synchronize()
+
+        self._report_torch_profiler_kernel_time(prof, n_iters)
+        print("---- torch profiler raw aggregate table (timed region) ----")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=-1))
 
     # ------------------------------------------------------------------
     # Optional debug checks
@@ -1759,6 +1854,10 @@ class Fc12TesterBase:
         """
         return fc2_fp32
 
+    def _extra_kernel_runtime_kwargs(self, to_cute) -> dict:
+        """Optional kind-specific runtime kwargs appended after common tensors."""
+        return {}
+
     def _extra_runtime_kwargs(self) -> dict:
         """Return extra kwargs to merge into runtime_kwargs before cute.compile.
 
@@ -1914,6 +2013,24 @@ def add_common_fc12_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Only for perf simulators: all tensors except offs are empty / undefined.",
+    )
+    parser.add_argument(
+        "--perf_warmup",
+        type=int,
+        default=0,
+        help=(
+            "Untimed in-process warmup launches before torch-profiler timing "
+            "(standalone fc12 runner only)."
+        ),
+    )
+    parser.add_argument(
+        "--perf_iters",
+        type=int,
+        default=1,
+        help=(
+            "Timed in-process launches; reported kernel_cutlass CUDA time is "
+            "divided by this count."
+        ),
     )
     parser.add_argument(
         "--enable_debug_checks",

@@ -109,8 +109,18 @@ def _prune_scope(manifest_path: Path) -> set[str]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("selection", {}).get("sanity_test"):
         raise ValueError("a sampled manifest cannot authorize pruning")
-    test_path = (REPO_ROOT / Path(manifest["test_path"])).resolve()
-    if test_path != (REPO_ROOT / "tests").resolve():
+
+    def _resolve_scope(raw: str) -> Path:
+        path = Path(raw)
+        return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+    if manifest.get("test_paths"):
+        resolved = tuple(_resolve_scope(path) for path in manifest["test_paths"])
+    else:
+        resolved = tuple(
+            _resolve_scope(part) for part in str(manifest["test_path"]).split()
+        )
+    if resolved != ((REPO_ROOT / "tests").resolve(),):
         raise ValueError("pruning requires a complete collection rooted at tests/")
     plan = Plan.from_dict(manifest["plan"])
     return {node.nodeid for node in plan.nodes}

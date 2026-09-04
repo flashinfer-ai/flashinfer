@@ -211,6 +211,66 @@ def gen_vllm_comm_module() -> JitSpec:
     )
 
 
+def gen_pcie_ipc_comm_debug_module(
+    stall_ns: int,
+    stall_island: int,
+    no_block_epoch: int = 0,
+    per_block_epoch: int = 0,
+    no_barrier_entry_sync: int = 0,
+) -> JitSpec:
+    """Build the kernels with one protocol mechanism disabled. Not for shipping.
+
+    Used by the opt-in negative-control tests and by the benchmark's
+    ``--protocol-ab`` mode. Every switch produces an INCORRECT build.
+
+    ``stall_ns``/``stall_island``
+        Stall one island between the owner-pair rendezvous and the cross read.
+        The only way to open the TP8 cross-island window -- a host-side delay
+        cannot, because the pair barrier releases both islands together.
+
+    ``no_block_epoch``
+        Pin the scratch to half 0, i.e. no double buffer. Matches what the two
+        staged TP8 kernels used to do; for the others it is a protocol that
+        never shipped.
+
+    ``per_block_epoch``
+        Pick the half by per-block parity instead of per call. Matches what
+        TP2, TP4 and the TP8 pack kernel used to do. One change in grid size
+        then desynchronises the block ranges permanently.
+
+    ``no_barrier_entry_sync``
+        Drop the leading CTA barrier from the three signalling helpers. Applies
+        to every kernel that takes a barrier.
+    """
+    return gen_jit_spec(
+        f"pcie_ipc_comm_dbg{stall_ns}_{stall_island}_{no_block_epoch}"
+        f"_{per_block_epoch}_{no_barrier_entry_sync}",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+        ],
+        extra_cuda_cflags=[
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_CROSS_STALL_NS={stall_ns}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_STALL_ISLAND={stall_island}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BLOCK_EPOCH={no_block_epoch}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_PER_BLOCK_EPOCH={per_block_epoch}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BARRIER_ENTRY_SYNC={no_barrier_entry_sync}",
+        ],
+    )
+
+
+def gen_pcie_ipc_comm_module() -> JitSpec:
+    # No architecture restriction: the kernels use only plain PTX loads/stores
+    # and CUDA IPC, both of which predate every architecture flashinfer builds
+    # for. The target is a PCIe machine without NVLink, which is orthogonal to
+    # the SM version.
+    return gen_jit_spec(
+        "pcie_ipc_comm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+        ],
+    )
+
+
 def gen_ulysses_a2a_module() -> JitSpec:
     return gen_jit_spec(
         "ulysses_a2a",

@@ -482,20 +482,26 @@ def _registry_by_fi_api() -> dict[str, tuple[Callable, list]]:
     """fi_api -> (undecorated original, [templates]) from the live trace registry."""
     out: dict[str, tuple[Callable, list]] = {}
     try:
-        from flashinfer.api_logging import _TRACE_REGISTRY  # noqa: PLC0415
+        from flashinfer.api_logging import (  # noqa: PLC0415
+            _TRACE_FI_API_ALIASES,
+            _TRACE_REGISTRY,
+            _trace_fi_api_for,
+        )
     except Exception:  # noqa: BLE001
         return out
     for original, template, _label in _TRACE_REGISTRY:
         module = getattr(original, "__module__", "") or ""
         qualname = getattr(original, "__qualname__", "") or ""
-        fi_api = f"{module}.{qualname}" if module else qualname
-        if not fi_api:
-            continue
-        entry = out.get(fi_api)
-        if entry is None:
-            out[fi_api] = (original, [template])
-        else:
-            entry[1].append(template)
+        moved_fi_api = f"{module}.{qualname}" if module else qualname
+        fi_apis = [api for api in (_trace_fi_api_for(original), moved_fi_api) if api]
+        if moved_fi_api in _TRACE_FI_API_ALIASES:
+            fi_apis.append(moved_fi_api)
+        for fi_api in dict.fromkeys(fi_apis):
+            entry = out.get(fi_api)
+            if entry is None:
+                out[fi_api] = (original, [template])
+            else:
+                entry[1].append(template)
     return out
 
 
