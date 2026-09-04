@@ -37,7 +37,8 @@ using namespace flashinfer;
 void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
                                   ffi::TensorView tmp, ffi::TensorView o,
                                   Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
-                                  int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+                                  int64_t layout, int64_t window_left,
+                                  int64_t window_right ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -96,6 +97,7 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
         params.v_stride_h = v_stride_h;
 
         params.window_left = window_left;
+        params.window_right = window_right;
         params.partition_kv = false;
 
         ADDITIONAL_PARAMS_SETTER

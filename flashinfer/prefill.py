@@ -355,6 +355,7 @@ def get_single_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
@@ -418,6 +419,7 @@ def get_single_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
                 maybe_k_cache_sf,
@@ -440,6 +442,7 @@ def get_single_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
@@ -497,6 +500,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -533,6 +537,7 @@ def get_batch_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 enable_pdl,
                 maybe_custom_mask,
                 maybe_mask_indptr,
@@ -622,6 +627,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -669,6 +675,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -764,6 +771,7 @@ def get_batch_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 enable_pdl,
                 maybe_custom_mask,
                 maybe_mask_indptr,
@@ -855,6 +863,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -935,6 +944,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         ragged_run_func(
@@ -951,6 +961,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             mask_mode,
             layout,
             window_left,
+            window_right,
             *args,
         )
 
@@ -969,6 +980,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         pass
@@ -1001,6 +1013,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         paged_run_func(
@@ -1019,6 +1032,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             mask_mode,
             layout,
             window_left,
+            window_right,
             *args,
         )
 
@@ -1039,6 +1053,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         pass
@@ -1065,6 +1080,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     kv_layout: str = "NHD",
     mask_mode: int = MaskMode.NON_CAUSAL.value,
     window_left: int = -1,
+    window_right: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Single-request prefill / append attention using a pre-compiled JIT module.
@@ -1096,6 +1112,8 @@ def single_prefill_with_kv_cache_with_jit_module(
         Defaults to ``MaskMode.NON_CAUSAL.value``.
     window_left : int
         Left window size for sliding-window attention; ``-1`` disables it.
+    window_right : int
+        Right window size for sliding-window attention in bidirectional models; ``-1`` disables it.
     return_lse : bool
         Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
 
@@ -1122,6 +1140,7 @@ def single_prefill_with_kv_cache_with_jit_module(
         mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        window_right,
         *args,
     )
     return (o, lse) if return_lse else o
@@ -1144,6 +1163,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1172,6 +1192,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1200,6 +1221,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1263,6 +1285,9 @@ def single_prefill_with_kv_cache(
     window_left : int
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+    window_right : int
+        The right (inclusive) window size for a bidirectional attention window, when set to ``-1``,
+        the window size will be unbounded for lookahead. Defaults to ``-1``.
     logits_soft_cap : Optional[float]
         The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
         provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1407,6 +1432,18 @@ def single_prefill_with_kv_cache(
             head_dim_vo=out_head_dim,
         )
 
+    if window_right >= 0:
+        if window_left < 0:
+            raise ValueError(
+                "window_right requires window_left to also be set (>= 0). "
+                "For bidirectional local attention, set both."
+            )
+        if backend not in ("fa2", "cute-dsl"):
+            raise NotImplementedError(
+                f"window_right is not supported on backend {backend!r}; "
+                "supported backends are 'fa2' and 'cute-dsl'."
+            )
+
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
     if kv_cache_sf is not None:
@@ -1443,6 +1480,7 @@ def single_prefill_with_kv_cache(
         mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        window_right,
         packed_custom_mask,
         get_alibi_slopes(q.shape[1], device=q.device)
         if pos_encoding_mode == "ALIBI"
@@ -1958,6 +1996,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -2025,6 +2064,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be unbounded for lookahead. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
             if not provided, will be set to ``0``.
@@ -2089,7 +2132,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             block_tables,
             max_item_len_ptr,
             max_token_per_sequence,
-            prefix_len_ptr,
             rope_scale,
             rope_theta,
             seq_lens_q,
@@ -2162,6 +2204,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if window_right >= 0:
+                if window_left < 0:
+                    raise ValueError(
+                        "window_right requires window_left to also be set (>= 0). "
+                        "For bidirectional local attention, set both."
+                    )
+                if prefix_len_ptr is not None:
+                    raise NotImplementedError(
+                        "window_right combined with prefix_len_ptr (multi-item "
+                        "scoring) is not supported."
+                    )
+                if backend not in ("fa2", "cute-dsl"):
+                    raise NotImplementedError(
+                        f"window_right is not supported on backend {backend!r}; "
+                        "supported backends are 'fa2' and 'cute-dsl'."
+                    )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -2201,6 +2259,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo,
             causal,
             window_left,
+            window_right,
         ]
         if backend == "fa2":
             args.append(fixed_split_size)
@@ -2229,6 +2288,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -2303,6 +2363,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window when set to ``-1``,
+            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -2594,6 +2658,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
                 window_left=window_left,
+                window_right=window_right,
                 variant=cute_variant,
                 page_size=page_size,
                 paged_kv_indptr=self._paged_kv_indptr_buf,
@@ -2679,6 +2744,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        if window_right >= 0:
+            if window_left < 0:
+                raise ValueError(
+                    "window_right requires window_left to also be set (>= 0). "
+                    "For bidirectional local attention, set both."
+                )
+            if prefix_len_ptr is not None:
+                raise NotImplementedError(
+                    "window_right combined with prefix_len_ptr (multi-item "
+                    "scoring) is not supported."
+                )
+            if self._backend not in ("fa2", "cute-dsl"):
+                raise NotImplementedError(
+                    f"window_right is not supported on backend {self._backend!r}; "
+                    "supported backends are 'fa2' and 'cute-dsl'."
+                )
+
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
             # Allocated once per plan and reused across run() launches; the
@@ -2726,6 +2808,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                window_right,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
@@ -2747,6 +2830,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -2766,6 +2850,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -2776,6 +2861,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -3220,6 +3306,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_mode,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                self._window_right,
                 enable_pdl,
             ]
             if self._jit_module is not None:
@@ -3347,6 +3434,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -3357,6 +3445,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -3695,6 +3784,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -3768,6 +3858,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window when set to ``-1``,
+            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -4090,6 +4184,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     if kv_data_type is not None
                     else q_data_type,
                     window_left=window_left,
+                    window_right=window_right,
                     variant=variant,
                 )
         elif self._backend == "cutile":
@@ -4227,6 +4322,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        if window_right >= 0:
+            if window_left < 0:
+                raise ValueError(
+                    "window_right requires window_left to also be set (>= 0). "
+                    "For bidirectional local attention, set both."
+                )
+            if prefix_len_ptr is not None:
+                raise NotImplementedError(
+                    "window_right combined with prefix_len_ptr (multi-item "
+                    "scoring) is not supported."
+                )
+            if self._backend not in ("fa2", "cute-dsl"):
+                raise NotImplementedError(
+                    f"window_right is not supported on backend {self._backend!r}; "
+                    "supported backends are 'fa2' and 'cute-dsl'."
+                )
+
         if self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
@@ -4259,6 +4371,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                window_right,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
@@ -4280,6 +4393,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -4296,6 +4410,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -4306,6 +4421,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -4770,6 +4886,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
+            self._window_right,
             enable_pdl,
         ]
         if self._jit_module is not None:
@@ -4827,6 +4944,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -4837,6 +4955,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale

@@ -51,6 +51,7 @@ struct SinglePrefillParams {
   uint32_t v_stride_h;
   uint32_t head_dim;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -79,6 +80,7 @@ struct SinglePrefillParams {
         v_stride_h(0),
         head_dim(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -90,8 +92,8 @@ struct SinglePrefillParams {
                                uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
                                uint32_t kv_len, uint32_t q_stride_n, uint32_t q_stride_h,
                                uint32_t kv_stride_n, uint32_t kv_stride_h, uint32_t head_dim,
-                               int32_t window_left, float logits_soft_cap, float sm_scale,
-                               float rope_scale, float rope_theta)
+                               int32_t window_left, int32_t window_right, float logits_soft_cap,
+                               float sm_scale, float rope_scale, float rope_theta)
       : q(q),
         k(k),
         v(v),
@@ -112,6 +114,7 @@ struct SinglePrefillParams {
         v_stride_h(kv_stride_h),
         head_dim(head_dim),
         window_left(window_left),
+        window_right(window_right),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1. / rope_scale),
@@ -162,6 +165,7 @@ struct BatchPrefillRaggedParams {
   uint32_t v_sf_stride_n;
   uint32_t v_sf_stride_h;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -212,6 +216,7 @@ struct BatchPrefillRaggedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -238,7 +243,7 @@ struct BatchPrefillRaggedParams {
                                     DTypeO* o, float* lse, float* maybe_alibi_slopes,
                                     uint32_t num_qo_heads, uint32_t num_kv_heads,
                                     uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
-                                    uint32_t kv_stride_h, int32_t window_left,
+                                    uint32_t kv_stride_h, int32_t window_left, int32_t window_right,
                                     float logits_soft_cap, float sm_scale, float rope_scale,
                                     float rope_theta)
       : q(q),
@@ -269,6 +274,7 @@ struct BatchPrefillRaggedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(window_left),
+        window_right(window_right),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
@@ -325,6 +331,7 @@ struct BatchPrefillPagedParams {
   uint32_t v_sf_stride_n;
   uint32_t v_sf_stride_h;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -367,6 +374,7 @@ struct BatchPrefillPagedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -392,8 +400,8 @@ struct BatchPrefillPagedParams {
                                    IdType* maybe_mask_indptr, IdType* maybe_q_rope_offset,
                                    DTypeO* o, float* lse, float* maybe_alibi_slopes,
                                    uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
-                                   int32_t window_left, float logits_soft_cap, float sm_scale,
-                                   float rope_scale, float rope_theta)
+                                   int32_t window_left, int32_t window_right, float logits_soft_cap,
+                                   float sm_scale, float rope_scale, float rope_theta)
       : q(q),
         paged_kv(paged_kv),
         maybe_custom_mask(maybe_custom_mask),
@@ -414,6 +422,7 @@ struct BatchPrefillPagedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(window_left),
+        window_right(window_right),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),

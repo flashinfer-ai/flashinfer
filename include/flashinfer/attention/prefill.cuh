@@ -2242,6 +2242,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/0, smem);
     const uint32_t window_left = variant.window_left;
+    const int32_t window_right = variant.window_right;
+    const bool has_window_right = window_right >= 0;  // single
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     constexpr uint32_t O_FRAG_D = KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT
@@ -2422,7 +2424,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                   qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
 
         // apply mask
-        if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
+        if (MASK_MODE == MaskMode::kCustom || has_window_right ||
+            (iter >= mask_iteration || iter < window_iteration)) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
         }
@@ -2866,6 +2869,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
+    const int32_t window_right = variant.window_right;
+    const bool has_window_right = window_right >= 0;  // ragged
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
@@ -3117,7 +3122,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                   kv_head_idx);
 
         // apply mask
-        if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
+        if (MASK_MODE == MaskMode::kCustom || has_window_right ||
+            (iter >= mask_iteration || iter < window_iteration)) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                kv_head_idx);
@@ -3198,8 +3204,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       finalize_m<KTraits>(variant, m);
 
-      const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+      const uint32_t num_kv_chunks = ceil_div(
+          min(kv_len_safe, window_left +
+                               (window_right >= 0 ? static_cast<uint32_t>(window_right) : 0u) +
+                               CTA_TILE_Q),
+          kv_chunk_size);
+
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
@@ -3652,6 +3662,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
+    const int32_t window_right = variant.window_right;
+    const bool has_window_right = window_right >= 0;  // paged
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
@@ -3999,7 +4011,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                kv_head_idx);
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-            if (iter >= mask_iteration || iter < window_iteration) {
+            if (has_window_right || iter >= mask_iteration || iter < window_iteration) {
               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                    kv_head_idx);
@@ -4104,8 +4116,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       finalize_m<KTraits>(variant, m);
 
-      const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+      const uint32_t num_kv_chunks = ceil_div(
+          min(kv_len_safe, window_left +
+                               (window_right >= 0 ? static_cast<uint32_t>(window_right) : 0u) +
+                               CTA_TILE_Q),
+          kv_chunk_size);
 
       if constexpr (KTraits::USE_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
