@@ -123,6 +123,24 @@ inline size_t getTrtllmGenMultiCtasKvCounterBytes(int64_t batch_size, int64_t nu
   return num_semaphores * sizeof(uint32_t);
 }
 
+inline void validateTrtllmGenWindowConfig(bool is_causal, int64_t window_left, int64_t window_right,
+                                          bool has_variable_window) {
+  TVM_FFI_CHECK(window_left >= -1 && window_right >= -1,
+                "window_left and window_right must be at least -1");
+  if (has_variable_window) {
+    TVM_FFI_CHECK(window_left == -1 && window_right == -1,
+                  "VariableWindow cannot be combined with fixed window bounds");
+    return;
+  }
+  if (is_causal) {
+    TVM_FFI_CHECK(window_right == -1 || window_right == 0,
+                  "causal attention requires window_right to be -1 or 0");
+  } else {
+    TVM_FFI_CHECK((window_left == -1) == (window_right == -1),
+                  "non-causal fixed-window attention requires both window bounds to be >= 0");
+  }
+}
+
 class TllmGenFmhaRunnerCache {
  public:
   using Key = std::tuple<Data_type, Data_type, Data_type, Data_type, int, int, int, int>;
@@ -174,7 +192,8 @@ void trtllm_paged_attention_launcher(
     int64_t kv_stride_keys_values, int64_t kv_stride_heads, int64_t kv_stride_batch,
     int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
-    int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
+    int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t window_right,
+    int64_t sum_seq_q, int* variable_window_token_starts, int* variable_window_token_ends,
     int64_t sparse_mla_top_k, void* sliding_window_kv_pool, int* sparse_mla_top_k_lens,
     bool has_sliding_window_kv_pool, float skip_softmax_threshold_scale_factor, bool skips_softmax,
     bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
@@ -182,6 +201,11 @@ void trtllm_paged_attention_launcher(
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
     bool uses_spcompress, cudaStream_t stream) {
+  TVM_FFI_CHECK(
+      (variable_window_token_starts == nullptr) == (variable_window_token_ends == nullptr),
+      "variable window starts and ends must be provided together");
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                variable_window_token_starts != nullptr);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -253,9 +277,13 @@ void trtllm_paged_attention_launcher(
   runner_params.mScaleSfO = o_sf_scale;
   TVM_FFI_ICHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1)
       << "Only support o_sf_vec_size == 16 or -1(not used)";
-  runner_params.mChunkedAttentionSize = INT_MAX;  // disable chunked attention by INT_MAX
-  runner_params.mAttentionWindowSize =
-      window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
+  // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths
+  // remain for parity with upstream TRT-LLM.
+  runner_params.mChunkedAttentionSize = 0;
+  runner_params.mLeftSlidingWindow = window_left;
+  runner_params.mRightSlidingWindow = window_right;
+  runner_params.variableWindowTokenStartsPtr = variable_window_token_starts;
+  runner_params.variableWindowTokenEndsPtr = variable_window_token_ends;
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx;
@@ -298,8 +326,14 @@ void trtllm_paged_attention_launcher(
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
-    runner_params.mMaskType =
-        is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
+    if (variable_window_token_starts != nullptr) {
+      runner_params.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
+    } else if (window_left >= 0 || window_right >= 0) {
+      runner_params.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+    } else {
+      runner_params.mMaskType =
+          is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
+    }
     runner_params.mKernelType = FmhaKernelType::Context;
     runner_params.mTileScheduler = TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = false;
@@ -312,7 +346,9 @@ void trtllm_paged_attention_launcher(
     // specified as causal, this is expected for better performance as each CTA will only process
     // one tokenQ in those cases, so dense mask works the same as causal mask.
     runner_params.mMaskType =
-        is_mla_decode ? TrtllmGenAttentionMaskType::Dense : TrtllmGenAttentionMaskType::Causal;
+        is_mla_decode ? TrtllmGenAttentionMaskType::Dense
+                      : (window_left >= 0 ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+                                          : TrtllmGenAttentionMaskType::Causal);
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
@@ -583,7 +619,9 @@ void trtllm_paged_attention_decode(
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
       q_stride_tokens, q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
-      bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
+      bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
+      /*window_right=*/window_left >= 0 ? 0 : -1, sum_seq_q,
+      /*variable_window_token_starts=*/nullptr, /*variable_window_token_ends=*/nullptr,
       sparse_mla_top_k,
       /*sliding_window_kv_pool=*/
       is_single_pool_dynamic_sparse_mla ? key_cache.data_ptr() : nullptr, sparse_mla_top_k_lens_ptr,
@@ -601,8 +639,10 @@ void trtllm_paged_attention_context(
     TensorView block_tables, TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
-    int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
-    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    int64_t window_left, int64_t window_right, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, Optional<TensorView> variable_window_token_starts,
+    Optional<TensorView> variable_window_token_ends, int64_t sm_count, bool enable_pdl,
+    int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
     Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
@@ -712,10 +752,36 @@ void trtllm_paged_attention_context(
   bool const use_fp16_softmax_value = use_fp16_softmax.value_or(false);
   bool const uses_spcompress_value = uses_spcompress.value_or(false);
 
-  TVM_FFI_CHECK(
-      is_causal || window_left == -1,
-      "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
-      "Use window_left=-1 for dense bidirectional attention.");
+  TVM_FFI_CHECK(variable_window_token_starts.has_value() == variable_window_token_ends.has_value(),
+                "variable_window_token_starts and variable_window_token_ends must be provided "
+                "together");
+  int* variable_window_token_starts_ptr = nullptr;
+  int* variable_window_token_ends_ptr = nullptr;
+  if (variable_window_token_starts.has_value()) {
+    TVM_FFI_CHECK(window_left == -1 && window_right == -1,
+                  "VariableWindow cannot be combined with fixed window bounds");
+    auto const& starts = variable_window_token_starts.value();
+    auto const& ends = variable_window_token_ends.value();
+    TVM_FFI_ICHECK_EQ(starts.dtype(), dl_int32)
+        << "variable_window_token_starts must have dtype int32";
+    TVM_FFI_ICHECK_EQ(ends.dtype(), dl_int32) << "variable_window_token_ends must have dtype int32";
+    TVM_FFI_ICHECK_EQ(starts.ndim(), 1) << "variable_window_token_starts must be 1D";
+    TVM_FFI_ICHECK_EQ(ends.ndim(), 1) << "variable_window_token_ends must be 1D";
+    TVM_FFI_ICHECK_EQ(starts.size(0), sum_seq_q)
+        << "variable_window_token_starts must contain one entry per query token";
+    TVM_FFI_ICHECK_EQ(ends.size(0), sum_seq_q)
+        << "variable_window_token_ends must contain one entry per query token";
+    TVM_FFI_ICHECK(starts.IsContiguous()) << "variable_window_token_starts must be contiguous";
+    TVM_FFI_ICHECK(ends.IsContiguous()) << "variable_window_token_ends must be contiguous";
+    TVM_FFI_ICHECK_EQ(starts.device().device_type, query.device().device_type);
+    TVM_FFI_ICHECK_EQ(starts.device().device_id, query.device().device_id);
+    TVM_FFI_ICHECK_EQ(ends.device().device_type, query.device().device_type);
+    TVM_FFI_ICHECK_EQ(ends.device().device_id, query.device().device_id);
+    variable_window_token_starts_ptr = static_cast<int*>(starts.data_ptr());
+    variable_window_token_ends_ptr = static_cast<int*>(ends.data_ptr());
+  }
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                variable_window_token_starts.has_value());
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -730,7 +796,8 @@ void trtllm_paged_attention_context(
       head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
-      sum_seq_q, /*sparse_mla_top_k=*/0, /*sliding_window_kv_pool=*/nullptr,
+      window_right, sum_seq_q, variable_window_token_starts_ptr, variable_window_token_ends_ptr,
+      /*sparse_mla_top_k=*/0, /*sliding_window_kv_pool=*/nullptr,
       /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
@@ -754,6 +821,9 @@ void trtllm_ragged_attention_launcher(
     const float* sage_attn_sfs_q, const float* sage_attn_sfs_k, const float* sage_attn_sfs_p,
     const float* sage_attn_sfs_v, int num_elts_sage_q, int num_elts_sage_k, int num_elts_sage_p,
     int num_elts_sage_v, int64_t lse_stride_tokens, int64_t lse_stride_heads, cudaStream_t stream) {
+  int64_t const window_right = is_causal && window_left >= 0 ? 0 : -1;
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                /*has_variable_window=*/false);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -788,9 +858,11 @@ void trtllm_ragged_attention_launcher(
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.mScaleSfO = o_sf_scale;
-  runner_params.mChunkedAttentionSize = INT_MAX;  // disable chunked attention by INT_MAX
-  runner_params.mAttentionWindowSize =
-      window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
+  // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths
+  // remain for parity with upstream TRT-LLM.
+  runner_params.mChunkedAttentionSize = 0;
+  runner_params.mLeftSlidingWindow = window_left;
+  runner_params.mRightSlidingWindow = window_right;
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.mSumOfSeqLensKv = sum_seq_kv;
@@ -809,8 +881,9 @@ void trtllm_ragged_attention_launcher(
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
   runner_params.mMultiCtasKvMode = false;
-  runner_params.mMaskType =
-      is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
+  runner_params.mMaskType = window_left >= 0 ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+                                             : (is_causal ? TrtllmGenAttentionMaskType::Causal
+                                                          : TrtllmGenAttentionMaskType::Dense);
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   // Only allocate the softmax stats slab when LSE is requested; size with the same
@@ -947,6 +1020,9 @@ void trtllm_ragged_attention(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
   bool const use_fp16_softmax_value = use_fp16_softmax.value_or(false);
   bool const uses_spcompress_value = uses_spcompress.value_or(false);
+
+  validateTrtllmGenWindowConfig(is_causal, window_left, is_causal && window_left >= 0 ? 0 : -1,
+                                /*has_variable_window=*/false);
 
   trtllm_ragged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),
@@ -1147,7 +1223,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*max_num_blocks_per_seq=*/sparse_mla_top_k, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr,
       /*o_sf_scale=*/-1.0, /*o_sf_vec_size=*/-1, /*o_sf_start_index=*/0,
-      /*window_left=*/127, sum_seq_q, sparse_mla_top_k, sliding_window_kv_cache.data_ptr(),
+      /*window_left=*/127, /*window_right=*/0, sum_seq_q,
+      /*variable_window_token_starts=*/nullptr, /*variable_window_token_ends=*/nullptr,
+      sparse_mla_top_k, sliding_window_kv_cache.data_ptr(),
       static_cast<int*>(sparse_mla_top_k_lens.data_ptr()), /*has_sliding_window_kv_pool=*/true,
       /*skip_softmax_threshold_scale_factor=*/0.0f, /*skips_softmax=*/false,
       /*uses_shared_paged_kv_idx=*/true, /*enable_block_sparse_attention=*/false, sm_count,
