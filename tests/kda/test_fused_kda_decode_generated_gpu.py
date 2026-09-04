@@ -69,9 +69,7 @@ def _boundary_shapes():
         wide_max = 148 // num_heads
         compact_min = 296 // num_heads + 1
         compact_max = 444 // num_heads
-        high_min = (
-            32 if num_heads == 32 else math.ceil(1184 / num_heads)
-        )
+        high_min = 32 if num_heads == 32 else math.ceil(1184 / num_heads)
         for num_rows in (
             wide_max,
             wide_max + 1,
@@ -146,9 +144,7 @@ def _page_strides(num_heads, state_dtype):
     hidden_size = num_heads * _HEAD_DIM
     conv_slot_bytes = 3 * hidden_size * 3 * torch.bfloat16.itemsize
     state_element_bytes = torch.empty((), dtype=state_dtype).element_size()
-    state_slot_bytes = (
-        num_heads * _HEAD_DIM * _HEAD_DIM * state_element_bytes
-    )
+    state_slot_bytes = num_heads * _HEAD_DIM * _HEAD_DIM * state_element_bytes
     page_bytes = conv_slot_bytes + state_slot_bytes
     return page_bytes // torch.bfloat16.itemsize, page_bytes // state_element_bytes
 
@@ -175,9 +171,7 @@ def _make_inputs(
 
     if layout == "page":
         x_padding, beta_padding, output_gate_padding = 17, 1, 7
-        conv_slot_stride, state_slot_stride = _page_strides(
-            num_heads, state_dtype
-        )
+        conv_slot_stride, state_slot_stride = _page_strides(num_heads, state_dtype)
     elif layout == "padded":
         x_padding, beta_padding, output_gate_padding = 29, 3, 11
         conv_slot_stride = 9 * hidden_size + 12
@@ -185,33 +179,22 @@ def _make_inputs(
     else:
         raise ValueError(f"unknown layout: {layout}")
 
-    x_storage = randn(
-        (num_rows, 3 * hidden_size + x_padding), torch.bfloat16
-    )
+    x_storage = randn((num_rows, 3 * hidden_size + x_padding), torch.bfloat16)
     conv_state = torch.empty_strided(
         (num_slots, 3 * hidden_size, 3),
         (conv_slot_stride, 1, 3 * hidden_size),
         dtype=torch.bfloat16,
         device=device,
     )
-    conv_state.copy_(
-        0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16)
-    )
+    conv_state.copy_(0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16))
     state = torch.empty_strided(
         (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
         (state_slot_stride, _HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1),
         dtype=state_dtype,
         device=device,
     )
-    state.copy_(
-        0.01
-        * randn(
-            (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), state_dtype
-        )
-    )
-    beta_storage = randn(
-        (1, num_rows, num_heads + beta_padding), torch.bfloat16
-    )
+    state.copy_(0.01 * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), state_dtype))
+    beta_storage = randn((1, num_rows, num_heads + beta_padding), torch.bfloat16)
     output_gate_storage = randn(
         (num_rows, hidden_size + output_gate_padding), torch.bfloat16
     )
@@ -223,13 +206,9 @@ def _make_inputs(
         output_gate = output_gate.unsqueeze(0)
 
     if slot_class == "positive":
-        state_indices = torch.arange(
-            num_rows, 0, -1, dtype=torch.int32, device=device
-        )
+        state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device=device)
     elif slot_class == "null":
-        state_indices = torch.arange(
-            num_rows, 0, -1, dtype=torch.int32, device=device
-        )
+        state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device=device)
         state_indices[: min(2, num_rows)] = torch.tensor(
             (0, -1)[: min(2, num_rows)], dtype=torch.int32, device=device
         )
@@ -246,9 +225,7 @@ def _make_inputs(
         "x": x_storage[:, : 3 * hidden_size],
         "weight": 0.1 * randn((3, 4, hidden_size)),
         "conv_state": conv_state,
-        "raw_gate": randn(
-            (1, num_rows, num_heads, _HEAD_DIM), torch.bfloat16
-        ),
+        "raw_gate": randn((1, num_rows, num_heads, _HEAD_DIM), torch.bfloat16),
         "raw_beta": beta_storage[:, :, :num_heads],
         "A_log": 0.5 * randn((num_heads,)),
         "dt_bias": 0.1 * randn((hidden_size,)),
@@ -272,7 +249,7 @@ def _guarded_strided_clone(tensor):
     suffix_elements = 31
     span = 1 + sum(
         (size - 1) * stride
-        for size, stride in zip(tensor.shape, tensor.stride())
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=False)
     )
     storage = torch.full(
         (prefix_elements + span + suffix_elements,),
@@ -287,9 +264,7 @@ def _guarded_strided_clone(tensor):
         storage_offset=prefix_elements,
     )
     guarded.copy_(tensor)
-    guard_mask = torch.ones(
-        storage.shape, dtype=torch.bool, device=tensor.device
-    )
+    guard_mask = torch.ones(storage.shape, dtype=torch.bool, device=tensor.device)
     torch.as_strided(
         guard_mask,
         tensor.shape,
@@ -350,9 +325,7 @@ def _reference_unique_rows(
 
     rows_output = torch.einsum("nhvk,nhk->nhv", selected_state, query)
     rows_output = rows_output.to(torch.bfloat16).float()
-    rows_output *= torch.rsqrt(
-        rows_output.square().mean(-1, keepdim=True) + norm_eps
-    )
+    rows_output *= torch.rsqrt(rows_output.square().mean(-1, keepdim=True) + norm_eps)
     output_gate = inputs["output_gate"]
     if output_gate.ndim == 4:
         output_gate = output_gate[0]
@@ -442,12 +415,8 @@ def _run_and_check_generated(
     if preallocate_output:
         assert actual is kwargs["output"]
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(
-        actual_conv_state, reference_conv_state, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        actual_state, reference_state, rtol=1e-2, atol=1e-2
-    )
+    torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -477,9 +446,7 @@ def test_generated_fused_kda_decode_all_manifest_routes(
         layout=layout,
         slot_class=slot_class,
     )
-    _run_and_check_generated(
-        monkeypatch, inputs, expected_variant=variant_name
-    )
+    _run_and_check_generated(monkeypatch, inputs, expected_variant=variant_name)
 
 
 @pytest.mark.parametrize(
@@ -591,9 +558,7 @@ def test_generated_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
 
     actual_conv_state = _clone_strided(inputs["conv_state"])
     actual_state = _clone_strided(inputs["state"])
-    output = torch.empty(
-        (1, 25, 12, _HEAD_DIM), dtype=torch.bfloat16, device="cuda"
-    )
+    output = torch.empty((1, 25, 12, _HEAD_DIM), dtype=torch.bfloat16, device="cuda")
     graph_kwargs = {
         **inputs,
         "conv_state": actual_conv_state,
@@ -620,9 +585,7 @@ def test_generated_fused_kda_decode_cuda_graph_replay_correctness(monkeypatch):
         torch.testing.assert_close(
             actual_conv_state, reference_conv_state, rtol=0, atol=0
         )
-        torch.testing.assert_close(
-            actual_state, reference_state, rtol=1e-2, atol=1e-2
-        )
+        torch.testing.assert_close(actual_state, reference_state, rtol=1e-2, atol=1e-2)
 
 
 def test_generated_fused_kda_decode_preserves_write_guards(monkeypatch):
@@ -637,8 +600,8 @@ def test_generated_fused_kda_decode_preserves_write_guards(monkeypatch):
     actual_state, state_storage, state_mask, expected_state_guard = (
         _guarded_strided_clone(inputs["state"])
     )
-    output, output_storage, output_mask, expected_output_guard = (
-        _guarded_strided_clone(torch.zeros_like(expected))
+    output, output_storage, output_mask, expected_output_guard = _guarded_strided_clone(
+        torch.zeros_like(expected)
     )
     routed_variants = []
     original_run = _impl._run_generated_variant
@@ -658,12 +621,8 @@ def test_generated_fused_kda_decode_preserves_write_guards(monkeypatch):
     assert actual is output
     assert routed_variants == ["compact_async_f32"]
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(
-        actual_conv_state, reference_conv_state, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        actual_state, reference_state, rtol=1e-2, atol=1e-2
-    )
+    torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=1e-2, atol=1e-2)
     for storage, mask, expected_guard in (
         (conv_storage, conv_mask, expected_conv_guard),
         (state_storage, state_mask, expected_state_guard),

@@ -66,9 +66,7 @@ _OFFICIAL_SHAPES = (
     (12, 256),
 )
 _ABBA_ORDER = ("baseline", "candidate", "candidate", "baseline")
-_ORIGINAL_SHAPES = tuple(
-    shape for shape in _OFFICIAL_SHAPES if shape[0] != 32
-)
+_ORIGINAL_SHAPES = tuple(shape for shape in _OFFICIAL_SHAPES if shape[0] != 32)
 
 
 def _page_strides(num_heads):
@@ -98,9 +96,7 @@ def _make_inputs(num_heads, num_rows, seed=42):
         dtype=torch.bfloat16,
         device=device,
     )
-    conv_state.copy_(
-        0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16)
-    )
+    conv_state.copy_(0.1 * randn((num_slots, 3 * hidden_size, 3), torch.bfloat16))
     state = torch.empty_strided(
         (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
         (state_slot_stride, _HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1),
@@ -108,20 +104,15 @@ def _make_inputs(num_heads, num_rows, seed=42):
         device=device,
     )
     state.copy_(
-        0.01
-        * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), torch.float32)
+        0.01 * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), torch.float32)
     )
     beta_storage = randn((1, num_rows, num_heads + 1), torch.bfloat16)
-    output_gate_storage = randn(
-        (num_rows, hidden_size + 7), torch.bfloat16
-    )
+    output_gate_storage = randn((num_rows, hidden_size + 7), torch.bfloat16)
     return {
         "x": x_storage[:, : 3 * hidden_size],
         "weight": 0.1 * randn((3, 4, hidden_size)),
         "conv_state": conv_state,
-        "raw_gate": randn(
-            (1, num_rows, num_heads, _HEAD_DIM), torch.bfloat16
-        ),
+        "raw_gate": randn((1, num_rows, num_heads, _HEAD_DIM), torch.bfloat16),
         "raw_beta": beta_storage[:, :, :num_heads],
         "A_log": 0.5 * randn((num_heads,)),
         "dt_bias": 0.1 * randn((hidden_size,)),
@@ -158,9 +149,7 @@ def _require_b200_and_cupti():
     except (ImportError, importlib.metadata.PackageNotFoundError) as error:
         raise RuntimeError("cupti-python >= 13 is required") from error
     if int(cupti_version.split(".", maxsplit=1)[0]) < 13:
-        raise RuntimeError(
-            f"cupti-python >= 13 is required, found {cupti_version}"
-        )
+        raise RuntimeError(f"cupti-python >= 13 is required, found {cupti_version}")
     if not fused_kda_decode_generated_is_available():
         raise RuntimeError("the generated fused KDA manifest is not complete")
     return cupti_version
@@ -183,9 +172,7 @@ def _query_single_visible_gpu_identity():
     )
     rows = [row.strip() for row in query.stdout.splitlines() if row.strip()]
     if len(rows) != 1:
-        raise RuntimeError(
-            f"expected exactly one visible GPU, found {len(rows)}"
-        )
+        raise RuntimeError(f"expected exactly one visible GPU, found {len(rows)}")
     fields = [field.strip() for field in rows[0].split(",")]
     if len(fields) != 2 or not fields[0] or not fields[1]:
         raise RuntimeError("nvidia-smi returned an invalid GPU identity")
@@ -298,16 +285,12 @@ def _require_close(observed, expected, description):
         or not math.isfinite(observed)
         or not math.isclose(observed, expected, rel_tol=1e-12, abs_tol=1e-15)
     ):
-        raise RuntimeError(
-            f"{description} does not match its recomputed value"
-        )
+        raise RuntimeError(f"{description} does not match its recomputed value")
 
 
 def _validate_samples(samples, repeat_iters, description):
     if not isinstance(samples, list) or len(samples) != repeat_iters:
-        raise RuntimeError(
-            f"{description} must contain exactly {repeat_iters} samples"
-        )
+        raise RuntimeError(f"{description} must contain exactly {repeat_iters} samples")
     for sample in samples:
         if (
             isinstance(sample, bool)
@@ -344,9 +327,7 @@ def _validate_row(row, index, repeat_iters):
     ):
         raise RuntimeError("checkpoint rows are not an official-shape prefix")
     measurements = row.get("measurements")
-    if not isinstance(measurements, list) or len(measurements) != len(
-        _ABBA_ORDER
-    ):
+    if not isinstance(measurements, list) or len(measurements) != len(_ABBA_ORDER):
         raise RuntimeError(f"{shape} does not contain the four ABBA cells")
     backend_samples = {"baseline": [], "candidate": []}
     candidate_variants = set()
@@ -414,12 +395,8 @@ def _summarize(rows):
         raise RuntimeError("rows do not cover the original 17 shapes")
     return {
         "shape_count": len(rows),
-        "baseline_geomean_ms": _geometric_mean(
-            [row["baseline_ms"] for row in rows]
-        ),
-        "candidate_geomean_ms": _geometric_mean(
-            [row["candidate_ms"] for row in rows]
-        ),
+        "baseline_geomean_ms": _geometric_mean([row["baseline_ms"] for row in rows]),
+        "candidate_geomean_ms": _geometric_mean([row["candidate_ms"] for row in rows]),
         "official21_geomean_speedup": _geometric_mean(speedups),
         "original17_geomean_speedup": _geometric_mean(original_speedups),
         "minimum_speedup": min(speedups),
@@ -438,9 +415,7 @@ def _validate_summary(observed, expected):
             if type(observed.get(field)) is not int or observed[field] != value:
                 raise RuntimeError(f"checkpoint summary {field} is invalid")
         else:
-            _require_close(
-                observed.get(field), value, f"checkpoint summary {field}"
-            )
+            _require_close(observed.get(field), value, f"checkpoint summary {field}")
 
 
 def _load_checkpoint(path, *, identity, measurement_config):
@@ -464,9 +439,7 @@ def _load_checkpoint(path, *, identity, measurement_config):
     if not isinstance(rows, list) or len(rows) > len(_OFFICIAL_SHAPES):
         raise RuntimeError("checkpoint rows are invalid")
     for index, row in enumerate(rows):
-        _validate_row(
-            row, index, measurement_config["repeat_iters_per_cell"]
-        )
+        _validate_row(row, index, measurement_config["repeat_iters_per_cell"])
     status = payload.get("status")
     if status not in ("in_progress", "complete"):
         raise RuntimeError(f"unsupported checkpoint status {status!r}")
@@ -578,14 +551,10 @@ def _run_paired_benchmark(args):
                     f"shape-{shape_index:02d}-{order_index}-{backend}.json"
                 )
                 subprocess.run(
-                    _worker_command(
-                        args, backend, num_heads, num_rows, worker_json
-                    ),
+                    _worker_command(args, backend, num_heads, num_rows, worker_json),
                     check=True,
                 )
-                worker_measurement = json.loads(
-                    worker_json.read_text(encoding="utf-8")
-                )
+                worker_measurement = json.loads(worker_json.read_text(encoding="utf-8"))
                 if (
                     worker_measurement.get("backend") != backend
                     or worker_measurement.get("num_heads") != num_heads
