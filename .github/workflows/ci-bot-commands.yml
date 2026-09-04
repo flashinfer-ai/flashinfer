@@ -129,8 +129,15 @@ jobs:
           #
           # Keying on the head SHA makes staleness structural: a new push is a new SHA
           # with no scope status, so an old scope cannot be resurrected by re-labelling.
+          # Guarded: this step runs under `bash -e` and everything below it is
+          # best-effort scope bookkeeping, but `gh pr edit --add-label run-ci` at the
+          # end is THE way CI starts in this repo. An unguarded network call here
+          # means a transient GitHub blip silently starts no CI for whoever typed the
+          # command -- on every PR, not just scoped ones. Publishing the scope may
+          # fail; labelling may not.
           HEAD_SHA=$(gh pr view ${{ github.event.issue.number }} \
-            --repo ${{ github.repository }} --json headRefOid -q .headRefOid)
+            --repo ${{ github.repository }} --json headRefOid -q .headRefOid) \
+            || HEAD_SHA=""
 
           ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
             | sed -nE 's/.*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+(.*)$/\1/p' \
@@ -191,12 +198,19 @@ jobs:
           # There is no DELETE for statuses, but re-posting a context supersedes it, so
           # a scope that shrank has its leftover chunks updated to empty; otherwise
           # pr-test would reassemble stale trailing paths.
+          # Same reasoning as HEAD_SHA: a failure here must not cost the label. 0 means
+          # "assume no previous chunks", which at worst leaves a stale trailing chunk
+          # -- strictly better than starting no CI at all.
           PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
             --jq '[.statuses[].context
               | select(test("^ci/test-scope-[0-9]+$"))
-              | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
+              | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
+            || PREV_MAX=0
+          PREV_MAX=${PREV_MAX:-0}
 
           publish_chunk() {
+            # No SHA means no status to key on; skip rather than POST to an empty path.
+            [ -n "${HEAD_SHA}" ] || return 0
             gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
               -f state=success \
               -f context="ci/test-scope-$1" \
