@@ -428,10 +428,6 @@ def get_symm_buffer_for_bf16_mega_moe(
         with_knobs,
     )
 
-    # ``token_back_mode`` is knob-owned, so knobs=None is a pure lookup: the
-    # offline-tuned cache entry for this session key when present, else the
-    # measured BF16 profile.  Both are resolved against the session's ikr,
-    # which forbids the epilogue carrier.  An explicit dict overrides both.
     if knobs is None:
         knobs, _ = resolve_knobs(
             dtype="bf16",
