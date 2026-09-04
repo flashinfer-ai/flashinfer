@@ -52,6 +52,12 @@ FENCE_RE = re.compile(
 )
 ROOT = "tests/experimental/"
 
+# Mirrors MAX_TEST_PATHS in scripts/test_sharding/runner.py. The runner raises
+# RunnerStateError deep inside sharding once the scope exceeds this, which surfaces
+# as three red GPU lanes and an error from an internal, long after the comment that
+# caused it. Rejecting here turns that into an actionable answer on the comment.
+MAX_TARGETS = 16
+
 # A target is a path, optionally with a ``::selector`` suffix. Anything outside this
 # charset is rejected outright rather than reasoned about: the value reaches a shell,
 # and "starts with tests/experimental/ and has no .." accepts
@@ -109,6 +115,14 @@ def validate(targets: list[str], root: str = ROOT) -> list[str]:
     ]
     if bad:
         raise ValueError(f"targets outside {root}: {', '.join(bad)}")
+    # Counted after de-duplication, matching how the runner counts.
+    unique = len(set(targets))
+    if unique > MAX_TARGETS:
+        raise ValueError(
+            f"too many targets ({unique}); maximum is {MAX_TARGETS} "
+            f"(scripts/test_sharding/runner.py enforces the same cap, but only "
+            f"after the lanes have started)"
+        )
     return targets
 
 
@@ -228,6 +242,25 @@ def _selftest() -> int:
             failures += 1
         except ValueError:
             pass
+
+    # The target cap mirrors the runner's, so the bot answers instead of the sharder.
+    try:
+        validate([f"{ROOT}test_{i}.py" for i in range(MAX_TARGETS)], ROOT)
+    except ValueError as e:
+        print(f"FAIL (at-cap rejected): {e}", file=sys.stderr)
+        failures += 1
+    try:
+        validate([f"{ROOT}test_{i}.py" for i in range(MAX_TARGETS + 1)], ROOT)
+        print("FAIL (over-cap accepted)", file=sys.stderr)
+        failures += 1
+    except ValueError:
+        pass
+    # Duplicates do not count toward the cap, matching the runner.
+    try:
+        validate([f"{ROOT}dup.py"] * (MAX_TARGETS + 5), ROOT)
+    except ValueError as e:
+        print(f"FAIL (duplicates counted toward cap): {e}", file=sys.stderr)
+        failures += 1
 
     # Chunking: split on target boundaries, never mid-path, and round-trip exactly.
     long_targets = [f"tests/experimental/test_{c}_{'x' * 40}.py" for c in "abcde"]
