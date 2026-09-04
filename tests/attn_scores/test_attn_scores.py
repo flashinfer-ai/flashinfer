@@ -404,6 +404,15 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
 
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -500,6 +509,15 @@ def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
 
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -584,6 +602,15 @@ def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
     neginf_mask = ~(positions <= limits)
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -655,6 +682,15 @@ def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     neginf_mask = ~(positions <= limits)
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -731,6 +767,15 @@ def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
     neginf_mask = ~(positions <= limits)
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -824,6 +869,15 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
 
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     out_clean = out_m.masked_fill(~finite, 0)
     ref_clean = ref_m.masked_fill(~finite, 0)
@@ -926,6 +980,15 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
 
     out_m = out.float().masked_fill(neginf_mask, 0)
     ref_m = ref.float().masked_fill(neginf_mask, 0)
+    # A non-finite kernel value where the reference is finite is a kernel
+    # failure (uninitialized read, bad predication), never an accumulation
+    # difference -- assert before masking so it cannot be hidden.  Exception:
+    # fp16 outputs saturate at |logit| > 65504 by contract (the fp16 epilogue
+    # trades range), so overflow-to-inf there is legitimate.
+    if out.dtype != torch.float16:
+        assert torch.isfinite(out_m[torch.isfinite(ref_m)]).all(), (
+            "kernel produced non-finite logits at positions the reference keeps finite"
+        )
     finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
     valid = (~neginf_mask) & finite
     assert valid.any(), "test shape produced no comparable positions"
@@ -1760,7 +1823,8 @@ def test_oversized_out_returns_exact_rows(variant):
 
 @pytest.mark.parametrize("variant", ["fp8", "fp4"])
 @pytest.mark.parametrize("preallocated_out", [False, True])
-def test_empty_batch_returns_without_launching(variant, preallocated_out):
+@pytest.mark.parametrize("next_n", [1, 4])
+def test_empty_batch_returns_without_launching(variant, preallocated_out, next_n):
     """B == 0 returns an empty result without scheduling, compiling or launching.
 
     The persistent kernel's grid is num_sms regardless of batch size, and each
@@ -1796,7 +1860,6 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
 
     device = "cuda"
     H, D, block_size, ctx = 64, 128, 64, 256
-    next_n = 1
 
     seq_lens = torch.zeros((0,), dtype=torch.int32, device=device)
     block_tables = torch.zeros((0, 4), dtype=torch.int32, device=device)
@@ -1805,11 +1868,22 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
 
     # Well-formed shape/dtype/device (so it passes the always-on buffer
     # validation) but garbage contents: launching with it would hang, so a
-    # clean return proves the schedule/launch path was skipped.
+    # clean return proves the schedule/launch path was skipped.  Exception:
+    # fp4 next_n=4 on a split device rejects ANY caller schedule -- even at
+    # B == 0 (the condition is batch-independent) -- so that combination runs
+    # schedule-free and pins the rejection explicitly below.
+    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
+
+    split_active = (
+        variant == "fp4"
+        and next_n == 4
+        and _fp4_max_atom_for_device(torch.device(device)) < 4
+    )
     num_sms = _cached_num_sms(0)
     bad_schedule = torch.full(
         (num_sms + 1, 2), 123_456_789, dtype=torch.int32, device=device
     )
+    schedule_arg = None if split_active else bad_schedule
 
     out = None
     if preallocated_out:
@@ -1830,7 +1904,7 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
             block_tables,
             seq_lens,
             ctx,
-            schedule_meta=bad_schedule,
+            schedule_meta=schedule_arg,
             out=out,
         )
     else:
@@ -1846,7 +1920,7 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
             seq_lens,
             ctx,
             output_dtype=torch.bfloat16,
-            schedule_meta=bad_schedule,
+            schedule_meta=schedule_arg,
             out=out,
         )
     torch.cuda.synchronize()
@@ -1861,6 +1935,23 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out):
     assert (after.hits, after.misses) == (before.hits, before.misses), (
         "the compile path was entered for an empty batch"
     )
+
+    if split_active:
+        # The split's schedule_meta rejection is batch-independent, so it
+        # fires even at B == 0 -- a buffer that cannot be right at any batch
+        # size fails immediately.
+        with pytest.raises(ValueError, match="schedule_meta must be None"):
+            fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                ctx,
+                output_dtype=torch.bfloat16,
+                schedule_meta=bad_schedule,
+            )
 
 
 def test_empty_batch_still_validates_out():
@@ -2069,6 +2160,179 @@ def test_validate_inputs_rejects_out_of_pool_block_index(monkeypatch):
 
     with pytest.raises(ValueError, match=r"only 8 blocks"):
         fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx)
+
+
+def test_output_span_32bit_guard():
+    """Outputs spanning >= 2^31 elements are rejected before allocation.
+
+    The kernels carry output store offsets (row * stride + col) as 32-bit
+    integers; past 2^31 elements the offset wraps negative and stores land far
+    outside the buffer -- silent device-memory corruption. The guard fires
+    before the output is allocated, so this test never touches the ~8 GB the
+    rejected shape implies.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp8_paged_mqa_logits
+
+    device = "cuda"
+    H, D, block_size = 64, 128, 64
+    B, max_len = 8192, 262_145  # 8192 rows x 262_400 padded cols > 2^31
+    cl = torch.full((B,), 64, dtype=torch.int32, device=device)
+    cols = ((max_len + 127) // 128 * 128) // block_size
+    bt = torch.zeros((B, cols), dtype=torch.int32, device=device)
+    w = torch.zeros(B, H, device=device, dtype=torch.float32)
+    kv = torch.zeros(1, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+    q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="32-bit"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, max_len)
+
+    # The guard also accounts for a caller out= whose row stride exceeds the
+    # padded width (a view into a wider arena). A real tensor with a
+    # 2^31-spanning stride would itself need 8 GB, so the branch is pinned at
+    # the helper level with a small real tensor and a large row count.
+    from flashinfer.attn_scores.attn_scores import _validate_output_addressable
+
+    arena_row = torch.empty((2, 4096), device=device, dtype=torch.float32)
+    _validate_output_addressable(2, 256, arena_row, "fp8_paged_mqa_logits")  # fine
+    with pytest.raises(ValueError, match="32-bit"):
+        # rows * stride(0) = 2^19 * 4096 = 2^31: the stride, not the padded
+        # width, is what overflows.
+        _validate_output_addressable(2**19, 256, arena_row, "fp8_paged_mqa_logits")
+
+
+def test_fp4_split_graph_replay_across_split_boundary():
+    """CUDA-graph replay of fp4 next_n=4 with the INTERNAL schedule.
+
+    The only other graph test uses a caller schedule_meta, which the split
+    rejects, so the split's capture machinery (the expanded per-atom schedule
+    computed by a captured GPU kernel; the offsets cache that refuses capture
+    population) had no replay coverage. Replays cross a 256-token schedule
+    boundary in BOTH directions and must be bit-exact against eager -- this
+    module's failure mode for schedule mismatches is a hang, so the guard
+    matters. On SM100/SM103 this exercises the two-pass split; on Rubin the
+    same test covers the direct path.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    torch.manual_seed(7)
+    B, next_n, H, D, block_size = 2, 4, 64, 128, 64
+    max_len = 512
+
+    sizing = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    bt, ntb = _make_paged_kv(B, block_size, sizing, device)
+    q_f32 = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+    q_packed, q_sf_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = q_sf_packed.view(torch.int32).view(B, next_n, H)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+    kv_fused, _ = _kv_cache_cast_to_fp4(kv_cache)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    seq_lens = torch.full((B,), 256, dtype=torch.int32, device=device)  # static
+    out = torch.empty(
+        (B * next_n, padded_seq_len(max_len)), device=device, dtype=torch.bfloat16
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len, out=out
+        )
+
+    call()  # warm: kernel + schedule-bucket compiles
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    # 256 -> 257 crosses the boundary upward, 300 -> 256 back down.  Compare
+    # bit-exact over the causal-valid region only: columns past each row's
+    # limit are documented UNSPECIFIED scratch and legitimately differ between
+    # the replayed buffer and a fresh eager allocation.
+    for length in (256, 257, 300, 256, 512):
+        seq_lens.fill_(length)
+        g.replay()
+        torch.cuda.synchronize()
+        replay_out = out[: B * next_n, :max_len].clone()
+        eager = fp4_paged_mqa_logits(q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len)
+        torch.cuda.synchronize()
+        valid = _valid_causal_mask(seq_lens, next_n, max_len, device)
+        assert torch.equal(
+            replay_out.masked_fill(~valid, 0), eager.masked_fill(~valid, 0)
+        ), f"replay != eager at seq_len={length}"
+
+
+def test_atom_offsets_cache_refuses_capture_population():
+    """A cache miss during CUDA-graph capture must NOT populate _ATOM_OFFSETS_CACHE.
+
+    A tensor allocated during capture comes from the graph's private memory
+    pool; caching it would leave a dangling entry after the graph is freed,
+    and later eager calls would read freed memory as per-atom lengths. The
+    manual dict deliberately skips population under capture (validated by hand
+    in commit 4c72476b); this pins it so a future functools.cache "cleanup"
+    cannot reintroduce the use-after-free. Split-only machinery, so it runs
+    where the atom split is active (SM100/SM103).
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits, padded_seq_len
+    from flashinfer.attn_scores import attn_scores as A
+
+    if A._fp4_max_atom_for_device(torch.device("cuda")) >= 4:
+        pytest.skip("direct next_n=4 path (Rubin): the offsets cache is unused")
+
+    device = "cuda"
+    torch.manual_seed(11)
+    B, next_n, H, D, block_size = 2, 4, 64, 128, 64
+    max_len = 256
+    sizing = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    bt, ntb = _make_paged_kv(B, block_size, sizing, device)
+    q_f32 = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+    q_packed, q_sf_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = q_sf_packed.view(torch.int32).view(B, next_n, H)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+    kv_fused, _ = _kv_cache_cast_to_fp4(kv_cache)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    seq_lens = torch.full((B,), max_len, dtype=torch.int32, device=device)
+    out = torch.empty(
+        (B * next_n, padded_seq_len(max_len)), device=device, dtype=torch.bfloat16
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len, out=out
+        )
+
+    call()  # warm compiles (also populates the cache eagerly)
+    torch.cuda.synchronize()
+
+    A._ATOM_OFFSETS_CACHE.clear()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()  # cache miss under capture: compute, do NOT retain
+    assert len(A._ATOM_OFFSETS_CACHE) == 0, (
+        "a graph-pool tensor was cached during capture (dangles after graph free)"
+    )
+
+    g.replay()
+    torch.cuda.synchronize()
+    replay_out = out[: B * next_n, :max_len].clone()
+
+    del g
+    torch.cuda.empty_cache()
+
+    eager = fp4_paged_mqa_logits(q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len)
+    torch.cuda.synchronize()
+    assert torch.equal(replay_out, eager), "post-graph-free eager call corrupted"
+    assert len(A._ATOM_OFFSETS_CACHE) == 1, "eager call should populate the cache"
 
 
 def test_schedule_meta_device_must_match():
