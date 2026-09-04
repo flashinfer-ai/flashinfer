@@ -441,7 +441,11 @@ jobs:
             set -f
             read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
             set +f
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_TARGETS[@]}"
+            # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
+            # to unit_test_runner.py, whose parser takes the scope as an option (or the
+            # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+            # Bare paths fail argument-preflight with "unrecognized arguments".
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
           else
             bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
           fi
