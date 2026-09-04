@@ -172,7 +172,7 @@ def test_moe_runner_enforces_lifecycle_order():
     events = []
 
     class Runner(MoERunner):
-        supported_quant_pairs = ((QuantFormat.BF16, QuantFormat.BF16),)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
         supported_activation_classes = (SwiGLU,)
 
         def _check_support(self):
@@ -208,7 +208,7 @@ def test_moe_runner_enforces_lifecycle_order():
 
 def test_failed_support_check_does_not_authorize_build():
     class Runner(MoERunner):
-        supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+        supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
         def get_valid_tactics(self, inputs, profile):
             return [-1]
@@ -1132,7 +1132,7 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     events = []
 
     class RecordingRunner:
-        supported_quant_pairs = ((QuantFormat.BF16, QuantFormat.BF16),)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
         supported_output_formats = (QuantFormat.BF16,)
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         backend_key = "recording"
@@ -1140,7 +1140,7 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
         @classmethod
         def supports_quant(cls, quant):
             return (
-                quant.pair in cls.supported_quant_pairs
+                quant.pair in cls.supported_quant_variants
                 and quant.output in cls.supported_output_formats
             )
 

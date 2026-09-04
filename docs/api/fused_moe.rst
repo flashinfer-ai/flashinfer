@@ -144,7 +144,7 @@ registered for both backend keys without copying::
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions((cake,)),

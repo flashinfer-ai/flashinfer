@@ -36,7 +36,7 @@ def get_activation_matrix_rows() -> tuple[ActivationMatrixRow, ...]:
     """Collect and validate backend × quantization × activation rows."""
     rows = []
     for config_type, runner_type in _BACKEND_RUNNERS.items():
-        pairs = runner_type.supported_quant_pairs
+        pairs = runner_type.supported_quant_variants
         by_quant = runner_type.supported_activation_classes_by_quant
         if by_quant and set(by_quant) != set(pairs):
             expected = tuple(f"{w.name}×{a.name}" for w, a in pairs)

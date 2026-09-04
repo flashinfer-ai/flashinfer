@@ -40,7 +40,7 @@ config = MoEConfig(
         top_k=8,
         method=RoutingMethodType.DeepSeekV3,
     ),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
+    quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
     backends=[TrtllmFp4Config(extra_backend_params...), CutlassNvfp4Config()],
 )
@@ -76,7 +76,9 @@ output = layer(tensors)
 layer.benchmark(Gemm1Tensors)   # isolate gemm1
 layer.benchmark_all()           # full breakdown
 # --- Variant via immutable replace ---
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
+fp8_config = dataclasses.replace(
+    config, quant=QuantConfig(weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor)
+)
 fp8_layer  = MoELayer(**fp8_config)
 # --- Repro from issue log ---
 repro = MoERepro.from_file("user_issue.log")
@@ -785,7 +787,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
-| `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×MXINT4` | `SwiGLU` |
+| `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
 This table records activation classes, not every accepted scalar value. For
@@ -1039,7 +1041,7 @@ MXFP4×MXFP8 rather than MXFP4×MXFP4.
 `QuantConfig` now has three `QuantFormat` axes: `weight`, `activation`, and
 `output`. `QuantConfig` itself is structural only (members must be
 `QuantFormat`; no `torch.dtype` coercion). Legal combinations are runner
-capabilities: `supported_quant_pairs` plus `supported_output_formats`.
+capabilities: `supported_quant_variants` plus `supported_output_formats`.
 `QuantVariant` remains a deprecated preset that expands every member except
 `W4A16`, which must be spelled as `weight=QuantFormat.MXFP4` or
 `weight=QuantFormat.NVFP4` with `activation=QuantFormat.BF16`, or expanded via

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -129,7 +130,7 @@ QUANT_VARIANT_TO_PAIR: Mapping[QuantVariant, Tuple[QuantFormat, QuantFormat]] = 
             QuantVariant.MxFp8: (QuantFormat.MXFP8, QuantFormat.MXFP8),
             QuantVariant.NVFP4: (QuantFormat.NVFP4, QuantFormat.NVFP4),
             QuantVariant.MXFP4: (QuantFormat.MXFP4, QuantFormat.MXFP8),
-            QuantVariant.MxInt4: (QuantFormat.MXINT4, QuantFormat.MXINT4),
+            QuantVariant.MxInt4: (QuantFormat.MXINT4, QuantFormat.BF16),
             QuantVariant.W4A8: (QuantFormat.INT4, QuantFormat.FP8PerTensor),
             QuantVariant.Humming: (QuantFormat.MXFP4, QuantFormat.FP8PerTensor),
         }
@@ -199,7 +200,7 @@ class QuantConfig:
     """Quantization scheme: MMA weight/activation formats plus the result format.
 
     ``QuantConfig`` only checks that each axis is a :class:`QuantFormat`. Legal
-    combinations are runner capabilities (``supported_quant_pairs`` and
+    combinations are runner capabilities (``supported_quant_variants`` and
     ``supported_output_formats``), not an allow-list in this dataclass.
 
     Parameters
@@ -213,10 +214,12 @@ class QuantConfig:
         Layer output format. Default BF16. Pass ``QuantFormat.FP16``, not
         ``torch.float16``.
     variant : QuantVariant or None
-        Deprecated preset that expands to ``weight`` / ``activation``. May be
-        combined with an explicit pair only when they agree (this is what
-        ``dataclasses.replace`` does). Output stays at its default unless
-        passed explicitly. ``QuantVariant.W4A16`` is rejected; spell the pair
+        Deprecated preset that expands to ``weight`` / ``activation`` and emits
+        a ``DeprecationWarning``. May be combined with an explicit pair only
+        when they agree. The stored ``variant`` attribute is derived from the
+        pair (``init=False``), so ``dataclasses.replace`` never replays it.
+        Output stays at its default unless passed explicitly.
+        ``QuantVariant.W4A16`` is rejected; spell the pair
         (``weight=MXFP4`` or ``weight=NVFP4`` with ``activation=BF16``) or use
         :meth:`from_variant`.
     swizzled_scale_factors : bool or None
@@ -234,7 +237,7 @@ class QuantConfig:
     weight: QuantFormat
     activation: QuantFormat
     output: QuantFormat
-    variant: Optional[QuantVariant]
+    variant: Optional[QuantVariant] = field(init=False)
     swizzled_scale_factors: Optional[bool]
     per_token_scale: Optional[bool]
 
@@ -256,6 +259,13 @@ class QuantConfig:
         set_(self, "variant", variant)
         set_(self, "swizzled_scale_factors", swizzled_scale_factors)
         set_(self, "per_token_scale", per_token_scale)
+        if variant is not None:
+            warnings.warn(
+                "QuantConfig(variant=...) is deprecated; pass weight= and "
+                "activation= QuantFormat axes instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.__post_init__()
 
     def __post_init__(self) -> None:

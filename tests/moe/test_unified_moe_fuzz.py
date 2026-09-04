@@ -2252,7 +2252,10 @@ def test_contract_curated_seeds_match_declared_capabilities():
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
         runner_type = _BACKEND_RUNNERS[config_type]
-        assert handler.variant in runner_type.supported_quant_variants
+        assert (
+            _quant_config_for_handler(handler).pair
+            in runner_type.supported_quant_variants
+        )
         by_quant = runner_type.supported_activation_classes_by_quant
         activations = (
             by_quant[_quant_config_for_handler(handler).pair]

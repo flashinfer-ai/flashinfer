@@ -33,7 +33,7 @@ def test_quant_specific_activation_mapping_must_cover_exact_variants(monkeypatch
 
     class Runner:
         backend_key = "incomplete"
-        supported_quant_pairs = (
+        supported_quant_variants = (
             (QuantFormat.BF16, QuantFormat.BF16),
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
         )

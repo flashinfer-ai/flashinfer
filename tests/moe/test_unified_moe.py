@@ -577,6 +577,22 @@ class TestQuantConfig:
         with pytest.raises(ValueError, match="conflicts"):
             QuantConfig(variant=QuantVariant.NVFP4, **kwargs)
 
+    def test_variant_emits_deprecation_warning(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            QuantConfig(variant=QuantVariant.NVFP4)
+
+    def test_replace_on_w4a16_pair_and_pair_change(self):
+        w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        out = dataclasses.replace(w4a16, output=QuantFormat.FP16)
+        assert out.pair == w4a16.pair and out.variant is QuantVariant.W4A16
+        changed = dataclasses.replace(
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            weight=QuantFormat.MXFP4,
+            activation=QuantFormat.MXFP8,
+        )
+        assert changed.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        assert changed.variant is QuantVariant.MXFP4
+
     def test_replace_keeps_derived_variant_consistent(self):
         cfg = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
         replaced = dataclasses.replace(cfg, output=QuantFormat.FP16)
@@ -1138,7 +1154,7 @@ class TestMoERunnerSupport:
         for runner_cls in set(_BACKEND_RUNNERS.values()):
             by_quant = runner_cls.supported_activation_classes_by_quant
             if by_quant:
-                assert set(by_quant) == set(runner_cls.supported_quant_pairs)
+                assert set(by_quant) == set(runner_cls.supported_quant_variants)
                 assert all(by_quant.values())
             else:
                 assert runner_cls.supported_activation_classes, (
@@ -1365,7 +1381,7 @@ class TestMoERunnerSupport:
         # every MMA pair it accepts; an unmapped pair must not fall back to
         # the permissive class default.
         class _UnmappedRunner(TrtllmFp4RoutedRunner):
-            supported_quant_pairs: ClassVar[
+            supported_quant_variants: ClassVar[
                 tuple[tuple[QuantFormat, QuantFormat], ...]
             ] = (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -1382,11 +1398,12 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="no entry for weight="):
             runner.check_support()
 
-    def test_pair_without_legacy_variant_uses_activation_table(self):
-        # A pair that has no QuantVariant (e.g. MXFP4×MXFP4) must still look up
-        # supported_activation_classes_by_quant by pair, not by variant.
+    def test_pair_without_legacy_variant_is_rejected_until_dispatch_migrates(self):
+        # A pair with no QuantVariant (e.g. MXFP4×MXFP4) can be declared, but
+        # runner build / weight preparation still dispatch on QuantVariant, so
+        # check_support must fail fast instead of passing and breaking later.
         class _Mxfp4xMxfp4Runner(TrtllmFp4RoutedRunner):
-            supported_quant_pairs = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
+            supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
             supported_activation_classes_by_quant = {
                 (QuantFormat.MXFP4, QuantFormat.MXFP4): (SwiGLU,),
             }
@@ -1396,7 +1413,8 @@ class TestMoERunnerSupport:
             quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)
         )
         assert runner.config.quant.variant is None
-        assert runner.check_support() is None
+        with pytest.raises(NotImplementedError, match="no QuantVariant mapping"):
+            runner.check_support()
 
     def test_moe_layer_rejects_unsupported_output_format(self, monkeypatch):
         from flashinfer.fused_moe import layer as layer_module
@@ -1555,7 +1573,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
-            supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
             supported_activation_classes = (SwiGLU,)
 
             def get_valid_tactics(self, inputs, profile):
@@ -1570,7 +1588,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_without_activation_capability_is_rejected(self):
         class Runner(MoERunner):
-            supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
             def get_valid_tactics(self, inputs, profile):
                 return []
@@ -3592,7 +3610,7 @@ class TestFusedSharedExpertsBackendGating:
         for runner_cls in set(_BACKEND_RUNNERS.values()):
             if runner_cls.supports_fused_shared_experts:
                 continue
-            pair = runner_cls.supported_quant_pairs[0]
+            pair = runner_cls.supported_quant_variants[0]
             runner = runner_cls.__new__(runner_cls)
             runner.config = self._shared_cfg(
                 QuantConfig(weight=pair[0], activation=pair[1])

@@ -187,7 +187,7 @@ class TestB12xUnifiedValidation:
     )
     def test_b12x_quant_mode_requires_one_variant(self, pairs):
         runner = object.__new__(B12xNvfp4Runner)
-        runner.supported_quant_pairs = pairs
+        runner.supported_quant_variants = pairs
         with pytest.raises(ValueError, match="exactly one"):
             runner._get_quant_mode_name()
 
