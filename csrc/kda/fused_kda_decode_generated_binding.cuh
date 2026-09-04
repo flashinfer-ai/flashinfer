@@ -49,6 +49,8 @@ static_assert(FLASHINFER_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 == 0 ||
 static_assert(sizeof(FLASHINFER_FUSED_KDA_DECODE_ARG_PLAN_SHA256) == 65,
               "fused KDA decode argument-plan identity must be a full SHA-256");
 
+#include <cstdint>
+
 // Frozen bodies own private fixed-width aliases. Keep those declarations
 // separate from the CUDA and TVM-FFI headers used by this translation unit.
 #define int8_t flashinfer_fused_kda_generated_int8_t
