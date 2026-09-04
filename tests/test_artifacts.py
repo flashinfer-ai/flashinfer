@@ -413,16 +413,21 @@ def test_get_checksums_rejects_tampered_manifest(monkeypatch, tmp_path):
 
 
 def test_get_checksums_rejects_traversal_filenames(monkeypatch, tmp_path):
-    """Manifest entries are joined onto FLASHINFER_CUBIN_DIR; absolute paths
-    and ``..`` segments must be rejected so a manifest can never direct a
-    write outside the cubin cache."""
+    """Manifest entries are joined onto FLASHINFER_CUBIN_DIR; absolute paths,
+    ``..`` segments and drive-qualified names must be rejected so a manifest
+    can never direct a write outside the cubin cache."""
     from flashinfer import artifacts
 
     cubin_dir = tmp_path / "cubins"
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
     monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
 
-    for bad_name in ("../../outside.so", "/etc/evil.so", "a\\..\\b.cubin"):
+    for bad_name in (
+        "../../outside.so",
+        "/etc/evil.so",
+        "a\\..\\b.cubin",
+        "C:/outside.so",
+    ):
         manifest_body = f"abc123 {bad_name}\n"
         cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
         cached.parent.mkdir(parents=True, exist_ok=True)

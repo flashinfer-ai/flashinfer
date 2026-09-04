@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+from pathlib import PureWindowsPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
 import requests  # type: ignore[import-untyped]
@@ -240,11 +241,15 @@ def get_checksums(subdirs):
                 sha256, filename = line.strip().split()
 
                 # Manifest entries are joined onto FLASHINFER_CUBIN_DIR and
-                # downloaded to; never accept a name that could escape it.
+                # downloaded to; never accept a name that could escape it
+                # (absolute, parent-relative, backslash-separated, or
+                # drive-qualified like ``C:/x.so``, which would replace the
+                # cache root when joined on Windows).
                 if (
                     "\\" in filename
                     or filename.startswith("/")
                     or ".." in filename.split("/")
+                    or PureWindowsPath(filename).drive
                 ):
                     raise RuntimeError(
                         f"Unsafe filename {filename!r} in checksum manifest for "
