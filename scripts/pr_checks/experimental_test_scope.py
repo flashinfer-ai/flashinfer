@@ -243,7 +243,35 @@ def _selftest() -> int:
         except ValueError:
             pass
 
-    # The target cap mirrors the runner's, so the bot answers instead of the sharder.
+    # The cap's whole point is that it EQUALS the runner's, so assert the coupling
+    # against the runner's source. Bounds cases written in terms of MAX_TARGETS are
+    # self-referential -- they pass at any value, including a drifted one -- so they
+    # cannot catch the only failure that matters here. Read the literal rather than
+    # importing, which would drag in the runner's dependencies.
+    runner_src = (
+        pathlib.Path(__file__).resolve().parents[1] / "test_sharding" / "runner.py"
+    )
+    if not runner_src.is_file():
+        print(
+            f"FAIL (cannot check cap coupling: {runner_src} missing)", file=sys.stderr
+        )
+        failures += 1
+    else:
+        m = re.search(
+            r"^MAX_TEST_PATHS\s*=\s*(\d+)", runner_src.read_text(), re.MULTILINE
+        )
+        if m is None:
+            print("FAIL (MAX_TEST_PATHS not found in runner.py)", file=sys.stderr)
+            failures += 1
+        elif int(m.group(1)) != MAX_TARGETS:
+            print(
+                f"FAIL (cap drifted: MAX_TARGETS={MAX_TARGETS} but the runner enforces "
+                f"{m.group(1)}; a scope this accepts would die inside sharding)",
+                file=sys.stderr,
+            )
+            failures += 1
+
+    # Bounds behaviour, relative to whatever the (now-pinned) constant is.
     try:
         validate([f"{ROOT}test_{i}.py" for i in range(MAX_TARGETS)], ROOT)
     except ValueError as e:
