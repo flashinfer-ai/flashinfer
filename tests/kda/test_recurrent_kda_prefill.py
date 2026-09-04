@@ -459,6 +459,77 @@ def test_public_backend_option_rejects_unknown_value():
         recurrent_kda(**_cpu_route_tensors(), backend="unknown")
 
 
+def test_public_fp32_indexed_prefill_routes_through_promotion_adapter(monkeypatch):
+    calls = []
+    sentinel = (object(), object())
+
+    class Adapter:
+        @staticmethod
+        def is_available(*, compute_capability):
+            assert compute_capability == (10, 0)
+            return True
+
+        @staticmethod
+        def run(**kwargs):
+            calls.append(kwargs)
+            return sentinel
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_fp32_indexed_kda_prefill_adapter",
+        lambda: Adapter,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 0),
+    )
+    inputs = _cpu_route_tensors()
+    state_pool = torch.empty((3, 1, 128, 128), dtype=torch.float32)
+    state_indices = torch.tensor([2], dtype=torch.int32)
+
+    assert (
+        recurrent_kda(
+            **inputs,
+            initial_state=state_pool,
+            ssm_state_indices=state_indices,
+        )
+        is sentinel
+    )
+    assert calls[0]["initial_state"] is state_pool
+    assert calls[0]["state_indices"] is state_indices
+
+
+def test_public_fp32_indexed_prefill_fails_closed_without_payload(monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: False,
+    )
+    inputs = _cpu_route_tensors()
+    with pytest.raises(RuntimeError, match="deterministic promotion payload"):
+        recurrent_kda(
+            **inputs,
+            initial_state=torch.empty((1, 1, 128, 128), dtype=torch.float32),
+            ssm_state_indices=torch.tensor([0], dtype=torch.int32),
+        )
+
+
 def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
     monkeypatch,
 ):
@@ -750,6 +821,62 @@ def _make_inputs(
             torch.tensor(offsets, dtype=torch.int64, device="cuda") if packed else None
         ),
     }
+
+
+def test_fp32_indexed_state_pool_eligibility_requires_promotion(
+    flash_kda_device, monkeypatch
+):
+    with torch.cuda.device(flash_kda_device):
+        inputs = _make_inputs(
+            seq_lens=[32],
+            num_heads=1,
+            packed=False,
+        )
+        state_pool = torch.empty(
+            (2, 1, 128, 128),
+            dtype=torch.float32,
+            device=flash_kda_device,
+        )
+        state_indices = torch.tensor([1], dtype=torch.int32, device=flash_kda_device)
+    eligibility_kwargs = {
+        **inputs,
+        "initial_state": state_pool,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "ssm_state_indices": state_indices,
+        "num_spec_tokens": None,
+        "num_accepted_tokens": None,
+        "output": None,
+        "initial_state_source": None,
+        "initial_state_indices": None,
+        "beta_is_logit": True,
+        "state_checkpoints": None,
+        "checkpoint_cu_starts": None,
+        "checkpoint_every_n_tokens": 0,
+    }
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_fp32_indexed_kda_prefill_is_available",
+        lambda device: False,
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_fp32_indexed_kda_prefill_is_available",
+        lambda device: True,
+    )
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+
+    eligibility_kwargs["initial_state"] = state_pool.to(torch.bfloat16)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_fp32_indexed_kda_prefill_is_available",
+        lambda device: pytest.fail("BF16 eligibility must not probe FP32 payloads"),
+    )
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
 
 
 @pytest.mark.parametrize(
