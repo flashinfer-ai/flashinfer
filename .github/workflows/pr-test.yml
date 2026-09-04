@@ -615,6 +615,12 @@ jobs:
 
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
+        env:
+          # Bound, not interpolated into the script body. The value originates from a
+          # commit status description, which anything holding statuses:write can set;
+          # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
+          # in another file and must not be what keeps this step from being injectable.
+          TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -645,10 +651,9 @@ jobs:
           # go green having run three narrow lanes. The job names change from "JIT
           # Unittest" to "Targeted Unittest", but that is easy to miss on a check
           # list -- say it outright on the check a merge decision actually reads.
-          SCOPE="${{ needs.setup.outputs.test_scope }}"
-          if [ -n "$SCOPE" ]; then
+          if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
-            echo "> Tested only: \`$SCOPE\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
             echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
