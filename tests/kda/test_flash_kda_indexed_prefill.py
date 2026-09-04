@@ -156,7 +156,9 @@ def test_source_catalog_verifies_complete_target_module_and_source_closure(
     )
 
     targets[0].modules[0].cuda_source.path.write_bytes(b"drift")
-    with pytest.raises(loader.GeneratedKDAIndexedPrefillError, match="content identity differs"):
+    with pytest.raises(
+        loader.GeneratedKDAIndexedPrefillError, match="content identity differs"
+    ):
         loader._read_catalog(tmp_path)
 
 
