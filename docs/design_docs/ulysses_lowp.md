@@ -51,7 +51,7 @@ Two stats protocols handle the case where a quantization group straddles a
 rank boundary. Protocol is chosen automatically by
 `stats_protocol_for(L, world_size)`.
 
-### Protocol 3 — ALIGN-128 (fused single-pass)
+### aligned path — ALIGN-128 (fused single-pass)
 
 **Condition:** `L % 128 == 0`, where `L` is the **local shard length** at
 forward time (i.e. `global_sequence / world_size` for the current request).
@@ -68,22 +68,22 @@ quant_and_pack(q, kv, stats)  →  payload                     [per rank, fused]
 ```
 
 The protocol is selected **per request** by `stats_protocol_for(L,
-world_size)` at forward time, not at server startup. Whether Protocol 3 is
+world_size)` at forward time, not at server startup. Whether aligned path is
 reached depends entirely on the packed sequence length of each incoming
 request: if the caller pads the global sequence to a multiple of
-`128 × world_size`, the local shard is always a multiple of 128 and Protocol
-3 is always taken. The environment variable
+`128 × world_size`, the local shard is always a multiple of 128 and the
+aligned path is always taken. The environment variable
 `SGLANG_MINIMAX_H3_PACKED_ALIGNMENT` (or its equivalent server argument) is
 an optional performance hint that controls this padding — it does not switch
-protocols globally; requests that happen to be aligned take Protocol 3
+protocols globally; requests that happen to be aligned take aligned path
 regardless.
 
-### Protocol 2 — boundary-amax merge
+### boundary-merge path — boundary-amax merge
 
 **Condition:** `L % 128 != 0`
 
 The first and last 64-token K groups on each rank may straddle boundaries.
-Protocol 2 adds a boundary all-gather step to collect partial amax values
+boundary-merge path adds a boundary all-gather step to collect partial amax values
 across the adjacent ranks and merge them before quantizing boundary groups:
 
 ```
@@ -94,7 +94,7 @@ finalize_stats(...)                      →  k_mean, v_scale, merged boundary a
 quant_and_pack(q, kv, stats)             →  payload  [boundary groups use merged amax]
 ```
 
-On 128-aligned shards, Protocol 2 and Protocol 3 produce byte-identical
+On 128-aligned shards, boundary-merge path and aligned path produce byte-identical
 payloads (covered by the test suite).
 
 ## 4. Payload Layout
@@ -174,7 +174,7 @@ parameter selects the scale layout expected by the consumer
 
 ```python
 stats_protocol_for(L, world_size) -> Literal[2, 3]
-required_alignment(world_size)    -> int      # minimum L multiple for protocol 3
+required_alignment(world_size)    -> int      # minimum L multiple for aligned path
 aligned_length(L, world_size)     -> int      # smallest L' >= L satisfying alignment
 payload_spec(B, S, H, P)         -> PayloadSpec
 payload_buffer(B, S, H, P)       -> torch.Tensor   # dtype=uint8
@@ -188,7 +188,7 @@ Six CUDA kernels are exposed through TVM FFI; each has a corresponding
 | Kernel | Purpose | PDL |
 |--------|---------|-----|
 | `k_sum_v_amax` | Two-stage deterministic K-sum and V per-channel amax | ✓ |
-| `k_boundary_minmax` | Partial amax at rank-boundary K groups (Protocol 2) | ✓ |
+| `k_boundary_minmax` | Partial amax at rank-boundary K groups (boundary-merge path) | ✓ |
 | `merge_boundary_amax` | All-reduce of boundary amaxes across ranks | — |
 | `derive_k_boundary_amax` | Final per-boundary-group amax after merge | ✓ |
 | `quant_and_pack` | Fused int8 Q/K + fp8 V quantize-and-pack into payload | ✓ |

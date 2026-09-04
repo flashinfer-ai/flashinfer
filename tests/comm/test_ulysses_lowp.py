@@ -111,7 +111,7 @@ def test_capability_and_layout_constants():
     assert cap["compiled_k_group"] == lowp.K_GROUP
     assert cap["compiled_head_dim"] == lowp.HEAD_DIM
     assert cap["supported"] is True
-    assert lowp.STATS_PROTOCOL == 3
+    assert lowp.ALIGNED == "aligned"  # STATS_PROTOCOL renamed
 
 
 # ---------------------------------------------------------------------------
@@ -1180,15 +1180,15 @@ def test_packed_q_amax_matches_split_path_on_special_values(dtype):
 
 
 def test_protocol_routing_structural():
-    assert lowp.stats_protocol_for(256, 4) == 3
-    assert lowp.stats_protocol_for(4736, 8) == 3
-    assert lowp.stats_protocol_for(1180, 4) == 2
-    assert lowp.stats_protocol_for(65, 8) == 2
+    assert lowp.stats_protocol_for(256, 4) == lowp.ALIGNED
+    assert lowp.stats_protocol_for(4736, 8) == lowp.ALIGNED
+    assert lowp.stats_protocol_for(1180, 4) == lowp.BOUNDARY_MERGE
+    assert lowp.stats_protocol_for(65, 8) == lowp.BOUNDARY_MERGE
     assert lowp.required_alignment(8, 3) == 1024
     assert lowp.required_alignment(4, 2) == 64
     with pytest.raises(ValueError, match="stats_protocol"):
         lowp.required_alignment(4, 1)
-    assert lowp.aligned_length(37730, 8, 3) == 37888
+    assert lowp.aligned_length(37730, 8, lowp.ALIGNED) == 37888
     assert lowp.aligned_length(4685, 4, 2) == 4736
     assert lowp.aligned_length(1024, 4, 3) == 1024
 
@@ -1258,7 +1258,7 @@ def test_auto_routing_matches_explicit_protocol3(dtype, flatten_gathered):
         )
         for r in range(world):
             st = stats_list[r]
-            assert st.stats_protocol == 3
+            assert st.stats_protocol == lowp.ALIGNED
             assert st.q_amax_final is None and st.k_amax_final is None
             assert _same_bits(st.k_mean_global, k_mean)
             assert _same_bits(st.v_scale_global, v_scale)
@@ -1362,7 +1362,7 @@ def test_auto_routing_matches_explicit_protocol2(world, local_sequence):
         )
         payloads, stats_list = _auto_chain(q, k, v, world, L, used)
         for r in range(world):
-            assert stats_list[r].stats_protocol == 2
+            assert stats_list[r].stats_protocol == lowp.BOUNDARY_MERGE
             assert _same_bits(stats_list[r].k_mean_global, k_mean)
             assert torch.equal(payloads[r], reference[r]), f"used={used} r={r}"
         recv = torch.stack([payloads[src][0] for src in range(world)]).contiguous()
@@ -1442,7 +1442,7 @@ def test_auto_routing_rejects_bad_inputs():
     with pytest.raises(ValueError, match="same shard"):
         lowp.finalize_stats(torch.stack([send] * world), ctx, k_r.to(torch.float16))
     with pytest.raises(TypeError, match="V2GStats"):
-        lowp.quant_and_pack(q_r, k_r, v_r, {"stats_protocol": 3})
+        lowp.quant_and_pack(q_r, k_r, v_r, {"stats_protocol": lowp.ALIGNED})
     with pytest.raises(TypeError, match="StatsContext"):
         lowp.finalize_stats(torch.stack([send] * world), {"rank": 0}, k_r)
 
@@ -1458,4 +1458,4 @@ def test_routing_dataclasses_repr_without_touching_tensor_contents():
     st = lowp.finalize_stats(torch.stack([send] * world), ctx, k_r)
     for text in (repr(ctx), repr(st)):
         assert "Tensor(" in text and "tensor(" not in text and "[" in text
-    assert "stats_protocol=2" in repr(st)
+    assert "stats_protocol=boundary_merge" in repr(st)

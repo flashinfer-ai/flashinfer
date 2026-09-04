@@ -54,21 +54,18 @@ from ..trace.templates.comm import (
 )
 from ..utils import device_support_pdl, register_custom_op
 
-# Stats protocol 3 (ALIGN-128): ONE stats AllGather carrying the K per-channel
-# sum and V per-channel amax only.  The ALIGN-128 shard guarantee
-# (local_sequence % 128 == 0, enforced by the unpack precondition) removes
-# every boundary-crossing group, so the locally computed Q/K grouped amax are
-# already final and no boundary descriptor/merge machinery exists.  Ranks
-# disagreeing on this value must refuse the low-precision path group-wide.
-STATS_PROTOCOL = 3
-# Both stats protocols share the payload ABI: 3 = ALIGN-128 (no boundary
-# machinery, aligned unpack); 2 = 64-aligned global packing (boundary
-# descriptor/min-max machinery below + unpack_for_sage(aligned=False)).
-# ``stats_protocol_for`` derives the protocol from the shard length
-# (local_sequence % 128 == 0 -> 3, else 2); the routed entry points
-# local_stats / finalize_stats / quant_and_pack / unpack_for_sage(aligned=None)
-# apply it, and the two routes are byte-identical wherever both are legal.
-SUPPORTED_STATS_PROTOCOLS = (2, 3)
+# ``stats_protocol_for`` returns one of these two constants.
+# ALIGNED: local_sequence % 128 == 0 — every rank's shard starts and ends on a
+#   128-token boundary, so no quantization group straddles a rank edge.
+#   A single fused amax+quant+pack kernel is sufficient; no cross-rank merge.
+# BOUNDARY_MERGE: shard boundaries are not 128-aligned — the first and last
+#   K groups on each rank may straddle a rank edge, so a cross-rank amax merge
+#   step is required before quantizing boundary groups.
+# Both paths share the same payload layout; they are byte-identical wherever
+# both are legal (i.e. on 128-aligned shards).
+ALIGNED = "aligned"
+BOUNDARY_MERGE = "boundary_merge"
+SUPPORTED_STATS_PROTOCOLS = (ALIGNED, BOUNDARY_MERGE)
 HEAD_DIM = 128
 Q_GROUP = 32
 K_GROUP = 64
@@ -1484,41 +1481,47 @@ def unpack_for_sage(
 # ---------------------------------------------------------------------------
 
 
-def stats_protocol_for(local_sequence: int, world_size: int) -> int:
-    """Stats protocol implied by the shard length: 3 (ALIGN-128 fast path)
-    when ``local_sequence % 128 == 0``, else 2 (boundary machinery).  Every
-    rank has the same L, so all ranks route identically with no collective.
-    Protocol 2 handles ANY shard length (a partial global tail group is
-    covered by the slot formulas and the receiver's zero tail); padding the
-    global sequence per ``required_alignment`` is the recommended policy,
-    not a kernel precondition.  The one admission condition protocol 2 does
-    enforce concerns a live prefix: with ``used_sequence`` the zero tail must
-    stay inside the last global K group (``ceil(used/64) == ceil(S/64)``),
-    which the 64-multiple padding policy guarantees."""
+def stats_protocol_for(local_sequence: int, world_size: int) -> str:
+    """Routing key implied by the shard length.
+
+    Returns :data:`ALIGNED` when ``local_sequence % 128 == 0``: every rank's
+    shard starts and ends on a 128-token boundary, so no quantization group
+    straddles a rank edge and a single fused kernel suffices.
+
+    Returns :data:`BOUNDARY_MERGE` otherwise: the first and last K groups on
+    some ranks straddle a rank boundary, so a cross-rank amax merge step is
+    required before quantizing those boundary groups.
+
+    Every rank derives the same value from the same ``local_sequence``, so
+    all ranks route identically with no collective. The boundary-merge path
+    handles any shard length; padding the global sequence per
+    ``required_alignment`` is a performance recommendation, not a kernel
+    precondition."""
 
     local_sequence = _positive_int("local_sequence", local_sequence)
     _world_size(world_size)
-    return 3 if local_sequence % 128 == 0 else 2
+    return ALIGNED if local_sequence % 128 == 0 else BOUNDARY_MERGE
 
 
-def required_alignment(world_size: int, stats_protocol: int) -> int:
-    """Recommended multiple for padding the packed GLOBAL sequence before
-    the Ulysses split: ``128 * world_size`` routes to protocol 3 (every
-    shard a whole number of 128-token blocks; tail padding < 128*P), ``64``
-    keeps whole global K groups under protocol 2 (tail padding < 64)."""
+def required_alignment(world_size: int, stats_protocol: str) -> int:
+    """Recommended multiple for padding the packed GLOBAL sequence.
+
+    ``128 * world_size`` for the aligned path (every shard a whole number of
+    128-token blocks); ``64`` for the boundary-merge path (keeps whole global
+    K groups, tail padding < 64)."""
 
     world_size = _world_size(world_size)
-    if stats_protocol == 3:
+    if stats_protocol == ALIGNED:
         return 128 * world_size
-    if stats_protocol == 2:
+    if stats_protocol == BOUNDARY_MERGE:
         return 64
     raise ValueError(
         f"stats_protocol must be one of {SUPPORTED_STATS_PROTOCOLS}, "
-        f"got {stats_protocol}"
+        f"got {stats_protocol!r}"
     )
 
 
-def aligned_length(n_tokens: int, world_size: int, stats_protocol: int) -> int:
+def aligned_length(n_tokens: int, world_size: int, stats_protocol: str) -> int:
     """``n_tokens`` rounded up to ``required_alignment``: the padded global
     sequence length the caller should materialize (zero-filled tail)."""
 
@@ -1636,7 +1639,7 @@ def local_stats(
         input_dtype=q.dtype,
         stats_numel=k_sum.numel(),
     )
-    if protocol == 3:
+    if protocol == ALIGNED:
         send = torch.cat([k_sum.flatten(), v_amax.flatten()]).contiguous()
         return send, ctx
 
@@ -1693,7 +1696,7 @@ def finalize_stats(
     if not isinstance(gathered, torch.Tensor) or gathered.dtype != torch.float32:
         raise TypeError("gathered must be the fp32 AllGather of local_stats sends")
     per_rank = ctx.stats_numel * 2
-    if ctx.stats_protocol == 2:
+    if ctx.stats_protocol == BOUNDARY_MERGE:
         per_rank += int(math.prod(ctx.q_desc_shape)) + int(
             math.prod(ctx.k_minmax_shape)
         )
@@ -1717,9 +1720,9 @@ def finalize_stats(
     v_scale_global = (
         g[:, n_stat : 2 * n_stat].amax(dim=0).view(stat_shape) / V_SCALE_MAX
     ).contiguous()
-    if ctx.stats_protocol == 3:
+    if ctx.stats_protocol == ALIGNED:
         return V2GStats(
-            stats_protocol=3,
+            stats_protocol=ALIGNED,
             rank=ctx.rank,
             world_size=world_size,
             used_sequence=used,
@@ -1757,7 +1760,7 @@ def finalize_stats(
         world_size=world_size,
     )
     return V2GStats(
-        stats_protocol=2,
+        stats_protocol=BOUNDARY_MERGE,
         rank=ctx.rank,
         world_size=world_size,
         used_sequence=used,
@@ -1785,7 +1788,7 @@ def quant_and_pack(
 
     if not isinstance(stats, V2GStats):
         raise TypeError("stats must be the V2GStats returned by finalize_stats")
-    if stats.stats_protocol == 3:
+    if stats.stats_protocol == ALIGNED:
         return quant_qkv_pack_fused(
             q,
             k,
@@ -1949,7 +1952,8 @@ __all__ = [
     "KSUM_CHUNK_TOKENS",
     "K_GROUP",
     "Q_GROUP",
-    "STATS_PROTOCOL",
+    "ALIGNED",
+    "BOUNDARY_MERGE",
     "StatsContext",
     "V2GStats",
     "V_SCALE_MAX",
