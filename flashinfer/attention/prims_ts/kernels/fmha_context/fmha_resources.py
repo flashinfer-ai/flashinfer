@@ -2576,6 +2576,7 @@ class TmemSPResource(MemoryResource):
                 )
             )
             row_max = cute.math.max(row_max, chunk_max)
+        cute.arch.fence_view_async_tmem_load()
         _tmem_sp_sdata[id(self)] = s_data
         row_max_safe = row_max
         if row_max == -Float32.inf:
