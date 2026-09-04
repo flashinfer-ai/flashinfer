@@ -1116,7 +1116,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             unsigned int compute_stage = 0;
             unsigned int checkpoint_stage_compute = 0;
             unsigned int _phase_checkpoint_free = 1;
-            unsigned int _phase_qk_full = 0;
             unsigned int _phase_v_full = 0;
             unsigned int _phase_old_out_ready = 0;
             unsigned int _phase_u2_acc_ready = 0;
@@ -1138,7 +1137,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 unsigned int state_packed1[16];
                 unsigned int state_packed2[16];
                 unsigned int state_packed3[16];
-                mbarrier_wait(qk_full_addr + (compute_stage) * 8, _phase_qk_full);
+                asm volatile("barrier.sync 1, 192;" ::: "memory");
                 #pragma unroll 1
                 for (int state_col_block_1 = 0; state_col_block_1 < ((1) ? 4 : 3); state_col_block_1++) {
                     int state_addr = taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_1 * 32);
@@ -1195,6 +1194,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (checkpoint_entering != 0) {
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(checkpoint_ready_addr + (checkpoint_stage_compute) * 8);
                     }
@@ -1340,7 +1340,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 }
                 int checkpoint_token = (chunk_idx + 1) * 16;
                 compute_stage += 1;
-                if (compute_stage == 5) { compute_stage = 0; _phase_qk_full ^= 1; _phase_v_full ^= 1; _phase_old_out_ready ^= 1; _phase_u2_acc_ready ^= 1; _phase_final_ready ^= 1; }
+                if (compute_stage == 5) { compute_stage = 0; _phase_v_full ^= 1; _phase_old_out_ready ^= 1; _phase_u2_acc_ready ^= 1; _phase_final_ready ^= 1; }
             }
             if (store_final_state != 0) {
                 #pragma unroll
@@ -1551,7 +1551,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
 
         }
     // ---- Role: aux_mma ----
-    } else if (warp >= 10 && warp <= 11) {
+    } else if (warp == 10) {
         { // aux_mma_main
             unsigned int _phase_aux_pairwise_inputs_ready = 0;
             {
@@ -1561,13 +1561,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 long long eos_2 = cu_seqlens[seq_idx_2 + 1];
                 int seq_len_2 = (int)(eos_2 - bos_2);
                 int num_chunks_2 = (seq_len_2 + 16 - 1) / 16;
-                int instance_id = (warp - 10) / 1;
+                int instance_id = (warp - 10) / 4;
                 int aux_instance = instance_id;
-                int num_aux_iters = (num_chunks_2 + 1 - aux_instance) / 2;
-                unsigned int aux_stage = (unsigned int)aux_instance;
+                int num_aux_iters = num_chunks_2;
+                unsigned int aux_stage = 0;
                 #pragma unroll 1
                 for (int aux_iter = 0; aux_iter < num_aux_iters; aux_iter++) {
-                    int chunk_idx_2 = aux_iter * 2 + aux_instance;
+                    int chunk_idx_2 = aux_iter;
                     int stage_f32 = aux_stage * 5376;
                     mbarrier_wait(aux_pairwise_inputs_ready_addr + (aux_stage) * 8, _phase_aux_pairwise_inputs_ready);
                     unsigned int a_frag[4];
@@ -2195,11 +2195,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     __syncwarp();
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive(qk_full_addr + (aux_stage) * 8);
+                    }
+                    asm volatile("barrier.sync 1, 192;" ::: "memory");
+                    if (elect_sync()) {
                         mbarrier_arrive(aux_inverse_ready_addr + (aux_stage) * 8);
                     }
-                    aux_stage += 1;
-                    if (aux_stage == 5) { aux_stage = 0; _phase_aux_pairwise_inputs_ready ^= 1; }
                     aux_stage += 1;
                     if (aux_stage == 5) { aux_stage = 0; _phase_aux_pairwise_inputs_ready ^= 1; }
                 }
@@ -2220,7 +2220,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             int seq_len_3 = (int)(eos_3 - bos_3);
             int num_chunks_0_2 = (seq_len_3 + 16 - 1) / 16;
             unsigned int mma_stage = 0;
-            unsigned int _phase_qk_full_1 = 0;
             unsigned int _phase_out_empty_0 = 1;
             unsigned int _phase_state_inp_left_ready = 0;
             unsigned int _phase_state_inp_ready = 0;
@@ -2229,7 +2228,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             unsigned int _phase_final_ready_2 = 0;
             #pragma unroll 1
             for (int _chunk_idx = 0; _chunk_idx < num_chunks_0_2; _chunk_idx++) {
-                mbarrier_wait(qk_full_addr + (mma_stage) * 8, _phase_qk_full_1);
+                asm volatile("barrier.sync 1, 192;" ::: "memory");
                 {
                     mbarrier_wait(out_empty_addr, _phase_out_empty_0);
                     _phase_out_empty_0 ^= 1;
@@ -2360,7 +2359,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 mma_ts_step(tmem_tmem_out, tmem_tmem_u2_inp, _mma_b_lo_9, 0xC0004010, 134546576, 1);
                 elect_commit(final_ready_addr + (mma_stage) * 8);
                 mma_stage += 1;
-                if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_left_ready ^= 1; _phase_state_inp_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; _phase_final_ready_2 ^= 1; }
+                if (mma_stage == 5) { mma_stage = 0; _phase_state_inp_left_ready ^= 1; _phase_state_inp_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; _phase_final_ready_2 ^= 1; }
             }
             unsigned int _phase_tmem_dealloc_ready_0 = 0;
             mbarrier_wait(tmem_dealloc_ready_addr, _phase_tmem_dealloc_ready_0);

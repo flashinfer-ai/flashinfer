@@ -2,10 +2,10 @@
 #ifndef FLASHINFER_FLASH_KDA_TARGET_MINOR
 #error "JIT spec must define FLASHINFER_FLASH_KDA_TARGET_MINOR"
 #endif
-static_assert(FLASHINFER_FLASH_KDA_TARGET_MINOR == 0,
+static_assert(FLASHINFER_FLASH_KDA_TARGET_MINOR == 3,
               "binding compiled for the wrong exact target");
 
-#define FLASHKDA_GENERATED_BODY_FILE "flashkda_generated_bf16_fused_m128_a7cdd460b5.cu"
+#define FLASHKDA_GENERATED_BODY_FILE "flashkda_generated_bf16_fused_m128_ac3225bbea.cu"
 #define FLASHKDA_GENERATED_KERNEL kernel_flashkda_bf16_fused_m128
 #define FLASHKDA_GENERATED_THREADS 1024
 #define FLASHKDA_GENERATED_SMEM_BYTES 183296

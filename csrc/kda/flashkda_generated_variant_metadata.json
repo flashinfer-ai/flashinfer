@@ -1,11 +1,11 @@
 {
-  "physical_selector_index_sha256": "0d26bf6cbb06e8da0f5dc6644e165f6373c68645f513345c3f61c010fa0852c9",
+  "physical_selector_index_sha256": "d13fe2c6ea524e8758472be368ebfb45bb6c044a6fb7e43be3d1436ee71b48af",
   "physical_selector_schema_version": 1,
   "runtime_source_contract_receipt_sha256_by_arch": {
-    "sm_100a": "b3b9794b6d90261a17aa018d35319cb726cafac69a565a72dbd52446f4d66b5e",
-    "sm_103a": "95e2cf93bbc96fddce69bd8d6f83356a9459eee891100a08a72b5e74f13bac00"
+    "sm_100a": "55ccd82579c32a42406c720f6fddf432e65793ae130ff9467ff2c5fd8fbd8fb4",
+    "sm_103a": "96dfd255ef94807807629c9a3a85abc7a3a063e82c5e612479a7afd0dee60505"
   },
-  "runtime_source_contract_sha256": "59981ae9a3385079de7d272b4699ab25eded52ec4713f5fe3951df2d882cabda",
+  "runtime_source_contract_sha256": "5942457fee9dc1bc2fbca716350b961aff674090108e14e27cb1e740f69158a5",
   "schema_version": 1,
   "variants": [
     {
@@ -3529,193 +3529,6 @@
       "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
       "arch": "sm_100a",
       "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-      "binding_relpath": "csrc/kda/flashkda_generated_sm_100a_bf16_fused_m128_a7cdd460b5_binding.cu",
-      "binding_sha256": "8ff77ac2a103de721abaa25d0ca9d6ea3c59af98a1d59eb33f804c10113a5fe5",
-      "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_a7cdd460b5.cu",
-      "body_sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422",
-      "bt16_descriptor_common_relpath": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
-      "cache_ident": "2fef5c452e",
-      "generated_common_wrapper_relpath": "csrc/kda/flashkda_generated_binding_common.cuh",
-      "kernel_name": "kernel_flashkda_bf16_fused_m128",
-      "launch_contract": {
-        "affine_dependency_contract": "none",
-        "chunk_tokens": 16,
-        "grid_policy": "sequence_head",
-        "grid_policy_evidence": "observed_head_factorization",
-        "observed_route_roles": [
-          "direct_m128_n16:main"
-        ],
-        "pair_packed_beta": false,
-        "route_role": "direct_m128_n16:main",
-        "schema_version": 2,
-        "sources": {
-          "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
-          "chunk_tokens": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
-          "grid_policy": "route_role policy table + route inventory grid evidence",
-          "grid_policy_evidence": "every route inventory grid for the physical module role",
-          "observed_route_roles": "runtime physical sequences + exact compile-factory physical roles",
-          "pair_packed_beta": "body define SMEM_SMEM_BETA_RAW_STAGE_BYTES + beta TMA ABI use",
-          "route_role": "module contexts + sealed runtime-to-public role alias",
-          "tma_tile": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
-          "value_rows": "body define SMEM_SMEM_V_STAGE_BYTES / (chunk tokens * BF16 bytes)",
-          "value_tma_rank": "sealed body tma_3d/tma_4d_gmem2smem call whose descriptor is v_tma"
-        },
-        "tma_tile": "n16",
-        "value_rows": 128,
-        "value_tma_rank": 4
-      },
-      "launch_contract_sha256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-      "module_ident": "flashkda_bf16_fused_m128_a7cdd460b5",
-      "normalized_equivalence_sha256": "b0b1edec238554c27fa0bd82a591548d62ccf5415d25a8b634c66c71ebf4f020",
-      "original_body_sha256": "9e86d1f3faeb83fca0f45de3c12579bba1e1a1d6b0c2dab875d7d871ab5d42c7",
-      "physical_selectors": [
-        {
-          "family_specialization": {
-            "affine_main_indexed_initial": false,
-            "affine_main_indexed_initial_bf16": false,
-            "checkpoint_tma": true,
-            "chunk": 16,
-            "early_n32_state_pack": false,
-            "gate_kind": "lower_bound",
-            "generic_register_inverse": false,
-            "n32_ft_slab": false,
-            "n32_prediction_first": false,
-            "pair_packed_beta": false,
-            "pdl_publish_final_state": false,
-            "pdl_wait_initial_state_f32": false,
-            "scalar_beta": true,
-            "serving_native_abi": true,
-            "state_dtype_is_fp32": false,
-            "tensor_state_decay": false
-          },
-          "schema_version": 1,
-          "selector_key": {
-            "abi_family": "direct_m128",
-            "arch": "sm_100a",
-            "family_specialization_vector": [
-              [
-                "chunk",
-                16
-              ],
-              [
-                "serving_native_abi",
-                true
-              ],
-              [
-                "gate_kind",
-                "lower_bound"
-              ],
-              [
-                "checkpoint_tma",
-                true
-              ],
-              [
-                "pair_packed_beta",
-                false
-              ],
-              [
-                "scalar_beta",
-                true
-              ],
-              [
-                "early_n32_state_pack",
-                false
-              ],
-              [
-                "generic_register_inverse",
-                false
-              ],
-              [
-                "n32_prediction_first",
-                false
-              ],
-              [
-                "tensor_state_decay",
-                false
-              ],
-              [
-                "state_dtype_is_fp32",
-                false
-              ],
-              [
-                "n32_ft_slab",
-                false
-              ],
-              [
-                "pdl_wait_initial_state_f32",
-                false
-              ],
-              [
-                "pdl_publish_final_state",
-                false
-              ],
-              [
-                "affine_main_indexed_initial",
-                false
-              ],
-              [
-                "affine_main_indexed_initial_bf16",
-                false
-              ]
-            ],
-            "route": "direct_m128_n16",
-            "route_role": "main",
-            "state_mode": "bf16"
-          },
-          "selector_key_sha256": "37d045ca082b1d240edc989267d3a16df8023b32aee9f1671b357b8d6a9901a1"
-        }
-      ],
-      "physical_selectors_sha256": "7b07a700ca733ee57a995237a89ccf37fc3cc3031f6fd6e498e356492a10dc3f",
-      "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
-      "runtime_arg_count": 50,
-      "sanitized_body_sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422",
-      "sanitizer_replacement_count": 11,
-      "smem_bytes": 183296,
-      "source_closure": [
-        {
-          "path": "csrc/kda/flashkda_generated_sm_100a_bf16_fused_m128_a7cdd460b5_binding.cu",
-          "role": "selector_binding",
-          "sha256": "8ff77ac2a103de721abaa25d0ca9d6ea3c59af98a1d59eb33f804c10113a5fe5"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_bf16_fused_m128_a7cdd460b5.cu",
-          "role": "sanitized_body",
-          "sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
-          "role": "abi_wrapper",
-          "sha256": "0849c31caca9eabb9f44dfd5bd582fac2f997cbe006110091373e1ed4782732e"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_binding_common.cuh",
-          "role": "generated_common_wrapper",
-          "sha256": "66c15546cc6d4d07c6b1a6cbe37ad083e4b5c42395bc39c822c0509c52da5b75"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
-          "role": "bt16_descriptor_common",
-          "sha256": "e3a7f99f27aa8f26fbbf73f0783939bdef21b74e06102564cf2dc6aedadb9a91"
-        },
-        {
-          "path": "csrc/kda/flashkda_binding_common.cuh",
-          "role": "public_common_include",
-          "sha256": "22eb231de4352d8afbb0359f61776c60209bf0cf1d32050f95fc3aae8d1369d3"
-        }
-      ],
-      "source_closure_sha256": "2fef5c452edf0d892b3dfaa669c702f382bf8593b1ea95a845404958580932d8",
-      "state_mode": "bf16",
-      "threads": 1024,
-      "tma_abi": "pointer",
-      "use_pdl": false,
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_a7cdd460b5"
-    },
-    {
-      "abi_family": "direct_m128",
-      "abi_variant": "serving",
-      "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
-      "arch": "sm_100a",
-      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
       "binding_relpath": "csrc/kda/flashkda_generated_sm_100a_bf16_fused_m128_a911cb7354_binding.cu",
       "binding_sha256": "92c126cd32a48b4158cd23057b4a4f2f0a32aed7a35f53779e278e620106093a",
       "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_a911cb7354.cu",
@@ -3896,6 +3709,193 @@
       "tma_abi": "pointer",
       "use_pdl": false,
       "variant_id": "sm_100a:flashkda_bf16_fused_m128_a911cb7354"
+    },
+    {
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
+      "arch": "sm_100a",
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_relpath": "csrc/kda/flashkda_generated_sm_100a_bf16_fused_m128_ac3225bbea_binding.cu",
+      "binding_sha256": "e26cc9bb30a4e0418a5c72435b9de243bd940e6ff8e9be67f802ea8055c5b6d5",
+      "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+      "body_sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4",
+      "bt16_descriptor_common_relpath": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
+      "cache_ident": "5744b2bb53",
+      "generated_common_wrapper_relpath": "csrc/kda/flashkda_generated_binding_common.cuh",
+      "kernel_name": "kernel_flashkda_bf16_fused_m128",
+      "launch_contract": {
+        "affine_dependency_contract": "none",
+        "chunk_tokens": 16,
+        "grid_policy": "sequence_head",
+        "grid_policy_evidence": "observed_head_factorization",
+        "observed_route_roles": [
+          "direct_m128_n16:main"
+        ],
+        "pair_packed_beta": false,
+        "route_role": "direct_m128_n16:main",
+        "schema_version": 2,
+        "sources": {
+          "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
+          "chunk_tokens": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
+          "grid_policy": "route_role policy table + route inventory grid evidence",
+          "grid_policy_evidence": "every route inventory grid for the physical module role",
+          "observed_route_roles": "runtime physical sequences + exact compile-factory physical roles",
+          "pair_packed_beta": "body define SMEM_SMEM_BETA_RAW_STAGE_BYTES + beta TMA ABI use",
+          "route_role": "module contexts + sealed runtime-to-public role alias",
+          "tma_tile": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
+          "value_rows": "body define SMEM_SMEM_V_STAGE_BYTES / (chunk tokens * BF16 bytes)",
+          "value_tma_rank": "sealed body tma_3d/tma_4d_gmem2smem call whose descriptor is v_tma"
+        },
+        "tma_tile": "n16",
+        "value_rows": 128,
+        "value_tma_rank": 4
+      },
+      "launch_contract_sha256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+      "module_ident": "flashkda_bf16_fused_m128_ac3225bbea",
+      "normalized_equivalence_sha256": "7ac77db29a0fd0239727cc2cfb8b838e71ed25cfca40898471412c63da8cb847",
+      "original_body_sha256": "959864f3189e804208b15be5a2a4b7dff28c82b0ebddc4eefe82d25faf51deec",
+      "physical_selectors": [
+        {
+          "family_specialization": {
+            "affine_main_indexed_initial": false,
+            "affine_main_indexed_initial_bf16": false,
+            "checkpoint_tma": true,
+            "chunk": 16,
+            "early_n32_state_pack": false,
+            "gate_kind": "lower_bound",
+            "generic_register_inverse": false,
+            "n32_ft_slab": false,
+            "n32_prediction_first": false,
+            "pair_packed_beta": false,
+            "pdl_publish_final_state": false,
+            "pdl_wait_initial_state_f32": false,
+            "scalar_beta": true,
+            "serving_native_abi": true,
+            "state_dtype_is_fp32": false,
+            "tensor_state_decay": false
+          },
+          "schema_version": 1,
+          "selector_key": {
+            "abi_family": "direct_m128",
+            "arch": "sm_100a",
+            "family_specialization_vector": [
+              [
+                "chunk",
+                16
+              ],
+              [
+                "serving_native_abi",
+                true
+              ],
+              [
+                "gate_kind",
+                "lower_bound"
+              ],
+              [
+                "checkpoint_tma",
+                true
+              ],
+              [
+                "pair_packed_beta",
+                false
+              ],
+              [
+                "scalar_beta",
+                true
+              ],
+              [
+                "early_n32_state_pack",
+                false
+              ],
+              [
+                "generic_register_inverse",
+                false
+              ],
+              [
+                "n32_prediction_first",
+                false
+              ],
+              [
+                "tensor_state_decay",
+                false
+              ],
+              [
+                "state_dtype_is_fp32",
+                false
+              ],
+              [
+                "n32_ft_slab",
+                false
+              ],
+              [
+                "pdl_wait_initial_state_f32",
+                false
+              ],
+              [
+                "pdl_publish_final_state",
+                false
+              ],
+              [
+                "affine_main_indexed_initial",
+                false
+              ],
+              [
+                "affine_main_indexed_initial_bf16",
+                false
+              ]
+            ],
+            "route": "direct_m128_n16",
+            "route_role": "main",
+            "state_mode": "bf16"
+          },
+          "selector_key_sha256": "37d045ca082b1d240edc989267d3a16df8023b32aee9f1671b357b8d6a9901a1"
+        }
+      ],
+      "physical_selectors_sha256": "7b07a700ca733ee57a995237a89ccf37fc3cc3031f6fd6e498e356492a10dc3f",
+      "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
+      "runtime_arg_count": 50,
+      "sanitized_body_sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4",
+      "sanitizer_replacement_count": 11,
+      "smem_bytes": 183296,
+      "source_closure": [
+        {
+          "path": "csrc/kda/flashkda_generated_sm_100a_bf16_fused_m128_ac3225bbea_binding.cu",
+          "role": "selector_binding",
+          "sha256": "e26cc9bb30a4e0418a5c72435b9de243bd940e6ff8e9be67f802ea8055c5b6d5"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+          "role": "sanitized_body",
+          "sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
+          "role": "abi_wrapper",
+          "sha256": "0849c31caca9eabb9f44dfd5bd582fac2f997cbe006110091373e1ed4782732e"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_binding_common.cuh",
+          "role": "generated_common_wrapper",
+          "sha256": "66c15546cc6d4d07c6b1a6cbe37ad083e4b5c42395bc39c822c0509c52da5b75"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
+          "role": "bt16_descriptor_common",
+          "sha256": "e3a7f99f27aa8f26fbbf73f0783939bdef21b74e06102564cf2dc6aedadb9a91"
+        },
+        {
+          "path": "csrc/kda/flashkda_binding_common.cuh",
+          "role": "public_common_include",
+          "sha256": "22eb231de4352d8afbb0359f61776c60209bf0cf1d32050f95fc3aae8d1369d3"
+        }
+      ],
+      "source_closure_sha256": "5744b2bb539d6242b80571355178d44cb961a86caa6532d58ade6265d6d5e296",
+      "state_mode": "bf16",
+      "threads": 1024,
+      "tma_abi": "pointer",
+      "use_pdl": false,
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_ac3225bbea"
     },
     {
       "abi_family": "direct_m128",
@@ -11612,193 +11612,6 @@
       "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
       "arch": "sm_103a",
       "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-      "binding_relpath": "csrc/kda/flashkda_generated_sm_103a_bf16_fused_m128_a7cdd460b5_binding.cu",
-      "binding_sha256": "e14bf5a2c126760b768f320e9574f8fca4f2967ad31fec72c092047d906190a7",
-      "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_a7cdd460b5.cu",
-      "body_sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422",
-      "bt16_descriptor_common_relpath": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
-      "cache_ident": "78e2e0bdae",
-      "generated_common_wrapper_relpath": "csrc/kda/flashkda_generated_binding_common.cuh",
-      "kernel_name": "kernel_flashkda_bf16_fused_m128",
-      "launch_contract": {
-        "affine_dependency_contract": "none",
-        "chunk_tokens": 16,
-        "grid_policy": "sequence_head",
-        "grid_policy_evidence": "observed_head_factorization",
-        "observed_route_roles": [
-          "direct_m128_n16:main"
-        ],
-        "pair_packed_beta": false,
-        "route_role": "direct_m128_n16:main",
-        "schema_version": 2,
-        "sources": {
-          "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
-          "chunk_tokens": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
-          "grid_policy": "route_role policy table + route inventory grid evidence",
-          "grid_policy_evidence": "every route inventory grid for the physical module role",
-          "observed_route_roles": "runtime physical sequences + exact compile-factory physical roles",
-          "pair_packed_beta": "body define SMEM_SMEM_BETA_RAW_STAGE_BYTES + beta TMA ABI use",
-          "route_role": "module contexts + sealed runtime-to-public role alias",
-          "tma_tile": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
-          "value_rows": "body define SMEM_SMEM_V_STAGE_BYTES / (chunk tokens * BF16 bytes)",
-          "value_tma_rank": "sealed body tma_3d/tma_4d_gmem2smem call whose descriptor is v_tma"
-        },
-        "tma_tile": "n16",
-        "value_rows": 128,
-        "value_tma_rank": 4
-      },
-      "launch_contract_sha256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-      "module_ident": "flashkda_bf16_fused_m128_a7cdd460b5",
-      "normalized_equivalence_sha256": "b0b1edec238554c27fa0bd82a591548d62ccf5415d25a8b634c66c71ebf4f020",
-      "original_body_sha256": "9e86d1f3faeb83fca0f45de3c12579bba1e1a1d6b0c2dab875d7d871ab5d42c7",
-      "physical_selectors": [
-        {
-          "family_specialization": {
-            "affine_main_indexed_initial": false,
-            "affine_main_indexed_initial_bf16": false,
-            "checkpoint_tma": true,
-            "chunk": 16,
-            "early_n32_state_pack": false,
-            "gate_kind": "lower_bound",
-            "generic_register_inverse": false,
-            "n32_ft_slab": false,
-            "n32_prediction_first": false,
-            "pair_packed_beta": false,
-            "pdl_publish_final_state": false,
-            "pdl_wait_initial_state_f32": false,
-            "scalar_beta": true,
-            "serving_native_abi": true,
-            "state_dtype_is_fp32": false,
-            "tensor_state_decay": false
-          },
-          "schema_version": 1,
-          "selector_key": {
-            "abi_family": "direct_m128",
-            "arch": "sm_103a",
-            "family_specialization_vector": [
-              [
-                "chunk",
-                16
-              ],
-              [
-                "serving_native_abi",
-                true
-              ],
-              [
-                "gate_kind",
-                "lower_bound"
-              ],
-              [
-                "checkpoint_tma",
-                true
-              ],
-              [
-                "pair_packed_beta",
-                false
-              ],
-              [
-                "scalar_beta",
-                true
-              ],
-              [
-                "early_n32_state_pack",
-                false
-              ],
-              [
-                "generic_register_inverse",
-                false
-              ],
-              [
-                "n32_prediction_first",
-                false
-              ],
-              [
-                "tensor_state_decay",
-                false
-              ],
-              [
-                "state_dtype_is_fp32",
-                false
-              ],
-              [
-                "n32_ft_slab",
-                false
-              ],
-              [
-                "pdl_wait_initial_state_f32",
-                false
-              ],
-              [
-                "pdl_publish_final_state",
-                false
-              ],
-              [
-                "affine_main_indexed_initial",
-                false
-              ],
-              [
-                "affine_main_indexed_initial_bf16",
-                false
-              ]
-            ],
-            "route": "direct_m128_n16",
-            "route_role": "main",
-            "state_mode": "bf16"
-          },
-          "selector_key_sha256": "00a78f9b31cb1c30706dbc6d7004b7674476001ae0a68a8f90c08eca6ac4f253"
-        }
-      ],
-      "physical_selectors_sha256": "c4552a07cf0831f5b1eb02a01629810b7c1e23c23baed35f1ae4dc756563abe6",
-      "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
-      "runtime_arg_count": 50,
-      "sanitized_body_sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422",
-      "sanitizer_replacement_count": 11,
-      "smem_bytes": 183296,
-      "source_closure": [
-        {
-          "path": "csrc/kda/flashkda_generated_sm_103a_bf16_fused_m128_a7cdd460b5_binding.cu",
-          "role": "selector_binding",
-          "sha256": "e14bf5a2c126760b768f320e9574f8fca4f2967ad31fec72c092047d906190a7"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_bf16_fused_m128_a7cdd460b5.cu",
-          "role": "sanitized_body",
-          "sha256": "aba4b79aaccdae74e85cab66a846118ef8bb7071dc6c54b74bc6a73101e61422"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
-          "role": "abi_wrapper",
-          "sha256": "0849c31caca9eabb9f44dfd5bd582fac2f997cbe006110091373e1ed4782732e"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_binding_common.cuh",
-          "role": "generated_common_wrapper",
-          "sha256": "66c15546cc6d4d07c6b1a6cbe37ad083e4b5c42395bc39c822c0509c52da5b75"
-        },
-        {
-          "path": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
-          "role": "bt16_descriptor_common",
-          "sha256": "e3a7f99f27aa8f26fbbf73f0783939bdef21b74e06102564cf2dc6aedadb9a91"
-        },
-        {
-          "path": "csrc/kda/flashkda_binding_common.cuh",
-          "role": "public_common_include",
-          "sha256": "22eb231de4352d8afbb0359f61776c60209bf0cf1d32050f95fc3aae8d1369d3"
-        }
-      ],
-      "source_closure_sha256": "78e2e0bdaea8ec2c8321b9467e9a1642a54faaa79445f73b268b28a0374e8a44",
-      "state_mode": "bf16",
-      "threads": 1024,
-      "tma_abi": "pointer",
-      "use_pdl": false,
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_a7cdd460b5"
-    },
-    {
-      "abi_family": "direct_m128",
-      "abi_variant": "serving",
-      "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
-      "arch": "sm_103a",
-      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
       "binding_relpath": "csrc/kda/flashkda_generated_sm_103a_bf16_fused_m128_a911cb7354_binding.cu",
       "binding_sha256": "71ca3f5e3fd0e149cbcca1cd9f2a3bf3670ee48c53bc2fbeb439d4b7ceb3bbd4",
       "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_a911cb7354.cu",
@@ -11979,6 +11792,193 @@
       "tma_abi": "pointer",
       "use_pdl": false,
       "variant_id": "sm_103a:flashkda_bf16_fused_m128_a911cb7354"
+    },
+    {
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "abi_wrapper_relpath": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
+      "arch": "sm_103a",
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_relpath": "csrc/kda/flashkda_generated_sm_103a_bf16_fused_m128_ac3225bbea_binding.cu",
+      "binding_sha256": "6e1beb3852642eec4a05e8524db778b915cfff54901ba60165ac9d472ed9efb5",
+      "body_relpath": "csrc/kda/flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+      "body_sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4",
+      "bt16_descriptor_common_relpath": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
+      "cache_ident": "23809e9ef5",
+      "generated_common_wrapper_relpath": "csrc/kda/flashkda_generated_binding_common.cuh",
+      "kernel_name": "kernel_flashkda_bf16_fused_m128",
+      "launch_contract": {
+        "affine_dependency_contract": "none",
+        "chunk_tokens": 16,
+        "grid_policy": "sequence_head",
+        "grid_policy_evidence": "observed_head_factorization",
+        "observed_route_roles": [
+          "direct_m128_n16:main"
+        ],
+        "pair_packed_beta": false,
+        "route_role": "direct_m128_n16:main",
+        "schema_version": 2,
+        "sources": {
+          "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
+          "chunk_tokens": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
+          "grid_policy": "route_role policy table + route inventory grid evidence",
+          "grid_policy_evidence": "every route inventory grid for the physical module role",
+          "observed_route_roles": "runtime physical sequences + exact compile-factory physical roles",
+          "pair_packed_beta": "body define SMEM_SMEM_BETA_RAW_STAGE_BYTES + beta TMA ABI use",
+          "route_role": "module contexts + sealed runtime-to-public role alias",
+          "tma_tile": "body define SMEM_SMEM_QD_STAGE_BYTES / (128 * BF16 bytes)",
+          "value_rows": "body define SMEM_SMEM_V_STAGE_BYTES / (chunk tokens * BF16 bytes)",
+          "value_tma_rank": "sealed body tma_3d/tma_4d_gmem2smem call whose descriptor is v_tma"
+        },
+        "tma_tile": "n16",
+        "value_rows": 128,
+        "value_tma_rank": 4
+      },
+      "launch_contract_sha256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+      "module_ident": "flashkda_bf16_fused_m128_ac3225bbea",
+      "normalized_equivalence_sha256": "7ac77db29a0fd0239727cc2cfb8b838e71ed25cfca40898471412c63da8cb847",
+      "original_body_sha256": "959864f3189e804208b15be5a2a4b7dff28c82b0ebddc4eefe82d25faf51deec",
+      "physical_selectors": [
+        {
+          "family_specialization": {
+            "affine_main_indexed_initial": false,
+            "affine_main_indexed_initial_bf16": false,
+            "checkpoint_tma": true,
+            "chunk": 16,
+            "early_n32_state_pack": false,
+            "gate_kind": "lower_bound",
+            "generic_register_inverse": false,
+            "n32_ft_slab": false,
+            "n32_prediction_first": false,
+            "pair_packed_beta": false,
+            "pdl_publish_final_state": false,
+            "pdl_wait_initial_state_f32": false,
+            "scalar_beta": true,
+            "serving_native_abi": true,
+            "state_dtype_is_fp32": false,
+            "tensor_state_decay": false
+          },
+          "schema_version": 1,
+          "selector_key": {
+            "abi_family": "direct_m128",
+            "arch": "sm_103a",
+            "family_specialization_vector": [
+              [
+                "chunk",
+                16
+              ],
+              [
+                "serving_native_abi",
+                true
+              ],
+              [
+                "gate_kind",
+                "lower_bound"
+              ],
+              [
+                "checkpoint_tma",
+                true
+              ],
+              [
+                "pair_packed_beta",
+                false
+              ],
+              [
+                "scalar_beta",
+                true
+              ],
+              [
+                "early_n32_state_pack",
+                false
+              ],
+              [
+                "generic_register_inverse",
+                false
+              ],
+              [
+                "n32_prediction_first",
+                false
+              ],
+              [
+                "tensor_state_decay",
+                false
+              ],
+              [
+                "state_dtype_is_fp32",
+                false
+              ],
+              [
+                "n32_ft_slab",
+                false
+              ],
+              [
+                "pdl_wait_initial_state_f32",
+                false
+              ],
+              [
+                "pdl_publish_final_state",
+                false
+              ],
+              [
+                "affine_main_indexed_initial",
+                false
+              ],
+              [
+                "affine_main_indexed_initial_bf16",
+                false
+              ]
+            ],
+            "route": "direct_m128_n16",
+            "route_role": "main",
+            "state_mode": "bf16"
+          },
+          "selector_key_sha256": "00a78f9b31cb1c30706dbc6d7004b7674476001ae0a68a8f90c08eca6ac4f253"
+        }
+      ],
+      "physical_selectors_sha256": "c4552a07cf0831f5b1eb02a01629810b7c1e23c23baed35f1ae4dc756563abe6",
+      "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
+      "runtime_arg_count": 50,
+      "sanitized_body_sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4",
+      "sanitizer_replacement_count": 11,
+      "smem_bytes": 183296,
+      "source_closure": [
+        {
+          "path": "csrc/kda/flashkda_generated_sm_103a_bf16_fused_m128_ac3225bbea_binding.cu",
+          "role": "selector_binding",
+          "sha256": "6e1beb3852642eec4a05e8524db778b915cfff54901ba60165ac9d472ed9efb5"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+          "role": "sanitized_body",
+          "sha256": "768e7394dbdd243da048b0d890803bbeeb5c03394ba83650fc4ea731b2db11b4"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_direct_m128_binding.cuh",
+          "role": "abi_wrapper",
+          "sha256": "0849c31caca9eabb9f44dfd5bd582fac2f997cbe006110091373e1ed4782732e"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_binding_common.cuh",
+          "role": "generated_common_wrapper",
+          "sha256": "66c15546cc6d4d07c6b1a6cbe37ad083e4b5c42395bc39c822c0509c52da5b75"
+        },
+        {
+          "path": "csrc/kda/flashkda_generated_bt16_descriptor_common.cuh",
+          "role": "bt16_descriptor_common",
+          "sha256": "e3a7f99f27aa8f26fbbf73f0783939bdef21b74e06102564cf2dc6aedadb9a91"
+        },
+        {
+          "path": "csrc/kda/flashkda_binding_common.cuh",
+          "role": "public_common_include",
+          "sha256": "22eb231de4352d8afbb0359f61776c60209bf0cf1d32050f95fc3aae8d1369d3"
+        }
+      ],
+      "source_closure_sha256": "23809e9ef530b9cd04a0d835da38e1e2934457dffc4677491b6965a6ebd94062",
+      "state_mode": "bf16",
+      "threads": 1024,
+      "tma_abi": "pointer",
+      "use_pdl": false,
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_ac3225bbea"
     },
     {
       "abi_family": "direct_m128",
