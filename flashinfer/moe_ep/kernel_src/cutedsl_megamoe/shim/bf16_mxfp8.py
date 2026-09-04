@@ -426,9 +426,6 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         with_knobs,
     )
 
-    # ``token_back_mode`` is knob-owned, so knobs=None is a pure lookup: the
-    # offline-tuned cache entry for this session key when present, else the
-    # measured mixed profile.  An explicit dict overrides both.
     if knobs is None:
         knobs, _ = resolve_knobs(
             dtype=kind,
