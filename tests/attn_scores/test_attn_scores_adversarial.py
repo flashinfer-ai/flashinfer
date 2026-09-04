@@ -87,6 +87,9 @@ def _cmp_fp8(
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     v = valid & fin
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     max_abs = (o[v] - r[v]).abs().max().item() if v.any() else 0.0
@@ -252,6 +255,9 @@ def test_adv_degenerate_values_fp8(mode):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     # zero_weights/zero_q -> all-zero logits -> cosine is 0 by construction
     assert diff < 0.02, f"cosine diff {diff:.3e} ({mode})"
@@ -331,6 +337,9 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.05, f"FP4 cosine diff {diff:.3e} ctx={ctx} block_size={block_size}"
 
@@ -381,6 +390,9 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.05, f"FP4 next_n={next_n} cosine diff {diff:.3e} ctx={ctx}"
 
@@ -419,6 +431,9 @@ def test_adv_shared_physical_blocks_fp8():
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.02, f"shared-block cosine diff {diff:.3e}"
 
@@ -710,6 +725,9 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
         a = out[b, :n].float()
         r = ref[b, :n].float()
         finite = torch.isfinite(a) & torch.isfinite(r)
+        assert torch.isfinite(a[torch.isfinite(r)]).all(), (
+            f"row {b}: non-finite kernel logits where the reference is finite"
+        )
         assert finite.any(), f"row {b} produced no finite logits"
         scale = float(r[finite].abs().max()) or 1.0
         rel = float((a[finite] - r[finite]).abs().max()) / scale
@@ -809,6 +827,9 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows():
             a = out[row, :limit].float()
             r = ref[row, :limit].float()
             finite = torch.isfinite(a) & torch.isfinite(r)
+            assert torch.isfinite(a[torch.isfinite(r)]).all(), (
+                f"row {row}: non-finite kernel logits where the reference is finite"
+            )
             assert finite.any(), f"row {row} produced no finite logits"
             scale = float(r[finite].abs().max()) or 1.0
             rel = float((a[finite] - r[finite]).abs().max()) / scale

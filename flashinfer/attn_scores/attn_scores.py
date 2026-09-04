@@ -404,6 +404,32 @@ def _validate_schedule_meta(
         )
 
 
+def _validate_output_addressable(
+    rows: int, padded_ctx_len: int, out: Optional[torch.Tensor], fn_name: str
+) -> None:
+    """The kernels index the output with 32-bit offsets (row * stride + col),
+    so the addressable span is bounded by 2^31 elements.  Beyond it the carried
+    offset wraps negative and stores land far outside the buffer -- silent
+    device-memory corruption, not an error.  Reject up front instead.  The
+    bound is enforced uniformly across architectures for a stable contract
+    (Rubin's gated store path would tolerate more, but an arch-dependent
+    output limit is worse than a conservative one)."""
+    stride0 = (
+        out.stride(0)
+        if (out is not None and out.dim() == 2 and out.shape[0] > 1)
+        else padded_ctx_len
+    )
+    span = rows * max(stride0, padded_ctx_len)
+    if span >= 2**31:
+        raise ValueError(
+            f"{fn_name}: the output would span {span} elements "
+            f"(batch_size*next_n = {rows} rows x row stride "
+            f"{max(stride0, padded_ctx_len)}), but the kernel's output indexing "
+            f"is 32-bit (< 2^31 elements). Reduce batch_size or max_seq_len, "
+            f"or split the call."
+        )
+
+
 def _validate_out(
     out: torch.Tensor,
     rows: int,
@@ -1447,7 +1473,10 @@ def fp8_paged_mqa_logits(
                          branch and would silently miscompute.  Note that
                          fp4_paged_mqa_logits defaults to bfloat16 -- pass
                          output_dtype explicitly in code that uses both.
-        epi_dtype:       epilogue accumulation dtype (float32 or float16)
+        epi_dtype:       epilogue accumulation dtype (float32 or float16).
+                         float16 halves the epilogue traffic but saturates at
+                         |logit| > 65504 -- long-context accumulations can
+                         overflow to inf where float32 would not.
         acc_dtype:       MMA accumulator dtype (float32 or float16)
         num_epi_subtiles: performance knob; numerics unchanged for any legal
                          value.  Leave at 1: measured on SM100 at num_heads=64,
@@ -1512,6 +1541,9 @@ def fp8_paged_mqa_logits(
         head_dim, num_heads and next_n together must fit per-CTA shared
                          memory: on SM100, head_dim <= 192 fits at num_heads=64,
                          next_n=1; 256 does not.
+        output size      batch_size*next_n * padded_seq_len(max_seq_len) must
+                         be < 2**31 elements -- the kernels index the output
+                         with 32-bit offsets.
     """
     _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
 
@@ -1540,6 +1572,9 @@ def fp8_paged_mqa_logits(
         "fp8_paged_mqa_logits",
     )
     padded_ctx_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    _validate_output_addressable(
+        B * next_n, padded_ctx_len, out, "fp8_paged_mqa_logits"
+    )
     if out is not None:
         _validate_out(
             out,
@@ -1987,6 +2022,9 @@ def fp4_paged_mqa_logits(
         num_epi_subtiles must divide num_heads, with the quotient a multiple of
                          4 (at num_heads=64: 1, 2, 4, 8, or 16).
         is_kv_sf_interleaved may be True only when block_size == 128.
+        output size      batch_size*next_n * padded_seq_len(max_seq_len) must
+                         be < 2**31 elements -- the kernels index the output
+                         with 32-bit offsets.
     """
     _require_cute_dsl(q.device, "fp4_paged_mqa_logits")
 
@@ -2048,6 +2086,9 @@ def fp4_paged_mqa_logits(
         "fp4_paged_mqa_logits",
     )
     padded_ctx_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    _validate_output_addressable(
+        B * next_n, padded_ctx_len, out, "fp4_paged_mqa_logits"
+    )
     if out is not None:
         _validate_out(
             out,
@@ -2161,11 +2202,11 @@ def precompile_paged_mqa_logits(
     of a package-build step.
 
     The warmed set is exactly: fp8 -- num_heads=64, head_dim=128, block_size
-    in {64, 128}, next_n 1..4, fp32 epilogue/accumulator (8 kernels); fp4 --
-    num_heads=64, head_dim=128, block_size in {32, 64, 128}, next_n 1..4, fp32
-    epilogue (12 kernels per output dtype).  Anything else (fp16 epilogue,
-    fp8 with block_size=32, other head geometry, num_epi_subtiles != 1) still
-    compiles on first use.  Measured on sm_100a: ~9s for the 8 fp8 kernels,
+    in {32, 64, 128}, next_n 1..4, fp32 epilogue/accumulator (12 kernels);
+    fp4 -- num_heads=64, head_dim=128, block_size in {32, 64, 128}, next_n
+    1..4, fp32 epilogue (12 kernels per output dtype).  Anything else (fp16
+    epilogue, other head geometry, num_epi_subtiles != 1) still compiles on
+    first use.  Measured on sm_100a: ~1s per fp8 kernel,
     ~3s per output dtype for the 12 fp4.  The fp4 next_n=4 entry compiles the
     decomposition the fixed policy picks on the target device (direct on
     Rubin, two internal passes on Blackwell).
@@ -2243,7 +2284,7 @@ def precompile_paged_mqa_logits(
         if "fp8" in variants:
             # block_size × next_n × output dtype, fp32 acc/epi
             fp8_outs = output_dtypes or (torch.float32,)
-            for block_size in (64, 128):
+            for block_size in (32, 64, 128):
                 for nn in (1, 2, 3, 4):
                     for out_dtype in fp8_outs:
                         _cached_compile_fp8_kernel(
