@@ -355,8 +355,10 @@ def gdn_verify_kernel_mtp(
         # All subsequent kernel sites use these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
         if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+            # The runtime leading stride is Int64; widen slot indices as well so
+            # large padded pools cannot truncate address arithmetic to Int32.
+            h_read_view = h0_source[(cutlass.Int64(cache_idx), i_hv, None, None)]
+            h_write_view = h0_source[(cutlass.Int64(write_cache_idx), i_hv, None, None)]
         else:
             h_read_view = h0_source[(flat_state_idx, None, None)]
             h_write_view = h0_source[(flat_write_idx, None, None)]
@@ -1776,8 +1778,10 @@ def gdn_verify_kernel_mtp_inline(
         # All subsequent kernel sites use these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
         if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+            # The runtime leading stride is Int64; widen slot indices as well so
+            # large padded pools cannot truncate address arithmetic to Int32.
+            h_read_view = h0_source[(cutlass.Int64(cache_idx), i_hv, None, None)]
+            h_write_view = h0_source[(cutlass.Int64(write_cache_idx), i_hv, None, None)]
         else:
             h_read_view = h0_source[(flat_state_idx, None, None)]
             h_write_view = h0_source[(flat_write_idx, None, None)]
@@ -2508,7 +2512,7 @@ def _get_compiled_mtp_kernel(
     cache_steps: int,
     disable_state_update: bool,
     use_pool_indexing: bool,
-    pool_strides_key,
+    pool_inner_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2533,7 +2537,7 @@ def _get_compiled_mtp_kernel_inline(
     cache_steps: int,
     disable_state_update: bool,
     use_pool_indexing: bool,
-    pool_strides_key,
+    pool_inner_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2585,7 +2589,10 @@ def run_mtp_decode(
     - BS >= 3: Warp-specialized kernel (SMEM precompute + h-state prefetch)
 
     Args:
-        h0_source: Reshaped initial state [pool_size * HV, V, K].
+        h0_source: Initial state as either a compact
+            [pool_size * HV, V, K] view or a strided
+            [pool_size, HV, V, K] pool when use_pool_indexing=True. The 4D
+            pool's leading stride must be a multiple of vec_size elements.
         intermediate_states: Reshaped intermediate state cache, or dummy tensor.
         A_log: Log decay parameter [HV].
         a: Input-dependent decay [B, T, HV].
@@ -2625,11 +2632,20 @@ def run_mtp_decode(
 
     per_token_pool_scatter = ssm_state_indices is not None
 
-    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
+    # Keep a 4D pool's inner layout in the compile key; pool capacity and the
+    # distance between slots are runtime values. vec_size FP32 elements are
+    # copied together, so every slot must retain that alignment.
     if use_pool_indexing:
-        pool_strides_key = tuple(h0_source.stride())
+        pool_strides = tuple(int(stride) for stride in h0_source.stride())
+        pool_stride0 = pool_strides[0]
+        pool_inner_strides_key = pool_strides[1:]
+        assert pool_stride0 % vec_size == 0, (
+            "initial_state stride(0) must be a multiple of "
+            f"{vec_size} FP32 elements for {vec_size * 32}-bit state copies, "
+            f"got stride(0)={pool_stride0}"
+        )
     else:
-        pool_strides_key = None
+        pool_inner_strides_key = None
 
     # Polymorphic dtypes baked into the compile signature (q/k/v/a/b/output are pinned).
     dtype_key = (
@@ -2648,7 +2664,7 @@ def run_mtp_decode(
             cache_steps,
             disable_state_update,
             use_pool_indexing,
-            pool_strides_key,
+            pool_inner_strides_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -2670,7 +2686,7 @@ def run_mtp_decode(
             cache_steps,
             disable_state_update,
             use_pool_indexing,
-            pool_strides_key,
+            pool_inner_strides_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -2728,17 +2744,21 @@ def run_mtp_decode(
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         if use_pool_indexing:
-            # 4D pool [pool, HV, V, K], possibly non-contiguous (e.g. a strided
-            # slice of an oversized backing tensor). main's mark_compact_shape_dynamic
-            # assumes a compact 3D flat pool (wrong rank + compactness here), and
-            # mark_layout_dynamic would make V/K dynamic (the kernel needs them as
-            # compile-time constants, e.g. num_v_tiles). So pass the layout through
-            # statically: the exact strides are baked in and keyed via
-            # pool_strides_key. The pool-dim (mode 0) stride is independent of the
-            # pool size, so one compiled kernel is reused across batch sizes and
-            # indexes correctly by cache_idx * stride — pool_size is not needed in
-            # the cache key or as a compile-time shape.
-            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+            # Keep the inner state layout static because V/K drive codegen, while
+            # accepting different pool capacities and padded slot strides through
+            # the same compiled callable.
+            stride1, stride2, stride3 = pool_inner_strides_key
+            h0_source_tensor = cute.runtime.make_fake_tensor(
+                cute.Float32,
+                shape=(cute.sym_int(), HV, V, K),
+                stride=(
+                    cute.sym_int64(divisibility=vec_size),
+                    stride1,
+                    stride2,
+                    stride3,
+                ),
+                assumed_align=16,
+            )
         else:
             # 3D flat pool [pool*HV, V, K], compact.
             h0_source_tensor = from_dlpack(
