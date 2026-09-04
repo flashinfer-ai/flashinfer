@@ -5023,6 +5023,11 @@ block_sparse_attention_run_trace = TraceTemplate(
         "q": Tensor(["qo_len", "num_qo_heads", "head_dim"]),
         "k": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
         "v": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description="SM120 BF16/FP16 skip-softmax threshold scale factor.",
+        ),
     },
     outputs={
         "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),

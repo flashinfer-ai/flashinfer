@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -112,6 +113,7 @@ def bsa_attn_sm120_blk64_fwd(
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -130,6 +132,9 @@ def bsa_attn_sm120_blk64_fwd(
         q2k_block_nums: Per-(batch, head, q_block) KV block count,
             (batch, num_heads, num_q_blocks) int32. Optional.
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
+        skip_softmax_threshold_scale_factor: Skip a K/V tile when its contribution
+            is below ``scale_factor / seqlen_k`` for every row in the CTA's
+            query tile. None or zero selects the dense specialization.
         return_lse: Whether to return log-sum-exp.
         out: Pre-allocated output tensor (batch, seqlen_q, num_heads, head_dim).
         lse: Pre-allocated LSE tensor (batch, num_heads, seqlen_q).
@@ -166,6 +171,20 @@ def bsa_attn_sm120_blk64_fwd(
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+    skip_threshold_log2 = None
+    if skip_softmax_threshold_scale_factor not in (None, 0):
+        skip_softmax_threshold_scale_factor = float(skip_softmax_threshold_scale_factor)
+        if (
+            not math.isfinite(skip_softmax_threshold_scale_factor)
+            or skip_softmax_threshold_scale_factor < 0
+        ):
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor must be finite and >= 0; "
+                f"got {skip_softmax_threshold_scale_factor!r}"
+            )
+        skip_threshold_log2 = cutlass.Float32(
+            math.log2(skip_softmax_threshold_scale_factor / seqlen_k)
+        )
 
     q = q.contiguous()
     k = k.contiguous()
@@ -186,7 +205,7 @@ def bsa_attn_sm120_blk64_fwd(
         )
     if lse is not None:
         assert lse.dtype == torch.float32, (
-            f"lse.dtype ({lse.dtype}) must be float32: the kernel always writes LSE in float32"
+            f"lse.dtype ({lse.dtype}) must be float32"
         )
         assert lse.shape == (batch, num_heads, seqlen_q), (
             f"lse.shape {tuple(lse.shape)} must be "
@@ -265,6 +284,7 @@ def bsa_attn_sm120_blk64_fwd(
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        return_lse=return_lse,
     )
 
     compile_key = (
@@ -277,6 +297,7 @@ def bsa_attn_sm120_blk64_fwd(
         bool(has_block_nums),
         bool(has_block_sizes),
         int(block_sizes_mode),
+        bool(return_lse),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),
@@ -285,6 +306,7 @@ def bsa_attn_sm120_blk64_fwd(
         q2k_t.stride(),
         q2k_nums_t.stride(),
         block_sizes_t.stride(),
+        skip_threshold_log2 is not None,
     )
 
     args = (
@@ -298,6 +320,7 @@ def bsa_attn_sm120_blk64_fwd(
         cutlass.Int32(block_sparse_num),
         block_sizes_cute,
         cutlass.Float32(softmax_scale),
+        skip_threshold_log2,
         current_stream,
     )
 
