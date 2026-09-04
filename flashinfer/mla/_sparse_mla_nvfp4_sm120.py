@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..jit.mla import (
     gen_sparse_mla_nvfp4_sm120_module,
     gen_sparse_mla_nvfp4_sm120_tile_module,
@@ -244,6 +245,7 @@ def _validate_unique_slots(slot_mapping: torch.Tensor, capacity: int) -> None:
 
 
 @supported_compute_capability([120, 121])
+@flashinfer_api
 def nvfp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
     *,
@@ -251,17 +253,26 @@ def nvfp4_quantize_pack_sparse_mla_cache(
 ) -> torch.Tensor:
     r"""Quantize complete DeepSeek-V4 latent-KV pages to the NVFP4 cache ABI.
 
-    ``latent_kv`` has shape ``[num_pages, page_size, 512]``. A singleton
-    latent-head axis is also accepted in HND or NHD position. The first 448
-    values are quantized in groups of 16 to packed E2M1 with E4M3 scales; the
-    final 64 BF16 RoPE values are copied bit-for-bit.
+    Parameters
+    ----------
+    latent_kv : torch.Tensor
+        Contiguous CUDA BF16 tensor with shape
+        ``[num_pages, page_size, 512]``. A singleton latent-head axis is also
+        accepted in HND or NHD position. The first 448 values are quantized in
+        groups of 16 to packed E2M1 with E4M3 scales; the final 64 BF16 RoPE
+        values are copied bit-for-bit.
+    kv_layout : str
+        Output layout, either ``"HND"`` or ``"NHD"``.
 
-    The returned uint8 tensor is an opaque paged cache with logical shape
-    ``[num_pages, 1, page_size, 384]`` for HND or
-    ``[num_pages, page_size, 1, 384]`` for NHD. Within each physical page it
-    stores ``page_size * 352`` data bytes followed by ``page_size * 32`` scale
-    bytes. Consumers must not interpret the last dimension as a contiguous
-    per-token record.
+    Returns
+    -------
+    torch.Tensor
+        Opaque uint8 paged cache with logical shape
+        ``[num_pages, 1, page_size, 384]`` for HND or
+        ``[num_pages, page_size, 1, 384]`` for NHD. Within each physical page
+        it stores ``page_size * 352`` data bytes followed by
+        ``page_size * 32`` scale bytes. Consumers must not interpret the last
+        dimension as a contiguous per-token record.
     """
     if kv_layout not in ("HND", "NHD"):
         raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
@@ -299,6 +310,7 @@ def nvfp4_quantize_pack_sparse_mla_cache(
 
 
 @supported_compute_capability([120, 121])
+@flashinfer_api
 def nvfp4_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -306,14 +318,23 @@ def nvfp4_quantize_append_sparse_mla_cache(
 ) -> None:
     r"""Quantize and append DeepSeek-V4 latent KV by physical cache slot.
 
-    ``cache`` accepts the 3D shorthand ``[num_pages, page_size, 384]`` in
-    addition to the public 4D HND/NHD layouts. ``slot_mapping[i]`` is
-    ``page_id * page_size + entry_id``. Page-strided views are accepted so the
-    cache can live inside vLLM's packed physical block allocation. Negative and
-    out-of-range slots are padding and are ignored. Valid slots must be unique;
-    set ``FLASHINFER_VALIDATE_INPUTS=1`` to check that invariant eagerly outside
-    CUDA Graph capture. Only the addressed data row and scale slot are written,
-    so prefill history is reused directly by decode.
+    Parameters
+    ----------
+    latent_kv : torch.Tensor
+        Contiguous CUDA BF16 tensor with one 512-element latent-KV row per
+        entry in ``slot_mapping``.
+    slot_mapping : torch.Tensor
+        Contiguous 1D CUDA int32 or int64 tensor. ``slot_mapping[i]`` is
+        ``page_id * page_size + entry_id``. Negative and out-of-range slots
+        are padding and are ignored. Valid slots must be unique; set
+        ``FLASHINFER_VALIDATE_INPUTS=1`` to check that invariant eagerly
+        outside CUDA Graph capture.
+    cache : torch.Tensor
+        Destination opaque uint8 paged cache. The 3D shorthand
+        ``[num_pages, page_size, 384]`` and public 4D HND/NHD layouts are
+        accepted. Page-strided views may place the cache inside vLLM's packed
+        physical block allocation. Only addressed data rows and scale slots
+        are written, so prefill history is reused directly by decode.
     """
     num_pages, page_size, _ = _cache_shape(cache)
     if not slot_mapping.is_cuda:
