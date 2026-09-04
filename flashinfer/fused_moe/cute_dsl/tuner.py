@@ -48,6 +48,7 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ...utils import get_compute_capability
+from ..api import QuantVariant
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -57,6 +58,7 @@ from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    normalize_cute_dsl_moe_weight_interleave,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -76,27 +78,82 @@ def _seeded_activation(shapes, dtype, device):
 # Blackwell (SM100) Tactics
 # =============================================================================
 
+AUTO_PDL_COUNT = "auto"
+AUTO_PDL_COUNTS: Tuple[Optional[int], ...] = (None, -1, 0, 1)
 
-def get_blackwell_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
+
+def get_blackwell_gemm1_valid_tactics(
+    tile_size: int,
+    swap_ab: bool = False,
+    pdl_count: Optional[int] = -1,
+    gated: bool = True,
+    split_k: Optional[int] = 1,
+    weight_interleave: Optional[int] = None,
+) -> List[Tuple]:
     """Get valid Blackwell tactics for GEMM1 (Gather + SwiGLU Fusion).
 
-    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m,
+    pdl_count[, split_k]).
     """
-    mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
-    cluster_shape_mn_candidates = [(tile_size // 128, 1)]
-    raster_along_m_candidates = [False]
+    from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel,
+    )
 
-    return [
-        (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-        for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
-            mma_tiler_mn_candidates,
-            cluster_shape_mn_candidates,
-            raster_along_m_candidates,
-        )
-    ]
+    weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+        weight_interleave, swap_ab
+    )
+    n_tile_candidates = [128, 256]
+    if gated and not swap_ab and weight_interleave == 16:
+        n_tile_candidates.insert(1, 192)
+    mma_tiler_mn_candidates = [(tile_size, n_tile) for n_tile in n_tile_candidates]
+    cluster_shape_mn_candidates = [(1, 1), (2, 1)]
+    raster_along_m_candidates = [False, True] if swap_ab else [False]
+    if split_k is None:
+        split_k_candidates = (1, 2, 4) if swap_ab else (1,)
+    else:
+        split_k_candidates = (split_k,)
+
+    tactics = []
+    for (
+        mma_tiler_mn,
+        cluster_shape_mn,
+        raster_along_m,
+    ) in itertools.product(
+        mma_tiler_mn_candidates,
+        cluster_shape_mn_candidates,
+        raster_along_m_candidates,
+    ):
+        device_mma_m = mma_tiler_mn[1] if swap_ab else mma_tiler_mn[0]
+        device_mma_n = mma_tiler_mn[0] if swap_ab else mma_tiler_mn[1]
+        if swap_ab and device_mma_m == 256 and not raster_along_m:
+            continue
+        if not BlockScaledContiguousGatherGroupedGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, swap_ab=swap_ab
+        ):
+            continue
+        for split_k_candidate in split_k_candidates:
+            if split_k_candidate > 1 and (
+                not swap_ab or (split_k_candidate > 4 and device_mma_n > 32)
+            ):
+                continue
+            tactic = (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                raster_along_m,
+                pdl_count,
+            )
+            tactics.append(
+                tactic if split_k_candidate == 1 else (*tactic, split_k_candidate)
+            )
+
+    return tactics
 
 
-def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
+def get_blackwell_gemm2_valid_tactics(
+    tile_size: int,
+    swap_ab: bool = False,
+    pdl_count: Optional[int] = -1,
+) -> List[Tuple]:
     """Get valid Blackwell tactics for GEMM2 (Finalize Fusion).
 
     The finalize kernel's MMA shape must match tile_size because it consumes
@@ -105,61 +162,107 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     1-CTA tactic at tile_size=256 yields a layout mismatch and incorrect output
     (bug #3067, fixed upstream by #3171).
 
-    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m, pdl_count)
     """
-    mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
-    cluster_shape_mn_candidates = [
-        (tile_size // 128, 1),
-        (tile_size // 128, 2),
-    ]
-    raster_along_m_candidates = [False]
+    from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+    )
 
-    return [
-        (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-        for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
-            mma_tiler_mn_candidates,
-            cluster_shape_mn_candidates,
-            raster_along_m_candidates,
+    if swap_ab:
+        mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
+        cluster_shape_mn_candidates = [(1, 1), (2, 1)]
+    else:
+        tile_n_candidates = (64, 128, 192, 256)
+        mma_tiler_mn_candidates = [(tile_size, tile_n) for tile_n in tile_n_candidates]
+        cluster_shape_mn_candidates = [
+            (tile_size // 128, 1),
+            (tile_size // 128, 2),
+        ]
+    raster_along_m_candidates = [False, True]
+    tactics = []
+    for (
+        mma_tiler_mn,
+        cluster_shape_mn,
+        raster_along_m,
+    ) in itertools.product(
+        mma_tiler_mn_candidates,
+        cluster_shape_mn_candidates,
+        raster_along_m_candidates,
+    ):
+        if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, swap_ab=swap_ab
+        ):
+            continue
+        tactics.append(
+            (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                raster_along_m,
+                pdl_count,
+            )
         )
-    ]
+
+    return tactics
 
 
-def get_blackwell_moe_valid_tactics() -> List[Tuple]:
+def get_blackwell_moe_valid_tactics(
+    swap_ab: bool = False,
+    w1_pdl_count: Any = -1,
+    w2_pdl_count: Any = -1,
+    gated: bool = True,
+    w1_split_k: Optional[int] = 1,
+    weight_interleave: Optional[int] = None,
+) -> List[Tuple]:
     """Get all valid Blackwell MoE tactic combinations.
 
-    Returns: List of (tile_size, gemm1_tactic, gemm2_tactic)
+    Only the 16-row interleave layout can feed both the swapped and unswapped
+    kernels, so swap_ab is tuned only in that case.
+
+    Returns: List of (tile_size, gemm1_tactic, gemm2_tactic[, swap_ab])
     """
-    tactics = []
+    autotune_swap_ab = weight_interleave == 16
     # tile_size=256 (2-CTA) is enabled: the gemm1(2-CTA)/gemm2(1-CTA) layout
     # mismatch that caused incorrect results (#3067) is fixed by parameterizing
     # get_blackwell_gemm2_valid_tactics on tile_size (#3171). Mirrors main's
     # get_moe_valid_tactics over VALID_TILE_SIZES.
-    for tile_size in VALID_TILE_SIZES:
-        gemm1_tactics = get_blackwell_gemm1_valid_tactics(tile_size)
-        gemm2_tactics = get_blackwell_gemm2_valid_tactics(tile_size)
+    if w1_pdl_count == w2_pdl_count == AUTO_PDL_COUNT:
+        pdl_count_pairs = [(count, count) for count in AUTO_PDL_COUNTS]
+    else:
+        pdl_count_pairs = list(
+            itertools.product(
+                *(
+                    AUTO_PDL_COUNTS if count == AUTO_PDL_COUNT else (count,)
+                    for count in (w1_pdl_count, w2_pdl_count)
+                )
+            )
+        )
+
+    tactics = []
+    for tactic_swap_ab, (w1_pdl, w2_pdl), tile_size in itertools.product(
+        (False, True) if autotune_swap_ab else (swap_ab,),
+        pdl_count_pairs,
+        VALID_TILE_SIZES,
+    ):
+        gemm1_tactics = get_blackwell_gemm1_valid_tactics(
+            tile_size,
+            swap_ab=tactic_swap_ab,
+            pdl_count=w1_pdl,
+            split_k=w1_split_k,
+            gated=gated,
+            weight_interleave=weight_interleave,
+        )
+        gemm2_tactics = get_blackwell_gemm2_valid_tactics(
+            tile_size if tactic_swap_ab else max(tile_size, 128),
+            swap_ab=tactic_swap_ab,
+            pdl_count=w2_pdl,
+        )
+
         for gemm1_tactic, gemm2_tactic in itertools.product(
             gemm1_tactics, gemm2_tactics
         ):
-            tactics.append((tile_size, gemm1_tactic, gemm2_tactic))
+            tactic = (tile_size, gemm1_tactic, gemm2_tactic)
+            tactics.append((*tactic, tactic_swap_ab) if autotune_swap_ab else tactic)
     return tactics
-
-
-def get_w4a8_moe_valid_tactics() -> List[Tuple]:
-    """Get the Blackwell tactics for W4A8 mixed-format MoE.
-
-    The mixed finalize kernel also supports N tiles 64 and 192. Keep its
-    tactic space distinct so W4A8 does not change W4A4 tuning results.
-    """
-    return [
-        (
-            tile,
-            ((tile, gemm1_n), (tile // 128, 1), False),
-            ((tile, gemm2_n), (tile // 128, cluster_n), False),
-        )
-        for tile, gemm1_n, gemm2_n, cluster_n in itertools.product(
-            VALID_TILE_SIZES, (128, 256), (64, 128, 192, 256), (1, 2)
-        )
-    ]
 
 
 # Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
@@ -167,7 +270,7 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
 # every tactic in the arch-specific tactic lists can reuse the prealloc,
 # regardless of which tile_size the autotuner picks at runtime.  Adding a
 # new tile_size here automatically widens the prealloc.
-VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
+VALID_TILE_SIZES: Tuple[int, ...] = (8, 16, 32, 64, 128, 256)
 
 
 # =============================================================================
@@ -311,8 +414,8 @@ def get_rubin_moe_valid_tactics() -> List[Tuple]:
 # Pre-generated tactic sets
 # =============================================================================
 
+# Fix PDL release at K-tile 1; tuning it has negligible impact.
 ALL_BLACKWELL_MOE_TACTICS = get_blackwell_moe_valid_tactics()
-ALL_W4A8_MOE_TACTICS = get_w4a8_moe_valid_tactics()
 ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 
 # Backwards-compatible alias.  Before the tactic space became
@@ -320,34 +423,16 @@ ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 # Use _get_arch_tactics() for new code.
 ALL_MOE_TACTICS = ALL_BLACKWELL_MOE_TACTICS
 
-
 DEFAULT_BLACKWELL_MOE_TACTIC = (
     128,
-    ((128, 128), (1, 1), False),
-    ((128, 128), (1, 1), False),
+    ((128, 128), (1, 1), False, 1),
+    ((128, 128), (1, 1), False, 1),
 )
-
 DEFAULT_RUBIN_MOE_TACTIC = (
     128,
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
     ((128, 128, 256), (128, 128, 128), (1, 1), False),
 )
-
-
-def canonicalize_w4a8_tactic(tactic: Any) -> Tuple:
-    """Canonicalize and validate a W4A8 tactic from Python or JSON."""
-    if not isinstance(tactic, (tuple, list)) or len(tactic) != 3:
-        raise ValueError("tactic must be (tile_size, gemm1_tactic, gemm2_tactic)")
-
-    def as_tuple(value: Any) -> Any:
-        if isinstance(value, (tuple, list)):
-            return tuple(as_tuple(item) for item in value)
-        return value
-
-    result = as_tuple(tactic)
-    if result not in ALL_W4A8_MOE_TACTICS:
-        raise ValueError(f"unsupported W4A8 MoE tactic: {result!r}")
-    return result
 
 
 # =============================================================================
@@ -361,8 +446,8 @@ def _is_rubin_tactic(tactic: Tuple) -> bool:
     Blackwell sub-tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m) — 3 elements
     Rubin sub-tactic: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m) — 4 elements
     """
-    _, gemm1_tactic, _ = tactic
-    return len(gemm1_tactic) == 4
+    _, gemm1_tactic, _ = tactic[:3]
+    return len(gemm1_tactic[0]) == 3
 
 
 def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
@@ -375,51 +460,60 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
         'gemm1_mma_tiler', 'gemm1_mma_inst_shape', etc. in addition to
         the standard keys.
     """
-    tile_size, gemm1_tactic, gemm2_tactic = tactic
+    tile_size, gemm1_tactic, gemm2_tactic = tactic[:3]
+    swap_ab = tactic[3] if len(tactic) > 3 else None
 
     if _is_rubin_tactic(tactic):
         (
             gemm1_mma_tiler,
             gemm1_mma_inst_shape,
             gemm1_cluster_shape_mn,
-            gemm1_raster_along_m,
+            w1_raster_along_m,
         ) = gemm1_tactic
         (
             gemm2_mma_tiler,
             gemm2_mma_inst_shape,
             gemm2_cluster_shape_mn,
-            gemm2_raster_along_m,
+            w2_raster_along_m,
         ) = gemm2_tactic
         return {
             "tile_size": tile_size,
             "is_rubin": True,
             "gemm1_mma_tiler_mn": (gemm1_mma_tiler[0], gemm1_mma_tiler[1]),
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
-            "gemm1_raster_along_m": gemm1_raster_along_m,
+            "w1_raster_along_m": w1_raster_along_m,
+            "w1_pdl_count": -1,
+            "w1_split_k": 1,
             "gemm1_mma_tiler": gemm1_mma_tiler,
             "gemm1_mma_inst_shape": gemm1_mma_inst_shape,
             "gemm2_mma_tiler_mn": (gemm2_mma_tiler[0], gemm2_mma_tiler[1]),
             "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
-            "gemm2_raster_along_m": gemm2_raster_along_m,
+            "w2_raster_along_m": w2_raster_along_m,
+            "w2_pdl_count": -1,
             "gemm2_mma_tiler": gemm2_mma_tiler,
             "gemm2_mma_inst_shape": gemm2_mma_inst_shape,
+            "swap_ab": swap_ab,
         }
     else:
-        gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
-        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m = gemm2_tactic
+        gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, w1_raster_along_m = gemm1_tactic[:3]
+        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, w2_raster_along_m = gemm2_tactic[:3]
         return {
             "tile_size": tile_size,
             "is_rubin": False,
             "gemm1_mma_tiler_mn": gemm1_mma_tiler_mn,
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
-            "gemm1_raster_along_m": gemm1_raster_along_m,
+            "w1_raster_along_m": w1_raster_along_m,
+            "w1_pdl_count": gemm1_tactic[3] if len(gemm1_tactic) >= 4 else -1,
+            "w1_split_k": gemm1_tactic[4] if len(gemm1_tactic) >= 5 else 1,
             "gemm1_mma_tiler": None,
             "gemm1_mma_inst_shape": None,
             "gemm2_mma_tiler_mn": gemm2_mma_tiler_mn,
             "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
-            "gemm2_raster_along_m": gemm2_raster_along_m,
+            "w2_raster_along_m": w2_raster_along_m,
+            "w2_pdl_count": gemm2_tactic[3] if len(gemm2_tactic) >= 4 else -1,
             "gemm2_mma_tiler": None,
             "gemm2_mma_inst_shape": None,
+            "swap_ab": swap_ab,
         }
 
 
@@ -457,18 +551,22 @@ class CuteDslFusedMoERunner(TunableRunner):
     Tactic format follows TRT-LLM style:
         (tile_size, gemm1_tactic, gemm2_tactic)
     where:
-        - tile_size: 128 or 256
-        - gemm1_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-        - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+        - tile_size: one of VALID_TILE_SIZES
+        - gemm1_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m,
+          pdl_count[, split_k])
+        - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m,
+          pdl_count)
 
     Input tensor indices (for dynamic_tensor_specs):
-        0: x (num_tokens, hidden_size//2) - FP4 packed input
+        0: x (num_tokens, hidden_size//2) for packed W4A4, or
+            (num_tokens, hidden_size) for MXFP8 W4A8 input
         1: x_sf (num_tokens, hidden_size//sf_vec_size) - input scale factors
         2: token_selected_experts (num_tokens, top_k) - expert assignments
         3: token_final_scales (num_tokens, top_k) - routing weights
-        4-10: weight tensors (fixed size, don't depend on num_tokens)
-        11: moe_output, or per_token_scale when per-token activation is enabled
-        12: moe_output when per-token activation is enabled
+        4-8: w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale
+        9-12: w2_weight, w2_weight_sf, w2_alpha, w2_bias
+        13: moe_output, or per_token_scale when per-token activation is enabled
+        14: moe_output when per-token activation is enabled
 
     Args:
         forward_impl: The actual MoE implementation function.
@@ -478,10 +576,30 @@ class CuteDslFusedMoERunner(TunableRunner):
         local_expert_offset: Starting expert index for this partition.
         use_fused_finalize: Whether to use fused finalize (default: True).
         output_dtype: Output data type (default: torch.bfloat16).
+        activation_type: FC1 activation type.
+        swiglu_alpha: Sigmoid multiplier for parameterized SwiGLU.
+        swiglu_beta: Up-projection bias for parameterized SwiGLU.
+        swiglu_limit: Clamp limit for parameterized SwiGLU.
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        swap_ab: Whether both GEMMs swap device A/B operands and M/N roles.
+        weight_interleave: Physical GEMM1 up/gate weight interleave. The
+            unswapped kernel accepts 16 or 64; the swapped kernel accepts 16.
+        w1_raster_along_m: Override GEMM1 rasterization, or None to let the
+            tactic decide.
+        w2_raster_along_m: Override GEMM2 rasterization, or None to let the
+            tactic decide.
+        fixed_tile_size: Force the routing tile size, or None to tune it.
+        w1_pdl_count: Fixed GEMM1 dependent-launch count, None to disable PDL,
+            or "auto" to tune it over AUTO_PDL_COUNTS.
+        w2_pdl_count: Fixed GEMM2 dependent-launch count, None to disable PDL,
+            or "auto" to tune it over AUTO_PDL_COUNTS.
+        w1_split_k: None to tune GEMM1 split-K over 1, 2, and 4, or an
+            integer to use one fixed factor.
+        activation_format: Activation quantization format.
+        weight_format: Weight quantization format.
 
     Also supports Rubin (SM107): tactic format is architecture-dependent —
     see _extract_tactic_params.
@@ -496,7 +614,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         local_expert_offset: int = 0,
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
-        enable_pdl: bool = True,
         activation_type: int = ActivationType.Swiglu.value,
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
@@ -504,15 +621,20 @@ class CuteDslFusedMoERunner(TunableRunner):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
-        quant_mode: str = "w4a4",
+        swap_ab: bool = False,
+        weight_interleave: Optional[int] = None,
+        w1_raster_along_m: Optional[bool] = None,
+        w2_raster_along_m: Optional[bool] = None,
+        fixed_tile_size: Optional[int] = None,
+        w1_pdl_count: Any = AUTO_PDL_COUNT,
+        w2_pdl_count: Any = AUTO_PDL_COUNT,
+        w1_split_k: Optional[int] = None,
+        enable_pdl: Optional[bool] = None,
+        activation_format: Optional[QuantVariant] = None,
+        weight_format: Optional[QuantVariant] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
-        quant_mode = quant_mode.lower()
-        if quant_mode not in ("w4a4", "w4a8"):
-            raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
-        if quant_mode == "w4a8" and use_per_token_activation:
-            raise ValueError("per-token activation scaling is not supported for W4A8")
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -520,7 +642,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
-        self.enable_pdl = enable_pdl
         self.activation_type = activation_type
         self.gated = gated
         self.swiglu_alpha = swiglu_alpha
@@ -529,7 +650,40 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
-        self.quant_mode = quant_mode
+        self.swap_ab = swap_ab
+        self.weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+            weight_interleave, swap_ab
+        )
+        self.w1_raster_along_m = w1_raster_along_m
+        self.w2_raster_along_m = w2_raster_along_m
+        self.fixed_tile_size = fixed_tile_size
+        if enable_pdl is False:
+            w1_pdl_count = None
+            w2_pdl_count = None
+        self.w1_pdl_count = w1_pdl_count
+        self.w2_pdl_count = w2_pdl_count
+        self.enable_pdl = w1_pdl_count is not None or w2_pdl_count is not None
+        self.w1_split_k = w1_split_k
+        if (activation_format is None) != (weight_format is None):
+            raise ValueError(
+                "activation_format and weight_format must be specified together"
+            )
+        if activation_format is not None:
+            if (activation_format, weight_format) not in (
+                (QuantVariant.NVFP4, QuantVariant.NVFP4),
+                (QuantVariant.MXFP8, QuantVariant.MXFP4),
+            ):
+                raise ValueError(
+                    "unsupported CuTe-DSL runner format pair "
+                    f"({activation_format!r}, {weight_format!r})"
+                )
+            if activation_format is QuantVariant.MXFP8 and use_per_token_activation:
+                raise ValueError(
+                    "per-token activation scaling is not supported for W4A8"
+                )
+        self.activation_format = activation_format
+        self.weight_format = weight_format
+        self._base_callback_contract = activation_format is not None
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -545,8 +699,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3, 11)
-                    + ((12,) if use_per_token_activation else ()),
+                    input_idx=(0, 1, 2, 3, 13)
+                    + ((14,) if use_per_token_activation else ()),
                     dim_idx=(0,) * (6 if use_per_token_activation else 5),
                     # Bare callables: autotuner adapts the bucket set to
                     # the actual input dim (matches the
@@ -557,8 +711,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                 ),
             ),
             # Per-input initializer closures, keyed by input index. Indices
-            # match input_idx above: 11 is per_token_scale when per-token
-            # activation is enabled (else moe_output), 12 is moe_output.
+            # match input_idx above: 13 is per_token_scale when per-token
+            # activation is enabled (else moe_output), 14 is moe_output.
             tensor_initializers=(
                 # 0: x — packed FP4 or MXFP8 activation. Seeded
                 # for cross-process determinism of autotune picks
@@ -608,16 +762,16 @@ class CuteDslFusedMoERunner(TunableRunner):
                 ),
                 *(
                     [
-                        # 11: per_token_scale — ones.
+                        # 13: per_token_scale — ones.
                         (
-                            11,
+                            13,
                             lambda shapes, dtype, device: torch.ones(
                                 shapes, dtype=torch.float32, device=device
                             ),
                         ),
-                        # 12: moe_output — empty.
+                        # 14: moe_output — empty.
                         (
-                            12,
+                            14,
                             lambda shapes, dtype, device: torch.empty(
                                 shapes, dtype=dtype, device=device
                             ),
@@ -625,9 +779,9 @@ class CuteDslFusedMoERunner(TunableRunner):
                     ]
                     if use_per_token_activation
                     else [
-                        # 11: moe_output — empty.
+                        # 13: moe_output — empty.
                         (
-                            11,
+                            13,
                             lambda shapes, dtype, device: torch.empty(
                                 shapes, dtype=dtype, device=device
                             ),
@@ -641,6 +795,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             # between profile iterations yields autotune timings
             # representative of production cold-cache conditions.
             use_cold_l2_cache=True,
+            use_cuda_graph=True,
         )
 
     def __hash__(self):
@@ -659,19 +814,52 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
                 self.use_per_token_activation,
-                self.quant_mode,
+                self.swap_ab,
+                self.weight_interleave,
+                self.w1_raster_along_m,
+                self.w2_raster_along_m,
+                self.fixed_tile_size,
+                self.w1_pdl_count,
+                self.w2_pdl_count,
+                self.w1_split_k,
+                self.activation_format,
+                self.weight_format,
             )
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        if len(inputs) > 12:
+            w1_alpha = inputs[6]
+            w1_bias = inputs[7]
+            w2_alpha = inputs[11]
+            w2_bias = inputs[12]
+        else:
+            w1_alpha = w1_bias = w2_alpha = w2_bias = None
         return (
-            self.quant_mode,
+            self.activation_format,
+            self.weight_format,
+            str(inputs[0].dtype) if inputs else "unknown",
             int(self.activation_type),
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.use_fused_finalize,
+            str(self.output_dtype),
+            self.use_per_token_activation,
+            self.swap_ab,
+            self.w1_raster_along_m,
+            self.w2_raster_along_m,
+            self.fixed_tile_size,
+            self.w1_pdl_count,
+            self.w2_pdl_count,
+            self.w1_split_k,
+            self.weight_interleave,
+            w1_alpha is not None,
+            w2_alpha is not None,
+            w1_bias is not None,
+            w2_bias is not None,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -686,6 +874,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         Supports both Blackwell and Rubin architectures.
         """
         import cutlass
+        from .blackwell import (
+            BlockScaledContiguousGatherGroupedGemmKernel,
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+        )
         from .moe_utils import get_max_num_permuted_tokens
 
         x = inputs[0]
@@ -693,20 +885,24 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         gated = self.gated
         num_tokens = x.shape[0]
-        is_mxfp8 = self.quant_mode == "w4a8"
-        hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
+        hidden_size = w1_weight.shape[2] * 2
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
         # has a single intermediate-row projection.
         gemm1_n = w1_weight.shape[1]
         intermediate_size = gemm1_n // 2 if gated else gemm1_n
 
-        a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
+        is_mxfp8 = x.dtype == torch.float8_e4m3fn
         b_dtype = cutlass.Float4E2M1FN
-        sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
-        sf_vec_size = 32 if is_mxfp8 else 16
-
-        if self.use_per_token_activation:
+        if is_mxfp8:
+            a_dtype = cutlass.Float8E4M3FN
+            sf_dtype = cutlass.Float8E8M0FNU
+            sf_vec_size = 32
+            gemm1_c_dtype = cutlass.Float8E4M3FN
+        elif self.use_per_token_activation:
+            a_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            sf_vec_size = 16
             if self.output_dtype == torch.float16:
                 gemm1_c_dtype = cutlass.Float16
             elif self.output_dtype == torch.bfloat16:
@@ -714,10 +910,13 @@ class CuteDslFusedMoERunner(TunableRunner):
             else:
                 return []
         else:
-            gemm1_c_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
+            a_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            sf_vec_size = 16
+            gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
 
-        all_tactics = ALL_W4A8_MOE_TACTICS if is_mxfp8 else _get_arch_tactics()
+        all_tactics = _get_arch_tactics()
 
         token_final_scales = inputs[3]
         if token_final_scales.dtype == torch.float32:
@@ -728,7 +927,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             final_scale_dtype = cutlass.Float16
 
         def _tactic_ok(tactic):
-            tile_size, gemm1_tactic, gemm2_tactic = tactic
+            tile_size, gemm1_tactic, gemm2_tactic = tactic[:3]
+            tactic_swap_ab = tactic[3] if len(tactic) > 3 else self.swap_ab
             permuted_m = get_max_num_permuted_tokens(
                 num_tokens, self.top_k, self.num_local_experts, tile_size
             )
@@ -736,9 +936,13 @@ class CuteDslFusedMoERunner(TunableRunner):
             if _is_rubin_tactic(tactic):
                 # The Rubin (SM107) kernels only implement the gated (SwiGLU)
                 # activation path; skip Rubin tactics for non-gated activations.
-                if not gated:
+                if (
+                    is_mxfp8
+                    or tactic_swap_ab
+                    or self.use_per_token_activation
+                    or not gated
+                ):
                     return False
-
                 # The SM107 kernels need cutlass.utils.rubin_helpers, which only
                 # exists from CuTe DSL 4.8. Without this probe the import below
                 # raises ModuleNotFoundError instead of merely declining the
@@ -762,7 +966,6 @@ class CuteDslFusedMoERunner(TunableRunner):
                 gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn, _ = (
                     gemm2_tactic
                 )
-
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,
@@ -773,7 +976,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     mma_tiler=gemm1_mma_tiler,
                     cluster_shape_mn=gemm1_cluster_shape_mn,
                     m=permuted_m,
-                    n=2 * intermediate_size,
+                    n=gemm1_n,
                     k=hidden_size,
                     l=num_local_experts,
                     a_major="k",
@@ -797,33 +1000,39 @@ class CuteDslFusedMoERunner(TunableRunner):
                     b_major="k",
                     c_major="n",
                 )
-            else:
-                from .blackwell import (
-                    BlockScaledContiguousGatherGroupedGemmKernel,
-                    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
-                )
+                return gemm1_ok and gemm2_ok
 
-                gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, _ = gemm1_tactic
-                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, _ = gemm2_tactic
+            gemm1_mma_tiler_mn = gemm1_tactic[0]
+            gemm1_cluster_shape_mn = gemm1_tactic[1]
+            gemm2_mma_tiler_mn = gemm2_tactic[0]
+            gemm2_cluster_shape_mn = gemm2_tactic[1]
 
-                gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    sf_dtype=sf_dtype,
-                    sf_vec_size=sf_vec_size,
-                    c_dtype=gemm1_c_dtype,
-                    mma_tiler_mn=gemm1_mma_tiler_mn,
-                    cluster_shape_mn=gemm1_cluster_shape_mn,
-                    m=permuted_m,
-                    n=gemm1_n,
-                    k=hidden_size,
-                    l=num_local_experts,
-                    a_major="k",
-                    b_major="k",
-                    c_major="n",
-                )
-                gemm2_ok = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-                    a_dtype=a_dtype,
+            gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                sf_dtype=sf_dtype,
+                sf_vec_size=sf_vec_size,
+                c_dtype=gemm1_c_dtype,
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                m=permuted_m,
+                n=gemm1_n,
+                k=hidden_size,
+                l=num_local_experts,
+                a_major="k",
+                b_major="k",
+                c_major="n",
+                swap_ab=tactic_swap_ab,
+                gated=gated,
+                split_k=gemm1_tactic[4] if len(gemm1_tactic) >= 5 else 1,
+                weight_interleave=self.weight_interleave,
+            )
+
+            gemm2_ok = (
+                Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+                    a_dtype=(
+                        cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
+                    ),
                     b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
@@ -838,11 +1047,32 @@ class CuteDslFusedMoERunner(TunableRunner):
                     a_major="k",
                     b_major="k",
                     out_major="n",
+                    swap_ab=tactic_swap_ab,
                 )
+            )
 
             return gemm1_ok and gemm2_ok
 
-        valid_tactics = [t for t in all_tactics if _tactic_ok(t)]
+        if all_tactics and _is_rubin_tactic(all_tactics[0]):
+            candidate_tactics = all_tactics
+        else:
+            candidate_tactics = get_blackwell_moe_valid_tactics(
+                swap_ab=self.swap_ab,
+                w1_pdl_count=self.w1_pdl_count,
+                w2_pdl_count=self.w2_pdl_count,
+                w1_split_k=self.w1_split_k,
+                gated=gated,
+                weight_interleave=self.weight_interleave,
+            )
+
+        valid_tactics = [
+            t
+            for t in candidate_tactics
+            if (self.fixed_tile_size is None or t[0] == self.fixed_tile_size)
+            and (self.w1_raster_along_m is None or t[1][2] == self.w1_raster_along_m)
+            and (self.w2_raster_along_m is None or t[2][2] == self.w2_raster_along_m)
+            and _tactic_ok(t)
+        ]
 
         if not valid_tactics:
             # The default tactic is a member of the arch tactic list, so an empty
@@ -876,9 +1106,9 @@ class CuteDslFusedMoERunner(TunableRunner):
         Args:
             inputs: List of input tensors:
                 [x, x_sf, token_selected_experts, token_final_scales,
-                 w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                 w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
-                 moe_output (optional)]
+                 w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale,
+                 w2_weight, w2_weight_sf, w2_alpha, w2_bias,
+                 per_token_scale (optional), moe_output (optional)]
             tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
@@ -887,13 +1117,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             Output tensor from the MoE computation.
         """
         if tactic is None or tactic == -1:
-            tactic = (
-                DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode == "w4a8"
-                else _get_default_tactic()
-            )
-        elif self.quant_mode == "w4a8":
-            tactic = canonicalize_w4a8_tactic(tactic)
+            tactic = _get_default_tactic()
 
         params = _extract_tactic_params(tactic)
 
@@ -905,10 +1129,12 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_weight,
             w1_weight_sf,
             w1_alpha,
+            w1_bias,
             fc2_input_scale,
             w2_weight,
             w2_weight_sf,
             w2_alpha,
+            w2_bias,
             *optional_inputs,
         ) = inputs
 
@@ -923,7 +1149,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             per_token_scale = None
             moe_output = optional_inputs[0] if optional_inputs else None
 
-        return self.forward_impl(
+        common_kwargs = dict(
             x=x,
             x_sf=x_sf,
             token_selected_experts=token_selected_experts,
@@ -931,10 +1157,12 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
+            w1_bias=w1_bias,
             fc2_input_scale=fc2_input_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
+            w2_bias=w2_bias,
             num_experts=self.num_experts,
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,
@@ -952,15 +1180,28 @@ class CuteDslFusedMoERunner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             per_token_scale=per_token_scale,
-            enable_pdl=self.enable_pdl,
             activation_type=int(self.activation_type),
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
-            **kwargs,
         )
+        common_kwargs.update(
+            w1_raster_along_m=params["w1_raster_along_m"],
+            w1_pdl_count=params["w1_pdl_count"],
+            w1_split_k=params["w1_split_k"],
+            w2_raster_along_m=params["w2_raster_along_m"],
+            w2_pdl_count=params["w2_pdl_count"],
+            swap_ab=(
+                params["swap_ab"] if params["swap_ab"] is not None else self.swap_ab
+            ),
+            weight_interleave=self.weight_interleave,
+        )
+        if self._base_callback_contract:
+            common_kwargs["enable_pdl"] = self.enable_pdl
+        common_kwargs.update(kwargs)
+        return self.forward_impl(**common_kwargs)
 
 
 _W4A16_ROUTE_TILES = (8, 16, 32, 64, 128, 192)

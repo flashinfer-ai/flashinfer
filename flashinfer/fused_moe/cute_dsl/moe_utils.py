@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import warnings
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Union
 
@@ -23,6 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
+from ...utils import get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -74,6 +76,44 @@ def validate_cute_dsl_moe_situ_config(
         not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
     ):
         raise ValueError("situ_linear_beta must be positive and finite when set")
+
+
+def normalize_cute_dsl_moe_weight_interleave(
+    weight_interleave: Optional[int], swap_ab: bool
+) -> int:
+    """Validate and resolve the physical up/gate weight interleave."""
+    if weight_interleave is None:
+        weight_interleave = 16 if swap_ab else 64
+    valid_values = (16,) if swap_ab else (16, 64)
+    if (
+        isinstance(weight_interleave, bool)
+        or not isinstance(weight_interleave, int)
+        or weight_interleave not in valid_values
+    ):
+        raise ValueError(
+            f"weight_interleave must be one of {valid_values} "
+            f"when swap_ab={swap_ab}, got {weight_interleave!r}"
+        )
+    return weight_interleave
+
+
+def warn_deprecated_cute_dsl_moe_weight_interleave(
+    weight_interleave: int, device: torch.device
+) -> None:
+    """Warn for the legacy Blackwell up/gate weight layout."""
+    device = torch.device(device)
+    if (
+        weight_interleave == 64
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and get_compute_capability(device) in ((10, 0), (10, 3))
+    ):
+        warnings.warn(
+            "weight_interleave=64 is deprecated for W4A4/W4A8 CuTe-DSL MoE "
+            "on SM100/SM103; use weight_interleave=16 instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def get_max_num_tiles(

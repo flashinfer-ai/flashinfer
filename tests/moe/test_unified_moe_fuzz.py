@@ -578,7 +578,7 @@ def _mxfp4_snap(t: torch.Tensor, *, bf16_activation: bool) -> torch.Tensor:
         if bf16_activation:
             return t.to(torch.bfloat16)
         q, sf = _mxfp8_quant_matrix(t.to(torch.bfloat16))
-        return _block_fp8_dequant(q, sf, QuantVariant.MxFp8).to(torch.bfloat16)
+        return _block_fp8_dequant(q, sf, QuantVariant.MXFP8).to(torch.bfloat16)
     return torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in t]).to(
         torch.bfloat16
     )
@@ -622,7 +622,7 @@ def _mxfp4_reference(
 ):
     if variant is QuantVariant.MXFP4:
         x_q, x_sf = _mxfp8_quant_matrix(x)
-        x32 = _block_fp8_dequant(x_q, x_sf, QuantVariant.MxFp8)
+        x32 = _block_fp8_dequant(x_q, x_sf, QuantVariant.MXFP8)
     else:
         x32 = x.float()
     w1_32 = torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in w1])
@@ -638,7 +638,7 @@ def _mxfp4_reference(
         inter = F.silu(gate) * up
         if variant is QuantVariant.MXFP4:
             inter_q, inter_sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
-            inter = _block_fp8_dequant(inter_q, inter_sf, QuantVariant.MxFp8)
+            inter = _block_fp8_dequant(inter_q, inter_sf, QuantVariant.MXFP8)
         else:
             inter = inter.to(torch.bfloat16).float()
         out[token] += final_scales[token, slot, None] * (inter @ w2_32[local_e].t())
@@ -1140,17 +1140,17 @@ _DTYPE = {
         atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
         rtol=0.85,  # legacy-aligned initial bound, not a settled regression bar
     ),
-    QuantVariant.MxFp8: DTypeHandler(
-        variant=QuantVariant.MxFp8,
+    QuantVariant.MXFP8: DTypeHandler(
+        variant=QuantVariant.MXFP8,
         candidate_configs=(TrtllmFp8BlockConfig,),
         snap=_block_fp8_snap,
         make_act_pack=lambda x, ids, weights: _block_fp8_act_pack(
-            x, ids, weights, variant=QuantVariant.MxFp8
+            x, ids, weights, variant=QuantVariant.MXFP8
         ),
         make_act_pack_logits=lambda x, logits, bias: _block_fp8_act_pack_logits(
-            x, logits, bias, variant=QuantVariant.MxFp8
+            x, logits, bias, variant=QuantVariant.MXFP8
         ),
-        reference=lambda *args: _block_fp8_reference(*args, variant=QuantVariant.MxFp8),
+        reference=lambda *args: _block_fp8_reference(*args, variant=QuantVariant.MXFP8),
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
         atol_frac=0.15,  # provisional; recalibrate over the expanded SM100 sweep
@@ -1286,7 +1286,7 @@ _CONTRACT_HANDLERS = {
     ),
     "cutlass_mxfp8": _contract_handler(
         CutlassMxfp8Config,
-        QuantVariant.MxFp8,
+        QuantVariant.MXFP8,
         activation_pack=_contract_fp8_act_pack(CutlassMxfp8Config),
         reference=_cutlass_post_reference("cutlass_mxfp8"),
         atol_frac=0.1,
@@ -2854,7 +2854,7 @@ def test_unified_moe_fuzz(cfg):
             device=dev,
             activation=_activation_for(cfg),
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = handler.variant
@@ -2996,7 +2996,7 @@ def test_unified_moe_fuzz(cfg):
     def run(runner, poison=False):
         inputs = runner.pack_inputs(act_pack, weight_pack)
         # Deterministically initialize the kernel-owned output buffer (a `new_empty` in the runner's
-        # pack_inputs; cute_dsl idx 11, trtllm the `output=`), located by dtype+shape: clean=zeros,
+        # pack_inputs; cute_dsl idx 13, trtllm the `output=`), located by dtype+shape: clean=zeros,
         # poison=seeded garbage+NaN/Inf. Both are bit-reproducible from cfg.seed, so any failure --
         # including a partial-write that depends on the buffer -- reproduces exactly.
         act_ptrs = {
@@ -3250,7 +3250,7 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # FP8BlockConfig distinguishes DeepSeekFp8/MXFP8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = variant

@@ -29,7 +29,7 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -71,7 +71,8 @@ class QuantVariant(Enum):
     BF16 = 0
     FP8PerTensor = 1
     DeepSeekFp8 = 2
-    MxFp8 = 3
+    MXFP8 = 3
+    MxFp8 = MXFP8
     NVFP4 = 4  # day-1 MVP target
     MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
@@ -635,7 +636,7 @@ class TrtllmFp8BlockConfig:
         """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
 
         ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
-        :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
+        :attr:`QuantVariant.MXFP8`; their scale formats are intentionally
         prepared by separate paths. The shuffled MXFP8 view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
@@ -1331,10 +1332,14 @@ class CuteDslConfig:
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
+        weight_interleave: int = 64,
         device=None,
+        w1_bias=None,
+        w2_bias=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
+        The view records ``weight_interleave`` for validation by the runner.
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         """
         from .prepare import prepare_cute_dsl_weights
@@ -1347,7 +1352,10 @@ class CuteDslConfig:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation=activation,
+            weight_interleave=weight_interleave,
             device=device,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
         )
 
     def __repr__(self) -> str:
@@ -1852,14 +1860,14 @@ class MoEWeightPack:
     dict that runner's ``forward`` expects for weight-side arguments.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

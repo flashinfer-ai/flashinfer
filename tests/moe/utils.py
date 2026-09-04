@@ -490,6 +490,8 @@ def compute_reference_moe_fp4(
     wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    gemm1_bias: torch.Tensor | None = None,
+    gemm2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -521,6 +523,8 @@ def compute_reference_moe_fp4(
         situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        gemm1_bias: Optional per-expert FC1 bias
+        gemm2_bias: Optional per-expert FC2 bias
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -600,6 +604,8 @@ def compute_reference_moe_fp4(
 
             w1 = gemm1_weights[local_idx]
             gemm1_out = gemm1_alpha[local_idx] * (token_input @ w1.T)
+            if gemm1_bias is not None:
+                gemm1_out += gemm1_bias[local_idx]
 
             per_token_scale = None
             if gated:
@@ -649,12 +655,12 @@ def compute_reference_moe_fp4(
                     )
 
             w2 = gemm2_weights[local_idx]
-            gemm2_out = act_out @ w2.T
-
-            output_scale = scale * gemm2_alpha[local_idx]
+            gemm2_out = gemm2_alpha[local_idx] * (act_out @ w2.T)
             if per_token_scale is not None:
-                output_scale = output_scale * per_token_scale[0]
-            output[token_idx] += output_scale * gemm2_out.squeeze(0)
+                gemm2_out *= per_token_scale[0]
+            if gemm2_bias is not None:
+                gemm2_out += gemm2_bias[local_idx]
+            output[token_idx] += scale * gemm2_out.squeeze(0)
 
     return output
 
@@ -671,6 +677,7 @@ def create_moe_tensors(
     gated: bool = True,
     use_per_token_activation: bool = False,
     interleave_gated_weights: bool = True,
+    weight_interleave: int = 64,
     use_nontrivial_alphas: bool = True,
 ):
     """Create properly quantized MoE tensors for testing.
@@ -765,7 +772,7 @@ def create_moe_tensors(
 
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w1_for_quant = (
-        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        interleave_linear_and_gate(w1_bf16, group_size=weight_interleave, dim=1)
         if gated and interleave_gated_weights
         else w1_bf16
     )

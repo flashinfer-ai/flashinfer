@@ -34,7 +34,7 @@ from __future__ import annotations
 import functools
 import struct
 import warnings
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -794,9 +794,9 @@ def prepare_trtllm_fp8_block_weights(
     """
     from .api import QuantVariant
 
-    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8):
+    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MXFP8):
         raise ValueError(
-            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MXFP8, "
             f"got {variant!r}."
         )
     activation = _normalize_activation(activation)
@@ -914,13 +914,13 @@ def prepare_trtllm_fp8_block_activations(
         if hidden_states_bf16.shape[1] % 128 != 0:
             raise ValueError("DeepSeek FP8 hidden_size must be divisible by 128.")
         return _deepseek_fp8_quantize_activations(hidden_states_bf16)
-    if variant is QuantVariant.MxFp8:
+    if variant is QuantVariant.MXFP8:
         from ..quantization.fp8_quantization import mxfp8_quantize
 
         q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
         return q, sf.view(torch.uint8).reshape(hidden_states_bf16.shape[0], -1)
     raise ValueError(
-        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MXFP8, "
         f"got {variant!r}."
     )
 
@@ -2235,11 +2235,14 @@ def prepare_cute_dsl_weights(
     hidden_size: int,
     intermediate_size: int,
     activation=None,
+    weight_interleave: int = 64,
     device: Optional[torch.device] = None,
-) -> Dict[str, torch.Tensor]:
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
-    Gemm1 weights get the linear/gate interleave only for gated activations;
+    Gemm1 weights use ``weight_interleave`` only for gated activations;
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
     ``variant`` selects NVFP4/W4A4, MXFP4/W4A8, or W4A16 weights.
     Starts from the same canonical bf16 expert weights as
@@ -2251,11 +2254,13 @@ def prepare_cute_dsl_weights(
     dict
         Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
-        ``w2_weight_sf``, ``w2_alpha``.
+        ``w2_weight_sf``, ``w2_alpha``, ``weight_interleave``, and optional
+        expert biases.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
     from .api import QuantVariant
+    from .cute_dsl.moe_utils import normalize_cute_dsl_moe_weight_interleave
 
     if variant is None:
         variant = QuantVariant.NVFP4
@@ -2263,6 +2268,13 @@ def prepare_cute_dsl_weights(
         raise ValueError(
             f"CuTe-DSL FP4 weight preparation does not support {variant!r}"
         )
+    weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+        weight_interleave, swap_ab=False
+    )
+    if variant is QuantVariant.W4A16 and weight_interleave != 64:
+        raise ValueError("CuTe-DSL W4A16 requires weight_interleave=64")
+    if variant is QuantVariant.W4A16 and (w1_bias is not None or w2_bias is not None):
+        raise ValueError("CuTe-DSL W4A16 does not support fused expert bias")
 
     if device is None:
         device = w1_bf16.device
@@ -2282,7 +2294,7 @@ def prepare_cute_dsl_weights(
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_interleaved = (
-        _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        _interleave_linear_and_gate(w1_bf16, group_size=weight_interleave, dim=1)
         if activation.is_gated
         else w1_bf16
     )
@@ -2325,12 +2337,27 @@ def prepare_cute_dsl_weights(
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
         "w1_alpha": ones,
-        "w2_weight": w2_weight,
-        "w2_weight_sf": w2_weight_sf,
-        "w2_alpha": ones,
+        "weight_interleave": weight_interleave,
     }
+    if w1_bias is not None:
+        shape = (num_local_experts, gemm1_rows)
+        if tuple(w1_bias.shape) != shape:
+            raise ValueError(f"w1_bias must have shape {shape}")
+        view["w1_bias"] = w1_bias.to(device=device, dtype=torch.float32).contiguous()
     if not is_mxfp4:
         view["fc2_input_scale"] = gs
+    view.update(
+        {
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+            "w2_alpha": ones,
+        }
+    )
+    if w2_bias is not None:
+        shape = (num_local_experts, hidden_size)
+        if tuple(w2_bias.shape) != shape:
+            raise ValueError(f"w2_bias must have shape {shape}")
+        view["w2_bias"] = w2_bias.to(device=device, dtype=torch.float32).contiguous()
     return view
 
 

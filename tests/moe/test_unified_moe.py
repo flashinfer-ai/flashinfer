@@ -411,7 +411,7 @@ class TestReprRoundTrip:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(variant=QuantVariant.MXFP8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=GeGLU(),
             backend=BackendOptions(
@@ -925,14 +925,14 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethodType.Renormalize,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(variant=QuantVariant.MXFP8),
             experts=ExpertConfig(intermediate_size=512),
             activation=SwiGLU(),
             backend=BackendOptions(
                 candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
         )
-        assert cfg.quant.variant == QuantVariant.MxFp8
+        assert cfg.quant.variant == QuantVariant.MXFP8
 
     def test_trtllm_fp8_per_tensor(self):
         """Per-tensor FP8 config."""
@@ -1090,7 +1090,7 @@ class TestMoERunnerSupport:
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
             QuantVariant.DeepSeekFp8: (SwiGLU,),
-            QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+            QuantVariant.MXFP8: (SwiGLU, GeGLU, ReLU2),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -1189,7 +1189,10 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="GEMM1 rows"):
             runner.pack_inputs(act, weights)
 
-    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
+    @pytest.mark.parametrize("weight_interleave", [16, 64])
+    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(
+        self, weight_interleave
+    ):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.MXFP4)
@@ -1207,6 +1210,7 @@ class TestMoERunnerSupport:
                 "w2_weight": torch.empty(32, 128, intermediate // 2, dtype=torch.uint8),
                 "w2_weight_sf": torch.empty(1, dtype=torch.uint8),
                 "w2_alpha": torch.ones(32),
+                "weight_interleave": weight_interleave,
             },
         )
         act = MoEActivationPack(
@@ -1220,6 +1224,12 @@ class TestMoERunnerSupport:
         assert packed[1].shape == (4, 4)
         assert packed[7] is None
         assert packed[-1].shape == (4, 128)
+        assert runner._inner.weight_interleave == weight_interleave
+        weights.get_view("cute_dsl")["weight_interleave"] = (
+            64 if weight_interleave == 16 else 16
+        )
+        with pytest.raises(ValueError, match="already bound"):
+            runner.pack_inputs(act, weights)
 
     def test_cute_dsl_mxfp4_pack_rejects_unaligned_geometry(self):
         w1 = torch.zeros(2, 2 * 96, 256, dtype=torch.bfloat16)
@@ -3479,7 +3489,7 @@ _RUNNERS = [
         TrtllmFp8BlockRunner,
         TrtllmFp8BlockConfig(),
         QuantVariant.DeepSeekFp8,
-        QuantVariant.MxFp8,
+        QuantVariant.MXFP8,
         id="fp8_block",
     ),
     pytest.param(
@@ -3642,7 +3652,7 @@ def test_cute_dsl_cache_key_extends_unified_fields():
     runner._inner = Inner()
 
     shared = MoERunner._cache_key_extras(runner)
-    assert runner.get_cache_key_extras([]) == shared + (False, True)
+    assert runner.get_cache_key_extras([]) == shared + (False, True, 64)
 
 
 @pytest.mark.parametrize(

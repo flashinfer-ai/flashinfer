@@ -944,7 +944,7 @@ def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, ma
 def test_cutlass_mxfp8_rejects_linear_scale_layout():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8, swizzled_scale_factors=False)
+        quant=QuantConfig(variant=QuantVariant.MXFP8, swizzled_scale_factors=False)
     )
     runner._device_arch = 100
     with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
@@ -1042,7 +1042,7 @@ def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
 def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(variant=QuantVariant.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=64),
     )
@@ -1052,7 +1052,7 @@ def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
         runner._pack_weight_inputs(view, hidden_size=64)
 
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(variant=QuantVariant.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=192),
     )
@@ -1063,7 +1063,7 @@ def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
 def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(variant=QuantVariant.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=256),
     )
@@ -2722,7 +2722,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
         True,
     ).to(device=device, dtype=torch.bfloat16)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(variant=QuantVariant.MXFP8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassMxfp8Config(),)),
@@ -2777,7 +2777,7 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
         device=device,
     )
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(variant=QuantVariant.MXFP8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassMxfp8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=8192),
