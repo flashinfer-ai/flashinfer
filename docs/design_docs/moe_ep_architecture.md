@@ -108,10 +108,13 @@ flowchart TD
 The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
 
 - **correctness knobs** change a code path or the output and must be kept at
-  the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
-  `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
-  `in_kernel_fc2_reduce` (ikr — makes the accumulation order
-  nondeterministic; pin `False` for bit-reproducibility);
+the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
+`token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
+`in_kernel_fc2_reduce` (ikr — makes the accumulation order
+nondeterministic); the NVFP4/MXFP8 knobs may select it, but only when the
+config sets `enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce` at `False`
+keeps the session bit-reproducible.
+For BF16/BF16xMXFP8 `enable_in_kernel_fc2_reduce` directly sets `in_kernel_fc2_reduce`
 - **perf knobs** are output-neutral and free to sweep: `group_hint`,
   `flag_batch`, `epi_flag_batch`.
 
@@ -121,7 +124,7 @@ compilable combinations.
 
 ### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
 
-**1. Default (`knobs=None`).** The session resolves the knob cache first;
+**1. Default (**`knobs=None`**).** The session resolves the knob cache first;
 on a miss it falls back to four measured token-count profiles keyed on the
 compile-time buffer capacity (`max_tokens_per_rank * world`):
 
@@ -132,7 +135,9 @@ compile-time buffer capacity (`max_tokens_per_rank * world`):
 | 1024–2047 | mid-large: 256-wide N tile, `standalone_warps` |
 | ≥ 2048 | large throughput: `flag_batch=8`, `reuse_dispatch_warps` |
 
-**2. Pinned (`knobs=dict`).** E.g. a winner from the kernel team's tester
+`in_kernel_fc2_reduce` defaults to the value of `enable_in_kernel_fc2_reduce`
+
+**2. Pinned (**`knobs=dict`**).** E.g. a winner from the kernel team's tester
 sweep:
 
 ```python
@@ -146,7 +151,7 @@ Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
 )
 ```
 
-**3. Online (`knobs="auto"`).** At the first `compute()` every rank runs the
+**3. Online (**`knobs="auto"`**).** At the first `compute()` every rank runs the
 same ~24-candidate sweep (`nvfp4_candidates()`: tile {256×128, 256×256} ×
 `flag_batch` {4, 8} × three `token_back_mode` values × ikr {off, on}, over a
 fixed base of `cluster (2,1,1)`, `group_hint 512`, `epi_flag_batch (2,4)`,
@@ -174,6 +179,9 @@ default `knobs=None` and gets the tuned winner as a pure lookup — no
 compiles, no collectives, no timing on the hot path. Nondeterministic ikr
 candidates are excluded from the CLI sweep unless
 `--allow-nondeterministic` is passed.
+Note: BF16 and BF16xMXFP8 cannot fall back to a deterministic path,
+the cache must contain results from `--allow-nondeterministic`
+to enable ikr for these kernels
 
 Measured results, methodology, and the full knob reference live in
 [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).

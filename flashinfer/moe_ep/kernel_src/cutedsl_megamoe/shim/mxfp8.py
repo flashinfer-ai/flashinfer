@@ -67,6 +67,7 @@ class MegaMoEMxfp8Config:
     num_sched_stages: Optional[int] = None
     flag_batch: int = 4
     epi_flag_batch: Tuple[int, int] = (1, 1)
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
@@ -103,6 +104,12 @@ class MegaMoEMxfp8Config:
             raise ValueError(
                 "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
+            )
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce is tuner-owned and needs the session's "
+                "permission: pass enable_in_kernel_fc2_reduce=True (it makes the "
+                "combine accumulation order nondeterministic)."
             )
         if self.in_kernel_fc2_reduce and self.token_back_by_dispatch:
             raise ValueError(
@@ -808,8 +815,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
-    token_back_by_dispatch: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
@@ -847,8 +853,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         intermediate=intermediate,
         kind=kind,
         gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_by_dispatch=token_back_by_dispatch,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_knobs
@@ -866,42 +871,16 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             num_experts=num_total_experts,
             topk=num_topk,
             max_tokens=num_max_tokens,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
-    # `in_kernel_fc2_reduce` is a caller-owned correctness choice; see the
-    # NVFP4 factory. The MXFP8 kernel rejects ikr together with dispatch-warp
-    # token-back, so a tuned `token_back_mode` that isn't "epi_warps" must be
-    # sanitized *before* with_knobs() applies it -- with_knobs() does a single
-    # dataclasses.replace() on a frozen, __post_init__-validated config, so an
-    # override that conflicts with the (unrelated, untouched) in_kernel_fc2_reduce
-    # field raises immediately inside with_knobs(), before any post-hoc fixup
-    # here could run.
-    # The knobs dict may itself carry in_kernel_fc2_reduce (e.g. a verbatim
-    # tuned-cache entry); the effective value after with_knobs() is the knob,
-    # not the argument, so sanitize against whichever will win.
-    effective_ikr = (
-        knobs.get("in_kernel_fc2_reduce", in_kernel_fc2_reduce)
-        if knobs
-        else in_kernel_fc2_reduce
-    )
-    if (
-        effective_ikr
-        and knobs
-        and knobs.get("token_back_mode")
-        not in (
-            None,
-            "epi_warps",
-        )
-    ):
-        knobs = {**knobs, "token_back_mode": "epi_warps"}
+    # TODO Add explicit validity checks
     cfg = with_knobs(cfg, knobs)
-    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-        cfg = dataclasses.replace(
-            cfg,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_by_dispatch=(
-                False if in_kernel_fc2_reduce else cfg.token_back_by_dispatch
-            ),
-        )
+    # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
+    #   despite the entire design of the autotuner being to allow it to disable ikr if it would be faster
+    #   We have enabled varying the knobs here, revisit this if we see unexpected behavior
+    assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
+        "in_kernel_fc2_reduce is not allowed when enable_in_kernel_fc2_reduce is False"
+    )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
@@ -1178,6 +1157,7 @@ def create_dummy_inputs(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    enable_in_kernel_fc2_reduce: bool = False,
     seed: int = 0,
 ) -> tuple[
     torch.Tensor,
@@ -1210,6 +1190,7 @@ def create_dummy_inputs(
         world_size,
         kind=kind,
         gate_up_clamp=clamp,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(

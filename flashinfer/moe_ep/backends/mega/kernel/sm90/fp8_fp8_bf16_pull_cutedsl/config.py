@@ -71,7 +71,7 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
+    enable_in_kernel_fc2_reduce: bool = False
     # Legacy alias: True maps to token_back_mode="reuse_dispatch_warps".
     token_back_by_dispatch: bool = False
     # Explicit token-back placement; overrides token_back_by_dispatch when set.

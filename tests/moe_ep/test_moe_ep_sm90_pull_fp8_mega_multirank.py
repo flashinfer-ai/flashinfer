@@ -410,7 +410,7 @@ def _megakernel_config(
         swap_ab=problem["swap_ab"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=(
             "reuse_dispatch_warps" if grouped_token_back else token_back_mode
         ),

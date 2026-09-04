@@ -417,9 +417,29 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     kind: MixedKind = "bf16_mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     in_kernel_fc2_reduce: bool = False,
-    token_back_mode: Literal["epi_warps", "reuse_dispatch_warps"] = "epi_warps",
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16Mxfp8SymmBuffer:
+    from .knob_cache import resolve_knobs
+    from .tuner import (
+        describe_invalid_knobs,
+        is_valid_bf16_mxfp8_for_config,
+        with_knobs,
+    )
+
+    # ``token_back_mode`` is knob-owned, so knobs=None is a pure lookup: the
+    # offline-tuned cache entry for this session key when present, else the
+    # measured mixed profile.  An explicit dict overrides both.
+    if knobs is None:
+        knobs, _ = resolve_knobs(
+            dtype=kind,
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        )
     config = MegaMoEBf16Mxfp8Config(
         rank=rank,
         world_size=world_size,
@@ -433,30 +453,22 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
             gate_up_clamp=gate_up_clamp, activation_clamp=None
         ),
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back_mode,
     )
-    if knobs:
-        from .tuner import (
-            describe_invalid_knobs,
-            is_valid_bf16_mxfp8_for_config,
-            warn_if_knobs_override_session,
-            with_knobs,
+    if not is_valid_bf16_mxfp8_for_config(config, knobs):
+        raise ValueError(
+            f"unsupported mixed MegaMoE knobs {knobs}: "
+            f"{describe_invalid_knobs(config, knobs, is_valid_bf16_mxfp8_for_config)}."
         )
+    config = with_knobs(config, knobs)
 
-        if not is_valid_bf16_mxfp8_for_config(config, knobs):
-            raise ValueError(
-                f"unsupported mixed MegaMoE knobs {knobs}: "
-                f"{describe_invalid_knobs(config, knobs, is_valid_bf16_mxfp8_for_config)}."
-            )
-        pinned = with_knobs(config, knobs)
-        warn_if_knobs_override_session(config, pinned, what="mixed MegaMoE")
-        config = pinned
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
+    # Read the mode off the config, not the argument: this shape is what
+    # MegaMoEBf16Mxfp8Frontend._validate() checks the launch against.
     combine = sym_zeros(
-        (num_max_tokens, 1 if in_kernel_fc2_reduce else num_topk, hidden),
+        (num_max_tokens, 1 if config.in_kernel_fc2_reduce else num_topk, hidden),
         torch.bfloat16,
     )
     return MegaMoEBf16Mxfp8SymmBuffer(
@@ -534,6 +546,97 @@ def bf16_mxfp8_mega_moe(
     return None
 
 
+def create_dummy_inputs(
+    rank: int,
+    world_size: int,
+    num_total_experts: int,
+    num_max_tokens: int,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate: int,
+    *,
+    kind: MixedKind = "bf16_mxfp8_e4m3",
+    gate_up_clamp: Optional[float] = None,
+    in_kernel_fc2_reduce: bool = False,
+    knobs: Optional[dict] = None,
+    seed: int = 0,
+) -> tuple[
+    torch.Tensor,
+    TransformedWeights,
+    TransformedWeights,
+    MegaMoEBf16Mxfp8SymmBuffer,
+]:
+    """Allocate symm buffer, MXFP8 weights, and stage BF16 activations + routing."""
+    if num_tokens < 0 or num_tokens > num_max_tokens:
+        raise ValueError(
+            f"num_tokens must be in [0, {num_max_tokens}], got {num_tokens}."
+        )
+
+    # The mixed kernel's transformed weights are the pure-MXFP8 layout (same
+    # shapes, dtype and swizzled flat SF), so the weight side is shared.
+    from .mxfp8 import _create_dummy_weights
+
+    num_local_experts = num_total_experts // world_size
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed + rank)
+
+    symm_buffer = get_symm_buffer_for_bf16_mxfp8_mega_moe(
+        num_total_experts,
+        num_max_tokens,
+        num_topk,
+        hidden,
+        intermediate,
+        rank,
+        world_size,
+        kind=kind,
+        gate_up_clamp=resolve_gate_up_clamp(
+            gate_up_clamp=gate_up_clamp, activation_clamp=None
+        ),
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        knobs=knobs,
+    )
+
+    transformed_l1, transformed_l2 = _create_dummy_weights(
+        num_local_experts,
+        hidden,
+        intermediate,
+        gen,
+        kind="mxfp8_e4m3" if kind == "bf16_mxfp8_e4m3" else "mxfp8_e5m2",
+    )
+
+    activation = torch.randn(
+        (num_tokens, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=gen,
+    )
+    scores = torch.randn(
+        num_tokens,
+        num_total_experts,
+        device="cuda",
+        dtype=torch.float32,
+        generator=gen,
+    )
+    topk_weights, topk_idx = torch.topk(
+        scores,
+        num_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
+    )
+
+    symm_buffer.x[:num_tokens].copy_(activation)
+    symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))
+    # Mask pad rows (and stale routes from a previous larger staging): the
+    # launch covers the full buffer and relies on topk_idx[n:] == -1.
+    symm_buffer.topk_idx[num_tokens:].fill_(-1)
+    symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
+
+    y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    return y, transformed_l1, transformed_l2, symm_buffer
+
+
 def bf16_mxfp8_mega_launch_thunk(
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
@@ -559,6 +662,7 @@ __all__ = [
     "MegaMoEBf16Mxfp8Inputs",
     "MegaMoEBf16Mxfp8SymmBuffer",
     "TransformedWeights",
+    "create_dummy_inputs",
     "get_symm_buffer_for_bf16_mxfp8_mega_moe",
     "init_dist",
     "bf16_mxfp8_mega_launch_thunk",

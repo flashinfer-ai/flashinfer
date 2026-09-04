@@ -1,10 +1,16 @@
-"""Offline knob tuner for the MXFP8 cutedsl mega kernel.
+"""Offline knob tuner for the mixed MXFP8-weight/BF16-activation mega kernel.
 
 Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim (``--dtype
-mxfp8_e4m3`` / ``mxfp8_e5m2``).  Kernel-specific pieces (dummy input
-creation, candidate enumeration, knob resolution, the autotune entry point)
-live here, next to the backend that consumes the recorded winners; the sweep
-loop and shared helpers come from ``backends/mega/kernel/tuning.py``.
+bf16_mxfp8_e4m3`` / ``bf16_mxfp8_e5m2``).  Kernel-specific pieces (dummy
+input creation, candidate enumeration, knob resolution, the autotune entry
+point) live here, next to the backend that consumes the recorded winners; the
+sweep loop and shared helpers come from ``backends/mega/kernel/tuning.py``.
+
+``in_kernel_fc2_reduce`` is a session axis here, not a sweep axis: it sizes
+the ``combine_output`` buffer, so the knob cache keeps one entry per mode and
+matches it exactly.  ``--allow-nondeterministic`` therefore runs a SECOND
+sweep for the ikr session rather than widening one candidate list, leaving
+both entries populated (at twice the compile cost of the 18-candidate list).
 """
 
 from __future__ import annotations
@@ -14,11 +20,18 @@ from typing import Any
 from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidates
 
 
-def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
+def _tune_session(
+    args,
+    rank: int,
+    world_size: int,
+    max_tokens: int,
+    *,
+    in_kernel_fc2_reduce: bool,
+) -> dict:
     from ......kernel_src.cutedsl_megamoe import (
-        autotune_mxfp8_mega_moe,
-        create_dummy_mxfp8_inputs,
-        mxfp8_candidates,
+        autotune_bf16_mxfp8_mega_moe,
+        bf16_mxfp8_candidates,
+        create_dummy_bf16_mxfp8_inputs,
         resolve_knobs,
     )
 
@@ -27,7 +40,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
         raise SystemExit("--live-tokens must be <= --max-tokens")
     symm_buffer: Any = None
     try:
-        y, l1, l2, symm_buffer = create_dummy_mxfp8_inputs(
+        y, l1, l2, symm_buffer = create_dummy_bf16_mxfp8_inputs(
             rank,
             world_size,
             args.num_experts,
@@ -38,11 +51,11 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             args.intermediate,
             kind=args.dtype,
             gate_up_clamp=args.gate_up_clamp,
-            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             seed=args.seed,
         )
-        candidates = mxfp8_candidates(
-            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
+        candidates = bf16_mxfp8_candidates(
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
 
         if args.sweep == "schedule":
@@ -63,7 +76,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     topk=args.topk,
                     max_tokens=max_tokens,
                     combine_dtype=args.combine_dtype,
-                    enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
+                    enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
@@ -79,11 +92,22 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             l1,
             l2,
             candidates,
-            autotune_mxfp8_mega_moe,
+            autotune_bf16_mxfp8_mega_moe,
         )
     finally:
         if symm_buffer is not None:
             symm_buffer.destroy()
+
+
+def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
+    winner = _tune_session(
+        args, rank, world_size, max_tokens, in_kernel_fc2_reduce=False
+    )
+    if args.allow_nondeterministic:
+        winner = _tune_session(
+            args, rank, world_size, max_tokens, in_kernel_fc2_reduce=True
+        )
+    return winner
 
 
 def run_tuning(args) -> int:

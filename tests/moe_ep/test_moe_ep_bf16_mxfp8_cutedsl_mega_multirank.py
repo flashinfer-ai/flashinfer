@@ -158,8 +158,7 @@ def _megakernel_config(
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode="epi_warps",
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         knobs=knobs,
     )
 
@@ -198,7 +197,6 @@ def _reference_mixed_mega_moe(
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode="epi_warps",
         knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
@@ -374,7 +372,6 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             kind=problem["kind"],
             gate_up_clamp=problem["gate_up_clamp"],
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_mode="epi_warps",
         )
         try:
             stage_mega_moe_inputs(
