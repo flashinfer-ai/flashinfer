@@ -16,6 +16,7 @@ from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
     select_graph_compile_bucket,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
+    interleave_gate_up_8,
     interleave_gate_up_16,
     scale_storage_size,
 )
@@ -30,7 +31,15 @@ def test_config_uses_post_swiglu_intermediate() -> None:
     assert config.kernel_name == "sm120_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_gate_up_interleave_is_grouped_in_sixteen_rows() -> None:
+def test_gate_up_interleave_is_grouped_in_eight_rows() -> None:
+    rows = torch.arange(32, dtype=torch.int64).view(1, 32, 1)
+    actual = interleave_gate_up_8(rows, full_width=32).flatten().tolist()
+    assert actual == list(range(0, 8)) + list(range(16, 24)) + list(
+        range(8, 16)
+    ) + list(range(24, 32))
+
+
+def test_legacy_gate_up_interleave_is_grouped_in_sixteen_rows() -> None:
     rows = torch.arange(64, dtype=torch.int64).view(1, 64, 1)
     actual = interleave_gate_up_16(rows, full_width=64).flatten().tolist()
     assert actual == (

@@ -10,7 +10,7 @@ FP4_DTYPE = torch.float4_e2m1fn_x2
 SCALE_DTYPE = torch.float8_e4m3fn
 SCALE_BLOCK = 16
 SCALE_ROW_PADDING = 128
-GATE_UP_INTERLEAVE = 16
+GATE_UP_INTERLEAVE = 8
 
 TransformedWeights = Tuple[
     Tuple[torch.Tensor, torch.Tensor],
@@ -44,28 +44,38 @@ def as_e4m3(tensor: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"NVFP4 scales must be uint8 or {SCALE_DTYPE}, got {tensor.dtype}")
 
 
-def interleave_gate_up_16(tensor: torch.Tensor, full_width: int) -> torch.Tensor:
-    """Convert canonical gate||up rows to the kernel's 16-row alternation."""
+def _interleave_gate_up(
+    tensor: torch.Tensor, full_width: int, interleave: int
+) -> torch.Tensor:
+    """Convert canonical gate||up rows to the requested row alternation."""
 
     if tensor.ndim != 3 or tensor.shape[1] != full_width:
         raise ValueError(
             f"expected (experts, {full_width}, columns), got {tuple(tensor.shape)}"
         )
     half = full_width // 2
-    if half % GATE_UP_INTERLEAVE:
-        raise ValueError(
-            f"post-SwiGLU width {half} must be divisible by {GATE_UP_INTERLEAVE}"
-        )
+    if half % interleave:
+        raise ValueError(f"post-SwiGLU width {half} must be divisible by {interleave}")
     experts, _rows, columns = tensor.shape
-    pairs = half // GATE_UP_INTERLEAVE
-    gate = (
-        tensor[:, :half].contiguous().view(experts, pairs, GATE_UP_INTERLEAVE, columns)
-    )
-    up = tensor[:, half:].contiguous().view(experts, pairs, GATE_UP_INTERLEAVE, columns)
-    output = tensor.new_empty((experts, pairs, 2, GATE_UP_INTERLEAVE, columns))
+    pairs = half // interleave
+    gate = tensor[:, :half].contiguous().view(experts, pairs, interleave, columns)
+    up = tensor[:, half:].contiguous().view(experts, pairs, interleave, columns)
+    output = tensor.new_empty((experts, pairs, 2, interleave, columns))
     output[:, :, 0].copy_(gate)
     output[:, :, 1].copy_(up)
     return output.reshape(experts, full_width, columns).contiguous()
+
+
+def interleave_gate_up_8(tensor: torch.Tensor, full_width: int) -> torch.Tensor:
+    """Convert canonical gate||up rows to the SM120 kernel's 8-row alternation."""
+
+    return _interleave_gate_up(tensor, full_width, GATE_UP_INTERLEAVE)
+
+
+def interleave_gate_up_16(tensor: torch.Tensor, full_width: int) -> torch.Tensor:
+    """Legacy helper for the SM100-style 16-row alternation."""
+
+    return _interleave_gate_up(tensor, full_width, 16)
 
 
 def to_blocked(scale: torch.Tensor) -> torch.Tensor:
@@ -126,7 +136,7 @@ def transform_weights(
             raise ValueError(
                 f"unquantized weights must have shapes {logical_w13} and {logical_w2}"
             )
-        interleaved_w13 = interleave_gate_up_16(w13, 2 * intermediate)
+        interleaved_w13 = interleave_gate_up_8(w13, 2 * intermediate)
         fc1_weight, fc1_scale = _quantize_weights(interleaved_w13)
         fc2_weight, fc2_scale = _quantize_weights(w2)
     else:
@@ -152,9 +162,9 @@ def transform_weights(
             raise ValueError(
                 f"w2_scale must have shape {expected_w2_scale}, got {tuple(w2_scale.shape)}"
             )
-        fc1_weight = interleave_gate_up_16(as_fp4(w13), 2 * intermediate)
+        fc1_weight = interleave_gate_up_8(as_fp4(w13), 2 * intermediate)
         fc2_weight = as_fp4(w2).contiguous()
-        fc1_scale = interleave_gate_up_16(as_e4m3(w13_scale), 2 * intermediate)
+        fc1_scale = interleave_gate_up_8(as_e4m3(w13_scale), 2 * intermediate)
         fc2_scale = as_e4m3(w2_scale).contiguous()
 
     fc1_swizzled = stack_byte_tensors(
@@ -175,6 +185,8 @@ __all__ = [
     "SCALE_DTYPE",
     "TransformedWeights",
     "ceil_div",
+    "interleave_gate_up_8",
+    "interleave_gate_up_16",
     "round_up",
     "scale_storage_size",
     "to_blocked",
