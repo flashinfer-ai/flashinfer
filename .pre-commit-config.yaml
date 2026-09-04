@@ -75,3 +75,18 @@ repos:
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]
+
+  - repo: local
+    hooks:
+      # The scope validator is the security boundary for `@flashinfer-bot run
+      # <paths>`: its charset check is what keeps comment text from reaching a
+      # shell as anything other than a test path. Its selftest covers exactly
+      # that (metacharacters, command substitution, traversal, smuggled pytest
+      # flags), so it runs whenever the script changes. No third-party imports,
+      # so it needs no environment.
+      - id: experimental-test-scope-selftest
+        name: experimental test scope selftest
+        entry: python3 scripts/pr_checks/experimental_test_scope.py --selftest
+        language: system
+        pass_filenames: false
+        files: ^scripts/pr_checks/experimental_test_scope\.py$
