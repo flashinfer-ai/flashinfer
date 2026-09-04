@@ -116,6 +116,16 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'run'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          # Commit statuses are published with GITHUB_TOKEN, not the bot PAT. The
+          # `permissions:` block at the top of this file grants `statuses: write` to
+          # GITHUB_TOKEN only -- it does not apply to a PAT -- and the bot PAT has no
+          # commit-status permission, so publishing a scope with it fails:
+          #     gh: Resource not accessible by personal access token (HTTP 403)
+          # The PAT is still required for the label, because a `labeled` event raised by
+          # GITHUB_TOKEN does not trigger workflows. A status needs to trigger nothing;
+          # pr-test.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
+          # and keeps the privileged token's blast radius smaller.
+          STATUS_TOKEN: ${{ github.token }}
           # Step-level env does not cross steps, so the comment body has to be bound
           # here too -- `Parse command` binding it is not enough. Passed through the
           # environment rather than interpolated into the script, so the body is data.
@@ -228,7 +238,7 @@ jobs:
           # Same reasoning as HEAD_SHA: a failure here must not cost the label. 0 means
           # "assume no previous chunks", which at worst leaves a stale trailing chunk
           # -- strictly better than starting no CI at all.
-          PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+          PREV_MAX=$(GH_TOKEN="$STATUS_TOKEN" gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
             --jq '[.statuses[].context
               | select(test("^ci/test-scope-[0-9]+$"))
               | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
@@ -238,7 +248,7 @@ jobs:
           publish_chunk() {
             # No SHA means no status to key on; skip rather than POST to an empty path.
             [ -n "${HEAD_SHA}" ] || return 0
-            gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+            GH_TOKEN="$STATUS_TOKEN" gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
               -f state=success \
               -f context="ci/test-scope-$1" \
               -f description="$2" \
