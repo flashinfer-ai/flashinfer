@@ -1971,15 +1971,27 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     f"flat hidden_states_scale numel {scale.numel()} is not a "
                     f"multiple of num_tokens={num_tokens}"
                 )
-                # Require the LINEAR layout, i.e. exactly the vector sizes the
-                # C++ side accepts (it computes
-                # vec_size = num_tokens * hidden_size / numel and only allows
-                # 16 for NvFp4 or 32 for Mx*).  A 128x4-swizzled buffer is
-                # row/col padded, so its numel implies some other vec_size;
-                # inferring sf_per_token from it would size the profiling buffer
-                # against a layout the kernel does not expect.  Reject early
-                # with a clear message rather than silently deriving a bogus
-                # stride.
+                # Sanity-check the implied vector size against what the C++ side
+                # accepts (it computes vec_size = num_tokens * hidden_size / numel
+                # and only allows 16 for NvFp4 or 32 for Mx*), so a malformed
+                # buffer fails here with a clear message instead of deriving a
+                # bogus stride.
+                #
+                # This is deliberately NOT a linear-vs-swizzled discriminator.
+                # As measured in #3455, the two layouts are indistinguishable at
+                # the API boundary: a 128x4-swizzled buffer has exactly the same
+                # numel as the linear one whenever num_tokens % 128 == 0 (and the
+                # SF count per token is a multiple of 4), so no numel-based test
+                # can separate them. That is fine here, because sf_per_token is
+                # only used to SIZE a profiling buffer, never to interpret data:
+                #   * num_tokens % 128 == 0 -> the numels coincide, so the derived
+                #     sf_per_token equals the linear one and the buffer is right.
+                #   * otherwise -> the swizzled buffer is row/col padded, so it is
+                #     strictly larger, and the derived sf_per_token either fails
+                #     the check below or over-sizes the buffer, which is safe.
+                # Rejecting swizzled inputs outright would need a signal we do not
+                # have; see #3455 and #3882 for why a numel guard is the wrong
+                # place to attempt it.
                 _sf_per_token = scale.numel() // num_tokens
                 assert (
                     _sf_per_token > 0
@@ -1990,8 +2002,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     f"{_sf_per_token} scales/token for hidden_size="
                     f"{self.hidden_size}, i.e. an SF vector size of "
                     f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
-                    "only the linear layout with vector size 16 (NvFp4) or 32 "
-                    "(Mx*) is supported. Pass a linear scale, e.g. "
+                    "which is not a supported SF vector size (16 for NvFp4, 32 "
+                    "for Mx*). Expected a linear scale of "
+                    f"num_tokens * hidden_size // sf_vec_size elements, e.g. from "
                     "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
                 )
                 constraint_specs = (
