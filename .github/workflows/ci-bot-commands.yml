@@ -1,7 +1,7 @@
 # Bot command handler for CI permissions
 # Authorized users - anyone who can apply the run-ci label to a PR, plus the
 # ci-users team - can comment to control CI:
-#   @flashinfer-bot run          - Apply run-ci label to start CI on the current
+#   @flashinfer-bot run [paths]  - Apply run-ci label to start CI on the current
 #                                  commit; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  statuses: write # publishes the requested test scope (see "Handle @flashinfer-bot run")
   actions: write
 
 jobs:
@@ -27,6 +28,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Base-repo checkout only - never the PR head. This job holds a write token, so
+      # the validator it runs must be the trusted copy from the default branch.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Check permission
         id: check-permission
         env:
@@ -109,7 +116,158 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'run'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          # Commit statuses are published with GITHUB_TOKEN, not the bot PAT. The
+          # `permissions:` block at the top of this file grants `statuses: write` to
+          # GITHUB_TOKEN only -- it does not apply to a PAT -- and the bot PAT has no
+          # commit-status permission, so publishing a scope with it fails:
+          #     gh: Resource not accessible by personal access token (HTTP 403)
+          # The PAT is still required for the label, because a `labeled` event raised by
+          # GITHUB_TOKEN does not trigger workflows. A status needs to trigger nothing;
+          # pr-test.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
+          # and keeps the privileged token's blast radius smaller.
+          STATUS_TOKEN: ${{ github.token }}
+          # Step-level env does not cross steps, so the comment body has to be bound
+          # here too -- `Parse command` binding it is not enough. Passed through the
+          # environment rather than interpolated into the script, so the body is data.
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
+          # `@flashinfer-bot run <paths>` mirrors GitLab's `/bot run TEST_PATH`, so the
+          # two systems present one convention. A label carries no payload, so the paths
+          # are parsed HERE - the one place that already parses this comment - and handed
+          # to pr-test.yml as a commit status on the head SHA. pr-test reads that value
+          # verbatim; nothing downstream re-reads comments.
+          #
+          # Keying on the head SHA makes staleness structural: a new push is a new SHA
+          # with no scope status, so an old scope cannot be resurrected by re-labelling.
+          # Guarded: this step runs under `bash -e` and everything below it is
+          # best-effort scope bookkeeping, but `gh pr edit --add-label run-ci` at the
+          # end is THE way CI starts in this repo. An unguarded network call here
+          # means a transient GitHub blip silently starts no CI for whoever typed the
+          # command -- on every PR, not just scoped ones. Publishing the scope may
+          # fail; labelling may not.
+          HEAD_SHA=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} --json headRefOid -q .headRefOid) \
+            || HEAD_SHA=""
+
+          ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
+            | sed -nE 's/.*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+(.*)$/\1/p' \
+            | head -1)
+
+          # Always publish, including the empty case: a bare `run` after a scoped one
+          # must clear the scope rather than silently inherit it.
+          #
+          # A status description caps at 140 chars, which fits only two or three real
+          # test paths, so the scope is published across `ci/test-scope-N` statuses and
+          # reassembled by pr-test.yml. Indices always start at 1, even for a single
+          # chunk, so there is one code path rather than a special case.
+          # A scope was asked for but the head SHA could not be resolved: the scope
+          # cannot be published, so honouring the request is impossible. Reject rather
+          # than label -- labelling here would start a full-suite run in place of the
+          # narrowed one, silently, which is the failure this command's contract exists
+          # to avoid. A bare command has nothing to publish and is unaffected, which
+          # keeps the guard on HEAD_SHA from costing anyone their CI.
+          if [ -n "$ARGS" ] && [ -z "$HEAD_SHA" ]; then
+            gh pr comment ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --body "Rejected: could not resolve this PR's head commit, so the requested test scope cannot be published. Please re-issue the command." \
+              || echo "warning: could not post the rejection note"
+            gh api -X POST \
+              "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+              -f content='confused' > /dev/null || echo "warning: could not react"
+            echo "Rejected: head SHA unresolved with a scope requested; run-ci not applied."
+            exit 0
+          fi
+
+          CHUNKS=()
+          if [ -n "$ARGS" ]; then
+            # Charset and root only. Existence needs the PR's files, which this job
+            # deliberately does not check out -- it holds a write token, so the validator
+            # it runs must be the trusted copy from the base branch. Whoever issues the
+            # trigger can check existence up front, and pytest errors on a missing path.
+            #
+            # A scope that does not validate is rejected, not degraded -- see the
+            # else branch below for why.
+            #
+            # Both calls are inside the same condition on purpose. `mapfile < <(...)`
+            # reports the status of mapfile, never of the child, so chunking used to
+            # fail (a target too long to split) while the step sailed on with an empty
+            # CHUNKS -- full suite substituted, and no note posted, which is precisely
+            # what this branch promises not to do. Capture first, check, then split.
+            if SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                  --targets "$ARGS" --root tests/ --no-check-exists --test-path \
+                  2>/tmp/scope_err) \
+               && CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                  --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
+                  2>>/tmp/scope_err); then
+              mapfile -t CHUNKS <<< "$CHUNKED"
+            else
+              # A malformed scope is a malformed command, and this repo already answers
+              # those one way: react 'confused' and do nothing (see "Unauthorized
+              # user"). Reject rather than degrade, to match.
+              #
+              # Degrading to the full suite looked safer and is not. The experimental
+              # track exists to land features same-day via *targeted* CI; silently
+              # substituting the full matrix drops the PR off the fast lane, takes
+              # hours instead of minutes, tests none of what was asked for, and still
+              # reports green. The caller is usually an automated watcher, which can
+              # retry a loud rejection and cannot detect a quiet one.
+              #
+              # The body must not contain the bot's own trigger phrase: the job guard
+              # is contains(comment.body, '<handle>') with no bot-author exclusion, and
+              # this is posted with a PAT, which GitHub does not suppress. Quoting it
+              # made the bot answer itself and restart CI.
+              #
+              # Both calls are best-effort under `bash -e`; neither a failed note nor a
+              # failed reaction should change the outcome, which is "no label, no CI".
+              gh pr comment ${{ github.event.issue.number }} \
+                --repo ${{ github.repository }} \
+                --body "Rejected: not a valid test scope -- $(cat /tmp/scope_err). Re-issue with a corrected path list, or with no arguments for the full suite." \
+                || echo "warning: could not post the rejection note"
+              gh api -X POST \
+                "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+                -f content='confused' > /dev/null \
+                || echo "warning: could not react"
+              echo "Rejected malformed scope; run-ci not applied."
+              exit 0
+            fi
+          fi
+
+          # There is no DELETE for statuses, but re-posting a context supersedes it, so
+          # a scope that shrank has its leftover chunks updated to empty; otherwise
+          # pr-test would reassemble stale trailing paths.
+          # Same reasoning as HEAD_SHA: a failure here must not cost the label. 0 means
+          # "assume no previous chunks", which at worst leaves a stale trailing chunk
+          # -- strictly better than starting no CI at all.
+          PREV_MAX=$(GH_TOKEN="$STATUS_TOKEN" gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+            --jq '[.statuses[].context
+              | select(test("^ci/test-scope-[0-9]+$"))
+              | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
+            || PREV_MAX=0
+          PREV_MAX=${PREV_MAX:-0}
+
+          publish_chunk() {
+            # No SHA means no status to key on; skip rather than POST to an empty path.
+            [ -n "${HEAD_SHA}" ] || return 0
+            GH_TOKEN="$STATUS_TOKEN" gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+              -f state=success \
+              -f context="ci/test-scope-$1" \
+              -f description="$2" \
+              -f target_url="${{ github.event.comment.html_url }}" > /dev/null
+          }
+
+          for i in "${!CHUNKS[@]}"; do
+            publish_chunk "$((i + 1))" "${CHUNKS[$i]}"
+          done
+          for ((i = ${#CHUNKS[@]} + 1; i <= PREV_MAX; i++)); do
+            publish_chunk "$i" ""
+          done
+
+          if [ ${#CHUNKS[@]} -eq 0 ]; then
+            echo "Published empty test scope (full suite)"
+          else
+            echo "Published test scope in ${#CHUNKS[@]} chunk(s): ${CHUNKS[*]}"
+          fi
+
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
 
           # Re-applying a label the PR already has emits no event, so remove it
