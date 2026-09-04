@@ -171,7 +171,17 @@ CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
 ]
 SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
 CCCL_INCLUDE_DIRS: list[pathlib.Path] = [
-    _package_root / "data" / "cccl" / "cub",
+    # Prefer system CUB/Thrust when present: the bundled CCCL 3.0.3 headers fail to
+    # compile sampling.cuh under nvcc 12 / CUDA 12 (SM89) with 100 errors, e.g.
+    # cub::_V_300302_SM_890::BlockAdjacentDifference<...> has no member ... .
+    # System CUB 2.0.1 compiles fine. Fall back to the bundle otherwise.
+    *(
+        [pathlib.Path("/usr/include")]
+        if (pathlib.Path("/usr/include") / "cub" / "cub.cuh").exists()
+        else [
+            _package_root / "data" / "cccl" / "cub",
+            _package_root / "data" / "cccl" / "thrust",
+        ]
+    ),
     _package_root / "data" / "cccl" / "libcudacxx" / "include",
-    _package_root / "data" / "cccl" / "thrust",
 ]
