@@ -1,5 +1,7 @@
+import gc
 import random
 import tracemalloc
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -411,6 +413,125 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert len(tuner.profiling_cache) >= 1
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
+
+
+def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch):
+    class PreparationMemoryErrorRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationMemoryErrorRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    profile = MagicMock(return_value=1.0)
+    empty_cache = MagicMock()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "preparation_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    profile.assert_not_called()
+    empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_phase", ("input_batches", "runner"))
+def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
+    monkeypatch, failure_phase
+):
+    """OOM inputs die before flag allocation and CUDA cache cleanup."""
+
+    class SyntheticInput:
+        pass
+
+    class PreparationRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if failure_phase == "runner" and do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    synthetic_ref = None
+
+    def prepare_input_tensors(_self, *_args):
+        nonlocal synthetic_ref
+        synthetic_input = SyntheticInput()
+        synthetic_ref = weakref.ref(synthetic_input)
+        return [synthetic_input]
+
+    def prepare_batches(_self, tensors, *_args):
+        if failure_phase == "input_batches":
+            raise MemoryError("CUDA out of memory")
+        return [list(tensors)]
+
+    def empty_cache():
+        gc.collect()
+        assert synthetic_ref is not None
+        assert synthetic_ref() is None
+
+    def sync_oom(local_oom):
+        gc.collect()
+        if local_oom:
+            assert synthetic_ref is not None
+            assert synthetic_ref() is None
+        return local_oom
+
+    monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_input_tensors)
+    monkeypatch.setattr(
+        AutoTuner, "_prepare_input_tensors_with_batches", prepare_batches
+    )
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", lambda *_args, **_kwargs: 1.0
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync_oom
+    )
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "input_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+
+
+def test_choose_one_recovers_from_memory_error_during_profiling(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        MagicMock(side_effect=MemoryError("CUDA out of memory")),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "profiling_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    empty_cache.assert_called_once_with()
 
 
 def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
