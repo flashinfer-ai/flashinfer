@@ -1,0 +1,2144 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+Copyright (c) 2026 NVIDIA Corporation.
+
+Low-precision (INT8 Q/K + FP8 V) Ulysses all-to-all payload operations on the
+V2-G global quantization grid (payload ABI v3, stats protocol 3 / ALIGN-128).
+
+V2-G preserves SageAttention2's GLOBAL 32/64-token Q/K quantization grids
+across rank boundaries.  Under ALIGN-128 every local shard is a whole number
+of 128-token blocks, so no quantization group (Q 32 / K 64) can straddle a
+rank boundary: each rank's locally computed grouped amax IS the final
+per-group scale, the single stats AllGather carries only the K per-channel
+sum and V per-channel amax, and no boundary-merge machinery exists.  The
+compute side consumes the unpacked tensors on the global grid unchanged.
+Attention itself is delegated to an external Sage backend (e.g. the
+sageattention package's prequant entry); this module carries quantization
+primitives only.
+
+NOTE: this submodule is addressed as ``flashinfer.comm.ulysses_lowp``. Never
+re-export a function named exactly ``ulysses_lowp`` from ``flashinfer.comm``:
+it would shadow this submodule on the package and break attribute-based
+module access (see the ulysses_a2a merge note in ``ulysses.py``).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import dataclasses
+import functools
+import math
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+from ..api_logging import flashinfer_api
+from ..jit.comm import gen_ulysses_lowp_module
+from ..trace.templates.comm import (
+    ulysses_lowp_k_grouped_amax_trace,
+    ulysses_lowp_k_sum_v_amax_trace,
+    ulysses_lowp_q_grouped_amax_trace,
+    ulysses_lowp_quant_qkv_pack_fused_trace,
+    ulysses_lowp_quant_qkv_pack_trace,
+    ulysses_lowp_unpack_for_sage_trace,
+)
+from ..utils import device_support_pdl, register_custom_op
+
+# ``stats_protocol_for`` returns one of these two constants.
+# ALIGNED: local_sequence % 128 == 0 — every rank's shard starts and ends on a
+#   128-token boundary, so no quantization group straddles a rank edge.
+#   A single fused amax+quant+pack kernel is sufficient; no cross-rank merge.
+# BOUNDARY_MERGE: shard boundaries are not 128-aligned — the first and last
+#   K groups on each rank may straddle a rank edge, so a cross-rank amax merge
+#   step is required before quantizing boundary groups.
+# Both paths share the same payload layout; they are byte-identical wherever
+# both are legal (i.e. on 128-aligned shards).
+ALIGNED = "aligned"
+BOUNDARY_MERGE = "boundary_merge"
+SUPPORTED_STATS_PROTOCOLS = (ALIGNED, BOUNDARY_MERGE)
+HEAD_DIM = 128
+Q_GROUP = 32
+K_GROUP = 64
+V_SCALE_MAX = 2.25
+# Stage-1 chunk width of the two-stage sequence-parallel k_sum/v_amax
+# reduction; fixes the fp32 sum association (see k_sum_v_amax).
+KSUM_CHUNK_TOKENS = 256
+
+
+# ---------------------------------------------------------------------------
+# Global-grid arithmetic (pure Python, mirrored by the CUDA grid:: helpers)
+# ---------------------------------------------------------------------------
+
+
+def slots(local_sequence: int, group: int) -> int:
+    """ceil((L+G-1)/G): groups a length-L interval can touch at ANY offset.
+
+    This is the fixed per-source slot allocation, not the per-rank valid
+    count; ranks whose offset happens to be group-aligned touch fewer groups
+    and leave the surplus slots deterministically zero.
+    """
+
+    return (local_sequence + 2 * group - 2) // group
+
+
+def group_first(rank: int, local_sequence: int, group: int) -> int:
+    return (rank * local_sequence) // group
+
+
+def group_last(rank: int, local_sequence: int, group: int) -> int:
+    return (rank * local_sequence + local_sequence - 1) // group
+
+
+def touched(rank: int, local_sequence: int, group: int) -> int:
+    return (
+        group_last(rank, local_sequence, group)
+        - group_first(rank, local_sequence, group)
+        + 1
+    )
+
+
+def owner(group_id: int, local_sequence: int, group: int) -> int:
+    """Canonical owner: the smallest group-rank holding the group's start token."""
+
+    return (group_id * group) // local_sequence
+
+
+# ---------------------------------------------------------------------------
+# JIT module loading
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def get_ulysses_lowp_module():
+    module = gen_ulysses_lowp_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_k_sum_v_amax",
+        mutates_args=["k_sum", "v_amax", "k_partial", "v_partial"],
+    )
+    def ulysses_lowp_k_sum_v_amax(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_sum: torch.Tensor,
+        v_amax: torch.Tensor,
+        k_partial: torch.Tensor,
+        v_partial: torch.Tensor,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_k_sum_v_amax(
+            k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_q_grouped_amax", mutates_args=["amax_out"]
+    )
+    def ulysses_lowp_q_grouped_amax(
+        q: torch.Tensor,
+        amax_out: torch.Tensor,
+        rank: int,
+        world_size: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_q_grouped_amax(q, amax_out, rank, world_size, enable_pdl)
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_k_grouped_amax", mutates_args=["amax_out"]
+    )
+    def ulysses_lowp_k_grouped_amax(
+        k: torch.Tensor,
+        k_mean: torch.Tensor,
+        amax_out: torch.Tensor,
+        rank: int,
+        world_size: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_k_grouped_amax(
+            k, k_mean, amax_out, rank, world_size, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_q_int8_pack", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_q_int8_pack(
+        q: torch.Tensor,
+        q_amax_final: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_quant_q_int8_pack(
+            q, q_amax_final, output, rank, world_size, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_kv_int8_fp8_pack(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_mean: torch.Tensor,
+        k_amax_final: torch.Tensor,
+        v_scale: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_quant_kv_int8_fp8_pack(
+            k, v, k_mean, k_amax_final, v_scale, output, rank, world_size, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_q_int8_pack_fused", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_q_int8_pack_fused(
+        q: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_quant_q_int8_pack_fused(
+            q, output, rank, world_size, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_kv_int8_fp8_pack_fused", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_mean: torch.Tensor,
+        v_scale: torch.Tensor,
+        output: torch.Tensor,
+        rank: int,
+        world_size: int,
+        used_sequence: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+            k, v, k_mean, v_scale, output, rank, world_size, used_sequence, enable_pdl
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_unpack_for_sage",
+        mutates_args=["q", "k", "v", "q_scale", "k_scale"],
+    )
+    def ulysses_lowp_unpack_for_sage(
+        input: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: torch.Tensor,
+        k_scale: torch.Tensor,
+        local_sequence: int,
+        world_size: int,
+        scale_sequence: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_unpack_for_sage(
+            input,
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            local_sequence,
+            world_size,
+            scale_sequence,
+            enable_pdl,
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_unpack_for_sage_unaligned",
+        mutates_args=["q", "k", "v", "q_scale", "k_scale"],
+    )
+    def ulysses_lowp_unpack_for_sage_unaligned(
+        input: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: torch.Tensor,
+        k_scale: torch.Tensor,
+        local_sequence: int,
+        world_size: int,
+        scale_sequence: int,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_unpack_for_sage_unaligned(
+            input,
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            local_sequence,
+            world_size,
+            scale_sequence,
+            enable_pdl,
+        )
+
+    @register_custom_op(
+        "flashinfer::ulysses_lowp_quant_v_fp8_with_scale", mutates_args=["output"]
+    )
+    def ulysses_lowp_quant_v_fp8_with_scale(
+        input: torch.Tensor,
+        scale: torch.Tensor,
+        output: torch.Tensor,
+        enable_pdl: bool,
+    ) -> None:
+        module.ulysses_lowp_quant_v_fp8_with_scale(input, scale, output, enable_pdl)
+
+    @register_custom_op("flashinfer::ulysses_lowp_abi_version", mutates_args=[])
+    def ulysses_lowp_abi_version() -> int:
+        return module.ulysses_lowp_abi_version()
+
+    return SimpleNamespace(
+        ulysses_lowp_k_sum_v_amax=ulysses_lowp_k_sum_v_amax,
+        ulysses_lowp_q_grouped_amax=ulysses_lowp_q_grouped_amax,
+        ulysses_lowp_k_grouped_amax=ulysses_lowp_k_grouped_amax,
+        ulysses_lowp_quant_q_int8_pack=ulysses_lowp_quant_q_int8_pack,
+        ulysses_lowp_quant_kv_int8_fp8_pack=ulysses_lowp_quant_kv_int8_fp8_pack,
+        ulysses_lowp_quant_q_int8_pack_fused=ulysses_lowp_quant_q_int8_pack_fused,
+        ulysses_lowp_quant_kv_int8_fp8_pack_fused=ulysses_lowp_quant_kv_int8_fp8_pack_fused,
+        ulysses_lowp_unpack_for_sage=ulysses_lowp_unpack_for_sage,
+        ulysses_lowp_unpack_for_sage_unaligned=ulysses_lowp_unpack_for_sage_unaligned,
+        ulysses_lowp_quant_v_fp8_with_scale=ulysses_lowp_quant_v_fp8_with_scale,
+        ulysses_lowp_abi_version=ulysses_lowp_abi_version,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_tensor(name: str, tensor: torch.Tensor) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+
+
+def _require_sm120(tensor: torch.Tensor) -> None:
+    capability = torch.cuda.get_device_capability(tensor.device)
+    if capability != (12, 0):
+        raise RuntimeError(
+            "low-precision Ulysses V2-G operations require CUDA capability "
+            f"(12, 0), but device {tensor.device} reports {capability}"
+        )
+
+
+def _positive_int(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _world_size(world_size: int) -> int:
+    world_size = _positive_int("world_size", world_size)
+    if world_size not in (2, 4, 6, 8):
+        raise ValueError("V2-G requires world_size in {2,4,6,8}")
+    return world_size
+
+
+def _rank(rank: int, world_size: int) -> int:
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, int)
+        or not 0 <= rank < world_size
+    ):
+        raise ValueError("V2-G requires 0 <= rank < world_size")
+    return rank
+
+
+def _resolve_pdl(enable_pdl: Optional[bool], tensor: torch.Tensor) -> bool:
+    """Programmatic Dependent Launch: default on wherever the device supports
+    it (every SM120 target does); the kernels order their global accesses
+    behind griddepcontrol.wait, so the flag never changes results."""
+
+    if enable_pdl is None:
+        return bool(device_support_pdl(tensor.device))
+    return bool(enable_pdl)
+
+
+def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int, int]:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if tensor.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"{name} must have dtype torch.bfloat16 or torch.float16")
+    if tensor.ndim != 4:
+        raise ValueError(f"{name} must have shape [B, L, H, D]")
+    batch, local_sequence, num_heads, head_dim = tensor.shape
+    if batch <= 0 or local_sequence <= 0:
+        raise ValueError("B and L must be non-zero")
+    if num_heads <= 0:
+        # Head count is parametric: TP shards heads before attention (e.g.
+        # 56/TP2 = 28).  All V2-G statistics and grids are per-(b, h, d)
+        # independent; divisibility by the Ulysses world size is enforced by
+        # the payload spec.  D=128 stays a hard requirement.
+        raise ValueError(f"V2-G requires a positive head count, got H={num_heads}")
+    if head_dim != HEAD_DIM:
+        raise ValueError(f"V2-G requires D={HEAD_DIM}, got D={head_dim}")
+    if tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must be contiguous along head_dim; got strides {tensor.stride()}"
+        )
+    # Every kernel addresses the source through explicit batch/token/head
+    # strides, so only head_dim has to be dense.  This admits the fused
+    # QKV-projection views ([B, L, H, 3, D] sliced on the 3-axis: head stride
+    # 3*D) without materializing three contiguous copies.  The kernels load
+    # 16-byte vectors along head_dim, so the base pointer and the outer
+    # strides must keep 16-byte alignment (8 elements of bf16/fp16).
+    vec_elems = 16 // tensor.element_size()
+    if tensor.data_ptr() % 16 != 0 or any(
+        tensor.stride(i) % vec_elems != 0 for i in range(3)
+    ):
+        raise ValueError(
+            f"{name} must keep 16-byte alignment of every head_dim row; "
+            f"got data_ptr % 16 = {tensor.data_ptr() % 16}, strides {tensor.stride()}"
+        )
+    _require_sm120(tensor)
+    return batch, local_sequence, num_heads, head_dim
+
+
+# ---------------------------------------------------------------------------
+# Capability and payload spec
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api
+def capability(
+    device: Optional[Union[int, str, torch.device]] = None,
+) -> Dict[str, Any]:
+    """Describe availability of the ulysses_lowp kernel on the current device.
+
+    Supported means the compiled kernel's layout constants (Q_GROUP, K_GROUP,
+    HEAD_DIM) match the Python-side values and the device capability is
+    ``(12, 0)`` (SM120).
+    """
+
+    device_capability = None
+    if torch.cuda.is_available():
+        if isinstance(device, int):
+            cuda_device = torch.device("cuda", device)
+        elif device is None:
+            cuda_device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            cuda_device = torch.device(device)
+
+        if cuda_device.type == "cuda":
+            if cuda_device.index is None:
+                cuda_device = torch.device("cuda", torch.cuda.current_device())
+            device_capability = tuple(torch.cuda.get_device_capability(cuda_device))
+
+    compiled_q_group = compiled_k_group = compiled_head_dim = 0
+    try:
+        mod = get_ulysses_lowp_module()
+        compiled_q_group = int(mod.ulysses_lowp_compiled_q_group())
+        compiled_k_group = int(mod.ulysses_lowp_compiled_k_group())
+        compiled_head_dim = int(mod.ulysses_lowp_compiled_head_dim())
+    except Exception:  # noqa: BLE001 — probe never raises; zeroes signal mismatch
+        pass
+    layout_match = bool(
+        compiled_q_group == Q_GROUP
+        and compiled_k_group == K_GROUP
+        and compiled_head_dim == HEAD_DIM
+    )
+    supported = bool(layout_match and device_capability == (12, 0))
+    return {
+        "compiled_q_group": compiled_q_group,
+        "compiled_k_group": compiled_k_group,
+        "compiled_head_dim": compiled_head_dim,
+        "device_capability": device_capability,
+        "supported": supported,
+    }
+
+
+@flashinfer_api
+def payload_spec(
+    *,
+    batch_size: int,
+    local_sequence: int,
+    num_heads: int,
+    head_dim: int,
+    world_size: int,
+) -> Dict[str, Union[int, float]]:
+    """Return the headerless V2-G destination-chunk layout in bytes."""
+
+    batch_size = _positive_int("batch_size", batch_size)
+    local_sequence = _positive_int("local_sequence", local_sequence)
+    num_heads = _positive_int("num_heads", num_heads)
+    head_dim = _positive_int("head_dim", head_dim)
+    world_size = _world_size(world_size)
+    if head_dim != HEAD_DIM:
+        raise ValueError(f"V2-G requires D={HEAD_DIM}, got D={head_dim}")
+    if num_heads % world_size:
+        # The only structural head constraint: equal head split across the
+        # Ulysses group.  The count itself is parametric (28 under TP2, 56
+        # without TP, ...).
+        raise ValueError("num_heads must be divisible by world_size")
+
+    local_heads = num_heads // world_size
+    q_slots = slots(local_sequence, Q_GROUP)
+    k_slots = slots(local_sequence, K_GROUP)
+    main_bytes = batch_size * local_sequence * local_heads * head_dim
+    q_scale_bytes = batch_size * local_heads * q_slots * 4
+    k_scale_bytes = batch_size * local_heads * k_slots * 4
+    q_scale_offset = 3 * main_bytes
+    k_scale_offset = q_scale_offset + q_scale_bytes
+    raw_chunk_bytes = k_scale_offset + k_scale_bytes
+    chunk_bytes = (raw_chunk_bytes + 127) // 128 * 128
+    payload_bytes = world_size * chunk_bytes
+    bf16_payload_bytes = 3 * batch_size * local_sequence * num_heads * head_dim * 2
+    logical_sequence = world_size * local_sequence
+    return {
+        "local_heads": local_heads,
+        "q_slots_per_source": q_slots,
+        "k_slots_per_source": k_slots,
+        "logical_sequence": logical_sequence,
+        "padded_sequence": (logical_sequence + 63) // 64 * 64,
+        "q_scale_alloc": (logical_sequence + 127) // 128 * 4,
+        "k_scale_alloc": (logical_sequence + 63) // 64,
+        "main_bytes": main_bytes,
+        "q_offset": 0,
+        "k_offset": main_bytes,
+        "v_offset": 2 * main_bytes,
+        "q_scale_offset": q_scale_offset,
+        "k_scale_offset": k_scale_offset,
+        "raw_chunk_bytes": raw_chunk_bytes,
+        "chunk_bytes": chunk_bytes,
+        "payload_bytes": payload_bytes,
+        "bf16_payload_bytes": bf16_payload_bytes,
+        "payload_reduction_pct": (1.0 - payload_bytes / bf16_payload_bytes) * 100.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Local statistics (pre-collective)
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api(trace=ulysses_lowp_k_sum_v_amax_trace)
+def k_sum_v_amax(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute local FP32 K sum and V absolute maximum over sequence.
+
+    Both inputs use canonical NHD ``[B, L, H, 128]`` storage. The returned
+    ``[B, H, 128]`` tensors are local statistics; callers must synchronize
+    them across the Ulysses process group before quantizing K or V.
+
+    The reduction is two-stage sequence-parallel: stage 1 reduces fixed
+    ``KSUM_CHUNK_TOKENS``-token chunks into fp32 partials — the
+    ``[B, H, ceil(L/256), 128]`` fp32 workspaces are allocated here and
+    passed to the kernel — and stage 2 combines the chunk partials in FIXED
+    ascending chunk order, so results are deterministic (bit-identical run
+    to run).  NOTE: the fp32 ``k_sum`` association differs from a single-pass
+    sequential sum by ULPs (the one deliberate bit change of the two-stage
+    launch-occupancy fix); ``v_amax`` is max-reduced (order-independent) and
+    stays byte-identical to the single-pass form.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if k.shape != v.shape:
+        raise ValueError("k and v must have identical shapes")
+    if k.dtype != v.dtype:
+        raise TypeError("k and v must have the same dtype")
+    if k.device != v.device:
+        raise ValueError("k and v must be on the same CUDA device")
+    if out is None:
+        k_sum = torch.empty(
+            (batch, num_heads, head_dim), dtype=torch.float32, device=k.device
+        )
+        v_amax = torch.empty_like(k_sum)
+    else:
+        if not isinstance(out, tuple) or len(out) != 2:
+            raise TypeError("out must be a (k_sum, v_amax) tensor tuple")
+        k_sum, v_amax = out
+    num_chunks = (local_sequence + KSUM_CHUNK_TOKENS - 1) // KSUM_CHUNK_TOKENS
+    k_partial = torch.empty(
+        (batch, num_heads, num_chunks, head_dim), dtype=torch.float32, device=k.device
+    )
+    v_partial = torch.empty_like(k_partial)
+    get_ulysses_lowp_module().ulysses_lowp_k_sum_v_amax(
+        k, v, k_sum, v_amax, k_partial, v_partial, _resolve_pdl(enable_pdl, k)
+    )
+    return k_sum, v_amax
+
+
+# ---------------------------------------------------------------------------
+# Grouped amax (locally final under ALIGN-128)
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api(trace=ulysses_lowp_q_grouped_amax_trace)
+def q_grouped_amax(
+    q: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Per-touched-global-group |Q| partial amax, ``[B, H, slots(L,32)]``.
+
+    Valid slots are ``[0, touched)``; the surplus allocation stays zero.
+    """
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    amax = torch.zeros(
+        (batch, num_heads, slots(local_sequence, Q_GROUP)),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    get_ulysses_lowp_module().ulysses_lowp_q_grouped_amax(
+        q, amax, rank, world_size, _resolve_pdl(enable_pdl, q)
+    )
+    return amax
+
+
+@flashinfer_api(trace=ulysses_lowp_k_grouped_amax_trace)
+def k_grouped_amax(
+    k: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Per-touched-global-group |K - global mean| partial amax, ``[B, H, slots(L,64)]``.
+
+    ``used_sequence`` is the live global row count when the caller's packed
+    sequence carries zero-filled tail padding in rows ``[used, S)``.  Unlike Q
+    and V, whose amax is taken on the raw values (a zero row contributes 0 and
+    cannot raise any group's max), the K amax is taken on the MEAN-SUBTRACTED
+    ``Kc = K - k_mean_global``: a zero padding row contributes
+    ``|0 - k_mean| = |k_mean|``, which under the smooth-k regime (large channel
+    means, small deviations -- the very regime smooth_k exists for) dominates
+    the live rows' amax and silently inflates the tail group's scale.  The
+    CUDA kernel has no notion of ``used``, so when padding is present this
+    recomputes the partial live group's slot over the live rows only, with
+    the exact pinned math (fp32 convert, subtract, abs, order-independent
+    max, 1e-7 floor), so the pack kernel's per-group scales see the corrected
+    value.  With ``used_sequence is None`` or ``used == S`` nothing is
+    touched, keeping the no-padding path bit-identical to the original kernel
+    output.
+
+    ALIGN-128 relaxation: the tail padding may span many trailing K groups.
+    Only ONE group can mix live and padding rows -- the partial live group
+    ``(used-1)//64`` -- and only there does the zero padding pollute a scale
+    that live rows consume.  Fully-padded groups beyond it are never read by
+    the compute (rows are sliced to ``used``); their kernel-produced values
+    are deterministic don't-cares.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if not isinstance(k_mean_global, torch.Tensor):
+        raise TypeError("k_mean_global must be a torch.Tensor")
+    if k_mean_global.dtype != k.dtype:
+        raise TypeError("k_mean_global must have the same dtype as k")
+    if tuple(k_mean_global.shape) != (batch, num_heads, head_dim):
+        raise ValueError(
+            f"k_mean_global must have shape {(batch, num_heads, head_dim)}"
+        )
+    if not k_mean_global.is_contiguous() or k_mean_global.device != k.device:
+        raise ValueError("k_mean_global must be contiguous and on the K device")
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+    amax = torch.zeros(
+        (batch, num_heads, slots(local_sequence, K_GROUP)),
+        dtype=torch.float32,
+        device=k.device,
+    )
+    get_ulysses_lowp_module().ulysses_lowp_k_grouped_amax(
+        k, k_mean_global, amax, rank, world_size, _resolve_pdl(enable_pdl, k)
+    )
+    if (
+        used_sequence is not None
+        and int(used_sequence) < global_sequence
+        and int(used_sequence) % K_GROUP
+    ):
+        used = int(used_sequence)
+        # ALIGN-128: the tail padding may span many trailing K groups.  Only
+        # ONE group can mix live and padding rows -- the partial live group
+        # (used-1)//64 -- and only there does the zero padding pollute a
+        # scale that live rows consume.  Fully-padded groups beyond it are
+        # never read by the compute (rows are sliced to ``used``); their
+        # kernel-produced values are deterministic don't-cares.  When
+        # ``used`` is a multiple of the group size there is no partial group
+        # and nothing to repair (the branch condition above skips).  Correct
+        # only the ranks that touch the partial group; each overwrites its
+        # own partial with the live-rows amax (a group straddling ranks --
+        # unit-test shapes only under ALIGN-128 -- still works: every
+        # touching rank repairs its own slice).
+        tail_group = (used - 1) // K_GROUP
+        g_first = (rank * local_sequence) // K_GROUP
+        g_last = (rank * local_sequence + local_sequence - 1) // K_GROUP
+        if g_first <= tail_group <= g_last:
+            lo = max(tail_group * K_GROUP, rank * local_sequence)
+            hi = min(used, (rank + 1) * local_sequence)
+            lo_local = lo - rank * local_sequence
+            hi_local = hi - rank * local_sequence
+            if hi_local > lo_local:
+                kc = k[:, lo_local:hi_local].float() - k_mean_global.float().unsqueeze(
+                    1
+                )
+                live = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+            else:
+                # this rank's slice of the tail group is padding only
+                live = torch.full(
+                    (batch, num_heads), 1e-7, dtype=torch.float32, device=k.device
+                )
+            amax[..., tail_group - g_first] = live
+    return amax
+
+
+# ---------------------------------------------------------------------------
+# Boundary machinery (stats protocol 2: 64-aligned global packing)
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api
+def boundary_descriptors(
+    grouped_amax: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    group: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Extract the ``[B, H, 2]`` boundary descriptor for one stats collective.
+
+    slot0 is the first touched group's partial amax and slot1 the last's.
+    When the rank touches a single group both slots carry the same value; the
+    downstream max merge is idempotent, so no dedup special case is needed.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    touched_count = touched(rank, local_sequence, group)
+    first = grouped_amax[..., 0:1]
+    last = grouped_amax[..., touched_count - 1 : touched_count]
+    return torch.cat([first, last], dim=-1).contiguous()
+
+
+@flashinfer_api
+def merge_boundary_amax(
+    grouped_amax: torch.Tensor,
+    gathered_descriptors: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    group: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Overwrite this rank's boundary slots with the cross-rank max merge.
+
+    ``gathered_descriptors`` is ``[P, B, H, 2]`` in group-rank order.  For each
+    of this rank's (at most two) boundary groups, the final amax is the max of
+    the partial amax from every rank whose interval intersects that group.
+    The merge uses only ``max`` (exact, order-independent), so the result is
+    bit-identical on every participating rank.  Returns ``grouped_amax``
+    (modified in place) for convenience.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if (
+        gathered_descriptors.shape[0] != world_size
+        or gathered_descriptors.shape[-1] != 2
+    ):
+        raise ValueError("gathered_descriptors must have shape [P, B, H, 2]")
+    my_first = group_first(rank, local_sequence, group)
+    touched_count = touched(rank, local_sequence, group)
+    for boundary_group in {my_first, my_first + touched_count - 1}:
+        parts = []
+        for other in range(world_size):
+            other_first = group_first(other, local_sequence, group)
+            other_last = group_last(other, local_sequence, group)
+            if not other_first <= boundary_group <= other_last:
+                continue
+            slot = 0 if boundary_group == other_first else 1
+            parts.append(gathered_descriptors[other, ..., slot])
+        merged = parts[0]
+        for part in parts[1:]:
+            merged = torch.maximum(merged, part)
+        grouped_amax[..., boundary_group - my_first] = merged
+    return grouped_amax
+
+
+@flashinfer_api
+def k_boundary_minmax(
+    k: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+) -> torch.Tensor:
+    """Per-channel raw-K min/max of this rank's two K boundary slices.
+
+    Returns ``[B, H, 2, 2, D]`` fp32: dim2 is the boundary slot (0 = first
+    touched global 64-group's slice, 1 = last touched group's; when the rank
+    touches a single group both slots describe the same slice, and the
+    downstream max-combine is idempotent).  dim3 is (min, max).
+
+    Stats-protocol 2 gathers this INSTEAD of the mean-dependent K boundary
+    amax: raw-K min/max needs no global mean, so it rides in AllGather #1,
+    and after ``k_mean_global`` is derived every rank reconstructs each
+    boundary group's exact |K - mean| amax locally (see
+    :func:`derive_k_boundary_amax`), eliminating the second collective.
+
+    fp32 transport is exact: every BF16/FP16 value converts to fp32 without
+    rounding, and min/max are selections.  ``used_sequence`` applies the
+    live-rows rule one stage earlier: rows ``[used, S)`` are zero-filled
+    padding whose inclusion would contribute ``min=0/max=0`` and hence
+    ``|0 - mean| = |mean|`` after the derive -- exactly the tail-group
+    pollution the k_grouped_amax fix removes.  A slice that is entirely
+    padding gets the sentinels ``min=+inf, max=-inf``; the derive turns those
+    into ``-inf`` before its 1e-7 floor, i.e. the same "this rank contributes
+    nothing" value the two-collective path used.
+
+    ``used_sequence`` must satisfy the padding admission condition
+    ``ceil(used_sequence/64) == ceil(S/64)`` (all padding inside the single
+    last global K group); violations raise :class:`ValueError`.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None:
+        if not 0 < int(used_sequence) <= global_sequence:
+            raise ValueError(
+                "used_sequence must lie in (0, local_sequence * world_size]"
+            )
+        # Enforced admission condition (comment-only precondition upstream):
+        # all padding must live in the single last global K group.
+        if (int(used_sequence) + K_GROUP - 1) // K_GROUP != (
+            global_sequence + K_GROUP - 1
+        ) // K_GROUP:
+            raise ValueError(
+                "used_sequence must satisfy ceil(used_sequence/64) == ceil(S/64): "
+                "all tail padding must lie inside the last global K group"
+            )
+    used = int(used_sequence) if used_sequence is not None else global_sequence
+
+    out = torch.empty(
+        (batch, num_heads, 2, 2, head_dim), dtype=torch.float32, device=k.device
+    )
+    g_first = group_first(rank, local_sequence, K_GROUP)
+    g_last = group_last(rank, local_sequence, K_GROUP)
+    base = rank * local_sequence
+    for slot, group_id in enumerate((g_first, g_last)):
+        lo = max(group_id * K_GROUP, base)
+        hi = min((group_id + 1) * K_GROUP, base + local_sequence, used)
+        if hi > lo:
+            # [B, rows, H, D] slice in local coordinates; fp32 convert is
+            # exact for BF16/FP16, min/max are selections (no rounding).
+            rows = k[:, lo - base : hi - base].float()
+            out[:, :, slot, 0] = rows.amin(dim=1)
+            out[:, :, slot, 1] = rows.amax(dim=1)
+        else:
+            out[:, :, slot, 0] = float("inf")
+            out[:, :, slot, 1] = float("-inf")
+    return out
+
+
+@flashinfer_api
+def derive_k_boundary_amax(
+    grouped_amax: torch.Tensor,
+    gathered_minmax: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    *,
+    rank: int,
+    local_sequence: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Overwrite this rank's K boundary slots with the derived cross-rank amax.
+
+    ``gathered_minmax`` is ``[P, B, H, 2, 2, D]`` fp32 in group-rank order
+    (from AllGather #1 under stats protocol 2).  For each of this rank's (at
+    most two) boundary groups g and every rank r touching g:
+
+        contrib(r, g) = max_d max( rn(maxK[r,g,d] - m[d]),
+                                   rn(m[d]  - minK[r,g,d]) )   floored at 1e-7
+
+    which is bit-equal to r's |K - m| partial amax over its slice of g: fp32
+    round-to-nearest subtraction is monotone in its tensor argument, so
+    ``max_t rn(k_t - m) = rn(max_t k_t - m)`` and likewise for the min side,
+    and ``max_t |rn(k_t - m)| = max(rn(maxK - m), rn(m - minK))`` exactly.
+    The final slot value is ``max_r contrib(r, g)`` -- the same values the
+    retired AllGather #2 merge produced, computed from identical gathered
+    inputs with identical exact ops on every rank, hence bit-identical
+    group-wide without a second collective.  A padding-only slice's sentinels
+    (min=+inf, max=-inf) yield ``-inf`` before the floor, i.e. contribute
+    1e-7 exactly as the two-collective path did.  Non-crossing boundary
+    groups (single toucher) reduce to the kernel's own partial, so the
+    unconditional overwrite is bit-neutral there.
+    """
+
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if gathered_minmax.shape[0] != world_size or gathered_minmax.shape[-3:-1] != (2, 2):
+        raise ValueError("gathered_minmax must have shape [P, B, H, 2, 2, D]")
+    mean32 = k_mean_global.float()
+    my_first = group_first(rank, local_sequence, K_GROUP)
+    touched_count = touched(rank, local_sequence, K_GROUP)
+    for boundary_group in {my_first, my_first + touched_count - 1}:
+        merged = None
+        for other in range(world_size):
+            other_first = group_first(other, local_sequence, K_GROUP)
+            other_last = group_last(other, local_sequence, K_GROUP)
+            if not other_first <= boundary_group <= other_last:
+                continue
+            slot = 0 if boundary_group == other_first else 1
+            mn = gathered_minmax[other, :, :, slot, 0]
+            mx = gathered_minmax[other, :, :, slot, 1]
+            contrib = (
+                torch.maximum(mx - mean32, mean32 - mn).amax(dim=-1).clamp_(min=1e-7)
+            )
+            merged = contrib if merged is None else torch.maximum(merged, contrib)
+        grouped_amax[..., boundary_group - my_first] = merged
+    return grouped_amax
+
+
+# ---------------------------------------------------------------------------
+# Quantize-and-pack into the headerless payload
+# ---------------------------------------------------------------------------
+
+
+def _validate_send(
+    send_u8: torch.Tensor,
+    *,
+    batch_size: int,
+    local_sequence: int,
+    num_heads: int,
+    world_size: int,
+) -> Dict[str, Union[int, float]]:
+    if not isinstance(send_u8, torch.Tensor):
+        raise TypeError("send_u8 must be a torch.Tensor")
+    spec = payload_spec(
+        batch_size=batch_size,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=HEAD_DIM,
+        world_size=world_size,
+    )
+    if not send_u8.is_cuda or send_u8.dtype != torch.uint8:
+        raise ValueError("send_u8 must be a CUDA uint8 tensor")
+    if tuple(send_u8.shape) != (world_size, spec["chunk_bytes"]):
+        raise ValueError(
+            f"send_u8 must have shape {(world_size, spec['chunk_bytes'])}, "
+            f"got {tuple(send_u8.shape)}"
+        )
+    if not send_u8.is_contiguous():
+        raise ValueError("send_u8 must be contiguous")
+    return spec
+
+
+@flashinfer_api
+def zero_scale_and_padding(
+    send_u8: torch.Tensor, spec: Dict[str, Union[int, float]]
+) -> None:
+    """Deterministically zero every scale slot and the alignment tail.
+
+    Must run before the first V2-G pack launch: the pack kernels write only
+    the touched slots, and the ABI requires every unused byte to be zero.
+    """
+
+    send_u8[:, int(spec["q_scale_offset"]) :].zero_()
+
+
+@flashinfer_api
+def quant_q_into_payload(
+    q: torch.Tensor,
+    q_amax_final: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    """Quantize Q on the global grid directly into the V2-G payload."""
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != q.device or q_amax_final.device != q.device:
+        raise ValueError("q, q_amax_final, and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_q_int8_pack(
+        q, q_amax_final, send_u8, rank, world_size, _resolve_pdl(enable_pdl, q)
+    )
+
+
+@flashinfer_api
+def quant_kv_into_payload(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    k_amax_final: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    """Quantize K (global grid) and V (global per-channel) into the payload."""
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if k.shape != v.shape or k.dtype != v.dtype or k.device != v.device:
+        raise ValueError("k and v must have identical shape, dtype, and device")
+    if k_mean_global.dtype != k.dtype:
+        raise TypeError("k_mean_global must have the same dtype as k")
+    if v_scale_global.dtype != torch.float32:
+        raise TypeError("v_scale_global must have dtype torch.float32")
+    for name, tensor in (
+        ("k_mean_global", k_mean_global),
+        ("v_scale_global", v_scale_global),
+    ):
+        if tuple(tensor.shape) != (batch, num_heads, head_dim):
+            raise ValueError(f"{name} must have shape {(batch, num_heads, head_dim)}")
+        if not tensor.is_contiguous() or tensor.device != k.device:
+            raise ValueError(f"{name} must be contiguous and on the K device")
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != k.device:
+        raise ValueError("K/V, statistics, and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack(
+        k,
+        v,
+        k_mean_global,
+        k_amax_final,
+        v_scale_global,
+        send_u8,
+        rank,
+        world_size,
+        _resolve_pdl(enable_pdl, k),
+    )
+
+
+@flashinfer_api(trace=ulysses_lowp_quant_qkv_pack_trace)
+def quant_qkv_pack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    q_amax_final: torch.Tensor,
+    k_amax_final: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Fused V2-G quantize-and-pack convenience entry point."""
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        raise ValueError("q, k, and v must have identical shape and dtype")
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    spec = payload_spec(
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=HEAD_DIM,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(
+            (world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
+        )
+    # Validate before the first write so a rejected call leaves `out` intact.
+    _validate_send(
+        out,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    zero_scale_and_padding(out, spec)
+    enable_pdl = _resolve_pdl(enable_pdl, q)
+    quant_q_into_payload(
+        q, q_amax_final, out, rank=rank, world_size=world_size, enable_pdl=enable_pdl
+    )
+    quant_kv_into_payload(
+        k,
+        v,
+        k_mean_global,
+        k_amax_final,
+        v_scale_global,
+        out,
+        rank=rank,
+        world_size=world_size,
+        enable_pdl=enable_pdl,
+    )
+    return out
+
+
+def _require_align128(api: str, local_sequence: int) -> None:
+    if local_sequence % 128:
+        raise ValueError(
+            f"{api} is an ALIGN-128 fast path: local_sequence must be a whole "
+            f"number of 128-token blocks, got {local_sequence}"
+        )
+
+
+@flashinfer_api
+def quant_q_into_payload_fused(
+    q: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    """Fused amax+quant of Q into the payload (ALIGN-128 fast path).
+
+    The Q half of :func:`quant_qkv_pack_fused`.  It needs no gathered
+    statistics (Q is scaled per 32-token group by its own amax), so a caller
+    may issue it on a side stream while the K-sum/V-amax AllGather is still
+    in flight and run :func:`quant_kv_into_payload_fused` afterwards; the two
+    write disjoint byte ranges of ``send_u8`` (Q section + Q scales vs the
+    K/V sections + K scales), so their relative order does not matter.  The
+    caller owns :func:`zero_scale_and_padding` before either half and the
+    cross-stream synchronization before the exchange.
+    """
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    _require_align128("quant_q_into_payload_fused", local_sequence)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != q.device:
+        raise ValueError("q and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_q_int8_pack_fused(
+        q, send_u8, rank, world_size, _resolve_pdl(enable_pdl, q)
+    )
+
+
+@flashinfer_api
+def quant_kv_into_payload_fused(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    send_u8: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    """Fused amax+quant of K plus per-channel FP8 V into the payload.
+
+    The K/V half of :func:`quant_qkv_pack_fused`; see
+    :func:`quant_q_into_payload_fused` for the split-launch contract.
+    ``used_sequence`` applies the K tail-group repair in-kernel with the
+    exact split-path semantics.
+    """
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    _require_align128("quant_kv_into_payload_fused", local_sequence)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    if k.shape != v.shape or k.dtype != v.dtype or k.device != v.device:
+        raise ValueError("k and v must have identical shape, dtype, and device")
+    if k_mean_global.dtype != k.dtype:
+        raise TypeError("k_mean_global must have the same dtype as k")
+    if v_scale_global.dtype != torch.float32:
+        raise TypeError("v_scale_global must have dtype torch.float32")
+    for name, tensor in (
+        ("k_mean_global", k_mean_global),
+        ("v_scale_global", v_scale_global),
+    ):
+        if tuple(tensor.shape) != (batch, num_heads, head_dim):
+            raise ValueError(f"{name} must have shape {(batch, num_heads, head_dim)}")
+        if not tensor.is_contiguous() or tensor.device != k.device:
+            raise ValueError(f"{name} must be contiguous and on the K device")
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+    _validate_send(
+        send_u8,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    if send_u8.device != k.device:
+        raise ValueError("K/V, statistics, and send_u8 must share a device")
+    get_ulysses_lowp_module().ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+        k,
+        v,
+        k_mean_global,
+        v_scale_global,
+        send_u8,
+        rank,
+        world_size,
+        int(used_sequence) if used_sequence is not None else 0,
+        _resolve_pdl(enable_pdl, k),
+    )
+
+
+@flashinfer_api(trace=ulysses_lowp_quant_qkv_pack_fused_trace)
+def quant_qkv_pack_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_mean_global: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Fused amax+quant V2-G pack (ALIGN-128 fast path).
+
+    Byte-identical to ``q_grouped_amax`` + ``k_grouped_amax`` +
+    ``quant_qkv_pack`` but reads Q/K from HBM once: each CTA loads its group,
+    reduces the per-group amax in-block, and quantizes from registers.  Legal
+    only when the locally computed amax IS the final scale, i.e. under
+    ALIGN-128 (``local_sequence % 128 == 0``); protocol 2 keeps the split
+    path because a collective sits between amax and quant for its boundary
+    groups.  ``used_sequence`` applies the K tail-group repair in-kernel with
+    the exact split-path semantics.
+
+    Convenience composition of :func:`zero_scale_and_padding`,
+    :func:`quant_q_into_payload_fused` and
+    :func:`quant_kv_into_payload_fused` on the current stream; call the
+    halves directly to overlap the Q half with the statistics AllGather.
+    """
+
+    batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        raise ValueError("q, k, and v must have identical shape and dtype")
+    _require_align128("quant_qkv_pack_fused", local_sequence)
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    spec = payload_spec(
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=HEAD_DIM,
+        world_size=world_size,
+    )
+    if out is None:
+        out = torch.empty(
+            (world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
+        )
+    _validate_send(
+        out,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        world_size=world_size,
+    )
+    zero_scale_and_padding(out, spec)
+    enable_pdl = _resolve_pdl(enable_pdl, q)
+    quant_q_into_payload_fused(
+        q, out, rank=rank, world_size=world_size, enable_pdl=enable_pdl
+    )
+    quant_kv_into_payload_fused(
+        k,
+        v,
+        k_mean_global,
+        v_scale_global,
+        out,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=used_sequence,
+        enable_pdl=enable_pdl,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Receiver unpack
+# ---------------------------------------------------------------------------
+
+
+def scale_widths(sequence: int) -> Tuple[int, int]:
+    """Per-head Q/K scale slot counts the SageAttention per-warp consumer
+    derives from ``sequence`` rows: ``ceil(sequence/128)*4`` Q slots (32-token
+    warps inside 128-token CTAs) and ``ceil(sequence/64)`` K slots.  Size
+    ``unpack_for_sage(..., out=)`` scale buffers with this for the
+    ``scale_sequence`` you will pass."""
+
+    sequence = _positive_int("sequence", sequence)
+    return (sequence + 127) // 128 * 4, (sequence + 63) // 64
+
+
+@flashinfer_api(trace=ulysses_lowp_unpack_for_sage_trace)
+def unpack_for_sage(
+    recv_u8: torch.Tensor,
+    *,
+    batch_size: int,
+    local_sequence: int,
+    local_heads: int,
+    head_dim: int,
+    world_size: int,
+    aligned: Optional[bool] = True,
+    scale_sequence: Optional[int] = None,
+    out: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack source chunks into pre-quant compute inputs on the global grid.
+
+    Returns contiguous logical Q/K ``[B,S,h,128]``, globally packed V
+    ``[B,128,h,ceil(S/64)*64]`` with a zero global tail, and global-grid Q/K
+    scale tensors whose unused tail slots are deterministically zero.
+
+    The Sage kernel derives its per-head scale stride from the rows it is
+    given, so a caller attending over a live prefix ``used < S`` must hand it
+    scales of exactly ``scale_widths(used)`` slots.  Pass
+    ``scale_sequence=used`` and the kernel emits the scale tensors at that
+    width directly (byte-identical to the full-width tensors' leading slots),
+    instead of the caller narrowing them with a copy per layer.  ``None``
+    keeps the full logical width.  Q/K/V are always emitted for the full
+    logical sequence.
+
+    ``aligned`` selects the receiver kernel: ``True`` is the ALIGN-128 fast
+    path (requires ``local_sequence % 128 == 0``), ``False`` the per-token
+    protocol-2 kernel, and ``None`` picks automatically from the shard length
+    (``local_sequence % 128 == 0``) -- the same rank-uniform rule
+    :func:`stats_protocol_for` applies, so all ranks agree without a
+    collective.  On 128-aligned shards both kernels produce byte-identical
+    outputs; the aligned path is purely a fast path.
+    """
+
+    batch_size = _positive_int("batch_size", batch_size)
+    local_sequence = _positive_int("local_sequence", local_sequence)
+    local_heads = _positive_int("local_heads", local_heads)
+    head_dim = _positive_int("head_dim", head_dim)
+    world_size = _world_size(world_size)
+    if aligned is None:
+        aligned = local_sequence % 128 == 0
+    if aligned and local_sequence % 128:
+        raise ValueError(
+            "ALIGN-128 (stats protocol 3): local_sequence must be a whole "
+            f"number of 128-token blocks, got {local_sequence}; pass "
+            "aligned=False for the protocol-2 (64-aligned global) receiver"
+        )
+    spec = payload_spec(
+        batch_size=batch_size,
+        local_sequence=local_sequence,
+        num_heads=local_heads * world_size,
+        head_dim=head_dim,
+        world_size=world_size,
+    )
+    if not isinstance(recv_u8, torch.Tensor):
+        raise TypeError("recv_u8 must be a torch.Tensor")
+    if not recv_u8.is_cuda or recv_u8.dtype != torch.uint8:
+        raise ValueError("recv_u8 must be a CUDA uint8 tensor")
+    if tuple(recv_u8.shape) != (world_size, spec["chunk_bytes"]):
+        raise ValueError(
+            f"recv_u8 must have shape {(world_size, spec['chunk_bytes'])}, "
+            f"got {tuple(recv_u8.shape)}"
+        )
+    if not recv_u8.is_contiguous():
+        raise ValueError("recv_u8 must be contiguous")
+    _require_sm120(recv_u8)
+
+    logical_sequence = int(spec["logical_sequence"])
+    padded_sequence = int(spec["padded_sequence"])
+    if scale_sequence is None:
+        scale_sequence = logical_sequence
+    elif not 0 < int(scale_sequence) <= logical_sequence:
+        raise ValueError("scale_sequence must lie in (0, local_sequence * world_size]")
+    q_scale_width, k_scale_width = scale_widths(int(scale_sequence))
+    if out is None:
+        q_logical = torch.empty(
+            (batch_size, logical_sequence, local_heads, head_dim),
+            dtype=torch.int8,
+            device=recv_u8.device,
+        )
+        k_logical = torch.empty_like(q_logical)
+        v_packed = torch.empty(
+            (batch_size, head_dim, local_heads, padded_sequence),
+            dtype=torch.float8_e4m3fn,
+            device=recv_u8.device,
+        )
+        q_scale = torch.empty(
+            (batch_size, local_heads, q_scale_width),
+            dtype=torch.float32,
+            device=recv_u8.device,
+        )
+        k_scale = torch.empty(
+            (batch_size, local_heads, k_scale_width),
+            dtype=torch.float32,
+            device=recv_u8.device,
+        )
+    else:
+        if not isinstance(out, tuple) or len(out) != 5:
+            raise TypeError("out must be a five-tensor global-grid Sage tuple")
+        q_logical, k_logical, v_packed, q_scale, k_scale = out
+    fn = (
+        get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage
+        if aligned
+        else get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage_unaligned
+    )
+    fn(
+        recv_u8,
+        q_logical,
+        k_logical,
+        v_packed,
+        q_scale,
+        k_scale,
+        local_sequence,
+        world_size,
+        int(scale_sequence),
+        _resolve_pdl(enable_pdl, recv_u8),
+    )
+    return q_logical, k_logical, v_packed, q_scale, k_scale
+
+
+# ---------------------------------------------------------------------------
+# Automatic protocol routing (padding decides, everything else follows)
+#
+# The caller owns exactly one decision: how far the packed global sequence is
+# padded.  Everything downstream -- which statistics ride the single
+# AllGather, whether the boundary machinery runs, fused vs split packing, and
+# which receiver kernel unpacks -- follows from ``local_sequence`` alone via
+# ``stats_protocol_for``.  The rule is rank-uniform (every rank has the same
+# L), so all ranks route identically with no extra collective.  The two
+# routes produce byte-identical payloads whenever both are legal (128-aligned
+# shards); the protocol-3 route is purely the fast path for that case.
+#
+# The collectives themselves stay with the caller:
+#
+#   send, ctx = local_stats(q, k, v, rank=..., world_size=..., used_sequence=u)
+#   gathered  = all_gather(send)                    # caller's process group
+#   stats     = finalize_stats(gathered, ctx, k)
+#   payload   = quant_and_pack(q, k, v, stats, out=send_u8)
+#   recv      = all_to_all(payload)                 # caller's process group
+#   q8, k8, v8, qs, ks = unpack_for_sage(recv, ..., aligned=None,
+#                                        scale_sequence=u)
+# ---------------------------------------------------------------------------
+
+
+def stats_protocol_for(local_sequence: int, world_size: int) -> str:
+    """Routing key implied by the shard length.
+
+    Returns :data:`ALIGNED` when ``local_sequence % 128 == 0``: every rank's
+    shard starts and ends on a 128-token boundary, so no quantization group
+    straddles a rank edge and a single fused kernel suffices.
+
+    Returns :data:`BOUNDARY_MERGE` otherwise: the first and last K groups on
+    some ranks straddle a rank boundary, so a cross-rank amax merge step is
+    required before quantizing those boundary groups.
+
+    Every rank derives the same value from the same ``local_sequence``, so
+    all ranks route identically with no collective. The boundary-merge path
+    handles any shard length; padding the global sequence per
+    ``required_alignment`` is a performance recommendation, not a kernel
+    precondition."""
+
+    local_sequence = _positive_int("local_sequence", local_sequence)
+    _world_size(world_size)
+    return ALIGNED if local_sequence % 128 == 0 else BOUNDARY_MERGE
+
+
+def required_alignment(world_size: int, stats_protocol: str) -> int:
+    """Recommended multiple for padding the packed GLOBAL sequence.
+
+    ``128 * world_size`` for the aligned path (every shard a whole number of
+    128-token blocks); ``64`` for the boundary-merge path (keeps whole global
+    K groups, tail padding < 64)."""
+
+    world_size = _world_size(world_size)
+    if stats_protocol == ALIGNED:
+        return 128 * world_size
+    if stats_protocol == BOUNDARY_MERGE:
+        return 64
+    raise ValueError(
+        f"stats_protocol must be one of {SUPPORTED_STATS_PROTOCOLS}, "
+        f"got {stats_protocol!r}"
+    )
+
+
+def aligned_length(n_tokens: int, world_size: int, stats_protocol: str) -> int:
+    """``n_tokens`` rounded up to ``required_alignment``: the padded global
+    sequence length the caller should materialize (zero-filled tail)."""
+
+    n_tokens = _positive_int("n_tokens", n_tokens)
+    alignment = required_alignment(world_size, stats_protocol)
+    return (n_tokens + alignment - 1) // alignment * alignment
+
+
+def _fields_repr(obj: Any) -> str:
+    """Dataclass repr that never touches tensor CONTENTS: the routing
+    objects are passed through ``@flashinfer_api``-logged calls, and a default
+    repr of a CUDA tensor is a device-to-host copy (illegal under CUDA-graph
+    capture, and a sync on the hot path)."""
+
+    parts = []
+    for field in dataclasses.fields(obj):
+        value = getattr(obj, field.name)
+        if isinstance(value, torch.Tensor):
+            value = f"Tensor{tuple(value.shape)}[{value.dtype}, {value.device}]"
+        parts.append(f"{field.name}={value!r}")
+    return f"{type(obj).__name__}({', '.join(parts)})"
+
+
+@dataclasses.dataclass(repr=False, eq=False)
+class StatsContext:
+    """Carries ``local_stats`` state across the caller's AllGather to
+    ``finalize_stats``.  ``q_amax`` (protocol 2 only) is this rank's local
+    grouped Q amax; ``finalize_stats`` max-merges its boundary slots in
+    place, so the context is single-use."""
+
+    stats_protocol: int
+    rank: int
+    world_size: int
+    used_sequence: Optional[int]
+    batch_size: int
+    local_sequence: int
+    num_heads: int
+    head_dim: int
+    input_dtype: torch.dtype
+    stats_numel: int
+    q_amax: Optional[torch.Tensor] = None
+    q_desc_shape: Optional[Tuple[int, ...]] = None
+    k_minmax_shape: Optional[Tuple[int, ...]] = None
+
+    __repr__ = _fields_repr
+
+
+@dataclasses.dataclass(repr=False, eq=False)
+class V2GStats:
+    """Finalized global statistics, ready for :func:`quant_and_pack`.  Under
+    protocol 3 the per-group scales are computed inside the fused pack
+    kernels, so ``q_amax_final``/``k_amax_final`` are ``None``."""
+
+    stats_protocol: int
+    rank: int
+    world_size: int
+    used_sequence: Optional[int]
+    k_mean_global: torch.Tensor
+    v_scale_global: torch.Tensor
+    q_amax_final: Optional[torch.Tensor] = None
+    k_amax_final: Optional[torch.Tensor] = None
+
+    __repr__ = _fields_repr
+
+
+@flashinfer_api
+def local_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    used_sequence: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, StatsContext]:
+    """Everything the single stats AllGather must carry, protocol-routed.
+
+    Returns a contiguous 1-D fp32 tensor (identical numel on every rank) and
+    the context for :func:`finalize_stats`.  Protocol 3 sends the K
+    per-channel sum and V per-channel amax; protocol 2 additionally sends the
+    Q boundary descriptors and the per-channel raw-K min/max of this rank's
+    two K boundary slices (min/max over LIVE rows only when
+    ``used_sequence`` is given: a zero padding row would contribute
+    min=0/max=0, and |0 - mean| would re-create the tail-group scale
+    pollution at the derive)."""
+
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
+    _validate_nhd_input("k", k)
+    _validate_nhd_input("v", v)
+    if (
+        q.shape != k.shape
+        or q.shape != v.shape
+        or q.dtype != k.dtype
+        or q.dtype != v.dtype
+    ):
+        raise ValueError("q, k, and v must have identical shape and dtype")
+    world_size = _world_size(world_size)
+    rank = _rank(rank, world_size)
+    protocol = stats_protocol_for(local_sequence, world_size)
+    global_sequence = local_sequence * world_size
+    if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
+        raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+
+    k_sum, v_amax = k_sum_v_amax(k, v, enable_pdl=enable_pdl)
+    ctx = StatsContext(
+        stats_protocol=protocol,
+        rank=rank,
+        world_size=world_size,
+        used_sequence=int(used_sequence) if used_sequence is not None else None,
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        input_dtype=q.dtype,
+        stats_numel=k_sum.numel(),
+    )
+    if protocol == ALIGNED:
+        send = torch.cat([k_sum.flatten(), v_amax.flatten()]).contiguous()
+        return send, ctx
+
+    q_amax = q_grouped_amax(q, rank=rank, world_size=world_size, enable_pdl=enable_pdl)
+    q_desc = boundary_descriptors(
+        q_amax,
+        rank=rank,
+        local_sequence=local_sequence,
+        group=Q_GROUP,
+        world_size=world_size,
+    )
+    k_minmax = k_boundary_minmax(
+        k, rank=rank, world_size=world_size, used_sequence=used_sequence
+    )
+    ctx.q_amax = q_amax
+    ctx.q_desc_shape = tuple(q_desc.shape)
+    ctx.k_minmax_shape = tuple(k_minmax.shape)
+    send = torch.cat(
+        [k_sum.flatten(), v_amax.flatten(), q_desc.flatten(), k_minmax.flatten()]
+    ).contiguous()
+    return send, ctx
+
+
+@flashinfer_api
+def finalize_stats(
+    gathered: torch.Tensor,
+    ctx: StatsContext,
+    k: torch.Tensor,
+    *,
+    enable_pdl: Optional[bool] = None,
+) -> V2GStats:
+    """Turn the gathered statistics into final quantization inputs.
+
+    ``gathered`` is the AllGather of ``local_stats`` sends, rank-major
+    (``[world_size * N]`` or ``[world_size, N]`` fp32); ``k`` is the same
+    local K shard passed to ``local_stats`` (protocol 2 computes its grouped
+    amax here, after the global mean exists).  The K mean divides by the
+    LIVE row count (``used_sequence``): tail padding contributes exactly 0
+    to the gathered sum, so dividing by the padded length would bias the
+    mean toward zero; with no padding the two are equal.  Reductions run in
+    fixed rank-major layout (``sum(dim=0)`` / ``amax(dim=0)``), so results
+    are bit-identical on every rank."""
+
+    if not isinstance(ctx, StatsContext):
+        raise TypeError("ctx must be the StatsContext returned by local_stats")
+    batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+    if (batch, local_sequence, num_heads, head_dim) != (
+        ctx.batch_size,
+        ctx.local_sequence,
+        ctx.num_heads,
+        ctx.head_dim,
+    ) or k.dtype != ctx.input_dtype:
+        raise ValueError("k must be the same shard local_stats saw")
+    if not isinstance(gathered, torch.Tensor) or gathered.dtype != torch.float32:
+        raise TypeError("gathered must be the fp32 AllGather of local_stats sends")
+    per_rank = ctx.stats_numel * 2
+    if ctx.stats_protocol == BOUNDARY_MERGE:
+        per_rank += int(math.prod(ctx.q_desc_shape)) + int(
+            math.prod(ctx.k_minmax_shape)
+        )
+    if gathered.numel() != ctx.world_size * per_rank:
+        raise ValueError(
+            f"gathered has {gathered.numel()} elements, expected "
+            f"{ctx.world_size} x {per_rank}"
+        )
+
+    world_size = ctx.world_size
+    used = ctx.used_sequence
+    denominator = used if used is not None else local_sequence * world_size
+    stat_shape = (batch, num_heads, head_dim)
+    g = gathered.reshape(world_size, per_rank)
+    n_stat = ctx.stats_numel
+    k_mean_global = (
+        (g[:, :n_stat].sum(dim=0).view(stat_shape) / denominator)
+        .to(ctx.input_dtype)
+        .contiguous()
+    )
+    v_scale_global = (
+        g[:, n_stat : 2 * n_stat].amax(dim=0).view(stat_shape) / V_SCALE_MAX
+    ).contiguous()
+    if ctx.stats_protocol == ALIGNED:
+        return V2GStats(
+            stats_protocol=ALIGNED,
+            rank=ctx.rank,
+            world_size=world_size,
+            used_sequence=used,
+            k_mean_global=k_mean_global,
+            v_scale_global=v_scale_global,
+        )
+
+    n_desc = int(math.prod(ctx.q_desc_shape))
+    merge_boundary_amax(
+        ctx.q_amax,
+        g[:, 2 * n_stat : 2 * n_stat + n_desc]
+        .reshape(world_size, *ctx.q_desc_shape)
+        .contiguous(),
+        rank=ctx.rank,
+        local_sequence=local_sequence,
+        group=Q_GROUP,
+        world_size=world_size,
+    )
+    k_amax = k_grouped_amax(
+        k,
+        k_mean_global,
+        rank=ctx.rank,
+        world_size=world_size,
+        used_sequence=used,
+        enable_pdl=enable_pdl,
+    )
+    derive_k_boundary_amax(
+        k_amax,
+        g[:, 2 * n_stat + n_desc :]
+        .reshape(world_size, *ctx.k_minmax_shape)
+        .contiguous(),
+        k_mean_global,
+        rank=ctx.rank,
+        local_sequence=local_sequence,
+        world_size=world_size,
+    )
+    return V2GStats(
+        stats_protocol=BOUNDARY_MERGE,
+        rank=ctx.rank,
+        world_size=world_size,
+        used_sequence=used,
+        k_mean_global=k_mean_global,
+        v_scale_global=v_scale_global,
+        q_amax_final=ctx.q_amax,
+        k_amax_final=k_amax,
+    )
+
+
+@flashinfer_api
+def quant_and_pack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    stats: V2GStats,
+    *,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Protocol-routed quantize-and-pack: the fused amax+quant fast path
+    under protocol 3, the split kernels with the merged/derived final scales
+    under protocol 2.  Byte-identical to each other on shards where both are
+    legal."""
+
+    if not isinstance(stats, V2GStats):
+        raise TypeError("stats must be the V2GStats returned by finalize_stats")
+    if stats.stats_protocol == ALIGNED:
+        return quant_qkv_pack_fused(
+            q,
+            k,
+            v,
+            stats.k_mean_global,
+            stats.v_scale_global,
+            rank=stats.rank,
+            world_size=stats.world_size,
+            used_sequence=stats.used_sequence,
+            out=out,
+            enable_pdl=enable_pdl,
+        )
+    return quant_qkv_pack(
+        q,
+        k,
+        v,
+        stats.k_mean_global,
+        stats.q_amax_final,
+        stats.k_amax_final,
+        stats.v_scale_global,
+        rank=stats.rank,
+        world_size=stats.world_size,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
+
+
+class UlyssesLowpSageLayout:
+    """Quantization layout for low-precision Ulysses A2A targeting SageAttention2.
+
+    Groups the layout constants (Q_GROUP / K_GROUP / HEAD_DIM) and all
+    compute operations (stats, pack, unpack) into a single replaceable unit.
+    The class is stateless: instantiate once and share across requests.
+
+    This is the SM89 / SM120 HMMA warp-level layout::
+
+        Q_GROUP = 32   # 2 × HMMA M=16 tile
+        K_GROUP = 64   # 4 × HMMA M=16 tile
+        HEAD_DIM = 128
+
+    A future SM90 WGMMA variant (Q_GROUP=16, K_GROUP=128) would be a separate
+    subclass; the orchestration layer accepts any ``UlyssesLowpSageLayout``
+    instance without modification.
+    """
+
+    Q_GROUP: int = Q_GROUP
+    K_GROUP: int = K_GROUP
+    HEAD_DIM: int = HEAD_DIM
+    V_SCALE_MAX: float = V_SCALE_MAX
+    KSUM_CHUNK_TOKENS: int = KSUM_CHUNK_TOKENS
+    SUPPORTED_STATS_PROTOCOLS = SUPPORTED_STATS_PROTOCOLS
+
+    # ── capability ──────────────────────────────────────────────────────────
+
+    def is_supported(
+        self,
+        device: Optional[Union[int, str, torch.device]] = None,
+    ) -> bool:
+        """Return True when the compiled kernel matches this layout and the
+        device is supported (SM120 for this layout)."""
+        return bool(capability(device=device).get("supported"))
+
+    # ── payload geometry ────────────────────────────────────────────────────
+
+    def payload_spec(
+        self,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        num_heads: int,
+        world_size: int,
+    ) -> Dict[str, Union[int, float]]:
+        """Byte layout of one destination chunk. Delegates to module-level
+        :func:`payload_spec`."""
+        return payload_spec(
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            num_heads=num_heads,
+            head_dim=self.HEAD_DIM,
+            world_size=world_size,
+        )
+
+    # ── protocol routing ────────────────────────────────────────────────────
+
+    def stats_protocol_for(self, local_sequence: int, world_size: int) -> str:
+        """Return :data:`ALIGNED` or :data:`BOUNDARY_MERGE` for this shard."""
+        return stats_protocol_for(local_sequence, world_size)
+
+    def required_alignment(self, world_size: int, stats_protocol: str) -> int:
+        """Recommended global-sequence padding multiple."""
+        return required_alignment(world_size, stats_protocol)
+
+    def aligned_length(
+        self, n_tokens: int, world_size: int, stats_protocol: str
+    ) -> int:
+        """Round ``n_tokens`` up to the recommended alignment."""
+        return aligned_length(n_tokens, world_size, stats_protocol)
+
+    # ── stats flow ──────────────────────────────────────────────────────────
+
+    def local_stats(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rank: int,
+        world_size: int,
+        used_sequence: Optional[int] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, StatsContext]":
+        """Local statistics for the AllGather. Delegates to :func:`local_stats`."""
+        return local_stats(
+            q, k, v,
+            rank=rank,
+            world_size=world_size,
+            used_sequence=used_sequence,
+            enable_pdl=enable_pdl,
+        )
+
+    def finalize_stats(
+        self,
+        gathered: torch.Tensor,
+        ctx: "StatsContext",
+        k: torch.Tensor,
+        *,
+        enable_pdl: Optional[bool] = None,
+    ) -> "V2GStats":
+        """Turn gathered statistics into final quantization inputs."""
+        return finalize_stats(gathered, ctx, k, enable_pdl=enable_pdl)
+
+    # ── pack / unpack ────────────────────────────────────────────────────────
+
+    def quant_and_pack(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        stats: "V2GStats",
+        *,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Protocol-routed quantize-and-pack. Delegates to :func:`quant_and_pack`."""
+        return quant_and_pack(q, k, v, stats, out=out, enable_pdl=enable_pdl)
+
+    def unpack_for_sage(
+        self,
+        recv_u8: torch.Tensor,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        local_heads: int,
+        world_size: int,
+        aligned: Optional[bool] = True,
+        scale_sequence: Optional[int] = None,
+        out: Optional[
+            "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]"
+        ] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Unpack received payload into SageAttention2 pre-quantized operands."""
+        return unpack_for_sage(
+            recv_u8,
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            local_heads=local_heads,
+            head_dim=self.HEAD_DIM,
+            world_size=world_size,
+            aligned=aligned,
+            scale_sequence=scale_sequence,
+            out=out,
+            enable_pdl=enable_pdl,
+        )
+
+
+@flashinfer_api
+def verify_duplicate_scale_slots(
+    recv_u8: torch.Tensor,
+    *,
+    batch_size: int,
+    local_sequence: int,
+    local_heads: int,
+    head_dim: int,
+    world_size: int,
+) -> bool:
+    """Debug/test-only check: every cross-boundary scale slot is bit-identical
+    on all sources that carry it.  Runs as a read-only pass after the A2A, so
+    there is no concurrent-writer hazard.  Never call on the hot path.
+    """
+
+    spec = payload_spec(
+        batch_size=batch_size,
+        local_sequence=local_sequence,
+        num_heads=local_heads * world_size,
+        head_dim=head_dim,
+        world_size=world_size,
+    )
+    chunks = recv_u8.view(world_size, -1)
+    for group, offset_key, slots_key in (
+        (Q_GROUP, "q_scale_offset", "q_slots_per_source"),
+        (K_GROUP, "k_scale_offset", "k_slots_per_source"),
+    ):
+        offset = int(spec[offset_key])
+        slot_count = int(spec[slots_key])
+        count = batch_size * local_heads * slot_count
+        views = [
+            chunks[src, offset : offset + count * 4]
+            .view(torch.float32)
+            .view(batch_size, local_heads, slot_count)
+            for src in range(world_size)
+        ]
+        total_groups = (world_size * local_sequence + group - 1) // group
+        for g in range(total_groups):
+            holders = [
+                src
+                for src in range(world_size)
+                if group_first(src, local_sequence, group)
+                <= g
+                <= group_last(src, local_sequence, group)
+            ]
+            if len(holders) < 2:
+                continue
+            reference = None
+            for src in holders:
+                slot = g - group_first(src, local_sequence, group)
+                value = views[src][..., slot]
+                if reference is None:
+                    reference = value
+                elif not torch.equal(reference, value):
+                    return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Canonical FP8 V bytes (shared helper, outside the packed payload)
+# ---------------------------------------------------------------------------
+
+
+@flashinfer_api
+def quant_v_fp8_with_scale(
+    v: torch.Tensor,
+    v_scale_global: torch.Tensor,
+    scale_max: float = V_SCALE_MAX,
+    *,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """Quantize canonical NHD V to canonical E4M3 bit patterns.
+
+    Args:
+        v: Contiguous ``[B, S, H, 128]`` BF16/FP16 CUDA tensor.
+        v_scale_global: Contiguous ``[B, H, 128]`` FP32 global per-channel
+            divisor. The payload contract requires it to be produced as
+            ``global_amax / 2.25`` from BF16/FP16 V values; this preserves
+            pinned Sage FP8 bits.
+        scale_max: Format guard. Only ``2.25`` is supported.
+
+    Returns:
+        A contiguous ``[B, S, H, 128]`` uint8 tensor containing raw
+        ``torch.float8_e4m3fn`` bit patterns.
+    """
+
+    _require_tensor("v", v)
+    _require_tensor("v_scale_global", v_scale_global)
+    if not v.is_cuda or not v_scale_global.is_cuda:
+        raise ValueError("v and v_scale_global must be CUDA tensors")
+    if v.device != v_scale_global.device:
+        raise ValueError("v and v_scale_global must be on the same CUDA device")
+    if v.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("v must have dtype torch.bfloat16 or torch.float16")
+    if v_scale_global.dtype != torch.float32:
+        raise TypeError("v_scale_global must have dtype torch.float32")
+    if v.ndim != 4:
+        raise ValueError("v must have shape [B, S, H, D]")
+    if v_scale_global.ndim != 3:
+        raise ValueError("v_scale_global must have shape [B, H, D]")
+    if not v.is_contiguous() or not v_scale_global.is_contiguous():
+        raise ValueError("v and v_scale_global must be contiguous")
+
+    batch, sequence, heads, head_dim = v.shape
+    if batch <= 0 or sequence <= 0 or heads <= 0:
+        raise ValueError("B, S, and H must all be non-zero")
+    if head_dim != HEAD_DIM:
+        raise ValueError(
+            f"quant_v_fp8_with_scale requires D={HEAD_DIM}, got D={head_dim}"
+        )
+    if tuple(v_scale_global.shape) != (batch, heads, head_dim):
+        raise ValueError(
+            "v_scale_global must have shape "
+            f"{(batch, heads, head_dim)}, got {tuple(v_scale_global.shape)}"
+        )
+    if isinstance(scale_max, bool) or not isinstance(scale_max, (int, float)):
+        raise TypeError("scale_max must be a finite real number")
+    scale_max = float(scale_max)
+    if not math.isfinite(scale_max) or scale_max != V_SCALE_MAX:
+        raise ValueError(f"quant_v_fp8_with_scale requires scale_max={V_SCALE_MAX}")
+
+    _require_sm120(v)
+    output = torch.empty_like(
+        v, dtype=torch.uint8, memory_format=torch.contiguous_format
+    )
+    get_ulysses_lowp_module().ulysses_lowp_quant_v_fp8_with_scale(
+        v, v_scale_global, output, _resolve_pdl(enable_pdl, v)
+    )
+    return output
+
+
+__all__ = [
+    "UlyssesLowpSageLayout",
+    "HEAD_DIM",
+    "KSUM_CHUNK_TOKENS",
+    "K_GROUP",
+    "Q_GROUP",
+    "ALIGNED",
+    "BOUNDARY_MERGE",
+    "StatsContext",
+    "V2GStats",
+    "V_SCALE_MAX",
+    "aligned_length",
+    "capability",
+    "gen_ulysses_lowp_module",
+    "get_ulysses_lowp_module",
+    "group_first",
+    "group_last",
+    "k_grouped_amax",
+    "k_sum_v_amax",
+    "owner",
+    "payload_spec",
+    "q_grouped_amax",
+    "boundary_descriptors",
+    "derive_k_boundary_amax",
+    "finalize_stats",
+    "k_boundary_minmax",
+    "local_stats",
+    "merge_boundary_amax",
+    "SUPPORTED_STATS_PROTOCOLS",
+    "quant_and_pack",
+    "quant_kv_into_payload",
+    "quant_kv_into_payload_fused",
+    "quant_q_into_payload",
+    "quant_q_into_payload_fused",
+    "quant_qkv_pack",
+    "quant_qkv_pack_fused",
+    "quant_v_fp8_with_scale",
+    "required_alignment",
+    "scale_widths",
+    "slots",
+    "stats_protocol_for",
+    "touched",
+    "unpack_for_sage",
+    "verify_duplicate_scale_slots",
+    "zero_scale_and_padding",
+]

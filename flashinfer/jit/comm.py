@@ -280,6 +280,23 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
+def gen_ulysses_lowp_module() -> JitSpec:
+    # Byte-parity contract: the golden reference (SageAttention fork) compiles
+    # with --use_fast_math (the gen_jit_spec default, do NOT override) and
+    # targets sm_120a.  The explicit 120a gencode matters: the default
+    # compilation context normalizes SM 12.0 to compute_120f, whose FMA
+    # semantics can drift from the anchored sm_120a golden by ULPs.
+    from .core import sm120a_nvcc_flags
+
+    return gen_jit_spec(
+        "ulysses_lowp",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
+        ],
+        extra_cuda_cflags=sm120a_nvcc_flags,
+    )
+
+
 def gen_moe_alltoall_module() -> JitSpec:
     return gen_jit_spec(
         "mnnvl_moe_alltoall",
