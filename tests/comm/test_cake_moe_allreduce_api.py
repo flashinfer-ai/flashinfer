@@ -53,9 +53,7 @@ def _reduction_args() -> dict:
         "rms_eps": 1e-6,
         "scale_factor": 1.0,
         "moe_reduction_device_num_experts": experts,
-        "moe_reduction_scale_input": torch.ones(
-            experts * tokens, dtype=torch.float32
-        ),
+        "moe_reduction_scale_input": torch.ones(experts * tokens, dtype=torch.float32),
         "moe_reduction_active_experts_token_input": torch.zeros(
             experts * tokens * hidden, dtype=dtype
         ),
@@ -76,9 +74,7 @@ def test_public_api_has_exact_22_parameter_contract() -> None:
     assert len(parameters) == 22
     assert parameters["backend"].kind == inspect.Parameter.KEYWORD_ONLY
     assert parameters["backend"].default == "trtllm"
-    assert (
-        comm.trtllm_moe_allreduce_fusion is trtllm_ar.trtllm_moe_allreduce_fusion
-    )
+    assert comm.trtllm_moe_allreduce_fusion is trtllm_ar.trtllm_moe_allreduce_fusion
 
 
 def test_default_backend_keeps_trtllm_dispatch(
@@ -95,9 +91,7 @@ def test_default_backend_keeps_trtllm_dispatch(
 
     assert len(calls) == 1
     assert calls[0]["world_size"] == args["world_size"]
-    assert calls[0]["moe_reduction_token_input"] is args[
-        "moe_reduction_token_input"
-    ]
+    assert calls[0]["moe_reduction_token_input"] is args["moe_reduction_token_input"]
 
 
 def test_cake_backend_dispatches_exact_18_argument_ffi_contract(
@@ -105,9 +99,7 @@ def test_cake_backend_dispatches_exact_18_argument_ffi_contract(
 ) -> None:
     calls = []
     module = SimpleNamespace(run_reduction=lambda *args: calls.append(args))
-    monkeypatch.setattr(
-        trtllm_ar, "_validate_cake_moe_allreduce", lambda **kwargs: 3
-    )
+    monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_allreduce", lambda **kwargs: 3)
     monkeypatch.setattr(
         trtllm_ar, "get_cake_moe_allreduce_module", lambda device_index: module
     )
@@ -222,6 +214,4 @@ def test_invalid_backend_fails_before_module_load(
     )
 
     with pytest.raises(ValueError, match="unsupported MoE all-reduce backend"):
-        trtllm_ar.trtllm_moe_allreduce_fusion(
-            **_reduction_args(), backend="unknown"
-        )
+        trtllm_ar.trtllm_moe_allreduce_fusion(**_reduction_args(), backend="unknown")

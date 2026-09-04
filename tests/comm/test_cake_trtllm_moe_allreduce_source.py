@@ -83,9 +83,7 @@ def test_host_exposes_only_reduction_and_has_exact_18_parameter_ffi() -> None:
             signature.group(1),
         )
     )
-    exported_functions = re.findall(
-        r"TVM_FFI_DLL_EXPORT_TYPED_FUNC\((\w+)", source
-    )
+    exported_functions = re.findall(r"TVM_FFI_DLL_EXPORT_TYPED_FUNC\((\w+)", source)
 
     assert parameter_names == _FFI_PARAMETER_NAMES
     assert len(parameter_names) == 18

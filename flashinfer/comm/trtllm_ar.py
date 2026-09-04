@@ -1238,8 +1238,7 @@ def _validate_cake_moe_allreduce(
         raise ValueError("Cake MoE all-reduce requires at least 1 token")
     if hidden_dim != _CAKE_MOE_ALLREDUCE_HIDDEN_DIM:
         raise ValueError(
-            "Cake MoE all-reduce requires "
-            f"hidden_dim={_CAKE_MOE_ALLREDUCE_HIDDEN_DIM}"
+            f"Cake MoE all-reduce requires hidden_dim={_CAKE_MOE_ALLREDUCE_HIDDEN_DIM}"
         )
 
     device = moe_reduction_active_experts_token_input.device

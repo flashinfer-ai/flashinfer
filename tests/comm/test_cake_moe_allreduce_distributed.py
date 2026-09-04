@@ -418,6 +418,7 @@ def _reduction_worker(
         if dist.is_initialized():
             dist.destroy_process_group(group=group)
 
+
 def _run_distributed(
     world_size: int,
     dtype: torch.dtype,
@@ -431,9 +432,7 @@ def _run_distributed(
         if torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3))
     ]
     if unsupported:
-        pytest.skip(
-            f"Cake MoE all-reduce requires SM100/SM103 devices: {unsupported=}"
-        )
+        pytest.skip(f"Cake MoE all-reduce requires SM100/SM103 devices: {unsupported=}")
 
     context = mp.get_context("spawn")
     distributed_init_port = _get_open_port()

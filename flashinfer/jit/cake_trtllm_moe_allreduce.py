@@ -289,8 +289,7 @@ def _reject_duplicate_manifest_keys(
     for key, value in pairs:
         if key in decoded:
             raise RuntimeError(
-                "Cake TRT-LLM MoE all-reduce manifest contains duplicate key "
-                f"{key!r}"
+                f"Cake TRT-LLM MoE all-reduce manifest contains duplicate key {key!r}"
             )
         decoded[key] = value
     return decoded
@@ -375,9 +374,7 @@ def load(device_index: int) -> Any:
     build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
     build_dir.mkdir(parents=True, exist_ok=True)
     cubin_path = build_dir / "cake_trtllm_moe_allreduce.cubin"
-    with FileLock(
-        build_dir / "cake_trtllm_moe_allreduce.lock", thread_local=False
-    ):
+    with FileLock(build_dir / "cake_trtllm_moe_allreduce.lock", thread_local=False):
         if not cubin_path.is_file():
             temporary = build_dir / f"cake_trtllm_moe_allreduce.{os.getpid()}.tmp.cubin"
             command = [
