@@ -289,6 +289,125 @@ def test_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
         ]
 
 
+def _sample_freq_single_row(sample_fn, row_probs, num_trials):
+    """Draw ``num_trials`` samples from a single probability row and return frequencies.
+
+    Uses the ``indices`` mechanism so every output samples from the same row but with
+    independent randomness (one block per output), mirroring ``test_sampling_freq``.
+    """
+    vocab_size = row_probs.numel()
+    probs = row_probs.view(1, vocab_size).contiguous()
+    indices = torch.zeros(num_trials, dtype=torch.int32, device=probs.device)
+    samples = sample_fn(probs, indices)
+    counter = torch.zeros(vocab_size, dtype=torch.int64, device=probs.device)
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples, dtype=torch.int64))
+    return counter, counter.float() / num_trials
+
+
+def test_midpoint_low_does_not_apply_index_tie_break():
+    """A midpoint lower bound is value-only, unlike a sampled-pivot lower bound.
+
+    In the dual-pivot rejection loop, case 3 sets ``low = pivot_1`` where
+    ``pivot_1 = (pivot_0 + high) / 2``.  That midpoint is not tied to the previously sampled
+    token, so tokens exactly equal to it must remain excluded by the next predicate.  Only
+    case 2, which sets ``low = pivot_0`` from an actual sampled token, may carry an index
+    tie-break.
+    """
+
+    def accepted_indices(row_probs, low, low_tie_break_id):
+        return [
+            idx
+            for idx, prob in enumerate(row_probs)
+            if prob > low
+            or (low_tie_break_id >= 0 and prob == low and idx > low_tie_break_id)
+        ]
+
+    row_probs = [0.4, 0.1, 0.25, 0.25]
+
+    # Model case 3: sampled_id=1 gave pivot_0=0.1 and high=0.4, so pivot_1=0.25.
+    # Since low is a midpoint, both 0.25 tokens must stay excluded.
+    assert accepted_indices(row_probs, low=0.25, low_tie_break_id=-1) == [0]
+
+    # Model case 2 with a real sampled-pivot lower bound. Here the index tie-break is valid.
+    assert accepted_indices(row_probs, low=0.1, low_tie_break_id=1) == [0, 2, 3]
+
+
+def test_top_k_sampling_boundary_tie():
+    """Tokens tied with the k-th token but outside top-k must not be over-accepted.
+
+    Distribution [0.4, 0.3, 0.3, 0.0] with k=2 has a tie at the boundary: tokens 1 and 2
+    both have probability 0.3 == p_min. The buggy value-only acceptance accepts all three of
+    {0, 1, 2}; the index tie-break must keep exactly 2 tokens and renormalize over mass 0.7.
+    """
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.4, 0.3, 0.3, 0.0], dtype=torch.float32, device="cuda:0")
+    k = 2
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, indices=indices
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    # Zero-probability token is never sampled.
+    assert counter[3].item() == 0
+    # Exactly k distinct tokens are accepted (no over-acceptance of the tied token).
+    assert int((counter > 0).sum().item()) == k
+    # The highest-probability token is always present, and the normalizer covers exactly the
+    # top-k mass (0.4 + 0.3 = 0.7), so its frequency is 0.4 / 0.7 rather than the buggy 0.4.
+    assert abs(freq[0].item() - 0.4 / 0.7) < 0.02, freq
+    # The single surviving tied token carries the remaining 0.3 / 0.7 mass.
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.3 / 0.7) < 0.02, freq
+
+
+def test_top_p_sampling_boundary_tie():
+    """Tokens tied at the top-p truncation boundary must not be over-accepted."""
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float32, device="cuda:0")
+    p = 0.7
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_p_sampling_from_probs(
+            probs, p, indices=indices
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    # Exactly 2 tokens survive: {0.5, one of the tied 0.25}; normalizer is 0.75.
+    assert int((counter > 0).sum().item()) == 2
+    assert abs(freq[0].item() - 0.5 / 0.75) < 0.02, freq
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.25 / 0.75) < 0.02, freq
+
+
+def test_top_k_top_p_sampling_boundary_tie():
+    """Joint top-k/top-p must also resolve boundary ties via the index tie-break."""
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.4, 0.3, 0.3, 0.0], dtype=torch.float32, device="cuda:0")
+    k, p = 2, 0.99
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, p, indices=indices, filter_apply_order="joint"
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    assert counter[3].item() == 0
+    assert int((counter > 0).sum().item()) == k
+    assert abs(freq[0].item() - 0.4 / 0.7) < 0.02, freq
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.3 / 0.7) < 0.02, freq
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
