@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -326,7 +327,10 @@ def test_generated_selector_falls_back_for_unaligned_state(monkeypatch):
 
 @pytest.mark.parametrize(
     ("lower_bound", "expected_tail"),
-    [(None, (0, 0.0, 1e-5)), (-5.0, (1, -5.0, 1e-5))],
+    [
+        (None, (0, 0.0, 1e-5)),
+        (-5.0, (1, -5.0 * math.log2(math.e), 1e-5)),
+    ],
 )
 def test_generated_launch_uses_public_scalar_semantics(
     monkeypatch, lower_bound, expected_tail
