@@ -15,7 +15,8 @@ class Sm100_Bf16_Cutedsl_MegaMoeConfigBase:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
+    # Enables in_kernel_fc2_reduce
+    enable_in_kernel_fc2_reduce: bool = False
     # "auto" runs the collective tuner over the current single supported
     # geometry, preserving the autotune contract as more geometries arrive.
     knobs: dict | str | None = None

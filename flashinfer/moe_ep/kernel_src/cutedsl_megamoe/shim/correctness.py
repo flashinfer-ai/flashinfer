@@ -65,6 +65,7 @@ def _config_from_args(
         flag_batch=args.flag_batch,
         epi_flag_batch=_parse_tuple(args.epi_flag_batch),  # type: ignore[arg-type]
         non_ubulk_fc2_store=not args.use_bulk_fc2_store,
+        enable_in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
         token_back_mode=args.token_back_mode,
         combine_dtype=args.combine_dtype,

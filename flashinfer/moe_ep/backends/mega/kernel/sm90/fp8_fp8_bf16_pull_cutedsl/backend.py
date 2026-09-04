@@ -139,7 +139,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             load_balance_mode=k.load_balance_mode,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
         )
 
@@ -287,6 +287,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.mma_tiler_mnk,
             k.load_balance_mode,
             _resolve_gate_up_clamp(k),
-            k.in_kernel_fc2_reduce,
+            k.enable_in_kernel_fc2_reduce,
             k.token_back_by_dispatch,
         )

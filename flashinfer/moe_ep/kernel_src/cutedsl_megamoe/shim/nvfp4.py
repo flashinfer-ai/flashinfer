@@ -100,6 +100,7 @@ class MegaMoENvfp4Config:
     flag_batch: int = 4
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -162,6 +163,10 @@ class MegaMoENvfp4Config:
                     "token_back_mode='reuse_dispatch_warps'; got "
                     f"{self.token_back_mode!r}."
                 )
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce is selected but enable_in_kernel_fc2_reduce is False"
+            )
         if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
             # Mirrors the kernel ctor check; fail at config build, not compile.
             raise ValueError(
@@ -1006,7 +1011,7 @@ def get_symm_buffer_for_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1066,10 +1071,8 @@ def get_symm_buffer_for_mega_moe(
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
     # knobs= dict overrides both entirely.
-    if knobs is not None:
-        resolved_knobs, knob_source = dict(knobs), "explicit"
-    else:
-        resolved_knobs, knob_source = resolve_knobs(
+    if knobs is None:
+        knobs, _ = resolve_knobs(
             dtype="nvfp4",
             world_size=world_size,
             hidden=hidden,
@@ -1078,13 +1081,10 @@ def get_symm_buffer_for_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
-    if knob_source == "heuristic" and combine_dtype != "bf16":
-        # The measured profiles pick the token-back mode freely, but a
-        # quantized combine wire is only wired for dispatch-warp token-back;
-        # explicit/cached knobs are the caller's/tuner's contract and are left
-        # untouched (the config validation rejects incompatible combos).
-        resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
+    else:
+        knobs = dict(knobs)
 
     cfg = MegaMoENvfp4Config(
         rank=rank,
@@ -1096,7 +1096,7 @@ def get_symm_buffer_for_mega_moe(
         intermediate=intermediate,
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
@@ -1104,13 +1104,13 @@ def get_symm_buffer_for_mega_moe(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
     )
-    cfg = with_knobs(cfg, resolved_knobs)
-    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-        # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
-        # the combine accumulation order nondeterministic); cached/heuristic
-        # perf knobs must not flip it. Explicit knobs dicts already bypassed
-        # resolution above and keep full control.
-        cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+    cfg = with_knobs(cfg, knobs)
+    # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
+    #   despite the entire design of the autotuner being to allow it to disable ikr if it would be faster
+    #   We have enabled varying the knobs here, revisit this if we see unexpected behavior
+    assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
+        "in_kernel_fc2_reduce must be disabled if enable_in_kernel_fc2_reduce is False"
+    )
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1451,6 +1451,7 @@ def create_dummy_inputs(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -1499,6 +1500,7 @@ def create_dummy_inputs(
         world_size,
         gate_up_clamp=clamp,
         combine_dtype=combine_dtype,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,

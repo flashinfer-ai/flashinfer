@@ -44,7 +44,7 @@ class TestSm90PullFp8Config:
         assert cfg.load_balance_mode == "static"
         assert cfg.gate_up_clamp is None
         assert cfg.fast_math is True
-        assert cfg.in_kernel_fc2_reduce is False
+        assert cfg.enable_in_kernel_fc2_reduce is False
         assert cfg.token_back_by_dispatch is False
         assert cfg.fc1_activation_dequant_scale == 1.0
         assert cfg.fc2_activation_dequant_scale == 1.0
