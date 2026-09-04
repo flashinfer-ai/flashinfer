@@ -1780,6 +1780,8 @@ class AutoTuner:
                             )
                         except (torch.cuda.OutOfMemoryError, MemoryError):
                             input_preparation_oom = True
+                            tensors = None
+                            prepared_input_batches = None
 
                         if _sync_oom_across_tune_group(input_preparation_oom):
                             tensors = None
@@ -1824,6 +1826,8 @@ class AutoTuner:
                                     )
                             except (torch.cuda.OutOfMemoryError, MemoryError):
                                 runner_preparation_oom = True
+                                tensors = None
+                                prepared_input_batches = None
 
                             if _sync_oom_across_tune_group(runner_preparation_oom):
                                 tensors = None

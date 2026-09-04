@@ -449,9 +449,11 @@ def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch):
 
 
 @pytest.mark.parametrize("failure_phase", ("input_batches", "runner"))
-def test_choose_one_releases_synthetic_inputs_before_emptying_cache(
+def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
     monkeypatch, failure_phase
 ):
+    """OOM inputs die before flag allocation and CUDA cache cleanup."""
+
     class SyntheticInput:
         pass
 
@@ -484,6 +486,13 @@ def test_choose_one_releases_synthetic_inputs_before_emptying_cache(
         assert synthetic_ref is not None
         assert synthetic_ref() is None
 
+    def sync_oom(local_oom):
+        gc.collect()
+        if local_oom:
+            assert synthetic_ref is not None
+            assert synthetic_ref() is None
+        return local_oom
+
     monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_input_tensors)
     monkeypatch.setattr(
         AutoTuner, "_prepare_input_tensors_with_batches", prepare_batches
@@ -493,6 +502,9 @@ def test_choose_one_releases_synthetic_inputs_before_emptying_cache(
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync_oom
+    )
 
     with autotune(tune_mode=True):
         chosen_runner, tactic = tuner.choose_one(
