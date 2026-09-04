@@ -162,9 +162,15 @@ jobs:
               mapfile -t CHUNKS < <(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140)
             else
+              # This body must NOT contain the bot's own trigger phrase. The job guard
+              # is `contains(comment.body, '@flashinfer-bot')` with no bot-author
+              # exclusion, and this comment is posted with a PAT -- GitHub only
+              # suppresses re-triggering for GITHUB_TOKEN. Quoting the phrase here made
+              # the bot answer itself, re-apply run-ci, and start a second full GPU run
+              # for every rejected scope.
               gh pr comment ${{ github.event.issue.number }} \
                 --repo ${{ github.repository }} \
-                --body "Ignoring the text after \`@flashinfer-bot run\` and running the full suite -- it is not a valid test scope: $(cat /tmp/scope_err)"
+                --body "Ignoring the trailing text on that command; running the full suite instead -- it is not a valid test scope: $(cat /tmp/scope_err)"
             fi
           fi
 
