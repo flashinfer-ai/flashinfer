@@ -4682,7 +4682,7 @@ def _run_generated_single_route(
             # device. All launch setup completes before the copy starts the
             # measured GPU DAG.
             with torch.cuda.device(q.device):
-                if beta_tma_copy_required and checkpoint_every_n_tokens == 0:
+                if beta_tma_copy_required:
                     from .jit.flash_kda import (
                         _load_flash_kda_generated_direct_python_factory,
                     )
