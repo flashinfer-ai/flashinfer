@@ -430,9 +430,10 @@ def main() -> None:
 
         best_fp8 = float("inf")
         best_nv = float("inf")
-        best_fp8_cpb = 0
+        best_fp8_cpb = None
         best_nv_cpb = 0
         for cpb in cpb_values:
+            fp8_cpb = None if cpb == 0 else cpb
 
             def run_fp8() -> None:
                 sparse_mla_sm120_decode_dsv4(
@@ -446,7 +447,7 @@ def main() -> None:
                     sm_scale,
                     topk_length=topk_length,
                     attn_sink=attn_sink,
-                    chunks_per_block=cpb,
+                    chunks_per_block=fp8_cpb,
                     extra_kv_cache=fp8_extra_cache,
                     extra_indices=extra_indices,
                     extra_topk_length=extra_topk_length,
@@ -470,7 +471,7 @@ def main() -> None:
                 f"{speedup_pct:.2f}"
             )
             if fp8_us < best_fp8:
-                best_fp8, best_fp8_cpb = fp8_us, cpb
+                best_fp8, best_fp8_cpb = fp8_us, fp8_cpb
             if inclusive_us < best_nv:
                 best_nv, best_nv_cpb = inclusive_us, cpb
 
@@ -500,7 +501,8 @@ def main() -> None:
         )
         print(
             f"BEST,topk={topk},extra_topk={args.extra_topk},"
-            f"extra_page_size={args.extra_page_size},fp8_cpb={best_fp8_cpb},"
+            f"extra_page_size={args.extra_page_size},"
+            f"fp8_cpb={best_fp8_cpb if best_fp8_cpb is not None else 'auto'},"
             f"nvfp4_cpb={best_nv_cpb},"
             f"fp8_us={best_fp8:.3f},nvfp4_us={best_nv:.3f},"
             f"speedup_pct={(best_fp8 / best_nv - 1.0) * 100.0:.2f},"

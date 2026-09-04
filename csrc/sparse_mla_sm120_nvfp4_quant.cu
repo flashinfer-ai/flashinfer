@@ -113,12 +113,15 @@ __global__ void QuantizeAppendKernel(const T* input, const IdType* slot_mapping,
 namespace {
 
 void check_input(const TensorView& input, int expected_tokens) {
+  constexpr size_t VECTOR_ALIGNMENT = alignof(uint4);
   TVM_FFI_ICHECK(input.ndim() == 2 || input.ndim() == 3 || input.ndim() == 4)
       << "latent_kv must be 2D, 3D, or 4D";
   TVM_FFI_ICHECK_EQ(input.size(input.ndim() - 1), kDLatent)
       << "latent_kv last dimension must be " << kDLatent;
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16) << "DeepSeek-V4 latent_kv must have dtype bfloat16";
   TVM_FFI_ICHECK(input.IsContiguous()) << "latent_kv must be contiguous";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(input.data_ptr()) % VECTOR_ALIGNMENT, 0)
+      << "latent_kv base pointer must be " << VECTOR_ALIGNMENT << "-byte aligned";
 
   int64_t num_tokens = 1;
   for (int i = 0; i + 1 < input.ndim(); ++i) num_tokens *= input.size(i);

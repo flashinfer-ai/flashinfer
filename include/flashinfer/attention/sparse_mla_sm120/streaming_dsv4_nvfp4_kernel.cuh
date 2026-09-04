@@ -479,18 +479,21 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     float local_sum[STREAMING_HEAD_GROUPS][2];
     float p[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4];
     float block_max_value[STREAMING_HEAD_GROUPS][2];
+    const int c0 = warp_first_cand + tid * 2;
+    const int c1 = c0 + 1;
+    const int abs_c0 = chunk_start + c0;
+    const int abs_c1 = chunk_start + c1;
+    const int idx0 = abs_c0 < section_len ? section_indices[abs_c0] : -1;
+    const int idx1 = abs_c1 < section_len ? section_indices[abs_c1] : -1;
+    const bool valid_c0 = abs_c0 < chunk_end && idx0 >= 0;
+    const bool valid_c1 = abs_c1 < chunk_end && idx1 >= 0;
+    const float qk_scale = sm_scale * LOG2E;
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-      const int c0 = warp_first_cand + tid * 2;
-      const int c1 = c0 + 1;
-      const int abs_c0 = chunk_start + c0;
-      const int abs_c1 = chunk_start + c1;
-      const int idx0 = abs_c0 < section_len ? section_indices[abs_c0] : -1;
-      const int idx1 = abs_c1 < section_len ? section_indices[abs_c1] : -1;
-      if (abs_c0 >= chunk_end || idx0 < 0) qk[group][0][0] = qk[group][0][2] = -1e30f;
-      if (abs_c1 >= chunk_end || idx1 < 0) qk[group][0][1] = qk[group][0][3] = -1e30f;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) qk[group][0][i] *= sm_scale * LOG2E;
+      qk[group][0][0] = valid_c0 ? qk[group][0][0] * qk_scale : -1e30f;
+      qk[group][0][2] = valid_c0 ? qk[group][0][2] * qk_scale : -1e30f;
+      qk[group][0][1] = valid_c1 ? qk[group][0][1] * qk_scale : -1e30f;
+      qk[group][0][3] = valid_c1 ? qk[group][0][3] * qk_scale : -1e30f;
 
       local_max[group][0] = fmaxf(qk[group][0][0], qk[group][0][1]);
       local_max[group][1] = fmaxf(qk[group][0][2], qk[group][0][3]);
@@ -501,10 +504,10 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         local_max[group][1] =
             fmaxf(local_max[group][1], __shfl_xor_sync(0xffffffff, local_max[group][1], s));
       }
-      p[group][0][0] = exp2f(qk[group][0][0] - local_max[group][0]);
-      p[group][0][1] = exp2f(qk[group][0][1] - local_max[group][0]);
-      p[group][0][2] = exp2f(qk[group][0][2] - local_max[group][1]);
-      p[group][0][3] = exp2f(qk[group][0][3] - local_max[group][1]);
+      p[group][0][0] = valid_c0 ? exp2f(qk[group][0][0] - local_max[group][0]) : 0.f;
+      p[group][0][1] = valid_c1 ? exp2f(qk[group][0][1] - local_max[group][0]) : 0.f;
+      p[group][0][2] = valid_c0 ? exp2f(qk[group][0][2] - local_max[group][1]) : 0.f;
+      p[group][0][3] = valid_c1 ? exp2f(qk[group][0][3] - local_max[group][1]) : 0.f;
       local_sum[group][0] = p[group][0][0] + p[group][0][1];
       local_sum[group][1] = p[group][0][2] + p[group][0][3];
 #pragma unroll

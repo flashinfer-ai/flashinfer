@@ -403,6 +403,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       }
     }
 
+    bool valid_candidate[DECODE_QK_N_TILES][2];
 #pragma unroll
     for (int nt = 0; nt < DECODE_QK_N_TILES; ++nt) {
       const int c0 = warp_first_cand + nt * 8 + tid * 2;
@@ -411,10 +412,13 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       const int abs_c1 = chunk_start + c1;
       const int idx0 = abs_c0 < section_len ? section_indices[abs_c0] : -1;
       const int idx1 = abs_c1 < section_len ? section_indices[abs_c1] : -1;
-      if (abs_c0 >= chunk_end || idx0 < 0) qk[nt][0] = qk[nt][2] = -1e30f;
-      if (abs_c1 >= chunk_end || idx1 < 0) qk[nt][1] = qk[nt][3] = -1e30f;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) qk[nt][i] *= sm_scale * LOG2E;
+      valid_candidate[nt][0] = abs_c0 < chunk_end && idx0 >= 0;
+      valid_candidate[nt][1] = abs_c1 < chunk_end && idx1 >= 0;
+      const float qk_scale = sm_scale * LOG2E;
+      qk[nt][0] = valid_candidate[nt][0] ? qk[nt][0] * qk_scale : -1e30f;
+      qk[nt][2] = valid_candidate[nt][0] ? qk[nt][2] * qk_scale : -1e30f;
+      qk[nt][1] = valid_candidate[nt][1] ? qk[nt][1] * qk_scale : -1e30f;
+      qk[nt][3] = valid_candidate[nt][1] ? qk[nt][3] * qk_scale : -1e30f;
     }
 
     float local_max[2] = {-1e30f, -1e30f};
@@ -432,10 +436,10 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     float p[DECODE_QK_N_TILES][4];
 #pragma unroll
     for (int nt = 0; nt < DECODE_QK_N_TILES; ++nt) {
-      p[nt][0] = exp2f(qk[nt][0] - local_max[0]);
-      p[nt][1] = exp2f(qk[nt][1] - local_max[0]);
-      p[nt][2] = exp2f(qk[nt][2] - local_max[1]);
-      p[nt][3] = exp2f(qk[nt][3] - local_max[1]);
+      p[nt][0] = valid_candidate[nt][0] ? exp2f(qk[nt][0] - local_max[0]) : 0.f;
+      p[nt][1] = valid_candidate[nt][1] ? exp2f(qk[nt][1] - local_max[0]) : 0.f;
+      p[nt][2] = valid_candidate[nt][0] ? exp2f(qk[nt][2] - local_max[1]) : 0.f;
+      p[nt][3] = valid_candidate[nt][1] ? exp2f(qk[nt][3] - local_max[1]) : 0.f;
       local_sum[0] += p[nt][0] + p[nt][1];
       local_sum[1] += p[nt][2] + p[nt][3];
     }

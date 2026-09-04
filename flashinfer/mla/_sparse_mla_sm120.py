@@ -455,6 +455,23 @@ def _normalize_kv_scale_format(kv_scale_format: str) -> str:
     return fmt
 
 
+def _normalize_nvfp4_indices(indices: torch.Tensor, name: str) -> torch.Tensor:
+    """Flatten the singleton query axis accepted by the shared FP8 API."""
+    if indices.ndim == 3:
+        if indices.shape[1] != 1:
+            raise ValueError(
+                f"NVFP4 {name} must have shape [T, 1, topk] when 3-D, got "
+                f"{tuple(indices.shape)}"
+            )
+        indices = indices.squeeze(1)
+    if indices.ndim != 2:
+        raise ValueError(
+            f"NVFP4 {name} must have shape [T, topk] or [T, 1, topk], got "
+            f"{tuple(indices.shape)}"
+        )
+    return indices
+
+
 def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
     fmt = _normalize_kv_scale_format(kv_scale_format)
     if d_qk == 576:
@@ -1228,6 +1245,9 @@ class _SparseMLAPagedAttentionRunner:
         {64, 128}) and is a no-op distinction for DSV4, where only the
         non-swapAB path exists. NVFP4 accepts ``None``, ``"auto"``, or
         ``"mg"`` and uses its separately calibrated streaming/split-K planner.
+        NVFP4 also accepts ``indices``/``extra_indices`` as either
+        ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
+        query axis is normalized before planning and launch.
         """
         if q.dim() == 4:
             if q.size(1) != 1:
@@ -1242,6 +1262,10 @@ class _SparseMLAPagedAttentionRunner:
                     f"output.shape={tuple(output.shape)}"
                 )
             output = output.squeeze(1)
+        if self._kv_cache_format == "nvfp4":
+            indices = _normalize_nvfp4_indices(indices, "indices")
+            if extra_indices is not None:
+                extra_indices = _normalize_nvfp4_indices(extra_indices, "extra_indices")
         num_tokens, num_heads, _ = q.shape
         if self._max_num_tokens is not None and num_tokens > self._max_num_tokens:
             raise ValueError(

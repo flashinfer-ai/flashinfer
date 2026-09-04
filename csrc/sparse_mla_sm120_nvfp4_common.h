@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <flashinfer/attention/sparse_mla_sm120/model/nvfp4_cache_traits.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -31,7 +32,14 @@ struct PagedLayout {
 
 inline PagedLayout parse_nvfp4_paged_layout(const TensorView& cache) {
   constexpr int BPT = NVFP4CacheTraits<ModelType::DSV4>::BYTES_PER_TOKEN;
+  constexpr size_t VECTOR_ALIGNMENT = alignof(uint4);
   TVM_FFI_ICHECK_EQ(cache.dtype(), dl_uint8) << "NVFP4 kv_cache must be uint8";
+  TVM_FFI_ICHECK(cache.ndim() == 2 || cache.ndim() == 3 || cache.ndim() == 4)
+      << "kv_cache must be 2D, 3D, HND, or NHD";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(cache.data_ptr()) % VECTOR_ALIGNMENT, 0)
+      << "NVFP4 kv_cache base pointer must be " << VECTOR_ALIGNMENT << "-byte aligned";
+  TVM_FFI_ICHECK_EQ(static_cast<size_t>(cache.stride(0)) % VECTOR_ALIGNMENT, 0)
+      << "NVFP4 kv_cache page stride must be a multiple of " << VECTOR_ALIGNMENT << " bytes";
   if (cache.ndim() == 2) {
     const size_t page_bytes = static_cast<size_t>(cache.size(1));
     TVM_FFI_ICHECK_EQ(page_bytes % BPT, 0);
@@ -42,7 +50,6 @@ inline PagedLayout parse_nvfp4_paged_layout(const TensorView& cache) {
             static_cast<size_t>(cache.stride(0))};
   }
 
-  TVM_FFI_ICHECK(cache.ndim() == 3 || cache.ndim() == 4) << "kv_cache must be 2D, 3D, HND, or NHD";
   TVM_FFI_ICHECK_EQ(cache.size(cache.ndim() - 1), BPT)
       << "NVFP4 cache last dimension must be " << BPT;
   int page_dim;
