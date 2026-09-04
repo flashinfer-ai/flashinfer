@@ -649,18 +649,26 @@ def testTrtllmFp4BlockScaleMoe(args):
         )
 
     # Prepare weights for kernel (packed uint8 format, scale as float8_e4m3fn)
+    # fp4_quantize pads the scale tensor on both dims; the data tensor is unpadded.
+    def _sf_outer(dim):
+        return (dim + 127) // 128 * 128
+
+    def _sf_inner(dim):
+        n = dim // sf_vec_size
+        return (n + 3) // 4 * 4
+
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, 2 * intermediate_size, hidden_size // 2
     )
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+        num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
     )
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )
     gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, hidden_size, intermediate_size // sf_vec_size
+        num_experts, _sf_outer(hidden_size), _sf_inner(intermediate_size)
     )
 
     gemm1_bias = None
