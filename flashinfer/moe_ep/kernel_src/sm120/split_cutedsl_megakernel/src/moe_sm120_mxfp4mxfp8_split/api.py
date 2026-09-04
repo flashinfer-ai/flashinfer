@@ -8,7 +8,7 @@ construction and the opaque workspace contract.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from typing import Any, Dict, Literal, Optional, Tuple
@@ -23,9 +23,9 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump for every generated-kernel code path or opaque workspace change. This
-# revision applies gate_up_clamp in the SM120 K1 epilogue; older cached
-# kernels accepted the parameter but performed unclamped SwiGLU.
-KERNEL_CACHE_ABI = 7
+# Revision 22 hoists the exact N32 SFB slot dispatch out of the production K2
+# K mainloop and keeps its SSA value isolated from the trace fallback.
+KERNEL_CACHE_ABI = 22
 
 
 @dataclass(frozen=True)
@@ -173,6 +173,47 @@ class SplitKernelBundle:
     cache_key: str
 
 
+_ONE_DISPATCH_WARP_ROWS_PER_EXPERT_MAX = 192.0
+
+
+def _select_dispatch_warp_count(
+    problem: MegaMoEProblemSpec,
+    kernel: MegaMoEKernelConfig,
+) -> int:
+    """Select the K1 ingest width for the compiled kernel.
+
+    RTX Pro 5000 scans show one dispatch warp reduces first-ready latency for
+    short to mid-sized same-NUMA P2P waves, while larger waves need the
+    historical four-warp ingest bandwidth. Express the rule in rows/expert so
+    it is portable across top-k and expert-parallel degree.
+    """
+
+    if (
+        kernel.kernel_comm_backend != "p2p_direct"
+        or kernel.token_back_mode != "epi_warps"
+    ):
+        return 4
+    return (
+        1
+        if kernel.expected_rows_per_expert
+        <= _ONE_DISPATCH_WARP_ROWS_PER_EXPERT_MAX
+        else 4
+    )
+
+
+def _resolve_jit_config(
+    problem: MegaMoEProblemSpec,
+    kernel: MegaMoEKernelConfig,
+    jit: Sm120JitConfig,
+) -> Sm120JitConfig:
+    if jit.dispatch_warp_count is not None:
+        return jit
+    return replace(
+        jit,
+        dispatch_warp_count=_select_dispatch_warp_count(problem, kernel),
+    )
+
+
 def select_compile_spec(
     *,
     problem: MegaMoEProblemSpec,
@@ -203,16 +244,24 @@ def select_compile_spec(
         sm_min_partition=sm_min_partition,
         sm_partition_alignment=sm_partition_alignment,
     )
+    kernel = select_megamoe_config(heuristic_input, overrides)
+    jit_config = _resolve_jit_config(problem, kernel, jit or Sm120JitConfig())
     return MegaMoECompileSpec(
         problem=problem,
-        kernel=select_megamoe_config(heuristic_input, overrides),
-        jit=jit or Sm120JitConfig(),
+        kernel=kernel,
+        jit=jit_config,
         build=build or SplitKernelBuildOptions(),
     )
 
 
 def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     """Construct K1/K2/K2-tail objects without benchmark-runner dependencies."""
+
+    if spec.jit.dispatch_warp_count is None:
+        spec = replace(
+            spec,
+            jit=_resolve_jit_config(spec.problem, spec.kernel, spec.jit),
+        )
 
     import cutlass
 
@@ -287,6 +336,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         k2_natural_regs=config.k2_natural_regs,
         k2_min_blocks_per_sm=config.k2_min_blocks_per_sm,
         k1_ready_queue_m_rotation=config.k1_ready_queue_m_rotation,
+        dispatch_warp_count=spec.jit.dispatch_warp_count,
         jit_config=spec.jit,
     )
 
@@ -352,8 +402,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             **finalizer_common, **common_kwargs
         )
 
-    # The dual-N8 policy reserves the historical twelfth role slot in the
-    # config/cache key, but physically omits the idle aux warp at launch.
+    # The dual-N8 policy reserves the twelfth role in the config/cache key but
+    # physically omits the idle aux warp at launch.
     expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(
@@ -369,9 +419,23 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         (type(kernel).__name__, kernel.get_workspace_sizes()) for kernel in peers
     ]
     if any(sizes != workspace_sizes for _, sizes in peer_workspace_sizes):
+        def _regions(kernel):
+            return {
+                "local": [
+                    (r.name, r.shape, r.nbytes, kernel._local_offsets[r.name])
+                    for r in kernel._local_region_specs
+                ],
+                "shared": [
+                    (r.name, r.shape, r.nbytes, kernel._shared_offsets[r.name])
+                    for r in kernel._shared_region_specs
+                ],
+            }
+
         raise RuntimeError(
             "K1/K2 workspace layouts are not byte-identical: "
-            f"K1={workspace_sizes}, peers={peer_workspace_sizes}"
+            f"K1={workspace_sizes}, peers={peer_workspace_sizes}; "
+            f"K1 regions={_regions(k1)}, peer regions="
+            f"{[(type(kernel).__name__, _regions(kernel)) for kernel in peers]}"
         )
 
     return SplitKernelBundle(

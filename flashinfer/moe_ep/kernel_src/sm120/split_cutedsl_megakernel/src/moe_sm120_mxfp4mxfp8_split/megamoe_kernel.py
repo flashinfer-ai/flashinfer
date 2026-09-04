@@ -38,18 +38,20 @@ multiple of ``token_padding_block``.
 # quoted explicitly.
 
 import dataclasses
+import os
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int32, Int64
 
 from .kernel_fc12 import Sm120SwapABSwigluMxfp8Fc12Kernel
 from .jit_config import Sm120JitConfig
 from .moe_utils import spin_wait
 from .token_comm import Sm120SysmemTokenInPullTokenBackPush
+from src.ptx_helpers import stg_b32_raw
 from src.token_comm import (
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenSrcMetadata,
@@ -74,7 +76,13 @@ _TokenMetadataBytes = TokenSrcMetadata.nbytes
 # NVLink signal slots used by the DeepGEMM-style phase/sign barrier.
 # A separate local counter selects phase/sign; the signal slots are not reset
 # by tail cleanup.
-_NvlinkSlotCount = 2
+# Dispatch and the graph-ordered K2 finalizer each own an independent pair of
+# phase/sign slots.  Keep the finalizer pair on a separate 128-byte region:
+# peer stores to different words in one coherence line can otherwise race a
+# slow rank's dispatch barrier when a fast rank reaches the finalizer first.
+_FinalizerSignalSlotBase = 32
+_NvlinkSlotCount = _FinalizerSignalSlotBase + 2
+_NvlinkCounterCount = 2
 
 # Grid-sync counter slots. ``software_grid_sync`` phase-flips bit 31 within
 # each slot; split K1 and K2 use separate slots so concurrent grids cannot
@@ -217,6 +225,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         k2_n16_dual_group: bool = False,
         green_trace_role: Optional[int] = None,
         k1_ready_queue_m_rotation: int = 0,
+        dispatch_warp_count: int = 4,
         jit_config: Optional[Sm120JitConfig] = None,
     ) -> None:
         if comm_backend not in ("p2p_direct", "nvshmem_ibgda"):
@@ -331,6 +340,11 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         self.producer_sm_count = producer_sm_count
         self.k2_tail_reclaim = k2_tail_reclaim
         self.skip_global_tail = skip_global_tail
+        self.streaming_k3 = (
+            split_role == "k2"
+            and k2_n16_dual_group
+            and os.environ.get("MEGAMOE_DUAL_N8_STREAMING_K3", "0") == "1"
+        )
         self.k2_ready_queue = (
             split_role in ("k1", "k2")
             and k2_ready_queue
@@ -341,6 +355,14 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         )
         self.k1_ready_queue = (
             split_role == "k1" and self.k1_ready_queue_workspace
+        )
+        if dispatch_warp_count not in (1, 2, 4):
+            raise ValueError(
+                "dispatch_warp_count must be 1, 2, or 4, got "
+                f"{dispatch_warp_count}"
+            )
+        self.sm120_dispatch_warp_id = tuple(
+            range(8, 8 + dispatch_warp_count)
         )
         self.k2_ready_queue_bundle = k2_ready_queue_bundle
         if self.k2_ready_queue_bundle <= 0:
@@ -416,7 +438,9 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             and mma_tiler_mnk[1] == 32
         )
         use_natural_regs = (
-            k2_natural_regs if split_role == "k2" else default_natural_regs
+            (k2_natural_regs or self.k2_n16_dual_group)
+            if split_role == "k2"
+            else default_natural_regs
         )
         self.use_warpgroup_reg_realloc = not (
             split_role == "k2" and compact_k2 and use_natural_regs
@@ -445,6 +469,9 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         self.dispatch_warp_id = (
             self.sm120_dispatch_warp_id if self.has_dispatch_warps else None
         )
+        token_comm_dispatch_warp_count = (
+            dispatch_warp_count if self.has_dispatch_warps else 4
+        )
         # Standalone token-back: a dedicated 4-warp group (12-15) doing
         # token_back_by_push concurrently with dispatch_pull, selected by the
         # user-facing token_back_mode knob ("standalone_warps").
@@ -452,7 +479,16 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         self.token_back_standalone = (
             split_role == "fused" and token_back_mode == "standalone_warps"
         )
-        self.token_back_warp_id = (12, 13, 14, 15) if self.token_back_standalone else None
+        self.token_back_warp_id = (
+            tuple(
+                range(
+                    8 + dispatch_warp_count,
+                    8 + 2 * dispatch_warp_count,
+                )
+            )
+            if self.token_back_standalone
+            else None
+        )
         num_token_back_warps = (
             len(self.token_back_warp_id) if self.token_back_standalone else 0
         )
@@ -469,9 +505,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             + num_token_back_warps
         )
         if self.k2_n16_dual_group:
-            # The compact K2 path has no work for the legacy aux warp.  Keep
-            # 8 compute + TMA-A + TMA-B + scheduler so two CTAs fit by the
-            # natural register allocation instead of forcing spills.
+            # The compact dual path has no work for the legacy aux warp.
             self.threads_per_cta = 32 * 11
 
         # Independent MegaMoE-specific constants.
@@ -569,8 +603,8 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             # the kernel-tail rank release/reset after their FC2 work; the
             # remaining producer/scheduler/aux warps are the four cohabitants.
             token_comm_dispatch_warp_start = 0
-            # Remaining compute warps plus TMA-A, TMA-B, scheduler and,
-            # except for the dual-N8 compact path, the legacy aux warp.
+            # Remaining compute warps plus TMA-A, TMA-B and scheduler.  The
+            # dual path physically omits the idle aux warp.
             num_other_warps = len(self.compute_warp_id) - 4 + (
                 3 if self.k2_n16_dual_group else 4
             )
@@ -634,6 +668,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             token_back_schedule_mode=self.token_back_schedule_mode,
             dispatch_pull_mode=dispatch_pull_mode,
             dispatch_warps_per_tile=dispatch_warps_per_tile,
+            dispatch_warp_count=token_comm_dispatch_warp_count,
             dispatch_compute_overlap=dispatch_compute_overlap,
             streaming_fc12=self.streaming_fc12,
             k1_ready_queue=self.k1_ready_queue,
@@ -681,8 +716,13 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
 
     def _dispatch_smem_bytes(self) -> int:
         """SMEM bytes for dispatch pull mbarriers and aliased count/token scratch."""
-        pull_mbar_bytes = _DispatchWarpCount * 8
-        pull_buffer_bytes = _DispatchWarpCount * self.hidden_bytes
+        dispatch_warp_count = (
+            len(self.dispatch_warp_id)
+            if self.dispatch_warp_id is not None
+            else _DispatchWarpCount
+        )
+        pull_mbar_bytes = dispatch_warp_count * 8
+        pull_buffer_bytes = dispatch_warp_count * self.hidden_bytes
         total = (
             _round_up(pull_mbar_bytes, 16)
             + _round_up(pull_buffer_bytes, 128)
@@ -690,9 +730,9 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         )
         if self.token_back_standalone:
             total += (
-                _round_up(_DispatchWarpCount * 8, 16)
+                _round_up(dispatch_warp_count * 8, 16)
                 + _round_up(
-                    _DispatchWarpCount * self.token_comm.tb_chunk_bytes, 128
+                    dispatch_warp_count * self.token_comm.tb_chunk_bytes, 128
                 )
             )
         return total
@@ -875,7 +915,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             _RegionSpec(
                 "nvlink_barrier_counter",
                 cutlass.Int32,
-                (1,),
+                (_NvlinkCounterCount,),
                 16,
             ),
             _RegionSpec(
@@ -936,7 +976,14 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
                     16,
                 )
             )
-            if self.token_back_schedule_mode == "atomic_counter":
+            # K1, K2 main/drain, and the finalizer share one opaque local
+            # workspace. Tail reclaim makes K2 use the atomic scheduler even
+            # when K1 keeps its static schedule, so every role must reserve
+            # this counter to keep all later queue regions byte-identical.
+            if (
+                self.token_back_schedule_mode == "atomic_counter"
+                or self.k2_tail_reclaim
+            ):
                 specs.append(
                     _RegionSpec(
                         "token_back_schedule_counter",
@@ -1529,6 +1576,75 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             lane_idx=lane_idx,
             tidx=tidx,
         )
+
+    @cute.jit
+    def token_comm_hook_fc2_tile_complete(
+        self,
+        token_comm_args,
+        combine_ready_flags,
+        fc2_block_done_counter,
+        work_tile_info,
+        *,
+        compute_warp,
+        lane_idx,
+    ):
+        """Publish source-row readiness after every hidden tile is stored."""
+        if cutlass.const_expr(self.streaming_k3):
+            counter_slot = (
+                work_tile_info.cumulative_data_physical_row
+                // cutlass.Int32(self.mma_tiler[1])
+                + work_tile_info.tile_n_idx
+            )
+            if compute_warp == cutlass.Int32(0):
+                if lane_idx == cutlass.Int32(0):
+                    cute.arch.atomic_add(
+                        fc2_block_done_counter.iterator + counter_slot,
+                        cutlass.Int32(1),
+                        sem="release",
+                        scope="gpu",
+                    )
+            cute.arch.barrier(
+                barrier_id=self.epilog_sync_bar_id,
+                number_of_threads=32 * len(self.compute_warp_id),
+            )
+
+            completed = cute.arch.load(
+                fc2_block_done_counter.iterator + counter_slot,
+                Int32,
+                sem="acquire",
+                scope="gpu",
+            )
+            hidden_tiles = (
+                self.hidden + self.mma_tiler[0] - 1
+            ) // self.mma_tiler[0]
+            if completed >= cutlass.Int32(hidden_tiles):
+                cute.arch.fence_acq_rel_sys()
+                row_in_tile = compute_warp * cutlass.Int32(32) + lane_idx
+                if row_in_tile < work_tile_info.valid_tokens_in_tile:
+                    pool_token = (
+                        work_tile_info.cumulative_data_physical_row
+                        + work_tile_info.tile_n_idx
+                        * cutlass.Int32(self.mma_tiler[1])
+                        + row_in_tile
+                    )
+                    metadata = TokenSrcMetadata.load(
+                        token_comm_args.token_src_metadata.iterator.toint()
+                        + cutlass.Int64(pool_token)
+                        * cutlass.Int64(TokenSrcMetadata.nbytes)
+                    )
+                    ready_offset = (
+                        metadata.src_token * cutlass.Int32(self.num_topk)
+                        + metadata.src_topk
+                    ) * cutlass.Int32(4)
+                    peer_ready_addr = (
+                        token_comm_args.peer_rank_ptr_mapper.map(
+                            combine_ready_flags.iterator.toint(),
+                            metadata.src_rank,
+                            cutlass.Int64(ready_offset),
+                        )
+                    )
+                    stg_b32_raw(peer_ready_addr, cutlass.Int32(1))
+            cute.arch.fence_acq_rel_sys()
 
     @cute.jit
     def token_comm_hook_tail_reset_shared_counters(

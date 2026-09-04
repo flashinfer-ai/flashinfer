@@ -621,10 +621,9 @@ class MegaMoESm120W4A8Frontend:
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
             execution.local_workspace[offset : offset + size].zero_()
-        if "expert_recv_count_sum" in kernel._shared_offsets:
-            offset = int(kernel._shared_offsets["expert_recv_count_sum"])
-            size = int(kernel._shared_region_by_name["expert_recv_count_sum"].nbytes)
-            execution.shared_workspace[offset : offset + size].zero_()
+        # The graph finalizer owns peer-written expert_recv_count and its
+        # published sum. It clears both between two rank barriers; clearing
+        # either here can erase an early peer's next-epoch dispatch write.
         if execution.green_trace is not None:
             execution.green_trace.zero_()
 

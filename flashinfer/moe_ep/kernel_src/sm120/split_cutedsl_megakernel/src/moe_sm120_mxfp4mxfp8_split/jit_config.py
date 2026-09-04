@@ -34,6 +34,8 @@ def _read_optional_int(name: str) -> Optional[int]:
 class Sm120JitConfig:
     """All non-shape options that specialize generated SM120 device code."""
 
+    # None means the production heuristic selects the K1 dispatch width.
+    dispatch_warp_count: Optional[int] = None
     fc12_stream_tiles: int = 0
     k1_ready_major: bool = True
     k2_token_stripe: int = 2
@@ -44,6 +46,14 @@ class Sm120JitConfig:
     enable_k2_tile_trace: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            self.dispatch_warp_count is not None
+            and self.dispatch_warp_count not in (1, 2, 4)
+        ):
+            raise ValueError(
+                "dispatch_warp_count must be 1, 2, or 4, got "
+                f"{self.dispatch_warp_count}"
+            )
         if self.fc12_stream_tiles < 0:
             raise ValueError("fc12_stream_tiles must be non-negative")
         if self.k2_token_stripe <= 0:
@@ -64,7 +74,9 @@ class Sm120JitConfig:
         if stream_tiles is None:
             stream_tiles = 1 if _read_bool("MEGA_FC12_STREAMING", False) else 0
         enable_k2_tile_trace = _read_bool("MEGA_SPLIT_K2_TILE_TRACE", False)
+        dispatch_warp_count = _read_optional_int("MEGA_DISPATCH_WARPS")
         return cls(
+            dispatch_warp_count=dispatch_warp_count,
             fc12_stream_tiles=stream_tiles,
             k1_ready_major=_read_bool("MEGA_K1_READY_MAJOR", True),
             k2_token_stripe=int(os.environ.get("MEGA_K2_TOKEN_STRIPE", "2")),

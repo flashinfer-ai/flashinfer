@@ -63,8 +63,17 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         max_tokens_per_rank: int,
         ibgda_dispatch_chunk_tokens: int,
         comm_backend: Literal["p2p_direct", "nvshmem_ibgda"] = "p2p_direct",
+        dispatch_warp_count: int = 4,
         **kwargs,
     ) -> None:
+        if dispatch_warp_count not in (1, 2, 4):
+            raise ValueError(
+                "dispatch_warp_count must be 1, 2, or 4, got "
+                f"{dispatch_warp_count}"
+            )
+        self.num_dispatch_warps = dispatch_warp_count
+        self.num_dispatch_threads = dispatch_warp_count * self.warp_threads
+        self.experts_per_dispatch_pass = self.num_dispatch_threads
         local_rank = kwargs.pop("local_rank")
         fc2_output_dtype = kwargs.pop("fc2_output_dtype", None)
         kwargs["combine_format"] = CombineFormat(
@@ -1707,6 +1716,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         num_sms,
         prologue_grid_sync: cutlass.Constexpr[bool],
         epilogue_grid_sync: cutlass.Constexpr[bool],
+        signal_slot_base: cutlass.Constexpr[int] = 0,
+        counter_index: cutlass.Constexpr[int] = 0,
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
@@ -1720,7 +1731,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 signal_phase = Int32(slot)
                 target = Int32(1)
                 if cutlass.const_expr(nvlink_barrier_counter is not None):
-                    status = nvlink_barrier_counter[0] & Int32(3)
+                    status = nvlink_barrier_counter[counter_index] & Int32(3)
                     signal_phase = status & Int32(1)
                     signal_sign = status >> Int32(1)
                     if signal_sign != Int32(0):
@@ -1729,7 +1740,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
                 if lane_idx < Int32(self.world_size):
                     signal_slot = (
-                        signal_phase * Int32(self.world_size)
+                        Int32(signal_slot_base * self.world_size)
+                        + signal_phase * Int32(self.world_size)
                         + Int32(self.local_rank)
                     )
                     lane_peer_addr = peer_rank_ptr_mapper.map(
@@ -1743,7 +1755,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 if lane_idx == 0:
                     if cutlass.const_expr(nvlink_barrier_counter is not None):
                         cute.arch.atomic_add(
-                            nvlink_barrier_counter.iterator,
+                            nvlink_barrier_counter.iterator + counter_index,
                             Int32(1),
                             sem="relaxed",
                             scope="gpu",
@@ -1754,6 +1766,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                         for rank in cutlass.range_constexpr(0, self.world_size, 1):
                             local_signal_ptr = (
                                 nvlink_barrier_signal.iterator
+                                + Int32(signal_slot_base * self.world_size)
                                 + signal_phase * Int32(self.world_size)
                                 + Int32(rank)
                             )
@@ -2206,6 +2219,86 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 num_sms=1,
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
+            )
+
+    @cute.jit
+    def kernel_tail_after_grid_drain_epoch(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+    ):
+        """Join peer stores once after graph-ordered worker completion.
+
+        The worker streams have already drained before this one-CTA node is
+        launched. The first cross-rank barrier transfers ownership of all
+        peer-written count records to their local rank. This CTA clears those
+        records, then a second barrier publishes reset completion before any
+        rank can begin the next replay.
+        """
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            local_warp_idx = Int32(warp_idx) - Int32(
+                self.dispatch_warp_start
+            )
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                local_warp_idx,
+                lane_idx,
+                slot=1,
+                num_sms=1,
+                # This finalizer is a single CTA launched after both worker
+                # streams have completed.  Reusing the persistent grid-sync
+                # counter here advances it with num_sms=1, corrupting the next
+                # epoch's 72-CTA dispatch generation.
+                prologue_grid_sync=False,
+                epilogue_grid_sync=False,
+                # The finalizer phase pair is deliberately separated from
+                # the dispatch pair by at least one full coherence line.
+                signal_slot_base=32,
+                counter_index=1,
+            )
+
+            thread_linear = (
+                local_warp_idx * Int32(self.warp_threads) + lane_idx
+            )
+            stride = Int32(self.num_dispatch_threads)
+            recv_total: cutlass.Constexpr[int] = (
+                self.world_size * self.num_experts_per_rank
+            )
+            i = thread_linear
+            while i < Int32(recv_total):
+                rank_idx = i // Int32(self.num_experts_per_rank)
+                expert_idx = i % Int32(self.num_experts_per_rank)
+                token_comm_args.expert_recv_count[rank_idx, expert_idx] = Int64(0)
+                i = i + stride
+
+            i = thread_linear
+            while i < Int32(self.num_experts_per_rank):
+                token_comm_args.expert_recv_count_sum[i] = Int64(0)
+                i = i + stride
+            cute.arch.fence_acq_rel_sys()
+
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                local_warp_idx,
+                lane_idx,
+                slot=1,
+                num_sms=1,
+                prologue_grid_sync=False,
+                epilogue_grid_sync=False,
+                signal_slot_base=32,
+                counter_index=1,
             )
 
     @cute.jit

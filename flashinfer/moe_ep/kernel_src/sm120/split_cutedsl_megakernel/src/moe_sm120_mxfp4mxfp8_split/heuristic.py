@@ -8,6 +8,7 @@ benchmark runner may apply explicit user overrides after selection.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
@@ -24,15 +25,15 @@ _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET = {
     16: 2,
     32: 1,
     64: 2,
-    128: 2,
 }
 _DECODE_ROW_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
 
-# Keep both decode experiments opt-in until the exact N16 selector and the
-# dual-N8 replay/barrier lifecycle complete production validation. Explicit
-# benchmark overrides can still instantiate N16 without affecting callers.
-_ENABLE_PRODUCTION_DECODE_N16 = False
+# The N16 selector is production-ready for the validated decode buckets.
+# Dual-N8 is enabled only in the bounded full-width EP4 window where it is
+# neutral on uniform routing and wins as routing skew grows.
+_ENABLE_PRODUCTION_DECODE_N16 = True
 _ENABLE_EXPERIMENTAL_DUAL_N8 = False
+_DUAL_N8_DEFAULT_BUCKETS = (7, 16, 32, 64)
 
 
 def _select_decode_row_bucket(rows_per_rank: int) -> Optional[int]:
@@ -381,6 +382,9 @@ class MegaMoEKernelConfig:
         if (
             overrides.token_back_mode is not None
             and overrides.token_back_mode != required_token_back
+            and os.environ.get(
+                "MEGAMOE_ALLOW_DEBUG_TOKEN_BACK_MODE", "0"
+            ) != "1"
         ):
             raise ValueError(
                 f"comm backend {backend!r} requires token_back_mode "
@@ -585,7 +589,26 @@ def select_megamoe_config(
         and config.k2_tile == (64, 32, 128)
         and decode_bundle is not None
     ):
-        use_dual_group = _ENABLE_EXPERIMENTAL_DUAL_N8
+        dual_group_default = (
+            decode_bucket in _DUAL_N8_DEFAULT_BUCKETS
+            and shape.expert_parallel_size == 4
+            and shape.tensor_parallel_size == 1
+            and shape.ep_same_numa_peer_count == 3
+            and shape.ep_cross_numa_peer_count == 0
+            and shape.hidden >= 4096
+            and shape.intermediate >= 4096
+        )
+        force_dual_group = (
+            _ENABLE_EXPERIMENTAL_DUAL_N8
+            or os.environ.get("MEGAMOE_ENABLE_EXPERIMENTAL_DUAL_N8", "0")
+            == "1"
+        )
+        disable_dual_group = (
+            os.environ.get("MEGAMOE_DISABLE_DUAL_N8", "0") == "1"
+        )
+        use_dual_group = not disable_dual_group and (
+            force_dual_group or dual_group_default
+        )
         config = replace(
             config,
             k2_tile=(64, 16, 128),

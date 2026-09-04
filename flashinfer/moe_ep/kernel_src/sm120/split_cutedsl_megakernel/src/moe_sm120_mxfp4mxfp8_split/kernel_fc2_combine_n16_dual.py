@@ -89,6 +89,10 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
         compact_k2: bool = True,
         **kwargs,
     ):
+        # The dual-group path needs a complete producer warpgroup for legal
+        # register redistribution and is intended to validate two CTA/SM.
+        kwargs["k2_natural_regs"] = True
+        kwargs["k2_min_blocks_per_sm"] = 2
         super().__init__(
             *args,
             split_role="k2",
