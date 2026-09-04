@@ -326,16 +326,12 @@ def _resolve_decode_native_bf16_selector(
         "NUM_KV_HEADS": num_kv_heads,
     }
     if (
-        _get_component_member(
-            "decode_native_bf16", exact_selector, required=False
-        )
+        _get_component_member("decode_native_bf16", exact_selector, required=False)
         is not None
     ):
         return dict(sorted(exact_selector.items()))
     if (
-        _get_component_member(
-            "decode_native_bf16", semantic_selector, required=False
-        )
+        _get_component_member("decode_native_bf16", semantic_selector, required=False)
         is not None
     ):
         return dict(sorted(semantic_selector.items()))
@@ -446,34 +442,30 @@ def _validate_context_specialization(
     }
     if exact_profile is None:
         return selector
-    exact = {
-        "q511": {
-            "expected": (11, 10, 2, 5, 32, 1),
-            "selector": {
-                "HEADS_PER_GROUP": 5,
-                "L2_SWIZZLE": 1,
-                "NUM_M_BLOCKS": 11,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 32,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        },
-        "q257": {
-            "expected": (6, 10, 2, 5, 1024, 8),
-            "selector": {
-                "HEADS_PER_GROUP": 5,
-                "L2_SWIZZLE": 8,
-                "NUM_M_BLOCKS": 6,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 1024,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        },
-    }[exact_profile]
+    if exact_profile == "q511":
+        expected = (11, 10, 2, 5, 32, 1)
+        exact_selector = {
+            "HEADS_PER_GROUP": 5,
+            "L2_SWIZZLE": 1,
+            "NUM_M_BLOCKS": 11,
+            "NUM_Q_HEADS": 10,
+            "PACK_G": 5,
+            "PAGE_SIZE": 32,
+            "SINGLE_MASK_LOOP": 1,
+            "TOK_PER_STAGE": 25,
+        }
+    else:
+        expected = (6, 10, 2, 5, 1024, 8)
+        exact_selector = {
+            "HEADS_PER_GROUP": 5,
+            "L2_SWIZZLE": 8,
+            "NUM_M_BLOCKS": 6,
+            "NUM_Q_HEADS": 10,
+            "PACK_G": 5,
+            "PAGE_SIZE": 1024,
+            "SINGLE_MASK_LOOP": 1,
+            "TOK_PER_STAGE": 25,
+        }
     actual = (
         num_m_blocks,
         num_q_heads,
@@ -482,7 +474,7 @@ def _validate_context_specialization(
         page_size,
         l2_swizzle,
     )
-    if actual != exact["expected"] or selector != {
+    if actual != expected or selector != {
         "ENABLE_SINK": 0,
         "IS_CAUSAL": 1,
         "RETURN_LSE": 0,
@@ -490,7 +482,7 @@ def _validate_context_specialization(
         raise ValueError(
             f"context BF16 exact profile {exact_profile} does not match its fixed selector"
         )
-    return {**selector, **exact["selector"]}
+    return {**selector, **exact_selector}
 
 
 def get_cake_fmha_context_bf16_uri(
@@ -996,10 +988,7 @@ def _gen_cake_fmha_context_hd256_module(
         is_fp8 = 1
     main_sources = _get_component_launch_sources(component, target, selector)
     csrc_dir = get_cake_fmha_csrc_dir()
-    support_source = (
-        csrc_dir
-        / "cuda/context_hd256_support/cake_fmha_hd256_support.cu"
-    )
+    support_source = csrc_dir / "cuda/context_hd256_support/cake_fmha_hd256_support.cu"
     api_binding = csrc_dir / _CONTEXT_HD256_JIT_BINDING
     for source in (support_source, api_binding):
         if not source.is_file():
@@ -1624,9 +1613,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
         page_size,
         full_blocks=full_blocks,
     )
-    main_sources = _get_component_launch_sources(
-        "decode_quant_fp8", target, selector
-    )
+    main_sources = _get_component_launch_sources("decode_quant_fp8", target, selector)
     reduce_sources = _get_component_launch_sources(
         "decode_quant_fp8_reduce", target, {}
     )
@@ -1728,9 +1715,7 @@ def gen_cake_fmha_decode_quant_nvfp4_module(
         num_kv_heads,
         page_size,
     )
-    main_sources = _get_component_launch_sources(
-        "decode_quant_nvfp4", target, selector
-    )
+    main_sources = _get_component_launch_sources("decode_quant_nvfp4", target, selector)
     reduce_sources = _get_component_launch_sources(
         "decode_quant_fp8_reduce", target, {}
     )

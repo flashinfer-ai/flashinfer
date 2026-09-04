@@ -293,7 +293,11 @@ def iter_context_cases() -> Iterator[dict[str, Any]]:
 def upstream_skip_reason(case: dict[str, Any]) -> str | None:
     if case["skip_softmax"] and case["q_dtype"] != case["kv_dtype"]:
         return "skip-softmax requires matching Q/KV dtypes"
-    if case["mode"] == "decode" and case["o_dtype"] == "fp8" and case["q_dtype"] != "fp8":
+    if (
+        case["mode"] == "decode"
+        and case["o_dtype"] == "fp8"
+        and case["q_dtype"] != "fp8"
+    ):
         return "decode FP8 output requires FP8 query"
     if case["kv_dtype"] == "nvfp4" and (
         case["q_dtype"] != "fp8" or case["o_dtype"] != "fp8"
@@ -373,7 +377,9 @@ def _normalized_kv_tensor(
     )
 
 
-def _route_name(route: cake_api.CakeFmhaDecodeRoute | cake_api.CakeFmhaContextRoute | None) -> str:
+def _route_name(
+    route: cake_api.CakeFmhaDecodeRoute | cake_api.CakeFmhaContextRoute | None,
+) -> str:
     return "cake_fmha_compat_v1" if route is None else _ROUTE_NAMES[route.component]
 
 

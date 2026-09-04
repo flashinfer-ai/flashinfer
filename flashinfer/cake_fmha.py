@@ -59,18 +59,21 @@ class CakeFmhaDecodeRoute:
     page_size: int = 16
 
 
+CakeFmhaContextComponent = Literal[
+    "context_bf16",
+    "context_fp16_hd256",
+    "context_fp8",
+    "context_fp8_hd256",
+    "context_nvfp4",
+]
+
+
 @dataclass(frozen=True)
 class CakeFmhaContextRoute:
     """One exact manifest-backed optimized context specialization."""
 
     target: CakeFmhaTarget
-    component: Literal[
-        "context_bf16",
-        "context_fp16_hd256",
-        "context_fp8",
-        "context_fp8_hd256",
-        "context_nvfp4",
-    ]
+    component: CakeFmhaContextComponent
     num_m_blocks: int
     num_q_heads: int
     num_kv_heads: int
@@ -135,7 +138,9 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
 )
 
 
-def _route_components(route: CakeFmhaDecodeRoute | CakeFmhaContextRoute) -> tuple[str, ...]:
+def _route_components(
+    route: CakeFmhaDecodeRoute | CakeFmhaContextRoute,
+) -> tuple[str, ...]:
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
             "decode_native_bf16": "decode_native_bf16_v1_bece",
@@ -192,17 +197,15 @@ def _tma_paged_kv_strides_supported(tensor: torch.Tensor) -> bool:
         return False
     element_size = tensor.element_size()
     return all(
-        stride > 0 and stride * element_size % 16 == 0
-        for stride in tensor.stride()[:3]
+        stride > 0 and stride * element_size % 16 == 0 for stride in tensor.stride()[:3]
     )
 
 
 def _tma_nvfp4_paged_kv_strides_supported(tensor: torch.Tensor) -> bool:
     """Return whether packed HND NVFP4 KV is exactly TMA-encodable."""
 
-    return (
-        tensor.stride(3) == 1
-        and all(stride > 0 and stride % 16 == 0 for stride in tensor.stride()[:3])
+    return tensor.stride(3) == 1 and all(
+        stride > 0 and stride % 16 == 0 for stride in tensor.stride()[:3]
     )
 
 
@@ -232,10 +235,7 @@ def _decode_native_workspace_supported(
 ) -> bool:
     """Mirror one native binding's resolved metadata/LSE workspace layout."""
 
-    if (
-        not workspace_buffer.is_contiguous()
-        or workspace_buffer.device != query.device
-    ):
+    if not workspace_buffer.is_contiguous() or workspace_buffer.device != query.device:
         return False
     even_kv_blocks = (max_seq_len + 127) // 128
     even_kv_blocks += even_kv_blocks % 2
@@ -272,10 +272,7 @@ def _decode_quant_workspace_supported(
 ) -> bool:
     """Mirror the BF16Q adapter's padding, scale, and partial workspace."""
 
-    if (
-        not workspace_buffer.is_contiguous()
-        or workspace_buffer.device != query.device
-    ):
+    if not workspace_buffer.is_contiguous() or workspace_buffer.device != query.device:
         return False
     even_kv_blocks = (max_seq_len + 127) // 128
     even_kv_blocks += even_kv_blocks % 2
@@ -334,9 +331,7 @@ def _decode_quant_fp8_seq_lens_supported(
         return False
     if any(length < 512 or length % 128 for length in lengths):
         return False
-    evened_buckets = {
-        ((length + 127) // 128 + 1) // 2 * 2 for length in lengths
-    }
+    evened_buckets = {((length + 127) // 128 + 1) // 2 * 2 for length in lengths}
     return len(evened_buckets) == 1
 
 
@@ -353,10 +348,7 @@ def _decode_quant_fp8_workspace_supported(
 ) -> bool:
     """Check a conservative upper bound for runtime split-KV workspace."""
 
-    if (
-        not workspace_buffer.is_contiguous()
-        or workspace_buffer.device != query.device
-    ):
+    if not workspace_buffer.is_contiguous() or workspace_buffer.device != query.device:
         return False
     even_kv_blocks = (max_seq_len + 127) // 128
     even_kv_blocks += even_kv_blocks % 2
@@ -413,10 +405,7 @@ def _decode_quant_nvfp4_workspace_supported(
 ) -> bool:
     """Conservatively bound NVFP4 GQA padding and split-KV workspace."""
 
-    if (
-        not workspace_buffer.is_contiguous()
-        or workspace_buffer.device != query.device
-    ):
+    if not workspace_buffer.is_contiguous() or workspace_buffer.device != query.device:
         return False
     even_kv_blocks = (max_seq_len + 127) // 128
     even_kv_blocks += even_kv_blocks % 2
@@ -454,9 +443,7 @@ def _manifest_optimized_route_accounting() -> tuple[int, int]:
 
     route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
     total = sum(
-        count
-        for name, count in route_counts.items()
-        if name != "cake_fmha_compat_v1"
+        count for name, count in route_counts.items() if name != "cake_fmha_compat_v1"
     )
     registered = sum(route_counts.get(name, 0) for name in _PRODUCT_ROUTE_COMPONENTS)
     return registered, total
@@ -467,16 +454,12 @@ def _manifest_authenticated_route_accounting() -> tuple[int, int]:
 
     route_counts = get_cake_fmha_manifest()["capability"]["route_counts"]
     total = sum(
-        count
-        for name, count in route_counts.items()
-        if name != "cake_fmha_compat_v1"
+        count for name, count in route_counts.items() if name != "cake_fmha_compat_v1"
     )
     authenticated = sum(
         route_counts.get(route_name, 0)
         for route_name, components in _PRODUCT_ROUTE_COMPONENTS.items()
-        if all(
-            component in _AUTHENTICATED_JIT_COMPONENTS for component in components
-        )
+        if all(component in _AUTHENTICATED_JIT_COMPONENTS for component in components)
     )
     return authenticated, total
 
@@ -490,17 +473,15 @@ def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
     if capability == (10, 0):
         if not is_cuda_version_at_least("12.8"):
             raise RuntimeError("Cake FMHA on B200 requires CUDA 12.8 or newer")
-        target = "sm100a"
-    elif capability == (10, 3):
+        return "sm100a"
+    if capability == (10, 3):
         if not is_cuda_version_at_least("12.9"):
             raise RuntimeError("Cake FMHA on B300 requires CUDA 12.9 or newer")
-        target = "sm103a"
-    else:
-        raise RuntimeError(
-            "Cake FMHA requires compute capability 10.0 (B200/GB200) or "
-            f"10.3 (B300/GB300), got {capability[0]}.{capability[1]}"
-        )
-    return target
+        return "sm103a"
+    raise RuntimeError(
+        "Cake FMHA requires compute capability 10.0 (B200/GB200) or "
+        f"10.3 (B300/GB300), got {capability[0]}.{capability[1]}"
+    )
 
 
 def get_cake_fmha_module(device: torch.device):
@@ -543,9 +524,7 @@ def select_cake_fmha_decode_route(
         return None
     if cum_seq_lens_q is not None or enable_block_sparse_attention:
         return None
-    if not _pinned_noop_skip_softmax_supported(
-        skip_softmax_threshold_scale_factor
-    ):
+    if not _pinned_noop_skip_softmax_supported(skip_softmax_threshold_scale_factor):
         return None
     if query.ndim != 3 or query.stride(2) != 1:
         return None
@@ -592,7 +571,11 @@ def select_cake_fmha_decode_route(
             return None
     elif block_tables.ndim != 3 or block_tables.shape[:2] != (batch_size, 2):
         return None
-    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size or not seq_lens.is_contiguous():
+    if (
+        seq_lens.ndim != 1
+        or seq_lens.shape[0] != batch_size
+        or not seq_lens.is_contiguous()
+    ):
         return None
     if seq_lens.dtype not in (torch.int32, torch.uint32):
         return None
@@ -910,8 +893,7 @@ def _resolve_cake_fmha_decode_module(
             return loader(*common_args, route.page_size), True
         except (OSError, RuntimeError) as error:
             warnings.warn(
-                "Cake FMHA portable NVFP4 loading failed closed to compat_v1: "
-                f"{error}",
+                f"Cake FMHA portable NVFP4 loading failed closed to compat_v1: {error}",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -1046,9 +1028,7 @@ def _context_bf16_exact_profile(
         return None
     try:
         kv_lengths = [int(value) for value in seq_lens.detach().cpu().tolist()]
-        q_indptr = [
-            int(value) for value in cum_seq_lens_q.detach().cpu().tolist()
-        ]
+        q_indptr = [int(value) for value in cum_seq_lens_q.detach().cpu().tolist()]
     except RuntimeError:
         return None
     if kv_lengths != [expected_kv_len] * batch_size:
@@ -1093,9 +1073,7 @@ def select_cake_fmha_context_route(
         bmm1_scale, query
     ) or not _decode_quant_scale_supported(bmm2_scale, query):
         return None
-    if not _pinned_noop_skip_softmax_supported(
-        skip_softmax_threshold_scale_factor
-    ):
+    if not _pinned_noop_skip_softmax_supported(skip_softmax_threshold_scale_factor):
         return None
     if query.ndim != 3 or query.stride(2) != 1:
         return None
@@ -1160,10 +1138,10 @@ def select_cake_fmha_context_route(
 
     dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
     no_block_scales = key_block_scales is None and value_block_scales is None
-    host_scalar_scales = not isinstance(
-        bmm1_scale, torch.Tensor
-    ) and not isinstance(bmm2_scale, torch.Tensor)
-    component = None
+    host_scalar_scales = not isinstance(bmm1_scale, torch.Tensor) and not isinstance(
+        bmm2_scale, torch.Tensor
+    )
+    component: CakeFmhaContextComponent | None = None
     if (
         dtypes == (torch.bfloat16,) * 4
         and query.shape[2] == 128
@@ -1348,8 +1326,7 @@ def get_cake_fmha_context_module(
             )
         except (OSError, RuntimeError) as error:
             warnings.warn(
-                "Cake FMHA NVFP4 context loading failed closed to compat_v1: "
-                f"{error}",
+                f"Cake FMHA NVFP4 context loading failed closed to compat_v1: {error}",
                 RuntimeWarning,
                 stacklevel=2,
             )

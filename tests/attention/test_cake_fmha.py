@@ -109,9 +109,7 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
         for component in components
     }
     assert routed_components | {"compat_v1"} == set(manifest["components"])
-    assert cake_api._AUTHENTICATED_JIT_COMPONENTS == routed_components | {
-        "compat_v1"
-    }
+    assert routed_components | {"compat_v1"} == cake_api._AUTHENTICATED_JIT_COMPONENTS
 
 
 def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
@@ -298,28 +296,27 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None
         "USE_SCALE_PTR": 0,
     }
 
-    sink_binding = (
-        "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
-    )
+    sink_binding = "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
     launch_override = sink_member["launch_override"]
     assert launch_override["binding_source"] == sink_binding
-    assert launch_override["binding_sha256"] == manifest["artifacts"][sink_binding][
-        "sha256"
-    ]
+    assert (
+        launch_override["binding_sha256"]
+        == manifest["artifacts"][sink_binding]["sha256"]
+    )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
     assert len(cake_jit._FLASHINFER_BINDINGS) == 12
     assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
-    assert cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding) == (
-        launch_override["binding_sha256"]
+    assert (
+        cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
+        == (launch_override["binding_sha256"])
     )
     assert cake_jit._flashinfer_bindings_sha256(get_cake_fmha_csrc_dir()) == (
         CAKE_FMHA_FLASHINFER_BINDINGS_SHA256
     )
 
     adapter = (
-        get_cake_fmha_csrc_dir()
-        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+        get_cake_fmha_csrc_dir() / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
     ).read_text(encoding="utf-8")
     exact_guard = (
         "#if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && "
@@ -336,8 +333,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None
 
 def test_cake_fmha_decode_native_bf16_exact_b4_grid_matches_cga_selector() -> None:
     adapter = (
-        get_cake_fmha_csrc_dir()
-        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+        get_cake_fmha_csrc_dir() / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
     ).read_text(encoding="utf-8")
     grid_policy = adapter.split("unsigned int grid_z = 1;", 1)[1].split(
         "cudaError_t status", 1
@@ -352,8 +348,7 @@ def test_cake_fmha_decode_native_bf16_exact_b4_grid_matches_cga_selector() -> No
     assert adapter.count(exact_guard) == 1
     exact_branch = grid_policy.split(exact_guard, 1)[1].split("#else", 1)[0]
     assert (
-        "unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;"
-        in exact_branch
+        "unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;" in exact_branch
     )
     assert "unsigned int logical_grid_x =" in exact_branch
     assert "grid_x = 2 * logical_grid_x;" in exact_branch
@@ -361,8 +356,7 @@ def test_cake_fmha_decode_native_bf16_exact_b4_grid_matches_cga_selector() -> No
 
 def test_cake_fmha_decode_native_bf16_other_grids_stay_persistent() -> None:
     adapter = (
-        get_cake_fmha_csrc_dir()
-        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+        get_cake_fmha_csrc_dir() / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
     ).read_text(encoding="utf-8")
     grid_policy = adapter.split("unsigned int grid_z = 1;", 1)[1].split(
         "cudaError_t status", 1
@@ -592,12 +586,8 @@ def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    spec = gen_cake_fmha_decode_quant_nvfp4_module(
-        "sm103a", 2, 1, 4, 2, 32
-    )
-    assert spec.name == get_cake_fmha_decode_quant_nvfp4_uri(
-        "sm103a", 2, 1, 4, 2, 32
-    )
+    spec = gen_cake_fmha_decode_quant_nvfp4_module("sm103a", 2, 1, 4, 2, 32)
+    assert spec.name == get_cake_fmha_decode_quant_nvfp4_uri("sm103a", 2, 1, 4, 2, 32)
     assert {Path(source).name for source in spec.sources} == {
         "page_size32.cu",
         "cake_fmha_decode_quant_nvfp4_binding.cu",
@@ -694,18 +684,19 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
         ),
     ],
 )
-def test_cake_fmha_context_bf16_exact_profile_selector(
-    profile, args, expected
-) -> None:
+def test_cake_fmha_context_bf16_exact_profile_selector(profile, args, expected) -> None:
     from flashinfer.jit import cake_fmha as cake_jit
 
-    assert cake_jit._validate_context_specialization(
-        *args,
-        is_causal=True,
-        return_lse=False,
-        enable_sink=False,
-        exact_profile=profile,
-    ) == expected
+    assert (
+        cake_jit._validate_context_specialization(
+            *args,
+            is_causal=True,
+            return_lse=False,
+            enable_sink=False,
+            exact_profile=profile,
+        )
+        == expected
+    )
     with pytest.raises(ValueError, match="does not match its fixed selector"):
         cake_jit._validate_context_specialization(
             *args[:-1],
@@ -762,12 +753,8 @@ def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    spec = gen_cake_fmha_context_nvfp4_module(
-        "sm100a", 1, 32, 4, 8, 16, 8
-    )
-    assert spec.name == get_cake_fmha_context_nvfp4_uri(
-        "sm100a", 1, 32, 4, 8, 16, 8
-    )
+    spec = gen_cake_fmha_context_nvfp4_module("sm100a", 1, 32, 4, 8, 16, 8)
+    assert spec.name == get_cake_fmha_context_nvfp4_uri("sm100a", 1, 32, 4, 8, 16, 8)
     assert {Path(source).name for source in spec.sources} == {
         "enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
         "cake_fmha_context_nvfp4_binding.cu",
@@ -953,9 +940,12 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
         is None
     )
     valid_lse = torch.empty((2, 4), dtype=torch.float32)
-    assert cake_api.select_cake_fmha_decode_route(
-        query.device, **{**kwargs, "lse": valid_lse}
-    ) == route
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            query.device, **{**kwargs, "lse": valid_lse}
+        )
+        == route
+    )
     for invalid_lse in (
         torch.empty((2, 4), dtype=torch.float16),
         torch.empty((2, 5), dtype=torch.float32)[:, :4],
@@ -1203,9 +1193,7 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
     assert nvfp4_separate_route is not None
     assert nvfp4_separate_route.component == "decode_quant_nvfp4"
-    bad_scale_stride = torch.empty(
-        (4, 2, 16, 9), dtype=torch.float8_e4m3fn
-    )[..., :8]
+    bad_scale_stride = torch.empty((4, 2, 16, 9), dtype=torch.float8_e4m3fn)[..., :8]
     assert bad_scale_stride.stride(2) == 9
     assert (
         select(
@@ -1230,9 +1218,7 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
         )
         is None
     )
-    too_many_group_heads = torch.empty(
-        (2, 18, 128), dtype=torch.float8_e4m3fn
-    )
+    too_many_group_heads = torch.empty((2, 18, 128), dtype=torch.float8_e4m3fn)
     assert (
         select(
             too_many_group_heads,
@@ -1263,9 +1249,7 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     assert hd512_route is not None
     assert hd512_route.component == "decode_native_fp16_hd512"
     assert cake_api.cake_fmha_route_is_optimized(hd512_route)
-    misaligned_hd512 = torch.empty((4, 2, 64, 513), dtype=torch.float16)[
-        ..., :512
-    ]
+    misaligned_hd512 = torch.empty((4, 2, 64, 513), dtype=torch.float16)[..., :512]
     assert misaligned_hd512.stride() == (65664, 32832, 513, 1)
     assert (
         select(
@@ -1284,12 +1268,8 @@ def test_cake_fmha_fp8_decode_route_requires_exact_full_block_bucket(
 ) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
     batch_size, num_q_heads, num_kv_heads, page_size = 2, 16, 2, 16
-    query = torch.empty(
-        (batch_size, num_q_heads, 128), dtype=torch.float8_e4m3fn
-    )
-    key = torch.empty(
-        (64, num_kv_heads, page_size, 128), dtype=torch.float8_e4m3fn
-    )
+    query = torch.empty((batch_size, num_q_heads, 128), dtype=torch.float8_e4m3fn)
+    key = torch.empty((64, num_kv_heads, page_size, 128), dtype=torch.float8_e4m3fn)
     out = torch.empty_like(query)
     block_tables = torch.zeros((batch_size, 32), dtype=torch.int32)
 
@@ -1355,10 +1335,15 @@ def test_cake_fmha_fp16_nhd_route_loads_its_authenticated_adapter(monkeypatch) -
         component="decode_native_fp16_nhd",
         page_size=32,
     )
-    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is fp16_sentinel
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+        is fp16_sentinel
+    )
 
 
-def test_cake_fmha_fp16_hd512_route_loads_its_authenticated_adapter(monkeypatch) -> None:
+def test_cake_fmha_fp16_hd512_route_loads_its_authenticated_adapter(
+    monkeypatch,
+) -> None:
     hd512_sentinel = object()
     observed = {}
 
@@ -1391,7 +1376,10 @@ def test_cake_fmha_fp16_hd512_route_loads_its_authenticated_adapter(monkeypatch)
         component="decode_native_fp16_hd512",
         page_size=64,
     )
-    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is hd512_sentinel
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+        is hd512_sentinel
+    )
     assert observed == {
         "args": ("sm103a", 2, 1, 4, 2),
         "kwargs": {
@@ -1429,7 +1417,10 @@ def test_cake_fmha_bf16q_route_loads_its_authenticated_adapter(monkeypatch) -> N
         component="decode_quant_bf16q",
         page_size=32,
     )
-    assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is bf16q_sentinel
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+        is bf16q_sentinel
+    )
     assert observed == {"args": ("sm100a", 2, 1, 4, 2, 32)}
 
 
@@ -1462,8 +1453,7 @@ def test_cake_fmha_fp8_route_loads_its_authenticated_adapter(monkeypatch) -> Non
         page_size=16,
     )
     assert (
-        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
-        is fp8_sentinel
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is fp8_sentinel
     )
     assert observed == {
         "args": ("sm103a", 2, 1, 16, 2, 16),
@@ -1524,12 +1514,13 @@ def test_cake_fmha_nvfp4_load_failure_fails_closed_to_compat(monkeypatch) -> Non
     )
     with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
         assert (
-            cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
-            is sentinel
+            cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route) is sentinel
         )
 
 
-def test_cake_fmha_context_candidate_selection_for_adapter_families(monkeypatch) -> None:
+def test_cake_fmha_context_candidate_selection_for_adapter_families(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
 
     def select(
@@ -1810,14 +1801,18 @@ def test_cake_fmha_context_nvfp4_load_failure_fails_closed(monkeypatch) -> None:
 def test_decode_route_miss_fails_closed_to_compat(monkeypatch) -> None:
     sentinel = object()
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
-    monkeypatch.setattr(cake_api, "load_cake_fmha_compat_module", lambda target: sentinel)
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
+    )
     assert cake_api.get_cake_fmha_decode_module(torch.device("cpu"), None) is sentinel
 
 
 def test_context_route_miss_fails_closed_to_compat(monkeypatch) -> None:
     sentinel = object()
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
-    monkeypatch.setattr(cake_api, "load_cake_fmha_compat_module", lambda target: sentinel)
+    monkeypatch.setattr(
+        cake_api, "load_cake_fmha_compat_module", lambda target: sentinel
+    )
     assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), None) is sentinel
 
 
@@ -2005,13 +2000,16 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         )
         is None
     )
-    assert cake_api.select_cake_fmha_context_route(
-        query.device,
-        **{
-            **kwargs,
-            "skip_softmax_threshold_scale_factor": 1e-30,
-        },
-    ) == route
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            query.device,
+            **{
+                **kwargs,
+                "skip_softmax_threshold_scale_factor": 1e-30,
+            },
+        )
+        == route
+    )
     assert (
         cake_api.select_cake_fmha_context_route(
             query.device,
@@ -2062,30 +2060,33 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         return_lse=False,
         enable_sink=False,
     )
-    assert cake_api.select_cake_fmha_context_route(
-        fp8_query.device,
-        query=fp8_query,
-        key_cache=fp8_key,
-        value_cache=torch.empty_like(fp8_key),
-        out=torch.empty_like(fp8_query),
-        block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
-        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
-        batch_size=2,
-        max_q_len=32,
-        max_kv_len=64,
-        window_left=-1,
-        bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
-        bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
-        sinks=None,
-        uses_shared_paged_kv_idx=False,
-        cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
-        cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
-        key_block_scales=None,
-        value_block_scales=None,
-        skip_softmax_threshold_scale_factor=1e-30,
-        is_causal=True,
-        lse=None,
-    ) == fp8_route
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            fp8_query.device,
+            query=fp8_query,
+            key_cache=fp8_key,
+            value_cache=torch.empty_like(fp8_key),
+            out=torch.empty_like(fp8_query),
+            block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+            batch_size=2,
+            max_q_len=32,
+            max_kv_len=64,
+            window_left=-1,
+            bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
+            bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
+            sinks=None,
+            uses_shared_paged_kv_idx=False,
+            cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
+            key_block_scales=None,
+            value_block_scales=None,
+            skip_softmax_threshold_scale_factor=1e-30,
+            is_causal=True,
+            lse=None,
+        )
+        == fp8_route
+    )
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
 
@@ -2297,27 +2298,29 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     kv_len = 4096
     pages_per_seq = kv_len // page_size
 
-    query = torch.randn(
-        (batch_size * q_len, num_q_heads, head_dim),
-        dtype=torch.bfloat16,
-        device=device,
-    ) * 0.125
-    kv_cache = torch.randn(
-        (pages_per_seq, 2, num_kv_heads, page_size, head_dim),
-        dtype=torch.bfloat16,
-        device=device,
-    ) * 0.125
+    query = (
+        torch.randn(
+            (batch_size * q_len, num_q_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    kv_cache = (
+        torch.randn(
+            (pages_per_seq, 2, num_kv_heads, page_size, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
     # Reuse one complete physical page row for every request.  This keeps the
     # exact logical B256/K4096 route while bounding the test's device footprint.
-    block_tables = torch.arange(
-        pages_per_seq, dtype=torch.int32, device=device
-    ).repeat(batch_size, 1)
-    seq_lens = torch.full(
-        (batch_size,), kv_len, dtype=torch.int32, device=device
+    block_tables = torch.arange(pages_per_seq, dtype=torch.int32, device=device).repeat(
+        batch_size, 1
     )
-    sinks = torch.linspace(
-        -2.0, 8.0, num_q_heads, dtype=torch.float32, device=device
-    )
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    sinks = torch.linspace(-2.0, 8.0, num_q_heads, dtype=torch.float32, device=device)
     reference_workspace = torch.empty(
         256 * 1024 * 1024, dtype=torch.uint8, device=device
     )
@@ -2404,15 +2407,9 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     # errors.  Use bounded BF16 inputs and the same sink-attention definition as
     # FlashInfer's reference tests, evaluated in FP32, and judge each
     # implementation against it at the standard BF16 tolerance.
-    key = kv_cache[:, 0].permute(0, 2, 1, 3).reshape(
-        kv_len, num_kv_heads, head_dim
-    )
-    value = kv_cache[:, 1].permute(0, 2, 1, 3).reshape(
-        kv_len, num_kv_heads, head_dim
-    )
-    key = torch.repeat_interleave(
-        key, num_q_heads // num_kv_heads, dim=1
-    ).contiguous()
+    key = kv_cache[:, 0].permute(0, 2, 1, 3).reshape(kv_len, num_kv_heads, head_dim)
+    value = kv_cache[:, 1].permute(0, 2, 1, 3).reshape(kv_len, num_kv_heads, head_dim)
+    key = torch.repeat_interleave(key, num_q_heads // num_kv_heads, dim=1).contiguous()
     value = torch.repeat_interleave(
         value, num_q_heads // num_kv_heads, dim=1
     ).contiguous()
@@ -2420,9 +2417,9 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     logits *= common["bmm1_scale"]
     sink_logits = sinks.view(1, num_q_heads, 1).expand(batch_size, -1, -1)
     weights = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
-    independent = torch.einsum(
-        "bhk,khd->bhd", weights[..., :-1], value.float()
-    ).to(query)
+    independent = torch.einsum("bhk,khd->bhd", weights[..., :-1], value.float()).to(
+        query
+    )
 
     torch.testing.assert_close(
         actual.float(), independent.float(), rtol=1e-2, atol=1e-2

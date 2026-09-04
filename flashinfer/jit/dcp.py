@@ -19,7 +19,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from .cake_fmha import (
     CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
@@ -53,7 +53,7 @@ _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
-def _get_dcp_family(name: str) -> Mapping[str, object]:
+def _get_dcp_family(name: str) -> Mapping[str, Any]:
     addon = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]
     if addon.get("installed") is not True:
         raise RuntimeError("the authenticated Cake FMHA DCP add-on is not installed")
