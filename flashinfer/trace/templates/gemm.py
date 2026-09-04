@@ -257,6 +257,102 @@ mm_bf16_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
+def _mm_bf16_swiglu_reference(A, B, pdl=False):
+    """Reference for prepared-weight BF16 GEMM followed by SwiGLU.
+
+    ``B.T`` is physically interleaved in 16-row ``[up, gate]`` groups. Undo
+    that preparation first, then preserve the public API's numerical boundary:
+    GEMM1 is rounded to BF16 before gate/up are promoted to FP32 for SwiGLU.
+    """
+    del pdl  # Launch scheduling does not change the numerical result.
+    k, gate_up_size = B.shape
+    n = gate_up_size // 2
+    interleave = 16
+    prepared_rows = B.T.reshape(n // interleave, 2, interleave, k)
+    up = prepared_rows[:, 0].reshape(n, k)
+    gate = prepared_rows[:, 1].reshape(n, k)
+    canonical_gate_up = torch.cat((gate, up), dim=0)
+
+    gate_up_bf16 = (A.float() @ canonical_gate_up.float().T).to(torch.bfloat16)
+    gate_bf16, up_bf16 = gate_up_bf16.chunk(2, dim=-1)
+    return (torch.nn.functional.silu(gate_bf16.float()) * up_bf16.float()).to(
+        torch.bfloat16
+    )
+
+
+def _mm_bf16_swiglu_init(
+    *,
+    M: int,
+    N: int = 0,
+    gate_up_size: int = 1024,
+    K: int = 6144,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a gate||up checkpoint weight and prepare its fused layout."""
+    del N  # Output-only axis derived from gate_up_size.
+    from flashinfer import prepare_bf16_swiglu_weight  # noqa: PLC0415
+
+    if gate_up_size <= 0 or gate_up_size % 128:
+        raise ValueError("gate_up_size must be a positive multiple of 128")
+    if K <= 0 or K % 128:
+        raise ValueError("K must be a positive multiple of 128")
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    canonical = (
+        torch.randn(gate_up_size, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    ).to(torch.bfloat16)
+    b = prepare_bf16_swiglu_weight(canonical, input_order="gate_up")
+    return {"a": a, "b": b, "pdl": False}
+
+
+mm_bf16_swiglu_trace = TraceTemplate(
+    op_type="gemm_bf16_swiglu",
+    description=(
+        "Low-M BF16 GEMM with a fused, unclamped SwiGLU epilogue and a "
+        "16-row-interleaved prepared gate/up weight."
+    ),
+    axes={
+        "M": Var(),
+        "gate_up_size": Const(
+            abbrev="g", description="Combined gate+up projection width (2*N)."
+        ),
+        "N": Var(description="Logical output width, derived as gate_up_size // 2."),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="BF16 activation."),
+        "B": Tensor(
+            ["K", "gate_up_size"],
+            param="b",
+            description=(
+                "Prepared BF16 weight with physical 16-row [up,gate] interleave."
+            ),
+        ),
+        "pdl": Scalar("bool", optional=True),
+    },
+    outputs={
+        "C": Tensor(
+            ["M", "N"],
+            dtype_from="a",
+            description="SwiGLU output; N = gate_up_size // 2.",
+        ),
+    },
+    constraints=[
+        "gate_up_size == 2 * N",
+        "M >= 1",
+        "M <= 64",
+        "N % 64 == 0",
+        "K % 128 == 0",
+    ],
+    tags=["status:experimental", "fused", "activation:swiglu"],
+    reference=_mm_bf16_swiglu_reference,
+    check=_gemm_check,
+    init=_mm_bf16_swiglu_init,
+)
+
+
 def _mm_fp8_init(
     *,
     M: int,
