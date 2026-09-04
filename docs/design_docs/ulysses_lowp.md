@@ -53,7 +53,8 @@ rank boundary. Protocol is chosen automatically by
 
 ### Protocol 3 — ALIGN-128 (fused single-pass)
 
-**Condition:** `L % 128 == 0`
+**Condition:** `L % 128 == 0`, where `L` is the **local shard length** at
+forward time (i.e. `global_sequence / world_size` for the current request).
 
 Every rank's local shard starts and ends on a 128-token boundary, so no
 quantization group straddles a rank edge. A single fused
@@ -65,6 +66,17 @@ all_gather(local_stats)        →  k_sum_all,  v_amax_all      [1 round]
 finalize_stats(k_sum_all, ...)  →  k_mean, v_scale            [per rank]
 quant_and_pack(q, kv, stats)  →  payload                     [per rank, fused]
 ```
+
+The protocol is selected **per request** by `stats_protocol_for(L,
+world_size)` at forward time, not at server startup. Whether Protocol 3 is
+reached depends entirely on the packed sequence length of each incoming
+request: if the caller pads the global sequence to a multiple of
+`128 × world_size`, the local shard is always a multiple of 128 and Protocol
+3 is always taken. The environment variable
+`SGLANG_MINIMAX_H3_PACKED_ALIGNMENT` (or its equivalent server argument) is
+an optional performance hint that controls this padding — it does not switch
+protocols globally; requests that happen to be aligned take Protocol 3
+regardless.
 
 ### Protocol 2 — boundary-amax merge
 
