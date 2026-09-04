@@ -173,7 +173,7 @@ parameter selects the scale layout expected by the consumer
 ### Routing helpers
 
 ```python
-stats_protocol_for(L, world_size) -> Literal[2, 3]
+stats_protocol_for(L, world_size) -> Literal["aligned", "boundary_merge"]
 required_alignment(world_size)    -> int      # minimum L multiple for aligned path
 aligned_length(L, world_size)     -> int      # smallest L' >= L satisfying alignment
 payload_spec(B, S, H, P)         -> PayloadSpec
