@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from flashinfer.comm import UlyssesCommunicator
+from flashinfer.comm import UlyssesCommunicator, UlyssesWorkspace
 from flashinfer.comm.ulysses_topology import UlyssesBackendError, UlyssesRankTopology
 
 
@@ -225,6 +225,44 @@ def test_w1_passthrough_no_copy(gloo_pg, monkeypatch):
     x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
     assert comm.scatter_heads(x) is x
     assert comm.gather_heads(x) is x
+    comm.close()
+
+
+@requires_cuda
+def test_w1_destination_passing_and_workspace(gloo_pg, monkeypatch):
+    _forbid_ipc_and_jit(monkeypatch)
+    comm = _make_w1(gloo_pg, monkeypatch, max_elems=4096)
+    x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
+    out = torch.empty_like(x)
+    workspace = comm.create_workspace(max_elems=x.numel())
+
+    assert isinstance(workspace, UlyssesWorkspace)
+    assert comm.scatter_heads(x, out=out, workspace=workspace) is out
+    assert torch.equal(out, x)
+    out.zero_()
+    assert comm.gather_heads(x, out=out, workspace=workspace) is out
+    assert torch.equal(out, x)
+
+    with pytest.raises(ValueError, match="expected"):
+        comm.scatter_heads(x, out=torch.empty(1, device="cuda", dtype=x.dtype))
+    with pytest.raises(TypeError, match="UlyssesWorkspace"):
+        comm.scatter_heads(x, workspace=object())
+    with pytest.raises(ValueError, match="capacity"):
+        comm.scatter_heads(x, workspace=comm.create_workspace(max_elems=x.numel() - 1))
+    with pytest.raises(ValueError, match="exceeds communicator"):
+        comm.create_workspace(max_elems=comm.max_elems + 1)
+    with pytest.raises(ValueError, match="workspace send buffer"):
+        comm.scatter_heads(
+            x,
+            out=workspace.send_buffer[: x.numel()].view_as(x),
+            workspace=workspace,
+        )
+    with pytest.raises(ValueError, match="workspace receive buffer"):
+        comm.gather_heads(
+            x,
+            out=workspace.recv_buffer[: x.numel()].view_as(x),
+            workspace=workspace,
+        )
     comm.close()
 
 
@@ -506,6 +544,241 @@ def _correctness_body(rank, world_size, group, backend):
             )
         comm.close()
     return ("ok", "correct")
+
+
+def _destination_passing_body(rank, world_size, group, backend):
+    B, S_local, H, D = 2, 7, 24, 32
+    max_elems = B * S_local * H * D
+    comm = UlyssesCommunicator(
+        group, max_elems=max_elems, dtype=torch.bfloat16, backend=backend
+    )
+    assert comm.backend == backend
+    workspace = comm.create_workspace()
+    send_ptr = workspace.send_buffer.data_ptr()
+    recv_ptr = workspace.recv_buffer.data_ptr()
+
+    for iteration in range(3):
+        torch.manual_seed(1000 + iteration + rank)
+        x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device="cuda")
+        scatter_out = torch.empty(
+            B,
+            S_local * world_size,
+            H // world_size,
+            D,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        returned = comm.scatter_heads(x, out=scatter_out, workspace=workspace)
+        ref = _ref_scatter_heads(x, world_size, rank, group)
+        torch.cuda.synchronize()
+        assert returned is scatter_out
+        assert torch.equal(scatter_out, ref)
+
+        torch.manual_seed(2000 + iteration + rank)
+        y = torch.randn_like(scatter_out)
+        gather_out = torch.empty_like(x)
+        returned = comm.gather_heads(y, out=gather_out, workspace=workspace)
+        ref = _ref_gather_heads(y, world_size, rank, group)
+        torch.cuda.synchronize()
+        assert returned is gather_out
+        assert torch.equal(gather_out, ref)
+        assert workspace.send_buffer.data_ptr() == send_ptr
+        assert workspace.recv_buffer.data_ptr() == recv_ptr
+
+    # After the communicator and NCCL path have warmed, explicit destinations
+    # plus workspace must not call Python-level tensor allocation APIs.
+    torch.manual_seed(4000 + rank)
+    x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device="cuda")
+    scatter_out = torch.empty(
+        B,
+        S_local * world_size,
+        H // world_size,
+        D,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    y = torch.randn_like(scatter_out)
+    gather_out = torch.empty_like(x)
+    scatter_ref = _ref_scatter_heads(x, world_size, rank, group)
+    gather_ref = _ref_gather_heads(y, world_size, rank, group)
+    original_empty = torch.empty
+    original_empty_like = torch.empty_like
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("stable workspace path attempted a tensor allocation")
+
+    torch.empty = reject_allocation
+    torch.empty_like = reject_allocation
+    allocations_before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    try:
+        comm.scatter_heads(x, out=scatter_out, workspace=workspace)
+        comm.gather_heads(y, out=gather_out, workspace=workspace)
+    finally:
+        torch.empty = original_empty
+        torch.empty_like = original_empty_like
+    torch.cuda.synchronize()
+    allocations_after = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert allocations_after == allocations_before
+    assert torch.equal(scatter_out, scatter_ref)
+    assert torch.equal(gather_out, gather_ref)
+
+    comm.close()
+    return ("ok", backend)
+
+
+def _head_chunk_body(rank, world_size, group, arg):
+    if isinstance(arg, tuple):
+        backend, dtype_name = arg
+    else:
+        backend, dtype_name = arg, "bfloat16"
+    dtype = getattr(torch, dtype_name)
+    B, S_local, H, D = 2, 7, 14 * world_size, 32
+    schedule = (3, 8, 3)
+    max_payload_elems = 3 * B * S_local * world_size * max(schedule) * D
+    comm = UlyssesCommunicator(
+        group,
+        max_elems=max_payload_elems,
+        dtype=dtype,
+        backend=backend,
+    )
+    assert comm.backend == backend
+    input_workspace = comm.create_workspace()
+    output_workspace = comm.create_workspace()
+
+    # Q/K/V are independent non-contiguous views of one fused projection.
+    torch.manual_seed(3000 + rank)
+    projection = torch.randn(B, S_local, H, 3, D, dtype=dtype, device="cuda")
+    query, key, value = projection.unbind(dim=3)
+    assert not query.is_contiguous()
+    expected_q = _ref_scatter_heads(query, world_size, rank, group)
+    expected_k = _ref_scatter_heads(key, world_size, rank, group)
+    expected_v = _ref_scatter_heads(value, world_size, rank, group)
+    full_output = torch.full_like(query.contiguous(), float("nan"))
+
+    offset = 0
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for head_count in schedule:
+            fused_out = torch.empty(
+                B,
+                S_local * world_size,
+                head_count,
+                3 * D,
+                dtype=query.dtype,
+                device=query.device,
+            )
+            returned = comm.scatter_qkv_head_chunk(
+                query,
+                key,
+                value,
+                head_offset=offset,
+                head_count=head_count,
+                out=fused_out,
+                workspace=input_workspace,
+            )
+            assert returned is fused_out
+            expected = torch.cat(
+                (
+                    expected_q[:, :, offset : offset + head_count],
+                    expected_k[:, :, offset : offset + head_count],
+                    expected_v[:, :, offset : offset + head_count],
+                ),
+                dim=-1,
+            )
+            assert torch.equal(fused_out, expected)
+
+            # Identity attention makes the complete reverse path reconstruct
+            # the original Q tensor after all bands have been merged.
+            attention_out = fused_out[..., :D]
+            comm.gather_output_head_chunk(
+                attention_out,
+                local_heads=14,
+                head_offset=offset,
+                out=full_output,
+                workspace=output_workspace,
+            )
+            offset += head_count
+    stream.synchronize()
+    assert torch.equal(full_output, query)
+
+    # The B=1 NCCL fast lifetime path may return a direct view of the
+    # workspace receive buffer, avoiding both an output allocation and an
+    # unpack copy. Its contents are valid until this workspace is reused.
+    if backend == "nccl":
+        projection_b1 = projection[:1]
+        q1, k1, v1 = projection_b1.unbind(dim=3)
+        direct = comm.scatter_qkv_head_chunk(
+            q1,
+            k1,
+            v1,
+            head_offset=3,
+            head_count=8,
+            workspace=input_workspace,
+        )
+        expected = torch.cat(
+            (
+                _ref_scatter_heads(q1, world_size, rank, group)[:, :, 3:11],
+                _ref_scatter_heads(k1, world_size, rank, group)[:, :, 3:11],
+                _ref_scatter_heads(v1, world_size, rank, group)[:, :, 3:11],
+            ),
+            dim=-1,
+        )
+        torch.cuda.synchronize()
+        assert direct.data_ptr() == input_workspace.recv_buffer.data_ptr()
+        assert torch.equal(direct, expected)
+
+    # The explicit-buffer head-chunk transport itself stays allocation-free
+    # after warmup (attention allocation is outside this primitive's scope).
+    head_count = 3
+    fused_out = torch.empty(
+        B,
+        S_local * world_size,
+        head_count,
+        3 * D,
+        dtype=dtype,
+        device="cuda",
+    )
+    noalloc_output = torch.full_like(query.contiguous(), float("nan"))
+    original_empty = torch.empty
+    original_empty_like = torch.empty_like
+
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("head-chunk transport attempted a tensor allocation")
+
+    torch.empty = reject_allocation
+    torch.empty_like = reject_allocation
+    allocations_before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    try:
+        comm.scatter_qkv_head_chunk(
+            query,
+            key,
+            value,
+            head_offset=0,
+            head_count=head_count,
+            out=fused_out,
+            workspace=input_workspace,
+        )
+        comm.gather_output_head_chunk(
+            fused_out[..., :D],
+            local_heads=14,
+            head_offset=0,
+            out=noalloc_output,
+            workspace=output_workspace,
+        )
+    finally:
+        torch.empty = original_empty
+        torch.empty_like = original_empty_like
+    torch.cuda.synchronize()
+    allocations_after = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert allocations_after == allocations_before
+    for source_rank in range(world_size):
+        start = source_rank * 14
+        assert torch.equal(
+            noalloc_output[:, :, start : start + head_count],
+            query[:, :, start : start + head_count],
+        )
+    comm.close()
+    return ("ok", backend)
 
 
 def _api_body(rank, world_size, group, backend):
@@ -1209,6 +1482,24 @@ def test_correctness_forced_nccl(world_size):
     # W=3 also proves the NCCL backend covers world sizes the fused kernel
     # does not support.
     _run_multi_rank("_correctness_body", world_size, "nccl")
+
+
+def test_destination_passing_forced_nccl():
+    _run_multi_rank("_destination_passing_body", 2, "nccl")
+
+
+def test_destination_passing_forced_nvlink():
+    _run_multi_rank("_destination_passing_body", 2, "nvlink", allow_skip=True)
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_head_chunk_forced_nccl(world_size, dtype_name):
+    _run_multi_rank("_head_chunk_body", world_size, ("nccl", dtype_name))
+
+
+def test_head_chunk_forced_nvlink():
+    _run_multi_rank("_head_chunk_body", 2, ("nvlink", "bfloat16"), allow_skip=True)
 
 
 def test_api_auto_ws3_falls_back_to_nccl():

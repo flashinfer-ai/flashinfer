@@ -289,6 +289,14 @@ run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
 time.
 
+**Destination-passing and workspace mode.** Both collectives accept an
+optional preallocated ``out=`` tensor. The NCCL backend additionally accepts
+a reusable :class:`UlyssesWorkspace`, which owns the packed send and receive
+buffers and removes their per-call allocations. Omitting both keywords keeps
+the original allocation path unchanged. The NVLink backend uses ``out=`` but
+does not consume the workspace because its IPC staging allocation is owned by
+the communicator.
+
 **Known limitations.**
 
 - PyTorch builds without ``torch.cuda.get_device_properties(...).uuid``
@@ -318,11 +326,73 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Preallocated outputs and NCCL staging can be reused across serialized calls::
+
+    workspace = comm.create_workspace()
+    q_global = torch.empty(B, S_global, H_local, D,
+                           dtype=q.dtype, device=q.device)
+    comm.scatter_heads(q, out=q_global, workspace=workspace)
+
 .. autoclass:: UlyssesCommunicator
     :members:
     :show-inheritance:
 
     .. automethod:: __init__
+
+.. autoclass:: UlyssesWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+Head-Chunk Layout and Transport Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Head-chunk APIs are opt-in building blocks for framework-owned
+communication/compute pipelines. They do not choose a chunk schedule, create
+streams/events or process groups, or alter the ordinary ``scatter_heads`` /
+``gather_heads`` path.
+
+``pack_ulysses_qkv_head_chunk`` accepts independent positive-strided Q/K/V
+views, selects the same destination-local head band from every Ulysses rank's
+head slice, and fuses Q/K/V into the last dimension. The communicator's
+``scatter_qkv_head_chunk`` method combines that transform with one all-to-all.
+After attention, ``gather_output_head_chunk`` performs the reverse all-to-all
+and writes the compact band directly into the full output. A framework that
+overlaps the two communication directions must use separate communicators and
+workspaces::
+
+    schedule = ((0, 3), (3, 8), (11, 3))  # local_heads == 14
+    full_output = torch.empty_like(q)
+    for head_offset, head_count in schedule:
+        qkv = input_comm.scatter_qkv_head_chunk(
+            q, k, v,
+            head_offset=head_offset,
+            head_count=head_count,
+            out=qkv_chunk_buffers[head_count],
+            workspace=input_workspace,
+        )
+        q_chunk, k_chunk, v_chunk = qkv.split(head_dim, dim=-1)
+        o_chunk = attention(q_chunk, k_chunk, v_chunk)
+        output_comm.gather_output_head_chunk(
+            o_chunk,
+            local_heads=14,
+            head_offset=head_offset,
+            out=full_output,
+            workspace=output_workspace,
+        )
+
+Head chunking is not automatically profitable. In particular, tensor
+parallelism reduces the effective local head count to approximately
+``H / (TP * Ulysses)``. Frameworks should enable a schedule only after all
+ranks agree that the attention backend supports every chunk head count and an
+offline benchmark shows a positive result. Small local-head counts, GQA/MLA
+with unequal Q/K/V heads, Ring Attention, and Attention2D should use the
+ordinary path unless separately implemented and measured.
+
+.. autofunction:: pack_ulysses_qkv_head_chunk
+
+.. autofunction:: merge_ulysses_output_head_chunk
 
 Topology Probing and Backend Selection
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
