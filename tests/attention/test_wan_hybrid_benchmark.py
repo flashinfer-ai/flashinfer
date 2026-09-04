@@ -9,6 +9,8 @@ import types
 
 import pytest
 
+from flashinfer.testing import utils as testing_utils
+
 
 _BENCHMARK_PATH = (
     Path(__file__).resolve().parents[2] / "benchmarks" / "bench_wan_hybrid_attention.py"
@@ -27,7 +29,41 @@ _SPEC.loader.exec_module(benchmark)
 
 
 def test_measure_order_reports_signed_and_absolute_deltas(monkeypatch) -> None:
-    samples = iter(([2.0], [4.0], [6.0], [2.0]))
+    def measured(sample: float, kernel_names: list[str]) -> tuple[list[float], dict]:
+        return [sample], {
+            "sample_count": 1,
+            "iterations": [
+                {
+                    "sample_index": 0,
+                    "kernel_activity_count": len(kernel_names),
+                    "kernel_activities": [
+                        {"name": name, "duration_ms": sample}
+                        for name in kernel_names
+                    ],
+                }
+            ],
+        }
+
+    samples = iter(
+        (
+            measured(
+                2.0,
+                [
+                    "void kernel_wan_hybrid_quantize_value<128>()",
+                    "void kernel_wan_hybrid_attention<128>()",
+                ],
+            ),
+            measured(4.0, ["production_fa4_kernel"]),
+            measured(6.0, ["production_fa4_kernel"]),
+            measured(
+                2.0,
+                [
+                    "void kernel_wan_hybrid_quantize_value<128>()",
+                    "void kernel_wan_hybrid_attention<128>()",
+                ],
+            ),
+        )
+    )
     monkeypatch.setattr(benchmark, "_measure_leg", lambda _fn: next(samples))
     monkeypatch.setattr(
         benchmark.torch.cuda,
@@ -45,6 +81,118 @@ def test_measure_order_reports_signed_and_absolute_deltas(monkeypatch) -> None:
     assert result["absolute_delta_ms"] == 3.0
     assert result["speedup"] == 2.5
     assert result["passed_speedup_ge_1"] is True
+    assert result["legs"][0]["cupti_activity_evidence"]["sample_count"] == 1
+    assert [
+        activity["name"]
+        for activity in result["legs"][0]["cupti_activity_evidence"][
+            "iterations"
+        ][0]["kernel_activities"]
+    ] == [
+        "void kernel_wan_hybrid_quantize_value<128>()",
+        "void kernel_wan_hybrid_attention<128>()",
+    ]
+    assert result["legs"][1]["cupti_activity_evidence"]["iterations"][0][
+        "kernel_activity_count"
+    ] == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "kernel_names", "message"),
+    [
+        (
+            "C",
+            [
+                "kernel_wan_hybrid_attention",
+                "kernel_wan_hybrid_quantize_value",
+            ],
+            "quantization and attention kernels in order",
+        ),
+        (
+            "F",
+            ["production_fa4_kernel", "unexpected_second_kernel"],
+            "exactly one kernel activity",
+        ),
+    ],
+)
+def test_validate_leg_activity_evidence_rejects_wrong_kernel_sequence(
+    label, kernel_names, message
+) -> None:
+    activity_evidence = {
+        "iterations": [
+            {
+                "kernel_activity_count": len(kernel_names),
+                "kernel_activities": [
+                    {"name": name, "duration_ms": 0.1}
+                    for name in kernel_names
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        benchmark._validate_leg_activity_evidence(label, activity_evidence)
+
+
+def test_measure_leg_requests_cupti_activity_evidence(monkeypatch) -> None:
+    captured = {}
+
+    def fake_bench_gpu_time(**kwargs):
+        captured.update(kwargs)
+        kwargs["cupti_activity_evidence"].append(
+            {
+                "sample_index": 0,
+                "kernel_activity_count": 2,
+                "kernel_activities": [
+                    {"name": "quantize", "duration_ms": 0.1},
+                    {"name": "attention", "duration_ms": 0.3},
+                ],
+                "kernel_sum_ms": 0.4,
+                "gpu_span_ms": 0.401,
+                "inter_kernel_gap_ms": 0.001,
+            }
+        )
+        return [0.401]
+
+    monkeypatch.setattr(benchmark, "bench_gpu_time", fake_bench_gpu_time)
+
+    samples, evidence = benchmark._measure_leg(lambda: None)
+
+    assert samples == [0.401]
+    assert captured["enable_cupti"] is True
+    assert captured["dry_run_iters"] == 2
+    assert captured["repeat_iters"] == 5
+    assert captured["cold_l2_cache"] is True
+    assert evidence["sample_count"] == 1
+    assert evidence["iterations"][0]["kernel_sum_ms"] == 0.4
+    assert evidence["iterations"][0]["inter_kernel_gap_ms"] == 0.001
+
+
+def test_cupti_activity_summary_preserves_kernel_durations_and_gap() -> None:
+    kernel_kind = object()
+    activities = [
+        ("attention", 1_100_250, 1_400_250, 2, 0, 0, 0, kernel_kind),
+        ("quantize", 1_000_000, 1_100_000, 1, 0, 0, 0, kernel_kind),
+    ]
+
+    result = testing_utils._summarize_cupti_iteration_activities(
+        activities, kernel_kind
+    )
+
+    assert result["activity_count"] == 2
+    assert result["kernel_activity_count"] == 2
+    assert [item["name"] for item in result["kernel_activities"]] == [
+        "quantize",
+        "attention",
+    ]
+    assert [item["duration_ms"] for item in result["kernel_activities"]] == [
+        pytest.approx(0.1),
+        pytest.approx(0.3),
+    ]
+    assert result["kernel_sum_ms"] == pytest.approx(0.4)
+    assert result["active_kernel_union_ms"] == pytest.approx(0.4)
+    assert result["kernel_span_ms"] == pytest.approx(0.40025)
+    assert result["inter_kernel_gap_ms"] == pytest.approx(0.00025)
+    assert result["gpu_span_ms"] == pytest.approx(0.40025)
 
 
 def test_baseline_quality_is_required_for_promotion() -> None:

@@ -57,8 +57,9 @@ def _load_production_fa4():
     return _flash_attn_fwd
 
 
-def _measure_leg(fn: Callable[[], None]) -> list[float]:
-    return [
+def _measure_leg(fn: Callable[[], None]) -> tuple[list[float], dict]:
+    activity_evidence = []
+    samples = [
         float(sample)
         for sample in bench_gpu_time(
             fn=fn,
@@ -67,8 +68,45 @@ def _measure_leg(fn: Callable[[], None]) -> list[float]:
             enable_cupti=True,
             use_cuda_graph=False,
             cold_l2_cache=True,
+            cupti_activity_evidence=activity_evidence,
         )
     ]
+    if len(activity_evidence) != len(samples):
+        raise RuntimeError(
+            "CUPTI activity evidence count does not match measured samples"
+        )
+    return samples, {
+        "sample_count": len(samples),
+        "iterations": activity_evidence,
+    }
+
+
+def _validate_leg_activity_evidence(label: str, activity_evidence: dict) -> None:
+    expected_candidate_kernels = (
+        "kernel_wan_hybrid_quantize_value",
+        "kernel_wan_hybrid_attention",
+    )
+    for iteration in activity_evidence["iterations"]:
+        kernel_names = [
+            activity["name"] for activity in iteration["kernel_activities"]
+        ]
+        if label == "C" and (
+            len(kernel_names) != len(expected_candidate_kernels)
+            or any(
+                expected not in actual
+                for expected, actual in zip(
+                    expected_candidate_kernels, kernel_names
+                )
+            )
+        ):
+            raise RuntimeError(
+                "candidate measurement must contain the quantization and "
+                "attention kernels in order"
+            )
+        if label == "F" and len(kernel_names) != 1:
+            raise RuntimeError(
+                "production FA4 measurement must contain exactly one kernel activity"
+            )
 
 
 def _measure_order(
@@ -82,7 +120,8 @@ def _measure_order(
     for leg_index, label in enumerate(order):
         process_id = os.getpid()
         stream_id = int(torch.cuda.current_stream().cuda_stream)
-        samples = _measure_leg(functions[label])
+        samples, activity_evidence = _measure_leg(functions[label])
+        _validate_leg_activity_evidence(label, activity_evidence)
         pooled[label].extend(samples)
         legs.append(
             {
@@ -94,6 +133,7 @@ def _measure_order(
                 "stream_id": stream_id,
                 "timing_backend": "CUPTI activity span",
                 "cold_l2": True,
+                "cupti_activity_evidence": activity_evidence,
             }
         )
     candidate_ms = statistics.median(pooled["C"])

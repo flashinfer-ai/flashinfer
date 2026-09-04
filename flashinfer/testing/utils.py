@@ -934,6 +934,58 @@ def bench_gpu_time_with_cuda_event(
     return measured_times
 
 
+def _summarize_cupti_iteration_activities(
+    activities, concurrent_kernel_kind
+) -> dict:
+    """Build a JSON-serializable timing decomposition for one CUPTI sample."""
+
+    ordered = sorted(activities, key=lambda item: (item[1], item[2], item[0]))
+    min_start = min(item[1] for item in ordered)
+    max_end = max(item[2] for item in ordered)
+
+    kernel_activities = [
+        item for item in ordered if item[7] == concurrent_kernel_kind
+    ]
+    kernel_intervals = sorted((item[1], item[2]) for item in kernel_activities)
+    active_kernel_ns = 0
+    if kernel_intervals:
+        union_start, union_end = kernel_intervals[0]
+        for start, end in kernel_intervals[1:]:
+            if start <= union_end:
+                union_end = max(union_end, end)
+            else:
+                active_kernel_ns += union_end - union_start
+                union_start, union_end = start, end
+        active_kernel_ns += union_end - union_start
+
+    kernel_span_ns = (
+        max(item[2] for item in kernel_activities)
+        - min(item[1] for item in kernel_activities)
+        if kernel_activities
+        else 0
+    )
+    return {
+        "activity_count": len(ordered),
+        "kernel_activity_count": len(kernel_activities),
+        "kernel_activities": [
+            {
+                "name": item[0],
+                "duration_ms": (item[2] - item[1]) / 1e6,
+                "start_offset_ms": (item[1] - min_start) / 1e6,
+                "end_offset_ms": (item[2] - min_start) / 1e6,
+            }
+            for item in kernel_activities
+        ],
+        "kernel_sum_ms": sum(
+            (item[2] - item[1]) / 1e6 for item in kernel_activities
+        ),
+        "active_kernel_union_ms": active_kernel_ns / 1e6,
+        "kernel_span_ms": kernel_span_ns / 1e6,
+        "inter_kernel_gap_ms": (kernel_span_ns - active_kernel_ns) / 1e6,
+        "gpu_span_ms": (max_end - min_start) / 1e6,
+    }
+
+
 def bench_gpu_time_with_cupti(
     fn,
     dry_run_iters: int = None,
@@ -949,6 +1001,7 @@ def bench_gpu_time_with_cupti(
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
     aggregate_op: Callable = max,
+    cupti_activity_evidence: Optional[List[dict]] = None,
 ):
     """
     Benchmark GPU time using CUPTI activity tracing for precise kernel timing.
@@ -985,6 +1038,9 @@ def bench_gpu_time_with_cupti(
         cold_l2_cache (bool): If True, flush L2 cache before each iteration to
             ensure cold-cache performance measurements (default: True).
         aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
+        cupti_activity_evidence (list, optional): When provided, append one
+            JSON-serializable activity summary per measured iteration. The
+            measured return values remain the first-to-last GPU activity spans.
 
     Returns:
         List[float]: Per-iteration GPU kernel execution times in milliseconds.
@@ -1047,6 +1103,10 @@ def bench_gpu_time_with_cupti(
             )
         from functools import partial
     except (ModuleNotFoundError, Exception) as e:
+        if cupti_activity_evidence is not None:
+            raise RuntimeError(
+                "CUPTI activity evidence was requested, but CUPTI is unavailable"
+            ) from e
         if isinstance(e, ModuleNotFoundError):
             warnings.warn(
                 "CUPTI is not installed. Try 'pip install -U cupti-python'. Falling back to CUDA events for benchmarking.",
@@ -1306,10 +1366,15 @@ def bench_gpu_time_with_cupti(
                 raise ValueError(
                     f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}"
                 )
-        min_start = min(k[1] for k in iter_kernels)
-        max_end = max(k[2] for k in iter_kernels)
-        span_ms = (max_end - min_start) / 1e6  # ns to ms
+        iteration_evidence = _summarize_cupti_iteration_activities(
+            iter_kernels, cupti.ActivityKind.CONCURRENT_KERNEL
+        )
+        span_ms = iteration_evidence["gpu_span_ms"]
         measured_times.append(span_ms)
+        if cupti_activity_evidence is not None:
+            cupti_activity_evidence.append(
+                {"sample_index": idx, **iteration_evidence}
+            )
     measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
@@ -1560,6 +1625,7 @@ def bench_gpu_time(
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
     aggregate_op: Callable = max,
+    cupti_activity_evidence: Optional[List[dict]] = None,
 ):
     """
     Unified GPU benchmarking interface with configurable timing backends.
@@ -1604,6 +1670,9 @@ def bench_gpu_time(
             (default: True). The strategy is automatically selected based on timing
             backend.
         aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
+        cupti_activity_evidence (list, optional): With ``enable_cupti=True``,
+            append one JSON-serializable activity summary per measured
+            iteration. Unsupported by the CUDA event and CUDA graph backends.
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds.
@@ -1656,6 +1725,11 @@ def bench_gpu_time(
     else:
         _cold_l2_cache = cold_l2_cache
 
+    if cupti_activity_evidence is not None and not enable_cupti:
+        raise ValueError(
+            "cupti_activity_evidence requires enable_cupti=True"
+        )
+
     if enable_cupti:
         return bench_gpu_time_with_cupti(
             fn=fn,
@@ -1669,6 +1743,7 @@ def bench_gpu_time(
             input_kwargs=input_kwargs,
             cold_l2_cache=_cold_l2_cache,
             aggregate_op=aggregate_op,
+            cupti_activity_evidence=cupti_activity_evidence,
         )
     if use_cuda_graph:
         return bench_gpu_time_with_cudagraph(
