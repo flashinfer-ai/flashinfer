@@ -21,10 +21,13 @@ pytest -s tests/moe/test_bgmv_moe.py
 pytest -s tests/moe/test_bgmv_moe_lora_delta.py
 
 # tests/experimental/ is excluded from `pytest tests/` by norecursedirs, so it has
-# to be named explicitly. Listed here, and not left to the targeted lane, because
-# these cover the gating machinery itself -- @flashinfer_experimental_api and
-# @experimental_backend live in flashinfer/api_logging.py and flashinfer/utils.py,
-# which are stable core. A regression there breaks stable dispatch, so it must fail
-# the stable lane rather than wait for someone to type a bot command. Tests of
-# experimental *backends* stay with the targeted lane.
-pytest -s tests/experimental/
+# to be named explicitly. This ONE FILE, not the directory: it covers the gating
+# machinery itself -- @flashinfer_experimental_api and @experimental_backend live in
+# flashinfer/api_logging.py and flashinfer/utils.py, which are stable core, so a
+# regression there breaks stable dispatch and must fail the stable lane rather than
+# wait for someone to type a bot command. Naming the directory instead would enrol
+# every future tests/experimental/test_<backend>.py into this shard automatically --
+# on hardware the backend may not target, against a timeout this shard never budgeted
+# for, and bypassing the per-PR declared scope that is the point of the experimental
+# lane. Backend tests stay with the targeted lane.
+pytest -s tests/experimental/test_experimental_api.py
