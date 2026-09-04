@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "description": "Capability surface of the NVFP4 paged-KV MSA prefill kernel on compute capability 10.0/10.3. Each field is a compile-time constant of the kernel body -- the shared-memory map, the 128-row MMA tile (8 query tokens x 16 GQA siblings of one KV head), the union-table capacity and the page addressing are derived from them -- so a geometry that is not listed here must never reach the kernel. Batch size, per-request query length, per-request KV length, total query count and block-table width are NOT listed: the kernel is parametric in all five and restricting them would make the capability unreachable rather than route it somewhere faster.",
+  "fields": [
+    "num_qo_heads",
+    "num_kv_heads",
+    "head_dim",
+    "page_size",
+    "topk"
+  ],
+  "workloads": [
+    [
+      64,
+      4,
+      128,
+      128,
+      16
+    ]
+  ],
+  "parametric_axes": {
+    "batch_size": "any positive value",
+    "per_request_query_length": "any positive length, heterogeneous across the batch, including lengths that are not a multiple of the 8-token row tile",
+    "seqused_k": "any per-request KV length at least as long as that request's query segment; the query offset is derived as seqused_k - query_length, and seqused_k is the SOLE source of KV length (cu_seqlens_k is refused)",
+    "total_q": "any positive value",
+    "max_blocks": "the block-table row width is a runtime argument and the only quantity in the kernel proportional to it is one row stride; up to max_selectable_blocks"
+  },
+  "capability_bounds": {
+    "causal": "required; the kernel masks every key past the query's own right-aligned position unconditionally",
+    "max_selectable_blocks": 16777215,
+    "max_selectable_blocks_reason": "A selected block id is packed into the low 24 bits of a union-table entry (bits 24..31 carry the per-query membership mask, and a zero word marks an empty slot), so the block-table width may not exceed 16777215 -- page_size 128 => 2147483520 context tokens. The bound is checked against the block-table width and never clamped: clamping would drop selected blocks from the union with no diagnostic. The union itself is a 128-slot open-addressed hash table sized by queries_per_tile * topk, so it does NOT scale with the block-table width; a 2048-wide table serving a 262144-token context is admitted and served at the same per-block cost as a 128-wide one.",
+    "softmax_lse": "not produced"
+  },
+  "scratch": {
+    "bytes": "0",
+    "bytes_per_request_at_128_blocks": 0,
+    "what": "None. Each CTA dequantizes the K and V sides of one selected page directly into its own 98848 B of dynamic shared memory, in the swizzled BF16 layout the MMA reads, so no BF16 copy of the cache is ever materialized in global memory. This route makes no workspace allocation, no device-global allocation and no caching-allocator temporary at any block-table width.",
+    "scales_with": "nothing"
+  },
+  "occupancy": {
+    "dynamic_shared_memory_bytes": 98848,
+    "threads_per_cta": 256,
+    "max_ctas_per_sm": 2,
+    "note": "The 98848 B request is what caps occupancy at 2 CTAs/SM on compute capability 10.0/10.3. It is the price of dequantizing in shared memory instead of through a global scratch, and it is recorded here because it bounds latency-hiding for any future tuning. The 256 threads are two warpgroups over the same 128 tile rows, split by KV column."
+  },
+  "grid": {
+    "shape": "(num_kv_heads, ceil(total_q / 8) + batch_size - 1, 1)",
+    "note": "An upper bound, not an exact count: the y extent over-covers by up to batch_size - 1 tiles because each request's tile count is rounded up independently, and the surplus CTAs exit immediately. KV head is the fastest-changing coordinate so all four heads share one heavy-to-light traversal. Each CTA linearly scans cu_seqlens_q to find its own request, which is O(batch_size) serial work per CTA."
+  },
+  "kv_cache_layout": {
+    "page_bytes": 73728,
+    "regions": [
+      [
+        "k_data",
+        0,
+        32768
+      ],
+      [
+        "k_scale",
+        32768,
+        4096
+      ],
+      [
+        "v_data",
+        36864,
+        32768
+      ],
+      [
+        "v_scale",
+        69632,
+        4096
+      ]
+    ],
+    "data_head_stride": 8192,
+    "scale_head_stride": 1024,
+    "k_scale_layout": "linear",
+    "v_scale_layout": "swizzled_4x4",
+    "note": "The four inputs are strided views over one packed page pool and are consumed in place; the byte offsets between their base pointers are asserted, because shape, dtype and stride cannot tell four views of one page apart from four unrelated allocations, and the V-scale swizzle is invisible to all three."
+  },
+  "reproducibility": {
+    "run_to_run_bitwise": "context <= 16384 tokens",
+    "note": "The per-tile block union is consumed in ascending hash-slot order. At or below 128 blocks per request the slot is a permutation of the selected set, the insert is a commutative atomicOr, and repeated runs are bit-identical. Above it the insert falls back to linear probing under atomicCAS and the accumulation order -- and therefore the last bits of the output -- depends on how the atomics resolve. Every result is correct either way; this is a determinism property, not a correctness one."
+  },
+  "softmax_range_guard": {
+    "fast_path_origin": "fixed",
+    "guard_band": [
+      "2**-120",
+      "2**112"
+    ],
+    "on_violation": "the tile is replayed against a data-derived running maximum",
+    "note": "The fast path exponentiates against a fixed origin, which is sound only because the row denominator is range-checked and any tile that fails is recomputed by a specialization that carries a per-row maximum and rescales both the running denominator and the output accumulator. The replay is exercised by real inputs and its cost is included in every figure this route quotes."
+  }
+}

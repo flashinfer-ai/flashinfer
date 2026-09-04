@@ -194,6 +194,7 @@ def msa_sparse_decode_attention(
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
 
@@ -216,7 +217,11 @@ def msa_sparse_decode_attention(
         that packs K and V in one ``2 * head_dim`` content dim per token
         on SM120/SM121 (see ``supports_packed_kv``). Compute capability
         10.0/10.3 requires separate contiguous K and V tensors and never
-        copies packed views implicitly.
+        copies packed views implicitly, with one exception: packed NVFP4
+        paged K/V (uint8, ``(num_pages, 4, 128, 64)``) is consumed in place
+        as strided views of a planar ``[K data | K scale | V data | V scale]``
+        page, together with ``k_scale``/``v_scale`` and the two global
+        scales.
     q2k_indices : torch.Tensor
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
@@ -242,11 +247,17 @@ def msa_sparse_decode_attention(
         16 elements, rows padded to a multiple of 128). Scale rows follow the
         cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
         token)`` for paged. SM120/SM121-only.
+        On compute capability 10.0/10.3 the paged NVFP4 decode route instead
+        takes the block-scale regions of the packed page as
+        ``(num_pages, num_kv_heads, page_size, head_dim // 16)`` views, either
+        uint8 or float8_e4m3fn: K scales linear, V scales ``(4, 4)``-swizzled
+        inside ``(token, scale index)``.
     k_global_scale, v_global_scale : float, optional
         Global dequant scales. On SM120/SM121, ``k_global_scale`` folds into
         the softmax scale for NVFP4 K and ``v_global_scale`` scales the output
         for any KV dtype. On SM100/SM103, both are supported only for uniform
-        FP8 Q/K/V decode.
+        FP8 Q/K/V decode and for the paged NVFP4 KV decode route, which
+        requires both.
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by causal alignment.
     partial_dtype : torch.dtype, optional
@@ -271,12 +282,36 @@ def msa_sparse_decode_attention(
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
 
+        The packed NVFP4 paged-KV route on compute capability 10.0/10.3 is the
+        one exception: it captures without a workspace, because everything
+        before its single kernel launch is host-side arithmetic over shapes and
+        strides. Passing one is still honoured, including the warm-vs-capture
+        identity check. What that route does require before capture is one
+        eager launch on the device, from
+        :func:`flashinfer.msa_ops.msa_decode_nvfp4_specialized_warmup` or from
+        any real call; ``msa_decode_nvfp4_specialized_stats()["cuda_graph"]``
+        states both facts for a caller that wants to check rather than assume.
+
+    out : torch.Tensor, optional
+        Destination for the attention output. When given, the kernel writes
+        straight into it and it is what this function returns -- no temporary
+        is allocated and nothing is copied. It must be contiguous, BF16, on
+        q's device, and exactly ``q.shape``; anything else raises rather than
+        being copied into, because a silent copy here is precisely the cost
+        this parameter exists to remove.
+
+        Supported by the packed-NVFP4 paged-KV route on compute capability
+        10.0/10.3. Every other route raises ``NotImplementedError`` when it is
+        passed -- deliberately, so that a caller cannot be handed the copy back
+        without being told.
+
     Returns
     -------
     torch.Tensor or (torch.Tensor, torch.Tensor)
         ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype, except
         uniform FP8 Q/K/V returns BF16; plus the natural-log LSE if
-        ``return_softmax_lse``.
+        ``return_softmax_lse``. When ``out`` is given it IS the returned
+        tensor.
     """
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_decode_attention(
@@ -299,11 +334,18 @@ def msa_sparse_decode_attention(
             partial_dtype=partial_dtype,
             force_fused=force_fused,
             workspace=workspace,
+            out=out,
         )
     if workspace is not None:
         raise ValueError(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3 backend"
+        )
+    if out is not None:
+        raise NotImplementedError(
+            "out= is implemented by the compute capability 10.0/10.3 "
+            "packed-NVFP4 paged-KV decode route; the SM120/SM121 backend "
+            "allocates its own output"
         )
     import cutlass
     import cutlass.cute as cute
