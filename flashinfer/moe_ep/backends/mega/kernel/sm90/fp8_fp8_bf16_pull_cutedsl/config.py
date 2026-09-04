@@ -56,7 +56,8 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
+    # Enables in_kernel_fc2_reduce
+    enable_in_kernel_fc2_reduce: bool = False
     token_back_by_dispatch: bool = False
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0

@@ -132,10 +132,6 @@ def _all_gather_stack(t):
     return torch.stack(gathered)
 
 
-def _token_back_for_ikr(in_kernel_fc2_reduce: bool) -> str:
-    return "reuse_dispatch_warps" if in_kernel_fc2_reduce else "epi_warps"
-
-
 def _megakernel_config(
     problem: dict,
     *,
@@ -149,8 +145,7 @@ def _megakernel_config(
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=_token_back_for_ikr(in_kernel_fc2_reduce),
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         knobs=knobs,
     )
 
@@ -178,7 +173,6 @@ def _reference_bf16_mega_moe(
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    token_back = _token_back_for_ikr(in_kernel_fc2_reduce)
     symm_buffer = get_symm_buffer_for_bf16_mega_moe(
         problem["num_experts"],
         problem["max_tokens"],
@@ -189,7 +183,6 @@ def _reference_bf16_mega_moe(
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back,
         knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
@@ -350,7 +343,6 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)
     )
-    token_back = _token_back_for_ikr(in_kernel_fc2_reduce)
     try:
         n = problem["num_tokens"]
         symm_buffer = get_symm_buffer_for_bf16_mega_moe(
@@ -363,7 +355,6 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             world_size,
             gate_up_clamp=problem["gate_up_clamp"],
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_mode=token_back,
         )
         try:
             stage_mega_moe_inputs(

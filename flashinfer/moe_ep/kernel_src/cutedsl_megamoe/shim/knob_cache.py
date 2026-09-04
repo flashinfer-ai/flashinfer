@@ -32,6 +32,9 @@ per buffer size); lookup picks the exact bucket when present, else the
 smallest recorded bucket >= the requested size, else the largest below it.
 All other key fields must match exactly — an untuned geometry deliberately
 falls back to the heuristic instead of borrowing a neighbour's knobs.
+
+If enabling ikr finds a faster config, each shape can have two winners:
+On for each of ikr on/off
 """
 
 from __future__ import annotations
@@ -123,6 +126,12 @@ def _knobs_from_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in knobs.items()}
 
 
+def _entry_needs_ikr(entry: Dict[str, Any]) -> bool:
+    """Whether a recorded winner requires ikr"""
+    knobs = entry.get("knobs")
+    return bool(isinstance(knobs, dict) and knobs.get("in_kernel_fc2_reduce"))
+
+
 def lookup_knobs(
     *,
     dtype: str,
@@ -133,9 +142,13 @@ def lookup_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return the cached knob dict for this session key, or ``None`` on miss."""
+    """Return the cached knob dict for this session key, or ``None`` on miss.
+
+    ``enable_in_kernel_fc2_reduce`` indicates whether the user has opted in to in_kernel_fc2_reduce.
+    """
     path = _cache_path()
     if path is None:
         return None
@@ -149,20 +162,37 @@ def lookup_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
     )
+    # BF16 and BF16-MXFP8 have different user interfaces for in_kernel_fc2_reduce, so we filter by exact match
+    # MXFP8 and NVFP4 can turn it on or off, without changing the API surface
+    # TODO: Remove this if we fuse the reduction into the kernel without IKR, like for MXFP8/NVFP4
+    session_owns_ikr = dtype in (
+        "bf16",
+        "bf16_mxfp8",
+        "bf16_mxfp8_e4m3",
+        "bf16_mxfp8_e5m2",
+    )
     matches = [
         e
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
+        and (
+            _entry_needs_ikr(e) == bool(enable_in_kernel_fc2_reduce)
+            if session_owns_ikr
+            else (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
+        )
     ]
     if not matches:
         return None
+    # We use IKR to break ties. If IKR is not allowed, that will be filtered out when constructing matches
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
     if at_or_above:
-        best = min(at_or_above, key=lambda e: e["max_tokens"])
+        best = min(
+            at_or_above, key=lambda e: (e["max_tokens"], not _entry_needs_ikr(e))
+        )
     else:
-        best = max(matches, key=lambda e: e["max_tokens"])
+        best = max(matches, key=lambda e: (e["max_tokens"], _entry_needs_ikr(e)))
     return _knobs_from_json(best["knobs"])
 
 
@@ -182,6 +212,11 @@ def record_knobs(
     source: str = "autotune",
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
+
+    Deterministic and ikr-tuned winners for the same geometry are separate
+    entries (see :func:`_entry_needs_ikr`), so a ``--allow-nondeterministic``
+    sweep does not evict the deterministic winner a reproducible session needs,
+    or vice versa.
 
     Returns the cache path written, or ``None`` when the cache is disabled or
     the write failed (recording is best-effort — a read-only home directory
@@ -213,6 +248,7 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
+                and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
         ]
         entries.append(entry)
@@ -248,12 +284,21 @@ def resolve_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
     Returns ``(knobs, source)`` where source is ``"cache"`` or ``"heuristic"``.
     Cheap and deterministic — safe on the engine hot path (called once per
     buffer creation, never per forward).
+
+    ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` describe the calling
+    session, so resolution can never hand back a knob set the session's config
+    would reject: the heuristic is built against them (see
+    :func:`.tuner.default_knobs`) and the lookup only considers entries tuned
+    under a compatible ikr objective (see :func:`lookup_knobs`), so a cache
+    populated with ``--allow-nondeterministic`` stays safe to share with
+    sessions that need a reproducible combine.
     """
     cached = lookup_knobs(
         dtype=dtype,
@@ -264,10 +309,26 @@ def resolve_knobs(
         topk=topk,
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
     if cached is not None:
         return cached, "cache"
     from .tuner import default_knobs
 
-    heuristic_dtype = "mxfp8" if dtype.startswith("mxfp8") else dtype
-    return default_knobs(max_tokens, dtype=heuristic_dtype), "heuristic"
+    # The cache keys on the precise element kind (``mxfp8_e4m3`` and
+    # ``mxfp8_e5m2`` are separate compiles); the profiles are per kernel.
+    if dtype.startswith("bf16_mxfp8"):
+        heuristic_dtype = "bf16_mxfp8"
+    elif dtype.startswith("mxfp8"):
+        heuristic_dtype = "mxfp8"
+    else:
+        heuristic_dtype = dtype
+    return (
+        default_knobs(
+            max_tokens,
+            dtype=heuristic_dtype,
+            combine_dtype=combine_dtype,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        ),
+        "heuristic",
+    )
