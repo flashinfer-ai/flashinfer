@@ -819,6 +819,11 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
     return torch.matmul(A_f, B_f).to(dtype)
 
 
+def _mm_bf16_fp8_reference(A, B, B_scale, dtype):
+    """Reference W8A16 GEMM using the quantized FP8 weight exactly."""
+    return (torch.mm(A.float(), B.to(A.dtype).float()) * B_scale.float()).to(dtype)
+
+
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
     """Reference MXFP8 BMM (block size 32, 1D 128x4-swizzled E8M0 scales)."""
     block = 32
@@ -944,6 +949,55 @@ bmm_fp8_trace = TraceTemplate(
     init=_bmm_fp8_init,
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
+
+
+def _mm_bf16_fp8_init(
+    *,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build BF16 activations and an unbatched bmm_fp8-compatible FP8 weight."""
+    del scalar
+    torch.manual_seed(seed)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight_nt = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    B_nt, B_scale = per_tensor_fp8_quantize(weight_nt)
+    return {
+        "A": A,
+        "B": B_nt.T,
+        "B_scale": B_scale.reshape(1),
+        "dtype": torch.bfloat16,
+    }
+
+
+mm_bf16_fp8_trace = TraceTemplate(
+    op_type="mm_bf16_fp8",
+    description=(
+        "Per-tensor W8A16 matrix multiply. A is bfloat16; B is a column-major "
+        "float8_e4m3fn weight shared with bmm_fp8."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "scalar": Var(description="Weight scale tensor length (always 1)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], dtype="bfloat16"),
+        "B": Tensor(["K", "N"], dtype="float8_e4m3fn"),
+        "B_scale": Tensor(["scalar"], dtype="float32"),
+        "dtype": Scalar("int32", description="Output dtype."),
+    },
+    outputs={"C": Tensor(["M", "N"], dtype="bfloat16")},
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_mm_bf16_fp8_reference,
+    check=_gemm_check,
+    init=_mm_bf16_fp8_init,
+)
 
 
 def _bmm_mxfp8_init(

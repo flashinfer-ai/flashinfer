@@ -27,6 +27,7 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
 
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
@@ -124,6 +125,7 @@ __all__ = (
         "bmm_fp8",
         "bmm_mxfp8",
         "mm_bf16",
+        "mm_bf16_fp8",
         "mm_fp4",
         "mm_fp8",
         "mm_mxfp8",

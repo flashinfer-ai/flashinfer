@@ -14,6 +14,7 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+mm_bf16_fp8_N64_K128.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 fused_add_rmsnorm_h5120.json
@@ -450,6 +451,16 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
+# ── MM bf16 x fp8 (shared bmm_fp8 weight) ───────────────────────────────────
+try:
+    M, K, N = 16, 128, 64
+    a_w8a16 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    weight_w8a16_nt = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    weight_scale_w8a16 = torch.ones(1, dtype=torch.float32, device=device)
+    flashinfer.mm_bf16_fp8(a_w8a16, weight_w8a16_nt.T, weight_scale_w8a16)
+except Exception:
+    pass
+
 # ── BMM mxfp8 (Blackwell SM100+: 2×128×128, block=32) ────────────────────────
 try:
     batch_size, M, K, N = 2, 128, 128, 128
@@ -554,7 +565,6 @@ try:
     )
 except Exception:
     pass  # Requires Blackwell (SM100+)
-
 # ── GQA paged decode (Llama-3.1-8B, h=32/kv=8/d=128) ────────────────────────
 num_qo, num_kv, head_dim, batch_size = 32, 8, 128, 32
 

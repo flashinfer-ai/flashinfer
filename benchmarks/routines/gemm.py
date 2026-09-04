@@ -40,6 +40,8 @@ def run_gemm_test(args):
         return testGroupGemmFp8NtGroupwise(args)
     elif args.routine == "bmm_fp8":
         return testBmmFp8(args)
+    elif args.routine == "mm_bf16_fp8":
+        return testMmBf16Fp8(args)
     elif args.routine == "mm_fp8":
         return testMmFp8(args)
     elif args.routine == "bmm_mxfp8":
@@ -178,7 +180,8 @@ def parse_gemm_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16)."
+            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, "
+            "mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16)."
         ),
     )
     parser.add_argument(
@@ -210,6 +213,13 @@ def parse_gemm_args(line, parser):
             args.backends = ["cute-dsl"]
         if not has_input_dtype_arg:
             args.input_dtype = "bfloat16"
+    if args.routine == "mm_bf16_fp8":
+        if not has_backends_arg:
+            args.backends = ["auto"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
+        if not has_mat2_dtype_arg:
+            args.mat2_dtype = "fp8_e4m3"
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
@@ -841,6 +851,96 @@ def testBmmFp8(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+def testMmBf16Fp8(args):
+    """Benchmark W8A16 GEMM with a weight allocation shared with bmm_fp8."""
+    if args.verbose >= 1:
+        print("[INFO] Running testMmBf16Fp8")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    unsupported_backends = set(args.backends) - {"auto"}
+    if unsupported_backends:
+        raise ValueError(
+            "mm_bf16_fp8 does not accept a backend; omit --backends or use auto; got "
+            f"{sorted(unsupported_backends)}"
+        )
+    m, n, k = args.m, args.n, args.k
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if input_dtype != torch.bfloat16:
+        raise ValueError("mm_bf16_fp8 requires input_dtype=bfloat16")
+    if mat2_dtype != torch.float8_e4m3fn:
+        raise ValueError("mm_bf16_fp8 requires mat2_dtype=fp8_e4m3")
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("mm_bf16_fp8 requires a bf16 or fp16 output")
+
+    torch.manual_seed(args.random_seed)
+    a = torch.randn(m, k, dtype=torch.bfloat16, device=device)
+    weight_nt = torch.randn(n, k, dtype=torch.bfloat16, device=device)
+    weight_nt, weight_scale = to_float8(weight_nt, dtype=mat2_dtype)
+    weight = weight_nt.T
+    weight_scale = weight_scale.reshape(1)
+    out = torch.empty(m, n, dtype=out_dtype, device=device)
+
+    def run(a, weight, weight_scale, out):
+        return flashinfer.mm_bf16_fp8(a, weight, weight_scale, dtype=out_dtype, out=out)
+
+    inputs = (a, weight, weight_scale, out)
+    run(*inputs)
+
+    if args.refcheck:
+        reference = (
+            torch.mm(a.float(), weight.to(a.dtype).float()) * weight_scale.float()
+        ).to(out_dtype)
+        actual = run(*inputs)
+        cosine = F.cosine_similarity(
+            reference.float().reshape(-1), actual.float().reshape(-1), dim=0
+        )
+        if cosine < 0.99 and not args.allow_output_mismatch:
+            raise AssertionError(f"mm_bf16_fp8 output cosine similarity is {cosine}")
+
+    timing = bench_gpu_time(
+        fn=run,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=True,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=inputs,
+    )
+    median_time = float(np.median(timing))
+    std_time = float(np.std(timing))
+    flops = 2 * m * n * k
+    bytes_accessed = (
+        m * k * input_dtype.itemsize
+        + n * k * mat2_dtype.itemsize
+        + m * n * out_dtype.itemsize
+    )
+    tflops = flops / median_time / 1e9
+    tb_per_sec = bytes_accessed / median_time / 1e9
+    backend_name = "auto"
+    print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+    return [
+        {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "backend": backend_name,
+            "m": m,
+            "n": n,
+            "k": k,
+            "input_dtype": str(input_dtype).split(".")[-1],
+            "mat2_dtype": str(mat2_dtype).split(".")[-1],
+            "out_dtype": str(out_dtype).split(".")[-1],
+            "case_tag": args.case_tag,
+        }
+    ]
 
 
 def testMmFp8(args):

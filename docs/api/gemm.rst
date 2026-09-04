@@ -43,6 +43,14 @@ BF16 x FP4 GEMM (W4A16)
     prepare_bf16_fp4_weights
     mm_bf16_fp4
 
+BF16 x FP8 GEMM (W8A16)
+-----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16_fp8
+
 MXFP8 GEMM
 ----------
 

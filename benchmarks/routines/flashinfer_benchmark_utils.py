@@ -237,6 +237,7 @@ benchmark_apis = {
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "bmm_fp8",
+        "mm_bf16_fp8",
         "mm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
