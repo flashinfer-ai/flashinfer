@@ -71,6 +71,9 @@ from .api import (
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    QUANT_PAIR_TO_VARIANT,
+    QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingInputMode,
 )
@@ -442,6 +445,19 @@ def _cutlass_activation_params(
     return params
 
 
+class _LegacyQuantVariants:
+    """Derive the deprecated ``supported_quant_variants`` tuple from MMA pairs."""
+
+    def __get__(self, obj, owner):
+        if owner is None:
+            return self
+        return tuple(
+            QUANT_PAIR_TO_VARIANT[pair]
+            for pair in owner.supported_quant_pairs
+            if pair in QUANT_PAIR_TO_VARIANT
+        )
+
+
 class MoERunner(TunableRunner):
     """Unified MoE runner lifecycle: validate, build once, then execute.
 
@@ -460,11 +476,14 @@ class MoERunner(TunableRunner):
 
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
-    supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+    supported_quant_pairs: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ()
+    supported_output_formats: ClassVar[tuple[QuantFormat, ...]] = (QuantFormat.BF16,)
+    # Derived from ``supported_quant_pairs`` for tests / fuzz handlers.
+    supported_quant_variants = _LegacyQuantVariants()
     # Default to no activations; each concrete runner must declare its support.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = ()
     supported_activation_classes_by_quant: ClassVar[
-        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {}
     # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
@@ -500,6 +519,14 @@ class MoERunner(TunableRunner):
         launch_state = self.launch_state_for(inputs)
         return {"launch_state": launch_state} if launch_state is not None else {}
 
+    @classmethod
+    def supports_quant(cls, quant: QuantConfig) -> bool:
+        """Return whether this runner can execute ``quant``'s three format axes."""
+        return (
+            quant.pair in cls.supported_quant_pairs
+            and quant.output in cls.supported_output_formats
+        )
+
     def check_support(self) -> None:
         self._support_checked = False
         self._check_support()
@@ -507,24 +534,33 @@ class MoERunner(TunableRunner):
 
     def _check_support(self) -> None:
         """Raise if the initialized runner cannot execute its configuration."""
-        variant = self.config.quant.variant
-        if variant not in self.supported_quant_variants:
+        quant = self.config.quant
+        pair = quant.pair
+        if pair not in self.supported_quant_pairs:
+            variant = quant.variant
+            extra = f" QuantVariant.{variant.name}." if variant is not None else ""
             raise NotImplementedError(
-                f"{type(self).__name__} does not support QuantVariant.{variant.name}."
+                f"{type(self).__name__} does not support weight={quant.weight.name}, "
+                f"activation={quant.activation.name}.{extra}"
+            )
+        if quant.output not in self.supported_output_formats:
+            names = ", ".join(fmt.name for fmt in self.supported_output_formats)
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support output={quant.output.name}; "
+                f"supported outputs are {names}."
             )
         if self.supported_activation_classes_by_quant:
             # Strict lookup: a runner that declares per-quant capabilities must
-            # declare them for every variant it accepts. Falling back to the
+            # declare them for every MMA pair it accepts. Falling back to the
             # permissive class default would silently admit every activation on
-            # a newly added variant.
+            # a newly added pair.
             try:
-                supported_activations = self.supported_activation_classes_by_quant[
-                    variant
-                ]
+                supported_activations = self.supported_activation_classes_by_quant[pair]
             except KeyError:
                 raise NotImplementedError(
                     f"{type(self).__name__} declares per-quantization activation "
-                    f"support but has no entry for QuantVariant.{variant.name}; "
+                    f"support but has no entry for weight={quant.weight.name}, "
+                    f"activation={quant.activation.name}; "
                     "add one to supported_activation_classes_by_quant."
                 ) from None
         else:
@@ -537,8 +573,9 @@ class MoERunner(TunableRunner):
             names = ", ".join(cls.__name__ for cls in supported_activations)
             raise NotImplementedError(
                 f"{type(self).__name__} does not support "
-                f"{type(self.config.activation).__name__} for QuantVariant."
-                f"{variant.name}; supported activations are {names}."
+                f"{type(self.config.activation).__name__} for weight="
+                f"{quant.weight.name}, activation={quant.activation.name}; "
+                f"supported activations are {names}."
             )
         self._assert_shared_experts_supported()
         self._assert_expert_parallelism_supported()
@@ -607,7 +644,9 @@ class MoERunner(TunableRunner):
         return (
             self.backend_key,
             # The persistent key uses str(), so prefer stable scalar values.
-            self.config.quant.variant.name,
+            self.config.quant.weight.name,
+            self.config.quant.activation.name,
+            self.config.quant.output.name,
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
@@ -652,7 +691,7 @@ class CakeWarpDecodeRunner(MoERunner):
 
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = (SwiGLU,)
     supports_expert_parallelism = False
 
@@ -1956,7 +1995,7 @@ class CutlassBf16Runner(_CutlassRunnerBase):
     """Unified adapter for dense BF16 CUTLASS fused MoE."""
 
     backend_key = "cutlass_bf16"
-    supported_quant_variants = (QuantVariant.BF16,)
+    supported_quant_pairs = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_BF16_ARCHS
     _weight_dtype = torch.bfloat16
@@ -1988,7 +2027,7 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
     """Unified adapter for MXFP4-weight x BF16-activation fused MoE."""
 
     backend_key = "cutlass_w4a16"
-    supported_quant_variants = (QuantVariant.W4A16,)
+    supported_quant_pairs = ((QuantFormat.MXFP4, QuantFormat.BF16),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_W4A16_ARCHS
     _weight_dtype = torch.uint8
@@ -2057,7 +2096,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     """
 
     backend_key = "cutlass_nvfp4"
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
     _weight_dtype = torch.int64
@@ -2170,7 +2209,7 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS per-tensor FP8 fused MoE."""
 
     backend_key = "cutlass_fp8_per_tensor"
-    supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    supported_quant_pairs = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_FP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2234,7 +2273,7 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS DeepSeek 128x128 FP8 block-scale MoE."""
 
     backend_key = "cutlass_fp8_block"
-    supported_quant_variants = (QuantVariant.DeepSeekFp8,)
+    supported_quant_pairs = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_FP8_BLOCK_ARCHS
     _weight_dtype = torch.float8_e4m3fn
@@ -2294,7 +2333,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE."""
 
     backend_key = "cutlass_mxfp8_mxfp4"
-    supported_quant_variants = (QuantVariant.MXFP4,)
+    supported_quant_pairs = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_MXFP4_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2383,7 +2422,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE."""
 
     backend_key = "cutlass_mxfp8"
-    supported_quant_variants = (QuantVariant.MxFp8,)
+    supported_quant_pairs = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2462,7 +2501,7 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS INT4-weight x FP8-activation fused MoE."""
 
     backend_key = "cutlass_w4a8"
-    supported_quant_variants = (QuantVariant.W4A8,)
+    supported_quant_pairs = ((QuantFormat.INT4, QuantFormat.FP8PerTensor),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_W4A8_ARCHS
     _weight_dtype = torch.uint8
@@ -2559,7 +2598,7 @@ class CutlassHummingRunner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS Humming MXFP4 x FP8 fused MoE."""
 
     backend_key = "cutlass_humming"
-    supported_quant_variants = (QuantVariant.Humming,)
+    supported_quant_pairs = ((QuantFormat.MXFP4, QuantFormat.FP8PerTensor),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_HUMMING_ARCHS
     _weight_dtype = torch.uint8
@@ -2852,7 +2891,7 @@ class CuTileBf16Runner(MoERunner):
 
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.BF16,)
+    supported_quant_pairs = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
@@ -3299,7 +3338,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
 
     backend_key = "cutile_nvfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     _block_sizes = (16, 32, 64, 128)
     _supported_archs = _CUTILE_NVFP4_ARCHS
     _precision_name = "NVFP4"
@@ -3742,10 +3781,10 @@ class CuteDslRunner(MoERunner):
     backend_key = "cute_dsl"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (
-        QuantVariant.NVFP4,
-        QuantVariant.MXFP4,
-        QuantVariant.W4A16,
+    supported_quant_pairs = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.NVFP4, QuantFormat.BF16),
     )
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
 
@@ -4170,18 +4209,18 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
-        QuantVariant.NVFP4,
-        QuantVariant.MXFP4,
-        QuantVariant.W4A16,
+    supported_quant_pairs = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
     )
     supports_fused_shared_experts = True
     supported_activation_classes_by_quant: ClassVar[
-        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-        QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-        QuantVariant.W4A16: (SwiGLU,),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
     }
 
     def _check_support(self) -> None:
@@ -4675,16 +4714,16 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
-        QuantVariant.DeepSeekFp8,
-        QuantVariant.MxFp8,
+    supported_quant_pairs = (
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
     supports_fused_shared_experts = True
     supported_activation_classes_by_quant: ClassVar[
-        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        QuantVariant.DeepSeekFp8: (SwiGLU,),
-        QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
     }
 
     def _check_support(self) -> None:
@@ -5013,7 +5052,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    supported_quant_pairs = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
     # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
     # representable by the enum but has no matching generated kernel.
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -5307,7 +5346,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (QuantVariant.BF16,)
+    supported_quant_pairs = ((QuantFormat.BF16, QuantFormat.BF16),)
     # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
     # SiTU are represented by the launcher enum but have no matching kernels.
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -5524,7 +5563,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (QuantVariant.MxInt4,)
+    supported_quant_pairs = ((QuantFormat.MXINT4, QuantFormat.MXINT4),)
     supported_activation_classes = (SwiGLU,)
 
     def _check_support(self) -> None:
@@ -5858,16 +5897,16 @@ class _B12xRunner(MoERunner):
         return [-1]
 
     def _get_quant_mode_name(self) -> str:
-        if len(self.supported_quant_variants) != 1:
+        if len(self.supported_quant_pairs) != 1:
             raise ValueError(
-                f"{type(self).__name__} must support exactly one quant variant."
+                f"{type(self).__name__} must support exactly one quant pair."
             )
-        quant_variant = self.supported_quant_variants[0]
-        if quant_variant is QuantVariant.NVFP4:
+        pair = self.supported_quant_pairs[0]
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
             return "nvfp4"
-        if quant_variant is QuantVariant.W4A16:
+        if pair == (QuantFormat.NVFP4, QuantFormat.BF16):
             return "w4a16"
-        raise ValueError(f"Unsupported b12x quant variant: {quant_variant!r}.")
+        raise ValueError(f"Unsupported b12x quant pair: {pair!r}.")
 
     def _validate_prepared_weights(
         self, prepared_weights: dict[str, torch.Tensor]
@@ -6001,7 +6040,7 @@ class B12xNvfp4Runner(_B12xRunner):
 
     backend_key = "b12x_nvfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2)
     required_weight_keys = (
         "w1_weight",
@@ -6019,7 +6058,7 @@ class B12xW4A16Runner(_B12xRunner):
 
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.W4A16,)
+    supported_quant_pairs = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes = (SwiGLU, ReLU2)
     required_weight_keys = (
         "w1_weight",

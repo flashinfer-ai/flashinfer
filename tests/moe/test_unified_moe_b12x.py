@@ -51,6 +51,7 @@ from flashinfer.fused_moe.api import (
     MoEConfig,
     MoEFinalizeConfig,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     RoutingInputMode,
@@ -131,7 +132,7 @@ class TestB12xUnifiedValidation:
     ):
         return MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=variant),
+            quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4),
             experts=experts or ExpertConfig(intermediate_size=512),
             activation=SwiGLU() if activation is None else activation,
             backend=BackendOptions((backend,)),
@@ -174,10 +175,19 @@ class TestB12xUnifiedValidation:
         runner = object.__new__(runner_type)
         assert runner._get_quant_mode_name() == expected
 
-    @pytest.mark.parametrize("variants", ((), (QuantVariant.NVFP4, QuantVariant.W4A16)))
-    def test_b12x_quant_mode_requires_one_variant(self, variants):
+    @pytest.mark.parametrize(
+        "pairs",
+        (
+            (),
+            (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.NVFP4, QuantFormat.BF16),
+            ),
+        ),
+    )
+    def test_b12x_quant_mode_requires_one_variant(self, pairs):
         runner = object.__new__(B12xNvfp4Runner)
-        runner.supported_quant_variants = variants
+        runner.supported_quant_pairs = pairs
         with pytest.raises(ValueError, match="exactly one"):
             runner._get_quant_mode_name()
 
@@ -469,7 +479,7 @@ def _make_b12x_layer_and_packs(
     weight_pack.prepare_for(backend_key, prepared)
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=num_experts,

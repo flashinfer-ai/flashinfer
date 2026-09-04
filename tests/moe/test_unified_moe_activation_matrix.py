@@ -2,7 +2,7 @@
 
 import pytest
 
-from flashinfer.fused_moe.api import QuantVariant, SwiGLU
+from flashinfer.fused_moe.api import QuantFormat, SwiGLU
 from scripts import generate_moe_activation_matrix as matrix
 from scripts.generate_moe_activation_matrix import (
     check_activation_matrix,
@@ -12,11 +12,15 @@ from scripts.generate_moe_activation_matrix import (
 
 def test_activation_matrix_rows_are_unique_and_complete():
     rows = get_activation_matrix_rows()
-    keys = [(backend_key, variant) for backend_key, _, variant, _ in rows]
+    keys = [(backend_key, label) for backend_key, _, label, _ in rows]
+    labels = {label for _, _, label, _ in rows}
 
     assert rows
     assert len(keys) == len(set(keys))
     assert all(activations for _, _, _, activations in rows)
+    # The two W4A16 encodings must not collapse to one QuantVariant name.
+    assert "MXFP4×BF16" in labels
+    assert "NVFP4×BF16" in labels
 
 
 def test_documented_activation_matrix_matches_runner_registry():
@@ -29,9 +33,12 @@ def test_quant_specific_activation_mapping_must_cover_exact_variants(monkeypatch
 
     class Runner:
         backend_key = "incomplete"
-        supported_quant_variants = (QuantVariant.BF16, QuantVariant.NVFP4)
+        supported_quant_pairs = (
+            (QuantFormat.BF16, QuantFormat.BF16),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        )
         supported_activation_classes_by_quant = {
-            QuantVariant.BF16: (SwiGLU,),
+            (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU,),
         }
 
     monkeypatch.setattr(matrix, "_BACKEND_RUNNERS", {Config: Runner})
