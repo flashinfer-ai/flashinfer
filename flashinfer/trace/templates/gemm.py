@@ -2263,6 +2263,7 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
         "return_lse": Scalar("bool"),
         "enable_pdl": Scalar("bool", optional=True),
         "skip_softmax_threshold_scale_factor": Scalar("float32", optional=True),
+        "skip_all_rows_active_check": Scalar("bool", optional=True),
     },
     outputs={
         "output": Tensor(
