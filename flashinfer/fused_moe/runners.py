@@ -4476,6 +4476,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         ``[offset, offset + local_num_experts)``.
         """
         self._require_built()
+        from ..tllm_enums import SfLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -4644,6 +4645,13 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
+            # Declare the activation scale-factor layout instead of letting the
+            # runner infer it (deprecated). The unified path's own activation
+            # preparation quantizes linear for trtllm-gen — see
+            # prepare_trtllm_fp4_activations in prepare.py, which passes
+            # is_sf_swizzled_layout=False for both the MXFP4 and NVFP4 variants
+            # — which is also the only layout the routed GEMM can consume.
+            hidden_states_scale_layout=SfLayout.layout_linear,
             # Match the canonical trtllm-gen wrappers' profiling regime so
             # choose_one() tunes under the same conditions as deployment
             # (otherwise it can cache a tactic picked under a different regime).
