@@ -14,11 +14,11 @@ from flashinfer.utils import get_compute_capability
 
 
 # The 63 SM103 tactics contain 36 generic K128/K256 entries followed by 27
-# native K768 entries. Autotuning is allowed to choose either family; the native
-# epilogue test forces a known K768 tactic so performance noise cannot reduce
-# correctness coverage.
-_GENERIC_K128_K256_TACTICS = range(36)
+# native K768 entries. Autotuning is allowed to choose either family; the
+# dedicated epilogue tests force a known tactic from each family so performance
+# noise cannot reduce correctness coverage.
 _ALL_SM103_TACTICS = range(63)
+_GENERIC_K128_K256_TACTIC = 0
 _NATIVE_K768_TACTIC = 51
 
 
@@ -167,7 +167,8 @@ def test_mm_fp4_sm103_generic_alignment_dispatch() -> None:
     )
     base_alpha = torch.reciprocal(a_global_sf * b_global_sf).float()
     reference = torch.mm(a, b.T).float()
-    tuner = AutoTuner.get()
+    workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8)
+    generic_runner = get_gemm_sm103_module_cutlass_fp4().cutlass_fp4_gemm_runner()
 
     def make_misaligned_output(dtype: torch.dtype):
         guard_elements = 16
@@ -186,29 +187,28 @@ def test_mm_fp4_sm103_generic_alignment_dispatch() -> None:
         return storage, output, offset
 
     def invoke(output: torch.Tensor, alpha: torch.Tensor):
-        with autotune(True, tuning_buckets=(m,)):
-            result = mm_fp4(
+        result = generic_runner(
+            inputs=[
                 a_fp4,
                 b_fp4.T,
                 a_sf,
                 b_sf.T,
-                alpha=alpha,
-                out_dtype=output.dtype,
-                out=output,
-                block_size=16,
-                use_8x4_sf_layout=False,
-                backend="cutlass",
-                use_nvfp4=True,
-            )
+                alpha,
+                output.dtype,
+                output,
+                16,
+                True,
+                workspace,
+            ],
+            tactic=_GENERIC_K128_K256_TACTIC,
+        )
         assert result.data_ptr() == output.data_ptr()
         return result
 
     for out_dtype in (torch.bfloat16, torch.float16):
-        # Check both cache transitions because output pointer alignment is not part of the
-        # autotuner cache key: aligned -> misaligned and misaligned -> aligned.
+        # Exercise both invocation orders with the same runner and tactic so the
+        # epilogue selection cannot retain the preceding output's alignment.
         for first_alignment in ("aligned", "misaligned"):
-            tuner.clear_cache()
-            selected_tactic_checked = False
             for alpha_factor in (1.0, 0.73125, -0.34375):
                 aligned = torch.empty((m, n), device="cuda", dtype=out_dtype)
                 storage, misaligned, offset = make_misaligned_output(out_dtype)
@@ -221,20 +221,6 @@ def test_mm_fp4_sm103_generic_alignment_dispatch() -> None:
                 else:
                     misaligned_result = invoke(misaligned, alpha)
                     aligned_result = invoke(aligned, alpha)
-
-                if not selected_tactic_checked:
-                    matching_entries = [
-                        (key, tactic)
-                        for key, (tactic, _) in tuner.profiling_cache.items()
-                        if key.custom_op == "fp4_gemm"
-                        and key.nearest_profile[0][0] == m
-                    ]
-                    assert len(matching_entries) == 1
-                    key, tactic = matching_entries[0]
-                    assert key.runner_class_name == "CutlassFp4GemmRunner"
-                    if first_alignment == "aligned":
-                        assert tactic in _GENERIC_K128_K256_TACTICS
-                    selected_tactic_checked = True
 
                 assert torch.equal(aligned_result, misaligned_result)
                 for result in (aligned_result, misaligned_result):
