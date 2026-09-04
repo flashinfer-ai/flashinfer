@@ -289,7 +289,7 @@ def test_generated_selector_falls_back_for_nonfinite_public_scalars(
     )
 
 
-def test_generated_selector_falls_back_for_unaligned_state(monkeypatch):
+def test_generated_selector_routes_unaligned_base_for_staging(monkeypatch):
     inputs = _fake_inputs()
     inputs["state"] = _FakeTensor(
         inputs["state"].shape,
@@ -297,15 +297,21 @@ def test_generated_selector_falls_back_for_unaligned_state(monkeypatch):
         torch.float32,
         data_ptr=0x100010,
     )
+    variant = object()
     monkeypatch.setattr(
-        fused, "load_fused_kda_decode_generated_variants", lambda: (object(),)
+        fused, "load_fused_kda_decode_generated_variants", lambda: (variant,)
     )
     monkeypatch.setattr(fused, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         fused,
         "_cached_state_indices_classification",
-        lambda tensor: pytest.fail(
-            "unaligned inputs must fall back before classification"
+        lambda tensor: (False, True),
+    )
+    monkeypatch.setattr(
+        fused,
+        "select_fused_kda_decode_generated_variant",
+        lambda **kwargs: (
+            variant if kwargs["slot_class"] == "positive_unique" else None
         ),
     )
 
@@ -320,7 +326,7 @@ def test_generated_selector_falls_back_for_unaligned_state(monkeypatch):
             lower_bound=-5.0,
             norm_eps=1e-5,
         )
-        is None
+        is variant
     )
 
 
@@ -362,6 +368,68 @@ def test_generated_launch_uses_public_scalar_semantics(
     )
 
     assert calls == [tuple(tensors) + expected_tail]
+
+
+def test_generated_launch_stages_misaligned_mutable_tensors(monkeypatch):
+    copied = []
+
+    class MutableTensor:
+        def __init__(self, name, dtype=None):
+            self.name = name
+            self.dtype = dtype
+
+        def copy_(self, source):
+            copied.append((self, source))
+
+    tensors = [object() for _ in range(12)]
+    tensors[2] = MutableTensor("conv_state")
+    tensors[8] = MutableTensor("state", torch.float32)
+    tensors[11] = MutableTensor("output")
+    staged = {
+        id(tensors[2]): object(),
+        id(tensors[8]): object(),
+        id(tensors[11]): object(),
+    }
+    calls = []
+    monkeypatch.setattr(
+        fused,
+        "_copy_to_generated_alignment",
+        lambda tensor, alignment: staged.get(id(tensor), tensor),
+    )
+    monkeypatch.setattr(
+        fused,
+        "load_fused_kda_decode_generated_module",
+        lambda name, target: SimpleNamespace(run=lambda *args: calls.append(args)),
+    )
+
+    fused._run_generated_variant(
+        SimpleNamespace(name="selected", target="sm100a"),
+        x=tensors[0],
+        weight=tensors[1],
+        conv_state=tensors[2],
+        raw_gate=tensors[3],
+        raw_beta=tensors[4],
+        A_log=tensors[5],
+        dt_bias=tensors[6],
+        state_indices=tensors[7],
+        state=tensors[8],
+        output_gate=tensors[9],
+        norm_weight=tensors[10],
+        output=tensors[11],
+        lower_bound=-5.0,
+        norm_eps=1e-5,
+    )
+
+    expected = list(tensors)
+    expected[2] = staged[id(tensors[2])]
+    expected[8] = staged[id(tensors[8])]
+    expected[11] = staged[id(tensors[11])]
+    assert calls == [tuple(expected) + (1, -5.0, 1e-5)]
+    assert copied == [
+        (tensors[2], staged[id(tensors[2])]),
+        (tensors[8], staged[id(tensors[8])]),
+        (tensors[11], staged[id(tensors[11])]),
+    ]
 
 
 @pytest.mark.parametrize("use_generated", [False, True])

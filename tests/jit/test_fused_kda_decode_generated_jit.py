@@ -397,3 +397,6 @@ def test_binding_header_packs_the_exact_physical_argument_count():
     assert "raw_beta.stride(1) >= num_heads" not in header
     assert "output_gate.stride(0) >= hidden" not in header
     assert "cudaLaunchKernel(kernel" in header
+    assert "for (int64_t row = 0; row < rows; ++row)" in header
+    assert "rows_i32 = 1;" in header
+    assert "fused KDA decode repeated-row launch" in header

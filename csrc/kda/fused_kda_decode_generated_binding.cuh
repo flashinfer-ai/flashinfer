@@ -312,7 +312,6 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(
       TVMFFIEnvGetStream(x.device().device_type, x.device().device_id));
-  const dim3 grid(static_cast<uint32_t>(num_heads), static_cast<uint32_t>(rows), 1);
   const dim3 block(FLASHINFER_FUSED_KDA_DECODE_THREADS, 1, 1);
   const void* kernel = reinterpret_cast<const void*>(FLASHINFER_FUSED_KDA_DECODE_KERNEL);
 
@@ -328,9 +327,31 @@ void Run(TensorView x, TensorView weight, TensorView conv_state, TensorView raw_
             "cudaFuncSetAttribute(fused KDA decode)");
 #endif
 
+#if FLASHINFER_FUSED_KDA_DECODE_HAS_ROWS
+  // Repeated slots have sequential recurrent semantics.  Launch each row on
+  // the same stream so every row observes the preceding mutation of its slot.
+  // The frozen owner-chain kernel receives one row and therefore retains its
+  // verified one-row data path without racing or reloading pre-launch state.
+  for (int64_t row = 0; row < rows; ++row) {
+    x_ptr = static_cast<__nv_bfloat16*>(x.data_ptr()) + row * x_row_stride;
+    raw_gate_ptr = static_cast<__nv_bfloat16*>(raw_gate.data_ptr()) + row * hidden;
+    raw_beta_ptr = static_cast<__nv_bfloat16*>(raw_beta.data_ptr()) + row * beta_row_stride;
+    state_indices_ptr = static_cast<int32_t*>(state_indices.data_ptr()) + row;
+    output_gate_ptr =
+        static_cast<__nv_bfloat16*>(output_gate.data_ptr()) + row * output_gate_row_stride;
+    output_ptr = static_cast<__nv_bfloat16*>(output.data_ptr()) + row * hidden;
+    rows_i32 = 1;
+    const dim3 grid(static_cast<uint32_t>(num_heads), 1, 1);
+    CheckCuda(
+        cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES, stream),
+        "fused KDA decode repeated-row launch");
+  }
+#else
+  const dim3 grid(static_cast<uint32_t>(num_heads), static_cast<uint32_t>(rows), 1);
   CheckCuda(
       cudaLaunchKernel(kernel, grid, block, args, FLASHINFER_FUSED_KDA_DECODE_SMEM_BYTES, stream),
       "fused KDA decode launch");
+#endif
 }
 
 }  // namespace fused_kda_decode_generated

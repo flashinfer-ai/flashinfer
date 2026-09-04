@@ -81,6 +81,23 @@ def _aligned_tensor(tensor, alignment):
     )
 
 
+def _copy_to_generated_alignment(tensor, alignment):
+    """Stage a tensor when its storage offset weakens the generated ABI alignment."""
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or int(tensor.data_ptr()) % alignment == 0
+    ):
+        return tensor
+    staged = torch.empty_strided(
+        tensor.shape,
+        tensor.stride(),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    staged.copy_(tensor)
+    return staged
+
+
 def _sigmoid(value):
     """Evaluate a cancellation-safe approximate sigmoid."""
     return cute.rcp(cute.exp(-value, fastmath=True) + 1.0, approx=True, ftz=True)
@@ -733,16 +750,12 @@ def _select_generated_variant(
         lower_bound is not None and not math.isfinite(float(lower_bound))
     ):
         return None
-    if (
-        int(conv_state.data_ptr()) % 8
-        or int(conv_state.stride(0)) * conv_state.element_size() % 8
-    ):
+    if int(conv_state.stride(0)) * conv_state.element_size() % 8:
         return None
-    state_alignment = 16 if state.dtype == torch.bfloat16 else 32
-    if (
-        int(state.data_ptr()) % state_alignment
-        or int(state.stride(0)) * state.element_size() % state_alignment
-    ):
+    state_alignment = (
+        16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
+    )
+    if int(state.stride(0)) * state.element_size() % state_alignment:
         return None
 
     num_rows = int(x.shape[0])
@@ -804,23 +817,36 @@ def _run_generated_variant(
     norm_eps,
 ) -> None:
     module = load_fused_kda_decode_generated_module(variant.name, variant.target)
+    generated_conv_state = _copy_to_generated_alignment(conv_state, 8)
+    state_alignment = (
+        16 if getattr(state, "dtype", None) == torch.bfloat16 else 32
+    )
+    generated_state = _copy_to_generated_alignment(state, state_alignment)
+    generated_output = _copy_to_generated_alignment(output, 8)
     module.run(
         x,
         weight,
-        conv_state,
+        generated_conv_state,
         raw_gate,
         raw_beta,
         A_log,
         dt_bias,
         state_indices,
-        state,
+        generated_state,
         output_gate,
         norm_weight,
-        output,
+        generated_output,
         int(lower_bound is not None),
         0.0 if lower_bound is None else float(lower_bound),
         float(norm_eps),
     )
+    for destination, source in (
+        (conv_state, generated_conv_state),
+        (state, generated_state),
+        (output, generated_output),
+    ):
+        if source is not destination:
+            destination.copy_(source)
 
 
 @torch.no_grad()
