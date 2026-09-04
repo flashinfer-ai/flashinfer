@@ -418,7 +418,7 @@ def _attention_sink_for_local_head(
         sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2,
         fastmath=True,
     )
-    if cutlass.const_expr(cfg.use_fp8_qkv):
+    if cutlass.const_expr(cfg.use_fp8_q):
         sink_exp = sink_exp * Float32(448.0)
     return sink_exp
 
