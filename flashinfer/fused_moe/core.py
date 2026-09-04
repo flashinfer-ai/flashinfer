@@ -1967,8 +1967,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 and scale.dim() == 1
             )
             if flat_scale:
-                assert num_tokens > 0 and scale.numel() % num_tokens == 0, (
-                    f"flat hidden_states_scale numel {scale.numel()} is not a "
+                # Hoisted: this runs on every op call (_make_tuning_config is not
+                # memoized), so avoid repeating the numel() FFI hop three times.
+                _sf_numel = scale.numel()
+                assert num_tokens > 0 and _sf_numel % num_tokens == 0, (
+                    f"flat hidden_states_scale numel {_sf_numel} is not a "
                     f"multiple of num_tokens={num_tokens}"
                 )
                 # Sanity-check the implied vector size against what the C++ side
@@ -1992,13 +1995,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 # Rejecting swizzled inputs outright would need a signal we do not
                 # have; see #3455 and #3882 for why a numel guard is the wrong
                 # place to attempt it.
-                _sf_per_token = scale.numel() // num_tokens
+                _sf_per_token = _sf_numel // num_tokens
                 assert (
                     _sf_per_token > 0
                     and self.hidden_size % _sf_per_token == 0
                     and self.hidden_size // _sf_per_token in (16, 32)
                 ), (
-                    f"flat hidden_states_scale numel {scale.numel()} implies "
+                    f"flat hidden_states_scale numel {_sf_numel} implies "
                     f"{_sf_per_token} scales/token for hidden_size="
                     f"{self.hidden_size}, i.e. an SF vector size of "
                     f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
