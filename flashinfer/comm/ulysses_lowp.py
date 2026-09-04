@@ -1816,6 +1816,155 @@ def quant_and_pack(
     )
 
 
+class UlyssesLowpSageLayout:
+    """Quantization layout for low-precision Ulysses A2A targeting SageAttention2.
+
+    Groups the layout constants (Q_GROUP / K_GROUP / HEAD_DIM) and all
+    compute operations (stats, pack, unpack) into a single replaceable unit.
+    The class is stateless: instantiate once and share across requests.
+
+    This is the SM89 / SM120 HMMA warp-level layout::
+
+        Q_GROUP = 32   # 2 × HMMA M=16 tile
+        K_GROUP = 64   # 4 × HMMA M=16 tile
+        HEAD_DIM = 128
+
+    A future SM90 WGMMA variant (Q_GROUP=16, K_GROUP=128) would be a separate
+    subclass; the orchestration layer accepts any ``UlyssesLowpSageLayout``
+    instance without modification.
+    """
+
+    Q_GROUP: int = Q_GROUP
+    K_GROUP: int = K_GROUP
+    HEAD_DIM: int = HEAD_DIM
+    V_SCALE_MAX: float = V_SCALE_MAX
+    KSUM_CHUNK_TOKENS: int = KSUM_CHUNK_TOKENS
+    SUPPORTED_STATS_PROTOCOLS = SUPPORTED_STATS_PROTOCOLS
+
+    # ── capability ──────────────────────────────────────────────────────────
+
+    def is_supported(
+        self,
+        device: Optional[Union[int, str, torch.device]] = None,
+    ) -> bool:
+        """Return True when the compiled kernel matches this layout and the
+        device is supported (SM120 for this layout)."""
+        return bool(capability(device=device).get("supported"))
+
+    # ── payload geometry ────────────────────────────────────────────────────
+
+    def payload_spec(
+        self,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        num_heads: int,
+        world_size: int,
+    ) -> Dict[str, Union[int, float]]:
+        """Byte layout of one destination chunk. Delegates to module-level
+        :func:`payload_spec`."""
+        return payload_spec(
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            num_heads=num_heads,
+            head_dim=self.HEAD_DIM,
+            world_size=world_size,
+        )
+
+    # ── protocol routing ────────────────────────────────────────────────────
+
+    def stats_protocol_for(self, local_sequence: int, world_size: int) -> str:
+        """Return :data:`ALIGNED` or :data:`BOUNDARY_MERGE` for this shard."""
+        return stats_protocol_for(local_sequence, world_size)
+
+    def required_alignment(self, world_size: int, stats_protocol: str) -> int:
+        """Recommended global-sequence padding multiple."""
+        return required_alignment(world_size, stats_protocol)
+
+    def aligned_length(
+        self, n_tokens: int, world_size: int, stats_protocol: str
+    ) -> int:
+        """Round ``n_tokens`` up to the recommended alignment."""
+        return aligned_length(n_tokens, world_size, stats_protocol)
+
+    # ── stats flow ──────────────────────────────────────────────────────────
+
+    def local_stats(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rank: int,
+        world_size: int,
+        used_sequence: Optional[int] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, StatsContext]":
+        """Local statistics for the AllGather. Delegates to :func:`local_stats`."""
+        return local_stats(
+            q, k, v,
+            rank=rank,
+            world_size=world_size,
+            used_sequence=used_sequence,
+            enable_pdl=enable_pdl,
+        )
+
+    def finalize_stats(
+        self,
+        gathered: torch.Tensor,
+        ctx: "StatsContext",
+        k: torch.Tensor,
+        *,
+        enable_pdl: Optional[bool] = None,
+    ) -> "V2GStats":
+        """Turn gathered statistics into final quantization inputs."""
+        return finalize_stats(gathered, ctx, k, enable_pdl=enable_pdl)
+
+    # ── pack / unpack ────────────────────────────────────────────────────────
+
+    def quant_and_pack(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        stats: "V2GStats",
+        *,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Protocol-routed quantize-and-pack. Delegates to :func:`quant_and_pack`."""
+        return quant_and_pack(q, k, v, stats, out=out, enable_pdl=enable_pdl)
+
+    def unpack_for_sage(
+        self,
+        recv_u8: torch.Tensor,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        local_heads: int,
+        world_size: int,
+        aligned: Optional[bool] = True,
+        scale_sequence: Optional[int] = None,
+        out: Optional[
+            "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]"
+        ] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Unpack received payload into SageAttention2 pre-quantized operands."""
+        return unpack_for_sage(
+            recv_u8,
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            local_heads=local_heads,
+            head_dim=self.HEAD_DIM,
+            world_size=world_size,
+            aligned=aligned,
+            scale_sequence=scale_sequence,
+            out=out,
+            enable_pdl=enable_pdl,
+        )
+
+
 @flashinfer_api
 def verify_duplicate_scale_slots(
     recv_u8: torch.Tensor,
@@ -1948,6 +2097,7 @@ def quant_v_fp8_with_scale(
 
 
 __all__ = [
+    "UlyssesLowpSageLayout",
     "HEAD_DIM",
     "KSUM_CHUNK_TOKENS",
     "K_GROUP",
