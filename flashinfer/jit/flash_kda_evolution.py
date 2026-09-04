@@ -26,6 +26,7 @@ from .core import (
     logger,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
+    sm103a_nvcc_flags,
 )
 from .utils import write_if_different
 
@@ -60,7 +61,7 @@ FlashKDAEvolutionVariant = Literal[
     "vtile_f1_t8192_h32_p1_s32",
     "vtile_f1_t8192_h96_p1_s96",
 ]
-FlashKDAEvolutionTarget = Literal["sm100a", "sm100f"]
+FlashKDAEvolutionTarget = Literal["sm100a", "sm100f", "sm103a"]
 
 
 class FlashKDAEvolutionMetadata(NamedTuple):
@@ -130,10 +131,12 @@ FLASH_KDA_EVOLUTION_VARIANTS: dict[
 _NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm100f": sm100f_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
 }
 _TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
     "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
+    "sm103a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
 }
 
 

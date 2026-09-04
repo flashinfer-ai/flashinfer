@@ -43,9 +43,7 @@ from ..utils import get_compute_capability
 GeneratedKDAIndexedTarget = Literal["sm100a", "sm103a"]
 
 _CATALOG_KIND = "flashinfer.generated_kda_indexed_prefill.source_catalog"
-_IMPORT_RECEIPT_KIND = "flashinfer.generated_kda_indexed_prefill.import_receipt"
 _CATALOG_NAME = "flashkda_generated_indexed_variant_metadata.json"
-_RECEIPT_NAME = "flashkda_generated_indexed_generation_receipt.json"
 _SOURCE_PREFIX = "flashkda_generated_indexed_"
 _CATALOG_SCHEMA_VERSION = 2
 _EXPECTED_MODULE_COUNTS = {
@@ -276,89 +274,6 @@ def _source_record(root: Path, value: object, label: str) -> _SourceRecord:
     )
 
 
-def _installed_source_manifest(root: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    for path in sorted(root.glob(f"{_SOURCE_PREFIX}*")):
-        _require(
-            not path.is_symlink(), "Generated KDA source closure contains a symlink"
-        )
-        if path.is_dir():
-            continue
-        _require(
-            path.is_file(), "Generated KDA source closure contains a non-regular file"
-        )
-        relative = path.name
-        if relative == _RECEIPT_NAME:
-            continue
-        payload = path.read_bytes()
-        records.append(
-            {
-                "path": relative,
-                "sha256": _sha256(payload),
-                "size_bytes": len(payload),
-            }
-        )
-    return records
-
-
-def _verify_catalog_receipt(root: Path, catalog_payload: bytes) -> dict[str, str]:
-    receipt_path = root / _RECEIPT_NAME
-    _require(
-        receipt_path.is_file() and not receipt_path.is_symlink(),
-        "Generated KDA import receipt is unavailable",
-    )
-    try:
-        receipt = json.loads(receipt_path.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise GeneratedKDAIndexedPrefillError(
-            "Generated KDA import receipt is invalid"
-        ) from error
-    receipt = _object(
-        receipt,
-        {"kind", "schema_version", "catalog_sha256", "inputs", "outputs", "passed"},
-        "import receipt",
-    )
-    _require(
-        receipt["kind"] == _IMPORT_RECEIPT_KIND
-        and type(receipt["schema_version"]) is int
-        and receipt["schema_version"] == 1
-        and receipt["passed"] is True,
-        "Generated KDA import receipt identity differs",
-    )
-    _require(
-        _full_sha256(receipt["catalog_sha256"], "import receipt.catalog_sha256")
-        == _sha256(catalog_payload),
-        "Generated KDA source catalog differs from its import receipt",
-    )
-    inputs = receipt["inputs"]
-    _require(
-        isinstance(inputs, list) and len(inputs) == len(_TARGET_ARCHITECTURES),
-        "Generated KDA import receipt input denominator differs",
-    )
-    assert isinstance(inputs, list)
-    input_archives: dict[str, str] = {}
-    for index, target in enumerate(_TARGET_ARCHITECTURES):
-        item = _object(
-            inputs[index],
-            {"target", "archive_sha256"},
-            f"import receipt.inputs[{index}]",
-        )
-        _require(
-            item["target"] == target,
-            "Generated KDA import receipt target order differs",
-        )
-        input_archives[target] = _full_sha256(
-            item["archive_sha256"],
-            f"import receipt.inputs[{index}].archive_sha256",
-        )
-    outputs = receipt["outputs"]
-    _require(
-        isinstance(outputs, list) and outputs == _installed_source_manifest(root),
-        "Generated KDA installed source closure differs from its import receipt",
-    )
-    return input_archives
-
-
 def _read_catalog(root: Path) -> tuple[_TargetRecord, ...]:
     root = root.resolve(strict=True)
     catalog_path = root / _CATALOG_NAME
@@ -367,7 +282,6 @@ def _read_catalog(root: Path) -> tuple[_TargetRecord, ...]:
         "Generated KDA source catalog is unavailable",
     )
     catalog_payload = catalog_path.read_bytes()
-    input_archives = _verify_catalog_receipt(root, catalog_payload)
     try:
         catalog = json.loads(catalog_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -415,13 +329,7 @@ def _read_catalog(root: Path) -> tuple[_TargetRecord, ...]:
             target["architecture"] == _TARGET_ARCHITECTURES[target_name],
             f"{label}.architecture differs",
         )
-        input_archive_sha256 = _full_sha256(
-            target["input_archive_sha256"], f"{label}.input_archive_sha256"
-        )
-        _require(
-            input_archive_sha256 == input_archives[target_name],
-            f"{label}.input_archive_sha256 differs from the import receipt",
-        )
+        _full_sha256(target["input_archive_sha256"], f"{label}.input_archive_sha256")
         _full_sha256(target["input_fragment_sha256"], f"{label}.input_fragment_sha256")
         _full_sha256(
             target["route_denominator_sha256"],

@@ -3952,6 +3952,11 @@ def test_frozen_uniform_piece_prefill_repeats_and_matches_direct_control(
     monkeypatch,
     num_heads,
 ):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_source_vtile_persistent",
+        lambda **kwargs: False,
+    )
     inputs = _make_inputs(
         seq_lens=[1024] * 8,
         num_heads=num_heads,

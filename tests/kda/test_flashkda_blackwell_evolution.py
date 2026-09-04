@@ -276,7 +276,7 @@ def test_flashkda_evolution_routes_persistent_scalar_by_sm_count(
     assert int(route.tile_schedule_counts.max()) == expected_stride
 
 
-@pytest.mark.parametrize("target", ["sm100a", "sm100f"])
+@pytest.mark.parametrize("target", ["sm100a", "sm100f", "sm103a"])
 @pytest.mark.parametrize("variant", FLASH_KDA_EVOLUTION_VARIANTS)
 def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
     spec = gen_flash_kda_evolution_module(variant, target)

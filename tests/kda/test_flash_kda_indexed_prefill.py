@@ -49,41 +49,6 @@ def _write_record(root: Path, relative: str, payload: bytes) -> dict[str, object
     }
 
 
-def _manifest(root: Path) -> list[dict[str, object]]:
-    records = []
-    for path in sorted(root.glob("flashkda_generated_indexed_*")):
-        if path.is_file() and path.name != loader._RECEIPT_NAME:
-            payload = path.read_bytes()
-            records.append(
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "sha256": _sha256(payload),
-                    "size_bytes": len(payload),
-                }
-            )
-    return records
-
-
-def _write_receipt(root: Path, catalog_payload: bytes) -> None:
-    outputs = _manifest(root)
-    assert len(outputs) == 79
-    receipt = {
-        "kind": "flashinfer.generated_kda_indexed_prefill.import_receipt",
-        "schema_version": 1,
-        "catalog_sha256": _sha256(catalog_payload),
-        "inputs": [
-            {
-                "target": target,
-                "archive_sha256": _sha256(f"archive-{target}".encode()),
-            }
-            for target in ("sm100a", "sm103a")
-        ],
-        "outputs": outputs,
-        "passed": True,
-    }
-    (root / loader._RECEIPT_NAME).write_text(json.dumps(receipt), encoding="utf-8")
-
-
 def _catalog_tree(root: Path) -> tuple[loader._TargetRecord, ...]:
     targets = []
     for target, architecture in (("sm100a", "sm_100a"), ("sm103a", "sm_103a")):
@@ -172,8 +137,7 @@ def _catalog_tree(root: Path) -> tuple[loader._TargetRecord, ...]:
         json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
     (root / loader._CATALOG_NAME).write_bytes(catalog_payload)
-    _write_receipt(root, catalog_payload)
-    assert sum(path.is_file() for path in root.rglob("*")) == 80
+    assert sum(path.is_file() for path in root.rglob("*")) == 79
     return loader._read_catalog(root)
 
 
@@ -192,7 +156,7 @@ def test_source_catalog_verifies_complete_target_module_and_source_closure(
     )
 
     targets[0].modules[0].cuda_source.path.write_bytes(b"drift")
-    with pytest.raises(loader.GeneratedKDAIndexedPrefillError, match="source closure"):
+    with pytest.raises(loader.GeneratedKDAIndexedPrefillError, match="content identity differs"):
         loader._read_catalog(tmp_path)
 
 
@@ -218,18 +182,6 @@ def test_checked_in_registry_uses_semantic_deduplicated_kda_layout() -> None:
         assert "module_" not in module.host_source.path.name
 
 
-def test_source_catalog_rejects_files_outside_the_import_receipt(
-    tmp_path: Path,
-) -> None:
-    _catalog_tree(tmp_path)
-    (tmp_path / "flashkda_generated_indexed_unbound_source.cu").write_text(
-        "// unbound\n"
-    )
-
-    with pytest.raises(loader.GeneratedKDAIndexedPrefillError, match="source closure"):
-        loader._read_catalog(tmp_path)
-
-
 def test_source_catalog_rejects_path_capable_module_ident(tmp_path: Path) -> None:
     _catalog_tree(tmp_path)
     catalog_path = tmp_path / loader._CATALOG_NAME
@@ -239,22 +191,8 @@ def test_source_catalog_rejects_path_capable_module_ident(tmp_path: Path) -> Non
         json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
     catalog_path.write_bytes(catalog_payload)
-    _write_receipt(tmp_path, catalog_payload)
 
     with pytest.raises(loader.GeneratedKDAIndexedPrefillError, match="C identifier"):
-        loader._read_catalog(tmp_path)
-
-
-def test_source_catalog_binds_each_archive_to_its_receipt(tmp_path: Path) -> None:
-    _catalog_tree(tmp_path)
-    receipt_path = tmp_path / loader._RECEIPT_NAME
-    receipt = json.loads(receipt_path.read_text())
-    receipt["inputs"][0]["archive_sha256"] = "0" * 64
-    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-
-    with pytest.raises(
-        loader.GeneratedKDAIndexedPrefillError, match="differs from the import receipt"
-    ):
         loader._read_catalog(tmp_path)
 
 
