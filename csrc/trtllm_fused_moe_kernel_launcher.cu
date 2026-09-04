@@ -1297,11 +1297,12 @@ class FusedMoeLauncher {
 
   // GEMM1 or GEMM2 weights [num_experts, M, K] or [num_experts, K/block_k, M, block_k]
   //
-  // `check_reduction_dim` must be false for launchers whose weights hold sub-byte values
-  // packed two per stored element (FP4 / MXINT4): their K extent counts bytes, i.e. half the
-  // logical contraction width, so the K equalities below do not apply. The M extent is never
-  // packed, so the GEMM2 output-width check stays meaningful for those launchers.
-  void check_weights_shape(std::string which_weights, bool check_reduction_dim = true) const {
+  // Only called for the launchers whose gemm2 weights actually follow `weight_layout`. That
+  // member describes GEMM1; on the FP4 / MXINT4 routed paths GEMM2's weights do not share it
+  // (they arrive 3-D where weight_layout says BlockMajorK), so calling this for their gemm2
+  // would reject valid inputs. See the PR discussion for why the reviewer-requested extension
+  // to those launchers needs a per-GEMM layout first.
+  void check_weights_shape(std::string which_weights) const {
     TensorView weights = (which_weights == "gemm1") ? gemm1_weights : gemm2_weights;
     if (which_weights != "gemm1" && which_weights != "gemm2") {
       TVM_FFI_LOG_AND_THROW(InternalError) << "Internal error: which_weights = " << which_weights;
@@ -1310,19 +1311,10 @@ class FusedMoeLauncher {
     int64_t Mn = 0, K = 0;
     if (weight_layout == batchedGemm::gemm::MatrixLayout::MajorK) {
       // MajorK [num_experts, M, K]
-      // Check the rank before indexing: a mis-shaped tensor must raise this error rather than an
-      // out-of-range size() access.
-      TVM_FFI_ICHECK_EQ(weights.ndim(), 3)
-          << which_weights << " weights must be 3D [num_experts, M, K] for MajorK layout, got "
-          << weights.ndim() << "D.";
       Mn = weights.size(1);
       K = weights.size(2);
     } else if (weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK) {
       // BlockMajorK [num_experts, K/block_k, M, block_k]
-      TVM_FFI_ICHECK_EQ(weights.ndim(), 4)
-          << which_weights
-          << " weights must be 4D [num_experts, K/block_k, M, block_k] for BlockMajorK layout, got "
-          << weights.ndim() << "D.";
       Mn = weights.size(2);
       int64_t block_k = weights.size(3);
       K = weights.size(1) * block_k;
@@ -1340,10 +1332,8 @@ class FusedMoeLauncher {
       // so Mn = intermediate_size. This check covers both gated and non-gated cases.
       TVM_FFI_ICHECK_EQ(args->intermediate_size * intermediate_size_factor, Mn)
           << "intermediate_size has incorrect shape.";
-      if (check_reduction_dim) {
-        TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
-            << which_weights << " weights K dimension must be equal to hidden_size.";
-      }
+      TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
+          << which_weights << " weights K dimension must be equal to hidden_size.";
     } else if (which_weights == "gemm2") {
       // The FC2 weights are laid out for GEMM2's N -- roundUp(valid_hidden_size, 128) when valid
       // dims are given -- NOT for the (narrower) caller output width; see
@@ -1352,10 +1342,8 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(Mn, gemm2_output_hidden_size())
           << which_weights << " weights M dimension must be equal to GEMM2's output hidden size.";
       // GEMM2 always consumes the post-activation hidden of size intermediate_size.
-      if (check_reduction_dim) {
-        TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
-            << which_weights << " weights K dimension must be equal to intermediate_size.";
-      }
+      TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
+          << which_weights << " weights K dimension must be equal to intermediate_size.";
     }
     if (args->num_fused_shared_experts > 0) {
       TVM_FFI_ICHECK_EQ(weights.size(0), args->local_num_experts + args->num_fused_shared_experts)
@@ -2143,7 +2131,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         << "FP8 MoE: gemm1_weights must be float8_e4m3fn.";
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn)
         << "FP8 MoE: gemm2_weights must be float8_e4m3fn.";
-    check_weights_shape("gemm2");
   }
 
   /** Allocate and bind one ordinary FP8 per-tensor MoE body workspace. */
@@ -3210,7 +3197,6 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
         << "gemm2_weights_scale must be bf16.";
     // MXINT4 packs two 4-bit weights per byte along K, so only the M extent is checked.
-    check_weights_shape("gemm2", /*check_reduction_dim=*/false);
   }
 
   void prepare_moe(int64_t& moe_tactic) override {
@@ -3490,7 +3476,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
         << "gemm2_weights_scale must be fp8.";
     // FP4 packs two 4-bit weights per byte along K, so only the M extent is checked.
-    check_weights_shape("gemm2", /*check_reduction_dim=*/false);
 
     if (args->num_fused_shared_experts > 0) {
       int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
