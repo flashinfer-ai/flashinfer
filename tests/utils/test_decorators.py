@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import flashinfer.api_logging as api_logging
 from flashinfer.utils import (
     supported_compute_capability,
     backend_requirement,
@@ -499,6 +500,10 @@ def test_backend_default_parameter():
 def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
     """@experimental_backend checkers stay out of backend="auto" without the opt-in."""
     monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
+    # The once-per-(api, backend) registry is module state that outlives a test.
+    # pytest.warns below needs the pair unseen, so start from an empty set rather
+    # than depending on this module never being collected twice in one process.
+    monkeypatch.setattr(api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
 
     def _check_stable(x, backend="auto"):
         return True
