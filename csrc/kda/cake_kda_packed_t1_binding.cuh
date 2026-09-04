@@ -16,9 +16,6 @@
 
 #pragma once
 
-#ifndef CAKE_KDA_PACKED_T1_BODY_FILE
-#error "CAKE_KDA_PACKED_T1_BODY_FILE must name one frozen generated body"
-#endif
 #ifndef CAKE_KDA_PACKED_T1_KERNEL
 #error "CAKE_KDA_PACKED_T1_KERNEL must name the frozen kernel symbol"
 #endif
@@ -49,30 +46,11 @@
 
 #include "tvm_ffi_utils.h"
 
-// Generated bodies carry private fixed-width aliases and a tensor-map stand-in.
-// Rename them at the include boundary so they cannot collide with CUDA headers.
-#define uint8_t cake_kda_packed_generated_uint8_t
-#define uint16_t cake_kda_packed_generated_uint16_t
-#define uint32_t cake_kda_packed_generated_uint32_t
-#define uint64_t cake_kda_packed_generated_uint64_t
-#define int32_t cake_kda_packed_generated_int32_t
-#define int16_t cake_kda_packed_generated_int16_t
-#define CakeTensorMap cake_kda_packed_generated_CakeTensorMap
-#define CakeTensorMapPack cake_kda_packed_generated_CakeTensorMapPack
-#define CUtensorMap cake_kda_packed_generated_CUtensorMap
-#include CAKE_KDA_PACKED_T1_BODY_FILE
-#undef uint8_t
-#undef uint16_t
-#undef uint32_t
-#undef uint64_t
-#undef int32_t
-#undef int16_t
-#undef CakeTensorMap
-#undef CakeTensorMapPack
-#undef CUtensorMap
-#undef THREADS
-#undef NUM_MAIN_STAGES
-#undef CAKE_INF
+extern "C" __global__ void CAKE_KDA_PACKED_T1_KERNEL(
+    __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, __nv_bfloat16* g, __nv_bfloat16* beta,
+    float* A_log, float* dt_bias, __nv_bfloat16* state, __nv_bfloat16* out, int* state_indices,
+    float scale, long long q_stride_token, long long k_stride_token, long long v_stride_token,
+    long long g_stride_token, long long beta_stride_token, long long state_stride_slot);
 
 namespace flashinfer {
 namespace cake_kda_packed_t1 {
@@ -83,10 +61,12 @@ constexpr int32_t kMixedWidth = 3 * kHeads * kHeadDim;
 constexpr int32_t kGateWidth = kHeads * kHeadDim;
 constexpr int32_t kTargetFamily = 100;
 constexpr int32_t kTargetSM100a = 1000;
+constexpr int32_t kTargetSM103a = 1003;
 constexpr int32_t kTargetKind = FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND;
 
-static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a,
-              "packed KDA T=1 must be compiled for SM100f or legacy exact SM100a");
+static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a ||
+                  kTargetKind == kTargetSM103a,
+              "packed KDA T=1 must be compiled for SM100f, exact SM100a, or exact SM103a");
 static_assert(CAKE_KDA_PACKED_T1_VALUE_TILES == 1 || CAKE_KDA_PACKED_T1_VALUE_TILES == 2 ||
                   CAKE_KDA_PACKED_T1_VALUE_TILES == 8 || CAKE_KDA_PACKED_T1_VALUE_TILES == 16,
               "packed KDA T=1 has an unsupported value tiling");
@@ -112,9 +92,13 @@ inline void CheckTarget(int32_t device_id) {
         << "this packed KDA T=1 module requires the SM100 family "
            "(compute capability 10.0, 10.3 or 10.7), got "
         << major << "." << minor;
-  } else {
+  } else if (kTargetKind == kTargetSM100a) {
     TVM_FFI_ICHECK(major == 10 && minor == 0)
         << "this packed KDA T=1 module requires exact compute capability 10.0, got " << major << "."
+        << minor;
+  } else {
+    TVM_FFI_ICHECK(major == 10 && minor == 3)
+        << "this packed KDA T=1 module requires exact compute capability 10.3, got " << major << "."
         << minor;
   }
 }

@@ -65,11 +65,10 @@ from .jit.blackwell_msa import (
     gen_blackwell_msa_module,
 )
 from .jit.cake_kda import (
-    CAKE_KDA_AFFINE_ROLES,
     CakeKDATarget,
-    cake_kda_affine_is_available,
-    gen_cake_kda_affine_module,
-    gen_cake_kda_m128_unbounded_softplus_module,
+    cake_kda_is_available,
+    gen_cake_kda_module,
+    get_cake_kda_module_specs,
 )
 from .jit.cake_kda_decode import (
     CAKE_KDA_DECODE_DIRECT_VARIANTS,
@@ -569,6 +568,9 @@ def gen_all_modules(
     has_flash_kda_packed_t1_sm100f = sm_capabilities.get(
         "flash_kda_packed_t1_sm100f", False
     )
+    has_cake_kda_packed_t1_sm103a = sm_capabilities.get(
+        "cake_kda_packed_t1_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm107 = sm_capabilities.get("sm107", False)
@@ -634,22 +636,20 @@ def gen_all_modules(
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
 
-    # The Cake-owned unbounded-softplus export remains an exact-architecture
-    # artifact on B200 and B300.
+    # The standard Cake portfolio remains exact-architecture on B200/B300.
     cake_kda_targets: tuple[tuple[CakeKDATarget, bool], ...] = (
         ("sm100a", has_cake_kda_prefill_sm100a),
         ("sm103a", has_cake_kda_prefill_sm103a),
     )
     for cake_kda_target, enabled in cake_kda_targets:
         if enabled:
-            jit_specs.append(
-                gen_cake_kda_m128_unbounded_softplus_module(cake_kda_target)
+            if not cake_kda_is_available():
+                raise RuntimeError("complete Cake KDA portfolio export is unavailable")
+            jit_specs.extend(
+                gen_cake_kda_module(spec.target, spec.family, spec.policy, spec.role)
+                for spec in get_cake_kda_module_specs()
+                if spec.target == cake_kda_target
             )
-            if cake_kda_affine_is_available():
-                jit_specs.extend(
-                    gen_cake_kda_affine_module(cake_kda_target, role)
-                    for role in CAKE_KDA_AFFINE_ROLES
-                )
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
@@ -713,6 +713,11 @@ def gen_all_modules(
         )
         jit_specs.extend(
             gen_cake_kda_packed_t1_module(variant, "sm100f")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
+        )
+    if has_cake_kda_packed_t1_sm103a:
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm103a")
             for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
 
@@ -1258,6 +1263,10 @@ def detect_sm_capabilities():
         ),
         "flash_kda_packed_t1_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_kda_packed_t1_sm103a": (
+            bool(flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "sm103": has_sm("compute_103", "12.9"),

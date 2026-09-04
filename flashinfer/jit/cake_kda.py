@@ -1,106 +1,92 @@
-"""
-Copyright (c) 2026 by FlashInfer team.
+"""Manifest-verified JIT loader for the exported Cake KDA portfolio."""
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+from __future__ import annotations
 
 import functools
 import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, cast, get_args
 
 from ._kda_jit_common import (
     gen_kda_jit_spec,
-    get_kda_csrc_dir as _get_cake_kda_csrc_dir,
-    get_flashinfer_include_dir as _get_cake_kda_include_dir,
+    get_flashinfer_include_dir,
+    get_kda_csrc_dir,
 )
 from .core import JitSpec, logger
 
-CakeKDAVariant = Literal[
-    "m128_unbounded_softplus",
-    "m128_bt64_unbounded_softplus",
-]
 CakeKDATarget = Literal["sm100a", "sm103a"]
-CakeKDAAffineRole = Literal["main", "map", "scan", "correction"]
+CakeKDAFamily = Literal[
+    "bounded_bf16_evolution",
+    "bounded_bf16_affine_prefix",
+    "bounded_bf16_affine_h12_prefix",
+    "bounded_fp32_serving",
+    "bounded_fp32_affine_prefix",
+    "bounded_fp32_affine_h12_prefix",
+    "unbounded_bf16_serving",
+    "unbounded_affine_prefix",
+]
+CakeKDASequenceFamily = Literal["unbounded_affine_prefix",]
+CakeKDARole = Literal["main", "prepare", "chain", "map", "scan", "correction"]
+CakeKDATMAABI = Literal["grid_constant", "pointer"]
 
-CAKE_KDA_VARIANTS: tuple[CakeKDAVariant, ...] = (
-    "m128_unbounded_softplus",
-    "m128_bt64_unbounded_softplus",
-)
-CAKE_KDA_AFFINE_ROLES: tuple[CakeKDAAffineRole, ...] = (
-    "main",
-    "map",
-    "scan",
-    "correction",
-)
-
-_CAKE_KDA_AFFINE_MANIFEST = (
-    "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
-)
-_CAKE_KDA_AFFINE_CONTRACT = {
-    "batch_size": 1,
-    "beta_layout": "contiguous",
-    "checkpoint_mode": "none",
-    "dtype": "bfloat16",
-    "gate_kind": "unbounded_softplus",
-    "head_dim": 128,
-    "head_relationship": "equal_q_kv",
-    "initial_state": "indexed_bfloat16_pool",
-    "max_local_heads": 32,
-    "min_parts": 2,
-    "min_tokens": 8192,
-    "state_publication": "final_only",
-    "targets": ["sm100a", "sm103a"],
-    "token_multiple": 32,
-}
-
-_CAKE_KDA_TARGETS: tuple[CakeKDATarget, ...] = ("sm100a", "sm103a")
-_CAKE_KDA_TARGET_DEFINE = {
+_MANIFEST = "cake_kda_prefill_portfolio_export_manifest.json"
+_TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=0",
     "sm103a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=3",
 }
-
-# Keep the frozen cache key tied to the complete generated-plus-integration
-# implementation so an installed cache cannot satisfy a refreshed export.
-_CAKE_KDA_MODULE_IDENTS = {
-    "m128_unbounded_softplus": "d7a7b33c69",
-    "m128_bt64_unbounded_softplus": "8f5147c17f",
-}
+_SUPPORTED_FAMILIES = frozenset(get_args(CakeKDAFamily))
+_SUPPORTED_ROLES = frozenset(get_args(CakeKDARole))
 
 
 @dataclass(frozen=True)
-class CakeKDAAffineModuleSpec:
-    """One verified target-and-role source closure from the sealed export."""
+class CakeKDAModuleSpec:
+    """One exact-architecture source closure from the standard Cake export."""
 
     target: CakeKDATarget
-    role: CakeKDAAffineRole
+    family: CakeKDAFamily
+    policy: str
+    role: CakeKDARole
+    name: str
     module_ident: str
+    closure_sha256: str
+    compile_flags: tuple[str, ...]
+    device_path: Path
     binding_path: Path
-    sources: tuple[Path, ...]
+    device_headers: tuple[Path, ...]
+    binding_headers: tuple[Path, ...]
+    use_pdl: bool
+    tma_abi: CakeKDATMAABI
+    tma_workspace_bytes: int
 
 
-def _require_affine_manifest(condition: bool, message: str) -> None:
+@dataclass(frozen=True)
+class CakeKDASequenceSpec:
+    """One manifest-sealed prepared multi-kernel source closure."""
+
+    target: CakeKDATarget
+    family: CakeKDASequenceFamily
+    name: str
+    closure_sha256: str
+    compile_flags: tuple[str, ...]
+    stage_order: tuple[str, ...]
+    arg_plan: tuple[tuple[str, str], ...]
+    device_paths: tuple[Path, ...]
+    binding_path: Path
+
+
+def _require(condition: bool, message: str) -> None:
     if not condition:
-        raise ValueError(f"invalid Cake KDA affine import manifest: {message}")
+        raise ValueError(f"invalid Cake KDA portfolio export manifest: {message}")
 
 
-def _resolve_affine_manifest_file(csrc_dir: Path, value: object, label: str) -> Path:
-    _require_affine_manifest(isinstance(value, str) and bool(value), f"{label} missing")
-    assert isinstance(value, str)
-    relative = PurePosixPath(value)
-    _require_affine_manifest(
+def _resolve_source(csrc_dir: Path, raw_path: object, label: str) -> Path:
+    _require(isinstance(raw_path, str), f"{label} must be a path")
+    assert isinstance(raw_path, str)
+    relative = PurePosixPath(raw_path)
+    _require(
         not relative.is_absolute()
         and ".." not in relative.parts
         and relative.parts[:2] == ("csrc", "kda")
@@ -108,299 +94,578 @@ def _resolve_affine_manifest_file(csrc_dir: Path, value: object, label: str) -> 
         f"{label} must name one csrc/kda file",
     )
     path = csrc_dir / relative.name
-    _require_affine_manifest(
-        path.name.startswith("cake_kda_") and path.suffix in (".cu", ".cuh"),
-        f"{label} must use a public cake_kda CUDA filename",
-    )
-    _require_affine_manifest(path.is_file(), f"{label} does not exist: {path}")
-    return path
-
-
-def _verify_affine_manifest_file(
-    csrc_dir: Path,
-    *,
-    path_value: object,
-    sha256_value: object,
-    label: str,
-) -> Path:
-    path = _resolve_affine_manifest_file(csrc_dir, path_value, f"{label}.path")
-    _require_affine_manifest(
-        isinstance(sha256_value, str)
-        and len(sha256_value) == 64
-        and all(character in "0123456789abcdef" for character in sha256_value),
-        f"{label}.sha256 must be one full lowercase SHA-256",
-    )
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    _require_affine_manifest(
-        actual == sha256_value,
-        f"{label}.sha256 mismatch: {actual} != {sha256_value}",
-    )
+    _require(path.is_file(), f"{label} does not exist: {path}")
     return path
 
 
 @functools.cache
-def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
-    """Read and verify all affine modules, or return empty while pending.
+def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
+    """Load and verify the complete manifest-sealed source closure."""
 
-    The checked-in pending manifest intentionally keeps the route disabled.
-    The sealed importer replaces it atomically only after all eight generated
-    target/role closures and their full SHA-256 identities are available.
-    """
+    csrc_dir = get_kda_csrc_dir()
+    payload: Any = json.loads((csrc_dir / _MANIFEST).read_text())
+    _require(isinstance(payload, dict), "root must be an object")
+    _require(payload.get("schema") == "cake.library_export.v1", "schema mismatch")
+    _require(payload.get("producer") == "cake", "producer mismatch")
+    _require(payload.get("library") == "flashinfer", "library mismatch")
+    _require(payload.get("name") == "cake_kda_prefill_portfolio", "name mismatch")
+    _require(payload.get("artifact_kind") == "source_only", "artifact kind mismatch")
 
-    csrc_dir = _get_cake_kda_csrc_dir()
-    manifest_path = csrc_dir / _CAKE_KDA_AFFINE_MANIFEST
-    payload: Any = json.loads(manifest_path.read_text())
-    _require_affine_manifest(isinstance(payload, dict), "root must be an object")
-    _require_affine_manifest(payload.get("schema_version") == 1, "unsupported schema")
-    _require_affine_manifest(
-        payload.get("contract") == _CAKE_KDA_AFFINE_CONTRACT,
-        "contract mismatch",
+    build = payload.get("build_contract")
+    _require(isinstance(build, dict), "build contract missing")
+    _require(
+        build.get("translation_unit_model") == "separate_device_and_binding",
+        "device and binding translation units must compile separately",
     )
-    status = payload.get("status")
-    modules = payload.get("modules")
-    _require_affine_manifest(isinstance(modules, list), "modules must be a list")
-    if status == "pending_generated_sources":
-        _require_affine_manifest(not modules, "pending manifest must not list modules")
-        return ()
-    _require_affine_manifest(status == "complete", f"unsupported status {status!r}")
+    _require(build.get("binary_payloads") is False, "binary payloads forbidden")
+    infrastructure = build.get("target_infrastructure")
+    _require(isinstance(infrastructure, dict), "target infrastructure missing")
+    _require(
+        infrastructure.get("required_headers") == ["tvm_ffi_utils.h"],
+        "target header contract mismatch",
+    )
 
-    expected: set[tuple[str, CakeKDAAffineRole]] = {
-        (target, role) for target in _CAKE_KDA_TARGETS for role in CAKE_KDA_AFFINE_ROLES
-    }
-    observed: set[tuple[str, CakeKDAAffineRole]] = set()
-    specs: list[CakeKDAAffineModuleSpec] = []
+    contract = payload.get("contract")
+    _require(isinstance(contract, dict), "contract missing")
+    _require(contract.get("architectures") == ["sm_100a", "sm_103a"], "architectures")
+    suites = contract.get("shape_suites")
+    _require(isinstance(suites, dict) and bool(suites), "shape suites missing")
+    suite_rows = 0
+    for suite, labels in suites.items():
+        _require(
+            isinstance(suite, str)
+            and bool(suite)
+            and isinstance(labels, list)
+            and bool(labels)
+            and all(isinstance(label, str) and bool(label) for label in labels)
+            and len(set(labels)) == len(labels),
+            f"{suite!r} must contain unique nonempty labels",
+        )
+        suite_rows += len(labels)
+    denominator = contract.get("shape_denominator")
+    _require(
+        isinstance(denominator, list)
+        and bool(denominator)
+        and all(isinstance(label, str) and bool(label) for label in denominator)
+        and len(set(denominator)) == len(denominator)
+        and contract.get("shape_count") == len(denominator),
+        "shape denominator must contain shape_count unique nonempty rows",
+    )
+    _require(
+        suite_rows == len(denominator)
+        and {label for labels in suites.values() for label in labels}
+        == set(denominator),
+        "shape suites must exactly partition the denominator",
+    )
+    required_problem_shapes = contract.get("required_problem_shapes")
+    _require(
+        isinstance(required_problem_shapes, list)
+        and len(set(required_problem_shapes)) == len(required_problem_shapes)
+        and set(required_problem_shapes).issubset(denominator),
+        "required predecessor/problem shapes must be a unique denominator subset",
+    )
+    core_base_shape_count = contract.get("core_base_shape_count")
+    core_state_arms = contract.get("core_state_arms")
+    if core_base_shape_count is not None or core_state_arms is not None:
+        _require(
+            isinstance(core_base_shape_count, int)
+            and not isinstance(core_base_shape_count, bool)
+            and core_base_shape_count > 0,
+            "core_base_shape_count must be positive",
+        )
+        _require(
+            isinstance(core_state_arms, list)
+            and bool(core_state_arms)
+            and all(isinstance(arm, str) and bool(arm) for arm in core_state_arms)
+            and len(set(core_state_arms)) == len(core_state_arms),
+            "core_state_arms must be unique nonempty labels",
+        )
+        _require(
+            isinstance(suites.get("core177"), list)
+            and len(suites["core177"]) == core_base_shape_count * len(core_state_arms),
+            "core suite size must equal base shapes times state arms",
+        )
+    timing_requirement = contract.get("timing_requirement")
+    _require(
+        isinstance(timing_requirement, str)
+        and "source_export_interleaved" in timing_requirement,
+        "interleaved timing requirement missing",
+    )
+
+    files = payload.get("files")
+    _require(isinstance(files, list) and bool(files), "file inventory missing")
+    file_sha256: dict[str, str] = {}
+    for index, item in enumerate(files):
+        _require(isinstance(item, dict), f"files[{index}] must be an object")
+        raw_path = item.get("path")
+        digest = item.get("sha256")
+        _require(isinstance(raw_path, str), f"files[{index}].path missing")
+        _require(
+            isinstance(digest, str) and len(digest) == 64, f"files[{index}].sha256"
+        )
+        path = _resolve_source(csrc_dir, raw_path, f"files[{index}].path")
+        _require(
+            hashlib.sha256(path.read_bytes()).hexdigest() == digest,
+            f"files[{index}] hash",
+        )
+        _require(raw_path not in file_sha256, f"duplicate file {raw_path}")
+        file_sha256[raw_path] = digest
+
+    modules = payload.get("modules")
+    target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
+    _require(isinstance(modules, list) and bool(modules), "module inventory missing")
+    observed: set[tuple[str, str, str, str]] = set()
+    specs: list[CakeKDAModuleSpec] = []
     for index, item in enumerate(modules):
         label = f"modules[{index}]"
-        _require_affine_manifest(isinstance(item, dict), f"{label} must be an object")
-        target = item.get("target")
+        _require(isinstance(item, dict), f"{label} must be an object")
+        arch = item.get("arch")
+        route = item.get("route")
         role = item.get("role")
-        _require_affine_manifest(target in _CAKE_KDA_TARGETS, f"{label}.target")
-        _require_affine_manifest(role in CAKE_KDA_AFFINE_ROLES, f"{label}.role")
-        key = (target, role)
-        _require_affine_manifest(
-            key not in observed, f"duplicate module {target}/{role}"
+        _require(arch in target_by_arch, f"{label}.arch unsupported")
+        _require(isinstance(route, dict), f"{label}.route missing")
+        family = route.get("family")
+        policy = route.get("policy")
+        _require(family in _SUPPORTED_FAMILIES, f"{label}.family unsupported")
+        _require(
+            isinstance(policy, str) and bool(policy),
+            f"{label}.policy must be nonempty",
         )
+        _require(role in _SUPPORTED_ROLES, f"{label}.role unsupported")
+        typed_family = cast(CakeKDAFamily, family)
+        typed_role = cast(CakeKDARole, role)
+        key = (arch, family, policy, role)
+        _require(key not in observed, f"duplicate module {key}")
         observed.add(key)
 
-        module_ident = item.get("module_ident")
-        _require_affine_manifest(
-            isinstance(module_ident, str)
-            and module_ident.startswith("cake_kda_")
-            and module_ident.replace("_", "").isalnum()
-            and module_ident == module_ident.lower(),
-            f"{label}.module_ident must be a public cake_kda symbol",
+        units = item.get("translation_units")
+        _require(isinstance(units, dict), f"{label}.translation_units")
+        _require(units.get("compile_separately") is True, f"{label}.compile_separately")
+        device_raw = units.get("device")
+        binding_raw = units.get("binding")
+        device_headers_raw = units.get("device_headers", [])
+        binding_headers_raw = units.get("binding_headers", [])
+        _require(
+            isinstance(device_headers_raw, list)
+            and all(isinstance(path, str) for path in device_headers_raw)
+            and len(device_headers_raw) == len(set(device_headers_raw)),
+            f"{label}.device_headers",
         )
-        binding_path = _verify_affine_manifest_file(
-            csrc_dir,
-            path_value=item.get("binding_path"),
-            sha256_value=item.get("binding_sha256"),
-            label=f"{label}.binding",
+        _require(
+            isinstance(binding_headers_raw, list)
+            and all(isinstance(path, str) for path in binding_headers_raw)
+            and len(binding_headers_raw) == len(set(binding_headers_raw)),
+            f"{label}.binding_headers",
         )
-        _require_affine_manifest(
-            binding_path.suffix == ".cu", f"{label}.binding must be a .cu file"
-        )
-        source_items = item.get("sources")
-        _require_affine_manifest(
-            isinstance(source_items, list) and bool(source_items),
-            f"{label}.sources must be non-empty",
-        )
-        source_paths = tuple(
-            _verify_affine_manifest_file(
-                csrc_dir,
-                path_value=source.get("path") if isinstance(source, dict) else None,
-                sha256_value=(
-                    source.get("sha256") if isinstance(source, dict) else None
-                ),
-                label=f"{label}.sources[{source_index}]",
+        device_path = _resolve_source(csrc_dir, device_raw, f"{label}.device")
+        binding_path = _resolve_source(csrc_dir, binding_raw, f"{label}.binding")
+        device_headers = tuple(
+            _resolve_source(
+                csrc_dir, raw_path, f"{label}.device_headers[{header_index}]"
             )
-            for source_index, source in enumerate(source_items)
+            for header_index, raw_path in enumerate(device_headers_raw)
         )
+        binding_headers = tuple(
+            _resolve_source(
+                csrc_dir, raw_path, f"{label}.binding_headers[{header_index}]"
+            )
+            for header_index, raw_path in enumerate(binding_headers_raw)
+        )
+        _require(
+            device_raw in file_sha256
+            and binding_raw in file_sha256
+            and all(path in file_sha256 for path in device_headers_raw)
+            and all(path in file_sha256 for path in binding_headers_raw),
+            f"{label}.files",
+        )
+        closure = item.get("closure")
+        _require(
+            isinstance(closure, list)
+            and len(closure) == 2 + len(device_headers_raw) + len(binding_headers_raw),
+            f"{label}.closure",
+        )
+        closure_map = {
+            entry.get("path"): entry.get("sha256")
+            for entry in closure
+            if isinstance(entry, dict)
+        }
+        _require(
+            closure_map
+            == {
+                device_raw: file_sha256[device_raw],
+                binding_raw: file_sha256[binding_raw],
+                **{raw_path: file_sha256[raw_path] for raw_path in device_headers_raw},
+                **{raw_path: file_sha256[raw_path] for raw_path in binding_headers_raw},
+            },
+            f"{label}.closure mismatch",
+        )
+        module_ident = item.get("module_ident")
+        closure_sha256 = item.get("closure_sha256")
+        compile_flags = item.get("compile_flags")
+        launch = item.get("launch")
+        arg_plan = item.get("arg_plan")
+        tma_abi = item.get("tma_abi")
+        tma_workspace_bytes = item.get("tma_workspace_bytes")
+        _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
+        _require(
+            isinstance(arg_plan, list)
+            and all(
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(part, str) and part for part in entry)
+                for entry in arg_plan
+            ),
+            f"{label}.arg_plan",
+        )
+        _require(tma_abi in ("grid_constant", "pointer"), f"{label}.tma_abi")
+        _require(
+            isinstance(tma_workspace_bytes, int) and tma_workspace_bytes >= 0,
+            f"{label}.tma_workspace_bytes",
+        )
+        workspace_args = [
+            entry
+            for entry in arg_plan
+            if entry == ["workspace", "tma_descriptor_workspace"]
+        ]
+        if tma_abi == "grid_constant":
+            _require(
+                tma_workspace_bytes == 0 and not workspace_args,
+                f"{label} grid-constant ABI must not request TMA workspace",
+            )
+        else:
+            _require(
+                tma_workspace_bytes > 0
+                and tma_workspace_bytes % 128 == 0
+                and workspace_args == [["workspace", "tma_descriptor_workspace"]],
+                f"{label} pointer ABI requires one aligned caller TMA workspace",
+            )
+        _require(isinstance(item.get("name"), str), f"{label}.name")
+        _require(isinstance(module_ident, str), f"{label}.module_ident")
+        _require(
+            isinstance(closure_sha256, str) and len(closure_sha256) == 64,
+            f"{label}.closure_sha256",
+        )
+        _require(
+            isinstance(compile_flags, list)
+            and all(isinstance(flag, str) for flag in compile_flags),
+            f"{label}.compile_flags",
+        )
+        _require(isinstance(launch, dict), f"{label}.launch")
         specs.append(
-            CakeKDAAffineModuleSpec(
-                target=target,
-                role=role,
+            CakeKDAModuleSpec(
+                target=cast(CakeKDATarget, target_by_arch[arch]),
+                family=typed_family,
+                policy=policy,
+                role=typed_role,
+                name=item["name"],
                 module_ident=module_ident,
+                closure_sha256=closure_sha256,
+                compile_flags=tuple(compile_flags),
+                device_path=device_path,
                 binding_path=binding_path,
-                sources=source_paths,
+                device_headers=device_headers,
+                binding_headers=binding_headers,
+                use_pdl=launch.get("use_pdl") is True,
+                tma_abi=tma_abi,
+                tma_workspace_bytes=tma_workspace_bytes,
             )
         )
 
-    _require_affine_manifest(
-        observed == expected,
-        f"target/role set mismatch: missing={sorted(expected - observed)}, "
-        f"extra={sorted(observed - expected)}",
+    observed_arch_families = {
+        (arch, family) for arch, family, _policy, _role in observed
+    }
+    expected_arch_families = {
+        (arch, family) for arch in target_by_arch for family in _SUPPORTED_FAMILIES
+    }
+    _require(
+        observed_arch_families == expected_arch_families,
+        "every architecture must contain every portfolio family",
     )
-    specs.sort(key=lambda spec: (spec.target, CAKE_KDA_AFFINE_ROLES.index(spec.role)))
+    specs.sort(key=lambda spec: (spec.target, spec.family, spec.policy, spec.role))
     return tuple(specs)
 
 
-def cake_kda_affine_is_available() -> bool:
-    """Return whether the complete sealed affine export is installed."""
+@functools.cache
+def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
+    """Load the two allocation-free unbounded affine sequences."""
 
-    return len(get_cake_kda_affine_module_specs()) == (
-        len(_CAKE_KDA_TARGETS) * len(CAKE_KDA_AFFINE_ROLES)
+    module_specs = get_cake_kda_module_specs()
+    module_by_identity = {
+        (spec.target, spec.name, spec.role): spec for spec in module_specs
+    }
+    csrc_dir = get_kda_csrc_dir()
+    payload: Any = json.loads((csrc_dir / _MANIFEST).read_text())
+    files = payload.get("files")
+    assert isinstance(files, list)
+    file_sha256 = {
+        item["path"]: item["sha256"]
+        for item in files
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("sha256"), str)
+    }
+    raw_sequences = payload.get("sequences")
+    _require(
+        isinstance(raw_sequences, list) and len(raw_sequences) == 2,
+        "prepared sequence inventory mismatch",
     )
+    expected: set[tuple[CakeKDATarget, CakeKDASequenceFamily]] = {
+        (target, family)
+        for target in cast(tuple[CakeKDATarget, ...], tuple(_TARGET_ARCH))
+        for family in cast(
+            tuple[CakeKDASequenceFamily, ...], ("unbounded_affine_prefix",)
+        )
+    }
+    observed: set[tuple[CakeKDATarget, CakeKDASequenceFamily]] = set()
+    specs: list[CakeKDASequenceSpec] = []
+    target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
+    for index, item in enumerate(raw_sequences):
+        label = f"sequences[{index}]"
+        _require(isinstance(item, dict), f"{label} must be an object")
+        arch = item.get("arch")
+        route = item.get("route")
+        _require(arch in target_by_arch, f"{label}.arch unsupported")
+        _require(isinstance(route, dict), f"{label}.route missing")
+        family = cast(CakeKDASequenceFamily, route.get("family"))
+        target = cast(CakeKDATarget, target_by_arch[arch])
+        key = (target, family)
+        _require(key in expected, f"{label} unsupported route {key}")
+        _require(key not in observed, f"duplicate sequence {key}")
+        observed.add(key)
+        _require(
+            route.get("policy") == "affine_prepared_sequence",
+            f"{label}.route policy",
+        )
+        _require(item.get("role") == "composite", f"{label}.role")
+        expected_name = "cake_kda_affine_unbounded_softplus_sequence"
+        _require(item.get("name") == expected_name, f"{label}.name")
+        _require(item.get("ffi_entry") == "run", f"{label}.ffi_entry")
+        _require(
+            item.get("ffi_abi") == "packed_positional",
+            f"{label}.ffi_abi",
+        )
+        stage_order = item.get("stage_order")
+        _require(
+            stage_order == ["main", "map", "scan", "correction"],
+            f"{label}.stage order",
+        )
+        stages = item.get("stages")
+        _require(isinstance(stages, list) and len(stages) == 4, f"{label}.stages")
+        expected_stage_specs = (
+            get_cake_kda_module_spec(target, family, "affine_split_main", "main"),
+            get_cake_kda_module_spec(target, family, "affine_split_map", "map"),
+            get_cake_kda_module_spec(
+                target,
+                "unbounded_affine_prefix",
+                "affine_prefix_scan",
+                "scan",
+            ),
+            get_cake_kda_module_spec(
+                target,
+                family,
+                "affine_split_correction",
+                "correction",
+            ),
+        )
+        device_raw: list[str] = []
+        for stage_index, (stage, expected_spec, stage_name) in enumerate(
+            zip(stages, expected_stage_specs, stage_order, strict=True)
+        ):
+            stage_label = f"{label}.stages[{stage_index}]"
+            _require(isinstance(stage, dict), f"{stage_label} must be an object")
+            _require(stage.get("name") == stage_name, f"{stage_label}.name")
+            module_ref = stage.get("module")
+            _require(isinstance(module_ref, dict), f"{stage_label}.module")
+            identity = (
+                target,
+                module_ref.get("name"),
+                cast(CakeKDARole, module_ref.get("role")),
+            )
+            _require(
+                module_by_identity.get(identity) == expected_spec,
+                f"{stage_label}.module identity",
+            )
+            raw_device = stage.get("device")
+            _require(isinstance(raw_device, str), f"{stage_label}.device")
+            _require(
+                _resolve_source(csrc_dir, raw_device, f"{stage_label}.device")
+                == expected_spec.device_path,
+                f"{stage_label}.device path",
+            )
+            device_raw.append(raw_device)
+        units = item.get("translation_units")
+        _require(isinstance(units, dict), f"{label}.translation_units")
+        _require(units.get("compile_separately") is True, f"{label}.compile_separately")
+        _require(units.get("devices") == device_raw, f"{label}.device closure")
+        binding_raw = units.get("binding")
+        binding_path = _resolve_source(csrc_dir, binding_raw, f"{label}.binding")
+        closure = item.get("closure")
+        _require(
+            isinstance(closure, list) and len(closure) == 5,
+            f"{label}.closure",
+        )
+        closure_map = {
+            entry.get("path"): entry.get("sha256")
+            for entry in closure
+            if isinstance(entry, dict)
+        }
+        expected_closure = {
+            path: file_sha256[path] for path in [*device_raw, binding_raw]
+        }
+        _require(closure_map == expected_closure, f"{label}.closure mismatch")
+        compile_flags = item.get("compile_flags")
+        _require(
+            isinstance(compile_flags, list)
+            and all(isinstance(flag, str) for flag in compile_flags),
+            f"{label}.compile_flags",
+        )
+        arg_plan = item.get("arg_plan")
+        _require(
+            isinstance(arg_plan, list)
+            and len(arg_plan) > 0
+            and all(
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(part, str) and part for part in entry)
+                for entry in arg_plan
+            ),
+            f"{label}.arg_plan",
+        )
+        closure_sha256 = item.get("closure_sha256")
+        _require(
+            isinstance(closure_sha256, str) and len(closure_sha256) == 64,
+            f"{label}.closure_sha256",
+        )
+        specs.append(
+            CakeKDASequenceSpec(
+                target=target,
+                family=family,
+                name=expected_name,
+                closure_sha256=closure_sha256,
+                compile_flags=tuple(compile_flags),
+                stage_order=tuple(stage_order),
+                arg_plan=tuple(tuple(entry) for entry in arg_plan),
+                device_paths=tuple(
+                    _resolve_source(csrc_dir, path, f"{label}.device")
+                    for path in device_raw
+                ),
+                binding_path=binding_path,
+            )
+        )
+    _require(observed == expected, "prepared sequence set mismatch")
+    specs.sort(key=lambda spec: (spec.target, spec.family))
+    return tuple(specs)
 
 
-def get_cake_kda_affine_module_spec(
-    target: CakeKDATarget, role: CakeKDAAffineRole
-) -> CakeKDAAffineModuleSpec:
-    """Return one verified affine source closure."""
+def cake_kda_is_available() -> bool:
+    return bool(get_cake_kda_module_specs()) and len(get_cake_kda_sequence_specs()) == 2
 
-    for spec in get_cake_kda_affine_module_specs():
-        if spec.target == target and spec.role == role:
+
+def get_cake_kda_module_spec(
+    target: CakeKDATarget,
+    family: CakeKDAFamily,
+    policy: str,
+    role: CakeKDARole = "main",
+) -> CakeKDAModuleSpec:
+    for spec in get_cake_kda_module_specs():
+        if (spec.target, spec.family, spec.policy, spec.role) == (
+            target,
+            family,
+            policy,
+            role,
+        ):
             return spec
-    raise RuntimeError(
-        "Cake KDA affine generated sources are not installed for "
-        f"{target}/{role}; run tools/import-cake-kda-prefill-affine with the "
-        "complete sealed bundle"
-    )
+    raise ValueError(f"unsupported Cake KDA module: {target}/{family}/{policy}/{role}")
 
 
-def get_cake_kda_affine_uri(target: CakeKDATarget, role: CakeKDAAffineRole) -> str:
-    """Return the exact target-and-role cache identity from the sealed export."""
-
-    spec = get_cake_kda_affine_module_spec(target, role)
-    return f"{spec.module_ident}_{target}_{role}"
+def get_cake_kda_sequence_spec(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+) -> CakeKDASequenceSpec:
+    for spec in get_cake_kda_sequence_specs():
+        if (spec.target, spec.family) == (target, family):
+            return spec
+    raise ValueError(f"unsupported Cake KDA prepared sequence: {target}/{family}")
 
 
 @functools.cache
-def gen_cake_kda_affine_module(
-    target: CakeKDATarget, role: CakeKDAAffineRole
+def gen_cake_kda_module(
+    target: CakeKDATarget,
+    family: CakeKDAFamily,
+    policy: str,
+    role: CakeKDARole = "main",
 ) -> JitSpec:
-    """Generate one verified affine target-and-role JIT module."""
-
-    spec = get_cake_kda_affine_module_spec(target, role)
-    csrc_dir = _get_cake_kda_csrc_dir()
+    spec = get_cake_kda_module_spec(target, family, policy, role)
     jit_spec = gen_kda_jit_spec(
-        name=get_cake_kda_affine_uri(target, role),
-        sources=[spec.binding_path],
+        name=f"{spec.module_ident}_{target}_{spec.closure_sha256}",
+        sources=[spec.device_path, spec.binding_path],
         target=target,
-        target_define=_CAKE_KDA_TARGET_DEFINE[target],
-        csrc_dir=csrc_dir,
-        include_dir=_get_cake_kda_include_dir(),
+        target_define=_TARGET_DEFINE[target],
+        csrc_dir=get_kda_csrc_dir(),
+        include_dir=get_flashinfer_include_dir(),
+        extra_cuda_cflags=spec.compile_flags,
     )
-    logger.info(f"Generated Cake KDA affine {role} {target} JIT spec: {jit_spec.name}")
+    logger.info(
+        "Generated Cake KDA portfolio JIT spec: "
+        f"target={target}, family={family}, policy={policy}, role={role}"
+    )
     return jit_spec
 
 
 @functools.cache
-def load_cake_kda_affine_module(target: CakeKDATarget, role: CakeKDAAffineRole):
-    """Build or load one verified affine target-and-role module."""
-
-    module = gen_cake_kda_affine_module(target, role).build_and_load()
-    logger.info(f"Loaded Cake KDA affine {role} {target} module")
-    return module
-
-
-def get_cake_kda_affine_module(target: CakeKDATarget, role: CakeKDAAffineRole):
-    """Return one loaded affine module for the host-side composite."""
-
-    return load_cake_kda_affine_module(target, role)
-
-
-def get_cake_kda_uri(variant: CakeKDAVariant, target: CakeKDATarget) -> str:
-    """Return the target-specific JIT/AOT key for one schedule."""
-
-    if variant not in CAKE_KDA_VARIANTS:
-        raise ValueError(f"unsupported CakeKDA variant: {variant}")
-    if target not in _CAKE_KDA_TARGETS:
-        raise ValueError(f"unsupported CakeKDA target: {target}")
-    module_ident = _CAKE_KDA_MODULE_IDENTS[variant]
-    return f"cake_kda_bf16_fused_{variant}_{module_ident}_{target}"
-
-
-@functools.cache
-def gen_cake_kda_module(variant: CakeKDAVariant, target: CakeKDATarget) -> JitSpec:
-    """Generate one exact-SM100a or exact-SM103a JIT module.
-
-    Each physical schedule is compiled in its own translation unit because the
-    checked-in frozen sources intentionally retain generated helper names and
-    macros. ``gen_jit_spec`` supplies FlashInfer's standard ``-use_fast_math``
-    flag. B200 and B300 use separate exact targets and therefore separate
-    cubins and cache identities.
-    """
-
-    csrc_dir = _get_cake_kda_csrc_dir()
-    include_dir = _get_cake_kda_include_dir()
-    uri = get_cake_kda_uri(variant, target)
-    binding = csrc_dir / f"cake_kda_bf16_fused_{variant}_binding.cu"
-    if not binding.exists():
-        raise FileNotFoundError(f"CakeKDA binding source not found: {binding}")
-
-    spec = gen_kda_jit_spec(
-        name=uri,
-        sources=[binding],
-        target=target,
-        target_define=_CAKE_KDA_TARGET_DEFINE[target],
-        csrc_dir=csrc_dir,
-        include_dir=include_dir,
-    )
-    logger.info(f"Generated CakeKDA {variant} {target} JIT spec: {spec.name}")
-    return spec
-
-
-def gen_cake_kda_m128_unbounded_softplus_module(target: CakeKDATarget) -> JitSpec:
-    """Generate the native unbounded-softplus M128 module."""
-
-    return gen_cake_kda_module("m128_unbounded_softplus", target)
-
-
-def gen_cake_kda_m128_bt64_unbounded_softplus_module(
+def get_cake_kda_module(
     target: CakeKDATarget,
-) -> JitSpec:
-    """Generate the checkpoint-aligned native unbounded-softplus BT64 module."""
-
-    return gen_cake_kda_module("m128_bt64_unbounded_softplus", target)
+    family: CakeKDAFamily,
+    policy: str,
+    role: CakeKDARole = "main",
+):
+    return gen_cake_kda_module(target, family, policy, role).build_and_load()
 
 
 @functools.cache
-def load_cake_kda_module(variant: CakeKDAVariant, target: CakeKDATarget):
-    """Build or load one physical, target-specific CakeKDA module."""
+def gen_cake_kda_sequence(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+) -> JitSpec:
+    spec = get_cake_kda_sequence_spec(target, family)
+    jit_spec = gen_kda_jit_spec(
+        name=f"{spec.name}_{target}_{spec.closure_sha256}",
+        sources=[*spec.device_paths, spec.binding_path],
+        target=target,
+        target_define=_TARGET_DEFINE[target],
+        csrc_dir=get_kda_csrc_dir(),
+        include_dir=get_flashinfer_include_dir(),
+        extra_cuda_cflags=spec.compile_flags,
+    )
+    logger.info(
+        "Generated Cake KDA prepared-sequence JIT spec: "
+        f"target={target}, family={family}, stages={spec.stage_order}"
+    )
+    return jit_spec
 
-    module = gen_cake_kda_module(variant, target).build_and_load()
-    logger.info(f"Loaded CakeKDA {variant} {target} module")
-    return module
 
-
-def load_cake_kda_m128_unbounded_softplus_module(target: CakeKDATarget):
-    """Load the native unbounded-softplus M128 module."""
-
-    return load_cake_kda_module("m128_unbounded_softplus", target)
-
-
-def load_cake_kda_m128_bt64_unbounded_softplus_module(target: CakeKDATarget):
-    """Load the checkpoint-aligned native unbounded-softplus BT64 module."""
-
-    return load_cake_kda_module("m128_bt64_unbounded_softplus", target)
-
-
-def get_cake_kda_prefill_module(variant: CakeKDAVariant, target: CakeKDATarget):
-    """Return the loaded module used by the recurrent-KDA prefill dispatcher."""
-
-    return load_cake_kda_module(variant, target)
+@functools.cache
+def get_cake_kda_sequence(
+    target: CakeKDATarget,
+    family: CakeKDASequenceFamily,
+):
+    return gen_cake_kda_sequence(target, family).build_and_load()
 
 
 __all__ = [
-    "CAKE_KDA_AFFINE_ROLES",
-    "CAKE_KDA_VARIANTS",
-    "CakeKDAAffineModuleSpec",
-    "CakeKDAAffineRole",
+    "CakeKDAFamily",
+    "CakeKDAModuleSpec",
+    "CakeKDARole",
+    "CakeKDASequenceFamily",
+    "CakeKDASequenceSpec",
     "CakeKDATarget",
-    "CakeKDAVariant",
-    "cake_kda_affine_is_available",
-    "gen_cake_kda_affine_module",
-    "gen_cake_kda_m128_bt64_unbounded_softplus_module",
-    "gen_cake_kda_m128_unbounded_softplus_module",
+    "cake_kda_is_available",
     "gen_cake_kda_module",
-    "get_cake_kda_affine_module",
-    "get_cake_kda_affine_module_spec",
-    "get_cake_kda_affine_module_specs",
-    "get_cake_kda_affine_uri",
-    "get_cake_kda_prefill_module",
-    "get_cake_kda_uri",
-    "load_cake_kda_m128_bt64_unbounded_softplus_module",
-    "load_cake_kda_m128_unbounded_softplus_module",
-    "load_cake_kda_affine_module",
-    "load_cake_kda_module",
+    "gen_cake_kda_sequence",
+    "get_cake_kda_module",
+    "get_cake_kda_module_spec",
+    "get_cake_kda_module_specs",
+    "get_cake_kda_sequence",
+    "get_cake_kda_sequence_spec",
+    "get_cake_kda_sequence_specs",
 ]

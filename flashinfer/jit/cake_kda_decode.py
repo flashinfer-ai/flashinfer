@@ -65,6 +65,22 @@ CAKE_KDA_DECODE_DIRECT_VARIANTS: tuple[CakeKDADecodeVariant, ...] = (
 )
 
 
+_CAKE_KDA_DECODE_KERNEL_SYMBOLS: dict[CakeKDADecodeVariant, str] = {
+    "d128_t1_unbounded_softplus_direct_split4": "kernel_flashinfer_recurrent_kda_t1_unbounded_softplus",
+    "d128_t1_unbounded_softplus_direct_split8": "kernel_cake_kda_t1_contract_e724f2cceb5341e2df2e",
+    "d128_t1_unbounded_softplus_direct_split16": "kernel_cake_kda_t1_contract_b13ee5576b0306e81f89",
+    "d128_t1_unbounded_softplus_direct_split8_warp2": "kernel_flashinfer_recurrent_kda_t1_unbounded_softplus_warp2",
+}
+
+
+_CAKE_KDA_DECODE_NATIVE_CUTENSORMAP_VARIANTS = frozenset(
+    {
+        "d128_t1_unbounded_softplus_direct_split8",
+        "d128_t1_unbounded_softplus_direct_split16",
+    }
+)
+
+
 class CakeKDADecodeVariantMetadata(NamedTuple):
     head_dim: int
     tokens: int
@@ -149,6 +165,7 @@ def _get_binding_cu(
 
     defines: list[tuple[str, str | int]] = [
         ("CAKE_KDA_DECODE_BODY_FILE", f'"cake_kda_decode_{variant}.cu"'),
+        ("CAKE_KDA_DECODE_KERNEL_SYMBOL", _CAKE_KDA_DECODE_KERNEL_SYMBOLS[variant]),
         ("CAKE_KDA_DECODE_HEAD_DIM", metadata.head_dim),
         ("CAKE_KDA_DECODE_TOKENS", metadata.tokens),
         ("CAKE_KDA_DECODE_GATE_KIND", metadata.gate_kind),
@@ -156,6 +173,8 @@ def _get_binding_cu(
         ("CAKE_KDA_DECODE_LAUNCH_THREADS", metadata.launch_threads),
         ("CAKE_KDA_DECODE_WARPS_PER_CTA", metadata.warps_per_cta),
     ]
+    if variant in _CAKE_KDA_DECODE_NATIVE_CUTENSORMAP_VARIANTS:
+        defines.append(("CAKE_KDA_DECODE_NATIVE_CUTENSORMAP", 1))
     if metadata.direct_impl:
         defines.append(("CAKE_KDA_DECODE_DIRECT_IMPL", 1))
     return render_kda_decode_binding(defines, "cake_kda_decode_binding.cuh")

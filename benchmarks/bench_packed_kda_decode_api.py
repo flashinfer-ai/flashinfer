@@ -33,8 +33,13 @@ import torch
 import flashinfer
 from flashinfer.jit.cake_flash_kda_packed_t1 import _variant_for_batch
 from flashinfer.jit.cake_flash_kda_packed_t1 import gen_flash_kda_packed_t1_module
+from flashinfer.jit.cake_kda_packed_t1 import gen_cake_kda_packed_t1_module
+from flashinfer.jit.cake_kda_packed_t1 import select_cake_kda_packed_t1_variant
 from flashinfer.kda_decode import packed_kda_decode
-from flashinfer.kda_kernels.cake_packed_kda_decode import _target_for_device
+from flashinfer.kda_kernels.cake_packed_kda_decode import (
+    _optimized_alignment_flags,
+    _target_for_device,
+)
 from flashinfer.testing import bench_gpu_time
 
 
@@ -291,14 +296,37 @@ def _check_source(expected_source_root):
     return source_sha
 
 
-def _jit_binary_metadata(variant, target):
-    spec = gen_flash_kda_packed_t1_module(variant, target)
+def _resolved_module(case, optimized_target):
+    state_aligned, aux_vec4_aligned = _optimized_alignment_flags(
+        case["mixed_qkv"], case["raw_gate"], case["dt_bias"], case["state"]
+    )
+    optimized_variant = select_cake_kda_packed_t1_variant(
+        case["batch"],
+        state_aligned=state_aligned,
+        aux_vec4_aligned=aux_vec4_aligned,
+    )
+    if optimized_variant is not None:
+        return "cake", optimized_variant, optimized_target
+    legacy_target = "sm100f" if optimized_target == "sm103a" else optimized_target
+    return "flash_kda", _variant_for_batch(case["batch"]), legacy_target
+
+
+def _jit_binary_metadata(module_family, variant, target):
+    generator = (
+        gen_cake_kda_packed_t1_module
+        if module_family == "cake"
+        else gen_flash_kda_packed_t1_module
+    )
+    spec = generator(variant, target)
     path = spec.get_library_path().resolve()
     if not path.is_file():
         raise RuntimeError(
             f"loaded packed KDA module has no auditable binary at {path}"
         )
     return {
+        "module_family": module_family,
+        "variant": variant,
+        "target": target,
         "spec_name": spec.name,
         "path": str(path),
     }
@@ -407,10 +435,12 @@ def main():
         case = _make_case(batch, device, args.seed + ordinal)
         warmup_case = _make_case(batch, device, args.seed + 10000 + ordinal)
         correctness = _check_correctness(case)
-        variant = _variant_for_batch(batch)
-        binary_key = f"{variant}_{target}"
+        module_family, variant, module_target = _resolved_module(case, target)
+        binary_key = f"{module_family}:{variant}_{module_target}"
         if binary_key not in jit_binaries:
-            jit_binaries[binary_key] = _jit_binary_metadata(variant, target)
+            jit_binaries[binary_key] = _jit_binary_metadata(
+                module_family, variant, module_target
+            )
         for mode in modes:
             warmup_run, measured_run = _make_timing_runners(case, warmup_case, mode)
             samples_ms = []
@@ -435,8 +465,9 @@ def main():
                 "dtype": "bfloat16",
                 "state_dtype": "bfloat16",
                 "mode": mode,
+                "module_family": module_family,
                 "variant": variant,
-                "target": target,
+                "target": module_target,
                 "median_ms": median_ms,
                 "samples_ms": samples_ms,
                 "correctness": correctness,

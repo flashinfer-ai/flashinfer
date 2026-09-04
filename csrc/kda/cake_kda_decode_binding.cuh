@@ -33,7 +33,9 @@
 #define int16_t cake_kda_generated_int16_t
 #define CakeKDATensorMap cake_kda_generated_CakeKDATensorMap
 #define CakeKDATensorMapPack cake_kda_generated_CakeKDATensorMapPack
+#ifndef CAKE_KDA_DECODE_NATIVE_CUTENSORMAP
 #define CUtensorMap cake_kda_generated_CUtensorMap
+#endif
 #include CAKE_KDA_DECODE_BODY_FILE
 #undef uint8_t
 #undef uint16_t
@@ -43,7 +45,9 @@
 #undef int16_t
 #undef CakeKDATensorMap
 #undef CakeKDATensorMapPack
+#ifndef CAKE_KDA_DECODE_NATIVE_CUTENSORMAP
 #undef CUtensorMap
+#endif
 
 #ifdef CAKE_KDA_DECODE_DIRECT_IMPL
 #include "cake_kda_decode_binding_direct_impl.cuh"
