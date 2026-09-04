@@ -116,6 +116,10 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'run'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          # Step-level env does not cross steps, so the comment body has to be bound
+          # here too -- `Parse command` binding it is not enough. Passed through the
+          # environment rather than interpolated into the script, so the body is data.
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           # `@flashinfer-bot run <paths>` mirrors GitLab's `/bot run TEST_PATH`, so the
           # two systems present one convention. A label carries no payload, so the paths
