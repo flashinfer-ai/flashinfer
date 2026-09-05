@@ -88,6 +88,23 @@ def sanitize_symbol_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z_]", "_", name)
 
 
+def cute_dsl_module_dir(module_name: str) -> Path:
+    """The on-disk directory holding one op family's CuTe-DSL artifacts.
+
+    Adopters that must persist small per-kernel side data next to the exported
+    ``.o`` can anchor it here. Invalidation wipes the directory as a unit
+    (:meth:`JitSpecCuteDsl.build`), so such data can never outlive the artifact
+    it describes.
+
+    The b12x direct-micro adopter needs this: its launchable-block-dim probe
+    reads ``cute.compile`` internals that a TVM-FFI ``.o`` reload does not
+    expose, so the probe result is recorded beside the artifact at build time.
+    """
+    return jit_env.FLASHINFER_JIT_DIR / sanitize_symbol_name(
+        f"{module_name}_{_get_compile_arch()}_cute_dsl"
+    )
+
+
 class JitSpecCuteDsl(JitSpec):
     """JitSpec for one CuTe-DSL kernel specialization.
 
@@ -106,11 +123,9 @@ class JitSpecCuteDsl(JitSpec):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
-        self.module_dir_name = sanitize_symbol_name(
-            f"{module_name}_{_get_compile_arch()}_cute_dsl"
-        )
+        self.module_dir = cute_dsl_module_dir(module_name)
+        self.module_dir_name = self.module_dir.name
         self.name = f"{self.module_dir_name}/{self.kernel_name}"
-        self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
         self.expected_meta = {
