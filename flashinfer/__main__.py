@@ -16,6 +16,7 @@ limitations under the License.
 
 import copy
 import os
+import re
 from packaging.version import InvalidVersion, Version
 import subprocess
 import sys
@@ -145,6 +146,45 @@ def _build_jit_cache_requirement(flashinfer_version: str, cuda_index_label: str)
     return f"flashinfer-jit-cache=={public_version}+{cuda_index_label}"
 
 
+def _normalize_jit_cache_provider_tag(cuda_architecture: str) -> str:
+    normalized = cuda_architecture.strip().lower()
+    for prefix in ("compute_", "sm_", "sm"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    normalized = normalized.replace(".", "").replace("_", "")
+    if not re.fullmatch(r"\d{2,3}[af]?", normalized):
+        raise click.ClickException(
+            f"Invalid SM architecture '{cuda_architecture}'. "
+            "Use a value such as 'sm80', 'sm90a', or 'sm120f'."
+        )
+    return f"sm{normalized}"
+
+
+def _detect_jit_cache_provider_tags() -> tuple[str, ...]:
+    provider_tags = tuple(
+        sorted(
+            {
+                _normalize_jit_cache_provider_tag(f"{major}{minor}")
+                for major, minor in current_compilation_context.TARGET_CUDA_ARCHS
+            }
+        )
+    )
+    if not provider_tags:
+        raise click.ClickException(
+            "No CUDA architecture could be detected. Pass --sm explicitly when "
+            "installing minimal jit-cache providers on a host without a visible GPU."
+        )
+    return provider_tags
+
+
+def _build_jit_cache_provider_requirement(
+    flashinfer_version: str, cuda_index_label: str, provider_tag: str
+) -> str:
+    public_version = _get_public_flashinfer_version(flashinfer_version)
+    return f"flashinfer-jit-cache-{provider_tag}=={public_version}+{cuda_index_label}"
+
+
 def _build_cubin_requirement(flashinfer_version: str) -> str:
     public_version = _get_public_flashinfer_version(flashinfer_version)
     return f"flashinfer-cubin=={public_version}"
@@ -162,19 +202,25 @@ def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
 
 
 def _build_pip_install_cmd(
-    requirement: str, index_url: str, nightly: bool
+    requirements: str | list[str],
+    index_url: str,
+    nightly: bool,
+    no_deps: bool = True,
 ) -> list[str]:
+    if isinstance(requirements, str):
+        requirements = [requirements]
     cmd = [
         sys.executable,
         "-m",
         "pip",
         "install",
         "--upgrade",
-        "--no-deps",
     ]
+    if no_deps:
+        cmd.append("--no-deps")
     if nightly:
         cmd.append("--pre")
-    cmd.extend(["--index-url", index_url, requirement])
+    cmd.extend(["--index-url", index_url, *requirements])
     return cmd
 
 
@@ -222,18 +268,48 @@ def _install_jit_cache_wheel(
     index_url: str | None,
     nightly: bool,
     dry_run: bool,
+    mode: str = "all",
+    sm_architectures: tuple[str, ...] = (),
 ) -> None:
     detected_cuda_version = _parse_cuda_version(cuda_version)
     wheel_cuda_version = _resolve_jit_cache_cuda_version(detected_cuda_version)
     cuda_index_label = _cuda_version_to_index_label(wheel_cuda_version)
     resolved_flashinfer_version = flashinfer_version or __version__
-    requirement = _build_jit_cache_requirement(
+    shim_requirement = _build_jit_cache_requirement(
         resolved_flashinfer_version, cuda_index_label
     )
     resolved_index_url = index_url or _build_jit_cache_index_url(
         cuda_index_label, nightly
     )
-    cmd = _build_pip_install_cmd(requirement, resolved_index_url, nightly)
+    if sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm can only be used with --mode minimal.")
+
+    provider_tags: tuple[str, ...] = ()
+    requirements = [shim_requirement]
+    if mode == "minimal":
+        provider_tags = tuple(
+            sorted(
+                {
+                    _normalize_jit_cache_provider_tag(architecture)
+                    for architecture in sm_architectures
+                }
+            )
+        )
+        if not provider_tags:
+            provider_tags = _detect_jit_cache_provider_tags()
+        requirements.extend(
+            _build_jit_cache_provider_requirement(
+                resolved_flashinfer_version, cuda_index_label, provider_tag
+            )
+            for provider_tag in provider_tags
+        )
+
+    cmd = _build_pip_install_cmd(
+        requirements,
+        resolved_index_url,
+        nightly,
+        no_deps=mode == "minimal",
+    )
 
     click.secho("=== JIT Cache Wheel Install ===", fg="yellow")
     click.secho("FlashInfer version:", fg="magenta", nl=False)
@@ -242,10 +318,15 @@ def _install_jit_cache_wheel(
     click.secho(f" {detected_cuda_version}", fg="cyan")
     click.secho("Wheel CUDA label:", fg="magenta", nl=False)
     click.secho(f" {cuda_index_label}", fg="cyan")
+    click.secho("Install mode:", fg="magenta", nl=False)
+    click.secho(f" {mode}", fg="cyan")
+    if provider_tags:
+        click.secho("Providers:", fg="magenta", nl=False)
+        click.secho(f" {', '.join(provider_tags)}", fg="cyan")
     click.secho("Wheel index:", fg="magenta", nl=False)
     click.secho(f" {resolved_index_url}", fg="cyan")
     click.secho("Requirement:", fg="magenta", nl=False)
-    click.secho(f" {requirement}", fg="cyan")
+    click.secho(f" {' '.join(requirements)}", fg="cyan")
     _run_pip_install_cmd(
         cmd, dry_run, "✅ flashinfer-jit-cache installed successfully."
     )
@@ -506,6 +587,26 @@ def clear_cubin_cmd():
     help="Override the FlashInfer version to install a matching jit-cache wheel for.",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(("all", "minimal")),
+    default="all",
+    show_default=True,
+    help=(
+        "Install all provider dependencies declared by the shim, or only the "
+        "providers selected by --sm or the visible GPUs. Minimal mode does not "
+        "add a baseline provider."
+    ),
+)
+@click.option(
+    "--sm",
+    "sm_architectures",
+    multiple=True,
+    help=(
+        "CUDA architecture to install in minimal mode, such as sm80, sm90a, "
+        "or sm120f. May be repeated."
+    ),
+)
+@click.option(
     "--index-url",
     default=None,
     help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
@@ -521,11 +622,23 @@ def clear_cubin_cmd():
     help="Print the pip command without executing it.",
 )
 def install_jit_cache_wheel_cmd(
-    cuda_version, flashinfer_version, index_url, nightly, dry_run
+    cuda_version,
+    flashinfer_version,
+    mode,
+    sm_architectures,
+    index_url,
+    nightly,
+    dry_run,
 ):
     """Install the matching flashinfer-jit-cache wheel."""
     _install_jit_cache_wheel(
-        cuda_version, flashinfer_version, index_url, nightly, dry_run
+        cuda_version,
+        flashinfer_version,
+        index_url,
+        nightly,
+        dry_run,
+        mode,
+        sm_architectures,
     )
 
 
