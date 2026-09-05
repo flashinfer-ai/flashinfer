@@ -2257,9 +2257,10 @@ with contextlib.suppress(Exception):
             causal=True,
         )
 
-# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103) ──
+# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103/SM107) ──
 # FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
-# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103. Inputs
+# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103 or
+# Rubin (SM107). Inputs
 # are built with each template's own init (H=64, D=128).
 with contextlib.suppress(Exception):
     import flashinfer.attn_scores  # noqa: F401  (triggers @flashinfer_api registration)

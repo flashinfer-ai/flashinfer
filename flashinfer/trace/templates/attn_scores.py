@@ -44,12 +44,12 @@ def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_paged_block_table(seq_lens, block_size, device):
-    """Random paged block table + total block count for a batch of context lens.
+    """Random paged block table + total block count for a batch of seq_lens.
 
-    Sized for the kernel's access pattern: it reads ceil(ctx/128) compute tiles *
-    (128 // block_size) physical blocks per row, which exceeds ceil(ctx/block_size)
-    when ctx is not a multiple of 128. The extra columns default to physical index
-    0 (a valid pool block); those positions are beyond ctx (masked), so this avoids
+    Sized for the kernel's access pattern: it reads ceil(seq_len/128) compute tiles *
+    (128 // block_size) physical blocks per row, which exceeds ceil(seq_len/block_size)
+    when seq_len is not a multiple of 128. The extra columns default to physical index
+    0 (a valid pool block); those positions are beyond seq_len (masked), so this avoids
     an out-of-bounds block_tables / KV read."""
     n_blk = (seq_lens + block_size - 1) // block_size
     kern_blk = ((seq_lens + 127) // 128) * (128 // block_size)
@@ -90,8 +90,8 @@ def _fp8_paged_mqa_logits_reference(
     q,
     kv_fused,
     weights,
-    seq_lens,
     block_tables,
+    seq_lens,
     max_seq_len,
     output_dtype=torch.float32,
 ):
@@ -122,21 +122,21 @@ def _fp8_paged_mqa_logits_reference(
         (B * next_n, max_seq_len), float("-inf"), device=device, dtype=output_dtype
     )
     for b in range(B):
-        ctx = int(seq_lens[b].item())
-        q_pos = torch.arange(ctx - next_n, ctx, device=device)
+        seq_len = int(seq_lens[b].item())
+        q_pos = torch.arange(seq_len - next_n, seq_len, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].to(output_dtype)
-        for blk in range((ctx + block_size - 1) // block_size):
+        for blk in range((seq_len + block_size - 1) // block_size):
             phys = int(block_tables[b, blk].item())
             k = kv_fp8[phys].float()
             sc = scales[phys].to(output_dtype)
             kpos = torch.arange(blk * block_size, (blk + 1) * block_size, device=device)
-            mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
+            mask = (kpos[None, :] < seq_len) & (kpos[None, :] <= q_pos[:, None])
             qk = torch.matmul(q_f32[b].permute(1, 0, 2), k.T)
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
             qk = torch.relu(qk).to(output_dtype)
             weighted = (w.T[:, :, None] * qk).sum(dim=0) * sc[None, :]
-            # max_seq_len is a free axis and need not be page-aligned, so
-            # the last physical page can extend past the output width. Clip
+            # max_seq_len is a free axis and need not be block-aligned, so
+            # the last physical block can extend past the output width. Clip
             # both the destination and the right-hand side to it.
             s = blk * block_size
             e = min(s + block_size, max_seq_len)
@@ -164,9 +164,9 @@ def _paged_mqa_logits_masked_check(
     atol=2e-2,
     **_unused,
 ):
-    """Compare kernel logits vs reference over the causal, in-context region.
+    """Compare kernel logits vs reference over the causal, within-length region.
 
-    Positions beyond each row's causal limit (and the SPLIT_KV-padded padding the
+    Positions beyond each row's causal limit (and the padded trailing columns the
     kernel may write) are excluded.  A non-finite *reference* is tolerated --
     that is the fp8/fp4 accumulation-order argument -- but a non-finite *actual*
     is a kernel failure and fails the check.  Excluding both sides symmetrically
@@ -244,7 +244,7 @@ def _fp8_paged_mqa_logits_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build valid inputs for ``flashinfer.fp8_paged_mqa_logits`` (fixed context)."""
+    """Build valid inputs for ``flashinfer.fp8_paged_mqa_logits`` (all rows at max_seq_len)."""
     torch.manual_seed(seed)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
     block_tables, num_blocks = _make_paged_block_table(seq_lens, block_size, device)
@@ -295,7 +295,7 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             abbrev="D", description="Head dimension (FP8 elements per row)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV block."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim + 4)."
         ),
@@ -442,8 +442,8 @@ def _fp4_paged_mqa_logits_reference(
     q_sf,
     kv_fused,
     weights,
-    seq_lens,
     block_tables,
+    seq_lens,
     max_seq_len,
     output_dtype=torch.bfloat16,
 ):
@@ -490,22 +490,22 @@ def _fp4_paged_mqa_logits_reference(
         (B * next_n, max_seq_len), float("-inf"), device=device, dtype=torch.float32
     )
     for b in range(B):
-        ctx = int(seq_lens[b].item())
-        q_pos = torch.arange(ctx - next_n, ctx, device=device)
+        seq_len = int(seq_lens[b].item())
+        q_pos = torch.arange(seq_len - next_n, seq_len, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].transpose(0, 1).contiguous()
-        n_blk = (ctx + block_size - 1) // block_size
+        n_blk = (seq_len + block_size - 1) // block_size
         blocks = block_tables[b, :n_blk]
         kx = kv_deq[blocks].permute(2, 3, 0, 1).reshape(1, head_dim, -1)
         qx = q_deq[b].transpose(0, 1)  # [H, next_n, D]
         s = torch.matmul(qx, kx).to(torch.float32)  # [H, next_n, total_len]
         total_len = n_blk * block_size
         kpos = torch.arange(0, total_len, device=device)
-        mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
+        mask = (kpos[None, :] < seq_len) & (kpos[None, :] <= q_pos[:, None])
         s = torch.where(mask[None, :, :], s, float("-inf"))
         s = torch.relu(s) * w[..., None]
         s = s.sum(dim=0)
-        # max_seq_len is a free axis and need not be page-aligned, so
-        # total_len (a whole number of pages) can exceed the output width.
+        # max_seq_len is a free axis and need not be block-aligned, so
+        # total_len (a whole number of blocks) can exceed the output width.
         end = min(total_len, max_seq_len)
         logits[b * next_n : (b + 1) * next_n, :end] = torch.where(
             (kpos[None, :] <= q_pos[:, None])[:, :end], s[:, :end], float("-inf")
@@ -535,7 +535,7 @@ def _fp4_paged_mqa_logits_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build valid inputs for ``flashinfer.fp4_paged_mqa_logits`` (fixed context)."""
+    """Build valid inputs for ``flashinfer.fp4_paged_mqa_logits`` (all rows at max_seq_len)."""
     torch.manual_seed(seed)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
     block_tables, num_blocks = _make_paged_block_table(seq_lens, block_size, device)
@@ -598,7 +598,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             abbrev="Dp", description="Packed head bytes (head_dim // 2)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV block."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim//2 + 4)."
         ),
@@ -613,7 +613,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
         "q_sf": Tensor(
             ["batch_size", "next_n", "num_heads"],
             dtype="int32",
-            description="Query UE8M0 scale factors (4 packed per token).",
+            description="Query UE8M0 scale factors (4 packed per (token, head) int32).",
         ),
         "kv_fused": Tensor(
             ["num_blocks", "block_size", "num_kv_heads", "block_row_bytes"],

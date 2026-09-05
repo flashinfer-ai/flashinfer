@@ -97,7 +97,7 @@ def _cmp_fp8(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A) Schedule kernel: GPU vs CPU bit-exact under adversarial batch/context
+# A) Schedule kernel: GPU vs CPU bit-exact under adversarial batch/length
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -116,7 +116,7 @@ def _cmp_fp8(
 )
 def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     """The on-GPU schedule kernel must be BIT-EXACT vs the CPU reference for every
-    batch size (incl. non-multiples of 32) and adversarial context distributions."""
+    batch size (incl. non-multiples of 32) and adversarial sequence-length distributions."""
     _skip_if_no_paged_mqa_support()
     from flashinfer.attn_scores.attn_scores import (
         _cached_num_sms,
@@ -161,7 +161,7 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# B) Context lengths at block / SPLIT_KV boundaries (± 1)
+# B) Sequence lengths at block / SPLIT_KV boundaries (± 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -172,7 +172,7 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     [1, 2, 3, 33, 64, 127, 128, 129, 255, 256, 257, 383, 384, 512, 640, 1024, 1025],
 )
 def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
-    """Boundary context lengths (block/128/256 multiples and ±1) must stay correct."""
+    """Boundary sequence lengths (block/128/256 multiples and ±1) must stay correct."""
     _skip_if_no_paged_mqa_support()
     if ctx < next_n:
         pytest.skip("ctx must be >= next_n for a valid causal window")
@@ -184,7 +184,7 @@ def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C) Skewed / variable context lengths (schedule load imbalance)
+# C) Skewed / variable sequence lengths (schedule load imbalance)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -293,7 +293,7 @@ def test_adv_determinism_fp8():
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("ctx", [128, 129, 256, 257, 1024])
 def test_adv_fp4_boundaries(block_size, next_n, ctx):
-    """FP4: boundary contexts across all block_size (SF layout correctness)."""
+    """FP4: boundary sequence lengths across all block_size (SF layout correctness)."""
     _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
@@ -345,13 +345,13 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G) max next_n with small / boundary contexts
+# G) max next_n with small / boundary sequence lengths
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("ctx", [8, 64, 128, 129, 256, 257])
 def test_adv_fp4_max_next_n_small_ctx(ctx):
-    """FP4 at the largest supported next_n with small/boundary contexts."""
+    """FP4 at the largest supported next_n with small/boundary sequence lengths."""
     _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
@@ -738,7 +738,7 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows():
     """Interspersed zero-work ATOMS must not desync the FP4 split's prefetch.
 
     Under an atom split a "row" the task iterators traverse is a q_atom, and
-    its context is ctx - (num_atoms-1-i)*atom -- which is zero or NEGATIVE for
+    its length is ctx - (num_atoms-1-i)*atom -- which is zero or NEGATIVE for
     a short-but-nonzero native row (here ctx=2 at next_n=4: the leading atom
     of the 2-atom split sees 0). The producer lookahead must skip exactly the
     atoms the consumers skip, on the per-atom length with a <= 0 test; a

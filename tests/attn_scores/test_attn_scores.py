@@ -62,7 +62,7 @@ def _ref_fp8_paged_mqa_logits(
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
-    max_model_len: int,
+    max_seq_len: int,
     block_size: int,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
@@ -70,7 +70,7 @@ def _ref_fp8_paged_mqa_logits(
     B, next_n, H, D = q_fp8.shape
     device = q_fp8.device
     logits = torch.full(
-        (B * next_n, max_model_len), float("-inf"), device=device, dtype=out_dtype
+        (B * next_n, max_seq_len), float("-inf"), device=device, dtype=out_dtype
     )
     q_f32 = q_fp8.float()
 
@@ -99,8 +99,8 @@ def _ref_fp8_paged_mqa_logits(
             weighted = weighted * scales[None, :]
 
             start = blk_idx * block_size
-            end = min(start + block_size, max_model_len)
-            if start >= max_model_len:
+            end = min(start + block_size, max_seq_len)
+            if start >= max_seq_len:
                 break
             ncol = end - start
             logits[b * next_n : (b + 1) * next_n, start:end] = torch.where(
@@ -212,13 +212,13 @@ def _ref_fp4_paged_mqa_logits(
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
-    max_model_len: int,
+    max_seq_len: int,
 ) -> torch.Tensor:
     """Pure-torch FP4 reference (adapted from TRT-LLM test)."""
     batch_size, next_n, num_heads, dim = q.size()
     _, block_size, _, _ = kv_cache.size()
     logits = torch.full(
-        [batch_size * next_n, max_model_len],
+        [batch_size * next_n, max_seq_len],
         float("-inf"),
         device=q.device,
         dtype=torch.float32,
@@ -242,7 +242,7 @@ def _ref_fp4_paged_mqa_logits(
         s = torch.where(mask[None, :, :], s, float("-inf"))
         s = torch.relu(s) * weight_slice[..., None]
         s = s.sum(dim=0)
-        w = min(total_len, max_model_len)
+        w = min(total_len, max_seq_len)
         logits[i * next_n : (i + 1) * next_n, :w] = torch.where(
             k_offsets[None, :w] <= q_offsets[:, None], s[:, :w], float("-inf")
         )
@@ -283,7 +283,7 @@ def _calc_cosine_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def _valid_causal_mask(seq_lens, next_n, max_len, device):
-    """Boolean [B*next_n, max_len] mask of in-context, causally-valid positions."""
+    """Boolean [B*next_n, max_len] mask of within-length, causally-valid positions."""
     rows = seq_lens.shape[0] * next_n
     positions = torch.arange(max_len, device=device).unsqueeze(0).expand(rows, -1)
     offsets = torch.arange(rows, device=device)
@@ -301,7 +301,9 @@ def _valid_causal_mask(seq_lens, next_n, max_len, device):
 def test_gpu_schedule_matches_cpu(batch_size, avg_ctx):
     """GPU schedule kernel must be bit-exact vs CPU numpy reference."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("GPU schedule kernel requires SM100a (B200)")
+        pytest.skip(
+            "GPU schedule kernel requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer.attn_scores.attn_scores import (
         _cached_num_sms,
@@ -339,19 +341,21 @@ def test_gpu_schedule_matches_cpu(batch_size, avg_ctx):
 def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dtype):
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(42)
     num_heads, head_dim = 64, 128
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     lo = max(block_size, int(0.7 * avg_ctx))
     hi = int(1.3 * avg_ctx) + 1
     seq_lens = torch.randint(
         lo, hi, (batch_size,), dtype=torch.int32, device=device
-    ).clamp(max=max_model_len)
+    ).clamp(max=max_seq_len)
     block_tables, num_total_blocks = _make_paged_kv(
         batch_size, block_size, seq_lens, device
     )
@@ -377,7 +381,7 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
         weights,
         seq_lens,
         block_tables,
-        max_model_len,
+        max_seq_len,
         block_size,
         out_dtype=output_dtype,
     )
@@ -388,13 +392,13 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=output_dtype,
     )
 
-    # Mask out padding / out-of-context positions before comparing
+    # Mask out padding / beyond-length positions before comparing
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -444,20 +448,22 @@ def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
     """
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(42)
     batch_size, avg_ctx, head_dim = 4, 1024, 64
     output_dtype = torch.float32
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     lo = max(block_size, int(0.7 * avg_ctx))
     hi = int(1.3 * avg_ctx) + 1
     seq_lens = torch.randint(
         lo, hi, (batch_size,), dtype=torch.int32, device=device
-    ).clamp(max=max_model_len)
+    ).clamp(max=max_seq_len)
     block_tables, num_total_blocks = _make_paged_kv(
         batch_size, block_size, seq_lens, device
     )
@@ -483,7 +489,7 @@ def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
         weights,
         seq_lens,
         block_tables,
-        max_model_len,
+        max_seq_len,
         block_size,
         out_dtype=output_dtype,
     )
@@ -494,12 +500,12 @@ def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=output_dtype,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -538,14 +544,16 @@ def test_fp8_paged_mqa_logits_head_dim64(next_n, block_size):
 def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
     """FP16 output path: use integer-valued data to keep precision losses small."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(0)
     device = "cuda"
     num_heads, head_dim, block_size = 64, 128, 64
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
     output_dtype = torch.float16
 
     seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
@@ -576,7 +584,7 @@ def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
         weights,
         seq_lens,
         block_tables,
-        max_model_len,
+        max_seq_len,
         block_size,
         out_dtype=output_dtype,
     )
@@ -586,14 +594,14 @@ def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=output_dtype,
         epi_dtype=output_dtype,
         acc_dtype=output_dtype,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -626,14 +634,16 @@ def test_fp8_paged_mqa_logits_fp16(batch_size, next_n, avg_ctx):
 def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     """FP8 natively supports next_n=4 without atom-split."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(5)
     device = "cuda"
     num_heads, head_dim, block_size, next_n = 64, 128, 64, 4
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
     block_tables, num_total_blocks = _make_paged_kv(
@@ -659,7 +669,7 @@ def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
         weights,
         seq_lens,
         block_tables,
-        max_model_len,
+        max_seq_len,
         block_size,
         out_dtype=torch.float32,
     )
@@ -669,11 +679,11 @@ def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -711,14 +721,16 @@ def test_fp8_paged_mqa_logits_next_n4(batch_size, avg_ctx):
 def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
     """num_heads below the per-slot weight-cache cap, where the budget binds."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(5)
     device = "cuda"
     head_dim, block_size, batch_size, avg_ctx = 128, 64, 4, 2048
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
     block_tables, num_total_blocks = _make_paged_kv(
@@ -744,7 +756,7 @@ def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
         weights,
         seq_lens,
         block_tables,
-        max_model_len,
+        max_seq_len,
         block_size,
         out_dtype=torch.float32,
     )
@@ -754,11 +766,11 @@ def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -797,20 +809,22 @@ def test_fp8_paged_mqa_logits_small_num_heads(num_heads, next_n):
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32, torch.float16])
 def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dtype):
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp4_paged_mqa_logits
 
     torch.manual_seed(42)
     device = "cuda"
     num_heads, head_dim = 64, 128
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     lo = max(block_size, int(0.7 * avg_ctx))
     hi = int(1.3 * avg_ctx) + 1
     seq_lens = torch.randint(
         lo, hi, (batch_size,), dtype=torch.int32, device=device
-    ).clamp(max=max_model_len)
+    ).clamp(max=max_seq_len)
     block_tables, num_total_blocks = _make_paged_kv(
         batch_size, block_size, seq_lens, device
     )
@@ -844,7 +858,7 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_model_len
+        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
     )
 
     out = fp4_paged_mqa_logits(
@@ -854,12 +868,12 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=output_dtype,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -908,11 +922,13 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     decomposition is a fixed internal rule keyed on the device, so running this
     test on both architectures covers both executions: direct on Rubin, the
     in-kernel split on Blackwell.  The staggered per-atom causal limits are the
-    easy thing to get wrong, so both a short context (one KV block) and a
+    easy thing to get wrong, so both a short sequence (one KV block) and a
     multi-block one are covered.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp4_paged_mqa_logits
 
@@ -922,13 +938,13 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     torch.manual_seed(42)
     num_heads, head_dim, block_size = 64, 128, 64
     output_dtype = torch.float32
-    max_model_len = max(avg_ctx * 2, 2048)
+    max_seq_len = max(avg_ctx * 2, 2048)
 
     lo = max(block_size, int(0.7 * avg_ctx))
     hi = int(1.3 * avg_ctx) + 1
     seq_lens = torch.randint(
         lo, hi, (batch_size,), dtype=torch.int32, device=device
-    ).clamp(max=max_model_len)
+    ).clamp(max=max_seq_len)
     block_tables, num_total_blocks = _make_paged_kv(
         batch_size, block_size, seq_lens, device
     )
@@ -956,7 +972,7 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_model_len
+        q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
@@ -965,12 +981,12 @@ def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=output_dtype,
     )
 
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -1007,7 +1023,7 @@ def test_fp4_next_n_limits():
     (SM107+, 576 columns) runs it directly while Blackwell reaches it as two
     atoms of 2.  The decomposition is now done *inside* the kernel, which is
     what makes it acceptable: an earlier caller-side version duplicated the
-    page table and rebuilt the context lengths per call, and this test
+    block table and rebuilt the sequence lengths per call, and this test
     previously asserted next_n=4 was refused outright for that reason.
 
     The one hazard that remains is a caller-supplied schedule_meta: a split
@@ -1018,7 +1034,9 @@ def test_fp4_next_n_limits():
     test_fp4_next_n4_split_rejects_caller_schedule.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp4_paged_mqa_logits
 
@@ -1042,30 +1060,31 @@ def test_fp4_next_n_limits():
                 fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
 
 
-def test_fp4_next_n4_split_rejects_caller_schedule():
-    """A caller-supplied schedule_meta is refused when next_n=4 must split.
+def test_fp4_next_n4_caller_schedule_via_helper(monkeypatch):
+    """A caller schedule built with matching helper arguments works everywhere.
 
-    On a device whose TMEM caps the atom at 3 (Blackwell), next_n=4 runs as two
-    atoms, so the schedule must describe 2*batch rows.  A schedule built from
-    the native seq_lens has the right shape and the wrong contents, and the
-    freshness check that would notice is opt-in and skipped under CUDA-graph
-    capture -- so this must be an error.  Not merely to avoid wrong results:
-    the persistent kernel terminates on exact equality with the schedule's end
-    boundary, and a B-row boundary is unreachable when the kernel iterates
-    2*B rows, so the mismatch HANGS.  Commit 29ca0629 removed the previous
-    caller-side next_n=4 split after hitting exactly this hang, and noted no
-    test covered the combination; this test is that coverage.
+    For next_n=4 on SM100/SM103 the kernel internally restructures the problem
+    (the two-pass split), so the schedule differs from the native one;
+    compute_paged_mqa_logits_schedule applies the same internal policy when
+    given the call's next_n and variant.  Pins: (a) the helper output equals
+    the schedule the kernel computes internally, (b) the main call accepts it,
+    and (c) on a split device a schedule built with the DEFAULT helper
+    arguments describes the wrong problem and the opt-in freshness check
+    catches it -- the hang class commit 29ca0629 documented.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import compute_paged_mqa_logits_schedule, fp4_paged_mqa_logits
-    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
+    from flashinfer.attn_scores.attn_scores import (
+        _expand_seq_lens,
+        _fp4_atom_decomposition,
+        _fp4_max_atom_for_device,
+    )
 
     device = "cuda"
-    if _fp4_max_atom_for_device(torch.device(device)) >= 4:
-        pytest.skip("device runs next_n=4 directly; no split to reject")
-
     B, H, D, block_size, ctx, next_n = 2, 64, 128, 64, 256, 4
     seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
     block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
@@ -1074,26 +1093,61 @@ def test_fp4_next_n4_split_rejects_caller_schedule():
     kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
     w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
 
-    sched = compute_paged_mqa_logits_schedule(seq_lens)
-    with pytest.raises(ValueError, match=r"schedule_meta must be None for next_n=4"):
-        fp4_paged_mqa_logits(
-            q,
-            q_sf,
-            kv,
-            w,
-            block_tables,
-            seq_lens,
-            ctx,
-            output_dtype=torch.bfloat16,
-            schedule_meta=sched,
-        )
+    # (a) The helper with matching arguments reproduces the internal schedule.
+    atom, num_atoms = _fp4_atom_decomposition(next_n, torch.device(device))
+    expected = compute_paged_mqa_logits_schedule(
+        _expand_seq_lens(seq_lens, num_atoms, atom), device=device
+    )
+    sched = compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=next_n, variant="fp4"
+    )
+    assert torch.equal(sched, expected), (
+        "helper(next_n, variant) must equal the kernel's internal schedule"
+    )
+
+    # (b) The main call accepts it (on any architecture).
+    res = fp4_paged_mqa_logits(
+        q,
+        q_sf,
+        kv,
+        w,
+        block_tables,
+        seq_lens,
+        ctx,
+        output_dtype=torch.bfloat16,
+        schedule_meta=sched,
+    )
+    torch.cuda.synchronize()
+    assert res.shape == (B * next_n, ctx)
+
+    # (c) On a split device the native (default-args) schedule is a different
+    # tensor, and the opt-in freshness check refuses it before the kernel
+    # could hang on the mismatched end boundary.
+    if _fp4_max_atom_for_device(torch.device(device)) < next_n:
+        native = compute_paged_mqa_logits_schedule(seq_lens, device=device)
+        assert not torch.equal(native, sched), "test premise: split changes it"
+        monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+        with pytest.raises(ValueError, match="Recompute it with"):
+            fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                ctx,
+                output_dtype=torch.bfloat16,
+                schedule_meta=native,
+            )
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
 def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
     """is_kv_sf_interleaved=True path (requires block_size=128)."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp4_paged_mqa_logits
 
@@ -1101,7 +1155,7 @@ def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
     device = "cuda"
     batch_size, next_n, num_heads, head_dim = 4, 2, 64, 128
     avg_ctx = 1024
-    max_model_len = avg_ctx * 2
+    max_seq_len = avg_ctx * 2
 
     seq_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
     block_tables, num_total_blocks = _make_paged_kv(
@@ -1140,7 +1194,7 @@ def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=torch.bfloat16,
         is_kv_sf_interleaved=(block_size == 128),
     )
@@ -1154,14 +1208,14 @@ def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
         weights,
         block_tables,
         seq_lens,
-        max_model_len,
+        max_seq_len,
         output_dtype=torch.bfloat16,
         is_kv_sf_interleaved=False,
     )
 
-    # Mask to valid (in-context, finite) positions before comparing
+    # Mask to valid (within-length, finite) positions before comparing
     positions = (
-        torch.arange(max_model_len, device=device)
+        torch.arange(max_seq_len, device=device)
         .unsqueeze(0)
         .expand(batch_size * next_n, -1)
     )
@@ -1209,7 +1263,9 @@ def test_fp8_out_and_schedule_meta_paths():
     default path bit-for-bit and the returned tensor must alias out."""
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import (
         padded_seq_len,
@@ -1233,7 +1289,7 @@ def test_fp8_out_and_schedule_meta_paths():
 
     assert ret.data_ptr() == out_buf.data_ptr(), "returned tensor must alias out="
     # Same kernel + same schedule → bit-identical in the causal-valid region.
-    # (Beyond-context padding is unwritten garbage and differs between buffers.)
+    # (Beyond-length padding is unwritten garbage and differs between buffers.)
     valid = _valid_causal_mask(cl, next_n, max_ml, device)
     torch.testing.assert_close(ret.float()[valid], ref.float()[valid], atol=0, rtol=0)
 
@@ -1241,7 +1297,9 @@ def test_fp8_out_and_schedule_meta_paths():
 def test_fp4_out_and_schedule_meta_paths():
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import (
         padded_seq_len,
@@ -1301,12 +1359,14 @@ def test_fp8_input_validation():
     """Guard rails: bad out= size, unsupported dtype, and non-int32/CPU inputs must raise."""
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP8 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP8 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import padded_seq_len, fp8_paged_mqa_logits
 
     B, next_n, ctx, block_size = 2, 1, 1024, 64
-    max_ml = ctx + 300  # deliberately not a multiple of 256 so padded_ctx_len > max_ml
+    max_ml = ctx + 300  # deliberately not a 256 multiple so padded_max_seq_len > max_ml
     q, kv_fused, w, cl, bt = _make_fp8_case(B, next_n, ctx, block_size, device)
 
     # Undersized out= (max_ml columns instead of padded) → ValueError (prevents OOB)
@@ -1372,7 +1432,9 @@ def test_fp4_head_dim_num_heads_validation():
     """FP4 hardcodes head_dim=128 / num_heads=64; the wrapper must say so clearly."""
     device = "cuda"
     if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
 
     from flashinfer import fp4_paged_mqa_logits
 
@@ -1419,14 +1481,14 @@ def test_fp4_head_dim_num_heads_validation():
 def test_block_table_width_contract(monkeypatch):
     """block_tables must be wide enough for the kernel's compute-tile indexing.
 
-    The kernel reads ceil(ctx/128) tiles x (128 // block_size) pages per tile,
+    The kernel reads ceil(ctx/128) tiles x (128 // block_size) blocks per tile,
     which exceeds ceil(ctx/block_size) when ctx is not a multiple of 128, so a
     naturally-sized table is indexed out of bounds. The bound needs the per-row
     seq_lens from device memory, so the check is opt-in behind
     FLASHINFER_VALIDATE_INPUTS. Regression for PR #4365 review r3824399380.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
@@ -1434,12 +1496,12 @@ def test_block_table_width_contract(monkeypatch):
     device = "cuda"
     B, H, D, block_size = 2, 64, 128, 64
     ctx = 257  # deliberately not a multiple of 128
-    pages = -(-ctx // block_size)  # 5 -- what a caller would naturally allocate
+    blocks = -(-ctx // block_size)  # 5 -- what a caller would naturally allocate
     need = -(-ctx // 128) * (128 // block_size)  # 6 -- what the kernel indexes
-    assert (pages, need) == (5, 6), "test premise: ctx exposes the tile/page gap"
+    assert (blocks, need) == (5, 6), "test premise: ctx exposes the tile/block gap"
 
     seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
-    narrow = torch.zeros((B, pages), dtype=torch.int32, device=device)
+    narrow = torch.zeros((B, blocks), dtype=torch.int32, device=device)
     wide = torch.zeros((B, need), dtype=torch.int32, device=device)
 
     # Default (unset): no sync, no check. Exercise the validator directly rather
@@ -1493,7 +1555,7 @@ def test_max_seq_len_bound(monkeypatch):
     lengths from device memory. Regression for PR #4365 review r3824481310.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
@@ -1566,7 +1628,7 @@ def test_schedule_meta_graph_replay_across_split_boundary(variant):
     reference. Regression for PR #4365 review r3824580059.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import (
         compute_paged_mqa_logits_schedule,
@@ -1703,7 +1765,7 @@ def test_stale_schedule_meta_detected(monkeypatch):
     for PR #4365 review r3824550881.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import compute_paged_mqa_logits_schedule, fp8_paged_mqa_logits
 
@@ -1752,7 +1814,7 @@ def test_oversized_out_returns_exact_rows(variant):
     PR #4365 review r3824692495.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import (
         fp4_paged_mqa_logits,
@@ -1845,7 +1907,7 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out, next_n
     Regression for PR #4365 review r3824960307.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import (
         fp4_paged_mqa_logits,
@@ -1868,22 +1930,12 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out, next_n
 
     # Well-formed shape/dtype/device (so it passes the always-on buffer
     # validation) but garbage contents: launching with it would hang, so a
-    # clean return proves the schedule/launch path was skipped.  Exception:
-    # fp4 next_n=4 on a split device rejects ANY caller schedule -- even at
-    # B == 0 (the condition is batch-independent) -- so that combination runs
-    # schedule-free and pins the rejection explicitly below.
-    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
-
-    split_active = (
-        variant == "fp4"
-        and next_n == 4
-        and _fp4_max_atom_for_device(torch.device(device)) < 4
-    )
+    # clean return proves the schedule/launch path was skipped.
     num_sms = _cached_num_sms(0)
     bad_schedule = torch.full(
         (num_sms + 1, 2), 123_456_789, dtype=torch.int32, device=device
     )
-    schedule_arg = None if split_active else bad_schedule
+    schedule_arg = bad_schedule
 
     out = None
     if preallocated_out:
@@ -1936,23 +1988,6 @@ def test_empty_batch_returns_without_launching(variant, preallocated_out, next_n
         "the compile path was entered for an empty batch"
     )
 
-    if split_active:
-        # The split's schedule_meta rejection is batch-independent, so it
-        # fires even at B == 0 -- a buffer that cannot be right at any batch
-        # size fails immediately.
-        with pytest.raises(ValueError, match="schedule_meta must be None"):
-            fp4_paged_mqa_logits(
-                q,
-                q_sf,
-                kv,
-                w,
-                block_tables,
-                seq_lens,
-                ctx,
-                output_dtype=torch.bfloat16,
-                schedule_meta=bad_schedule,
-            )
-
 
 def test_empty_batch_still_validates_out():
     """The empty-batch short-circuit sits after out= validation, not before.
@@ -1961,7 +1996,7 @@ def test_empty_batch_still_validates_out():
     would silently accept buffers it never checks.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits, padded_seq_len
 
@@ -2001,7 +2036,7 @@ def test_api_rejects_malformed_ranks_and_dtypes():
     the FFI boundary with a bare dtype error.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
 
@@ -2048,7 +2083,7 @@ def test_out_layout_rejected():
     binding, which either errored bare or silently misplaced stores.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits, padded_seq_len
 
@@ -2073,7 +2108,7 @@ def test_inputs_foreign_device_rejected_paged():
     depending on peer access.  Needs two GPUs.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
     if torch.cuda.device_count() < 2:
         pytest.skip("needs a second CUDA device")
 
@@ -2137,14 +2172,14 @@ def test_precompile_dsl_guards(monkeypatch):
 
 
 def test_validate_inputs_rejects_out_of_pool_block_index(monkeypatch):
-    """FLASHINFER_VALIDATE_INPUTS=1 catches stale/out-of-pool page indices.
+    """FLASHINFER_VALIDATE_INPUTS=1 catches stale/out-of-pool block indices.
 
     The debug validator already pays the D2H sync for the width check; the
-    value check rides along.  A stale page index is the classic silent OOB
+    value check rides along.  A stale block index is the classic silent OOB
     READ this validator exists to surface.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits
 
@@ -2172,7 +2207,7 @@ def test_output_span_32bit_guard():
     rejected shape implies.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits
 
@@ -2216,7 +2251,7 @@ def test_fp4_split_graph_replay_across_split_boundary():
     same test covers the direct path.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, padded_seq_len
 
@@ -2280,7 +2315,7 @@ def test_atom_offsets_cache_refuses_capture_population():
     where the atom split is active (SM100/SM103).
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, padded_seq_len
     from flashinfer.attn_scores import attn_scores as A
@@ -2344,7 +2379,7 @@ def test_schedule_meta_device_must_match():
     review r3824973386.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
     if torch.cuda.device_count() < 2:
         pytest.skip("needs two visible CUDA devices")
 
@@ -2388,7 +2423,7 @@ def test_seq_lens_must_be_rank_1(variant):
     Regression for PR #4365 review r3825144972.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
 
@@ -2442,7 +2477,7 @@ def test_gpu_arch_resolves_from_requested_device():
     review r3824968121.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer.attn_scores.attn_scores import _cached_gpu_arch
 
@@ -2651,7 +2686,7 @@ def test_precompile_targets_the_requested_device():
     miss, which is what proves arch is really in the key.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import precompile_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import (
@@ -2705,7 +2740,7 @@ def test_precompile_warms_fp4_float32_output():
     Regression for PR #4365 review r3825087342.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import precompile_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import (
@@ -2753,7 +2788,7 @@ def test_precompile_warms_fp4_float32_output():
 def test_precompile_output_dtypes_is_honoured_and_validated():
     """An explicit output_dtypes tuple builds only those, and is checked up front."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import precompile_paged_mqa_logits
 
@@ -2777,7 +2812,7 @@ def test_relu_is_applied_per_head_before_weighting():
     no existing test could have caught it.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits
 
@@ -2826,7 +2861,7 @@ def test_relu_is_applied_per_head_before_weighting():
 def test_precompile_variants():
     """precompile_paged_mqa_logits(variants=...) builds only what was asked for."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
     from flashinfer import fp8_paged_mqa_logits, precompile_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import (
@@ -2868,12 +2903,14 @@ def test_precompile_variants():
 def test_fp4_is_kv_sf_interleaved_guard():
     """is_kv_sf_interleaved=True is only valid at block_size=128.
 
-    The kernel silently forces the flag back to False for other page sizes, so
+    The kernel silently forces the flag back to False for other block sizes, so
     a caller who pre-arranged SF for UTCCP would get it interleaved twice
     -- wrong logits with no error. The API must reject the combination.
     """
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
     from flashinfer import fp4_paged_mqa_logits
 
     device, B, next_n, H, D, ctx, max_ml = "cuda", 2, 1, 64, 128, 512, 512
@@ -2915,7 +2952,7 @@ def test_fp4_is_kv_sf_interleaved_guard():
 def test_next_n_and_weights_contract():
     """weights shape/dtype are validated, and pin next_n without a next_n arg."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
 
     device, B, next_n, H, D, block_size, ctx, max_ml = (
@@ -2965,7 +3002,9 @@ def test_next_n_and_weights_contract():
 def test_fp4_sf_vec_size_contract():
     """sf_vec_size drives both q_sf packing and the KV row's scale-factor bytes."""
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+        pytest.skip(
+            "FP4 paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)"
+        )
     from flashinfer import fp4_paged_mqa_logits
 
     device, B, next_n, H, D, block_size, ctx, max_ml = (

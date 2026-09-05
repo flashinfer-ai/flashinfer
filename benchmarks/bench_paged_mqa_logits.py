@@ -14,7 +14,7 @@
 """Benchmark fp8_paged_mqa_logits / fp4_paged_mqa_logits through the public API.
 
 This is the reproduction script for the performance numbers quoted on the
-paged-MQA PRs (e.g. #4737): sweep a (kind, batch, ctx, next_n) grid on the
+paged-MQA PRs (e.g. #4737): sweep a (kind, batch, seq_len, next_n) grid on the
 current GPU and report two numbers per cell:
 
 * ``graph_ms``  -- CUDA-graph replay time of one call (out= preallocated, the
@@ -37,7 +37,7 @@ Examples:
     python benchmarks/bench_paged_mqa_logits.py
 
     # the B200-vs-Rubin serving shape used in PR #4737
-    python benchmarks/bench_paged_mqa_logits.py --batch 64 --ctx 16384
+    python benchmarks/bench_paged_mqa_logits.py --batch 64 --seq-len 16384
 """
 
 import argparse
@@ -51,15 +51,15 @@ from flashinfer import (
     padded_seq_len,
 )
 
-_HEADS = 64  # both kernels pin num_heads
-_HEAD_DIM = 128  # and head_dim
+_HEADS = 64  # fp4 pins num_heads=64/head_dim=128; fp8 is parametric --
+_HEAD_DIM = 128  # bench both at the fp4 (DeepSeek indexer) shape
 
 
-def _make_inputs(kind, batch, ctx, next_n, block_size, device):
+def _make_inputs(kind, batch, seq_len, next_n, block_size, device):
     """Random inputs in the exact layouts the public API requires."""
-    ntb_cols = ((ctx + 127) // 128 * 128) // block_size
+    ntb_cols = ((seq_len + 127) // 128 * 128) // block_size
     num_blocks = max(batch * ntb_cols, 1)
-    seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device=device)
+    seq_lens = torch.full((batch,), seq_len, dtype=torch.int32, device=device)
     block_tables = (
         torch.arange(batch * ntb_cols, dtype=torch.int32, device=device)
         .reshape(batch, ntb_cols)
@@ -77,7 +77,7 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
             dtype=torch.uint8,
             device=device,
         )
-        return (q, kv, weights, block_tables, seq_lens, ctx)
+        return (q, kv, weights, block_tables, seq_lens, seq_len)
     q = torch.randint(
         0,
         256,
@@ -97,7 +97,7 @@ def _make_inputs(kind, batch, ctx, next_n, block_size, device):
         device=device,
     )
     kv[:, :, :, _HEAD_DIM // 2 :] = 0x7F
-    return (q, q_sf, kv, weights, block_tables, seq_lens, ctx)
+    return (q, q_sf, kv, weights, block_tables, seq_lens, seq_len)
 
 
 def _call(kind, args, out):
@@ -106,10 +106,10 @@ def _call(kind, args, out):
     return fp4_paged_mqa_logits(*args, out=out)
 
 
-def bench_one(kind, batch, ctx, next_n, block_size, iters, device):
-    args = _make_inputs(kind, batch, ctx, next_n, block_size, device)
+def bench_one(kind, batch, seq_len, next_n, block_size, iters, device):
+    args = _make_inputs(kind, batch, seq_len, next_n, block_size, device)
     out = torch.empty(
-        (batch * next_n, padded_seq_len(ctx)),
+        (batch * next_n, padded_seq_len(seq_len)),
         dtype=torch.float32 if kind == "fp8" else torch.bfloat16,
         device=device,
     )
@@ -151,7 +151,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--kind", choices=["fp8", "fp4"], nargs="+", default=["fp8", "fp4"])
     p.add_argument("--batch", type=int, nargs="+", default=[1, 16, 64])
-    p.add_argument("--ctx", type=int, nargs="+", default=[4096, 16384])
+    p.add_argument("--seq-len", type=int, nargs="+", default=[4096, 16384])
     p.add_argument("--next-n", type=int, nargs="+", default=[1, 2, 3, 4])
     p.add_argument("--block-size", type=int, default=64)
     p.add_argument("--iters", type=int, default=100)
@@ -162,23 +162,23 @@ def main():
         f"device: {torch.cuda.get_device_name(dev)} cc={torch.cuda.get_device_capability(dev)}"
     )
     print(
-        f"{'kind':>4} {'batch':>5} {'ctx':>6} {'next_n':>6} {'graph_ms':>10} {'eager_ms':>10}"
+        f"{'kind':>4} {'batch':>5} {'seq_len':>7} {'next_n':>6} {'graph_ms':>10} {'eager_ms':>10}"
     )
     for kind in args.kind:
         for b in args.batch:
-            for ctx in args.ctx:
+            for seq_len in args.seq_len:
                 for nn in args.next_n:
                     try:
                         g_ms, e_ms = bench_one(
-                            kind, b, ctx, nn, args.block_size, args.iters, dev
+                            kind, b, seq_len, nn, args.block_size, args.iters, dev
                         )
                     except (ValueError, RuntimeError) as e:
                         print(
-                            f"{kind:>4} {b:>5} {ctx:>6} {nn:>6}  skipped: {str(e).splitlines()[0][:60]}"
+                            f"{kind:>4} {b:>5} {seq_len:>7} {nn:>6}  skipped: {str(e).splitlines()[0][:60]}"
                         )
                         continue
                     print(
-                        f"{kind:>4} {b:>5} {ctx:>6} {nn:>6} {g_ms:>10.4f} {e_ms:>10.4f}"
+                        f"{kind:>4} {b:>5} {seq_len:>7} {nn:>6} {g_ms:>10.4f} {e_ms:>10.4f}"
                     )
 
 
