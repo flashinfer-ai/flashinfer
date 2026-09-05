@@ -360,17 +360,34 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-@functools.cache
-def load(device_index: int) -> Any:
-    source, source_bytes = _load_source_bundle()
-    arch = _target_arch(device_index)
-    nvcc = _nvcc()
+def _module_name(source_bytes: bytes, arch: str, nvcc: Path) -> str:
+    version = subprocess.run(
+        [str(nvcc), "--version"],
+        text=True,
+        capture_output=True,
+    )
+    if version.returncode != 0 or not version.stdout.strip():
+        detail = version.stderr.strip() or "nvcc --version returned no version text"
+        raise RuntimeError(
+            "failed to identify nvcc for the Cake TRT-LLM MoE all-reduce "
+            f"cache key:\n{detail}"
+        )
+
     digest = hashlib.sha256()
     digest.update(source_bytes)
     digest.update(_HOST_SOURCE.encode())
     digest.update(arch.encode())
     digest.update(str(nvcc).encode())
-    module_name = f"cake_trtllm_moe_allreduce_{arch}_{digest.hexdigest()[:16]}"
+    digest.update(version.stdout.encode())
+    return f"cake_trtllm_moe_allreduce_{arch}_{digest.hexdigest()[:16]}"
+
+
+@functools.cache
+def load(device_index: int) -> Any:
+    source, source_bytes = _load_source_bundle()
+    arch = _target_arch(device_index)
+    nvcc = _nvcc()
+    module_name = _module_name(source_bytes, arch, nvcc)
     build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
     build_dir.mkdir(parents=True, exist_ok=True)
     cubin_path = build_dir / "cake_trtllm_moe_allreduce.cubin"

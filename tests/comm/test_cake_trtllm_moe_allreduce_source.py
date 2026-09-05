@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from flashinfer.jit import cake_trtllm_moe_allreduce as backend
 
@@ -101,3 +105,47 @@ def test_embedded_kernel_launch_has_exact_18_argument_pointer_table() -> None:
 
     assert argument_names == _KERNEL_ARGUMENT_NAMES
     assert len(argument_names) == 18
+
+
+def test_nvcc_version_changes_module_cache_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    nvcc = Path("/opt/cuda/bin/nvcc")
+    version_outputs = iter(("release 12.8\n", "release 12.9\n"))
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        assert command == [str(nvcc), "--version"]
+        assert kwargs == {"text": True, "capture_output": True}
+        return SimpleNamespace(
+            returncode=0,
+            stdout=next(version_outputs),
+            stderr="",
+        )
+
+    monkeypatch.setattr(backend.subprocess, "run", fake_run)
+    first = backend._module_name(b"same source", "sm_100a", nvcc)
+    second = backend._module_name(b"same source", "sm_100a", nvcc)
+
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    ((1, "", "nvcc failed"), (0, "", "")),
+)
+def test_nvcc_version_query_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to identify nvcc"):
+        backend._module_name(b"source", "sm_100a", Path("/opt/cuda/bin/nvcc"))
