@@ -64,6 +64,48 @@ def get_seed_and_offset(
 
 
 @functools.cache
+def get_vibecuda_softmax_module():
+    from .jit.vibecuda_softmax import gen_vibecuda_softmax_module
+
+    module = gen_vibecuda_softmax_module().build_and_load()
+
+    @register_custom_op("flashinfer::softmax_vibecuda", mutates_args=())
+    def softmax_vibecuda(
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        logits = logits.float()
+        probs = torch.empty_like(logits, device=logits.device)
+        maybe_temperature_arr = (
+            maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+        )
+        module.softmax_vibecuda(
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
+        return probs
+
+    @register_fake_op("flashinfer::softmax_vibecuda")
+    def _fake_softmax_vibecuda(
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
+
+    # Register the module
+    return SimpleNamespace(
+        softmax_vibecuda=softmax_vibecuda,
+    )
+
+
+@functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
@@ -738,6 +780,7 @@ def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
     enable_pdl: Optional[bool] = None,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
 
@@ -753,6 +796,13 @@ def softmax(
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
+    backend : Optional[str]
+        Softmax implementation backend. ``None`` (default) selects the
+        upstream online-softmax implementation. ``"vibecuda"`` selects the
+        VibeCUDA cluster-softmax backend (SM100-class GPUs only: thread
+        clusters over 8+ CTAs with distributed-shared-memory pair pools);
+        selecting it on a device with compute capability < 10.0 fails
+        loudly with an unsupported-architecture error.
     Returns
     -------
     probs : torch.Tensor
@@ -778,6 +828,25 @@ def softmax(
             [0.2401, 0.1707, 0.2249, 0.1664, 0.1979],
             [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
     """
+    if backend is None:
+        backend = "flashinfer"
+    if backend == "vibecuda":
+        if temperature is None:
+            temperature = 1.0
+
+        # Auto-detect PDL support if not specified
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(logits.device)
+
+        return get_vibecuda_softmax_module().softmax_vibecuda(
+            logits, *_to_tensor_scalar_tuple(temperature), enable_pdl
+        )
+    if backend != "flashinfer":
+        raise ValueError(
+            f"unsupported softmax backend: {backend!r} "
+            "(expected None, 'flashinfer', or 'vibecuda')"
+        )
+
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
     if temperature is None:
         temperature = 1.0

@@ -76,6 +76,64 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+@pytest.mark.skipif(
+    flashinfer.utils.get_compute_capability(torch.device("cuda"))[0] < 10,
+    reason="vibecuda softmax backend requires SM100-class GPUs",
+)
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 64000, 128256, 256000])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("temperature", [1.0, 0.5, 0.1])
+@pytest.mark.parametrize("temperature_arr", [True, False])
+@pytest.mark.parametrize("neg_inf_input", [True, False])
+def test_softmax_vibecuda(
+    batch_size, vocab_size, distribution, temperature, temperature_arr, neg_inf_input
+):
+    torch.manual_seed(42)
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    if neg_inf_input:
+        # assign random logits to -inf
+        num_inf = torch.randint(0, logits.numel() - 1, (), device=logits.device).item()
+        inf_idx = torch.randperm(logits.numel(), device=logits.device)[:num_inf]
+        logits.view(-1).index_fill_(0, inf_idx, float("-inf"))
+        torch.cuda.synchronize()  # wait for the index_fill_ to finish because it can overlap with the softmax kernel
+
+    if temperature_arr:
+        temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")
+        probs = flashinfer.sampling.softmax(
+            logits, temperature=temperature_arr, backend="vibecuda"
+        )
+        logits_scaled = logits / temperature_arr.unsqueeze(-1)
+    else:
+        probs = flashinfer.sampling.softmax(
+            logits, temperature=temperature, backend="vibecuda"
+        )
+        logits_scaled = logits / temperature
+
+    probs_ref = torch.softmax(logits_scaled, dim=-1)
+
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    flashinfer.utils.get_compute_capability(torch.device("cuda"))[0] < 10,
+    reason="vibecuda softmax backend requires SM100-class GPUs",
+)
+def test_softmax_vibecuda_backend_validation():
+    logits = torch.randn(4, 32000, device="cuda:0")
+
+    # unknown backend strings fail loudly instead of silently routing elsewhere
+    with pytest.raises(ValueError, match="unsupported softmax backend"):
+        flashinfer.sampling.softmax(logits, backend="not-a-backend")
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
