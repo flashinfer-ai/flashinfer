@@ -97,7 +97,8 @@ def gen_bgmv_moe_module():
         if not src_path.exists():
             raise FileNotFoundError(f"BGMV MoE source file not found: {src_path}")
         dest_path = gen_directory / fname
-        shutil.copy(src_path, dest_path)
+        # copy2 keeps source mtimes; a fresh mtime forces a full ninja rebuild (#4782)
+        shutil.copy2(src_path, dest_path)
         sources.append(dest_path)
 
     # Copy headers to gen directory
@@ -105,7 +106,7 @@ def gen_bgmv_moe_module():
         src_path = csrc_dir / fname
         if not src_path.exists():
             raise FileNotFoundError(f"BGMV MoE header file not found: {src_path}")
-        shutil.copy(src_path, gen_directory / fname)
+        shutil.copy2(src_path, gen_directory / fname)
 
     # Get nvcc flags for supported architectures (SM70+)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
