@@ -13,6 +13,7 @@
 # See https://github.com/pre-commit/pre-commit
 # Note the pre-commit hooks shoule only be used for formatting, but not for linting.
 # For linting consider using CI.
+files: ^(?!flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/)
 
 # The kernel_src */src trees and blackwell_msa CUDA snapshots are generated or
 # upstream kernel drops that are re-synced periodically
