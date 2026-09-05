@@ -29,6 +29,9 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+
 # ============================================================================
 # Constants for NONTRANSPOSE version ([pool, HV, K, V])
 # ============================================================================
@@ -675,6 +678,35 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
 # ============================================================================
 
 
+_CUTE_DSL_MODULE = "gdn_decode_nontranspose"
+
+
+def _nontranspose_kernel_name(
+    use_small_batch: bool,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    scale: float,
+    use_qk_l2norm: bool,
+) -> str:
+    """Specialization name within the gdn_decode_nontranspose module, encoding
+    every parameter that affects codegen."""
+    return make_kernel_name(
+        "small" if use_small_batch else "big",
+        T,
+        H,
+        HV,
+        K,
+        V,
+        dtype,
+        scale,
+        use_qk_l2norm,
+    )
+
+
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
     use_small_batch: bool,
@@ -763,31 +795,36 @@ def run_nontranspose_decode(
         ).mark_layout_dynamic()
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            cu_seqlens_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            a_tensor,
-            b_tensor,
-            A_log_tensor,
-            dt_bias_tensor,
-            h0_source_tensor,
-            h0_indices_tensor,
-            o_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _nontranspose_kernel_name(*cache_key),
+            lambda: cute.compile(
+                run_func,
+                cu_seqlens_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                a_tensor,
+                b_tensor,
+                A_log_tensor,
+                dt_bias_tensor,
+                h0_source_tensor,
+                h0_indices_tensor,
+                o_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                stream=stream,
+                options="--enable-tvm-ffi",
+            ),
+            extra_key_files=(__file__,),
         )
         cache["compiled"] = compiled
     else:

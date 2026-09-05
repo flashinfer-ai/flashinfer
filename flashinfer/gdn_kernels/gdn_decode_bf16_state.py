@@ -48,6 +48,8 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 from .dtype_compat import as_bf16
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
 
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
@@ -2843,6 +2845,18 @@ def gated_delta_rule(
 _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
 
+_CUTE_DSL_MODULE = "gdn_decode_bf16_state"
+
+
+def _bf16_state_kernel_name(variant: str, cache_key: tuple) -> str:
+    """Specialization name within the gdn_decode_bf16_state module.
+
+    ``variant`` distinguishes the compiled entry points sharing this module
+    ("wide_vec", "wide_vec_t1", "mtp_ilp4"); ``cache_key`` is the in-process
+    cache tuple, which already encodes every parameter that affects codegen.
+    """
+    return make_kernel_name(variant, *cache_key)
+
 
 def _dtype_key(
     A_log: torch.Tensor,
@@ -3225,43 +3239,48 @@ def gated_delta_rule_mtp_wide_vec(
         )
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
-                _run_wide_vec,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                acc_steps_,
-                ssm_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV_val,
-                T_val,
-                H_val,
-                K_val,
-                V_val,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                effective_disable_final,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                disable_output,
-                recovery_steps,
-                per_request_accepted_steps,
-                per_token_pool_scatter,
-                per_token_pool_scatter_flat,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("wide_vec", cache_key),
+                lambda: cute.compile(
+                    _run_wide_vec,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    acc_steps_,
+                    ssm_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV_val,
+                    T_val,
+                    H_val,
+                    K_val,
+                    V_val,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    effective_disable_final,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    disable_output,
+                    recovery_steps,
+                    per_request_accepted_steps,
+                    per_token_pool_scatter,
+                    per_token_pool_scatter_flat,
+                    stream,
+                    options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes; can't be shared
             # across batch sizes — see #L bug at cache_key without B).
@@ -3494,36 +3513,41 @@ def gated_delta_rule_t1_wide_vec(
         h0_out_idx_ = h0_idx_
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
-                _run_wide_vec_t1,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV_val,
-                T_val,
-                H_val,
-                K_val,
-                V_val,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                effective_disable_final,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("wide_vec_t1", cache_key),
+                lambda: cute.compile(
+                    _run_wide_vec_t1,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV_val,
+                    T_val,
+                    H_val,
+                    K_val,
+                    V_val,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    effective_disable_final,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    stream,
+                    options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
@@ -3885,42 +3909,47 @@ def gated_delta_rule_mtp(
         )
 
         _compiled_kernels_mtp[cache_key] = {
-            "compiled": cute.compile(
-                run_gdn_decode_bf16state_mtp_ilp4,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                acc_steps_,
-                ssm_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV,
-                T,
-                H,
-                K,
-                V,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                disable_state_update,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                disable_output,
-                per_request_accepted_steps,
-                per_token_pool_scatter,
-                per_token_pool_scatter_flat,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("mtp_ilp4", cache_key),
+                lambda: cute.compile(
+                    run_gdn_decode_bf16state_mtp_ilp4,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    acc_steps_,
+                    ssm_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV,
+                    T,
+                    H,
+                    K,
+                    V,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    disable_state_update,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    disable_output,
+                    per_request_accepted_steps,
+                    per_token_pool_scatter,
+                    per_token_pool_scatter_flat,
+                    stream,
+                    options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
