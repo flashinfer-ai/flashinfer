@@ -25,7 +25,6 @@ from .jit.xqa import (
     gen_xqa_module,
     gen_xqa_module_mla,
     ragged_q_changes_build,
-    swap_ab_eligible,
 )
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
@@ -302,9 +301,8 @@ def xqa(
     Note
     ----
     On SM90 with fp8 KV cache, speculative decode runs on the generic kernel
-    instead of the Hopper fp8 kernel when any of these holds: ragged Q,
-    attention sinks, a positive ``sliding_win_size`` (even one larger than
-    every sequence), or ``q_seq_len * (num_q_heads // num_kv_heads) <= 32``.
+    instead of the Hopper fp8 kernel when ragged Q is used, or when ``sinks``
+    are provided together with speculative decoding.
 
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0] (or seq_lens.shape[0] with ragged Q)
@@ -418,14 +416,8 @@ def xqa(
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
-        if (
-            use_ragged_q
-            or use_sliding_window
-            or swap_ab_eligible(q_seq_len, head_group_ratio)
-        ):
-            # mha_sm90.cu rejects ragged Q and gets full draft masks wrong,
-            # both under sliding windows and in SWAP_AB. Causal masks can't
-            # be exempted without inspecting the device-side mask.
+        if use_ragged_q:
+            # mha_sm90.cu rejects ragged Q.
             run_sm90_fp8_mha = False
 
     xqa_module.xqa(
