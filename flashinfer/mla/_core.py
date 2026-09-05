@@ -3046,7 +3046,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens : Optional[torch.Tensor]
         Per-request physical KV sequence lengths for dense and TRTLLM-GEN
         paths. With DCP these are rank-local lengths and continue to control
-        paging, memory bounds, and split-KV. For
+        paging, memory bounds, and split-KV. A request with ``seq_lens == 0``
+        (for example a DCP rank that owns no KV slice of it) is the attention
+        identity: for dense MLA decode without attention sinks, the
+        ``trtllm-gen`` and ``cute-dsl`` backends write ``out = 0`` and
+        ``lse = -inf`` for its query rows when ``return_lse=True`` so a
+        downstream merge ignores them. For
         SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
         ``None``, every column in ``block_tables`` is active.
@@ -3131,7 +3136,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return_lse : bool = False
         Whether to return LSE values. Supported by ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
-        returns ``(out, lse)``. With compact variable Q, LSE is currently
+        returns ``(out, lse)``. For dense MLA decode without attention
+        sinks on the ``trtllm-gen`` and ``cute-dsl`` backends, rows with
+        ``seq_lens == 0`` then hold the empty-attention identity
+        (``out = 0``, ``lse = -inf``); without the LSE their ``out`` rows
+        are left undefined, and sparse MLA / block-sparse decode make no
+        such guarantee. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use. Honored when

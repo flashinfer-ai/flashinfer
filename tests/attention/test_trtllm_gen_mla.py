@@ -1714,3 +1714,108 @@ def test_trtllm_batch_decode_mla_use_fp16_softmax(
         uses_shared_paged_kv_idx=True,
         use_fp16_softmax=True,
     )
+
+
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_batch_decode_mla_empty_kv_rows_are_neutral(
+    num_heads: int, q_len_per_request: int, dtype: torch.dtype
+):
+    """Rows with ``seq_lens == 0`` must come back as ``out = 0`` / ``lse = -inf``.
+
+    A decode-context-parallel rank that owns no KV slice of a request, or a
+    chunked-KV merge, feeds such rows into ``merge_state``; stale ``out`` memory
+    would poison the merge even with a zero weight.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    page_size = 64
+    kv_lora_rank = 512
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    seq_lens = torch.tensor(
+        [130, 0, 5, 0, 0, 300, 64, 0], dtype=torch.int32, device=device
+    )
+    batch_size = seq_lens.numel()
+    max_seq_len = int(seq_lens.max().item())
+    max_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = batch_size * max_pages_per_seq
+    block_tables = (
+        torch.randperm(num_pages, device=device)
+        .view(batch_size, max_pages_per_seq)
+        .to(torch.int32)
+    )
+    kv_cache = torch.randn(
+        num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim, device=device
+    ).to(dtype)
+    query = torch.randn(
+        batch_size,
+        q_len_per_request,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+    ).to(dtype)
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    bmm1_scale = 1.0 / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
+
+    def run(query, block_tables, seq_lens, out=None, lse=None):
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            backend="trtllm-gen",
+            out=out,
+            lse=lse,
+            return_lse=True,
+        )
+
+    # Sentinels: the kernel must overwrite both buffers for the empty rows.
+    out = torch.full(
+        (batch_size, q_len_per_request, num_heads, kv_lora_rank),
+        7.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    lse = torch.full(
+        (batch_size * q_len_per_request, num_heads),
+        3.0,
+        dtype=torch.float32,
+        device=device,
+    )
+    out_ret, lse_ret = run(query, block_tables, seq_lens, out=out, lse=lse)
+    assert out_ret is out
+    assert lse_ret is lse
+    torch.cuda.synchronize()
+
+    empty = seq_lens == 0
+    lse_rows = lse.view(batch_size, q_len_per_request, num_heads)
+    assert torch.all(out[empty] == 0), "empty-KV rows must produce out = 0"
+    assert torch.isneginf(lse_rows[empty]).all(), (
+        "empty-KV rows must produce lse = -inf"
+    )
+
+    # Active rows must match the same batch with the empty rows removed.
+    active = torch.nonzero(~empty, as_tuple=False).flatten()
+    out_active, lse_active = run(query[active], block_tables[active], seq_lens[active])
+    torch.testing.assert_close(
+        out[active].float(), out_active.float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        lse_rows[active],
+        lse_active.view(-1, q_len_per_request, num_heads),
+        atol=2e-2,
+        rtol=2e-2,
+    )

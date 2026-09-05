@@ -41,6 +41,71 @@ namespace {
 
 constexpr int32_t kDsv4SparseMlaSlidingWindowTopK = 128;
 
+// Empty-KV rows (seqLensKv[b] == 0) are the attention identity: out = 0, lse = -inf, so that a
+// caller merging partial states (decode context parallelism, chunked KV) can ignore them. The
+// generation cubins export lse = -inf for those rows but never write `out`, which leaves stale
+// memory (possibly NaN/Inf) that poisons the merge even with a zero weight. This kernel
+// materializes the identity after the main launch. It is sync-free and CUDA-graph safe: every
+// (row, query token) gets a block that exits immediately unless the row is empty.
+//
+// grid = (max_q_len, batch_size), block = kFixupEmptyKvRowsThreads.
+constexpr int32_t kFixupEmptyKvRowsThreads = 256;
+
+__global__ void FixupEmptyKvRowsKernel(uint8_t* out, int64_t out_row_bytes, float* lse,
+                                       int64_t lse_stride_tokens, int64_t lse_stride_heads,
+                                       int32_t num_heads, int32_t const* seq_lens_kv,
+                                       int32_t const* cum_seq_lens_q, int32_t q_len_per_request) {
+  int32_t const batch_idx = blockIdx.y;
+  if (seq_lens_kv[batch_idx] != 0) {
+    return;
+  }
+  int32_t token_begin, token_end;
+  if (cum_seq_lens_q != nullptr) {
+    token_begin = cum_seq_lens_q[batch_idx];
+    token_end = cum_seq_lens_q[batch_idx + 1];
+  } else {
+    token_begin = batch_idx * q_len_per_request;
+    token_end = token_begin + q_len_per_request;
+  }
+  int32_t const token = token_begin + static_cast<int32_t>(blockIdx.x);
+  if (token >= token_end) {
+    return;
+  }
+  uint8_t* row = out + static_cast<int64_t>(token) * out_row_bytes;
+  if ((reinterpret_cast<uintptr_t>(row) & 15) == 0 && (out_row_bytes & 15) == 0) {
+    uint4* row_vec = reinterpret_cast<uint4*>(row);
+    int64_t const num_vec = out_row_bytes / 16;
+    for (int64_t i = threadIdx.x; i < num_vec; i += blockDim.x) {
+      row_vec[i] = make_uint4(0u, 0u, 0u, 0u);
+    }
+  } else {
+    for (int64_t i = threadIdx.x; i < out_row_bytes; i += blockDim.x) {
+      row[i] = 0;
+    }
+  }
+  if (lse != nullptr) {
+    for (int32_t h = threadIdx.x; h < num_heads; h += blockDim.x) {
+      lse[static_cast<int64_t>(token) * lse_stride_tokens + h * lse_stride_heads] = -INFINITY;
+    }
+  }
+}
+
+void launch_fixup_empty_kv_rows(void* out, int64_t out_row_bytes, float* lse,
+                                int64_t lse_stride_tokens, int64_t lse_stride_heads,
+                                int64_t num_heads, int32_t const* seq_lens_kv,
+                                int32_t const* cum_seq_lens_q, int64_t q_len_per_request,
+                                int64_t max_q_len, int64_t batch_size, cudaStream_t stream) {
+  if (batch_size <= 0 || max_q_len <= 0) {
+    return;
+  }
+  dim3 const grid(static_cast<uint32_t>(max_q_len), static_cast<uint32_t>(batch_size));
+  FixupEmptyKvRowsKernel<<<grid, kFixupEmptyKvRowsThreads, 0, stream>>>(
+      static_cast<uint8_t*>(out), out_row_bytes, lse, lse_stride_tokens, lse_stride_heads,
+      static_cast<int32_t>(num_heads), seq_lens_kv, cum_seq_lens_q,
+      static_cast<int32_t>(q_len_per_request));
+  FLASHINFER_CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void RemapDsv4SparseMlaIndicesKernel(int32_t const* input, int32_t* output,
                                                 int64_t num_indices, int32_t sparse_mla_top_k,
                                                 int32_t primary_page_size,
@@ -380,6 +445,22 @@ void trtllm_paged_attention_launcher(
   }
 
   fmha_runner->run(runner_params);
+
+  // Only callers that request the LSE merge partial attention states, and only a merge can
+  // observe an empty-KV row, so the fixup is skipped (zero cost) on the plain decode path.
+  // Scope: dense MLA decode without attention sinks. A sink contributes to the softmax
+  // denominator, so an empty-KV row with sinks has a finite LSE that must not be overwritten with
+  // -inf. Block-sparse attention carries per-head lengths and sparse MLA has no empty-row
+  // contract, so both are left untouched as well.
+  if (mode == TllmPagedAttentionMode::ForGen && is_mla_decode && lse != nullptr &&
+      seq_lens != nullptr && attention_sinks == nullptr && !enable_block_sparse_attention &&
+      sparse_mla_top_k <= 0) {
+    int64_t const out_row_bytes = num_qo_heads * head_dim_vo * get_size_in_bits(o_data_type) / 8;
+    int64_t const q_len_per_request = cum_seq_lens_q == nullptr ? sum_seq_q / batch_size : 0;
+    launch_fixup_empty_kv_rows(out, out_row_bytes, lse, lse_stride_tokens, lse_stride_heads,
+                               num_qo_heads, seq_lens, cum_seq_lens_q, q_len_per_request, max_q_len,
+                               batch_size, stream);
+  }
 }
 
 inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
