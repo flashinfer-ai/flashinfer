@@ -96,6 +96,7 @@ from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
     SmemKvReuseCreditResource,
+    _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
     create_correction_task_one_inst_qkv,
@@ -343,6 +344,8 @@ def _build_decode_gen_schedule(
     sparse_row_route_offsets: cute.Pointer | None = None,
     sparse_row_route_counts: cute.Pointer | None = None,
     sparse_route_metadata: cute.Pointer | None = None,
+    sparse_row_route_begin: Int32 | None = None,
+    sparse_route_count: Int32 | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -1238,6 +1241,8 @@ def _build_decode_gen_schedule(
         "seq_len_q": seq_len_q,
         "sparse_row_route_offsets": sparse_row_route_offsets,
         "sparse_row_route_counts": sparse_row_route_counts,
+        "sparse_row_route_begin": sparse_row_route_begin,
+        "sparse_route_count": sparse_route_count,
         "num_heads_kv": num_heads_kv,
     }
     if use_one_inst_qkv:
@@ -2095,6 +2100,27 @@ def _run_decode_gen_active(
     if cutlass.const_expr(cfg.max_seq_len_q > 1):
         q_output_rows = g_h_r * Int32(cfg.max_seq_len_q)
 
+    # Static block-sparse tiles read their prepared row header here, before
+    # TMEM allocation and barrier setup, so that global-memory round trip is
+    # hidden instead of stalling every task at its first schedule step.
+    sparse_row_route_begin = None
+    sparse_route_count = None
+    if cutlass.const_expr(
+        cfg.use_block_sparse
+        and not cfg.use_persistent_scheduler
+        and g_sparse_row_route_offsets is not None
+        and g_sparse_row_route_counts is not None
+    ):
+        sparse_row_route_begin, sparse_route_count = _prefetch_prepared_sparse_row(
+            cfg,
+            g_sparse_row_route_offsets,
+            g_sparse_row_route_counts,
+            q_group_idx,
+            h_k_idx,
+            b_idx,
+            g_h_k,
+        )
+
     (
         task_list,
         dep_graph,
@@ -2145,6 +2171,8 @@ def _run_decode_gen_active(
         sparse_row_route_offsets=g_sparse_row_route_offsets,
         sparse_row_route_counts=g_sparse_row_route_counts,
         sparse_route_metadata=g_sparse_route_metadata,
+        sparse_row_route_begin=sparse_row_route_begin,
+        sparse_route_count=sparse_route_count,
     )
 
     smem_allocator.allocate()

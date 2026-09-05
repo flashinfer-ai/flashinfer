@@ -630,6 +630,47 @@ def _decode_work_tile_schedule_with_invariant_bridge(
 
 
 @cute.jit
+def _prepared_sparse_row_address(
+    cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    q_group_idx: cutlass.Int32,
+    h_idx: cutlass.Int32,
+    b_idx: cutlass.Int32,
+    num_heads_kv: cutlass.Int32,
+) -> cutlass.Int32:
+    """Map a (q_group, head, batch) tile to its prepared row header index."""
+
+    q_token_base = _q_group_token_base(cfg, q_group_idx)
+    q_block = q_token_base // cutlass.Int32(cfg.q_block_size)
+    num_q_blocks = (cfg.max_seq_len_q + cfg.q_block_size - 1) // cfg.q_block_size
+    return (b_idx * num_heads_kv + h_idx) * cutlass.Int32(num_q_blocks) + q_block
+
+
+@cute.jit
+def _prefetch_prepared_sparse_row(
+    cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    row_route_offsets: cute.Pointer,
+    row_route_counts: cute.Pointer,
+    q_group_idx: cutlass.Int32,
+    h_idx: cutlass.Int32,
+    b_idx: cutlass.Int32,
+    num_heads_kv: cutlass.Int32,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """Load one static tile's prepared row header before its tasks start.
+
+    Every thread loads the same two words, so each warp issues one request
+    and the global-memory latency overlaps the CTA prologue (TMEM allocation
+    and barrier setup) instead of stalling every task at its first step.
+    """
+
+    row_address = _prepared_sparse_row_address(
+        cfg, q_group_idx, h_idx, b_idx, num_heads_kv
+    )
+    row_route_begin = cutlass.Int32(row_route_offsets[row_address])
+    route_count = _assume_nonnegative_i32(cutlass.Int32(row_route_counts[row_address]))
+    return row_route_begin, route_count
+
+
+@cute.jit
 def _load_prepared_sparse_row_warp(
     row_route_offsets: cute.Pointer,
     row_route_counts: cute.Pointer,
@@ -662,6 +703,9 @@ class DecodeGenTask(Task):
         self.paged_kv_indptr = kwargs.pop("paged_kv_indptr", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
         self.sparse_row_route_counts = kwargs.pop("sparse_row_route_counts", None)
+        # Static tiles may pass the already loaded row header instead.
+        self.sparse_row_route_begin = kwargs.pop("sparse_row_route_begin", None)
+        self.sparse_route_count = kwargs.pop("sparse_route_count", None)
         self.num_heads_kv = kwargs.pop("num_heads_kv", None)
         self.max_seq_len_kv = kwargs.pop("max_seq_len_kv", cutlass.Int32(0))
         self.seq_len_q = kwargs.pop("seq_len_q", None)
@@ -918,20 +962,20 @@ class DecodeGenTask(Task):
             q_group_idx = cutlass.Int32(tile_coord[0])
             h_idx = cutlass.Int32(tile_coord[1])
             b_idx = cutlass.Int32(tile_coord[2])
-            q_token_base = _q_group_token_base(self.cfg, q_group_idx)
-
-            q_block = q_token_base // self.cfg.q_block_size
-            num_q_blocks = (
-                self.cfg.max_seq_len_q + self.cfg.q_block_size - 1
-            ) // self.cfg.q_block_size
-            row_address = (b_idx * self.num_heads_kv + h_idx) * num_q_blocks + q_block
-
-            row_route_begin, route_count = _load_prepared_sparse_row_warp(
-                row_route_offsets,
-                row_route_counts,
-                cutlass.Int32(row_address),
-                self._lane_idx,
-            )
+            if self.sparse_row_route_begin is not None:
+                # The static kernel prologue already loaded this tile's header.
+                row_route_begin = self.sparse_row_route_begin
+                route_count = self.sparse_route_count
+            else:
+                row_address = _prepared_sparse_row_address(
+                    self.cfg, q_group_idx, h_idx, b_idx, self.num_heads_kv
+                )
+                row_route_begin, route_count = _load_prepared_sparse_row_warp(
+                    row_route_offsets,
+                    row_route_counts,
+                    row_address,
+                    self._lane_idx,
+                )
 
             # Sparse route-span accessors share two underlying cache words
             # with paged KV. Clear dense/paged-only coordinates on every
@@ -2728,6 +2772,12 @@ def create_mma_task(
                     cfg,
                 )
 
+        # Q is live for every BMM1 call, and the last BMM1 has been issued once
+        # the loop ends. Releasing here commits after those MMAs complete, so
+        # the next tile's Q load overlaps the final softmax and BMM2 waves
+        # instead of waiting for them.
+        smem_q.release()
+
         # TAIL: no future K tiles remain, so only the final two BMM2 waves run.
         _consume_staged_pv_mma(
             smem_kv,
@@ -2749,8 +2799,6 @@ def create_mma_task(
             FmhaStage.Tail,
             cfg,
         )
-        # Q is live for every BMM1 call and can be released only after the loop.
-        smem_q.release()
 
     def mma_schedule_prelude(
         smem_q: MemoryResource,

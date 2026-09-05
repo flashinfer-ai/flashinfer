@@ -874,6 +874,87 @@ class TmemCorrResource(DecodeGenResourceBase):
         return output_vals, sum_val, new_max, new_max
 
     @cute.jit
+    def _merge_kv_tile_256_peer_fragment(
+        self,
+        own_vals: cutlass.Array,
+        peer_vals,
+        first_col: Constexpr[int],
+        count: Constexpr[int],
+    ) -> cutlass.Array:
+        """Add the peer spatial half to ``count`` own columns from ``first_col``."""
+        merged_vals = cutlass.Array(
+            Float32,
+            count,
+            space=cutlass.AddressSpace.rmem,
+        )
+        for elem in cutlass.range_constexpr(0, count, 2):
+            value_idx = first_col + elem
+            merged = fadd2(
+                (own_vals[value_idx], own_vals[value_idx + 1]),
+                (
+                    Float32(peer_vals[value_idx]),
+                    Float32(peer_vals[value_idx + 1]),
+                ),
+            )
+            merged_vals[elem] = merged[0]
+            merged_vals[elem + 1] = merged[1]
+        return merged_vals
+
+    @cute.jit
+    def _store_final_o_vec16(
+        self,
+        final_o_dst,
+        output_vals: cutlass.Array,
+        norm_scale: Float32,
+        o_is_32b_aligned: cutlass.Boolean,
+    ) -> None:
+        """Pack 16 contiguous output columns and store them as one 32-byte sector.
+
+        The 256-bit store needs a 32-byte-aligned destination; misaligned output
+        buffers fall back to two 16-byte stores of the same packed registers.
+        FP8 output keeps the 8-element packing path.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.use_fp8_output):
+            self._store_final_o_vec8(final_o_dst, output_vals, norm_scale)
+            upper_vals = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
+            for elem in cutlass.range_constexpr(8):
+                upper_vals[elem] = output_vals[8 + elem]
+            self._store_final_o_vec8(
+                final_o_dst + Int32(8 * cfg.o_dtype_bytes // 4),
+                upper_vals,
+                norm_scale,
+            )
+        else:
+            final_regs = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+            for reg_idx in cutlass.range_constexpr(8):
+                pair = fmul2(
+                    (norm_scale, norm_scale),
+                    (
+                        output_vals[reg_idx * 2],
+                        output_vals[reg_idx * 2 + 1],
+                    ),
+                )
+                if cutlass.const_expr(cfg.use_bf16_output):
+                    final_regs[reg_idx] = _pack_float2_to_bf16(pair[0], pair[1])
+                else:
+                    final_regs[reg_idx] = _pack_float2_to_fp16(pair[0], pair[1])
+            if o_is_32b_aligned:
+                final_o_dst.store(
+                    final_regs.data_ptr().load(count=8, alignment=4),
+                    alignment=32,
+                )
+            else:
+                final_o_dst.store(
+                    final_regs.data_ptr().load(count=4, alignment=4),
+                    alignment=16,
+                )
+                (final_o_dst + Int32(4)).store(
+                    (final_regs.data_ptr() + Int32(4)).load(count=4, alignment=4),
+                    alignment=16,
+                )
+
+    @cute.jit
     def _store_final_o_vec8(
         self,
         final_o_dst,
@@ -2394,6 +2475,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         else:
             dst_row_base = Int64(0)
             norm_scale = Float32(1.0)
+            # Row strides are multiples of 32 bytes for D128, so sector-wide
+            # stores are legal exactly when the output base pointer is.
+            o_is_32b_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
             if output_lane:
                 valid_output_row = _q_row_is_valid_for_seq(
                     cfg,
@@ -2436,27 +2520,46 @@ class TmemCorrResource(DecodeGenResourceBase):
                 peer_vals = (
                     exchange.data_ptr() + output_exchange_row_base + Int32(fragment_col)
                 ).load(count=32, alignment=16)
-                for vector_idx in cutlass.range_constexpr(4):
-                    vector_col = vector_idx * 8
-                    output_vals = cutlass.Array(
-                        Float32,
-                        8,
-                        space=cutlass.AddressSpace.rmem,
-                    )
-                    for elem in cutlass.range_constexpr(0, 8, 2):
-                        value_idx = vector_col + elem
-                        merged = fadd2(
-                            (own_vals[value_idx], own_vals[value_idx + 1]),
-                            (
-                                Float32(peer_vals[value_idx]),
-                                Float32(peer_vals[value_idx + 1]),
-                            ),
+                if cutlass.const_expr(not cfg.use_split_kv):
+                    # Direct output: merge and store 16 columns per instruction so
+                    # each lane writes one full 32-byte sector. Adjacent lanes own
+                    # adjacent rows, so 16-byte stores would leave every sector
+                    # half-written twice.
+                    for vector_pair in cutlass.range_constexpr(2):
+                        pair_col = vector_pair * 16
+                        merged_vals = self._merge_kv_tile_256_peer_fragment(
+                            own_vals,
+                            peer_vals,
+                            pair_col,
+                            16,
                         )
-                        output_vals[elem] = merged[0]
-                        output_vals[elem + 1] = merged[1]
-                    if valid_output_row:
-                        output_col = fragment_col + vector_col
-                        if cutlass.const_expr(cfg.use_split_kv):
+                        if valid_output_row:
+                            output_col = fragment_col + pair_col
+                            dst_offset = dst_row_base + Int32(
+                                output_col * cfg.o_dtype_bytes
+                            )
+                            final_o_dst = cutlass.inttoptr(
+                                self.o_ptr.toint() + cutlass.Int64(dst_offset),
+                                mem_space=1,
+                                dtype=Int32,
+                            )
+                            self._store_final_o_vec16(
+                                final_o_dst,
+                                merged_vals,
+                                norm_scale,
+                                o_is_32b_aligned,
+                            )
+                else:
+                    for vector_idx in cutlass.range_constexpr(4):
+                        vector_col = vector_idx * 8
+                        output_vals = self._merge_kv_tile_256_peer_fragment(
+                            own_vals,
+                            peer_vals,
+                            vector_col,
+                            8,
+                        )
+                        if valid_output_row:
+                            output_col = fragment_col + vector_col
                             scaled_values: tuple = ()
                             for elem in cutlass.range_constexpr(0, 8, 2):
                                 scaled_values += fmul2(
@@ -2482,20 +2585,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                                 dtype=Int32,
                             )
                             partial_o_dst.store(packed, alignment=16)
-                        else:
-                            dst_offset = dst_row_base + Int32(
-                                output_col * cfg.o_dtype_bytes
-                            )
-                            final_o_dst = cutlass.inttoptr(
-                                self.o_ptr.toint() + cutlass.Int64(dst_offset),
-                                mem_space=1,
-                                dtype=Int32,
-                            )
-                            self._store_final_o_vec8(
-                                final_o_dst,
-                                output_vals,
-                                norm_scale,
-                            )
 
         if cutlass.const_expr(cfg.use_split_kv):
             if valid_output_row:
