@@ -448,6 +448,19 @@ class TllmGenFmhaKernel {
       }
     }
 
+    // The batch dimension maps onto gridDim.z (computeCtaAndClusterConfig sets
+    // numCtasZ = params.mBatchSize), and CUDA caps gridDim.z at 65535. Without this
+    // check cuLaunchKernelEx returns CUDA_ERROR_INVALID_VALUE, which cuErrCheck only
+    // prints to stderr, so no kernel runs and the caller is handed an untouched output
+    // buffer with no error. gridDim.z is the only dimension that can realistically
+    // overflow: gridDim.x carries Q tiles (limit 2^31-1), and gridDim.y (head x head-dim
+    // splits) would need at least 2048 query heads to exceed the 65535 limit.
+    FLASHINFER_CHECK(launch_config.gridDimZ <= 65535,
+                     "trtllm-gen fmha: the batch dimension maps to gridDim.z and exceeds the "
+                     "CUDA limit of 65535; callers must keep the flattened batch (rows) at or "
+                     "below 65535, e.g. by chunking. Got gridDim.z =",
+                     launch_config.gridDimZ);
+
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
     // Run the separate reduction kernel if needed.
