@@ -30,6 +30,11 @@ from moe_nvfp4_swapab.runner_common import (
     _pack_f32_to_fp4,
     _rcp_approx_ftz_f32_cuda,
 )
+from moe_nvfp4_swapab.activation import (
+    Fc1Activation,
+    post_activation_width,
+    validate_fc1_activation,
+)
 from src.token_comm import CombineFormat
 
 
@@ -44,6 +49,26 @@ class MegaMoEReference:
 
     combine_output: torch.Tensor
     combine_reduced_output: torch.Tensor
+
+
+def apply_fc1_activation_reference(
+    fc1_fp32: torch.Tensor,
+    activation: Fc1Activation = "swiglu",
+    *,
+    gate_up_interleave: int = 16,
+    gate_up_clamp: Optional[float] = None,
+) -> torch.Tensor:
+    """Independent Torch activation oracle for the FC1/FC2 hand-off."""
+    activation = validate_fc1_activation(activation)
+    if activation == "relu2":
+        if gate_up_clamp is not None:
+            raise ValueError("relu2 does not support gate_up_clamp.")
+        return torch.relu(fc1_fp32).square()
+    return swiglu_fold_interleave(
+        fc1_fp32,
+        gate_up_interleave,
+        gate_up_clamp=gate_up_clamp,
+    )
 
 
 def _check_cuda_inputs(named_tensors: Tuple[Tuple[str, torch.Tensor], ...]) -> None:
@@ -94,6 +119,7 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
+    activation: Fc1Activation = "swiglu",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 reference shared by the single-rank tester
     and the multi-rank MegaMoE reference.
@@ -102,11 +128,12 @@ def reference_expert_fc12(
     straight off the packed fp4/fp8 operands -- no host dequant; the launcher's
     K-major ``b`` and raw SF formats are identical for the per-expert single-rank
     and gathered multi-rank tensors.  Returns the fc2 fp32 output (``deepgemm``:
-    topk pre-multiplied into SwiGLU; ``transformers``: left unweighted for the
+    topk pre-multiplied into the FC1 activation; ``transformers``: left
+    unweighted for the
     caller to apply), the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
-    fc1-phase ablation, and the raw fc1 fp32 pre-SwiGLU activations.
+    fc1-phase ablation, and the raw fc1 fp32 pre-activation values.
     """
-    intermediate_downproj = intermediate // 2
+    intermediate_downproj = post_activation_width(intermediate, activation)
     fc1_fp32 = ref_scaled_mm(
         a=act_packed,
         sfa=act_sf,
@@ -117,15 +144,16 @@ def reference_expert_fc12(
     )
     fc1_fp32 = fc1_fp32 * fc1_alpha
 
-    swiglu = swiglu_fold_interleave(
+    post_activation = apply_fc1_activation_reference(
         fc1_fp32,
-        gate_up_interleave,
+        activation,
+        gate_up_interleave=gate_up_interleave,
         gate_up_clamp=gate_up_clamp,
     )
     if ref_compute_graph == "deepgemm":
-        swiglu = swiglu * topk_weights.unsqueeze(-1)
+        post_activation = post_activation * topk_weights.unsqueeze(-1)
 
-    fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
+    fc1_q, fc1_sf_out = quantize_fn(post_activation, fc1_norm_const)
 
     fc2_fp32 = ref_scaled_mm(
         a=fc1_q,
@@ -213,26 +241,27 @@ def compute_megamoe_reference(
     input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
     fc1_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
     fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
-    fc2_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
-    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
+    fc2_weight: torch.Tensor,  # storage (rank, expert, post_activation_width//2, hidden)
+    fc2_weight_sf: torch.Tensor,  # (rank, expert, hidden, post_activation_width//Nvfp4BlockSize)
     fc1_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
     fc2_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
     fc1_norm_const: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
     ref_compute_graph: Literal["transformers", "deepgemm"],
     combine_format: CombineFormat,
     gate_up_clamp: Optional[float] = None,
+    activation: Fc1Activation = "swiglu",
 ) -> MegaMoEReference:
     """Return per-topk combine terms plus optional reduced reference.
 
     Two routing-weight application points are supported.  ``deepgemm``
-    pre-multiplies the per-token weight into the SwiGLU output BEFORE the
+    pre-multiplies the per-token weight into the FC1 activation output BEFORE the
     fc1-output NVFP4 quant; this matches the MegaMoE form-B path.  In
     ``transformers`` mode ``combine_output`` intentionally stays unweighted;
     Mega form A applies topk scores in the standalone topk_reduce kernel.  Both
     compute graphs return ``combine_reduced_output`` so callers can validate the
     reduced form without re-implementing graph-specific reduce semantics.
 
-    The structure (per-expert gather -> packed blockscaled fc1 -> swiglu +
+    The structure (per-expert gather -> packed blockscaled fc1 -> activation +
     fc1-out NVFP4 round-trip -> packed blockscaled fc2 -> scatter back) mirrors
     the kernel's own data path so kernel-vs-reference disagreement is bounded by
     NVFP4 quantize RTNE at fc1-out and blockscaled GEMM accumulation noise.
@@ -273,7 +302,7 @@ def compute_megamoe_reference(
     # early (helpful when the runner-side reshape forgets a //2).
     hidden = fc2_weight.shape[-1]
     intermediate = fc1_weight.shape[-1]
-    intermediate_downproj = intermediate // 2
+    intermediate_downproj = post_activation_width(intermediate, activation)
 
     if fc1_weight.shape[0] != num_ranks or fc2_weight.shape[0] != num_ranks:
         raise ValueError(
@@ -292,8 +321,8 @@ def compute_megamoe_reference(
     if fc2_weight.shape[2] * 2 != intermediate_downproj:
         raise ValueError(
             f"fc2_weight packed dim ({fc2_weight.shape[2]}) * 2 != "
-            f"intermediate_downproj ({intermediate_downproj}); fc2's K is "
-            f"intermediate//2 (post-SwiGLU-fold)."
+            f"post-activation width ({intermediate_downproj}); fc2's K must "
+            f"match the {activation} FC1 output."
         )
 
     combine_ref = torch.zeros(
@@ -326,7 +355,7 @@ def compute_megamoe_reference(
             source_ranks, source_tokens, source_topk_slots
         ]
 
-        # Packed NVFP4 blockscaled fc1 -> SwiGLU(+clamp) -> NVFP4 round-trip ->
+        # Packed NVFP4 blockscaled fc1 -> selected activation -> NVFP4 round-trip ->
         # blockscaled fc2, all via the shared bit-exact per-expert core.  The
         # NVFP4 round-trip on the fc1 output is the only step that introduces
         # kernel-vs-ref disagreement above fp32 accumulation noise (RTNE may
@@ -355,6 +384,7 @@ def compute_megamoe_reference(
             gate_up_clamp=gate_up_clamp,
             topk_weights=gathered_topk_weights,
             ref_compute_graph=ref_compute_graph,
+            activation=activation,
         )
 
         combine_ref[source_ranks, source_tokens, source_topk_slots, :] = (

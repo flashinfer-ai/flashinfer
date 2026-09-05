@@ -47,6 +47,7 @@ from cutlass.cutlass_dsl import Int64
 
 from common.host_utils import get_cutedsl_target_arch
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
+from .activation import Fc1Activation, post_activation_width
 from .topk_reduce import TopkReduce
 from src.token_comm import (
     CombineFormat,
@@ -196,6 +197,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
+        activation: Fc1Activation = "swiglu",
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
@@ -274,6 +276,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
             epi_flag_batch=epi_flag_batch,
+            activation=activation,
         )
 
         self.enable_token_comm = True
@@ -308,8 +311,13 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
+        # The static shape carries the physical FC1 projection width. SwiGLU
+        # has two planes; ReLU2 has one. ``intermediate_downproj`` is the
+        # semantic post-activation width consumed by FC2 in both cases.
         self.intermediate_gateup = static_expert_shape[1]
-        self.intermediate_downproj = self.intermediate_gateup // 2
+        self.intermediate_downproj = post_activation_width(
+            self.intermediate_gateup, self.activation
+        )
 
         # NVFP4: 4 bits/elem -> 2 elements per byte.
         self.hidden_bytes = self.hidden // 2
@@ -938,7 +946,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_token_back_by_{token_back}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
-            f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_acc{self.acc_dtype.__name__}_activation{self.activation}"
+            f"_planes{self.fc1_projection_planes}_clamp{self.gate_up_clamp}"
+            f"_epiflag{epiflag}"
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
@@ -996,6 +1006,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         scale_dtype = cutlass.Float8E4M3FN
         float32 = cutlass.Float32
 
+        self.validate_problem_shapes(
+            (tokens, hidden),
+            (experts, hidden, fc1_n),
+            (experts, intermediate, hidden),
+        )
+
         def fake_tensor(dtype, shape, stride_order, dynamic_dims, alignment):
             # dynamic_dims -> runtime SymInt(div=gcd(extent,128)); the stride-1
             # (contiguous) dim stays static -- mirrors to_cute's mark_layout_dynamic.
@@ -1020,8 +1036,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             ),
             topk_idx=fake_tensor(Int64, (tokens, topk), (1, 0), {0}, 8),
             topk_weights=fake_tensor(float32, (tokens, topk), (1, 0), {0}, 16),
+            # FC1 physical projection width is part of the activation
+            # specialization. Keep it static in the TVM-FFI ABI so a padded
+            # 2I tensor cannot be accepted by a single-plane ReLU2 module.
             fc1_weight=fake_tensor(
-                data_dtype, (experts, hidden, fc1_n), (2, 0, 1), {0, 2}, 16
+                data_dtype, (experts, hidden, fc1_n), (2, 0, 1), {0}, 16
             ),
             fc1_weight_sf=fake_tensor(
                 scale_dtype, (experts, fc1_sf_cols), (1, 0), {0}, 16

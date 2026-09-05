@@ -9,6 +9,7 @@ to skip re-quantization.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
+_logger = logging.getLogger(__name__)
+
+
 def _resolve_gate_up_clamp(
     config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
@@ -52,6 +56,14 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_state: tuple | None = None
+        _logger.info(
+            "Configured NVFP4 MegaMoE layout=%s activation=%s "
+            "semantic_intermediate=%d physical_fc1=%d",
+            config.layout_identity,
+            config.activation,
+            config.intermediate_size,
+            config.physical_fc1_size,
+        )
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -100,6 +112,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            activation=self._kernel_config.activation,
+            relu2_kernel=self._kernel_config.relu2_kernel,
             gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
             activation_clamp=self._kernel_config.activation_clamp,
         )
@@ -116,6 +130,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
+            activation=self._kernel_config.activation,
+            relu2_kernel=self._kernel_config.relu2_kernel,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -128,9 +144,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.max_tokens_per_rank,
             k.top_k,
             fp.token_hidden_size,
-            2 * k.intermediate_size,
+            k.physical_fc1_size,
             self.ep_rank,
             self.ep_world_size,
+            activation=k.activation,
+            relu2_kernel=k.relu2_kernel,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
@@ -241,6 +259,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 )
             num_tokens = staged
 
+        capacity = workspace.output_activation.shape[0]
+        if num_tokens > capacity:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) exceeds workspace capacity ({capacity})"
+            )
+
         kcfg = self._kernel_config
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
@@ -263,22 +287,37 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # the clamp, and rebuilds the 12-field inputs bundle on every call
         # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
         # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
-        # Build once per (workspace, weights, compiled-session, STREAM) and
+        # Build once per (workspace, weights, compiled-session, LIVE ROWS,
+        # STREAM) and
         # reuse. The stream is part of the key because the thunk's launch
-        # kwargs bind it at build time — a graph capture runs on a capture
-        # stream and must get its own thunk or the kernel launch escapes the
-        # graph. A knobs/clamp change nulls the frontend's compiled session,
-        # changing the key and forcing a rebuild through the validated path.
+        # kwargs bind the runtime tensor descriptors and stream at build time.
+        # A different live-row extent therefore needs a fresh thunk (but keeps
+        # the same dynamic-shape compiled kernel), while a graph capture runs on
+        # a capture stream and must get its own thunk or the kernel launch
+        # escapes the graph. A knobs/clamp change nulls the frontend's compiled
+        # session, changing the key and forcing a rebuild through the validated
+        # path.
         fe = workspace._frontend
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
+        # The persistent EP kernel's shared routing metadata uses a fixed
+        # ``capacity * topk`` rank/expert stride.  Slicing every token-row
+        # descriptor to ``num_tokens`` also changes dispatch_prep's stride,
+        # while receivers still index the capacity-sized workspace.  That
+        # corrupts remote token metadata for any partial batch.  Keep the
+        # capacity descriptor on every rank; stage_inputs masks all tail rows
+        # with topk_idx=-1, so they remain inert.  A future live-row reduction
+        # must narrow only the standalone TopkReduce tail, not the persistent
+        # kernel's communication descriptors.
+        launch_num_tokens = None
         key = (
             id(workspace),
             id(transformed_weights[0][0]),
             id(mega.compiled) if mega is not None and mega.compiled else None,
+            launch_num_tokens,
             stream,
         )
         state = self._thunk_state
@@ -303,9 +342,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
+            thunk = fe.make_launch_thunk(inputs, num_tokens=launch_num_tokens)
             mega = fe._mega
-            key = (key[0], key[1], id(mega.compiled), stream)
+            key = (key[0], key[1], id(mega.compiled), launch_num_tokens, stream)
             state = (key, thunk, workspace.output_activation)
             self._thunk_state = state
 
@@ -339,7 +378,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.max_tokens_per_rank,
             k.top_k,
             fp.token_hidden_size,
-            2 * k.intermediate_size,
+            k.physical_fc1_size,
+            k.layout_identity,
             _resolve_gate_up_clamp(k),
             k.apply_topk_in_fc1,
             k.in_kernel_fc2_reduce,
