@@ -17,12 +17,14 @@ limitations under the License.
 import functools
 import math
 import threading
+import warnings
 import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -50,6 +52,7 @@ from ..trace.templates.moe import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -81,6 +84,7 @@ from ..tllm_enums import (
     Fp8QuantizationType,
     RoutingInputMode,
     RoutingMethodType,
+    SfLayout,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
     trtllm_gen_dtype_has_scale,
@@ -1697,6 +1701,110 @@ class MoeRunnerInputs:
 MoEInputs = MoeRunnerInputs
 
 
+@functools.cache
+def _make_flat_act_sf_numel_inferrer(
+    hidden_states_idx: int, sf_per_token: int
+) -> Callable[[Sequence[Sequence[int]]], int]:
+    """ConstraintSpec callback for a flat (1-D) activation scale buffer.
+
+    A flat scale holds ``num_tokens * sf_per_token`` elements, so its single
+    dimension is *not* a token count.  The autotuner writes a bucket's token
+    count verbatim into a dynamic dim (see ``_generate_optimization_profiles``),
+    which would under-allocate the buffer by a factor of ``sf_per_token`` and
+    make the kernel read out of bounds while profiling.  A ConstraintSpec
+    instead derives the extent from the profiled ``hidden_states`` dim 0, the
+    same approach ``runners.py`` uses for the swizzled MXFP8 activation scale.
+
+    Cached so equal arguments yield the same callable: ConstraintSpec is hashed
+    into AutoTuner._find_nearest_profile's lru_cache key, and a fresh closure
+    per inference call would cause unbounded cache growth.
+    """
+
+    def infer_shape(shapes: Sequence[Sequence[int]]) -> int:
+        return shapes[hidden_states_idx][0] * sf_per_token
+
+    return infer_shape
+
+
+# The trtllm-gen batched GEMM that consumes the caller's activation scale is
+# built with routeAct=true (csrc/trtllm_fused_moe_runner.cu:119), and its
+# kernel-option validation hard-requires a routed operand's scale factors to be
+# in the LINEAR layout:
+#
+#   TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::Linear || ...,
+#                    "Tokens need use SF linear layout when being routed");
+#     -- trtllmGen_bmm_export/BatchedGemmOptions.h
+#
+# So the layout is a contract, not a dispatch knob: declaring it lets a mismatch
+# fail loudly instead of being read as linear bytes and silently producing wrong
+# numbers.  (The runtime SfLayout switch in trtllm_fused_moe_runner.cu belongs to
+# GEMM2, whose scale factors FlashInfer produces itself and never come from the
+# caller.)
+_SUPPORTED_MOE_ACT_SF_LAYOUT = SfLayout.layout_linear
+
+# Double deprecation: both the implicit layout *and* the optionality of the
+# parameter are announced at once, so a later release can make the parameter
+# required and delete the inference in a single step without ever flipping a
+# default under an existing caller.
+_IMPLICIT_ACT_SF_LAYOUT_DEPRECATION = (
+    "Calling a trtllm-gen block-scale MoE op with a `hidden_states_scale` but "
+    "without `hidden_states_scale_layout` is deprecated; the layout is being "
+    "inferred as SfLayout.layout_linear. The layout cannot actually be "
+    "recovered from the tensor -- a 128x4-swizzled buffer has exactly the "
+    "linear numel whenever num_tokens % 128 == 0 (see #3455) -- so pass "
+    "`hidden_states_scale_layout=flashinfer.tllm_enums.SfLayout.layout_linear` "
+    "explicitly. Both the inference and the parameter's optionality are "
+    "deprecated: the parameter is scheduled to become required and the "
+    "inference to be removed in a future release."
+)
+
+
+def _resolve_moe_act_sf_layout(
+    hidden_states_scale_layout: Optional[SfLayout],
+) -> SfLayout:
+    """Resolve the activation scale-factor layout for a trtllm-gen MoE call.
+
+    ``None`` reproduces the historical behavior exactly -- assume the linear
+    layout -- and emits a :class:`DeprecationWarning`.  Any explicitly declared
+    layout other than :attr:`SfLayout.layout_linear` is rejected, because the
+    routed GEMM cannot consume it (see ``_SUPPORTED_MOE_ACT_SF_LAYOUT``).
+    """
+    if hidden_states_scale_layout is None:
+        # Dedup is per distinct *caller* line: with stacklevel != 1 ``warnings``
+        # resolves ``__warningregistry__`` against the caller's frame, so this
+        # bounds the warning to one per user call site rather than one per
+        # process.  That is enough for a hot path -- ``_make_tuning_config``
+        # runs on every op call and is not memoized.
+        #
+        # stacklevel 6 walks helper -> _make_tuning_config -> <op impl> ->
+        # _auto_dump_wrapper -> <public wrapper> -> user code.  Note
+        # _auto_dump_wrapper is present *unconditionally* whenever the API is
+        # declared with trace= (it does not depend on FLASHINFER_LOGLEVEL), so
+        # omitting it attributes the warning to flashinfer/api_logging.py and
+        # the default filters then hide it entirely.  Depth still varies for the
+        # unified-API runners, so the message stands on its own.
+        warnings.warn(
+            _IMPLICIT_ACT_SF_LAYOUT_DEPRECATION, DeprecationWarning, stacklevel=6
+        )
+        return _SUPPORTED_MOE_ACT_SF_LAYOUT
+
+    try:
+        layout = SfLayout(hidden_states_scale_layout)
+    except ValueError:
+        layout = hidden_states_scale_layout  # reported verbatim below
+    if layout != _SUPPORTED_MOE_ACT_SF_LAYOUT:
+        raise NotImplementedError(
+            f"hidden_states_scale_layout={layout!r} is not supported by the "
+            "trtllm-gen MoE path: the routed batched GEMM requires the "
+            "activation scale factors in "
+            f"{_SUPPORTED_MOE_ACT_SF_LAYOUT!r} "
+            '("Tokens need use SF linear layout when being routed"). Quantize '
+            "the activations with is_sf_swizzled_layout=False (equivalently "
+            "sf_swizzle_layout=SfLayout.layout_linear)."
+        )
+    return layout
+
+
 def _alloc_trtllm_moe_output(
     num_tokens: int,
     hidden_size: int,
@@ -1913,6 +2021,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs: "MoeRunnerInputs",
             tune_max_num_tokens: int = 8192,
             routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+            hidden_states_scale_layout: Optional[SfLayout] = None,
             **kwargs,
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
@@ -1921,6 +2030,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 moe_inputs: Input parameters for this call.
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 routing_input_mode: Routing representation used by the launcher.
+                hidden_states_scale_layout: Layout of ``hidden_states_scale``
+                    for block-scale activations.  Only
+                    :attr:`SfLayout.layout_linear` is supported; anything else
+                    raises.  ``None`` (the default) infers the linear layout and
+                    emits a :class:`DeprecationWarning` -- both the inference
+                    and the optionality are deprecated.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
 
@@ -1951,10 +2066,110 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
             num_tokens = moe_inputs.hidden_states.shape[0]
 
+            # A flat (1-D) activation scale — the linear layout produced by
+            # mxfp8_quantize(..., is_sf_swizzled_layout=False), and what
+            # TensorRT-LLM passes through — packs num_tokens * sf_per_token
+            # elements into a single dimension, so no dim of it equals
+            # num_tokens.  Resizing it as a dynamic dim would shrink it to the
+            # raw bucket count; drive it with a ConstraintSpec that scales by
+            # sf_per_token instead.  The C++ launcher accepts any rank here (it
+            # derives the SF vector size from numel alone).
+            constraint_specs: Tuple[ConstraintSpec, ...] = ()
+            scale = moe_inputs.hidden_states_scale
+
+            # Resolve the declared scale-factor layout.  Two quant types carry a
+            # layout-ambiguous activation scale -- NoneFp8 (the fp4 block-scale
+            # op) and MxFp8 -- because for those the buffer is a flat byte run
+            # whose linear-vs-swizzled layout is a convention rather than a
+            # shape.  The other two are pinned to an exact shape by the C++
+            # launcher (DeepSeekFp8 is [hidden_size//128, num_tokens],
+            # PerTensorFp8 is [num_tokens, 1]), so there is nothing to declare.
+            #
+            # Only NoneFp8 resolves here for now: MxFp8 arrives via
+            # trtllm_fp8_block_scale_moe, which does not yet expose
+            # hidden_states_scale_layout, so warning on it would tell the caller
+            # to pass a parameter that does not exist.  Extending the parameter
+            # to that op is tracked as follow-up; until then MxFp8 keeps the
+            # historical implicit-linear assumption, undeclared.
+            if (
+                scale is not None
+                and self.fp8_quantization_type == Fp8QuantizationType.NoneFp8
+            ):
+                act_sf_layout = _resolve_moe_act_sf_layout(hidden_states_scale_layout)
+            else:
+                act_sf_layout = _SUPPORTED_MOE_ACT_SF_LAYOUT
+
+            flat_scale = (
+                scale is not None
+                and self.fp8_quantization_type != Fp8QuantizationType.DeepSeekFp8
+                and scale.dim() == 1
+            )
+            if flat_scale:
+                # Hoisted: this runs on every op call (_make_tuning_config is not
+                # memoized), so avoid repeating the numel() FFI hop three times.
+                _sf_numel = scale.numel()
+                assert num_tokens > 0 and _sf_numel % num_tokens == 0, (
+                    f"flat hidden_states_scale numel {_sf_numel} is not a "
+                    f"multiple of num_tokens={num_tokens}"
+                )
+                # Validate the buffer against the DECLARED layout.
+                # ``act_sf_layout`` is linear here — the caller either said so or
+                # the deprecated implicit path inferred it, and
+                # _resolve_moe_act_sf_layout() rejects every other value up
+                # front — so the expected extent is exact: a linear scale holds
+                # num_tokens * hidden_size // sf_vec_size elements, and the C++
+                # launcher recovers sf_vec_size as
+                # num_tokens * hidden_size / numel, accepting only 16 (NvFp4) or
+                # 32 (Mx*).  A buffer that implies anything else is malformed
+                # for the declared layout and fails here with a clear message
+                # instead of deriving a bogus profiling stride.
+                #
+                # This validates against the declaration; it is not a layout
+                # *detector*, and it does not need to be.  As measured in #3455,
+                # a 128x4-swizzled buffer has exactly the linear numel whenever
+                # num_tokens % 128 == 0, so it would slip past any numel-based
+                # test — which is precisely why the layout is declared rather
+                # than guessed.  A caller that declares swizzled never reaches
+                # this code (NotImplementedError above); one that stays on the
+                # deprecated implicit path gets the DeprecationWarning telling
+                # it to declare.  Either way sf_per_token is only used to SIZE a
+                # profiling buffer, never to interpret data, so an
+                # indistinguishable swizzled buffer sizes correctly and a
+                # distinguishable one (row/column padded, hence strictly larger)
+                # either trips this assert or over-sizes the buffer, which is
+                # safe.
+                _sf_per_token = _sf_numel // num_tokens
+                assert (
+                    _sf_per_token > 0
+                    and self.hidden_size % _sf_per_token == 0
+                    and self.hidden_size // _sf_per_token in (16, 32)
+                ), (
+                    f"flat hidden_states_scale numel {_sf_numel} implies "
+                    f"{_sf_per_token} scales/token for hidden_size="
+                    f"{self.hidden_size}, i.e. an SF vector size of "
+                    f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
+                    "which is not a supported SF vector size (16 for NvFp4, 32 "
+                    f"for Mx*). {act_sf_layout!r} expects "
+                    "num_tokens * hidden_size // sf_vec_size elements, e.g. from "
+                    "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
+                )
+                constraint_specs = (
+                    ConstraintSpec(
+                        MoeRunnerInputs.idx("hidden_states_scale"),
+                        0,
+                        _make_flat_act_sf_numel_inferrer(
+                            MoeRunnerInputs.idx("hidden_states"),
+                            _sf_per_token,
+                        ),
+                    ),
+                )
+
             def _dynamic_dim(name: str) -> int:
                 if name == "hidden_states_scale":
-                    # DeepSeekFp8 uses [hidden_size//128, num_tokens];
-                    # all others (MxFp8, fp4, …) use [num_tokens, ...].
+                    # DeepSeekFp8 uses [hidden_size//128, num_tokens]; all others
+                    # (MxFp8, fp4, …) use [num_tokens, ...] when 2-D.  The flat
+                    # 1-D layout never reaches here — it is filtered out above
+                    # and handled by a ConstraintSpec.
                     t = moe_inputs.hidden_states_scale
                     if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
                         assert t.shape == (self.hidden_size // 128, num_tokens), (
@@ -1963,14 +2178,25 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                             f"(hidden_size//128={self.hidden_size // 128}, num_tokens={num_tokens})"
                         )
                         return 1
-                    assert t.shape[0] == num_tokens, (
+                    assert t.dim() >= 1 and t.shape[0] == num_tokens, (
                         f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                        f"expected layout (num_tokens={num_tokens}, ...)"
+                        f"expected layout (num_tokens={num_tokens}, ...) or flat "
+                        f"(num_tokens * sf_per_token,)"
                     )
                     return 0
                 return MoeRunnerInputs._DYNAMIC_DIM[name]
 
-            dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
+            # The constrained flat scale is excluded from the dynamic spec but
+            # stays in profile_arena_input_indices (set from input_idx above) and
+            # keeps its initializer: a ConstraintSpec also marks the dim dynamic,
+            # so the profiler still synthesizes the tensor at the derived size.
+            dynamic_inputs = tuple(
+                (idx, name)
+                for idx, name, _ in sorted_inputs
+                if not (flat_scale and name == "hidden_states_scale")
+            )
+            dynamic_input_idx = tuple(idx for idx, _ in dynamic_inputs)
+            dim_idx = tuple(_dynamic_dim(name) for _, name in dynamic_inputs)
             tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
             value_aware_names = {"topk_ids", "expert_weights"}
             kwargs.setdefault(
@@ -1984,12 +2210,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             return TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
-                        input_idx,
+                        dynamic_input_idx,
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
                     ),
                 ),
+                constraint_specs=constraint_specs,
                 tensor_initializers=tensor_initializers,
                 **kwargs,
             )
@@ -2135,18 +2362,32 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 "hidden_states's first dimension must be batch size."
             )
             if hidden_states_scale is not None:
-                assert hidden_states_scale.dim() == 2, (
-                    "hidden_states_scale must be a 2D tensor"
-                )
                 if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                    assert hidden_states_scale.shape[1] == num_tokens, (
+                    assert (
+                        hidden_states_scale.dim() == 2
+                        and hidden_states_scale.shape[1] == num_tokens
+                    ), (
                         f"DeepSeekFp8 hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
-                        f"expects num_tokens={num_tokens} at dim 1"
+                        f"expects a 2D tensor with num_tokens={num_tokens} at dim 1"
+                    )
+                elif hidden_states_scale.dim() == 1:
+                    # Flat linear layout, i.e. mxfp8_quantize(...,
+                    # is_sf_swizzled_layout=False): one
+                    # contiguous run of sf_per_token scales per token.
+                    assert (
+                        num_tokens > 0 and hidden_states_scale.numel() % num_tokens == 0
+                    ), (
+                        f"flat hidden_states_scale numel {hidden_states_scale.numel()} "
+                        f"is not a multiple of num_tokens={num_tokens}"
                     )
                 else:
-                    assert hidden_states_scale.shape[0] == num_tokens, (
+                    assert (
+                        hidden_states_scale.dim() == 2
+                        and hidden_states_scale.shape[0] == num_tokens
+                    ), (
                         f"hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
-                        f"expects num_tokens={num_tokens} at dim 0"
+                        f"expects a 2D tensor with num_tokens={num_tokens} at dim 0, "
+                        f"or a flat (num_tokens * sf_per_token,) tensor"
                     )
             # Choose the appropriate operation based on data types
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
@@ -4036,6 +4277,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
         num_fused_shared_experts: int = 0,
+        # Typed as int (SfLayout is an IntEnum) to match the other kernel-ABI
+        # enums crossing this op boundary -- activation_type, weight_layout,
+        # routing_method_type -- which stay schema-expressible if
+        # register_custom_op is ever re-enabled.
+        hidden_states_scale_layout: Optional[int] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -4145,6 +4391,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             routing_input_mode=RoutingInputMode(routing_input_mode),
+            hidden_states_scale_layout=hidden_states_scale_layout,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
         )
@@ -6689,6 +6936,7 @@ def trtllm_fp4_block_scale_moe(
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
     num_fused_shared_experts: Optional[int] = None,
+    hidden_states_scale_layout: Optional[SfLayout] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6708,6 +6956,11 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale : Optional[torch.Tensor]
         Block scales for MXFP8 / NVFP4 hidden states of shape
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
+        The equivalent flat ``[seq_len * hidden_size // (32 if mxfp8 else 16)]``
+        buffer returned by :func:`~flashinfer.mxfp8_quantize` with
+        ``is_sf_swizzled_layout=False`` (the linear layout) is also accepted.
+        Declare which layout the buffer is in with
+        ``hidden_states_scale_layout``; only the linear layout is supported.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
@@ -6817,6 +7070,22 @@ def trtllm_fp4_block_scale_moe(
         with weight ``1.0``. With ``do_finalize=False``, the returned
         ``expert_weights`` and ``expanded_idx_to_permuted_idx`` cover
         ``top_k + num_fused_shared_experts`` slots per token.
+    hidden_states_scale_layout : Optional[flashinfer.tllm_enums.SfLayout]
+        Layout of ``hidden_states_scale``.  This is **validation only**: the
+        trtllm-gen routed GEMM can consume only
+        :attr:`~flashinfer.tllm_enums.SfLayout.layout_linear`, so declaring any
+        swizzled layout raises :class:`NotImplementedError` instead of reading
+        the buffer as linear bytes and silently producing wrong results.
+
+        .. deprecated::
+            Omitting this argument is deprecated.  ``None`` (the default)
+            preserves today's behavior — the linear layout is inferred — and
+            emits a :class:`DeprecationWarning`.  The layout genuinely cannot be
+            recovered from the tensor: a 128x4-swizzled buffer has exactly the
+            linear ``numel`` whenever ``num_tokens % 128 == 0``.  Both the
+            inference and this argument's optionality are deprecated together,
+            so a future release can make it required and drop the inference in
+            one step.
 
     Returns
     -------
@@ -6888,6 +7157,7 @@ def trtllm_fp4_block_scale_moe(
         norm_topk_prob,
         routing_replay_out,
         nsfe,
+        hidden_states_scale_layout,
     )
 
 
@@ -6925,6 +7195,7 @@ def trtllm_fp4_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
+    hidden_states_scale_layout: Optional[SfLayout] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -6954,7 +7225,12 @@ def trtllm_fp4_block_scale_routed_moe(
         MXFP8 (``float8_e4m3fn``), and NVFP4 (packed into ``uint8``).
     hidden_states_scale : Optional[torch.Tensor]
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]`` block scales of
-        the hidden states, float8.
+        the hidden states, float8.  The equivalent flat
+        ``[seq_len * hidden_size // (32 if mxfp8 else 16)]`` buffer returned by
+        :func:`~flashinfer.mxfp8_quantize` with ``is_sf_swizzled_layout=False``
+        (the linear layout) is also accepted.  Declare which layout the buffer
+        is in with ``hidden_states_scale_layout``; only the linear layout is
+        supported.
     gemm1_weights : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
         FP4 FC1 weights, ``uint8``.
@@ -7046,6 +7322,16 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
         set it is added to FC1 before the fused gated activation and the
         post-activation FC1 output is appended to the return list.
+    hidden_states_scale_layout : Optional[flashinfer.tllm_enums.SfLayout]
+        Layout of ``hidden_states_scale``.  See
+        :func:`trtllm_fp4_block_scale_moe` — validation only, linear layout
+        only, and omitting it is deprecated.
+
+        .. deprecated::
+            Omitting this argument is deprecated.  ``None`` (the default)
+            infers :attr:`~flashinfer.tllm_enums.SfLayout.layout_linear` and
+            emits a :class:`DeprecationWarning`.  Both the inference and this
+            argument's optionality are deprecated together.
 
     Returns
     -------
@@ -7116,6 +7402,7 @@ def trtllm_fp4_block_scale_routed_moe(
         True,  # norm_topk_prob: not used for pre-computed routing
         None,  # routing_replay_out: not used for pre-computed routing
         0,  # num_fused_shared_experts: not used for pre-computed routing
+        hidden_states_scale_layout,
     )
 
 
