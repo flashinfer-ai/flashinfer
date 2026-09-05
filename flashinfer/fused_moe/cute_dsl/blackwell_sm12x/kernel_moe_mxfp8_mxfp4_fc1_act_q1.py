@@ -56,11 +56,11 @@ def is_swapab(tile):
 QUANT_EPIS = (EpiMethod.WG_S2R_QUANT, EpiMethod.WG_QUANT_R2S)
 NO_HANDOFF = (EpiMethod.DIRECT_STG, EpiMethod.WG_QUANT_SWAP)
 REG_PROD_BY_TACTIC = {
-    (64, 128, EpiMethod.WG_S2R_QUANT): 72,
-    (64, 128, EpiMethod.WG_QUANT_R2S): 72,
-    (32, 128, EpiMethod.WG_S2R_QUANT): 56,
-    (32, 128, EpiMethod.WG_QUANT_R2S): 56,
-    (8, 128, EpiMethod.WG_QUANT_SWAP): 72,
+    (64, 128, EpiMethod.WG_S2R_QUANT): 88,
+    (64, 128, EpiMethod.WG_QUANT_R2S): 88,
+    (32, 128, EpiMethod.WG_S2R_QUANT): 88,
+    (32, 128, EpiMethod.WG_QUANT_R2S): 88,
+    (8, 128, EpiMethod.WG_QUANT_SWAP): 120,
 }
 
 
@@ -129,27 +129,24 @@ def make_cfg(
 
 
 @cute.jit
-def load_ab(
+def load_a_sfa(
     tma_atom_a,
-    tma_atom_b,
-    tma_atom_sfb,
+    tma_atom_sfa,
     tma_tensor_a,
-    tma_tensor_b,
-    tma_tensor_sfb,
+    tma_tensor_sfa,
     sA,
-    sU,
-    sG,
-    sSFU,
-    sSFG,
+    sSFA,
     tile_mnk,
     tile,
-    n_gate_off,
-    ab_full,
-    ab_empty,
-    ab_bytes,
-    k_tile_count,
+    a_full,
+    a_empty,
+    a_bytes,
+    sfa_bytes,
+    num_sf_cycles,
+    sf_stages,
+    kt_per_pack,
     ab_stages,
-    ab_phase,
+    a_phase,
 ):
     i32 = cutlass.Int32
     cluster = cute.make_layout((1, 1, 1))
@@ -163,19 +160,86 @@ def load_ab(
         cute.group_modes(sA, 0, 2),
         cute.group_modes(gA_mkl, 0, 2),
     )
-    gB_nkl = cute.local_tile(
+    sf_m_off = (tile.m_offset + tile.group * i32(SF_M_ALIGN - 1)) & i32(-SF_M_ALIGN)
+    mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
+    gSFA_ml = cute.local_tile(mSFA, (tile_mnk[0], 1), (None, None, None))
+    tAsSFA, tAgSFA = cpasync.tma_partition(
+        tma_atom_sfa,
+        i32(0),
+        multicast,
+        cute.group_modes(sSFA, 0, 2),
+        cute.group_modes(gSFA_ml, 0, 2),
+    )
+    for sf_cycle in cutlass.range(num_sf_cycles):
+        for sf_stage in cutlass.range_constexpr(sf_stages):
+            global_sf_stage = sf_cycle * sf_stages + sf_stage
+            for k_in_sf in cutlass.range_constexpr(kt_per_pack):
+                local_k_tile = sf_stage * kt_per_pack + k_in_sf
+                global_k_tile = sf_cycle * sf_stages * kt_per_pack + local_k_tile
+                stage = local_k_tile & (ab_stages - 1)
+                cute.arch.mbarrier_wait(a_empty + stage, a_phase)
+                tx_bytes = a_bytes
+                if cutlass.const_expr(k_in_sf == 0):
+                    tx_bytes += sfa_bytes
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(a_full + stage, tx_bytes)
+                if cutlass.const_expr(k_in_sf == 0):
+                    cute.copy(
+                        tma_atom_sfa,
+                        tAgSFA[(None, tile.m_block, global_sf_stage, 0)],
+                        tAsSFA[(None, sf_stage)],
+                        tma_bar_ptr=a_full + stage,
+                    )
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, tile.m_block, global_k_tile)],
+                    tAsA[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                if cutlass.const_expr(stage == ab_stages - 1):
+                    a_phase ^= 1
+    return a_phase
+
+
+@cute.jit
+def load_b_sfb(
+    tma_atom_b,
+    tma_atom_sfb,
+    tma_tensor_b,
+    tma_tensor_sfb,
+    sU,
+    sG,
+    sSFU,
+    sSFG,
+    tile_mnk,
+    tile,
+    n_gate_off,
+    b_full,
+    b_empty,
+    b_bytes,
+    sfb_bytes,
+    num_sf_cycles,
+    sf_stages,
+    kt_per_pack,
+    ab_stages,
+    b_phase,
+):
+    i32 = cutlass.Int32
+    cluster = cute.make_layout((1, 1, 1))
+    multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
+    gU_nkl = cute.local_tile(
         tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+    )
+    mG = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_b)
+    gG_nkl = cute.local_tile(
+        mG, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
     )
     tUsU, tUgU = cpasync.tma_partition(
         tma_atom_b,
         i32(0),
         multicast,
         cute.group_modes(sU, 0, 2),
-        cute.group_modes(gB_nkl, 0, 2),
-    )
-    mB_g = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_b)
-    gG_nkl = cute.local_tile(
-        mB_g, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+        cute.group_modes(gU_nkl, 0, 2),
     )
     tGsG, tGgG = cpasync.tma_partition(
         tma_atom_b,
@@ -185,6 +249,8 @@ def load_ab(
         cute.group_modes(gG_nkl, 0, 2),
     )
     gSFU_nl = cute.local_tile(tma_tensor_sfb, (tile_mnk[1], 1), (None, None, None))
+    mSFG = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfb)
+    gSFG_nl = cute.local_tile(mSFG, (tile_mnk[1], 1), (None, None, None))
     tUsSFU, tUgSFU = cpasync.tma_partition(
         tma_atom_sfb,
         i32(0),
@@ -192,8 +258,6 @@ def load_ab(
         cute.group_modes(sSFU, 0, 2),
         cute.group_modes(gSFU_nl, 0, 2),
     )
-    mSFB_g = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfb)
-    gSFG_nl = cute.local_tile(mSFB_g, (tile_mnk[1], 1), (None, None, None))
     tGsSFG, tGgSFG = cpasync.tma_partition(
         tma_atom_sfb,
         i32(0),
@@ -201,117 +265,78 @@ def load_ab(
         cute.group_modes(sSFG, 0, 2),
         cute.group_modes(gSFG_nl, 0, 2),
     )
-    for kt_base in cutlass.range(0, k_tile_count, ab_stages):
-        for s in cutlass.range_constexpr(ab_stages):
-            kt = kt_base + s
-            cute.arch.mbarrier_wait(ab_empty + s, ab_phase)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(ab_full + s, ab_bytes)
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, tile.m_block, kt)],
-                tAsA[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_b,
-                tUgU[(None, tile.n_block, kt, tile.group)],
-                tUsU[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_b,
-                tGgG[(None, tile.n_block, kt, tile.group)],
-                tGsG[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_sfb,
-                tUgSFU[(None, tile.n_block, kt, tile.group)],
-                tUsSFU[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_sfb,
-                tGgSFG[(None, tile.n_block, kt, tile.group)],
-                tGsSFG[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-        ab_phase ^= 1
-    return ab_phase
+    for sf_cycle in cutlass.range(num_sf_cycles):
+        for sf_stage in cutlass.range_constexpr(sf_stages):
+            for k_in_sf in cutlass.range_constexpr(kt_per_pack):
+                local_k_tile = sf_stage * kt_per_pack + k_in_sf
+                global_k_tile = sf_cycle * sf_stages * kt_per_pack + local_k_tile
+                stage = local_k_tile & (ab_stages - 1)
+                cute.arch.mbarrier_wait(b_empty + stage, b_phase)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        b_full + stage, b_bytes + sfb_bytes
+                    )
+                cute.copy(
+                    tma_atom_b,
+                    tUgU[(None, tile.n_block, global_k_tile, tile.group)],
+                    tUsU[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tGgG[(None, tile.n_block, global_k_tile, tile.group)],
+                    tGsG[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+                cute.copy(
+                    tma_atom_sfb,
+                    tUgSFU[(None, tile.n_block, global_k_tile, tile.group)],
+                    tUsSFU[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+                cute.copy(
+                    tma_atom_sfb,
+                    tGgSFG[(None, tile.n_block, global_k_tile, tile.group)],
+                    tGsSFG[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+                if cutlass.const_expr(stage == ab_stages - 1):
+                    b_phase ^= 1
+    return b_phase
 
 
 @cute.jit
-def load_sf(
-    tma_atom_sfa,
-    tma_tensor_sfa,
-    sSFA,
-    tile_m,
-    tile,
-    sf_full,
-    sf_empty,
-    sfa_bytes,
-    m_align,
-    num_sf_cycles,
-    sf_stages,
-    sf_phase,
-):
-    i32 = cutlass.Int32
-    cluster = cute.make_layout((1, 1, 1))
-    multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
-    sf_m_off = (tile.m_offset + tile.group * i32(m_align - 1)) & i32(-m_align)
-    mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
-    gSFA_ml = cute.local_tile(mSFA, (tile_m, 1), (None, None, None))
-    tAsSFA, tAgSFA = cpasync.tma_partition(
-        tma_atom_sfa,
-        i32(0),
-        multicast,
-        cute.group_modes(sSFA, 0, 2),
-        cute.group_modes(gSFA_ml, 0, 2),
-    )
-    for sf_cycle in cutlass.range(0, num_sf_cycles):
-        for s in cutlass.range_constexpr(sf_stages):
-            cute.arch.mbarrier_wait(sf_empty + s, sf_phase)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(sf_full + s, sfa_bytes)
-            cute.copy(
-                tma_atom_sfa,
-                tAgSFA[(None, tile.m_block, sf_cycle * sf_stages + s, 0)],
-                tAsSFA[(None, s)],
-                tma_bar_ptr=sf_full + s,
-            )
-        sf_phase ^= 1
-    return sf_phase
-
-
-@cute.jit
-def load_ab_swap(
+def load_a_sfa_swap(
     tma_atom_a,
-    tma_atom_b,
     tma_atom_sfa,
     tma_tensor_a,
-    tma_tensor_b,
     tma_tensor_sfa,
     sU,
     sG,
-    sB,
     sSFU,
     sSFG,
     tile_mnk,
     tile,
     n_gate_off,
-    ab_full,
-    ab_empty,
-    ab_bytes,
-    k_tile_count,
+    a_full,
+    a_empty,
+    a_bytes,
+    sfa_bytes,
+    num_sf_cycles,
+    sf_stages,
+    kt_per_pack,
     ab_stages,
-    ab_phase,
+    a_phase,
 ):
     i32 = cutlass.Int32
     cluster = cute.make_layout((1, 1, 1))
     multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
     gU_mkl = cute.local_tile(
         tma_tensor_a, cute.slice_(tile_mnk, (None, 0, None)), (None, None, None)
+    )
+    mG = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_a)
+    gG_mkl = cute.local_tile(
+        mG, cute.slice_(tile_mnk, (None, 0, None)), (None, None, None)
     )
     tUsU, tUgU = cpasync.tma_partition(
         tma_atom_a,
@@ -320,10 +345,6 @@ def load_ab_swap(
         cute.group_modes(sU, 0, 2),
         cute.group_modes(gU_mkl, 0, 2),
     )
-    mA_g = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_a)
-    gG_mkl = cute.local_tile(
-        mA_g, cute.slice_(tile_mnk, (None, 0, None)), (None, None, None)
-    )
     tGsG, tGgG = cpasync.tma_partition(
         tma_atom_a,
         i32(0),
@@ -331,6 +352,86 @@ def load_ab_swap(
         cute.group_modes(sG, 0, 2),
         cute.group_modes(gG_mkl, 0, 2),
     )
+    gSFU_ml = cute.local_tile(tma_tensor_sfa, (tile_mnk[0], 1), (None, None, None))
+    mSFG = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfa)
+    gSFG_ml = cute.local_tile(mSFG, (tile_mnk[0], 1), (None, None, None))
+    tUsSFU, tUgSFU = cpasync.tma_partition(
+        tma_atom_sfa,
+        i32(0),
+        multicast,
+        cute.group_modes(sSFU, 0, 2),
+        cute.group_modes(gSFU_ml, 0, 2),
+    )
+    tGsSFG, tGgSFG = cpasync.tma_partition(
+        tma_atom_sfa,
+        i32(0),
+        multicast,
+        cute.group_modes(sSFG, 0, 2),
+        cute.group_modes(gSFG_ml, 0, 2),
+    )
+    for sf_cycle in cutlass.range(num_sf_cycles):
+        for sf_stage in cutlass.range_constexpr(sf_stages):
+            for k_in_sf in cutlass.range_constexpr(kt_per_pack):
+                local_k_tile = sf_stage * kt_per_pack + k_in_sf
+                global_k_tile = sf_cycle * sf_stages * kt_per_pack + local_k_tile
+                stage = local_k_tile & (ab_stages - 1)
+                cute.arch.mbarrier_wait(a_empty + stage, a_phase)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        a_full + stage, a_bytes + sfa_bytes
+                    )
+                cute.copy(
+                    tma_atom_a,
+                    tUgU[(None, tile.m_block, global_k_tile, tile.group)],
+                    tUsU[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                cute.copy(
+                    tma_atom_a,
+                    tGgG[(None, tile.m_block, global_k_tile, tile.group)],
+                    tGsG[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                cute.copy(
+                    tma_atom_sfa,
+                    tUgSFU[(None, tile.m_block, global_k_tile, tile.group)],
+                    tUsSFU[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                cute.copy(
+                    tma_atom_sfa,
+                    tGgSFG[(None, tile.m_block, global_k_tile, tile.group)],
+                    tGsSFG[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                )
+                if cutlass.const_expr(stage == ab_stages - 1):
+                    a_phase ^= 1
+    return a_phase
+
+
+@cute.jit
+def load_b_sfb_swap(
+    tma_atom_b,
+    tma_atom_sfb,
+    tma_tensor_b,
+    tma_tensor_sfb,
+    sB,
+    sSFB,
+    tile_mnk,
+    tile,
+    b_full,
+    b_empty,
+    b_bytes,
+    sfb_bytes,
+    num_sf_cycles,
+    sf_stages,
+    kt_per_pack,
+    ab_stages,
+    b_phase,
+):
+    i32 = cutlass.Int32
+    cluster = cute.make_layout((1, 1, 1))
+    multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
     mB = cute.domain_offset((tile.m_offset, 0), tma_tensor_b)
     gB_nkl = cute.local_tile(mB, cute.slice_(tile_mnk, (0, None, None)), (None, None))
     tBsB, tBgB = cpasync.tma_partition(
@@ -340,84 +441,9 @@ def load_ab_swap(
         cute.group_modes(sB, 0, 2),
         cute.group_modes(gB_nkl, 0, 2),
     )
-    gSFU_ml = cute.local_tile(tma_tensor_sfa, (tile_mnk[0], 1), (None, None, None))
-    tUsSFU, tUgSFU = cpasync.tma_partition(
-        tma_atom_sfa,
-        i32(0),
-        multicast,
-        cute.group_modes(sSFU, 0, 2),
-        cute.group_modes(gSFU_ml, 0, 2),
-    )
-    mSFA_g = cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfa)
-    gSFG_ml = cute.local_tile(mSFA_g, (tile_mnk[0], 1), (None, None, None))
-    tGsSFG, tGgSFG = cpasync.tma_partition(
-        tma_atom_sfa,
-        i32(0),
-        multicast,
-        cute.group_modes(sSFG, 0, 2),
-        cute.group_modes(gSFG_ml, 0, 2),
-    )
-    for kt_base in cutlass.range(0, k_tile_count, ab_stages):
-        for s in cutlass.range_constexpr(ab_stages):
-            kt = kt_base + s
-            cute.arch.mbarrier_wait(ab_empty + s, ab_phase)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(ab_full + s, ab_bytes)
-            cute.copy(
-                tma_atom_a,
-                tUgU[(None, tile.m_block, kt, tile.group)],
-                tUsU[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_a,
-                tGgG[(None, tile.m_block, kt, tile.group)],
-                tGsG[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, tile.n_block, kt)],
-                tBsB[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tUgSFU[(None, tile.m_block, kt, tile.group)],
-                tUsSFU[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tGgSFG[(None, tile.m_block, kt, tile.group)],
-                tGsSFG[(None, s)],
-                tma_bar_ptr=ab_full + s,
-            )
-        ab_phase ^= 1
-    return ab_phase
-
-
-@cute.jit
-def load_sf_swap(
-    tma_atom_sfb,
-    tma_tensor_sfb,
-    sSFB,
-    tile_n,
-    tile,
-    sf_full,
-    sf_empty,
-    sfb_bytes,
-    m_align,
-    num_sf_cycles,
-    sf_stages,
-    sf_phase,
-):
-    i32 = cutlass.Int32
-    cluster = cute.make_layout((1, 1, 1))
-    multicast = cute.make_layout(cute.slice_(cluster, (0, None, 0)).shape)
-    sf_m_off = (tile.m_offset + tile.group * i32(m_align - 1)) & i32(-m_align)
+    sf_m_off = (tile.m_offset + tile.group * i32(SF_M_ALIGN - 1)) & i32(-SF_M_ALIGN)
     mSFB = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfb)
-    gSFB_nl = cute.local_tile(mSFB, (tile_n, 1), (None, None, None))
+    gSFB_nl = cute.local_tile(mSFB, (tile_mnk[1], 1), (None, None, None))
     tBsSFB, tBgSFB = cpasync.tma_partition(
         tma_atom_sfb,
         i32(0),
@@ -425,19 +451,35 @@ def load_sf_swap(
         cute.group_modes(sSFB, 0, 2),
         cute.group_modes(gSFB_nl, 0, 2),
     )
-    for sf_cycle in cutlass.range(0, num_sf_cycles):
-        for s in cutlass.range_constexpr(sf_stages):
-            cute.arch.mbarrier_wait(sf_empty + s, sf_phase)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(sf_full + s, sfb_bytes)
-            cute.copy(
-                tma_atom_sfb,
-                tBgSFB[(None, tile.n_block, sf_cycle * sf_stages + s, 0)],
-                tBsSFB[(None, s)],
-                tma_bar_ptr=sf_full + s,
-            )
-        sf_phase ^= 1
-    return sf_phase
+    for sf_cycle in cutlass.range(num_sf_cycles):
+        for sf_stage in cutlass.range_constexpr(sf_stages):
+            global_sf_stage = sf_cycle * sf_stages + sf_stage
+            for k_in_sf in cutlass.range_constexpr(kt_per_pack):
+                local_k_tile = sf_stage * kt_per_pack + k_in_sf
+                global_k_tile = sf_cycle * sf_stages * kt_per_pack + local_k_tile
+                stage = local_k_tile & (ab_stages - 1)
+                cute.arch.mbarrier_wait(b_empty + stage, b_phase)
+                tx_bytes = b_bytes
+                if cutlass.const_expr(k_in_sf == 0):
+                    tx_bytes += sfb_bytes
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(b_full + stage, tx_bytes)
+                if cutlass.const_expr(k_in_sf == 0):
+                    cute.copy(
+                        tma_atom_sfb,
+                        tBgSFB[(None, tile.n_block, global_sf_stage, 0)],
+                        tBsSFB[(None, sf_stage)],
+                        tma_bar_ptr=b_full + stage,
+                    )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, tile.n_block, global_k_tile)],
+                    tBsB[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+                if cutlass.const_expr(stage == ab_stages - 1):
+                    b_phase ^= 1
+    return b_phase
 
 
 @cute.jit
@@ -467,16 +509,16 @@ def mma(
     a_is_m_major,
     unpack_bits,
     tidx,
-    ab_full,
-    ab_empty,
-    sf_full,
-    sf_empty,
+    a_full,
+    a_empty,
+    b_full,
+    b_empty,
     num_sf_cycles,
     sf_stages,
     kt_per_pack,
     ab_stages,
-    ab_phase,
-    sf_phase,
+    a_phase,
+    b_phase,
 ):
     bm, bn = tile_mn
     thr = tiledmma.get_slice(tidx)
@@ -515,15 +557,16 @@ def mma(
     acc_g.fill(0.0)
     for _sf_cycle in cutlass.range(0, num_sf_cycles):
         for sf_stage in cutlass.range_constexpr(sf_stages):
-            cute.arch.mbarrier_wait(sf_full + sf_stage, sf_phase)
-            cute.copy(
-                s2r_sfa,
-                thr_sfa.partition_S(cute.slice_(sSFA, (None, None, sf_stage))),
-                thr_sfa.retile(tCrSFA),
-            )
             for k_in_sf in cutlass.range_constexpr(kt_per_pack):
                 s = (sf_stage * kt_per_pack + k_in_sf) & (ab_stages - 1)
-                cute.arch.mbarrier_wait(ab_full + s, ab_phase)
+                cute.arch.mbarrier_wait(a_full + s, a_phase)
+                if cutlass.const_expr(k_in_sf == 0):
+                    cute.copy(
+                        s2r_sfa,
+                        thr_sfa.partition_S(cute.slice_(sSFA, (None, None, sf_stage))),
+                        thr_sfa.retile(tCrSFA),
+                    )
+                cute.arch.mbarrier_wait(b_full + s, b_phase)
                 cute.copy(
                     s2r_sfb,
                     thr_sfb.partition_S(cute.slice_(sSFU, (None, None, s))),
@@ -564,14 +607,14 @@ def mma(
                         [tCrG[None, None, k_block], tCrSFG_frg[None, None, k_block, 0]],
                         acc_g,
                     )
-                cute.arch.mbarrier_arrive(ab_empty + s)
+                cute.arch.mbarrier_arrive(a_empty + s)
+                cute.arch.mbarrier_arrive(b_empty + s)
                 if cutlass.const_expr(s == ab_stages - 1):
-                    ab_phase ^= 1
-            cute.arch.mbarrier_arrive(sf_empty + sf_stage)
-        sf_phase ^= 1
+                    a_phase ^= 1
+                    b_phase ^= 1
 
     activation(acc_u, acc_g, fastmath)
-    return acc_u, ab_phase, sf_phase
+    return acc_u, a_phase, b_phase
 
 
 @cute.jit
@@ -594,16 +637,16 @@ def mma_swap(
     b_dtype,
     unpack_bits,
     tidx,
-    ab_full,
-    ab_empty,
-    sf_full,
-    sf_empty,
+    a_full,
+    a_empty,
+    b_full,
+    b_empty,
     num_sf_cycles,
     sf_stages,
     kt_per_pack,
     ab_stages,
-    ab_phase,
-    sf_phase,
+    a_phase,
+    b_phase,
 ):
     bm, bn = tile_mn
     thr = tiledmma.get_slice(tidx)
@@ -642,15 +685,9 @@ def mma_swap(
     acc_g.fill(0.0)
     for _sf_cycle in cutlass.range(0, num_sf_cycles):
         for sf_stage in cutlass.range_constexpr(sf_stages):
-            cute.arch.mbarrier_wait(sf_full + sf_stage, sf_phase)
-            cute.copy(
-                s2r_sfb,
-                thr_sfb.partition_S(cute.slice_(sSFB, (None, None, sf_stage))),
-                thr_sfb.retile(tCrSFB),
-            )
             for k_in_sf in cutlass.range_constexpr(kt_per_pack):
                 s = (sf_stage * kt_per_pack + k_in_sf) & (ab_stages - 1)
-                cute.arch.mbarrier_wait(ab_full + s, ab_phase)
+                cute.arch.mbarrier_wait(a_full + s, a_phase)
                 cute.copy(
                     s2r_sfa,
                     thr_sfa.partition_S(cute.slice_(sSFU, (None, None, s))),
@@ -661,6 +698,13 @@ def mma_swap(
                     thr_sfa.partition_S(cute.slice_(sSFG, (None, None, s))),
                     thr_sfa.retile(tCrSFG),
                 )
+                cute.arch.mbarrier_wait(b_full + s, b_phase)
+                if cutlass.const_expr(k_in_sf == 0):
+                    cute.copy(
+                        s2r_sfb,
+                        thr_sfb.partition_S(cute.slice_(sSFB, (None, None, sf_stage))),
+                        thr_sfb.retile(tCrSFB),
+                    )
                 tUsU_s = thr_a.partition_S(sU)[None, None, None, s]
                 tGsG_s = thr_a.partition_S(sG)[None, None, None, s]
                 tBsB_s = thr_b.partition_S(sB)[None, None, None, s]
@@ -691,14 +735,14 @@ def mma_swap(
                         ],
                         acc_g,
                     )
-                cute.arch.mbarrier_arrive(ab_empty + s)
+                cute.arch.mbarrier_arrive(a_empty + s)
+                cute.arch.mbarrier_arrive(b_empty + s)
                 if cutlass.const_expr(s == ab_stages - 1):
-                    ab_phase ^= 1
-            cute.arch.mbarrier_arrive(sf_empty + sf_stage)
-        sf_phase ^= 1
+                    a_phase ^= 1
+                    b_phase ^= 1
 
     activation(acc_u, acc_g, fastmath)
-    return acc_u, ab_phase, sf_phase
+    return acc_u, a_phase, b_phase
 
 
 _DEFAULT_QCFG = QuantConst()
@@ -833,21 +877,27 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             else cfg.load_ab.a_smem_dtype
         )
         coarse_sf_smem = sfb_smem if cutlass.const_expr(swap) else sfa_smem
-        coarse_stages = sfb_stages if cutlass.const_expr(swap) else sfa_stages
         gate_sf_bytes = cute.size_in_bytes(
             sf_dtype, cute.slice_(gate_sf_smem, (None, None, 0))
         )
-        self.ab_sfb_bytes = (
-            cfg.load_ab.tma_bytes_ab
-            + 2 * gate_sf_bytes
-            + (
-                cfg.load_ab.tma_bytes_a
-                if cutlass.const_expr(swap)
-                else cfg.load_ab.tma_bytes_b
-            )
-        )
-        self.sf_bytes = cute.size_in_bytes(
+        coarse_sf_bytes = cute.size_in_bytes(
             sf_dtype, cute.slice_(coarse_sf_smem, (None, None, 0))
+        )
+        self.a_bytes = (
+            2 * cfg.load_ab.tma_bytes_a
+            if cutlass.const_expr(swap)
+            else cfg.load_ab.tma_bytes_a
+        )
+        self.sfa_bytes = (
+            2 * gate_sf_bytes if cutlass.const_expr(swap) else coarse_sf_bytes
+        )
+        self.b_bytes = (
+            cfg.load_ab.tma_bytes_b
+            if cutlass.const_expr(swap)
+            else 2 * cfg.load_ab.tma_bytes_b
+        )
+        self.sfb_bytes = (
+            coarse_sf_bytes if cutlass.const_expr(swap) else 2 * gate_sf_bytes
         )
 
         store_full_bars = cfg.store_stages if cfg.epi.HAS_STORE_WARP else 0
@@ -866,10 +916,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         @cute.struct
         class SharedStorage:
             xchg: cute.struct.MemRange[cfg.ACC, xchg_elems]
-            ab_full: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
-            ab_empty: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
-            sf_full: cute.struct.MemRange[cfg.I64, coarse_stages]
-            sf_empty: cute.struct.MemRange[cfg.I64, coarse_stages]
+            a_full: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
+            a_empty: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
+            b_full: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
+            b_empty: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
             store_full: cute.struct.MemRange[cfg.I64, store_full_bars]
             store_empty: cute.struct.MemRange[cfg.I64, store_empty_bars]
             sfull: cute.struct.MemRange[cfg.I64, cfg.sched_stages]
@@ -986,13 +1036,12 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             if cutlass.const_expr(swap)
             else self.sf.k_tiles_per_pack_a(bk)
         )
-        sf_stages_c = (
+        sf_stages = (
             self.sf.sfb_stages(cfg.ab_stage, bk)
             if cutlass.const_expr(swap)
             else self.sf.sfa_stages(cfg.ab_stage, bk)
         )
-        num_sf_cycles = ceil_div(K, grank_c * self.sf.PACK_NSF * sf_stages_c)
-        k_tile_count = num_sf_cycles * sf_stages_c * kt_per_pack_c
+        num_sf_cycles = ceil_div(K, grank_c * self.sf.PACK_NSF * sf_stages)
 
         smem = cutlass.utils.SmemAllocator()
         stg = smem.allocate(self.storage)
@@ -1024,8 +1073,8 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                 (None, None, 0),
             )
             xchg = stg.xchg.get_tensor(cute.make_layout(bm * cfg.mma.num_warp_n))
-        ab_full, ab_empty = stg.ab_full.data_ptr(), stg.ab_empty.data_ptr()
-        sf_full, sf_empty = stg.sf_full.data_ptr(), stg.sf_empty.data_ptr()
+        a_full, a_empty = stg.a_full.data_ptr(), stg.a_empty.data_ptr()
+        b_full, b_empty = stg.b_full.data_ptr(), stg.b_empty.data_ptr()
         store_full = (
             stg.store_full.data_ptr()
             if cutlass.const_expr(cfg.epi.HAS_STORE_WARP)
@@ -1042,11 +1091,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for s in cutlass.range_constexpr(cfg.ab_stage):
-                    cute.arch.mbarrier_init(ab_full + s, 1)
-                    cute.arch.mbarrier_init(ab_empty + s, cfg.mma_threads)
-                for s in cutlass.range_constexpr(sf_stages_c):
-                    cute.arch.mbarrier_init(sf_full + s, 1)
-                    cute.arch.mbarrier_init(sf_empty + s, cfg.mma_threads)
+                    cute.arch.mbarrier_init(a_full + s, 1)
+                    cute.arch.mbarrier_init(a_empty + s, cfg.mma_threads)
+                    cute.arch.mbarrier_init(b_full + s, 1)
+                    cute.arch.mbarrier_init(b_empty + s, cfg.mma_threads)
                 for s in cutlass.range_constexpr(cfg.store_stages):
                     if cutlass.const_expr(cfg.epi.HAS_STORE_WARP):
                         cute.arch.mbarrier_init(store_full + s, cfg.mma_threads)
@@ -1092,95 +1140,112 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                 prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == cfg.ab_warp:
+                if cutlass.const_expr(cfg.enable_pdl and not swap):
+                    cute.arch.griddepcontrol_wait()
                 cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
                 tile = cons.get_next_tile(sWork, sfull, sempty)
-                abphase, stphase = i32(1), i32(1)
+                a_phase, stphase = i32(1), i32(1)
                 while tile.valid != i32(0):
                     if cutlass.const_expr(cfg.union_smem):
                         cute.arch.mbarrier_wait(store_empty, stphase)
                         stphase ^= 1
                     if cutlass.const_expr(swap):
-                        abphase = load_ab_swap(
+                        a_phase = load_a_sfa_swap(
                             tma_atom_a,
-                            tma_atom_b,
                             tma_atom_sfa,
                             tma_tensor_a,
-                            tma_tensor_b,
                             tma_tensor_sfa,
                             sU,
                             sG,
-                            sA,
                             sSFU,
                             sSFG,
                             cfg.TILE,
                             tile,
                             N,
-                            ab_full,
-                            ab_empty,
-                            self.ab_sfb_bytes,
-                            k_tile_count,
+                            a_full,
+                            a_empty,
+                            self.a_bytes,
+                            self.sfa_bytes,
+                            num_sf_cycles,
+                            sf_stages,
+                            kt_per_pack_c,
                             cfg.ab_stage,
-                            abphase,
+                            a_phase,
                         )
                     else:
-                        abphase = load_ab(
+                        a_phase = load_a_sfa(
                             tma_atom_a,
-                            tma_atom_b,
-                            tma_atom_sfb,
+                            tma_atom_sfa,
                             tma_tensor_a,
-                            tma_tensor_b,
-                            tma_tensor_sfb,
+                            tma_tensor_sfa,
                             sA,
-                            sU,
-                            sG,
-                            sSFU,
-                            sSFG,
+                            sSFA,
                             cfg.TILE,
                             tile,
-                            N,
-                            ab_full,
-                            ab_empty,
-                            self.ab_sfb_bytes,
-                            k_tile_count,
+                            a_full,
+                            a_empty,
+                            self.a_bytes,
+                            self.sfa_bytes,
+                            num_sf_cycles,
+                            sf_stages,
+                            kt_per_pack_c,
                             cfg.ab_stage,
-                            abphase,
+                            a_phase,
                         )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
             if warp_idx == cfg.sf_warp:
+                if cutlass.const_expr(cfg.enable_pdl and swap):
+                    cute.arch.griddepcontrol_wait()
                 cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
                 tile = cons.get_next_tile(sWork, sfull, sempty)
-                sfaphase = i32(1)
+                b_phase, stphase = i32(1), i32(1)
                 while tile.valid != i32(0):
+                    if cutlass.const_expr(cfg.union_smem):
+                        cute.arch.mbarrier_wait(store_empty, stphase)
+                        stphase ^= 1
                     if cutlass.const_expr(swap):
-                        sfaphase = load_sf_swap(
+                        b_phase = load_b_sfb_swap(
+                            tma_atom_b,
                             tma_atom_sfb,
+                            tma_tensor_b,
                             tma_tensor_sfb,
+                            sA,
                             sSFA,
-                            bn,
+                            cfg.TILE,
                             tile,
-                            sf_full,
-                            sf_empty,
-                            self.sf_bytes,
-                            SF_M_ALIGN,
+                            b_full,
+                            b_empty,
+                            self.b_bytes,
+                            self.sfb_bytes,
                             num_sf_cycles,
-                            sf_stages_c,
-                            sfaphase,
+                            sf_stages,
+                            kt_per_pack_c,
+                            cfg.ab_stage,
+                            b_phase,
                         )
                     else:
-                        sfaphase = load_sf(
-                            tma_atom_sfa,
-                            tma_tensor_sfa,
-                            sSFA,
-                            bm,
+                        b_phase = load_b_sfb(
+                            tma_atom_b,
+                            tma_atom_sfb,
+                            tma_tensor_b,
+                            tma_tensor_sfb,
+                            sU,
+                            sG,
+                            sSFU,
+                            sSFG,
+                            cfg.TILE,
                             tile,
-                            sf_full,
-                            sf_empty,
-                            self.sf_bytes,
-                            SF_M_ALIGN,
+                            N,
+                            b_full,
+                            b_empty,
+                            self.b_bytes,
+                            self.sfb_bytes,
                             num_sf_cycles,
-                            sf_stages_c,
-                            sfaphase,
+                            sf_stages,
+                            kt_per_pack_c,
+                            cfg.ab_stage,
+                            b_phase,
                         )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
@@ -1212,12 +1277,14 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                 thr_st = tiled_st.get_slice(tidx)
                 thr_st_q = tiled_st_q.get_slice(tidx)
             warp_n = (tidx // 32) // cfg.mma.num_warp_m
-            abphase, sfaphase = i32(0), i32(0)
+            if cutlass.const_expr(cfg.enable_pdl):
+                cute.arch.griddepcontrol_wait()
+            a_phase, b_phase = i32(0), i32(0)
             cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
             tile = cons.get_next_tile(sWork, sfull, sempty)
             while tile.valid != i32(0):
                 if cutlass.const_expr(swap):
-                    acc, abphase, sfaphase = mma_swap(
+                    acc, a_phase, b_phase = mma_swap(
                         tiledmma,
                         self.mma,
                         self.sf,
@@ -1236,17 +1303,54 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         cfg.load_ab.b_dtype,
                         cfg.load_ab.a_unpack_bits,
                         tidx,
-                        ab_full,
-                        ab_empty,
-                        sf_full,
-                        sf_empty,
+                        a_full,
+                        a_empty,
+                        b_full,
+                        b_empty,
                         num_sf_cycles,
-                        sf_stages_c,
+                        sf_stages,
                         kt_per_pack_c,
                         cfg.ab_stage,
-                        abphase,
-                        sfaphase,
+                        a_phase,
+                        b_phase,
                     )
+                else:
+                    acc, a_phase, b_phase = mma(
+                        tiledmma,
+                        self.mma,
+                        self.sf,
+                        cfg.activation,
+                        cfg.fastmath,
+                        sA,
+                        sU,
+                        sG,
+                        sSFA,
+                        sSFU,
+                        sSFG,
+                        (bm, bn),
+                        bk,
+                        cfg.ACC,
+                        cfg.load_ab.a_dtype,
+                        cfg.load_ab.b_smem_dtype,
+                        self.a_is_m_major,
+                        cfg.load_ab.b_unpack_bits,
+                        tidx,
+                        a_full,
+                        a_empty,
+                        b_full,
+                        b_empty,
+                        num_sf_cycles,
+                        sf_stages,
+                        kt_per_pack_c,
+                        cfg.ab_stage,
+                        a_phase,
+                        b_phase,
+                    )
+                if cutlass.const_expr(cfg.enable_pdl):
+                    next_tile = cons.get_next_tile(sWork, sfull, sempty)
+                    if next_tile.valid == i32(0):
+                        cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(swap):
                     moe_epilogue.store_wg_q1_swap(
                         acc,
                         thr,
@@ -1267,37 +1371,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         swap_n_store,
                     )
                 else:
-                    acc, abphase, sfaphase = mma(
-                        tiledmma,
-                        self.mma,
-                        self.sf,
-                        cfg.activation,
-                        cfg.fastmath,
-                        sA,
-                        sU,
-                        sG,
-                        sSFA,
-                        sSFU,
-                        sSFG,
-                        (bm, bn),
-                        bk,
-                        cfg.ACC,
-                        cfg.load_ab.a_dtype,
-                        cfg.load_ab.b_smem_dtype,
-                        self.a_is_m_major,
-                        cfg.load_ab.b_unpack_bits,
-                        tidx,
-                        ab_full,
-                        ab_empty,
-                        sf_full,
-                        sf_empty,
-                        num_sf_cycles,
-                        sf_stages_c,
-                        kt_per_pack_c,
-                        cfg.ab_stage,
-                        abphase,
-                        sfaphase,
-                    )
                     if cutlass.const_expr(self.epi_q.quant_at is QuantPoint.BEFORE_R2S):
                         store_wg_q1_before_r2s(
                             acc,
@@ -1342,7 +1415,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                             UE8M0_PACK_NUM,
                             self.epi_q.s2g_threads_n(cfg.TILE),
                         )
-                tile = cons.get_next_tile(sWork, sfull, sempty)
+                if cutlass.const_expr(cfg.enable_pdl):
+                    tile = next_tile
+                else:
+                    tile = cons.get_next_tile(sWork, sfull, sempty)
 
 
 def _stream():

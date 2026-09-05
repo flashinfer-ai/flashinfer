@@ -14,9 +14,12 @@
 """Public entry for the fused fc2_down + finalize arm: tile choice, compile cache, and its gates."""
 
 import functools
+import os
 
 import cutlass.cute as cute
 import torch
+
+from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
@@ -31,7 +34,6 @@ from .kernel_moe_mxfp8_mxfp4_fc2_finalize import (
     make_args,
     make_cfg,
 )
-from ._moe_utils.heuristic import select_plain_bm_64_or_128
 
 TILES = ((128, 128), (64, 128), (32, 128))
 BK = GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF
@@ -129,7 +131,7 @@ def select_tile(*, total_rows: int, n: int, num_experts: int, num_sms: int):
     m_per_expert = total_rows // num_experts if num_experts > 0 else 0
     if m_per_expert <= 32:
         return (32, 128, BK)
-    return (select_plain_bm_64_or_128(m_per_expert, n, num_experts, num_sms), 128, BK)
+    return (128, 128, BK)
 
 
 def _check_a_scale_granularity(a_scale, k: int) -> None:
@@ -157,15 +159,40 @@ def cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
     num_tokens: int,
     tile=None,
     epi: EpiMethod = DEFAULT_EPI,
+    tune=None,
     enable_pdl: bool = False,
     *,
     out: torch.Tensor | None = None,
 ):
     n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
+    assert not enable_pdl or out is not None, "PDL requires caller-owned out"
     _check_a_scale_granularity(a_scale, k)
     _check_b_scale_granularity(b_scale, k)
     props = torch.cuda.get_device_properties(a_q.device)
     grid_x, sm_version = props.multi_processor_count, f"sm_{props.major}{props.minor}"
+    if tile is None and tune is not False:
+        chosen = None
+        if MOE_AUTOTUNE_ENABLED():
+            with autotune():
+                _, tactic = AutoTuner.get().choose_one(
+                    "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
+                    [_Fc2FinalizeRunner(enable_pdl)],
+                    TuningConfig(),
+                    [
+                        a_q,
+                        a_scale,
+                        b_q,
+                        b_scale,
+                        m_indptr,
+                        src_token,
+                        pair_scales,
+                        num_tokens,
+                    ],
+                )
+            if tactic != -1:
+                chosen = tactic
+        if chosen is not None:
+            tile, epi = split_tactic(chosen)
     if tile is None:
         tile = select_tile(
             total_rows=int(a_q.shape[0]),
@@ -176,8 +203,13 @@ def cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
     op = CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
     if out is None:
         out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
-    else:
-        out.zero_()
+    if (
+        out.shape != (num_tokens, n)
+        or out.dtype is not torch.bfloat16
+        or out.device != a_q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("out does not match the FC2 output contract")
     args = make_args(
         a_q,
         a_scale,
@@ -190,3 +222,97 @@ def cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
+
+
+class _Fc2FinalizeRunner(TunableRunner):
+    def __init__(self, enable_pdl=False):
+        self.out_dtype = torch.bfloat16
+        self._out = None
+        self.enable_pdl = enable_pdl
+
+    def __hash__(self) -> int:
+        return hash(type(self))
+
+    def get_valid_tactics(self, inputs, profile):
+        return self.valid_tactics(inputs)
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        if self._out is None:
+            self._out = self.alloc_out(inputs)
+        if do_preparation:
+            return self._out
+        self.launch(inputs, self._out, None if tactic == -1 else tactic)
+        return self._out
+
+    def valid_tactics(self, inputs):
+        a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, num_tokens = (
+            inputs
+        )
+        n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
+        return [
+            t
+            for t in TACTICS
+            if CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp.can_implement(
+                n=n, k=k, tile=split_tactic(t)[0], epi=split_tactic(t)[1]
+            )
+        ]
+
+    def alloc_out(self, inputs):
+        a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, num_tokens = (
+            inputs
+        )
+        n = int(b_q.shape[1])
+        return torch.zeros(num_tokens, n, dtype=self.out_dtype, device=a_q.device)
+
+    def launch(self, inputs, out, tactic):
+        a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, num_tokens = (
+            inputs
+        )
+        n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
+        props = torch.cuda.get_device_properties(a_q.device)
+        grid_x = props.multi_processor_count
+        if tactic is None:
+            tile, epi = (
+                select_tile(
+                    total_rows=int(a_q.shape[0]),
+                    n=n,
+                    num_experts=int(b_q.shape[0]),
+                    num_sms=grid_x,
+                ),
+                DEFAULT_EPI,
+            )
+        else:
+            tile, epi = split_tactic(tactic)
+        op = CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp(
+            n, k, tuple(tile), epi, self.enable_pdl
+        )
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            out,
+            src_token.to(torch.int32),
+            pair_scales.to(torch.float32),
+            m_indptr.to(torch.int32),
+        )
+        sm_version = "sm_{}{}".format(props.major, props.minor)
+        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+
+    def get_cache_key_extras(self, inputs):
+        a_q, a_scale, b_q, b_scale, m_indptr, src_token, pair_scales, num_tokens = (
+            inputs
+        )
+        return (
+            int(a_q.shape[0]),
+            int(b_q.shape[0]),
+            int(b_q.shape[1]),
+            int(b_q.shape[2]) * 2,
+            int(num_tokens),
+            self.enable_pdl,
+            torch.cuda.get_device_capability(),
+        )
+
+
+def MOE_AUTOTUNE_ENABLED() -> bool:
+    return os.environ.get("MOE_AUTOTUNE", "0") not in ("0", "", "false", "False")
