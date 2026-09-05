@@ -2183,7 +2183,15 @@ BF16_ATOL = 3e-2
 
 
 def _bf16_dense_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    narrow_routing_weights=True,
 ):
     """fp32 dense MoE authority for the bf16 path.
 
@@ -2194,7 +2202,9 @@ def _bf16_dense_reference(
     LOCAL experts; a token routed to global id ``g`` uses local weight
     ``g - expert_offset``.
     """
-    final_scales = final_scales.to(torch.bfloat16).float()
+    if narrow_routing_weights:
+        final_scales = final_scales.to(torch.bfloat16)
+    final_scales = final_scales.float()
     x32 = x.float()
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -2221,6 +2231,8 @@ def _make_bf16_packs_and_config(
     local_expert_offset: int = 0,
     max_tokens: int | None = None,
     seed: int = 42,
+    routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+    routing_weights_dtype: torch.dtype = torch.float32,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for the bf16 path.
 
@@ -2262,19 +2274,20 @@ def _make_bf16_packs_and_config(
     selected_experts = (
         torch.topk(logits, top_k, dim=-1).indices + local_expert_offset
     ).to(torch.int32)
-    # Snap gate weights to the bf16 grid: pack_inputs truncates them to bf16 bits
-    # for the packed top-k ids, so unsnapped fp32 scales would add rounding noise
-    # the reference cannot see.
     final_scales = torch.rand(num_tokens, top_k, device=device)
-    final_scales = (
-        (final_scales / final_scales.sum(-1, keepdim=True)).to(torch.bfloat16).float()
-    )
+    final_scales = final_scales / final_scales.sum(-1, keepdim=True)
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        # Packed IDs truncate weights to BF16 bits, so the reference must see
+        # the same values. Unpacked FP32 routing intentionally preserves the
+        # full caller-provided precision.
+        final_scales = final_scales.to(torch.bfloat16).float()
 
     act_pack = MoEActivationPack(
         hidden_states_q=x,  # raw bf16 on this path
         hidden_states_scale=None,  # unused by trtllm_bf16_routed
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        topk_weights=final_scales.to(routing_weights_dtype),
+        routing_input_mode=routing_input_mode,
     )
 
     weight_pack = MoEWeightPack()
@@ -2365,6 +2378,70 @@ def test_trtllm_interleaved_real_packs_keep_their_launch_state():
         first.launch_state.static_kwargs["gemm1_weights"] = second_gemm1
 
 
+@sm100_required
+def test_trtllm_dual_stream_packed_calls_match_reference():
+    """One runner may launch distinct packed calls concurrently on two streams."""
+    cases = [
+        _make_bf16_packs_and_config(
+            64,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=4,
+            top_k=2,
+            max_tokens=64,
+            seed=seed,
+        )
+        for seed in (1, 2)
+    ]
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner,
+        cases[0][2],
+        cases[0][0].hidden_states_q.device,
+    )
+    packed_calls = [
+        runner.pack_inputs(act_pack, weight_pack)
+        for act_pack, weight_pack, _, _ in cases
+    ]
+    references = [
+        _bf16_dense_reference(
+            tensors["x"],
+            tensors["w1"],
+            tensors["w2"],
+            act_pack.topk_ids,
+            act_pack.topk_weights,
+            intermediate_size=256,
+        )
+        for act_pack, _, _, tensors in cases
+    ]
+
+    producer = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    gate_stream = torch.cuda.Stream()
+    launch_gate = torch.cuda.Event()
+    with torch.cuda.stream(gate_stream):
+        gate_stream.wait_stream(producer)
+        torch.cuda._sleep(1_000_000)
+        launch_gate.record()
+    for stream in streams:
+        stream.wait_stream(producer)
+        stream.wait_event(launch_gate)
+
+    for _ in range(16):
+        for stream, packed in zip(streams, packed_calls, strict=True):
+            with torch.cuda.stream(stream):
+                runner.forward(packed, tactic=-1)
+    for stream in streams:
+        stream.synchronize()
+
+    for packed, reference in zip(packed_calls, references, strict=True):
+        torch.testing.assert_close(
+            packed[0].float(),
+            reference,
+            rtol=BF16_RTOL,
+            atol=BF16_ATOL,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5. Variant-parametrized conformance + packing contract
 # ---------------------------------------------------------------------------
@@ -2420,11 +2497,50 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
         act_pack.topk_weights,
         tensors["w2"].shape[-1],  # intermediate_size, derived not hardcoded
         expert_offset=expert_offset,
+        narrow_routing_weights=(
+            act_pack.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed
+        ),
     )
 
 
 def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@sm100_required
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_bf16_unpacked_routing_forwards_inputs_and_matches_reference(weights_dtype):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        64,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=8,
+        top_k=2,
+        local_num_experts=4,
+        local_expert_offset=4,
+        max_tokens=64,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        routing_weights_dtype=weights_dtype,
+    )
+    ids = act.topk_ids
+    route_weights = act.topk_weights
+    reference = _bf16_ref(act, tensors, expert_offset=4)
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner, config, act.hidden_states_q.device
+    )
+    inputs = runner.pack_inputs(act, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _bf16_check(runner.forward(inputs, tactic=-1), reference, "bf16 direct")
+    _bf16_check(MoELayer(config)(act, weights), reference, "bf16 layer")
 
 
 @dataclasses.dataclass(frozen=True)

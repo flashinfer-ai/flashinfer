@@ -4667,12 +4667,14 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
 
     DeepSeek FP8 and MXFP8 share the kernel family but not scale contracts:
     DeepSeek uses FP32 128-element/128x128 block scales, while MXFP8 uses
-    linear UE8M0 scales over 32-element K blocks.
+    linear UE8M0 scales over 32-element K blocks. Routing can be computed from
+    logits or supplied as packed or unpacked precomputed expert IDs and weights.
     """
 
     backend_key = "trtllm_fp8_block"
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (
@@ -4899,30 +4901,30 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             dtype=torch.bfloat16,
         )
         routing_input_mode = act.routing_input_mode
+        if (
+            self._num_fused_shared_experts > 0
+            and routing_input_mode is not RoutingInputMode.FromLogits
+        ):
+            raise NotImplementedError(
+                "TrtllmFp8BlockRunner requires FromLogits routing when "
+                "num_fused_shared_experts > 0. A pre-routed caller can fuse "
+                "the shared experts itself by appending the slots to "
+                "topk_ids/topk_weights and declaring num_experts + "
+                f"{self._num_fused_shared_experts} experts with top_k + "
+                f"{self._num_fused_shared_experts}."
+            )
         if routing_input_mode == RoutingInputMode.FromLogits:
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, "TrtllmFp8BlockRunner"
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            # FP8 infers the routing mode from the expert-index tensor: a
-            # non-empty 2D tensor means PackedPrecomputed and suppresses
-            # routing_logits. Empty placeholders select FromLogits, matching
-            # the canonical trtllm_fp8_block_scale_moe wrapper.
+            # routing_input_mode selects FromLogits explicitly; the empty
+            # placeholders only satisfy the launcher ABI, which still requires
+            # the topk_ids / expert_weights slots.
             topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
             expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
-            # The flat pre-routed API has no shared-expert argument. Callers can
-            # append shared slots themselves and declare the fused totals.
-            if self._num_fused_shared_experts > 0:
-                raise NotImplementedError(
-                    "TrtllmFp8BlockRunner requires FromLogits routing when "
-                    "num_fused_shared_experts > 0. A pre-routed caller can fuse "
-                    "the shared experts itself by appending the slots to "
-                    "topk_ids/topk_weights and declaring num_experts + "
-                    f"{self._num_fused_shared_experts} experts with top_k + "
-                    f"{self._num_fused_shared_experts}."
-                )
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"
             )
@@ -4932,10 +4934,23 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
+        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                "TrtllmFp8BlockRunner",
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = act.topk_ids
+            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
-                "TrtllmFp8BlockRunner supports only FromLogits and "
-                "PackedPrecomputed routing."
+                "TrtllmFp8BlockRunner supports only FromLogits, "
+                "PackedPrecomputed, and UnpackedPrecomputed routing."
             )
 
         moe_inputs = MoeRunnerInputs(
@@ -4982,6 +4997,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -5294,8 +5310,9 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     ``MoERunner`` (whose ``forward`` dispatches to ``moe_op.trtllm_bf16_moe`` when
     ``dtype_weights == Bfloat16``).  Used for the EP grouped-GEMM bf16 path: the
     packed pre-routed ids carry ``(GLOBAL expert_id << 16) | bf16(weight)`` (with
-    ``local_expert_offset`` passed separately), while ``FromLogits`` lets the
-    kernel compute routing from BF16 or FP32 logits;
+    ``local_expert_offset`` passed separately), unpacked pre-routed inputs keep
+    separate int32 ids and BF16/FP32 weights, and ``FromLogits`` lets the kernel
+    compute routing from BF16 or FP32 logits;
     with the EP bridge's synthesized ``top_k=1`` + ``weight=1`` and
     ``do_finalize=True``, the output comes back in input row order.
 
@@ -5305,6 +5322,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     backend_key = "trtllm_bf16_routed"
     supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.BF16,)
@@ -5448,10 +5466,23 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
+        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                type(self).__name__,
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = act.topk_ids
+            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
-                f"{type(self).__name__} supports only FromLogits and "
-                "PackedPrecomputed routing."
+                f"{type(self).__name__} supports only FromLogits, "
+                "PackedPrecomputed, and UnpackedPrecomputed routing."
             )
 
         output = hidden_states.new_empty(
@@ -5517,11 +5548,16 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 
 
 class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
-    """MxInt4 adapter over the canonical TRTLLM MoE runner."""
+    """MxInt4 adapter over the canonical TRTLLM MoE runner.
+
+    Routing can be computed from logits or supplied as packed or unpacked
+    precomputed expert IDs and weights.
+    """
 
     backend_key = "trtllm_mxint4_routed"
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.MxInt4,)
@@ -5643,9 +5679,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            # MxInt4 infers routing mode from these placeholders rather than
-            # receiving RoutingInputMode explicitly. Non-empty tensors select
-            # precomputed routing and would suppress routing_logits.
+            # routing_input_mode selects FromLogits explicitly; the empty
+            # placeholders only satisfy the launcher ABI, which still requires
+            # the topk_ids / expert_weights slots.
             topk_ids = hidden_states.new_empty((0,), dtype=torch.int32)
             expert_weights = hidden_states.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
@@ -5655,13 +5691,24 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            expert_weights = act.topk_weights.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            expert_weights = act.topk_weights.new_empty((0,), dtype=torch.bfloat16)
+        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                type(self).__name__,
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
             )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = act.topk_ids
+            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
-                f"{type(self).__name__} supports only FromLogits and "
-                "PackedPrecomputed routing."
+                f"{type(self).__name__} supports only FromLogits, "
+                "PackedPrecomputed, and UnpackedPrecomputed routing."
             )
 
         required = (
@@ -5745,6 +5792,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         )
 
         static_kwargs = dict(
+            routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
