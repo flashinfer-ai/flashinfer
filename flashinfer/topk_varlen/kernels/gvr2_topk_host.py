@@ -23,7 +23,11 @@ bound at the physical width and inflates only the routing value (DKG #60);
 ``validate_run_ws`` enforces the 16-byte alignment the compiled workspace
 declares; ``run_varlen`` rejects overlapping row layouts; ``run``/``run_ws``/
 ``run_varlen`` re-enter under the logits device and every compile passes an
-explicit ``--gpu-arch``. FlashInfer's ``top_k_varlen(backend="gvr_2")``
+explicit ``--gpu-arch``; ``route()`` adds two register-kernel rungs in the
+4K < n <= 8K band (VPT=2 for b <= 148, BLK=512 for 148 < b <= 296 — see the inline
+note; DKG #61); ``run_varlen`` accepts ``pre_idx=None`` and runs
+hint-free on a cached ``arange(k)`` anchor (``_hint_free_pre_idx``).
+FlashInfer's ``top_k_varlen(backend="gvr_2")``
 calls ``run_varlen`` below; the batch-uniform ``run``/``run_ws`` entries are
 kept for parity tests and benchmarking. Keep future diffs against upstream
 mechanical.
@@ -153,7 +157,11 @@ BLKC = 1024  # CTA size of the clustered register path
 
 
 def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
+    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
+
+    FlashInfer-local deviations (both in the 4K < n <= 8K band, marked
+    inline): the wide VPT=2 rung and the 148 < b <= 296 BLK=512 register
+    rung."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     # 148 is the B200 SM count, baked in by the upstream CUDA dispatch (route()
@@ -171,7 +179,11 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB
+    # FlashInfer-local: the `n4 <= 2048 and not wide` window runs the BLK=512
+    # register kernel with NBH = NB for b <= 296 (upstream: main slab, which
+    # ignores NBSEL), so the NB selector must follow (IMGOFF == NBSEL == NBH
+    # is asserted at launch).
+    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
     IMGOFF = NBSEL
     smem_reg = (NBSEL + 2 * CMP) * 4
 
@@ -266,6 +278,23 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 "ws": False,
             }
 
+    # FlashInfer-local rungs for the 4K < n <= 8K band (the upstream dispatch
+    # runs `wide` rows here on the VPT=4 kernel below and everything else on
+    # the streaming slab). Measured on B100/B200, K in {512, 1024, 2048},
+    # exact in every cell (logs/sglang_perf/force_plan*.py):
+    #   * wide (b <= 148): VPT=2 covers n4 <= 2048 exactly; the VPT=4 kernel
+    #     iterates two empty float4 slots per thread in every pass and is
+    #     ~18-20% slower (4.2 -> 3.4 us at n=8192, K=512).
+    #   * 148 < b <= 296 (one wave at MINB=2, two CTAs per SM): the
+    #     BLK=512/VPT=4 register kernel beats the main slab by 1.3-1.7x
+    #     (8.0 -> 4.9 us at b=256, n=8192, K=512). Beyond one wave the two
+    #     trade places by shape (b=512: -13%..+12%), so the slab keeps it.
+    # Reported upstream for adoption as DKG issue #61.
+    if n4 <= 2048:
+        if wide:
+            return _reg(1024, 2, 1, 2 * NB)
+        if b <= 296:
+            return _reg(512, 4, 2, NB)
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
 
@@ -1024,6 +1053,42 @@ builder in _build_launcher; only the main family takes the workspace.
 # shape key (b, n, npad, k) -> (fn, args tuple of python ints, needs_ws)
 _LAUNCH_CACHE = {}
 _DUMMY_KV = {}
+# hint-free entry: (device index, k) -> int32[cap, k] table whose every row
+# is arange(k). Superseded tables are kept alive (captured graphs may still
+# address them).
+_HINT_FREE = {}
+_HINT_FREE_KEEP = []
+
+
+def _hint_free_pre_idx(batch, k, device):
+    """FlashInfer-local: the ``pre_idx`` stand-in for hint-free ``run_varlen``.
+
+    The kernels consume the hint only as a sampling anchor — the block-wide
+    (min, max) of ``logits[pre_idx[j]]`` — and never for exactness, so ANY k
+    distinct in-range indices are a valid hint; ``arange(k)`` is the cheapest
+    (rows shorter than k take the in-kernel identity path before the anchor
+    matters, and columns < k always lie inside the row's storage). One table
+    per (device, k), grown by doubling and reused as a contiguous row-prefix
+    view (16-byte aligned: k is a multiple of 512), so the hot path performs
+    no allocation and CUDA-graph replays see a stable address. Growth is
+    refused under capture — run one eager call (or ``warmup_varlen``) at the
+    largest batch first, like every other launcher resource.
+    """
+    key = (device.index if device.index is not None else torch.cuda.current_device(), k)
+    t = _HINT_FREE.get(key)
+    if t is None or t.shape[0] < batch:
+        if _is_capturing():
+            raise RuntimeError(
+                f"hint-free gvr_2: no pre_idx table for batch={batch}, k={k} on "
+                f"{device}; run one eager call (or warmup_varlen) at this batch "
+                "before CUDA-graph capture"
+            )
+        cap = max(batch, 64 if t is None else 2 * t.shape[0])
+        new = torch.arange(k, dtype=_I32, device=device).unsqueeze(0).expand(cap, k).contiguous()
+        if t is not None:
+            _HINT_FREE_KEEP.append(t)
+        _HINT_FREE[key] = t = new
+    return t[:batch]
 
 
 def _dummy_kv(dev_index, device):
@@ -1302,7 +1367,7 @@ def run_ws(
 
 def run_varlen(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
+    pre_idx: torch.Tensor | None,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
     next_n: int = 1,
@@ -1311,8 +1376,15 @@ def run_varlen(
     max_seq_len: int | None = None,
     engine: str = "auto",
     workspace: torch.Tensor | None = None,
+    top_k: int | None = None,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
+
+    HINT-FREE (FlashInfer-local): ``pre_idx=None`` runs with the cached
+    ``arange(k)`` stand-in of ``_hint_free_pre_idx`` and then REQUIRES
+    ``top_k`` (normally ``k = pre_idx.shape[1]``). Exact like the hinted
+    call; only the sampling anchor is weaker. When both are given they must
+    agree.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1360,6 +1432,7 @@ def run_varlen(
                 max_seq_len=max_seq_len,
                 engine=engine,
                 workspace=workspace,
+                top_k=top_k,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -1388,6 +1461,12 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
+    if pre_idx is None:
+        if top_k is None:
+            raise RuntimeError("run_varlen: top_k is required when pre_idx is None (hint-free)")
+        pre_idx = _hint_free_pre_idx(batch, _index(top_k), logits.device)
+    elif top_k is not None and len(pre_idx.shape) == 2 and pre_idx.shape[1] != _index(top_k):
+        raise RuntimeError(f"top_k={top_k} != pre_idx.shape[1]={pre_idx.shape[1]}")
     if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
         raise RuntimeError(
             f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
@@ -1623,6 +1702,9 @@ def warmup_varlen(
     # rows) even when CUDA-graph batch lists reach thousands of rows.
     n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
     npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
+    # hint-free callers capture with the arange table: size it for the
+    # largest requested batch now (growth is refused under capture)
+    _hint_free_pre_idx(req_rows[-1] // nn, int(top_k), torch.device("cuda", dev))
     seen_keys = set()
     rows_list = []
     r = nn

@@ -45,8 +45,9 @@ Backend choices
                        accepted and ignored (the kernel takes no hint).
 ``"auto"``           — shape/dtype-aware ranking that tracks the measured
                        per-config winner (see ``_top_k_varlen_heuristic``):
-                       gvr_2 for hinted fp32; radix_filter for hint-free
-                       fp32 from 32K columns up and for the mid/large bf16 and
+                       gvr_2 for fp32, hinted or hint-free (one tiny
+                       single-row K>=2048 cell excepted); radix_filter for
+                       the rest of hint-free fp32 and for the mid/large bf16 and
                        fp16 regions; gvr only for large hinted batches of
                        mid/long rows; radix otherwise, with radix_cutlass
                        preferred in its fp32 big-batch/long-row corner and as
@@ -272,12 +273,13 @@ def _gvr2_top_k_varlen_check(
 
     Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
     explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
+
+    ``pre_idx`` is NOT a requirement (FlashInfer-local): the kernels use the
+    hint only as a sampling anchor, so the host runs hint-free with a cached
+    ``arange(k)`` stand-in when it is absent — or malformed, in which case the
+    API body discards it with a RuntimeWarning first.
     """
-    if not (
-        _cute_dsl_ready(logits.device)
-        and pre_idx is not None
-        and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
-    ):
+    if not _cute_dsl_ready(logits.device):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
     # follow-up (run_varlen raises on any other dtype).
@@ -327,8 +329,15 @@ def _top_k_varlen_heuristic(
     cr in {1, 4}, next_n in {1, 2}; see PR #4811). Decision rules, using only
     capture-stable host facts (dtype, logits width N, request count B):
 
-    1. fp32 + pre_idx: gvr_2 first — it won 211/213 measured cells (geomean
-       2.1-3.8x over every other backend) and ~1.00x vs its TRT-LLM origin.
+    1. fp32: gvr_2 first, hinted or not — hinted it won 211/213 measured
+       cells (geomean 2.1-3.8x over every other backend) and ~1.00x vs its
+       TRT-LLM origin; HINT-FREE (FlashInfer-local arange anchor, see
+       ``gvr2_topk_host._hint_free_pre_idx``) it stays within ~10% of the
+       hinted time on most cells and beats the best hint-free radix backend
+       by 1.5-5x on every measured cell (B100, K in {512, 1024, 2048}, N in
+       [4K, 512K], B in [1, 256], cr 1 and 4, uniform and mixed lengths)
+       except one: K >= 2048 with N <= 4096 at B == 1, where radix_filter is
+       ~1.3x faster (3.0 vs 3.9 us) — that cell is carved out.
     2. gvr vs radix (when a hint is given but gvr_2 is unsuitable, and for
        every bf16/fp16 hinted call): gvr only pays off when the batch is
        large AND rows are long — B*N >= 2^22 (fp32) / 2^23 (bf16/fp16).
@@ -392,8 +401,14 @@ def _top_k_varlen_heuristic(
         )
         gvr_first = batch >= 256 and 32768 <= n_cols <= 524288
     cutlass_first = fp32 and n_cols >= 65536 and elems >= (1 << 23)
+    # the one measured cell where hint-free radix_filter beats gvr_2 (rule 1);
+    # hinted gvr_2 is still ahead there, so the carve-out is hint-free only
+    hinted = (
+        pre_idx is not None and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    )
+    gvr2_tiny_loss = (not hinted) and top_k >= 2048 and n_cols <= 4096 and batch == 1
 
-    order = ["gvr_2"]
+    order = [] if gvr2_tiny_loss else ["gvr_2"]
     if fp32:
         # radix_filter beats gvr in every measured fp32 cell (1.2-3x)
         if rf_first:
@@ -413,6 +428,11 @@ def _top_k_varlen_heuristic(
     if "gvr" not in order:
         # small-problem fallback rank: radix > gvr > radix_cutlass
         order.insert(order.index("radix") + 1, "gvr")
+    if gvr2_tiny_loss:
+        # radix_filter (the cell's winner) first, gvr_2 right behind it
+        order = ["radix_filter", "gvr_2"] + [
+            b for b in order if b not in ("radix_filter", "gvr_2")
+        ]
     return [b for b in order if b in suitable_backends]
 
 
@@ -1038,7 +1058,7 @@ def _run_gvr(
 
 def _run_gvr2(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
+    pre_idx: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
     top_k: int,
     next_n: int,
@@ -1057,6 +1077,9 @@ def _run_gvr2(
     the launcher for this shape has been compiled (warm up before capture).
     The kernel reads each request's ``seq_lens`` on device and re-derives its
     sampling ladder per row, so no LJF sort or prepare kernel is needed.
+    ``pre_idx=None`` runs hint-free: the host substitutes a cached
+    ``arange(top_k)`` table as the sampling anchor (exact, no per-call
+    allocation, CUDA-graph safe once sized by an eager call).
     """
     from .kernels import gvr2_topk_host
 
@@ -1070,6 +1093,7 @@ def _run_gvr2(
         values=out_values if return_output_values else None,
         max_seq_len=logits.shape[1] * compress_ratio,
         workspace=workspace.get("gvr2_workspace") if workspace else None,
+        top_k=top_k,
     )
     return out_indices, (out_values if return_output_values else None)
 
@@ -1436,8 +1460,9 @@ def top_k_varlen(
     Backend selection
     -----------------
     ``backend="auto"`` (default) ranks the backends that can run the call by
-    shape and dtype (see ``_top_k_varlen_heuristic``): ``gvr_2`` for hinted
-    fp32 on datacentre Blackwell-class GPUs, ``radix_filter`` in the
+    shape and dtype (see ``_top_k_varlen_heuristic``): ``gvr_2`` for fp32 on
+    datacentre Blackwell-class GPUs, with or without a hint (a missing hint
+    costs ~10% on most shapes), ``radix_filter`` in the
     measured large-N regions, ``gvr`` for large hinted half-precision
     batches of mid-length rows, otherwise the CuTe DSL ``radix`` backend on
     Blackwell, with the ``radix_cutlass`` masked fallback in its fp32 big
@@ -1473,12 +1498,14 @@ def top_k_varlen(
         internally applies a ``+1`` offset (DSv3.2) so the previous step's
         indices land correctly in the current step's grown KV-cache space.
         ``pre_idx[:, 0]`` must be the argmax index.
-        Required by the ``"gvr"`` and ``"gvr_2"`` backends; ignored by the
-        radix backends. Must be a contiguous, 16-byte-aligned int32 CUDA
-        tensor on ``logits.device`` of shape ``[seq_lens.shape[0], top_k]``:
-        a hint that violates this is **discarded with a RuntimeWarning** and
-        the call runs hint-free (``auto`` picks a hint-free backend; an
-        explicit ``"gvr"`` / ``"gvr_2"`` request is refused).
+        Required by the ``"gvr"`` backend; optional for ``"gvr_2"`` (the
+        kernels use it only as a sampling anchor, so a hint-free call is
+        exact and only somewhat slower); ignored by the radix backends. Must
+        be a contiguous, 16-byte-aligned int32 CUDA tensor on
+        ``logits.device`` of shape ``[seq_lens.shape[0], top_k]``: a hint
+        that violates this is **discarded with a RuntimeWarning** and the
+        call runs hint-free (``gvr_2`` with its synthetic anchor; an explicit
+        ``"gvr"`` request is refused).
     compress_ratio : int, optional
         KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4).
         Default ``1``.
@@ -1511,9 +1538,10 @@ def top_k_varlen(
                               sample-calibrated threshold ladders, exact
                               tie-interchangeable top-K, one launch per batch.
                               Datacentre Blackwell-class only (sm_100/103, or
-                              Rubin sm_107); requires
-                              ``pre_idx`` (hints steer sampling, never
-                              exactness) and fp32 logits;
+                              Rubin sm_107); fp32 logits; ``pre_idx``
+                              optional (hints steer sampling, never
+                              exactness — without one the host supplies a
+                              cached ``arange`` anchor);
                               ``top_k`` in {512, 1024, 2048}. ``load_balance``
                               is ignored (the kernel families load-balance
                               internally). CUDA graphs: warm up each
@@ -1539,8 +1567,11 @@ def top_k_varlen(
                               hint), as for ``"radix"`` and
                               ``"radix_cutlass"``.
         ``"auto"``          — shape/dtype-aware selection tracking the
-                              measured per-config winner: gvr_2 for hinted
-                              fp32; radix_filter for hint-free fp32 from 32K
+                              measured per-config winner: gvr_2 for fp32,
+                              hinted or hint-free (except hint-free
+                              ``top_k >= 2048`` at ``N <= 4096`` for a single
+                              row, where radix_filter wins); radix_filter
+                              for the remaining hint-free fp32 cells from 32K
                               columns up (all N once ``batch >= 256``) and
                               for the bf16/fp16 mid/large regions; gvr for
                               fp32 when ``batch * max_seq_len >= 2^22`` and
@@ -1612,7 +1643,7 @@ def top_k_varlen(
     ------
     BackendSupportedError
         If the requested backend is not supported on the current device, or
-        an explicit ``"gvr"`` / ``"gvr_2"`` request has no usable ``pre_idx``.
+        an explicit ``"gvr"`` request has no usable ``pre_idx``.
     ValueError
         If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
         grouping contract, an ``out_indices`` / ``out_values`` buffer is
@@ -1698,13 +1729,17 @@ def top_k_varlen(
     if pre_idx is not None:
         problem = _hint_problem(pre_idx, logits, seq_lens, top_k)
         if problem is not None:
-            tail = (
-                "Fix the caller: with a well-formed hint auto can use the gvr_2 / "
-                "gvr paths, which are several times faster on hinted fp32 shapes."
-                if backend == "auto"
-                else f"backend={backend!r} never consumes the hint; the result is "
-                "unaffected, but fix the caller."
-            )
+            if backend in ("auto", "gvr_2"):
+                tail = (
+                    "Fix the caller: gvr_2 falls back to a synthetic sampling anchor "
+                    "(exact, but slower than with a real previous-step hint) and "
+                    "gvr cannot run at all without a well-formed hint."
+                )
+            else:
+                tail = (
+                    f"backend={backend!r} never consumes the hint; the result is "
+                    "unaffected, but fix the caller."
+                )
             warnings.warn(
                 f"top_k_varlen: pre_idx is malformed ({problem}); the hint is "
                 f"DISCARDED and this call runs hint-free (int32[{seq_lens.shape[0]}, "
@@ -1752,10 +1787,10 @@ def top_k_varlen(
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
-    if pre_idx is None and backend in ("gvr", "gvr_2"):
+    if pre_idx is None and backend == "gvr":
         # reachable under skip_check=True (the checkers did not run) with a
         # missing or just-discarded hint: refuse here instead of handing None
-        # to a kernel host
+        # to a kernel host (gvr_2 runs hint-free, see _run_gvr2)
         raise BackendSupportedError(
             f"backend={backend!r} requires a well-formed pre_idx hint "
             f"(int32[{seq_lens.shape[0]}, {top_k}] contiguous CUDA tensor on "
