@@ -130,7 +130,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-              /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+              /*strides*/ {1, DSTATE, DSTATE * DIM, (uint64_t)params.state_stride_batch},
               /*tiles*/ {DSTATE, DIM, 1, 1}, params.state);
 
           auto B_tensor = tma::buildNdDescriptor(
@@ -206,7 +206,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-              /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+              /*strides*/ {1, DSTATE, DSTATE * DIM, (uint64_t)params.state_stride_batch},
               /*tiles*/ {DSTATE_PAD, TMA_STATE_ROWS, 1, 1}, params.state);
 
           // B/C: tile by DSTATE_PAD to match padded smem layout.

@@ -1283,11 +1283,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     dim3 block(warpSize, numWarps);
     dim3 grid(params.batch, params.nheads);
 
-    auto state_tensor =
-        tma::buildNdDescriptor(typeid(state_t),
-                               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                               /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
+    auto state_tensor = tma::buildNdDescriptor(
+        typeid(state_t),
+        /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+        /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+        /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
 
     using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
                                          rowsPerStage, DIM, DSTATE, numStages>;
@@ -1319,11 +1319,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
 
-      auto state_tensor =
-          tma::buildNdDescriptor(typeid(state_t),
-                                 /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-                                 /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                                 /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
+      auto state_tensor = tma::buildNdDescriptor(
+          typeid(state_t),
+          /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+          /*strides*/ {1, DSTATE, DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)},
+          /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
       static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
       using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
