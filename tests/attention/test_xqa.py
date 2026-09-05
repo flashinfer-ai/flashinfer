@@ -693,3 +693,237 @@ def test_xqa_mla(
         f"Total {total_elements} elements, only {passing_elements} ({pass_ratio:.1%}) meet tolerance criteria, "
         f"require at least {required_ratio:.1%}"
     )
+
+
+def ref_attention_varlen(
+    q, k_cache, v_cache, seq_lens, q_scale, kv_scale, attention_sinks, sliding_win_size
+):
+    """Reference for per-request KV lengths.
+
+    q: [batch_size, nb_k_heads, head_grp_size, head_dim]
+    k_cache, v_cache: [batch_size, nb_k_heads, capacity, head_dim]
+    seq_lens: [batch_size]
+    """
+    head_dim = q.shape[-1]
+    capacity = k_cache.shape[2]
+    lens = seq_lens.to(device=q.device, dtype=torch.int64)
+    pos = torch.arange(capacity, device=q.device)
+    valid = pos[None, :] < lens[:, None]
+    if sliding_win_size > 0:
+        valid &= pos[None, :] >= lens[:, None] - sliding_win_size
+    qk_scale = q_scale * kv_scale / math.sqrt(head_dim)
+    logits = torch.matmul(q.float(), k_cache.float().transpose(-2, -1)) * qk_scale
+    logits = logits.masked_fill(~valid[:, None, None, :], float("-inf"))
+    row_max = logits.amax(dim=-1, keepdim=True)
+    x = torch.exp(logits - row_max)
+    row_sum = x.sum(dim=-1, keepdim=True)
+    if attention_sinks is not None:
+        row_sum = row_sum + torch.exp(attention_sinks[None, :, :, None] - row_max)
+    return torch.matmul(x, v_cache.float()) * kv_scale / row_sum
+
+
+def assert_close_ratio(ref, out, atol, rtol, required_ratio=0.98):
+    """Require at least required_ratio of elements within atol or rtol."""
+    diff_abs = torch.abs(ref - out)
+    diff_rel = diff_abs / (torch.abs(ref) + 1e-8)
+    pass_ratio = ((diff_abs <= atol) | (diff_rel <= rtol)).float().mean().item()
+    assert pass_ratio >= required_ratio, (
+        f"only {pass_ratio:.1%} of elements within tolerance, need {required_ratio:.1%}"
+    )
+
+
+def make_paged_kv(
+    batch_size, nb_k_heads, head_dim, tokens_per_page, capacity, dtype, seed=42
+):
+    """Random NHD paged K/V, a shuffled page table and the gathered per-request caches."""
+    nb_pages_per_seq = capacity // tokens_per_page
+    total_pages = nb_pages_per_seq * batch_size
+    k_cache = torch.randn(
+        total_pages, tokens_per_page, nb_k_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    v_cache = torch.randn(
+        total_pages, tokens_per_page, nb_k_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    page_table = torch.randperm(
+        total_pages, generator=generator, device="cuda", dtype=torch.int32
+    ).view(batch_size, nb_pages_per_seq)
+
+    def gather(cache):
+        # [batch, pages, tokens, heads, dim] -> [batch, heads, capacity, dim]
+        return (
+            cache[page_table.long()]
+            .reshape(batch_size, capacity, nb_k_heads, head_dim)
+            .permute(0, 2, 1, 3)
+        )
+
+    return k_cache, v_cache, page_table, gather
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize(
+    "fp8_kv_cache,use_fp8_output", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("use_attention_sinks", [False, True])
+@pytest.mark.parametrize("use_sliding_window", [False, True])
+# None: page-table capacity (2x the longest sequence); 4096: exact bound;
+# 256: too small, which may only change the split, never the result.
+@pytest.mark.parametrize("max_kv_len", [None, 4096, 256])
+def test_xqa_multi_block_mixed_seq_lens(
+    fp8_kv_cache, use_fp8_output, use_attention_sinks, use_sliding_window, max_kv_len
+):
+    """Large batch with one KV head: every long sequence is split across several
+    CTAs, while short ones fall back to fewer splits or a single CTA."""
+    set_random_seed(0)
+    batch_size, nb_k_heads, head_grp_size, head_dim, tokens_per_page = 64, 1, 8, 128, 64
+    longest = 4096
+    capacity = 2 * longest  # page table wider than any sequence
+    input_type = torch.bfloat16
+    nb_q_heads = nb_k_heads * head_grp_size
+
+    seq_lens = torch.randint(1, longest + 1, (batch_size,), dtype=torch.int64)
+    pinned = torch.tensor([1, 63, 64, 65, 127, 128, 129, 255, 511, 512, 513, longest])
+    seq_lens[: pinned.numel()] = pinned
+    seq_lens_arg = seq_lens.to(torch.uint32).view(batch_size, 1).cuda()
+
+    q = torch.randn(
+        batch_size, 1, nb_q_heads, head_dim, dtype=input_type, device="cuda"
+    )
+    k_cache, v_cache, page_table, gather = make_paged_kv(
+        batch_size, nb_k_heads, head_dim, tokens_per_page, capacity, input_type
+    )
+    if fp8_kv_cache:
+        k_cache = (k_cache / 4).to(torch.float8_e4m3fn)
+        v_cache = (v_cache / 4).to(torch.float8_e4m3fn)
+    attention_sinks = (
+        (2.0 + torch.arange(head_grp_size, device="cuda") % 4)
+        .float()
+        .expand(nb_k_heads, head_grp_size)
+        .contiguous()
+        if use_attention_sinks
+        else None
+    )
+    sliding_win_size = 256 if use_sliding_window else 0
+    q_scale, kv_scale = 0.5, 1.0
+    rcp_out_scale = 4.0 if use_fp8_output else 1.0
+    output = torch.full(
+        (batch_size, 1, nb_q_heads, head_dim),
+        float("nan"),
+        dtype=torch.float8_e4m3fn if use_fp8_output else input_type,
+        device="cuda",
+    )
+    nb_seq = nb_k_heads * batch_size
+    semaphores = torch.zeros(
+        round_up(nb_seq, 2) + 2 + nb_seq + 2, dtype=torch.uint32, device="cuda"
+    )
+    scratch = torch.zeros(64 << 20, dtype=torch.uint8, device="cuda")
+
+    xqa(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens_arg,
+        output,
+        scratch,
+        semaphores,
+        nb_k_heads,
+        tokens_per_page,
+        sinks=attention_sinks,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        sliding_win_size=sliding_win_size,
+        sm_count=sm_count,
+        rcp_out_scale=rcp_out_scale,
+        max_kv_len=max_kv_len,
+    )
+
+    ref = ref_attention_varlen(
+        q.view(batch_size, nb_k_heads, head_grp_size, head_dim),
+        gather(k_cache),
+        gather(v_cache),
+        seq_lens,
+        q_scale,
+        kv_scale,
+        attention_sinks,
+        sliding_win_size,
+    )
+    out = output.view(batch_size, nb_k_heads, head_grp_size, head_dim).float()
+    if use_fp8_output:
+        ref = ref * rcp_out_scale
+        atol = rtol = 0.15
+    elif fp8_kv_cache:
+        atol = rtol = 0.05
+    else:
+        atol = rtol = 0.01
+    assert_close_ratio(ref, out, atol, rtol)
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("scratch_bytes", [0, 4096, 200 << 10, 300 << 10, 1 << 20])
+def test_xqa_multi_block_scratch_bound(scratch_bytes):
+    """The split count shrinks to what the scratch holds; nothing is written past it."""
+    set_random_seed(0)
+    batch_size, nb_k_heads, head_grp_size, head_dim, tokens_per_page = 64, 1, 8, 128, 64
+    seq_len = 4096
+    input_type = torch.bfloat16
+    nb_q_heads = nb_k_heads * head_grp_size
+
+    q = torch.randn(
+        batch_size, 1, nb_q_heads, head_dim, dtype=input_type, device="cuda"
+    )
+    k_cache, v_cache, page_table, gather = make_paged_kv(
+        batch_size, nb_k_heads, head_dim, tokens_per_page, seq_len, input_type
+    )
+    k_cache = (k_cache / 4).to(torch.float8_e4m3fn)
+    v_cache = (v_cache / 4).to(torch.float8_e4m3fn)
+    seq_lens = torch.full((batch_size, 1), seq_len, dtype=torch.uint32, device="cuda")
+    output = torch.empty(
+        batch_size, 1, nb_q_heads, head_dim, dtype=input_type, device="cuda"
+    )
+    nb_seq = nb_k_heads * batch_size
+    semaphores = torch.zeros(
+        round_up(nb_seq, 2) + 2 + nb_seq + 2, dtype=torch.uint32, device="cuda"
+    )
+    guard = 1 << 20
+    workspace = torch.full(
+        (guard + scratch_bytes + guard,), 0xA5, dtype=torch.uint8, device="cuda"
+    )
+    scratch = workspace[guard : guard + scratch_bytes]
+
+    xqa(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        output,
+        scratch,
+        semaphores,
+        nb_k_heads,
+        tokens_per_page,
+        sm_count=sm_count,
+    )
+
+    assert torch.all(workspace[:guard] == 0xA5) and torch.all(
+        workspace[guard + scratch_bytes :] == 0xA5
+    ), "kernel wrote outside its scratch buffer"
+    ref = ref_attention_varlen(
+        q.view(batch_size, nb_k_heads, head_grp_size, head_dim),
+        gather(k_cache),
+        gather(v_cache),
+        seq_lens.view(-1),
+        1.0,
+        1.0,
+        None,
+        0,
+    )
+    out = output.view(batch_size, nb_k_heads, head_grp_size, head_dim).float()
+    assert_close_ratio(ref, out, 0.05, 0.05)
