@@ -20,12 +20,13 @@
 #include <tvm/ffi/container/tuple.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <mutex>
 #include <numeric>
 #include <vector>
 
 #include "flashinfer/utils.cuh"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
@@ -47,6 +48,24 @@ namespace fi_throughput = torch_ext::moe_alltoall;
 
 constexpr size_t kCachelineAlignment = 128;
 constexpr size_t kInt32Bytes = sizeof(int32_t);
+constexpr int kMaxCachedCudaDevices = 64;
+
+int cachedSmVersionForDevice(int deviceId) {
+  FLASHINFER_CHECK(deviceId >= 0 && deviceId < kMaxCachedCudaDevices, "CUDA device index (",
+                   deviceId, ") is out of the SM-version cache range");
+  static std::array<std::once_flag, kMaxCachedCudaDevices> initialized;
+  static std::array<int, kMaxCachedCudaDevices> smVersions{};
+  std::call_once(initialized[deviceId], [deviceId] {
+    int smMajor = 0;
+    int smMinor = 0;
+    FLASHINFER_CUDA_CHECK(
+        cudaDeviceGetAttribute(&smMajor, cudaDevAttrComputeCapabilityMajor, deviceId));
+    FLASHINFER_CUDA_CHECK(
+        cudaDeviceGetAttribute(&smMinor, cudaDevAttrComputeCapabilityMinor, deviceId));
+    smVersions[deviceId] = smMajor * 10 + smMinor;
+  });
+  return smVersions[deviceId];
+}
 
 inline size_t alignOffset(size_t offset, size_t alignment = kCachelineAlignment) {
   return (offset + alignment - 1) & ~(alignment - 1);
@@ -345,7 +364,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
     }
   }
 
-  ffi::CUDADeviceGuard device_guard(tokenSelectedExperts.device().device_id);
+  FLASHINFER_CUDA_CHECK(cudaSetDevice(tokenSelectedExperts.device().device_id));
   params.stream = get_stream(tokenSelectedExperts.device());
 
   tl_throughput::moe_a2a_prepare_dispatch_launch(params);
@@ -448,7 +467,7 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
         << " != " << (void*)expectedPtr;
   }
 
-  ffi::CUDADeviceGuard device_guard(payload.device().device_id);
+  FLASHINFER_CUDA_CHECK(cudaSetDevice(payload.device().device_id));
   auto stream = get_stream(payload.device());
 
   // Output dtype precedence:
@@ -532,7 +551,7 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
     // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
     // Validate the public tensor contract first so malformed inputs report their causal error
     // consistently on every architecture.
-    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    auto const sm_version = cachedSmVersionForDevice(payload.device().device_id);
     TVM_FFI_ICHECK(sm_version >= 100)
         << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     params.output_scales = scales.data_ptr();
@@ -644,7 +663,7 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
   auto* recvCounters =
       reinterpret_cast<int*>(rankWorkspacePtr + offsets[fi_throughput::RECV_COUNTERS_OFFSET_INDEX]);
 
-  ffi::CUDADeviceGuard device_guard(expertIds.device().device_id);
+  FLASHINFER_CUDA_CHECK(cudaSetDevice(expertIds.device().device_id));
   tl_throughput::moe_a2a_sanitize_expert_ids_launch(
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),

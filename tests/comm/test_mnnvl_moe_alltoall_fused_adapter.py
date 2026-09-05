@@ -636,7 +636,7 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     )
 
 
-def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
+def test_kernel_preload_cache_is_per_kernel_and_device_without_hot_device_query():
     source_root = Path(__file__).resolve().parents[2] / "csrc"
     launcher_source = (
         source_root
@@ -647,16 +647,64 @@ def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
         / "nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
     ).read_text()
     adapter_source = (source_root / "trtllm_moe_alltoall.cu").read_text()
+    capability_cache_source = adapter_source[
+        adapter_source.index("int cachedSmVersionForDevice(") : adapter_source.index(
+            "inline size_t alignOffset("
+        )
+    ]
+    initialize_source = adapter_source[
+        adapter_source.index("moeA2AInitializeOp(") : adapter_source.index(
+            "moeA2ADispatchOp("
+        )
+    ]
+    dispatch_source = adapter_source[
+        adapter_source.index("moeA2ADispatchOp(") : adapter_source.index(
+            "void moeA2ACombineIntoOp("
+        )
+    ]
+    combine_source = adapter_source[
+        adapter_source.index("void moeA2ACombineIntoOp(") : adapter_source.index(
+            "Tensor moeA2ACombineOp("
+        )
+    ]
+    sanitize_source = adapter_source[
+        adapter_source.index("void moeA2ASanitizeExpertIdsOp(") : adapter_source.index(
+            "// Expose metainfo index constants"
+        )
+    ]
 
     assert "template <PreloadKernelSlot Slot, typename KernelFn>" in launcher_source
     assert "int device_id;" in params_source
     assert "params.device_id = payload.device().device_id;" in adapter_source
     assert (
-        "ffi::CUDADeviceGuard device_guard(payload.device().device_id);"
-        in adapter_source
+        "ffi::CUDADeviceGuard device_guard(workspace.device().device_id);"
+        in initialize_source
+    )
+    assert (
+        "FLASHINFER_CUDA_CHECK(cudaSetDevice(tokenSelectedExperts.device().device_id));"
+        in dispatch_source
+    )
+    assert (
+        "FLASHINFER_CUDA_CHECK(cudaSetDevice(payload.device().device_id));"
+        in combine_source
+    )
+    assert (
+        "FLASHINFER_CUDA_CHECK(cudaSetDevice(expertIds.device().device_id));"
+        in sanitize_source
     )
     assert "auto stream = get_stream(payload.device());" in adapter_source
     assert "CHECK_DEVICE(payload, workspace);" in adapter_source
+    assert "cachedSmVersionForDevice(payload.device().device_id)" in combine_source
+    assert "std::array<std::once_flag, kMaxCachedCudaDevices>" in capability_cache_source
+    assert "std::call_once(initialized[deviceId]" in capability_cache_source
+    assert "cudaDevAttrComputeCapabilityMajor" in capability_cache_source
+    assert "cudaDevAttrComputeCapabilityMinor" in capability_cache_source
+    assert "cudaGetDevice" not in capability_cache_source
+    for hot_path_source in (dispatch_source, combine_source, sanitize_source):
+        assert "cudaGetDevice" not in hot_path_source
+        assert "CUDADeviceGuard" not in hot_path_source
+        assert "get_current_stream" not in hot_path_source
+        assert "getSMVersion" not in hot_path_source
     assert "KernelFn kernel_fn, int device_id" in launcher_source
     assert (
         "static std::array<std::once_flag, kMaxPreloadDevices> preloaded_devices;"
@@ -984,11 +1032,10 @@ def _run_public_combine_round(
     if quantization is None:
         caller_output = torch.empty_like(reference)
         previous_device = torch.cuda.current_device()
-        selected_device = previous_device
         if mismatch_current_device:
-            selected_device = 1 - rank
-            assert selected_device != expert_output.device.index
-            torch.cuda.set_device(selected_device)
+            mismatched_device = 1 - rank
+            assert mismatched_device != expert_output.device.index
+            torch.cuda.set_device(mismatched_device)
         try:
             result = collective.combine(
                 expert_output,
@@ -997,7 +1044,7 @@ def _run_public_combine_round(
                 output=caller_output,
                 active_rank_mask=active_mask,
             )
-            assert torch.cuda.current_device() == selected_device
+            assert torch.cuda.current_device() == expert_output.device.index
         finally:
             torch.cuda.set_device(previous_device)
         assert result is caller_output
