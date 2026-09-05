@@ -5,7 +5,7 @@ Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
 - CuteDSL W4A4: NVFP4 activations and weights
 - CuteDSL W4A16: BF16 activations with NVFP4 weights decoded online
 - CUTLASS: NVIDIA CUTLASS-based implementation
-- TRTLLM: TensorRT-LLM's NVFP4 implementation
+- TRTLLM NVFP4: TensorRT-LLM's NVFP4 implementation
 - TRTLLM BF16: unquantized BF16 activations and weights
 
 Usage:
@@ -31,6 +31,9 @@ Usage:
 
     # Compare CuTe DSL W4A4/W4A16 against pure BF16 TRTLLM MoE
     python bench_moe_deepseek.py --backends cutedsl,trtllm-bf16
+
+    # Compare TRTLLM NVFP4 and BF16
+    python bench_moe_deepseek.py --backends trtllm-nvfp4,trtllm-bf16
 
     # Disable CUDA graph (useful for debugging or profiling)
     python bench_moe_deepseek.py --no-cuda-graph
@@ -745,156 +748,161 @@ def bench_trtllm(
     autotune_cache=None,
     routing_input_mode="logits",
     distributions=("uniform",),
+    precision="nvfp4",
 ):
-    """Benchmark TRT-LLM-Gen MoE.
+    """Benchmark TRTLLM NVFP4 or pure BF16 MoE with native finalize.
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+        precision: ``"nvfp4"`` or ``"bf16"``. Both modes prepare the same
+            source weights outside timing. BF16 preserves the activations
+            and weights without quantization; FP4 activation flags do not
+            affect it.
     """
-    from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.fused_moe import (
-        RoutingMethodType,
-        trtllm_fp4_block_scale_moe,
-        trtllm_fp4_block_scale_routed_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-    from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
-    from flashinfer.quantization.nvfp4_quantization_utils import (
-        current_nvfp4_4over6_config,
-        make_nvfp4_global_scale,
-    )
+    from flashinfer.fused_moe import RoutingMethodType
 
+    if precision not in ("nvfp4", "bf16"):
+        raise ValueError(f"Unsupported TRTLLM precision: {precision}")
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
 
     n, dev = inputs["router_logits"].shape[0], inputs["router_logits"].device
-    sv, etm, cache = 16, 128, {}
-
-    # Expert range for this EP partition
     expert_start = local_expert_offset
     expert_end = local_expert_offset + num_local_experts
+    input_kwargs = {
+        "routing_logits": inputs["router_logits"],
+        "routing_bias": inputs["routing_bias"],
+        "hidden_states": inputs["hidden_bf16"],
+    }
+    moe_kwargs = dict(
+        num_experts=CFG.num_experts,
+        top_k=CFG.top_k,
+        n_group=CFG.n_group,
+        topk_group=CFG.topk_group,
+        intermediate_size=CFG.intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=num_local_experts,
+        do_finalize=True,
+    )
 
-    hidden_global_scale = inputs["hidden_gs"]
-    if use_per_token_activation:
-        hidden_global_scale = make_nvfp4_global_scale(
-            inputs["hidden_bf16"],
-            per_token_activation=True,
-            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+    if precision == "bf16":
+        from flashinfer.fused_moe import (
+            TrtllmBf16Config,
+            trtllm_bf16_moe,
+            trtllm_bf16_routed_moe,
         )
 
-    def quantize_hidden(hidden_states):
+        # Canonical [up, gate] weights need both the gated row reorder and
+        # BlockMajorK shuffle. The public helper preserves their BF16 values.
+        weights = TrtllmBf16Config.prepare_weights(
+            inputs["w1_bf16"][expert_start:expert_end],
+            inputs["w2_bf16"][expert_start:expert_end],
+            num_local_experts=num_local_experts,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=CFG.intermediate_size,
+            device=dev,
+        )
+        moe_kwargs.update(
+            gemm1_weights=weights["gemm1_weights"],
+            gemm2_weights=weights["gemm2_weights"],
+        )
+        logits_moe, routed_moe = trtllm_bf16_moe, trtllm_bf16_routed_moe
+    else:
+        from flashinfer import SfLayout, nvfp4_quantize
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_moe,
+            trtllm_fp4_block_scale_routed_moe,
+        )
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+        from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            current_nvfp4_4over6_config,
+            make_nvfp4_global_scale,
+        )
+
+        sv, etm, cache = 16, 128, {}
+        hidden_global_scale = inputs["hidden_gs"]
         if use_per_token_activation:
-            hidden_states, hidden_states_scale, per_token_scale = nvfp4_quantize(
-                hidden_states,
-                hidden_global_scale,
-                sfLayout=SfLayout.layout_linear,
+            hidden_global_scale = make_nvfp4_global_scale(
+                inputs["hidden_bf16"],
                 per_token_activation=True,
-                backend="cute-dsl",
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
             )
-        else:
-            hidden_states, hidden_states_scale = fp4_quantize(
-                hidden_states, hidden_global_scale, sv, False, True
+
+        def quantize_hidden(hidden_states):
+            if use_per_token_activation:
+                hidden_states, hidden_states_scale, per_token_scale = nvfp4_quantize(
+                    hidden_states,
+                    hidden_global_scale,
+                    sfLayout=SfLayout.layout_linear,
+                    per_token_activation=True,
+                    backend="cute-dsl",
+                )
+            else:
+                hidden_states, hidden_states_scale = fp4_quantize(
+                    hidden_states, hidden_global_scale, sv, False, True
+                )
+                per_token_scale = None
+            hidden_states = hidden_states.view(torch.uint8).reshape(
+                n, CFG.hidden_size // 2
             )
-            per_token_scale = None
-        hidden_states = hidden_states.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
-        hidden_states_scale = (
-            hidden_states_scale.view(torch.float8_e4m3fn)
-            .flatten()[: n * CFG.hidden_size // sv]
-            .reshape(n, CFG.hidden_size // sv)
+            hidden_states_scale = (
+                hidden_states_scale.view(torch.float8_e4m3fn)
+                .flatten()[: n * CFG.hidden_size // sv]
+                .reshape(n, CFG.hidden_size // sv)
+            )
+            return hidden_states, hidden_states_scale, per_token_scale
+
+        hfp, hsc, hidden_per_token_scale = quantize_hidden(inputs["hidden_bf16"])
+
+        def prep(bf16, gs, M, K):
+            """Prepare weights for LOCAL experts only."""
+            fl, sl = [], []
+            for e in range(expert_start, expert_end):
+                q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
+                fl.append(q.view(torch.uint8).reshape(M, K // 2))
+                sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
+            return torch.stack(fl), torch.stack(sl)
+
+        w1f, w1s = prep(
+            inputs["w1_bf16"],
+            inputs["w1_gs"],
+            2 * CFG.intermediate_size,
+            CFG.hidden_size,
         )
-        return hidden_states, hidden_states_scale, per_token_scale
+        w2f, w2s = prep(
+            inputs["w2_bf16"], inputs["w2_gs"], CFG.hidden_size, CFG.intermediate_size
+        )
 
-    hfp, hsc, hidden_per_token_scale = quantize_hidden(inputs["hidden_bf16"])
+        def shuf(fp4, sf, perm_fn):
+            """Shuffle weights for LOCAL experts only."""
+            fsh, ssh = [], []
+            for i in range(num_local_experts):
+                p = perm_fn(cache, fp4[i], etm)
+                fsh.append(fp4[i][p.to(dev)].contiguous())
+                ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
+                ssh.append(
+                    block_scale_interleave(
+                        sf[i].view(torch.uint8)[ps.to(dev)].contiguous()
+                    )
+                )
+            return torch.stack(fsh), torch.stack(ssh)
 
-    def prep(bf16, gs, M, K):
-        """Prepare weights for LOCAL experts only."""
-        fl, sl = [], []
-        for e in range(expert_start, expert_end):
-            q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
-            fl.append(q.view(torch.uint8).reshape(M, K // 2))
-            sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
-        return torch.stack(fl), torch.stack(sl)
+        w1f, w1s = shuf(w1f, w1s, _maybe_get_cached_w3_w1_permute_indices)
+        w2f, w2s = shuf(w2f, w2s, get_w2_permute_indices_with_cache)
+        w1s = w1s.view(torch.float8_e4m3fn).reshape(
+            num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
+        )
+        w2s = w2s.view(torch.float8_e4m3fn).reshape(
+            num_local_experts, CFG.hidden_size, CFG.intermediate_size // sv
+        )
 
-    w1f, w1s = prep(
-        inputs["w1_bf16"], inputs["w1_gs"], 2 * CFG.intermediate_size, CFG.hidden_size
-    )
-    w2f, w2s = prep(
-        inputs["w2_bf16"], inputs["w2_gs"], CFG.hidden_size, CFG.intermediate_size
-    )
-
-    def shuf(fp4, sf, perm_fn):
-        """Shuffle weights for LOCAL experts only."""
-        fsh, ssh = [], []
-        for i in range(num_local_experts):
-            p = perm_fn(cache, fp4[i], etm)
-            fsh.append(fp4[i][p.to(dev)].contiguous())
-            ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
-            ssh.append(
-                block_scale_interleave(sf[i].view(torch.uint8)[ps.to(dev)].contiguous())
-            )
-        return torch.stack(fsh), torch.stack(ssh)
-
-    w1f, w1s = shuf(w1f, w1s, _maybe_get_cached_w3_w1_permute_indices)
-    w2f, w2s = shuf(w2f, w2s, get_w2_permute_indices_with_cache)
-    w1s = w1s.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
-    )
-    w2s = w2s.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, CFG.hidden_size, CFG.intermediate_size // sv
-    )
-
-    # Scale tensors sized for LOCAL experts only
-    sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
-
-    routing_ids, routing_weights = _trtllm_routing_inputs(
-        inputs, routing_input_mode, distributions
-    )
-
-    def run(routing_logits, routing_bias, hidden_states, hidden_states_scale):
-        """Invoke the selected logits or pre-routed TRTLLM public entry point."""
-        per_token_scale = hidden_per_token_scale
-        if include_activation_quant:
-            hidden_states, hidden_states_scale, per_token_scale = quantize_hidden(
-                hidden_states
-            )
-        if routing_input_mode == "routed":
-            return trtllm_fp4_block_scale_routed_moe(
-                topk_ids=(routing_ids, routing_weights),
-                routing_bias=None,
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                gemm1_weights=w1f,
-                gemm1_weights_scale=w1s,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=w2f,
-                gemm2_weights_scale=w2s,
-                gemm2_bias=None,
-                output1_scale_scalar=sc,
-                output1_scale_gate_scalar=sc,
-                output2_scale_scalar=sc,
-                num_experts=CFG.num_experts,
-                top_k=CFG.top_k,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                intermediate_size=CFG.intermediate_size,
-                local_expert_offset=local_expert_offset,
-                local_num_experts=num_local_experts,
-                routed_scaling_factor=1.0,
-                routing_method_type=RoutingMethodType.Renormalize.value,
-                per_token_scale=per_token_scale,
-                do_finalize=True,
-            )
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
+        # Scale tensors sized for LOCAL experts only
+        sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
+        moe_kwargs.update(
             gemm1_weights=w1f,
             gemm1_weights_scale=w1s,
             gemm1_bias=None,
@@ -907,124 +915,56 @@ def bench_trtllm(
             output1_scale_scalar=sc,
             output1_scale_gate_scalar=sc,
             output2_scale_scalar=sc,
-            num_experts=CFG.num_experts,
-            top_k=CFG.top_k,
-            n_group=CFG.n_group,
-            topk_group=CFG.topk_group,
-            intermediate_size=CFG.intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=num_local_experts,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
-            per_token_scale=per_token_scale,
-            do_finalize=True,
         )
+        input_kwargs.update(
+            hidden_states=inputs["hidden_bf16"] if include_activation_quant else hfp,
+            hidden_states_scale=None if include_activation_quant else hsc,
+        )
+        logits_moe = trtllm_fp4_block_scale_moe
+        routed_moe = trtllm_fp4_block_scale_routed_moe
 
-    input_kwargs = {
-        "routing_logits": inputs["router_logits"],
-        "routing_bias": inputs["routing_bias"],
-        "hidden_states": inputs["hidden_bf16"] if include_activation_quant else hfp,
-        "hidden_states_scale": None if include_activation_quant else hsc,
-    }
-
-    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
-    with _autotune_context(do_autotune, autotune_cache):
-        run(**input_kwargs)
-        torch.cuda.synchronize()
-
-    return _measure_or_profile(
-        run,
-        input_kwargs,
-        warmup,
-        iters,
-        use_cuda_graph,
-        use_cupti,
-        profile_cuda,
-        profile_iters,
-    )
-
-
-def bench_trtllm_bf16(
-    inputs,
-    warmup=10,
-    iters=100,
-    num_local_experts=None,
-    local_expert_offset=0,
-    use_cuda_graph=True,
-    use_cupti=True,
-    do_autotune=True,
-    profile_cuda=False,
-    profile_iters=10,
-    autotune_cache=None,
-    routing_input_mode="logits",
-    distributions=("uniform",),
-):
-    """Benchmark pure BF16 TRTLLM MoE with its native finalize.
-
-    Repack the same source weights outside timing; activations and both
-    GEMMs remain BF16. CuTe DSL finalize and FP4 activation-quantization
-    flags do not change this baseline.
-    """
-    from flashinfer.fused_moe import (
-        RoutingMethodType,
-        TrtllmBf16Config,
-        trtllm_bf16_moe,
-        trtllm_bf16_routed_moe,
-    )
-
-    if num_local_experts is None:
-        num_local_experts = CFG.num_experts
-    dev = inputs["router_logits"].device
-    expert_end = local_expert_offset + num_local_experts
-    # Canonical [up, gate] weights need both the gated row reorder and
-    # BlockMajorK shuffle. The public helper preserves their BF16 values.
-    weights = TrtllmBf16Config.prepare_weights(
-        inputs["w1_bf16"][local_expert_offset:expert_end],
-        inputs["w2_bf16"][local_expert_offset:expert_end],
-        num_local_experts=num_local_experts,
-        hidden_size=CFG.hidden_size,
-        intermediate_size=CFG.intermediate_size,
-        device=dev,
-    )
     routing_ids, routing_weights = _trtllm_routing_inputs(
         inputs, routing_input_mode, distributions
     )
-    moe_kwargs = dict(
-        gemm1_weights=weights["gemm1_weights"],
-        gemm2_weights=weights["gemm2_weights"],
-        num_experts=CFG.num_experts,
-        top_k=CFG.top_k,
-        n_group=CFG.n_group,
-        topk_group=CFG.topk_group,
-        intermediate_size=CFG.intermediate_size,
-        local_expert_offset=local_expert_offset,
-        local_num_experts=num_local_experts,
-        do_finalize=True,
+    is_routed = routing_input_mode == "routed"
+    moe = routed_moe if is_routed else logits_moe
+    moe_kwargs.update(
+        routed_scaling_factor=1.0 if is_routed else CFG.routed_scaling_factor,
+        routing_method_type=(
+            RoutingMethodType.Renormalize.value
+            if is_routed
+            else RoutingMethodType.DeepSeekV3
+        ),
     )
 
-    def run(routing_logits, routing_bias, hidden_states):
-        if routing_input_mode == "routed":
-            return trtllm_bf16_routed_moe(
-                topk_ids=(routing_ids, routing_weights),
-                hidden_states=hidden_states,
-                routed_scaling_factor=1.0,
-                routing_method_type=RoutingMethodType.Renormalize.value,
-                **moe_kwargs,
+    def run(routing_logits, routing_bias, hidden_states, hidden_states_scale=None):
+        activation_kwargs = {}
+        if precision == "nvfp4":
+            per_token_scale = hidden_per_token_scale
+            if include_activation_quant:
+                hidden_states, hidden_states_scale, per_token_scale = quantize_hidden(
+                    hidden_states
+                )
+            activation_kwargs.update(
+                hidden_states_scale=hidden_states_scale,
+                per_token_scale=per_token_scale,
             )
-        return trtllm_bf16_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
+        if is_routed:
+            routing_kwargs = {"topk_ids": (routing_ids, routing_weights)}
+            if precision == "nvfp4":
+                routing_kwargs["routing_bias"] = None
+        else:
+            routing_kwargs = dict(
+                routing_logits=routing_logits, routing_bias=routing_bias
+            )
+        return moe(
             hidden_states=hidden_states,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
+            **routing_kwargs,
+            **activation_kwargs,
             **moe_kwargs,
         )
 
-    input_kwargs = {
-        "routing_logits": inputs["router_logits"],
-        "routing_bias": inputs["routing_bias"],
-        "hidden_states": inputs["hidden_bf16"],
-    }
+    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
     with _autotune_context(do_autotune, autotune_cache):
         run(**input_kwargs)
         torch.cuda.synchronize()
@@ -1229,7 +1169,7 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    selected = set(backends or ("cutedsl", "cutlass", "trtllm", "trtllm-bf16"))
+    selected = set(backends or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"))
     run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
         None,
         "cute-dsl",
@@ -1239,7 +1179,10 @@ def _benchmark_single(
         "cute-dsl-w4a16",
     )
     run_cutlass = "cutlass" in selected and profile_backend in (None, "cutlass")
-    run_trtllm = "trtllm" in selected and profile_backend in (None, "trtllm")
+    run_trtllm_nvfp4 = "trtllm-nvfp4" in selected and profile_backend in (
+        None,
+        "trtllm-nvfp4",
+    )
 
     run_trtllm_bf16 = "trtllm-bf16" in selected and profile_backend in (
         None,
@@ -1300,41 +1243,29 @@ def _benchmark_single(
             profile_iters=profile_iters,
             autotune_cache=autotune_cache,
         )
-    if run_trtllm:
-        lat["TRTLLM"] = bench_trtllm(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            do_autotune=do_autotune,
-            use_per_token_activation=use_per_token_activation,
-            include_activation_quant=include_activation_quant,
-            profile_cuda=profile_cuda,
-            profile_iters=profile_iters,
-            autotune_cache=autotune_cache,
-            routing_input_mode=routing_input_mode,
-            distributions=distributions,
-        )
-
-    if run_trtllm_bf16:
-        lat["TRTLLM BF16"] = bench_trtllm_bf16(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            do_autotune=do_autotune,
-            profile_cuda=profile_cuda,
-            profile_iters=profile_iters,
-            autotune_cache=autotune_cache,
-            routing_input_mode=routing_input_mode,
-            distributions=distributions,
-        )
+    for precision, enabled in (
+        ("nvfp4", run_trtllm_nvfp4),
+        ("bf16", run_trtllm_bf16),
+    ):
+        if enabled:
+            lat[f"TRTLLM {precision.upper()}"] = bench_trtllm(
+                inputs,
+                warmup,
+                iters,
+                num_local,
+                local_offset,
+                use_cuda_graph,
+                use_cupti,
+                do_autotune=do_autotune,
+                use_per_token_activation=use_per_token_activation,
+                include_activation_quant=include_activation_quant,
+                profile_cuda=profile_cuda,
+                profile_iters=profile_iters,
+                autotune_cache=autotune_cache,
+                routing_input_mode=routing_input_mode,
+                distributions=distributions,
+                precision=precision,
+            )
 
     # Build results
     results = []
@@ -1411,9 +1342,9 @@ def _print_header(
             f"{'Tokens':>6} | "
             f"{'CuteDSL W4A4':^15} | "
             f"{'CuteDSL W4A16':^15} | "
-            f"{'TRTLLM':^15} | "
+            f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
-            f"{'Speedup vs TRTLLM':^18} | "
+            f"{'Speedup vs NVFP4':^18} | "
             f"{'Speedup vs BF16':^18} | "
             f"{'Winner':^8} | "
             f"{'Active':^7} | "
@@ -1437,10 +1368,10 @@ def _print_header(
             f"{'CuteDSL W4A4':^15} | "
             f"{'CuteDSL W4A16':^15} | "
             f"{'CUTLASS':^15} | "
-            f"{'TRTLLM':^15} | "
+            f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
             f"{'Speedup vs CUTLASS':^18} | "
-            f"{'Speedup vs TRTLLM':^18} | "
+            f"{'Speedup vs NVFP4':^18} | "
             f"{'Speedup vs BF16':^18} | "
             f"{'Winner':^8} | "
             f"{'Active':^7} | "
@@ -1467,18 +1398,18 @@ def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
-    w4a4, w4a16, trtllm = (
+    w4a4, w4a16, nvfp4 = (
         r["CuteDSL W4A4"],
         r["CuteDSL W4A16"],
-        r["TRTLLM"],
+        r["TRTLLM NVFP4"],
     )
     cutlass = r.get("CUTLASS")
     bf16 = r["TRTLLM BF16"]
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
-    trtllm_speedups = (
-        trtllm.latency_ms / w4a4.latency_ms,
-        trtllm.latency_ms / w4a16.latency_ms,
+    nvfp4_speedups = (
+        nvfp4.latency_ms / w4a4.latency_ms,
+        nvfp4.latency_ms / w4a16.latency_ms,
     )
 
     bf16_speedups = (
@@ -1492,6 +1423,7 @@ def _print_row(results, histogram_record):
     winner = {
         "CuteDSL W4A4": "W4A4",
         "CuteDSL W4A16": "W4A16",
+        "TRTLLM NVFP4": "NVFP4",
         "TRTLLM BF16": "BF16",
     }.get(winner, winner)
 
@@ -1502,12 +1434,12 @@ def _print_row(results, histogram_record):
         f"{histogram_record['median_count']:>7.2f}"
     )
     if cutlass is None:
-        speedups = f"{trtllm_speedups[0]:>7.2f}x {trtllm_speedups[1]:>7.2f}x"
+        speedups = f"{nvfp4_speedups[0]:>7.2f}x {nvfp4_speedups[1]:>7.2f}x"
         print(
             f"{w4a4.tokens:>6} | "
             f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
-            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{speedups:>18} | "
             f"{bf16_speedups_text:>18} | "
@@ -1523,18 +1455,16 @@ def _print_row(results, histogram_record):
         cutlass_speedups_text = (
             f"{cutlass_speedups[0]:>7.2f}x {cutlass_speedups[1]:>7.2f}x"
         )
-        trtllm_speedups_text = (
-            f"{trtllm_speedups[0]:>7.2f}x {trtllm_speedups[1]:>7.2f}x"
-        )
+        nvfp4_speedups_text = f"{nvfp4_speedups[0]:>7.2f}x {nvfp4_speedups[1]:>7.2f}x"
         print(
             f"{w4a4.tokens:>6} | "
             f"{w4a4.latency_ms:>7.3f} {w4a4.tflops:>7.1f} | "
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
-            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{cutlass_speedups_text:>18} | "
-            f"{trtllm_speedups_text:>18} | "
+            f"{nvfp4_speedups_text:>18} | "
             f"{bf16_speedups_text:>18} | "
             f"{winner:^8} | "
             f"{active_experts:>7} | "
@@ -1628,7 +1558,7 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        help="Comma-separated subset of cutedsl,cutlass,trtllm,trtllm-bf16 (default: all)",
+        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16 (default: all)",
     )
     parser.add_argument(
         "--distributions",
@@ -1704,7 +1634,13 @@ def main():
     )
     parser.add_argument(
         "--profile-backend",
-        choices=["cute-dsl", "cute-dsl-w4a16", "cutlass", "trtllm", "trtllm-bf16"],
+        choices=[
+            "cute-dsl",
+            "cute-dsl-w4a16",
+            "cutlass",
+            "trtllm-nvfp4",
+            "trtllm-bf16",
+        ],
         help="Backend captured by --profile-cuda.",
     )
     parser.add_argument(
@@ -1727,7 +1663,7 @@ def main():
             item.strip() for item in args.backends.split(",") if item.strip()
         )
         unknown = sorted(
-            set(backends) - {"cutedsl", "cutlass", "trtllm", "trtllm-bf16"}
+            set(backends) - {"cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"}
         )
         if unknown:
             parser.error(f"unknown --backends value(s): {', '.join(unknown)}")
