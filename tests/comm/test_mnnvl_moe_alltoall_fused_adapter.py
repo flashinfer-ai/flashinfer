@@ -388,11 +388,12 @@ def test_legacy_jit_inventory_remains_available(monkeypatch):
     assert captured["kwargs"]["extra_cuda_cflags"] == ["-DENABLE_BF16"]
 
 
-def test_runtime_module_selection_uses_exact_current_device_capability(monkeypatch):
+def test_runtime_module_selection_uses_requested_device_capability(monkeypatch):
     import flashinfer.comm.trtllm_moe_alltoall as api
 
     monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 7)
     selected = []
+    capability_devices = []
 
     def select_target(target):
         selected.append(target)
@@ -402,22 +403,32 @@ def test_runtime_module_selection_uses_exact_current_device_capability(monkeypat
     monkeypatch.setattr(api, "_get_moe_alltoall_module_for_target", select_target)
 
     try:
-        monkeypatch.setattr(
-            api.torch.cuda, "get_device_capability", lambda device: (10, 0)
-        )
+        def capability(device):
+            capability_devices.append(device)
+            return (10, 0)
+
+        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
         api.get_moe_alltoall_module.cache_clear()
-        assert api.get_moe_alltoall_module() == "sm100a"
-        monkeypatch.setattr(
-            api.torch.cuda, "get_device_capability", lambda device: (10, 3)
-        )
+        assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "sm100a"
+
+        def capability(device):
+            capability_devices.append(device)
+            return (10, 3)
+
+        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
         api.get_moe_alltoall_module.cache_clear()
-        assert api.get_moe_alltoall_module() == "sm103a"
-        monkeypatch.setattr(
-            api.torch.cuda, "get_device_capability", lambda device: (9, 0)
-        )
+        assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "sm103a"
+
+        def capability(device):
+            capability_devices.append(device)
+            return (9, 0)
+
+        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
         api.get_moe_alltoall_module.cache_clear()
-        assert api.get_moe_alltoall_module() == "legacy"
+        assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "legacy"
         assert selected == ["sm100a", "sm103a", "legacy"]
+        assert capability_devices == [3, 3, 3]
+        assert api.torch.cuda.current_device() == 7
     finally:
         api.get_moe_alltoall_module.cache_clear()
 
@@ -651,6 +662,9 @@ def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
     assert "template <PreloadKernelSlot Slot, typename KernelFn>" in launcher_source
     assert "int device_id;" in params_source
     assert "params.device_id = payload.device().device_id;" in adapter_source
+    assert "ffi::CUDADeviceGuard device_guard(payload.device().device_id);" in adapter_source
+    assert "auto stream = get_stream(payload.device());" in adapter_source
+    assert "CHECK_DEVICE(payload, workspace);" in adapter_source
     assert "KernelFn kernel_fn, int device_id" in launcher_source
     assert (
         "static std::array<std::once_flag, kMaxPreloadDevices> preloaded_devices;"
@@ -723,6 +737,18 @@ _TOPK8_ROUTES_BY_RANK = (
         (1, 3, 5, 7, 9, 11, 13, 15),
         (0, 1, 6, 7, 8, 9, 14, 15),
         (2, 3, 4, 5, 10, 11, 12, 13),
+    ),
+)
+_TOPK6_ROUTES_BY_RANK = (
+    (
+        (0, 1, 2, 6, 7, 8),
+        (3, 4, 5, 9, 10, 11),
+        (0, 2, 4, 6, 8, 10),
+    ),
+    (
+        (1, 3, 5, 7, 9, 11),
+        (0, 1, 4, 5, 6, 7),
+        (2, 3, 4, 8, 9, 10),
     ),
 )
 _QUANTIZATION_CELLS = (
@@ -933,6 +959,7 @@ def _run_public_combine_round(
     layout=SfLayout.layout_linear,
     routes_by_rank=_ROUTES_BY_RANK,
     num_experts=5,
+    mismatch_current_device=False,
 ):
     received, valid_slots = _dispatch_public_round(
         collective,
@@ -964,13 +991,23 @@ def _run_public_combine_round(
 
     if quantization is None:
         caller_output = torch.empty_like(reference)
-        result = collective.combine(
-            expert_output,
-            routes.shape[0],
-            payload_in_workspace=payload_in_workspace,
-            output=caller_output,
-            active_rank_mask=active_mask,
-        )
+        previous_device = torch.cuda.current_device()
+        selected_device = previous_device
+        if mismatch_current_device:
+            selected_device = 1 - rank
+            assert selected_device != expert_output.device.index
+            torch.cuda.set_device(selected_device)
+        try:
+            result = collective.combine(
+                expert_output,
+                routes.shape[0],
+                payload_in_workspace=payload_in_workspace,
+                output=caller_output,
+                active_rank_mask=active_mask,
+            )
+            assert torch.cuda.current_device() == selected_device
+        finally:
+            torch.cuda.set_device(previous_device)
         assert result is caller_output
         torch.testing.assert_close(result, reference, atol=1e-2, rtol=1e-2)
         return
@@ -1105,6 +1142,43 @@ def _run_public_mpi2_cycle():
         routes_by_rank=_TOPK8_ROUTES_BY_RANK,
         num_experts=16,
     )
+
+    topk6_routes = torch.tensor(
+        _TOPK6_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda"
+    )
+    topk6_payloads = _payloads(rank, topk6_routes)
+    topk6_workspace_size = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        2,
+        6,
+        max_tokens,
+        _HIDDEN_SIZE,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
+    topk6_collective = MoeAlltoAll(
+        mapping,
+        max_num_tokens=max_tokens,
+        top_k=6,
+        num_experts=12,
+        workspace_size_per_rank=topk6_workspace_size,
+        enable_rank_mask=True,
+    )
+    for payload_in_workspace in (False, True):
+        for repeat in range(2):
+            _run_public_combine_round(
+                topk6_collective,
+                rank,
+                topk6_routes,
+                topk6_payloads,
+                active_mask,
+                (0, 1),
+                (0, 1),
+                payload_in_workspace=payload_in_workspace,
+                routes_by_rank=_TOPK6_ROUTES_BY_RANK,
+                num_experts=12,
+                mismatch_current_device=(
+                    not payload_in_workspace and repeat == 1
+                ),
+            )
     _run_public_combine_round(
         topk8_collective,
         rank,

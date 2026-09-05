@@ -362,9 +362,17 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
     )
 
 
-def get_moe_alltoall_module():
-    """Return the legacy or exact-architecture module for the current device."""
-    device_index = torch.cuda.current_device()
+def get_moe_alltoall_module(device: Optional[torch.device] = None):
+    """Return the legacy or exact-architecture module for ``device``."""
+    if device is None:
+        device_index = torch.cuda.current_device()
+    else:
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"MoE all-to-all requires a CUDA device, got {device}")
+        device_index = (
+            torch.cuda.current_device() if device.index is None else device.index
+        )
     return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
 
 
@@ -417,7 +425,7 @@ def moe_a2a_initialize(
         Metainfo tensor opaque to callers; pass it to subsequent
         ``moe_a2a_*`` calls.
     """
-    return get_moe_alltoall_module().moe_a2a_initialize(
+    return get_moe_alltoall_module(workspace.device).moe_a2a_initialize(
         workspace, ep_rank, ep_size, max_num_tokens, eplb_stats_num_experts
     )
 
@@ -554,7 +562,7 @@ def moe_a2a_dispatch(
         combine_payload_offset,
         eplb_gathered_stats_offset,
         eplb_stats_num_experts,
-    ) = get_moe_alltoall_module().moe_a2a_dispatch(
+    ) = get_moe_alltoall_module(token_selected_experts.device).moe_a2a_dispatch(
         token_selected_experts,
         input_payloads,
         workspace,
@@ -704,7 +712,7 @@ def moe_a2a_combine(
         if not output.is_contiguous():
             raise ValueError(f"output must be contiguous, got stride={output.stride()}")
 
-    module = get_moe_alltoall_module()
+    module = get_moe_alltoall_module(payload.device)
     args = (
         payload,
         local_num_tokens,
@@ -763,7 +771,7 @@ def moe_a2a_sanitize_expert_ids(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(expert_ids.device)
-    return get_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
+    return get_moe_alltoall_module(expert_ids.device).moe_a2a_sanitize_expert_ids(
         expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
     )
 

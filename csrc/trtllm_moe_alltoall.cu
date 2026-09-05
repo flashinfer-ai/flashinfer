@@ -153,12 +153,15 @@ int64_t getMoeA2AAuxDataSize(int64_t epSize, int64_t maxNumTokens, int64_t eplbS
 
 Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
                           int64_t maxNumTokens, int64_t eplbStatsNumExperts) {
+  CHECK_CUDA(workspace);
+  TVM_FFI_ICHECK_EQ(workspace.stride(1), 1) << "workspace rows must be contiguous";
   CHECK_INPUT_TYPE(workspace, dl_uint8);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2) << "workspace must be a 2D tensor";
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize) << "workspace first dim must equal ep_size";
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "epRank out of range";
 
-  auto stream = get_current_stream();
+  ffi::CUDADeviceGuard device_guard(workspace.device().device_id);
+  auto stream = get_stream(workspace.device());
   auto* basePtr = static_cast<uint8_t*>(workspace.data_ptr());
   auto* rankPtr = basePtr + epRank * workspace.stride(0);
   auto result = cudaMemsetAsync(rankPtr, 0, workspace.size(1), stream);
@@ -203,6 +206,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   for (int i = 0; i < numPayloads; ++i) {
     auto const& payload = inputPayloads[i];
     CHECK_INPUT(payload);
+    CHECK_DEVICE(tokenSelectedExperts, payload);
     TVM_FFI_ICHECK_EQ(payload.ndim(), 2) << "payload " << i << " must be 2D";
     TVM_FFI_ICHECK_EQ(payload.size(0), localNumTokens)
         << "payload " << i << " first dimension must match local_num_tokens";
@@ -216,7 +220,10 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   fi_throughput::MoeA2ADataOffsets offsets{};
   std::copy(offsetsPtr, offsetsPtr + fi_throughput::NUM_METAINFO_FIELDS, offsets.begin());
 
+  CHECK_CUDA(workspace);
+  TVM_FFI_ICHECK_EQ(workspace.stride(1), 1) << "workspace rows must be contiguous";
   CHECK_INPUT_TYPE(workspace, dl_uint8);
+  CHECK_DEVICE(tokenSelectedExperts, workspace);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
   TVM_FFI_ICHECK(epSize > 0 && epSize <= tl_throughput::kMaxRanks)
@@ -233,6 +240,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   if (enableEplb) {
     auto const& localStats = eplbLocalStats.value();
     CHECK_INPUT(localStats);
+    CHECK_DEVICE(tokenSelectedExperts, localStats);
     CHECK_INPUT_TYPE(localStats, dl_int32);
     TVM_FFI_ICHECK_EQ(localStats.ndim(), 1) << "eplb_local_stats must be a 1D tensor";
     eplbStatsNumExperts = localStats.size(0);
@@ -337,7 +345,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
     }
   }
 
-  params.stream = get_current_stream();
+  ffi::CUDADeviceGuard device_guard(tokenSelectedExperts.device().device_id);
+  params.stream = get_stream(tokenSelectedExperts.device());
 
   tl_throughput::moe_a2a_prepare_dispatch_launch(params);
   tl_throughput::moe_a2a_dispatch_launch(params);
@@ -414,7 +423,10 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   fi_throughput::MoeA2ADataOffsets offsets{};
   std::copy(offsetsPtr, offsetsPtr + fi_throughput::NUM_METAINFO_FIELDS, offsets.begin());
 
+  CHECK_CUDA(workspace);
+  TVM_FFI_ICHECK_EQ(workspace.stride(1), 1) << "workspace rows must be contiguous";
   CHECK_INPUT_TYPE(workspace, dl_uint8);
+  CHECK_DEVICE(payload, workspace);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
   auto* workspaceBase = static_cast<uint8_t*>(workspace.data_ptr());
@@ -436,7 +448,8 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
         << " != " << (void*)expectedPtr;
   }
 
-  auto stream = get_current_stream();
+  ffi::CUDADeviceGuard device_guard(payload.device().device_id);
+  auto stream = get_stream(payload.device());
 
   // Output dtype precedence:
   //   - explicit outputDtype_ (e.g. MXFP8/FP4 output quantization) wins;
@@ -621,17 +634,22 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
   fi_throughput::MoeA2ADataOffsets offsets{};
   std::copy(offsetsPtr, offsetsPtr + fi_throughput::NUM_METAINFO_FIELDS, offsets.begin());
 
+  CHECK_CUDA(workspace);
+  TVM_FFI_ICHECK_EQ(workspace.stride(1), 1) << "workspace rows must be contiguous";
   CHECK_INPUT_TYPE(workspace, dl_uint8);
+  CHECK_DEVICE(expertIds, workspace);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
   auto* workspaceBase = static_cast<uint8_t*>(workspace.data_ptr());
   auto* rankWorkspacePtr = workspaceBase + epRank * workspace.stride(0);
   auto* recvCounters =
       reinterpret_cast<int*>(rankWorkspacePtr + offsets[fi_throughput::RECV_COUNTERS_OFFSET_INDEX]);
 
+  ffi::CUDADeviceGuard device_guard(expertIds.device().device_id);
   tl_throughput::moe_a2a_sanitize_expert_ids_launch(
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),
-      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream(),
+      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK),
+      get_stream(expertIds.device()),
       enablePdl);
 
   auto err = cudaGetLastError();
