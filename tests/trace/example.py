@@ -53,10 +53,10 @@ mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
-prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
-prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4.json
+prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
@@ -1772,26 +1772,16 @@ with contextlib.suppress(Exception):
         device=device,
     )
     _pts_v = torch.randn_like(_pts_k)
-    _pts_indptr = torch.arange(
-        0,
-        _pts_num_pages + 1,
-        _pts_pages_per_request,
-        dtype=torch.int32,
-        device=device,
-    )
     _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
-    _pts_last_page_len = torch.full(
-        (_pts_B,), _pts_PS, dtype=torch.int32, device=device
-    )
+    _pts_block_tables = _pts_indices.view(_pts_B, _pts_pages_per_request)
     _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
     _pts_cache = (_pts_k, _pts_v)
 
     _attention_ts_decode(
         _pts_q,
         _pts_cache,
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_block_tables,
+        _pts_seq_lens,
         seq_len_q=_pts_SQ,
         mask_type="causal",
     )
@@ -1815,8 +1805,7 @@ with contextlib.suppress(Exception):
         _pts_q,
         _pts_cache,
         _pts_workspace,
-        _pts_indptr,
-        _pts_indices,
+        _pts_block_tables,
         _pts_seq_lens,
         _pts_SK,
         seq_len_q=_pts_SQ,
@@ -1826,30 +1815,36 @@ with contextlib.suppress(Exception):
 
     _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
     _pts_wrapper.plan(
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_q.device,
+        _pts_B,
         _pts_Hq,
         _pts_Hkv,
         _pts_D,
         _pts_PS,
-        seq_len_q=_pts_SQ,
+        _pts_SK,
+        max_seq_len_q=_pts_SQ,
+        packed_query=False,
         q_data_type=_pts_q.dtype,
         kv_data_type=_pts_k.dtype,
         o_data_type=torch.bfloat16,
         mask_type="causal",
-        max_kv_len=_pts_SK,
+        workspace_buffer=_pts_workspace,
     )
-    _pts_wrapper.run(_pts_q, _pts_cache)
+    _pts_wrapper.run(
+        _pts_q,
+        _pts_cache,
+        _pts_seq_lens,
+        _pts_block_tables,
+    )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
-        batch_decode_mla_with_paged_kv_cache as _attention_ts_mla_decode,
-        get_prims_ts_batch_decode_mla_workspace_size as _prims_ts_mla_ws_size,
-        prims_ts_batch_decode_with_kv_cache_mla as _prims_ts_mla_decode,
+        batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
+        get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
+        prims_ts_batch_mla_decode_with_kv_cache as _prims_ts_mla_decode,
     )
 
     _pmla_B, _pmla_SQ, _pmla_SK, _pmla_PS = 4, 4, 2048, 32
@@ -1918,20 +1913,27 @@ with contextlib.suppress(Exception):
 
     _pmla_wrapper = _PrimTSMLADecodeWrapper()
     _pmla_wrapper.plan(
-        _pmla_block_tables,
-        _pmla_seq_lens,
+        _pmla_q.device,
+        _pmla_B,
         _pmla_H,
         _pmla_CKV,
         _pmla_KPE,
         _pmla_PS,
-        seq_len_q=_pmla_SQ,
+        _pmla_SK,
+        max_seq_len_q=_pmla_SQ,
+        packed_query=False,
         q_data_type=_pmla_q.dtype,
         kv_data_type=_pmla_cache.dtype,
         o_data_type=torch.bfloat16,
         mask_type="causal",
-        max_kv_len=_pmla_SK,
+        workspace_buffer=_pmla_workspace,
     )
-    _pmla_wrapper.run(_pmla_q, _pmla_cache)
+    _pmla_wrapper.run(
+        _pmla_q,
+        _pmla_cache,
+        _pmla_block_tables,
+        _pmla_seq_lens,
+    )
 
 # trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
 # page tables and seq lens; SM100/103 only).

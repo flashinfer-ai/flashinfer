@@ -1,18 +1,34 @@
 {
-  "name": "prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4",
-  "description": "Reusable PrimTS MLA decode wrapper. Page tables, sequence lengths, Q offsets, masks, and static bounds are retained by plan(); run() receives only query, KV cache, scales, and an optional output buffer.",
+  "name": "prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4",
+  "description": "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static bounds, and exact batch size. Every run supplies page tables and sequence lengths; packed-Q runs also supply Q offsets.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchMLADecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental",
-    "mla"
+    "mla",
+    "mask:causal"
   ],
   "axes": {
     "batch_size": {
       "type": "var",
-      "description": "Number of plan-owned MLA requests."
+      "description": "Exact number of planned MLA requests."
+    },
+    "max_seq_len_q": {
+      "type": "const",
+      "value": 4,
+      "description": "Query-length capacity frozen by plan()."
+    },
+    "max_kv_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "K/V-length capacity frozen by plan()."
+    },
+    "causal": {
+      "type": "const",
+      "value": 1,
+      "description": "One for a causal plan and zero for a dense plan."
     },
     "num_heads": {
       "type": "const",
@@ -23,8 +39,14 @@
       "value": 576
     },
     "kv_lora_rank": {
-      "type": "var",
-      "description": "Fixed MLA output dimension (512)."
+      "type": "const",
+      "value": 512,
+      "description": "Latent K/V rank frozen by plan()."
+    },
+    "qk_rope_head_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "RoPE head dimension frozen by plan()."
     },
     "num_pages": {
       "type": "var",
@@ -34,9 +56,13 @@
       "type": "const",
       "value": 32
     },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Per-run block-table column capacity."
+    },
     "len_qo_indptr": {
       "type": "var",
-      "description": "Length of plan-owned cumulative Q offsets."
+      "description": "Length of cumulative Q offsets."
     },
     "seq_len_q": {
       "type": "const",
@@ -48,6 +74,10 @@
     "head_dim_qk == 576",
     "kv_lora_rank == 512",
     "page_size in (16, 32, 64, 128)",
+    "block_tables.shape[0] == batch_size",
+    "max_pages_per_seq * page_size >= max_kv_len",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_kv_len",
     "seq_len_q >= 1"
   ],
   "inputs": {
@@ -68,23 +98,28 @@
       ],
       "dtype": "bfloat16"
     },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32",
+      "description": "Required physical page table supplied to run()."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Required per-request KV lengths supplied to run()."
+    },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Cumulative Q offsets retained by plan()."
-    },
-    "max_seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "mask_type": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
+      "description": "Cumulative Q offsets required by a packed-Q run."
     },
     "bmm1_scale": {
       "shape": null,
@@ -95,6 +130,12 @@
       "shape": null,
       "dtype": "float32",
       "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "Whether to validate per-run tensors and metadata values."
     }
   },
   "outputs": {

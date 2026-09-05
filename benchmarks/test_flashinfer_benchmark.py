@@ -38,7 +38,6 @@ def mocked_prims_ts_benchmark(monkeypatch):
 
     benchmark_outputs = []
     real_torch_empty = torch.empty
-
     monkeypatch.setattr(
         attention_routine, "get_device", lambda _args: torch.device("cpu")
     )
@@ -415,18 +414,33 @@ def test_prims_ts_paged_context_adapter_contract(
     assert wrapper.constructor_call == (("HND",), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    q, k_cache, v_cache = plan_args[:3]
+    assert plan_args == ()
+    assert plan_kwargs["device"] == torch.device("cpu")
+    assert plan_kwargs["batch_size"] == 2
+    assert plan_kwargs["max_seq_len_q"] == 2
+    assert plan_kwargs["max_kv_len"] == 16
+    assert "max_num_pages_per_seq_kv" not in plan_kwargs
+    assert plan_kwargs["num_qo_heads"] == 2
+    assert plan_kwargs["num_kv_heads"] == 1
+    assert plan_kwargs["head_dim"] == 128
+    assert plan_kwargs["q_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["kv_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["page_size"] == 16
+    assert plan_kwargs["mask_type"] == "causal"
+    assert plan_kwargs["out_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["uniform_packed_lengths"] is True
+    assert plan_kwargs["has_q_offset"] is True
+
+    run_args, run_kwargs = wrapper.run_calls[0]
+    q, k_cache, v_cache = run_args[:3]
     assert q.shape == (4, 2, 128)
     assert k_cache.shape == v_cache.shape == (2, 1, 16, 128)
     assert k_cache.is_contiguous() and v_cache.is_contiguous()
     assert k_cache.stride() == v_cache.stride() == (2048, 2048, 128, 1)
     assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
-    assert plan_args[3].tolist() == [0, 2, 4]
-    assert plan_args[4].tolist() == [0, 1, 2]
-    assert plan_args[6].tolist() == [16, 16]
-    assert plan_kwargs["page_size"] == 16
-    assert plan_kwargs["mask_type"] == "causal"
-    assert plan_kwargs["out_dtype"] == torch.float8_e4m3fn
+    assert run_args[3].tolist() == [0, 2, 4]
+    assert run_args[4].tolist() == [[0], [1]]
+    assert run_args[5].tolist() == [16, 16]
     # With deterministic identical Q/K/V input, all three dequantization
     # scales match. This relation proves both Q and K scales are folded into
     # softmax scale, while V is forwarded as the output scale.
@@ -435,16 +449,62 @@ def test_prims_ts_paged_context_adapter_contract(
         output_scale**2 / math.sqrt(128), rel=1e-6
     )
 
-    run_args, run_kwargs = wrapper.run_calls[0]
-    assert all(
-        runtime_tensor is planned_tensor
-        for runtime_tensor, planned_tensor in zip(
-            run_args, (q, k_cache, v_cache), strict=True
-        )
-    )
     assert run_kwargs["out"].shape == q.shape
     assert run_kwargs["out"].dtype == torch.float8_e4m3fn
+    assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == q.shape
+
+
+@pytest.mark.parametrize(
+    ("random_actual_seq_len", "expected_uniform_packed_lengths"),
+    ((False, True), (True, False)),
+    ids=("exact-uniform", "random-lengths"),
+)
+def test_prims_ts_paged_context_adapter_selects_length_contract(
+    mocked_prims_ts_benchmark,
+    random_actual_seq_len,
+    expected_uniform_packed_lengths,
+):
+    """The benchmark specializes only metadata contracts guaranteed by its inputs."""
+
+    install_wrapper, _benchmark_outputs = mocked_prims_ts_benchmark
+    wrapper = install_wrapper("BatchPrefillPagedTSWrapper")
+    extra_args = [
+        "--page_size",
+        "16",
+        "--batch_size",
+        "2",
+        "--s_qo",
+        "16",
+        "--s_kv",
+        "16",
+        "--num_qo_heads",
+        "2",
+        "--num_kv_heads",
+        "1",
+        "--head_dim_qk",
+        "128",
+        "--head_dim_vo",
+        "128",
+        "--q_dtype",
+        "bfloat16",
+        "--kv_dtype",
+        "bfloat16",
+        "--causal",
+    ]
+    if random_actual_seq_len:
+        extra_args.append("--random_actual_seq_len")
+    args = _parse_prims_ts_case(
+        "BatchPrefillWithPagedKVCacheWrapper",
+        extra_args,
+    )
+
+    attention_routine.testBatchPrefillWithPagedKVCacheWrapper(args)
+
+    assert len(wrapper.plan_calls) == 1
+    plan_kwargs = wrapper.plan_calls[0][1]
+    assert plan_kwargs["uniform_packed_lengths"] is expected_uniform_packed_lengths
+    assert plan_kwargs["has_q_offset"] is False
 
 
 def test_prims_ts_ragged_context_adapter_contract(
@@ -483,24 +543,32 @@ def test_prims_ts_ragged_context_adapter_contract(
     assert wrapper.constructor_call == ((), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    q, k, v = plan_args
-    assert q.shape == (6, 2, 128)
-    assert k.shape == v.shape == (6, 1, 128)
-    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
-    assert plan_kwargs["qo_indptr"].tolist() == [0, 3, 6]
-    assert plan_kwargs["kv_indptr"].tolist() == [0, 3, 6]
+    assert plan_args == ()
+    assert plan_kwargs["device"] == torch.device("cpu")
+    assert plan_kwargs["batch_size"] == 2
+    assert plan_kwargs["max_seq_len_q"] == 3
+    assert plan_kwargs["max_kv_len"] == 3
+    assert plan_kwargs["num_qo_heads"] == 2
+    assert plan_kwargs["num_kv_heads"] == 1
+    assert plan_kwargs["head_dim"] == 128
+    assert plan_kwargs["q_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["kv_dtype"] == torch.float8_e4m3fn
+    assert plan_kwargs["packed"] is True
     assert plan_kwargs["mask_type"] == "causal"
     assert plan_kwargs["out_dtype"] == torch.float8_e4m3fn
     assert plan_kwargs["sm_scale"] == pytest.approx((1.0 / 256) ** 2 / math.sqrt(128))
     assert plan_kwargs["output_scale"] == pytest.approx(1.0 / 256)
 
     run_args, run_kwargs = wrapper.run_calls[0]
-    assert all(
-        runtime_tensor is planned_tensor
-        for runtime_tensor, planned_tensor in zip(run_args, (q, k, v), strict=True)
-    )
+    q, k, v = run_args[:3]
+    assert q.shape == (6, 2, 128)
+    assert k.shape == v.shape == (6, 1, 128)
+    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+    assert run_args[3].tolist() == [0, 3, 6]
+    assert run_args[4].tolist() == [0, 3, 6]
     assert run_kwargs["out"].shape == q.shape
     assert run_kwargs["out"].dtype == torch.float8_e4m3fn
+    assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == q.shape
 
 
@@ -563,31 +631,39 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
     assert wrapper.constructor_call == (("HND",), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    assert plan_args[0].tolist() == [0, 1, 2]
-    assert plan_args[2].tolist() == [16, 16]
-    assert plan_args[3:] == (2, 1, 128, 16)
+    assert plan_args == (torch.device("cpu"), 2, 2, 1, 128, 16, 16)
+    workspace_buffer = plan_kwargs.pop("workspace_buffer")
+    assert workspace_buffer.dtype == torch.int8
     assert plan_kwargs == {
-        "seq_len_q": 3,
+        "max_seq_len_q": 3,
+        "packed_query": False,
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
         "mask_type": expected_plan_mask,
-        "max_kv_len": 16,
+        "seq_lens": [16, 16],
     }
     assert len(results) == 1
     assert results[0]["causal"] is expected_recorded_causal
     assert metric_causal == [expected_recorded_causal]
 
     run_args, run_kwargs = wrapper.run_calls[0]
-    runtime_q, runtime_kv_cache = run_args
+    (
+        runtime_q,
+        runtime_kv_cache,
+        runtime_seq_lens,
+        runtime_block_tables,
+    ) = run_args
     assert runtime_q.shape == (2, 3, 2, 128)
     assert runtime_kv_cache.shape == (2, 2, 1, 16, 128)
     assert runtime_kv_cache.is_contiguous()
+    assert runtime_seq_lens.tolist() == [16, 16]
+    assert runtime_block_tables.tolist() == [[0], [1]]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128))
     assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == runtime_q.shape
-    # The public benchmark schema remains packed even though PrimTS receives
-    # the rank-4 multi-query form.
+    assert run_kwargs["validate"] is False
+    # The wrapper receives unpacked queries and returns the benchmark's packed view.
     assert benchmark_outputs[0].shape == (6, 2, 128)
 
 
@@ -670,27 +746,30 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     assert wrapper.constructor_call == ((), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    assert plan_args[0].shape == (2, 1)
-    assert plan_args[1].tolist() == [16, 16]
-    assert plan_args[2:] == (2, 512, 64, 16)
+    assert plan_args == (torch.device("cpu"), 2, 2, 512, 64, 16, 16)
+    workspace_buffer = plan_kwargs.pop("workspace_buffer")
+    assert workspace_buffer.dtype == torch.int8
     assert plan_kwargs == {
-        "seq_len_q": 3,
+        "max_seq_len_q": 3,
+        "packed_query": False,
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
         "mask_type": "causal",
-        "max_kv_len": 16,
     }
 
     run_args, run_kwargs = wrapper.run_calls[0]
-    runtime_q, runtime_kv_cache = run_args
+    runtime_q, runtime_kv_cache, runtime_block_tables, runtime_seq_lens = run_args
     assert runtime_q.shape == (2, 3, 2, 576)
     assert runtime_kv_cache.shape == (2, 16, 576)
     assert runtime_kv_cache.is_contiguous()
+    assert runtime_block_tables.shape == (2, 1)
+    assert runtime_seq_lens.tolist() == [16, 16]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(192))
     assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == (2, 3, 2, 512)
     assert run_kwargs["out"].dtype == torch.bfloat16
+    assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == (6, 2, 512)
 
 

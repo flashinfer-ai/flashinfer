@@ -2,8 +2,8 @@
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA context/prefill
 kernel used by FlashInfer's experimental Blackwell APIs. One implementation
-serves fixed contiguous, packed-ragged contiguous, and packed-query paged-KV
-attention with MHA or GQA.
+serves fixed contiguous, packed contiguous with uniform or ragged request
+lengths, and packed-query paged-KV attention with MHA or GQA.
 
 The public API exposes attention semantics, not scheduling controls. Contiguous
 and paged plans select a nonpersistent, static-persistent, or CLC-persistent
@@ -11,11 +11,12 @@ launch from logical work, task topology, live-metadata requirements, causal
 domain structure, and GPU capacity. Paired, live-ragged, and zero-offset
 triangular contiguous domains use CLC. Immutable single-instance
 bottom-right-offset domains launch directly within one resident wave and use
-static persistence above one wave. Single-instance uniform causal paged plans
-use static persistence: zero-offset triangular domains run a heavy-first
-raster, while bottom-right-offset or windowed domains keep sequence-local
-order. A positive causal left window selects an internal head-paired GQA
-mapping; other cases use the query-paired mapping.
+static persistence above one wave. Paged causal plans use CLC under the default
+dynamic-length contract; an explicit exact-uniform contract permits a static
+schedule where the remaining topology allows it. Dense paged plans select a
+direct or persistent launch from their logical work and topology. A positive
+causal left window selects an internal head-paired GQA mapping; other cases use
+the query-paired mapping.
 
 ## Public APIs
 
@@ -23,22 +24,32 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchPrefillTSWrapper` | Reusable fixed or packed-ragged contiguous Q/K/V plan. |
-| `batch_prefill` | One-shot fixed or packed-ragged contiguous attention. |
+| `BatchPrefillTSWrapper` | Reusable fixed or packed contiguous Q/K/V plan. |
+| `batch_prefill` | One-shot fixed or packed contiguous attention. |
 | `BatchPrefillPagedTSWrapper` | Reusable packed-Q, paged-K/V plan. |
 | `batch_prefill_with_paged_kv_cache` | One-shot packed-Q, paged-K/V attention. |
 
 These experimental context entry points are not currently registered with
-`fi_trace`; tracing support is limited to the PrimTS decode APIs.
+`fi_trace`. This exclusion is specific to context and does not limit tracing
+support for other PrimTS APIs.
 
-Planning validates static geometry, reads cumulative metadata when needed, and
-may compile. The `run()` host path does not copy metadata values to the host or
-synchronize. Packed contiguous plans retain `qo_indptr` and `kv_indptr` as
-live inputs; general ragged kernels reload their values on every run, while a
-uniform packed plan may compile its fixed offsets into the specialization.
-General ragged paged kernels reload the retained `qo_indptr`; uniform paged
-plans may compile those fixed offsets into the specialization. Both execute
-against the K/V lengths and page table translated and snapshotted by `plan()`.
+Both reusable wrappers use a static-spec lifecycle. `plan()` receives only
+device, capacity, head, dtype, mask, window, and default-scale information. The
+contiguous plan also freezes its `packed` storage-mode choice (`False` for fixed
+BSHD, `True` for packed THD); the paged plan additionally receives page size
+and optional `uniform_packed_lengths` / `has_q_offset` metadata contracts.
+Neither plan retains Q/K/V tensors or request metadata. Every `run()` supplies
+the current tensors and metadata: packed
+contiguous offsets, per-token variable-window bounds for fixed-shape inputs, or
+paged Q offsets, fixed page-table rows, and K/V lengths. Both wrappers own
+one-element device tensors for their default softmax and output scales.
+Contiguous variable-window plans additionally own mutable scratch that reduces
+only the start bounds to per-CTA minima; end bounds remain per-token. Paged
+plans own no workspace beyond the default scale tensors. Runtime validation is
+enabled by default and may read metadata back to the host. `validate=False`
+skips those checks for a previously validated steady state or CUDA Graph
+launch; the caller then owns every dtype, device, shape, stride, alignment,
+value, aliasing, and lifetime obligation in the runtime contract.
 
 ## Supported contract
 
@@ -49,10 +60,10 @@ against the K/V lengths and page table translated and snapshotted by `plan()`.
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
 | Q/K/V dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
-| Contiguous storage | Fixed BSHD or packed-ragged THD |
+| Contiguous storage | Fixed BSHD or packed THD with uniform or ragged request lengths |
 | Paged storage | Packed Q plus separate compact HND K/V page pools |
 | Page size | 16, 32, 64, or 128 tokens |
-| Mask | Dense or bottom-right causal |
+| Mask | Dense or bottom-right causal; fixed contiguous also supports variable-window bounds |
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state |
@@ -61,19 +72,24 @@ Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
-one. Causal attention requires `Sq <= Sk` for every request, both when the plan
-is created and after any live cumulative-offset update. All tensor extents and
-packed request lengths must be positive. Total logical Q and K extents—
-`B*Sq`/`B*Sk` for fixed storage and `total_q`/`total_k` for packed storage—must
-be at most `2**31 - 256`; this coordinate-representation limit reserves 255
-values for the padded tail of the largest supported 256-row query work tile.
+one. Causal attention requires `Sq <= Sk` for every request at run time. All
+tensor extents and packed request lengths must be positive. For each contiguous
+run, the aggregate logical Q and K extents—`B*Sq` and `B*Sk` for fixed storage,
+or `total_q` and `total_k` for packed storage—must each be at most
+`2**31 - 256`. Paged runs apply that limit only to `total_q`. At plan time,
+contiguous `B*max_seq_len_q` and `B*max_kv_len` must each satisfy the same cap;
+paged plans cap only `B*max_seq_len_q`. This coordinate-representation limit
+reserves 255 values for the padded tail of the largest supported 256-row query
+work tile.
 
 Q, K, V, and `out` must be compact, 16-byte-aligned CUDA tensors on one
-device. Metadata must be compact CUDA `torch.int32` on that device and at
-least 4-byte aligned. A caller-provided `out` must not overlap Q, K, V, or any
-metadata retained by the plan. The launch conservatively rejects overlapping
-storage spans. The API returns O only; rowwise LSE and other softmax state
-remain internal to the kernel.
+device. Cumulative offsets, sequence lengths, and variable-window bounds must
+be compact CUDA `torch.int32` tensors on that device and at least 4-byte
+aligned. `block_tables` instead permits the row-strided layout documented
+below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
+or plan-owned scale/scratch storage. The launch conservatively rejects
+overlapping storage spans. The API returns O only; rowwise LSE and other
+softmax state remain internal to the kernel.
 
 ## Tensor and metadata layouts
 
@@ -90,15 +106,24 @@ Paged inputs:
 
 - Q/O: `[total_q, Hq, D]`.
 - Separate K and V pools: `[num_pages, Hkv, page_size, D]`.
-- FlashInfer CSR metadata: `qo_indptr[B + 1]`,
-  `paged_kv_indptr[B + 1]`, `paged_kv_indices[num_used_pages]`, and
-  `paged_kv_last_page_len[B]`, all compact CUDA `int32` tensors.
+- Wrapper and one-shot metadata: `qo_indptr[B + 1]`, `block_tables[B, C]`, and
+  `seq_lens_kv[B]`, all CUDA `int32`.
+- `block_tables` has unit column stride and a row stride at least `C`; compact
+  `[B, C]` storage and padded views such as `[B, 2, C][:, 0, :]` are both
+  accepted. `C` must be at least `ceil(max_kv_len / page_size)`.
+  `seq_lens_kv` defines each row's active prefix and partial tail. Entries
+  after `ceil(seq_lens_kv[b] / page_size)` are padding and are never
+  dereferenced, so they need not contain valid page IDs. K and V pools use the
+  same physical page IDs.
 - Physical page IDs may be arbitrary, repeated, and nonidentity ordered.
 
-Every cumulative-offset vector starts at zero and increases strictly.
-`qo_indptr[-1]` equals `total_q`, `paged_kv_indptr[-1]` equals the number of
-page-index entries, every page ID indexes the physical cache, and each last
-page length is in `[1, page_size]`.
+Every cumulative-offset vector starts at zero and increases strictly. For
+packed contiguous runs, `qo_indptr[-1]` equals `total_q`, `kv_indptr[-1]`
+equals `total_k`, each Q delta is at most `max_seq_len_q`, and each K/V delta
+is at most `max_kv_len`. For paged runs, `qo_indptr[-1]` equals `total_q`, each
+Q delta is at most `max_seq_len_q`, and each `seq_lens_kv` value is at most
+`max_kv_len`. All deltas and lengths are positive, and every page ID selected
+for an active page indexes the physical cache.
 
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
@@ -106,40 +131,51 @@ most `W` preceding keys. `sm_scale` defaults to `1 / sqrt(D)` and
 `output_scale` defaults to 1; supplied scales must be finite, positive, and
 representable as positive `float32` values.
 
-The host reads cumulative metadata once during planning to establish the
-static geometry and maximum Q/K capacities. For packed contiguous attention,
-the plan keeps `qo_indptr` and `kv_indptr` as live device inputs; their storage
-must remain valid and stable. Their values may change between runs while
-preserving the planned batch, zero starting offsets, final packed extents,
-strictly positive deltas, and these per-request capacity bounds. Each capacity
-is the corresponding global plan maximum,
-`max_b(Sq_plan[b])` or `max_b(Sk_plan[b])`, and applies independently to every
-runtime request:
+For packed contiguous attention, planning fixes only static capacities and
+compile-time semantics. Every run supplies `qo_indptr` and `kv_indptr`; their
+values and packed tensor totals may change between runs while preserving the
+exact planned batch, zero starting offsets, matching terminal tensor extents,
+strictly positive deltas, and these per-request capacity bounds:
 
 ```text
 0 < Sq[b] <= planned max_seq_len_q
-0 < Sk[b] <= planned max_seq_len_k
+0 < Sk[b] <= planned max_kv_len
 ```
 
 Every causal replay must additionally satisfy `Sq[b] <= Sk[b]`. The
-request-local bottom-right offset `Sk[b] - Sq[b]` may change; it is derived
-from the live offsets. Fixed totals plus the per-request capacity bounds force
-plan-time uniform Q or K lengths to remain unchanged. In particular, when a
-dense plan compiles away request-local K-tail masking because every K length
-equals the same 128-row-aligned maximum, the replay conditions preserve that
-specialization.
+request-local bottom-right offset `Sk[b] - Sq[b]` may change and is derived
+from the live offsets. Fixed variable-window plans likewise receive current
+`[B, max_seq_len_q]` inclusive start/end bounds on every run. Only the start
+bounds are reduced to per-CTA minima; end bounds remain per-token inputs. The
+contiguous wrapper owns the mutable scratch used for that start reduction.
 
-Paged planning keeps `qo_indptr` as a live device input, but snapshots and
-translates `paged_kv_indptr`, `paged_kv_indices`, and
-`paged_kv_last_page_len`. Live Q offsets may change while preserving the
-planned batch, a zero starting offset, the final packed-Q extent, strictly
-positive deltas, and `Sq[b] <= planned max_seq_len_q`. For a causal plan, every
-live `Sq[b]` must also be no greater than that request's snapshotted `Sk[b]`.
-The kernel derives the request-local causal offset from those live Q and
-snapshotted K lengths; there is no separate replay restriction on the maximum
-offset. Changing any paged K/V metadata value requires another `plan()` call.
-The `run()` host path trusts live offset values; violating this replay contract
-can produce incorrect results or out-of-bounds access.
+Paged wrapper planning fixes static capacities and one compile-time metadata
+contract. The conservative defaults, `uniform_packed_lengths=False` and
+`has_q_offset=True`, allow each run to provide different valid Q offsets,
+block-table rows, K/V lengths, and physical page IDs without another plan. The
+batch remains exact; Q deltas stay positive and within `max_seq_len_q`, K/V
+lengths stay within `max_kv_len`, and the final Q offset matches the packed Q/O
+extent. For causal attention, every per-run `Sq[b]` is no greater than `Sk[b]`.
+
+`uniform_packed_lengths=True` is a caller promise that every Q delta equals
+`max_seq_len_q` and every K/V length equals `max_kv_len`.
+`has_q_offset=False` is a separate causal promise that `Sq[b] == Sk[b]` for
+every request; dense attention ignores and canonicalizes this flag. These
+promises compile exactly one narrower specialization rather than a runtime
+choice between kernels. Re-plan before changing a promise. The one-shot paged
+API already reads the metadata and derives the tightest valid flags for its
+temporary plan.
+
+With the default `validate=True`, `run()` checks tensor structure, shapes,
+dtypes, devices, scales, output, aliasing, page-table strides, sequence
+lengths, and active page IDs. Those metadata checks read device values back to
+the host and may synchronize. `validate=False` skips validation and host
+readback; callers using that path must enforce every dtype, device, shape,
+stride, alignment, value, aliasing, lifetime, and selected plan-promise
+obligation because invalid offsets, lengths, page IDs, or false compile-time
+promises can produce incorrect results or out-of-bounds access.
+CUDA Graph capture requires `validate=False` plus stable tensor shapes,
+strides, and addresses, although values may change between completed replays.
 
 ## Dataflow and source map
 
@@ -166,7 +202,7 @@ is not a user-selectable tuning parameter.
 
 | Source | Responsibility |
 | --- | --- |
-| [`../../context.py`](../../context.py) | Public validation, metadata translation, automatic scheduling, JIT caching, and launch adaptation |
+| [`../../context.py`](../../context.py) | Public validation, automatic scheduling, JIT caching, and plan/run adaptation |
 | [`fmha_kernel.py`](fmha_kernel.py) | Unified TS kernel and task graph construction |
 | [`fmha_tasks.py`](fmha_tasks.py) | Load, MMA, softmax, correction, epilogue, page-offset, and scheduler work |
 | [`fmha_resources.py`](fmha_resources.py) | GMEM/SMEM/TMEM resources and pipelines |
@@ -188,7 +224,18 @@ k = torch.randn(B, Sk, Hkv, D, device=device, dtype=torch.bfloat16)
 v = torch.randn_like(k)
 
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(q, k, v, mask_type="causal")
+wrapper.plan(
+    device=q.device,
+    batch_size=B,
+    max_seq_len_q=Sq,
+    max_kv_len=Sk,
+    num_qo_heads=Hq,
+    num_kv_heads=Hkv,
+    head_dim=D,
+    q_dtype=q.dtype,
+    kv_dtype=k.dtype,
+    mask_type="causal",
+)
 out = wrapper.run(q, k, v)
 assert out.shape == q.shape
 ```
@@ -197,12 +244,12 @@ Packed Q with a paged K/V cache:
 
 ```python
 import torch
-from flashinfer.attention.prims_ts import batch_prefill_with_paged_kv_cache
+from flashinfer.attention.prims_ts import BatchPrefillPagedTSWrapper
 
 device = "cuda"
 B, Hq, Hkv, D, page_size = 2, 8, 2, 128, 32
-q_lens, kv_pages = (32, 48), (2, 3)
-num_pages = sum(kv_pages)
+q_lens, kv_lens = (32, 48), (64, 80)
+num_pages = 5
 
 q = torch.randn(sum(q_lens), Hq, D, device=device, dtype=torch.float16)
 k_cache = torch.randn(
@@ -210,29 +257,45 @@ k_cache = torch.randn(
 )
 v_cache = torch.randn_like(k_cache)
 qo_indptr = torch.tensor((0, 32, 80), device=device, dtype=torch.int32)
-paged_kv_indptr = torch.tensor((0, 2, 5), device=device, dtype=torch.int32)
-paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
-paged_kv_last_page_len = torch.tensor(
-    (32, 16), device=device, dtype=torch.int32
+block_tables = torch.tensor(
+    ((0, 1, -1), (2, 3, 4)), device=device, dtype=torch.int32
 )
+seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
-out = batch_prefill_with_paged_kv_cache(
+wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+wrapper.plan(
+    device=q.device,
+    batch_size=B,
+    max_seq_len_q=max(q_lens),
+    max_kv_len=max(kv_lens),
+    num_qo_heads=Hq,
+    num_kv_heads=Hkv,
+    head_dim=D,
+    q_dtype=q.dtype,
+    kv_dtype=k_cache.dtype,
+    out_dtype=q.dtype,
+    page_size=page_size,
+    mask_type="causal",
+)
+out = wrapper.run(
     q,
     k_cache,
     v_cache,
     qo_indptr,
-    paged_kv_indptr,
-    paged_kv_indices,
-    paged_kv_last_page_len=paged_kv_last_page_len,
-    page_size=page_size,
-    mask_type="causal",
+    block_tables,
+    seq_lens_kv,
 )
 assert out.shape == q.shape
 ```
 
-For CUDA graph capture, call `plan()` and perform a warm-up `run()` first, keep
-all planned tensors at stable addresses, and pass a preallocated,
-non-overlapping `out`.
+For CUDA graph capture, call `plan()` and perform one default-validating
+`run()` first. Capture subsequent calls with `validate=False`, keep every
+run-time tensor shape, stride, and address stable, preserve any explicit
+`uniform_packed_lengths` / `has_q_offset` promises, and pass a preallocated,
+non-overlapping `out`. Callers must keep storage unmodified until queued work
+completes. Before running on a CUDA stream that is not already ordered after the
+planning stream, the caller must establish that dependency. Keep the wrapper and
+all captured runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 
@@ -243,9 +306,15 @@ non-overlapping `out`.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
 - Attention sinks, custom masks, and mixed Q/K/V dtypes are not exposed.
-- Re-plan after changing paged K/V metadata values. Live packed offsets may be
-  updated only within their plan-time Q/K capacities, packed extents, and
-  per-request causal contract.
+- Re-plan either wrapper after changing a static capacity, head or dtype
+  geometry, mask, window, or default scale; page size and explicit metadata
+  promises are also static for paged plans. Request tensors and metadata may
+  change between completed runs while remaining within the static plan and its
+  promises.
+- A variable-window wrapper owns mutable CTA-minimum scratch, so its launches
+  must not overlap across streams or captured graphs. Replanning either wrapper
+  replaces plan-owned tensors and invalidates graphs captured from the prior
+  plan; finish all prior launches and replays before replanning.
 
 ## Validation
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,8 +67,15 @@ on ``plan()`` state, pass the live bound method to the module-level helper:
     )
 
     # BatchDecodePagedTSWrapper retains packed-query mode and output dtype in
-    # plan state, so its live instance is required.
-    defn = fi_trace(ts_wrapper.run, q=q_tensor, paged_kv_cache=(k, v))
+    # its frozen plan state, so its live instance is required. Runtime request
+    # metadata remains explicit and required by both run() and fi_trace().
+    defn = fi_trace(
+        ts_wrapper.run,
+        q=q_tensor,
+        paged_kv_cache=(k, v),
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+    )
 
 Both modes support an optional ``save_dir`` argument / env-var to control
 where the JSON file is written.  Explicit ``save_dir`` always writes; the

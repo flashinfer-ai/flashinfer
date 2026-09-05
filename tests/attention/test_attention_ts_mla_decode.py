@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compact public-interface acceptance coverage for PrimTS MLA decode."""
+"""Public-interface acceptance coverage for PrimTS MLA decode."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 import inspect
 import math
+from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
@@ -42,7 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
-    batch_decode_mla_with_paged_kv_cache,
+    batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
@@ -63,8 +64,8 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
     make_throughput_latency_mla_config,
 )
 from flashinfer.mla import (
-    get_prims_ts_batch_decode_mla_workspace_size,
-    prims_ts_batch_decode_with_kv_cache_mla,
+    get_prims_ts_batch_mla_decode_workspace_size,
+    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -306,6 +307,33 @@ def _pack_mla_case(
         [case.query[batch_idx, :q_len] for batch_idx, q_len in enumerate(q_lens)]
     ).contiguous()
     return replace(case, query=packed_query), qo_indptr
+
+
+def _with_trt_plane0_block_tables(
+    case: _MLACase,
+) -> tuple[_MLACase, torch.Tensor, int]:
+    """Expose K-plane metadata with TRT's two-plane row stride and an offset."""
+
+    batch_size, columns = case.block_tables.shape
+    storage = torch.empty(
+        1 + batch_size * 2 * columns,
+        dtype=torch.int32,
+        device=case.block_tables.device,
+    )
+    trt_block_offsets = storage[1:].view(batch_size, 2, columns)
+    trt_block_offsets[:, 0].copy_(case.block_tables)
+    used_pages = set(int(page) for row in case.block_tables.tolist() for page in row)
+    poison_page = next(
+        page for page in range(int(case.kv_cache.shape[0])) if page not in used_pages
+    )
+    trt_block_offsets[:, 1].fill_(poison_page)
+    block_tables = trt_block_offsets[:, 0]
+    assert block_tables.shape == case.block_tables.shape
+    assert block_tables.stride() == (2 * columns, 1)
+    assert block_tables.storage_offset() == 1
+    assert block_tables.data_ptr() % 4 == 0
+    assert block_tables.data_ptr() % 16 != 0
+    return replace(case, block_tables=block_tables), trt_block_offsets, poison_page
 
 
 def _gather_request_cache(case: _MLACase, batch_idx: int) -> torch.Tensor:
@@ -689,35 +717,42 @@ def _plan_case(
     num_heads = int(
         case.query.shape[1] if qo_indptr is not None else case.query.shape[2]
     )
+    resolved_max_seq_len_q = (
+        int(case.query.shape[1])
+        if qo_indptr is None and max_seq_len_q is None
+        else max_seq_len_q
+    )
+    if resolved_max_seq_len_q is None:
+        raise ValueError("packed plan coverage requires max_seq_len_q")
     wrapper.plan(
-        case.block_tables,
-        case.seq_lens,
+        case.query.device,
+        int(case.block_tables.shape[0]),
         num_heads,
         _LATENT_DIM,
         _ROPE_DIM,
         case.page_size,
-        qo_indptr=qo_indptr,
-        max_seq_len_q=(
-            int(case.query.shape[1])
-            if qo_indptr is None and max_seq_len_q is None
-            else max_seq_len_q
-        ),
+        case.max_seq_len,
+        max_seq_len_q=resolved_max_seq_len_q,
+        packed_query=qo_indptr is not None,
         q_data_type=case.query.dtype,
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
-        max_kv_len=case.max_seq_len,
     )
     return wrapper
 
 
-def _run_case(wrapper, case, *, out=None):
+def _run_case(wrapper, case, *, qo_indptr=None, out=None, validate=True):
     return wrapper.run(
         case.query,
         case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        qo_indptr=qo_indptr,
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
         out=out,
+        validate=validate,
     )
 
 
@@ -735,7 +770,7 @@ def _run_standalone(
     if resolved_max_seq_len_q is None:
         raise ValueError("packed standalone coverage requires max_seq_len_q")
     num_heads = int(case.query.shape[1] if packed_query else case.query.shape[2])
-    workspace_size = get_prims_ts_batch_decode_mla_workspace_size(
+    workspace_size = get_prims_ts_batch_mla_decode_workspace_size(
         case.block_tables.shape[0],
         num_heads,
         _LATENT_DIM,
@@ -773,7 +808,7 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_decode_with_kv_cache_mla(
+    result = prims_ts_batch_mla_decode_with_kv_cache(
         case.query,
         case.kv_cache,
         workspace,
@@ -795,7 +830,8 @@ def _run_standalone(
 
 
 def _policy_dict(wrapper) -> dict[str, object]:
-    policy = dict(wrapper._policy)
+    assert wrapper._plan_state is not None
+    policy = dict(wrapper._plan_state.policy)
     assert policy["source"] == "auto"
     return policy
 
@@ -900,7 +936,7 @@ def _exercise_public_paths(
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
-    eager = _run_case(wrapper, case)
+    eager = _run_case(wrapper, case, qo_indptr=qo_indptr)
     _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
     if not exercise_all_paths:
         return eager
@@ -916,7 +952,13 @@ def _exercise_public_paths(
     graph_out = torch.full_like(eager, float("nan"))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_case(wrapper, case, out=graph_out)
+        captured = _run_case(
+            wrapper,
+            case,
+            qo_indptr=qo_indptr,
+            out=graph_out,
+            validate=False,
+        )
     assert captured is graph_out
     graph_out.fill_(float("nan"))
     graph.replay()
@@ -1077,6 +1119,7 @@ def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
         query=torch.empty(8),
         normalized_cache=torch.empty(8),
         out=torch.empty(8),
+        num_physical_pages=1,
         bmm1_scale=1.0,
         bmm2_scale=1.0,
     )
@@ -1089,9 +1132,9 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.__init__,
         BatchMLADecodePagedTSWrapper.plan,
         BatchMLADecodePagedTSWrapper.run,
-        batch_decode_mla_with_paged_kv_cache,
-        get_prims_ts_batch_decode_mla_workspace_size,
-        prims_ts_batch_decode_with_kv_cache_mla,
+        batch_mla_decode_with_paged_kv_cache,
+        get_prims_ts_batch_mla_decode_workspace_size,
+        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1120,14 +1163,193 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     assert violations == []
 
 
+def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
+    """Keep request metadata out of construction and static planning."""
+
+    init_parameters = inspect.signature(
+        BatchMLADecodePagedTSWrapper.__init__
+    ).parameters
+    assert tuple(init_parameters) == ("self",)
+
+    plan_parameters = inspect.signature(BatchMLADecodePagedTSWrapper.plan).parameters
+    assert tuple(plan_parameters) == (
+        "self",
+        "device",
+        "batch_size",
+        "num_heads",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "page_size",
+        "max_kv_len",
+        "max_seq_len_q",
+        "packed_query",
+        "q_data_type",
+        "kv_data_type",
+        "o_data_type",
+        "mask_type",
+        "workspace_buffer",
+    )
+    for name in (
+        "device",
+        "batch_size",
+        "num_heads",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "page_size",
+        "max_kv_len",
+        "max_seq_len_q",
+        "packed_query",
+        "q_data_type",
+        "kv_data_type",
+        "o_data_type",
+    ):
+        assert plan_parameters[name].default is inspect.Parameter.empty
+    for request_metadata in (
+        "block_tables",
+        "seq_lens",
+        "qo_indptr",
+    ):
+        assert request_metadata not in plan_parameters
+
+    run_parameters = inspect.signature(BatchMLADecodePagedTSWrapper.run).parameters
+    assert tuple(run_parameters) == (
+        "self",
+        "query",
+        "kv_cache",
+        "block_tables",
+        "seq_lens",
+        "qo_indptr",
+        "bmm1_scale",
+        "bmm2_scale",
+        "out",
+        "validate",
+    )
+    assert run_parameters["block_tables"].default is inspect.Parameter.empty
+    assert run_parameters["seq_lens"].default is inspect.Parameter.empty
+    assert run_parameters["qo_indptr"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["validate"].default is True
+
+
+def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
+    monkeypatch,
+):
+    """Keep plan publication atomic and compilation after workspace checks."""
+
+    events = []
+    policy = (("source", "auto"), ("split_kv", 1))
+    spec = mla_decode_module._MLADecodeLaunchSpec(
+        kernel=object(),
+        policy=policy,
+        kernel_workspace_bytes=0,
+        split_kv=1,
+    )
+    original_bind = mla_decode_module._bind_mla_workspace
+
+    def resolve_device(device):
+        assert device == "cuda:0"
+        return torch.device("cpu"), 0
+
+    def resolve_spec(*args):
+        events.append("spec")
+        return spec
+
+    def validate_workspace(workspace_buffer, *, device, required_bytes):
+        assert workspace_buffer.device == device
+        assert workspace_buffer.numel() >= required_bytes
+        events.append("validate_workspace")
+
+    def bind_workspace(workspace_buffer, layout):
+        events.append("bind_workspace")
+        return original_bind(workspace_buffer, layout)
+
+    def compile_plan(*args):
+        assert events == ["spec", "validate_workspace", "bind_workspace"]
+        events.append("compile")
+        return lambda *launch_args: None
+
+    monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
+    monkeypatch.setattr(
+        mla_decode_module, "_resolve_mla_decode_launch_spec", resolve_spec
+    )
+    monkeypatch.setattr(
+        mla_decode_module, "_validate_workspace_buffer", validate_workspace
+    )
+    monkeypatch.setattr(mla_decode_module, "_bind_mla_workspace", bind_workspace)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_make_mla_decode_compile_spec",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(mla_decode_module, "_get_compiled_mla_decode", compile_plan)
+
+    workspace = torch.empty(256, dtype=torch.int8)
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda:0",
+        1,
+        8,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        _DEFAULT_PAGE_SIZE,
+        32,
+        max_seq_len_q=1,
+        packed_query=False,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+        workspace_buffer=workspace,
+    )
+
+    assert events == ["spec", "validate_workspace", "bind_workspace", "compile"]
+    assert tuple(vars(wrapper)) == ("_plan_state",)
+    state = wrapper._plan_state
+    assert state is not None
+    with pytest.raises(FrozenInstanceError):
+        state.batch_size = 2
+
+    def fail_replan(*args):
+        raise RuntimeError("replan failed")
+
+    monkeypatch.setattr(
+        mla_decode_module, "_resolve_mla_decode_launch_spec", fail_replan
+    )
+    with pytest.raises(RuntimeError, match="replan failed"):
+        wrapper.plan(
+            "cuda:0",
+            1,
+            8,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            32,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            workspace_buffer=workspace,
+        )
+    assert wrapper._plan_state is state
+
+
 def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
-    """Trace packed-Q shapes from the live MLA wrapper plan state."""
+    """Trace packed-Q shapes from the immutable MLA wrapper plan state."""
     from flashinfer.fi_trace import fi_trace
 
     wrapper = BatchMLADecodePagedTSWrapper()
     query = torch.empty((5, 8, 576), dtype=torch.bfloat16)
     kv_cache = torch.empty((9, 32, 576), dtype=torch.bfloat16)
-    kwargs = {"query": query, "kv_cache": kv_cache}
+    block_tables = torch.empty((2, 1), dtype=torch.int32)
+    seq_lens = torch.empty((2,), dtype=torch.int32)
+    qo_indptr = torch.tensor((0, 2, 5), dtype=torch.int32)
+    kwargs = {
+        "query": query,
+        "kv_cache": kv_cache,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "qo_indptr": qo_indptr,
+    }
 
     with pytest.raises(
         ValueError,
@@ -1137,8 +1359,20 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
         fi_trace(wrapper.run, **kwargs)
 
-    wrapper._planned = True
-    wrapper._packed_query = True
+    wrapper._plan_state = SimpleNamespace(
+        packed_query=True,
+        mask_type="causal",
+        max_seq_len_q=3,
+        max_kv_len=64,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+    )
+    for required_name in ("block_tables", "seq_lens", "qo_indptr"):
+        incomplete_kwargs = dict(kwargs)
+        incomplete_kwargs.pop(required_name)
+        with pytest.raises(ValueError, match=required_name):
+            fi_trace(wrapper.run, **incomplete_kwargs)
+
     defn = fi_trace(wrapper.run, **kwargs)
     assert defn["name"].startswith("prims_ts_decode_mla_wrapper_packed_q")
     assert defn["inputs"]["query"]["shape"] == [
@@ -1151,7 +1385,14 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
         "num_heads",
         "kv_lora_rank",
     ]
-    assert defn["axes"]["kv_lora_rank"]["type"] == "var"
+    assert defn["axes"]["kv_lora_rank"] == {
+        "type": "const",
+        "value": _LATENT_DIM,
+        "description": "Latent K/V rank frozen by plan().",
+    }
+    assert defn["axes"]["max_seq_len_q"]["value"] == 3
+    assert defn["axes"]["max_kv_len"]["value"] == 64
+    assert "mask:causal" in defn["tags"]
 
 
 def test_attention_ts_mla_output_guard_covers_every_live_allocation():
@@ -1236,7 +1477,62 @@ def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
 def test_attention_ts_mla_run_requires_plan():
     wrapper = BatchMLADecodePagedTSWrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
-        wrapper.run(None, None)
+        wrapper.run(None, None, None, None)
+
+
+def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
+    monkeypatch,
+):
+    """Leave validation outside compiled and captured MLA run regions."""
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        device=torch.device("cpu"),
+        batch_size=1,
+        num_heads=8,
+        max_seq_len_q=1,
+        packed_query=False,
+        page_size=32,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        workspace_buffer=torch.empty(8),
+        kv_lora_rank=_LATENT_DIM,
+        split_kv=1,
+        workspace_views=object(),
+        compiled=object(),
+    )
+    runtime = _empty_mla_runtime()
+    sentinel = torch.empty(1)
+
+    def fail_validation(*args, **kwargs):
+        pytest.fail("validate=False must bypass explicit runtime validators")
+
+    def prepare_runtime(*args, **kwargs):
+        assert kwargs["validate"] is False
+        return runtime
+
+    def launch(*args, **kwargs):
+        return sentinel
+
+    monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
+    monkeypatch.setattr(
+        mla_decode_module, "_validate_mla_run_metadata", fail_validation
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_tensor_does_not_overlap_inputs",
+        fail_validation,
+    )
+    monkeypatch.setattr(
+        mla_decode_module, "_validate_mla_output_aliasing", fail_validation
+    )
+    monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
+
+    tensor = torch.empty(1)
+    assert wrapper.run(tensor, tensor, tensor, tensor, validate=False) is sentinel
+    with pytest.raises(TypeError, match="validate must be a bool"):
+        wrapper.run(tensor, tensor, tensor, tensor, validate=0)
 
 
 def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
@@ -1394,7 +1690,7 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
     """Workspace policy resolution rejects unsafe bounds before CUDA work."""
 
     with pytest.raises(NotImplementedError, match=r"padded MLA K/V coordinates"):
-        get_prims_ts_batch_decode_mla_workspace_size(
+        get_prims_ts_batch_mla_decode_workspace_size(
             1,
             8,
             _LATENT_DIM,
@@ -1407,7 +1703,7 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
         NotImplementedError,
         match=r"batch_size \* max_seq_len_q \* num_heads must fit",
     ):
-        get_prims_ts_batch_decode_mla_workspace_size(
+        get_prims_ts_batch_mla_decode_workspace_size(
             1,
             2,
             _LATENT_DIM,
@@ -1442,6 +1738,42 @@ def test_attention_ts_mla_public_interfaces_reject_output_alias():
         _run_standalone(case, out=aliased_out)
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_block_table_stride_contract():
+    """Accept padded rows and reject non-unit inner or overlapping strides."""
+
+    device = torch.device("cuda")
+    batch_size, columns = 2, 3
+    seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    compact = torch.zeros((batch_size, columns), dtype=torch.int32, device=device)
+    padded_storage = torch.zeros(
+        1 + batch_size * 2 * columns, dtype=torch.int32, device=device
+    )
+    padded = padded_storage[1:].view(batch_size, 2, columns)[:, 0]
+
+    assert mla_decode_module._validate_mla_metadata(compact, seq_lens)[1:] == (
+        batch_size,
+        columns,
+    )
+    assert mla_decode_module._validate_mla_metadata(padded, seq_lens)[1:] == (
+        batch_size,
+        columns,
+    )
+
+    non_unit_inner = torch.zeros(
+        (columns, batch_size), dtype=torch.int32, device=device
+    ).transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous within each row"):
+        mla_decode_module._validate_mla_metadata(non_unit_inner, seq_lens)
+
+    overlapping = torch.zeros(
+        columns + batch_size, dtype=torch.int32, device=device
+    ).as_strided((batch_size, columns), (columns - 1, 1))
+    with pytest.raises(ValueError, match="rows must not overlap"):
+        mla_decode_module._validate_mla_metadata(overlapping, seq_lens)
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "max_kv_len", "message"),
     (
@@ -1453,25 +1785,69 @@ def test_attention_ts_mla_public_interfaces_reject_output_alias():
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_plan_rejects_invalid_kv_lengths(
+def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
     seq_lens,
     max_kv_len,
     message,
 ):
-    """Validate every planned MLA K/V length and its explicit static bound."""
+    """Validate every runtime MLA K/V length against the static plan bound."""
 
     device = torch.device("cuda")
     block_tables = torch.zeros((2, 3), dtype=torch.int32, device=device)
-    planned_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    runtime_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    query = torch.empty((2, 1, 8, _QK_DIM), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty(
+        (1, _DEFAULT_PAGE_SIZE, _QK_DIM), dtype=torch.bfloat16, device=device
+    )
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper.plan(
+        device,
+        2,
+        8,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        _DEFAULT_PAGE_SIZE,
+        max_kv_len,
+        max_seq_len_q=1,
+        packed_query=False,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+    )
     with pytest.raises(ValueError, match=message):
-        BatchMLADecodePagedTSWrapper().plan(
+        wrapper.run(
+            query,
+            kv_cache,
             block_tables,
-            planned_seq_lens,
-            8,
-            _LATENT_DIM,
-            _ROPE_DIM,
-            _DEFAULT_PAGE_SIZE,
-            max_kv_len=max_kv_len,
+            runtime_seq_lens,
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_run_rejects_invalid_active_page_id():
+    """Validate every active page reference against runtime cache storage."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=8,
+        max_seq_len=32,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=20260901,
+    )
+    invalid_block_tables = case.block_tables.clone()
+    invalid_block_tables[0, 0] = int(case.kv_cache.shape[0])
+    wrapper = _plan_case(case)
+    with pytest.raises(
+        ValueError,
+        match=r"block_tables values.*physical K/V cache.*invalid page ID",
+    ):
+        wrapper.run(
+            case.query,
+            case.kv_cache,
+            invalid_block_tables,
+            case.seq_lens,
         )
 
 
@@ -1490,8 +1866,7 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
     qo_indptr = (
         torch.tensor([0, 5, 6], dtype=torch.int32, device=device) if packed_q else None
     )
-    seq_len_q = None if packed_q else 8
-    max_seq_len_q = 5 if packed_q else None
+    max_seq_len_q = 5 if packed_q else 8
     query = torch.empty(
         (6, 8, _QK_DIM) if packed_q else (2, 8, 8, _QK_DIM),
         dtype=torch.bfloat16,
@@ -1500,22 +1875,32 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
     kv_cache = torch.empty((2, page_size, _QK_DIM), dtype=torch.bfloat16, device=device)
     match = r"request 0 has Q=(5|8) and K/V=4"
 
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper.plan(
+        device,
+        2,
+        8,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        page_size,
+        16,
+        max_seq_len_q=max_seq_len_q,
+        packed_query=packed_q,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+        mask_type="causal",
+    )
     with pytest.raises(ValueError, match=match):
-        BatchMLADecodePagedTSWrapper().plan(
+        wrapper.run(
+            query,
+            kv_cache,
             block_tables,
             seq_lens,
-            8,
-            _LATENT_DIM,
-            _ROPE_DIM,
-            page_size,
-            seq_len_q=seq_len_q,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
-            mask_type="causal",
-            max_kv_len=16,
         )
     with pytest.raises(ValueError, match=match):
-        batch_decode_mla_with_paged_kv_cache(
+        batch_mla_decode_with_paged_kv_cache(
             query,
             kv_cache,
             block_tables,
@@ -1544,7 +1929,7 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_decode_with_kv_cache_mla(
+        prims_ts_batch_mla_decode_with_kv_cache(
             case.query,
             case.kv_cache,
             workspace,
@@ -1612,8 +1997,9 @@ def test_attention_ts_mla_fp8_fully_masked_split_partials(
     wrapper = _plan_case(case)
     policy = _policy_dict(wrapper)
     _assert_auto_policy(policy, expected_policy, device=case.query.device)
+    assert wrapper._plan_state is not None
     assert (
-        wrapper._workspace_layout.kernel_workspace.byte_size
+        wrapper._plan_state.workspace_layout.kernel_workspace.byte_size
         == expected_kernel_workspace_bytes
     )
     _exercise_public_paths(wrapper, case, policy, exercise_all_paths=False)
@@ -1661,8 +2047,9 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
-    assert wrapper._packed_query is True
-    assert wrapper._max_seq_len_q == max_seq_len_q
+    assert wrapper._plan_state is not None
+    assert wrapper._plan_state.packed_query is True
+    assert wrapper._plan_state.max_seq_len_q == max_seq_len_q
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
         policy,
@@ -1682,7 +2069,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -1698,7 +2085,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
-    derived_bound_one_shot = batch_decode_mla_with_paged_kv_cache(
+    derived_bound_one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -1743,6 +2130,85 @@ def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
         max_seq_len_q=max_seq_len_q,
     )
     assert policy["source"] == "auto"
+
+
+@pytest.mark.parametrize("table_layout", ("compact", "trt-plane0"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
+    table_layout: str,
+):
+    """Reload compact or raw TRT page rows after eager and graph mutations."""
+
+    case = _make_mla_case(
+        batch_size=3,
+        num_qo_heads=8,
+        max_seq_len=129,
+        qkv_dtype=torch.bfloat16,
+        page_size=32,
+        device="cuda",
+        seed=32103,
+    )
+    assert case.block_tables.shape == (3, 5)
+    seq_lens_storage = torch.empty(
+        case.seq_lens.numel() + 1,
+        dtype=torch.int32,
+        device=case.seq_lens.device,
+    )
+    seq_lens = seq_lens_storage[1:]
+    seq_lens.copy_(case.seq_lens)
+    assert seq_lens.is_contiguous()
+    assert seq_lens.data_ptr() % 4 == 0
+    assert seq_lens.data_ptr() % 16 != 0
+    case = replace(case, seq_lens=seq_lens)
+    trt_block_offsets = None
+    poison_page = None
+    if table_layout == "trt-plane0":
+        case, trt_block_offsets, poison_page = _with_trt_plane0_block_tables(case)
+        case.kv_cache[poison_page].fill_(float("nan"))
+    else:
+        assert case.block_tables.is_contiguous()
+        assert case.block_tables.stride() == (5, 1)
+
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    initial = _run_case(wrapper, case).clone()
+    _assert_case_correct(initial, case, policy)
+    standalone = _run_standalone(case)
+    _assert_case_correct(standalone, case, policy)
+    torch.testing.assert_close(standalone, initial, rtol=0, atol=0)
+
+    case.block_tables.copy_(torch.roll(case.block_tables.clone(), 1, dims=0))
+    case.seq_lens.copy_(torch.roll(case.seq_lens.clone(), 1))
+    eager_mutated = _run_case(wrapper, case).clone()
+    _assert_case_correct(eager_mutated, case, policy)
+    assert not torch.allclose(
+        initial.float(), eager_mutated.float(), rtol=1e-3, atol=1e-3
+    )
+
+    graph_out = torch.full_like(eager_mutated, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out, validate=False)
+    assert captured is graph_out
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, eager_mutated, rtol=0, atol=0)
+
+    case.block_tables.copy_(torch.roll(case.block_tables.clone(), 1, dims=0))
+    case.seq_lens.copy_(torch.roll(case.seq_lens.clone(), 1))
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(graph_out, case, policy)
+    assert not torch.allclose(
+        graph_out.float(), eager_mutated.float(), rtol=1e-3, atol=1e-3
+    )
+
+    if trt_block_offsets is not None:
+        assert poison_page is not None
+        assert bool((trt_block_offsets[:, 1] == poison_page).all().item())
 
 
 @pytest.mark.parametrize(
@@ -1834,7 +2300,7 @@ def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
     graph_out = torch.full_like(eager, float("nan"))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_case(wrapper, case, out=graph_out)
+        captured = _run_case(wrapper, case, out=graph_out, validate=False)
     assert captured is graph_out
 
     graph_out.fill_(float("nan"))
@@ -1897,13 +2363,19 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
         device=case.query.device,
     )
 
-    eager = _run_case(wrapper, case).clone()
+    eager = _run_case(wrapper, case, qo_indptr=qo_indptr).clone()
     _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
 
     graph_out = torch.full_like(eager, float("nan"))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_case(wrapper, case, out=graph_out)
+        captured = _run_case(
+            wrapper,
+            case,
+            qo_indptr=qo_indptr,
+            out=graph_out,
+            validate=False,
+        )
     assert captured is graph_out
     graph_out.fill_(float("nan"))
     graph.replay()
@@ -2072,11 +2544,15 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
             max_seq_len_q=1 if packed_query else None,
         )
         policy = _policy_dict(wrapper)
-        output = _run_case(wrapper, case)
+        output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
         wrappers.append(wrapper)
 
-    assert wrappers[0]._compiled is wrappers[1]._compiled
+    first_state = wrappers[0]._plan_state
+    second_state = wrappers[1]._plan_state
+    assert first_state is not None
+    assert second_state is not None
+    assert first_state.compiled is second_state.compiled
 
 
 @pytest.mark.parametrize(
@@ -2374,7 +2850,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,
@@ -2424,11 +2900,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     with pytest.raises(
         ValueError, match="max_seq_len_q is required for an all-empty packed query"
     ):
-        _plan_case(case, qo_indptr=qo_indptr)
-    with pytest.raises(
-        ValueError, match="max_seq_len_q is required for an all-empty packed query"
-    ):
-        batch_decode_mla_with_paged_kv_cache(
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
             case.block_tables,
@@ -2454,7 +2926,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
         dtype=case.output_dtype,
         device=case.query.device,
     )
-    eager = _run_case(wrapper, case, out=eager_out)
+    eager = _run_case(wrapper, case, qo_indptr=qo_indptr, out=eager_out)
     assert eager is eager_out
     _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
 
@@ -2466,7 +2938,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     _assert_case_correct(standalone, case, policy, qo_indptr=qo_indptr)
 
     one_shot_out = torch.empty_like(eager)
-    one_shot = batch_decode_mla_with_paged_kv_cache(
+    one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
         case.block_tables,

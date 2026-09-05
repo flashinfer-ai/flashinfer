@@ -1,12 +1,15 @@
 {
-  "name": "prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "Reusable PrimTS GQA decode wrapper. Native CSR metadata, Q offsets, mask, window, and static bounds are retained by plan(); run() receives only Q, the HND cache, scales, and an optional output buffer.",
+  "name": "prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32",
+  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. Every run supplies a fixed row-strided page table and K/V lengths; packed-Q runs also supply Q offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
-    "status:experimental"
+    "status:experimental",
+    "mask:causal",
+    "kv-prefix-mode:dynamic",
+    "kv-lengths-mode:dynamic"
   ],
   "axes": {
     "batch_size": {
@@ -17,6 +20,36 @@
       "type": "const",
       "value": 4,
       "description": "Fixed query length per request."
+    },
+    "max_seq_len_q": {
+      "type": "const",
+      "value": 4,
+      "description": "Query-length capacity frozen by plan()."
+    },
+    "max_kv_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "K/V-length capacity frozen by plan()."
+    },
+    "causal": {
+      "type": "const",
+      "value": 1,
+      "description": "One for a causal plan and zero for a dense plan."
+    },
+    "window_left": {
+      "type": "const",
+      "value": -1,
+      "description": "Sliding-window extent frozen by plan()."
+    },
+    "planned_full_kv_prefix": {
+      "type": "const",
+      "value": 0,
+      "description": "Whether plan() compiled the full-prefix specialization."
+    },
+    "planned_uniform_max_kv_lengths": {
+      "type": "const",
+      "value": 0,
+      "description": "Whether plan() compiled uniform maximum K/V lengths."
     },
     "num_qo_heads": {
       "type": "const",
@@ -38,9 +71,13 @@
       "type": "const",
       "value": 32
     },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Physical page-table capacity per request."
+    },
     "len_qo_indptr": {
       "type": "var",
-      "description": "Length of plan-owned cumulative Q offsets."
+      "description": "Length of cumulative Q offsets."
     }
   },
   "constraints": [
@@ -48,7 +85,9 @@
     "page_size in (16, 32, 64, 128)",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
-    "window_left == -1 or mask_type == 'causal'",
+    "max_pages_per_seq * page_size >= max(seq_lens)",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_kv_len",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -79,28 +118,28 @@
       ],
       "dtype": "bfloat16"
     },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32",
+      "description": "Required fixed row-strided physical page table supplied to run()."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Required per-request KV lengths supplied to run()."
+    },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Cumulative Q offsets retained by plan()."
-    },
-    "max_seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "mask_type": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
-    },
-    "window_left": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
+      "description": "Cumulative Q offsets required by a packed-Q run."
     },
     "bmm1_scale": {
       "shape": null,
@@ -111,6 +150,12 @@
       "shape": null,
       "dtype": "float32",
       "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "Whether to validate per-run tensors and metadata values."
     }
   },
   "outputs": {
