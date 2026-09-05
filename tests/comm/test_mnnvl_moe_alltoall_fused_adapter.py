@@ -695,7 +695,9 @@ def test_kernel_preload_cache_is_per_kernel_and_device_without_hot_device_query(
     assert "auto stream = get_stream(payload.device());" in adapter_source
     assert "CHECK_DEVICE(payload, workspace);" in adapter_source
     assert "cachedSmVersionForDevice(payload.device().device_id)" in combine_source
-    assert "std::array<std::once_flag, kMaxCachedCudaDevices>" in capability_cache_source
+    assert (
+        "std::array<std::once_flag, kMaxCachedCudaDevices>" in capability_cache_source
+    )
     assert "std::call_once(initialized[deviceId]" in capability_cache_source
     assert "cudaDevAttrComputeCapabilityMajor" in capability_cache_source
     assert "cudaDevAttrComputeCapabilityMinor" in capability_cache_source
