@@ -53,7 +53,6 @@ struct alignas(128) DescriptorWorkspace {
   TensorMap input_compact_p32;
   TensorMap input_compact_q8;
   TensorMap input_compact_q4;
-  TensorMap input_compact_q3;
   TensorMap input_compact_p1_c64;
   TensorMap input_id40_ptail_c64;
   TensorMap input_id40_qtail_c64;
@@ -64,7 +63,7 @@ struct alignas(128) DescriptorWorkspace {
 };
 
 static_assert(sizeof(TensorMap) == 128);
-static_assert(sizeof(DescriptorWorkspace) == 13 * sizeof(TensorMap));
+static_assert(sizeof(DescriptorWorkspace) == 12 * sizeof(TensorMap));
 
 enum class LaunchPart : int { kAll = 0, kMain = 1, kAuxiliary = 2 };
 

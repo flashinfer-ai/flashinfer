@@ -179,6 +179,8 @@ __global__ void general_m64n128_d1_c32_micro_kernel(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(compact_q4 ? input_compact_q4_map
+                                                        : input_c32_map);
     constexpr uint32_t b_bytes =
         kM64N128MicroSemanticRows * 32 * sizeof(Element);
     uint32_t transfer_bytes =

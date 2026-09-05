@@ -29,12 +29,11 @@ enum InputMapMask : uint32_t {
   kInputCompactP32 = 1u << 2,
   kInputCompactQ8 = 1u << 3,
   kInputCompactQ4 = 1u << 4,
-  kInputCompactQ3 = 1u << 5,
-  kInputCompactP1C64 = 1u << 6,
-  kInputId40PTailC64 = 1u << 7,
-  kInputId40QTailC64 = 1u << 8,
-  kInputM64 = 1u << 9,
-  kInputM64CompactQ4 = 1u << 10,
+  kInputCompactP1C64 = 1u << 5,
+  kInputId40PTailC64 = 1u << 6,
+  kInputId40QTailC64 = 1u << 7,
+  kInputM64 = 1u << 8,
+  kInputM64CompactQ4 = 1u << 9,
 };
 
 __device__ __forceinline__ void ReplaceTensorMapAddress(TensorMap* map, Element* input) {
@@ -60,7 +59,6 @@ __global__ void UpdateInputMapAddresses(DescriptorWorkspace* workspace, Element*
   if (mask & kInputCompactP32) ReplaceTensorMapAddress(&workspace->input_compact_p32, input);
   if (mask & kInputCompactQ8) ReplaceTensorMapAddress(&workspace->input_compact_q8, input);
   if (mask & kInputCompactQ4) ReplaceTensorMapAddress(&workspace->input_compact_q4, input);
-  if (mask & kInputCompactQ3) ReplaceTensorMapAddress(&workspace->input_compact_q3, input);
   if (mask & kInputCompactP1C64) ReplaceTensorMapAddress(&workspace->input_compact_p1_c64, input);
   if (mask & kInputId40PTailC64) ReplaceTensorMapAddress(&workspace->input_id40_ptail_c64, input);
   if (mask & kInputId40QTailC64) ReplaceTensorMapAddress(&workspace->input_id40_qtail_c64, input);
@@ -108,10 +106,9 @@ Status UpdateInputMaps(DescriptorWorkspace* workspace, Element* input, const Con
 
   uint32_t input_map_mask = 0;
   if (m128_tiles > 0) input_map_mask |= kInputM128;
-  if (use_hybrid_c64_c32 || use_hybrid_compact_c96) input_map_mask |= kInputHybridC32;
+  if (use_hybrid_c64_c32) input_map_mask |= kInputHybridC32;
   if (use_compact_spatial) input_map_mask |= kInputCompactP32 | kInputCompactQ8;
   if (use_compact_qtail_q2_single_launch) input_map_mask |= kInputCompactQ4;
-  if (use_hybrid_compact_c96) input_map_mask |= kInputCompactQ3;
   if (use_hybrid_compact_p1_c96) input_map_mask |= kInputCompactP1C64;
   if (use_m256_cluster_b_c64_exact_id40) {
     input_map_mask |= kInputId40PTailC64 | kInputId40QTailC64;
@@ -146,7 +143,6 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
   TensorMap* d_input_map_compact_p32 = &workspace->input_compact_p32;
   TensorMap* d_input_map_compact_q8 = &workspace->input_compact_q8;
   TensorMap* d_input_map_compact_q4 = &workspace->input_compact_q4;
-  TensorMap* d_input_map_compact_q3 = &workspace->input_compact_q3;
   TensorMap* d_input_map_compact_p1_c64 = &workspace->input_compact_p1_c64;
   TensorMap* d_input_map_id40_ptail_c64 = &workspace->input_id40_ptail_c64;
   TensorMap* d_input_map_id40_qtail_c64 = &workspace->input_id40_qtail_c64;
@@ -160,7 +156,6 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
   int q_tiles = use_hybrid_exact_w31 ? 1 : (opts.w + kOutQ - 1) / kOutQ;
   int p_tiles_m128 = (opts.h + kMainOutP - 1) / kMainOutP;
   int p_tiles_m64 = use_m64n128_d1_c32_micro ? (opts.h + kM64N128MicroOutP - 1) / kM64N128MicroOutP
-                    : use_m32_d1_c32_micro   ? (opts.h + kM32MicroOutP - 1) / kM32MicroOutP
                     : (use_m32_path || use_m64_p16) ? (opts.h + kM64P16OutP - 1) / kM64P16OutP
                                                     : (opts.h + kTailOutP - 1) / kTailOutP;
   int compact_spatial_tasks =
@@ -172,11 +167,9 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
                        (compact_p_tail > 0 ? compact_full_q_tiles : 0) +
                        (compact_q_tail > 0 ? (opts.h + kCompactQOutP - 1) / kCompactQOutP : 0));
   int m128_spatial_tasks = use_hybrid_compact_p1_c96 ? compact_full_q_tiles * compact_full_p_tiles
-                           : use_hybrid_compact_c96  ? hybrid_compact_q1_spatial_tasks
                                                      : compact_spatial_tasks;
-  dim3 grid_m128 = (use_compact_spatial || use_hybrid_compact_c96)
-                       ? dim3(m128_spatial_tasks, 1, opts.n * opts.d * m128_tiles)
-                       : dim3(q_tiles, p_tiles_m128, opts.n * opts.d * m128_tiles);
+  dim3 grid_m128 = use_compact_spatial ? dim3(m128_spatial_tasks, 1, opts.n * opts.d * m128_tiles)
+                                       : dim3(q_tiles, p_tiles_m128, opts.n * opts.d * m128_tiles);
   // The x dimension is expressed in physical CTAs.  clusterDim.x=2 binds
   // each adjacent pair to one logical spatial tile, while rank 0/1 select
   // adjacent M128 output-channel tiles (a logical M256 macro tile).
@@ -198,10 +191,6 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
       RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_hybrid_c96_exact_p15_cluster_a4_kernel,
                                                 cudaFuncAttributePreferredSharedMemoryCarveout,
                                                 cudaSharedmemCarveoutMaxShared));
-    } else if (use_hybrid_compact_c96) {
-      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(
-          general_m128n256_hybrid_c64_c32_b2a3_kernel<false, true, true>,
-          cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
     } else if (use_cluster_a_spatial_c64_k64) {
       RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(
           use_cluster_a_exact_n2d2   ? general_m128_cluster_a_spatial_c64_k64_kernel<4, true>
@@ -215,17 +204,9 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
           : use_cluster_a_group4 ? general_m128_cluster_a_spatial_c64_k64_kernel<4, false>
                                  : general_m128_cluster_a_spatial_c64_k64_kernel<2, false>,
           cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
-      if (use_split_cluster_a_compact_edges) {
-        RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_id18_p1_q1_compact_edge_kernel,
-                                                  cudaFuncAttributePreferredSharedMemoryCarveout,
-                                                  cudaSharedmemCarveoutMaxShared));
-      }
     } else if (use_hybrid_c64_c32) {
       if (use_hybrid_compact_p1_c96) {
         RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_hybrid_main_exact_h17_w840_kernel,
-                                                  cudaFuncAttributePreferredSharedMemoryCarveout,
-                                                  cudaSharedmemCarveoutMaxShared));
-        RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_hybrid_ptail1_exact_h17_w840_kernel,
                                                   cudaFuncAttributePreferredSharedMemoryCarveout,
                                                   cudaSharedmemCarveoutMaxShared));
       } else if (use_hybrid_exact_p15) {
@@ -364,13 +345,20 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
       }
     }
   }
-  if (m64_tiles > 0 && !use_c16_path && part != LaunchPart::kAuxiliary) {
-    if (use_m64n128_d1_c32_micro) {
-      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_m64n128_d1_c32_micro_kernel,
+  if (part != LaunchPart::kMain) {
+    if (use_split_cluster_a_compact_edges) {
+      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_id18_p1_q1_compact_edge_kernel,
                                                 cudaFuncAttributePreferredSharedMemoryCarveout,
                                                 cudaSharedmemCarveoutMaxShared));
-    } else if (use_m32_d1_c32_micro) {
-      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_m32n128_d1_c32_micro_kernel,
+    } else if (use_hybrid_compact_p1_c96) {
+      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_hybrid_ptail1_exact_h17_w840_kernel,
+                                                cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                cudaSharedmemCarveoutMaxShared));
+    }
+  }
+  if (m64_tiles > 0 && !use_c16_path && part != LaunchPart::kMain) {
+    if (use_m64n128_d1_c32_micro) {
+      RETURN_IF_CUDA_ERROR(cudaFuncSetAttribute(general_m64n128_d1_c32_micro_kernel,
                                                 cudaFuncAttributePreferredSharedMemoryCarveout,
                                                 cudaSharedmemCarveoutMaxShared));
     } else if (use_m32_d1_c128_shallow) {
@@ -418,13 +406,7 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
   }
   auto launch_main = [&](cudaStream_t stream) -> Status {
     if (m128_tiles > 0) {
-      if (use_hybrid_compact_c96) {
-        general_m128n256_hybrid_c64_c32_b2a3_kernel<false, true, true>
-            <<<grid_m128, kHybridC64C32Threads, 0, stream>>>(
-                d_input_map_m128, d_input_map_hybrid_c32, d_weight_map_m128, d_output, opts.n,
-                opts.d, opts.h, opts.w, c64_groups, c32_groups, opts.k, d_input_map_compact_q3,
-                compact_full_q_tiles, compact_full_p_tiles, compact_q_tail);
-      } else if (use_cluster_a_spatial_c64_k64) {
+      if (use_cluster_a_spatial_c64_k64) {
         cudaLaunchConfig_t config{};
         config.gridDim = grid_cluster_a_spatial;
         config.blockDim = dim3(kClusterBM256Threads, 1, 1);
@@ -693,9 +675,6 @@ Status Launch(DescriptorWorkspace* workspace, Element* input, Element* output,
             dim3(kM64N128MicroFullTasks + kM64N128MicroCompactTasks, 1, 1), kM64N128MicroThreads, 0,
             stream>>>(d_input_map_m64, d_input_map_m64_compact_q4, d_weight_map_m64, d_output,
                       opts.h, opts.w);
-      } else if (use_m32_d1_c32_micro) {
-        general_m32n128_d1_c32_micro_kernel<<<grid_m64, kM32MicroThreads, 0, stream>>>(
-            d_input_map_m64, d_weight_map_m64, d_output, opts.h, opts.w, opts.k);
       } else if (use_m32_d1_c128_shallow) {
         if (use_m32_d1_c128_shallow_cluster4) {
           cudaLaunchConfig_t config{};

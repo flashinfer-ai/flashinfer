@@ -148,6 +148,7 @@ __global__ void general_m64n256_k32_tail_kernel(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_map);
     constexpr uint32_t b_bytes_per_group =
         kTailSemanticRows * kK * sizeof(Element);
     constexpr uint32_t a_bytes =
@@ -477,6 +478,7 @@ __global__ void general_m64n256_k32_deep_b_c32_multi_issuer_tail_kernel(
 
   // Warp 0: unchanged B2 C32 activation producer.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     constexpr uint32_t b_bytes =
         kTailSemanticRows * 32 * sizeof(Element);
     int b_slot = 0;

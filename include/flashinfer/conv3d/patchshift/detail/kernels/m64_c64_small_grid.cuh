@@ -143,6 +143,7 @@ __global__ void general_m64n256_k64_p16_b2a6_c64_kernel(
   }
   __syncthreads();
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 64 * sizeof(Element);
     for (int macro = 0; macro < local_macros; ++macro) {

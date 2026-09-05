@@ -183,6 +183,7 @@ void general_m256_cluster_b_c32_kernel(
   // statically identical, so one local destination offset names both DSM
   // targets selected by mask 0b11.
   if (cluster_rank == 0 && wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 32 * sizeof(Element);
     constexpr uint16_t cluster_mask = 0x3u;

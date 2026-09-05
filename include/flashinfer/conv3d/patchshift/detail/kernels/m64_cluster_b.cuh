@@ -75,19 +75,15 @@ void general_m128_cluster_b_m64_p16_c64_kernel(
   int c32_groups_per_time = effective_c64_groups * 2;
   int full_k32_supergroups = kT * c32_groups_per_time;
 
-  if constexpr (!kExactDepth) {
-    constexpr int guard_rows = kMainBackingRows - kMainSemanticRows;
-    constexpr int guard_per_stage = guard_rows * 64;
-    for (int idx = int(threadIdx.x);
-         idx < 2 * guard_per_stage;
-         idx += int(blockDim.x)) {
-      int slot = idx / guard_per_stage;
-      int rest = idx - slot * guard_per_stage;
-      int row = kMainSemanticRows + rest / 64;
-      int kk = rest % 64;
-      shared.b_stage[slot].b[swizzled_b_c64_index(row, kk)] =
-          patchshift::element_from_float(0.0f);
-    }
+  constexpr int guard_rows = kMainBackingRows - kMainSemanticRows;
+  constexpr int guard_per_stage = guard_rows * 64;
+  for (int idx = int(threadIdx.x); idx < 2 * guard_per_stage; idx += int(blockDim.x)) {
+    int slot = idx / guard_per_stage;
+    int rest = idx - slot * guard_per_stage;
+    int row = kMainSemanticRows + rest / 64;
+    int kk = rest % 64;
+    shared.b_stage[slot].b[swizzled_b_c64_index(row, kk)] =
+        patchshift::element_from_float(0.0f);
   }
   if (threadIdx.x == 0) {
     shared.tmem_base = 0;
@@ -109,6 +105,7 @@ void general_m128_cluster_b_m64_p16_c64_kernel(
   cute::cluster_sync();
 
   if (cluster_rank == 0 && wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 64 * sizeof(Element);
     constexpr uint16_t b_cluster_mask = 0x3u;

@@ -42,8 +42,8 @@ def _require_sm100a(tensor: torch.Tensor) -> None:
         raise ValueError("PatchShift Conv3d currently requires SM100a/B200")
 
 
-class _PatchShiftConcurrencyState:
-    """Resources owned by one prepared descriptor workspace."""
+class _PatchShiftWorkspaceState:
+    """Pointer binding and optional concurrency resources for a workspace."""
 
     def __init__(
         self,
@@ -54,6 +54,15 @@ class _PatchShiftConcurrencyState:
         self.input_shape = tuple(input.shape)
         self.packed_weight_data_ptr = packed_weight.data_ptr()
         self.out_channels = out_channels
+        self.concurrent = False
+        self.main_stream: Optional[torch.cuda.Stream] = None
+        self.auxiliary_stream: Optional[torch.cuda.Stream] = None
+        self.fork_event: Optional[torch.cuda.Event] = None
+        self.main_done_event: Optional[torch.cuda.Event] = None
+        self.auxiliary_done_event: Optional[torch.cuda.Event] = None
+
+    def enable_concurrency(self, input: torch.Tensor) -> None:
+        self.concurrent = True
         self.main_stream = torch.cuda.Stream(device=input.device)
         self.auxiliary_stream = torch.cuda.Stream(device=input.device)
         self.fork_event = torch.cuda.Event(enable_timing=False)
@@ -72,7 +81,14 @@ class _PatchShiftConcurrencyState:
 
 
 def pack_patchshift_conv3d_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Prepack a BF16 ``[K, C, 3, 3, 3]`` weight for PatchShift Conv3d."""
+    """Prepack a BF16 ``[K, C, 3, 3, 3]`` weight for PatchShift Conv3d.
+
+    Args:
+        weight: Contiguous CUDA BF16 convolution weight in KCDHW layout.
+
+    Returns:
+        A one-dimensional packed weight tensor for :func:`patchshift_conv3d`.
+    """
     if weight.ndim != 5 or tuple(weight.shape[2:]) != (3, 3, 3):
         raise ValueError("weight must have shape [K, C, 3, 3, 3]")
     if not weight.is_cuda or weight.dtype is not torch.bfloat16:
@@ -93,7 +109,17 @@ def pack_patchshift_conv3d_weight(weight: torch.Tensor) -> torch.Tensor:
 def prepare_patchshift_conv3d(
     input: torch.Tensor, packed_weight: torch.Tensor, out_channels: int
 ) -> torch.Tensor:
-    """Prepare pointer-dependent TMA descriptors outside CUDA graph capture."""
+    """Prepare pointer-dependent TMA descriptors outside CUDA graph capture.
+
+    Args:
+        input: Contiguous CUDA BF16 input in NDHWC layout.
+        packed_weight: Weight returned by :func:`pack_patchshift_conv3d_weight`.
+        out_channels: Number of output channels in the original weight.
+
+    Returns:
+        An opaque descriptor workspace bound to ``packed_weight`` and the input
+        shape. The input storage pointer may change between executions.
+    """
     if not input.is_cuda or input.dtype is not torch.bfloat16 or input.ndim != 5:
         raise ValueError("input must be a contiguous CUDA BF16 NDHWC tensor")
     if not input.is_contiguous() or any(size <= 0 for size in input.shape):
@@ -118,10 +144,10 @@ def prepare_patchshift_conv3d(
         module.descriptor_workspace_size(), dtype=torch.uint8, device=input.device
     )
     module.prepare(workspace, input, packed_weight, out_channels)
+    state = _PatchShiftWorkspaceState(input, packed_weight, out_channels)
     if module.concurrency_mode(input, out_channels) != 0:
-        workspace._patchshift_conv3d_concurrency_state = (  # type: ignore[attr-defined]
-            _PatchShiftConcurrencyState(input, packed_weight, out_channels)
-        )
+        state.enable_concurrency(input)
+    workspace._patchshift_conv3d_state = state  # type: ignore[attr-defined]
     return workspace
 
 
@@ -151,14 +177,15 @@ def _check_patchshift_conv3d(
         raise ValueError("workspace must be uint8 on the input device")
     if workspace.ndim != 1 or not workspace.is_contiguous():
         raise ValueError("workspace must be a contiguous 1D tensor")
-    concurrency_state = getattr(workspace, "_patchshift_conv3d_concurrency_state", None)
-    if concurrency_state is not None:
-        if concurrency_state.input_shape != tuple(input.shape):
-            raise ValueError("workspace was prepared for a different input shape")
-        if concurrency_state.out_channels != out_channels:
-            raise ValueError("workspace was prepared for different output channels")
-        if concurrency_state.packed_weight_data_ptr != packed_weight.data_ptr():
-            raise ValueError("workspace was prepared for a different packed_weight")
+    state = getattr(workspace, "_patchshift_conv3d_state", None)
+    if state is None:
+        raise ValueError("workspace must be returned by prepare_patchshift_conv3d")
+    if state.input_shape != tuple(input.shape):
+        raise ValueError("workspace was prepared for a different input shape")
+    if state.out_channels != out_channels:
+        raise ValueError("workspace was prepared for different output channels")
+    if state.packed_weight_data_ptr != packed_weight.data_ptr():
+        raise ValueError("workspace was prepared for a different packed_weight")
     if out is not None:
         expected = (*input.shape[:-1], out_channels)
         if tuple(out.shape) != expected:
@@ -186,6 +213,18 @@ def patchshift_conv3d(
     ``input`` and the returned tensor use NDHWC layout. Call
     :func:`pack_patchshift_conv3d_weight` once per weight and
     :func:`prepare_patchshift_conv3d` once per input shape before capture.
+
+    Args:
+        input: Contiguous CUDA BF16 input in NDHWC layout.
+        packed_weight: Weight returned by :func:`pack_patchshift_conv3d_weight`.
+            It must be the same tensor used to prepare ``workspace``.
+        workspace: Opaque tensor returned by :func:`prepare_patchshift_conv3d`.
+        out_channels: Number of output channels in the original weight.
+        out: Optional contiguous CUDA BF16 output in NDHWK layout.
+
+    Returns:
+        The convolution output. When ``out`` is provided, the same tensor is
+        returned.
     """
     if out is None:
         out = torch.empty(
@@ -193,13 +232,11 @@ def patchshift_conv3d(
             dtype=input.dtype,
             device=input.device,
         )
-    concurrency_state = getattr(workspace, "_patchshift_conv3d_concurrency_state", None)
-    if concurrency_state is None:
+    state = getattr(workspace, "_patchshift_conv3d_state", None)
+    if state is None or not state.concurrent:
         _patchshift_conv3d_impl(out, input, packed_weight, workspace)
     else:
-        _patchshift_conv3d_concurrent(
-            out, input, packed_weight, workspace, concurrency_state
-        )
+        _patchshift_conv3d_concurrent(out, input, packed_weight, workspace, state)
     return out
 
 
@@ -208,10 +245,15 @@ def _patchshift_conv3d_concurrent(
     input: torch.Tensor,
     packed_weight: torch.Tensor,
     workspace: torch.Tensor,
-    state: _PatchShiftConcurrencyState,
+    state: _PatchShiftWorkspaceState,
 ) -> None:
     """Fork from and join back into the caller's current CUDA stream."""
     caller_stream = torch.cuda.current_stream(input.device)
+    assert state.fork_event is not None
+    assert state.main_stream is not None
+    assert state.auxiliary_stream is not None
+    assert state.main_done_event is not None
+    assert state.auxiliary_done_event is not None
     _patchshift_conv3d_update_impl(out, input, packed_weight, workspace)
     state.fork_event.record(caller_stream)
     state.main_stream.wait_event(state.fork_event)

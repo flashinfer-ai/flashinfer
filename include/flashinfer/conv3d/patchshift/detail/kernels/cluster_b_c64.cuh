@@ -270,6 +270,7 @@ void general_m256_cluster_b_c64_k64_kernel(
             ? input_id40_qtail_c64_map
             : (compact_id40_ptail ? input_id40_ptail_c64_map
                                   : input_c64_map);
+    patchshift::tma_descriptor_fence_acquire(selected_input_map);
     for (int macro = 0; macro < local_macros; ++macro) {
       int slot = macro % kK64C64B2A3K32ABRing;
       int seq = macro / kK64C64B2A3K32ABRing;

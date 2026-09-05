@@ -40,9 +40,10 @@ The standalone program packed weights and allocated TensorMap storage inside
 its process. A library API must instead make these lifetimes explicit:
 
 1. prepack a static logical weight once;
-2. allocate descriptor workspace owned by the caller or an explicit plan;
-3. rebuild pointer-dependent input/weight TensorMaps when tensor addresses
-   change;
+2. allocate descriptor workspace owned by the caller or an explicit plan and
+   bind it to that packed-weight storage;
+3. update pointer-dependent input TensorMaps when the input address changes,
+   and prepare a new workspace before changing the packed-weight address;
 4. preserve caller-stream ordering for every launch, including routes whose
    disjoint main and auxiliary tiles execute on plan-owned internal streams;
 5. perform no hidden synchronization or process termination in the hot launch.
@@ -91,5 +92,6 @@ The Python API separates static and dynamic work:
 3. `patchshift_conv3d(input, packed_weight, workspace, K)` performs the hot,
    CUDA-graph-capturable launch.
 
-The TVM-FFI binding validates dtype, layout, device, packed-buffer size,
-workspace alignment, and exact compute capability 10.0 before dispatch.
+The public API validates dtype, layout, device, packed-buffer size, workspace
+alignment, packed-weight identity, and exact compute capability 10.0 before
+dispatch.

@@ -96,6 +96,8 @@ void general_hybrid_c96_exact_p15_cluster_a4_kernel(
   // Every rank publishes its own spatial activation tile.  The local
   // completion barrier decouples B-slot reuse from slower peers.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     for (int macro = 0; macro < local_macros; ++macro) {
       int slot = macro % kHybridC64C32BStages;
       int seq = macro / kHybridC64C32BStages;

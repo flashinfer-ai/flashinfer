@@ -47,6 +47,8 @@ def _reference(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         ((1, 4, 16, 30, 96), 128),
         ((1, 2, 17, 31, 128), 160),
         ((1, 3, 64, 120, 128), 192),
+        ((1, 2, 128, 120, 128), 128),
+        ((1, 3, 128, 120, 128), 128),
     ],
 )
 def test_patchshift_conv3d_matches_torch(shape, out_channels):
@@ -85,7 +87,7 @@ def test_patchshift_conv3d_concurrent_out_caller_stream_and_cuda_graph():
     out = torch.empty((*shape[:-1], out_channels), dtype=input.dtype, device="cuda")
     consumed = torch.empty_like(out)
 
-    assert hasattr(workspace, "_patchshift_conv3d_concurrency_state")
+    assert workspace._patchshift_conv3d_state.concurrent
 
     caller_stream = torch.cuda.Stream()
     with torch.cuda.stream(caller_stream):
@@ -119,6 +121,30 @@ def test_patchshift_conv3d_concurrent_out_caller_stream_and_cuda_graph():
     )
 
 
+@pytest.mark.parametrize(
+    "shape,out_channels",
+    [
+        ((1, 1, 16, 30, 32), 64),
+        ((1, 2, 17, 31, 128), 160),
+    ],
+)
+def test_patchshift_conv3d_reuses_workspace_with_new_input_pointer(shape, out_channels):
+    torch.manual_seed(2)
+    prepared_input = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    replacement_input = torch.randn_like(prepared_input)
+    weight = torch.randn(
+        (out_channels, shape[-1], 3, 3, 3), dtype=torch.bfloat16, device="cuda"
+    )
+    packed_weight = pack_patchshift_conv3d_weight(weight)
+    workspace = prepare_patchshift_conv3d(prepared_input, packed_weight, out_channels)
+
+    for input in (replacement_input, prepared_input, replacement_input):
+        actual = patchshift_conv3d(input, packed_weight, workspace, out_channels)
+        torch.testing.assert_close(
+            actual, _reference(input, weight), rtol=2e-2, atol=2e-2
+        )
+
+
 def test_patchshift_conv3d_rejects_invalid_input_channels():
     input = torch.empty((1, 1, 2, 2, 7), dtype=torch.bfloat16, device="cuda")
     packed_weight = torch.empty(1, dtype=torch.bfloat16, device="cuda")
@@ -136,3 +162,19 @@ def test_patchshift_conv3d_rejects_input_output_alias():
 
     with pytest.raises(ValueError, match="must not alias"):
         patchshift_conv3d(input, packed_weight, workspace, 8, out=input)
+
+
+def test_patchshift_conv3d_rejects_workspace_with_different_packed_weight():
+    shape = (1, 1, 8, 8, 8)
+    input = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    first_weight = torch.randn((32, 8, 3, 3, 3), dtype=torch.bfloat16, device="cuda")
+    second_weight = torch.randn_like(first_weight)
+    first_packed = pack_patchshift_conv3d_weight(first_weight)
+    second_packed = pack_patchshift_conv3d_weight(second_weight)
+    workspace = prepare_patchshift_conv3d(input, first_packed, 32)
+
+    with pytest.raises(ValueError, match="different packed_weight"):
+        patchshift_conv3d(input, second_packed, workspace, 32)
+
+    with pytest.raises(ValueError, match="returned by prepare_patchshift_conv3d"):
+        patchshift_conv3d(input, first_packed, workspace.detach(), 32)

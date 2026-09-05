@@ -89,6 +89,7 @@ void general_m32n256_d1_c128_shallow_c64_kernel(
   }
   // D1 with pad1 consumes only td=1. C128 is exactly two C64 macros.
   if ((!ClusterK4 || cluster_rank == 0) && wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 64 * sizeof(Element);
 #pragma unroll

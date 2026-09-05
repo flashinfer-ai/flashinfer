@@ -124,6 +124,7 @@ __global__ void general_m64n256_k32_p16_b2a3_c32_kernel(
   // Warp 0: B2 activation producer.  Slot reuse waits for both the final MMA
   // completion and explicit observation of that generation by the A producer.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     constexpr uint32_t b_bytes =
         kM64P16SemanticRows * 32 * sizeof(Element);
     for (int sg = 0; sg < local_supergroups; ++sg) {
@@ -529,6 +530,7 @@ __global__ void general_m32n256_k32_p16_b2a3_c32_kernel(
 
   // Warp 0 publishes one compact P18xQ32xC32 B tile into a two-stage ring.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     constexpr uint32_t b_bytes =
         kM64P16SemanticRows * 32 * sizeof(Element);
     for (int sg = 0; sg < local_supergroups; ++sg) {

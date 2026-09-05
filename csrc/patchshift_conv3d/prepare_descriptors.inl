@@ -47,8 +47,8 @@ Status PrepareDescriptors(DescriptorWorkspace* workspace, Element* input, Elemen
 
   int supergroup_count = patchshift::Supergroups(problem.c);
   if (m128_tiles > 0) {
-    bool use_c64_map = use_cluster_a_spatial_c64_k64 || use_hybrid_compact_c96 ||
-                       use_hybrid_c64_c32 || use_m256_cluster_b_c64_k64 || use_k64_c64_b2a3_k32a;
+    bool use_c64_map = use_cluster_a_spatial_c64_k64 || use_hybrid_c64_c32 ||
+                       use_m256_cluster_b_c64_k64 || use_k64_c64_b2a3_k32a;
     int input_p = use_hybrid_cluster_a4_exact_p15 ? kHybridExactP15InputP : kMainInputP;
     if (use_c64_map) {
       RETURN_IF_DRIVER_ERROR(MakeInputC64Map(&host_workspace.input_m128, input, problem.n,
@@ -74,7 +74,7 @@ Status PrepareDescriptors(DescriptorWorkspace* workspace, Element* input, Elemen
                                              problem.d, problem.h, problem.w, problem.c,
                                              kId40CompactPitch, kId40CompactInputP));
     }
-    if (use_hybrid_c64_c32 || use_hybrid_compact_c96) {
+    if (use_hybrid_c64_c32) {
       RETURN_IF_DRIVER_ERROR(MakeInputC32Map(&host_workspace.input_hybrid_c32, input, problem.n,
                                              problem.d, problem.h, problem.w, problem.c, kPitch,
                                              input_p));
@@ -94,11 +94,6 @@ Status PrepareDescriptors(DescriptorWorkspace* workspace, Element* input, Elemen
                                                problem.d, problem.h, problem.w, problem.c,
                                                kCompactQ2Pitch, kCompactQ2InputP));
       }
-    }
-    if (use_hybrid_compact_c96) {
-      RETURN_IF_DRIVER_ERROR(MakeInputC32Map(&host_workspace.input_compact_q3, input, problem.n,
-                                             problem.d, problem.h, problem.w, problem.c,
-                                             kCompactQ1Pitch, kCompactQ1InputP));
     }
     if (use_hybrid_compact_p1_c96) {
       RETURN_IF_DRIVER_ERROR(MakeInputC64Map(&host_workspace.input_compact_p1_c64, input, problem.n,
@@ -120,9 +115,7 @@ Status PrepareDescriptors(DescriptorWorkspace* workspace, Element* input, Elemen
       RETURN_IF_DRIVER_ERROR(MakeInputMap(&host_workspace.input_m64, input, problem.n, problem.d,
                                           problem.h, problem.w, problem.c, kPitch, kTailInputP));
     } else {
-      int input_p = use_m32_d1_c32_micro            ? kM32MicroInputP
-                    : (use_m32_path || use_m64_p16) ? kM64P16InputP
-                                                    : kTailInputP;
+      int input_p = (use_m32_path || use_m64_p16) ? kM64P16InputP : kTailInputP;
       RETURN_IF_DRIVER_ERROR(MakeInputC32Map(&host_workspace.input_m64, input, problem.n, problem.d,
                                              problem.h, problem.w, problem.c, kPitch, input_p));
     }

@@ -311,6 +311,7 @@ __global__ void general_m128n256_k32_deep_ilp_kernel(
   // the final MMA commit and the A producer's explicit observation of every
   // A-row lifetime from the old supergroup.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_map);
     constexpr uint32_t b_bytes_per_group =
         kMainSemanticRows * kK * sizeof(Element);
     int b_slot = 0;
@@ -1044,6 +1045,7 @@ __device__ __forceinline__ void run_compact_spatial_cta(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_map);
     uint32_t b_bytes =
         uint32_t(semantic_rows * 32 * int(sizeof(Element)));
     for (int sg = 0; sg < local_supergroups; ++sg) {
@@ -1291,6 +1293,7 @@ __device__ __forceinline__ void run_compact_ptail1_cta(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_map);
     constexpr uint32_t b_bytes =
         kCompactPTail1SemanticRows * 32 * sizeof(Element);
     for (int sg = 0; sg < local_supergroups; ++sg) {
@@ -1653,6 +1656,7 @@ __global__ void general_m128n256_k32_deep_b_c32_kernel(
 
   // Warp 0: exactly one P18xQ32xC32 activation transaction per sg.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 32 * sizeof(Element);
     int b_slot = 0;

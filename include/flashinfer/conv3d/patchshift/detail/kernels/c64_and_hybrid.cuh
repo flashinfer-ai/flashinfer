@@ -180,6 +180,7 @@ __global__ void general_m128n256_k64_c64_b2a3_k32a_kernel(
   // slot overlaps the next macro without increasing the activation command
   // count back to the two C32 publications used by the retained path.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 64 * sizeof(Element);
     for (int macro = 0; macro < local_macros; ++macro) {
@@ -766,6 +767,8 @@ __device__ __forceinline__ void run_hybrid_ptail1_cta(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     for (int macro = 0; macro < local_macros; ++macro) {
       int slot = macro % kHybridC64C32BStages;
       int seq = macro / kHybridC64C32BStages;
@@ -1268,6 +1271,8 @@ void general_hybrid_main_exact_h17_w840_kernel(
   __syncthreads();
 
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     for (int macro = 0; macro < local_macros; ++macro) {
       int slot = macro & 1;
       int seq = macro >> 1;
@@ -1569,6 +1574,8 @@ __global__ void general_m128n256_hybrid_c64_c32_b2a3_kernel(
   // tail. B2 reuse waits until the A producer has observed the old macro's
   // final K32 half, independent of whether that macro had two halves or one.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
+    patchshift::tma_descriptor_fence_acquire(input_c32_map);
     for (int macro = 0; macro < local_macros; ++macro) {
       int slot = macro % kHybridC64C32BStages;
       int seq = macro / kHybridC64C32BStages;

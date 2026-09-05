@@ -43,7 +43,6 @@ namespace patchshift = ::flashinfer::conv3d::patchshift;
 #include <flashinfer/conv3d/patchshift/detail/kernels/m32_d1_shallow_c64.cuh>
 #include <flashinfer/conv3d/patchshift/detail/kernels/m64_c64_small_grid.cuh>
 #include <flashinfer/conv3d/patchshift/detail/kernels/m64_cluster_b.cuh>
-#include <flashinfer/conv3d/patchshift/detail/kernels/micro_d1.cuh>
 #include <flashinfer/conv3d/patchshift/detail/kernels/m64n128_micro_d1.cuh>
 
 }  // namespace flashinfer::conv3d::patchshift::detail

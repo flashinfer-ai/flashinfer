@@ -174,6 +174,7 @@ void general_m128_cluster_a_spatial_c64_k64_kernel(
   // Both ranks load their own spatial activation tile.  B2 slot reuse waits
   // for the cluster-wide completion of the old macro's last half/row.
   if (wid == 0 && lane == 0) {
+    patchshift::tma_descriptor_fence_acquire(input_c64_map);
     constexpr uint32_t b_bytes =
         kMainSemanticRows * 64 * sizeof(Element);
     for (int macro = 0; macro < local_macros; ++macro) {

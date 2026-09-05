@@ -164,15 +164,12 @@ bool use_cluster_a_exact_n2d4 = use_cluster_a_spatial_c64_k64 && opts.n == 2 && 
 bool use_cluster_a_exact_id18 = use_split_cluster_a_compact_edges;
 bool use_hybrid_exact_w31 =
     opts.n == 1 && opts.d == 4 && opts.c == 96 && opts.k == 128 && opts.h == 512 && opts.w == 31;
-bool use_hybrid_compact_c96 = false;
 bool use_m32_p16 = opts.k == kM32P16M && opts.c > kK;
 bool use_m64n128_d1_c32_micro =
     opts.n == 1 && opts.d == 1 && opts.h == 64 && opts.w == 64 && opts.c == 32 && opts.k == 64;
-bool use_m32_d1_c32_micro = !use_m64n128_d1_c32_micro && opts.n == 1 && opts.d == 1 &&
-                            opts.h == 64 && opts.w == 64 && opts.c == 32 && opts.k == 64;
-bool use_m32_multi_p16 = !use_cluster_a_spatial_c64_k64 && !use_hybrid_compact_c96 &&
-                         !use_m64_d3_small_grid && !use_m64n128_d1_c32_micro && !use_m32_p16 &&
-                         !use_exact_m32_tail && opts.c > kK&& opts.k % kM32P16M == 0 &&
+bool use_m32_multi_p16 = !use_cluster_a_spatial_c64_k64 && !use_m64_d3_small_grid &&
+                         !use_m64n128_d1_c32_micro && !use_m32_p16 && !use_exact_m32_tail &&
+                         opts.c > kK&& opts.k % kM32P16M == 0 &&
                          opts.k <= kMainM&& m32_p16_total_ctas <= 128;
 bool use_m32_path = use_m32_p16 || use_exact_m32_tail || use_m32_multi_p16;
 // Preserve the M32 tile count selected above while consuming aligned C64
@@ -186,9 +183,8 @@ bool use_m32_d1_c128_shallow_exact =
     use_m32_d1_c128_shallow && opts.h % kM32P16OutP == 0 && opts.w % kOutQ == 0;
 bool use_m32_d1_c128_shallow_cluster4 =
     use_m32_d1_c128_shallow_exact && opts.h == 128 && opts.w == 120;
-bool use_m64_p16 = !use_padded_m256 && !use_cluster_a_spatial_c64_k64 && !use_hybrid_compact_c96 &&
-                   !use_m32_path && !use_c16_path &&
-                   (m64_p16_total_ctas <= 128 || use_m64_d3_small_grid);
+bool use_m64_p16 = !use_padded_m256 && !use_cluster_a_spatial_c64_k64 && !use_m32_path &&
+                   !use_c16_path && (m64_p16_total_ctas <= 128 || use_m64_d3_small_grid);
 bool use_m64_p16_c64 = use_m64_p16 && opts.c % 64 == 0;
 bool use_m64_p16_c64_exact =
     use_m64_p16_c64 && opts.h % kM64P16OutP == 0 && opts.w % kOutQ == 0 && opts.k % kTailM == 0;
@@ -235,8 +231,8 @@ int64_t spatial_partial_ctas = spatial_total_ctas - spatial_full_ctas;
 bool compact_tail_fits = compact_p_tail <= kCompactPOutP && compact_q_tail <= 6 &&
                          (compact_p_tail > 0 || compact_q_tail > 0);
 bool compact_tail_fraction_at_least_ten_percent = spatial_partial_ctas * 10 >= spatial_total_ctas;
-bool use_compact_spatial = !use_hybrid_compact_c96 && !use_hybrid_exact_w31 && !use_m32_path &&
-                           !use_c16_path && opts.k % kMainM == 0 && m128_tiles > 0 &&
+bool use_compact_spatial = !use_hybrid_exact_w31 && !use_m32_path && !use_c16_path &&
+                           opts.k % kMainM == 0 && m128_tiles > 0 &&
                            compact_tail_fits&& compact_tail_fraction_at_least_ten_percent;
 
 // Replace only a one-row P edge whose width has no Q tail.  Both kernels
@@ -282,9 +278,6 @@ bool use_compact_qtail_q2_single_launch = use_compact_spatial && compact_q_tail 
                                           compact_q2_tail_tasks < ordinary_compact_q_tail_tasks;
 bool use_compact_ptail1_single_launch =
     use_compact_ptail1_wave_path || (use_compact_qtail_q2_single_launch && q2_combines_p1);
-int hybrid_compact_q1_tail_tasks = (opts.h + kCompactQ1OutP - 1) / kCompactQ1OutP;
-int hybrid_compact_q1_spatial_tasks =
-    compact_full_q_tiles * compact_full_p_tiles + hybrid_compact_q1_tail_tasks;
 bool use_exact_p15_full_q_m128 = !use_compact_spatial && use_partial_m128_epilogue &&
                                  opts.h == 15 && opts.w % kOutQ == 0 && opts.k % kMainM == 0 &&
                                  m128_tiles > 0 && m64_tiles == 0;
@@ -306,7 +299,7 @@ bool use_hybrid_compact_p1_c96 = use_compact_ptail1_single_launch &&
 // epilogue retain priority.  Existing small-grid M32/M64 choices are not
 // overridden by this measured gate.
 bool use_hybrid_c64_c32 =
-    opts.c == 96 && opts.k == 128 && !use_hybrid_compact_c96 &&
+    opts.c == 96 && opts.k == 128 &&
     ((!use_compact_spatial && !use_partial_m128_epilogue) || use_hybrid_exact_p15 ||
      use_hybrid_compact_p1_c96 || use_hybrid_exact_w31) &&
     !use_m32_path && !use_m64_p16 && m128_tiles == 1 && m64_tiles == 0;
@@ -324,8 +317,8 @@ bool use_hybrid_exact_h16_w840 =
 // CTAs it reduces the Kout256 path by about 2.3% relative to Cluster-B C32;
 // larger C64-aligned grids retain the same activation-publication saving.
 bool m256_cluster_b_eligible = !use_cluster_a_spatial_c64_k64 && !use_hybrid_c64_c32 &&
-                               !use_hybrid_compact_c96 && !use_m32_path && !use_m64_p16 &&
-                               !use_compact_spatial && m128_tiles > 0 && opts.c > kK &&
+                               !use_m32_path && !use_m64_p16 && !use_compact_spatial &&
+                               m128_tiles > 0 && opts.c > kK &&
                                (opts.k % 256 == 0 || use_padded_m256);
 bool use_m256_cluster_b_c64_k64 =
     m256_cluster_b_eligible && (base_ctas >= 128 || use_padded_m256) && opts.c % 64 == 0;
@@ -349,9 +342,9 @@ bool use_m256_cluster_b_c64_exact_d4_c128 =
 // The K64 path retains the ordinary K32 packed-weight layout, but publishes
 // one canonical C64 activation tile for two consecutive K32 halves.
 bool use_k64_c64_b2a3_k32a = !use_cluster_a_spatial_c64_k64 && !use_hybrid_c64_c32 &&
-                             !use_hybrid_compact_c96 && !use_m32_path && !use_m64_p16 &&
-                             !use_compact_spatial && !use_m256_cluster_b_c64_k64 &&
-                             !use_m256_cluster_b_c32 && m128_tiles > 0 && opts.c % 64 == 0 &&
+                             !use_m32_path && !use_m64_p16 && !use_compact_spatial &&
+                             !use_m256_cluster_b_c64_k64 && !use_m256_cluster_b_c32 &&
+                             m128_tiles > 0 && opts.c % 64 == 0 &&
                              (opts.k % kMainM == 0 || opts.k == 192 || exact_aligned_kout == 96 ||
                               exact_aligned_kout == 120);
 bool use_k64_c64_exact_k128 = use_k64_c64_b2a3_k32a && opts.k == kMainM;

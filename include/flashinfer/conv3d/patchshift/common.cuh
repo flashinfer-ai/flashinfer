@@ -117,6 +117,14 @@ __device__ __forceinline__ bool mbarrier_try_wait(uint64_t* barrier, int phase) 
   return complete != 0;
 }
 
+__device__ __forceinline__ void tma_descriptor_fence_acquire(void const* map) {
+  uint64_t map_address = reinterpret_cast<uint64_t>(map);
+  asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;\n"
+               :
+               : "l"(map_address)
+               : "memory");
+}
+
 __device__ __forceinline__ void tma_load_5d(void const* map, uint64_t* barrier, void* smem, int c0,
                                             int c1, int c2, int c3, int c4) {
   cute::SM90_TMA_LOAD_5D::copy(map, barrier,
