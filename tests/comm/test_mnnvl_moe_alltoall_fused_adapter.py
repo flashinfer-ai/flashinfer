@@ -394,6 +394,7 @@ def test_runtime_module_selection_uses_requested_device_capability(monkeypatch):
     monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 7)
     selected = []
     capability_devices = []
+    capabilities = iter(((10, 0), (10, 3), (9, 0)))
 
     def select_target(target):
         selected.append(target)
@@ -402,28 +403,16 @@ def test_runtime_module_selection_uses_requested_device_capability(monkeypatch):
     select_target.cache_clear = lambda: None
     monkeypatch.setattr(api, "_get_moe_alltoall_module_for_target", select_target)
 
-    try:
-        def capability(device):
-            capability_devices.append(device)
-            return (10, 0)
+    def capability(device):
+        capability_devices.append(device)
+        return next(capabilities)
 
-        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
+    try:
         api.get_moe_alltoall_module.cache_clear()
         assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "sm100a"
-
-        def capability(device):
-            capability_devices.append(device)
-            return (10, 3)
-
-        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
         api.get_moe_alltoall_module.cache_clear()
         assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "sm103a"
-
-        def capability(device):
-            capability_devices.append(device)
-            return (9, 0)
-
-        monkeypatch.setattr(api.torch.cuda, "get_device_capability", capability)
         api.get_moe_alltoall_module.cache_clear()
         assert api.get_moe_alltoall_module(torch.device("cuda:3")) == "legacy"
         assert selected == ["sm100a", "sm103a", "legacy"]
