@@ -1891,11 +1891,14 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   uint32_t pos = num_speculative_tokens;
   for (uint32_t i = 0; i < num_speculative_tokens; ++i) {
     IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    if (static_cast<int32_t>(draft_id) < 0) {
+      pos = i;
+      break;
+    }
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
     if (u * p < q) {
-      // accept the draft models output
       output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
       pos = i;
@@ -1906,7 +1909,10 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   uint32_t emitted_token_num = pos;
   uint32_t accepted_token_num = pos;
   for (uint32_t i = pos; i < num_speculative_tokens; ++i) {
-    int draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    if (static_cast<int32_t>(draft_id) < 0) {
+      break;
+    }
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);

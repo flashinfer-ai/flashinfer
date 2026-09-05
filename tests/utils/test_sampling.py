@@ -834,6 +834,56 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
+def test_chain_speculative_sampling_negative_draft_ids():
+    """Regression test for https://github.com/flashinfer-ai/flashinfer/issues/879
+
+    When draft_token_ids contains -1 sentinel values (early-stopped draft),
+    the kernel must treat them as rejections instead of using -1 as an array index.
+    """
+    token_ids = torch.tensor([[1, 0, 1, -1, -1]], device="cuda:0", dtype=torch.int32)
+    draft_probs = torch.tensor(
+        [
+            [
+                [0.5883, 0.4117, 0.0000, 0.0000],
+                [1.0000, 0.0000, 0.0000, 0.0000],
+                [0.3803, 0.5435, 0.0762, 0.0000],
+                [0.0000, 0.0000, 0.0000, 0.0000],
+                [0.0000, 0.0000, 0.0000, 0.0000],
+            ]
+        ],
+        device="cuda:0",
+    )
+    verify_probs = torch.tensor(
+        [
+            [
+                [0.4555, 0.5445, 0.0000, 0.0000],
+                [1.0000, 0.0000, 0.0000, 0.0000],
+                [0.5783, 0.2831, 0.0000, 0.1386],
+                [0.2346, 0.6850, 0.0804, 0.0000],
+                [0.0000, 0.0000, 0.0000, 0.0000],
+                [0.0000, 0.0000, 0.0000, 0.0000],
+            ]
+        ],
+        device="cuda:0",
+    )
+
+    num_valid_drafts = 3
+    for _ in range(50):
+        accepted_num = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+        emitted_num = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+        output_token_ids, accepted_num, emitted_num = (
+            flashinfer.sampling.chain_speculative_sampling(
+                draft_probs, token_ids, verify_probs, accepted_num, emitted_num
+            )
+        )
+        assert emitted_num.item() <= num_valid_drafts, (
+            f"emitted_token_num ({emitted_num.item()}) exceeded the number of "
+            f"valid draft tokens ({num_valid_drafts})"
+        )
+        assert accepted_num.item() <= num_valid_drafts
+        assert torch.all(output_token_ids[0, num_valid_drafts + 1 :] == -1)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
