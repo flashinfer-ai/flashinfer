@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from flashinfer.cake_dcp import (
+from flashinfer.dcp import (
     get_dcp_spec_counter_bytes,
     get_dcp_spec_workspace_size_bytes,
 )
@@ -232,7 +232,7 @@ def _run_public_rank(
         bmm2_scale=bmm2_scale,
         out=out.flatten(0, 1),
         kv_layout="HND",
-        backend="trtllm-gen",
+        backend="cake",
         q_len_per_req=q_len,
         lse=lse.flatten(0, 1),
         return_lse=True,
