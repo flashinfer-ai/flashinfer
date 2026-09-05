@@ -358,6 +358,7 @@ def test_sm120_ragged_tensor_threshold_updates_between_graph_replays():
         cu_k,
         max_seqlen_q=Sq,
         skip_softmax_threshold=threshold,
+        enable_pdl=True,
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -370,6 +371,7 @@ def test_sm120_ragged_tensor_threshold_updates_between_graph_replays():
             cu_k,
             max_seqlen_q=Sq,
             skip_softmax_threshold=threshold,
+            enable_pdl=True,
         )
 
     threshold.copy_(torch.tensor([2.0, 0.0], device="cuda"))

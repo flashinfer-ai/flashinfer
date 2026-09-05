@@ -710,6 +710,7 @@ class SM120PrimsBatchPrefillBackend:
             device=self.device,
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
+            enable_skip_softmax=False,
         )
         self._compiled_lse_variants = {False}
 
@@ -783,6 +784,7 @@ class SM120PrimsBatchPrefillBackend:
             device=self.device,
             with_lse=False,
             balanced_scheduler=_use_balanced_scheduler(causal),
+            enable_skip_softmax=False,
         )
         self._compiled_lse_variants = {False}
 
@@ -834,30 +836,36 @@ class SM120PrimsBatchPrefillBackend:
             compile_sm120_fmha_fp8_ragged_kernel,
         )
 
-        common = (
-            self._q_dtype,
-            self._o_dtype,
-            self._num_qo_heads,
-            self._num_kv_heads,
-            self._head_dim,
-            self._causal,
-            128,
-            128,
-        )
         if self._mode == "ragged":
             compile_sm120_fmha_fp8_ragged_kernel(
-                *common,
-                self.device,
-                with_lse,
-                _use_balanced_scheduler(self._causal),
+                in_dtype=self._q_dtype,
+                out_dtype=self._o_dtype,
+                num_qo_heads=self._num_qo_heads,
+                num_kv_heads=self._num_kv_heads,
+                head_dim=self._head_dim,
+                is_causal=self._causal,
+                kv_tile=128,
+                q_tile=128,
+                device=self.device,
+                with_lse=with_lse,
+                balanced_scheduler=_use_balanced_scheduler(self._causal),
+                enable_skip_softmax=False,
             )
         else:
             compile_sm120_fmha_fp8_paged_kernel(
-                *common,
-                self._page_size,
-                self.device,
-                with_lse,
-                _use_balanced_scheduler(self._causal),
+                in_dtype=self._q_dtype,
+                out_dtype=self._o_dtype,
+                num_qo_heads=self._num_qo_heads,
+                num_kv_heads=self._num_kv_heads,
+                head_dim=self._head_dim,
+                is_causal=self._causal,
+                kv_tile=128,
+                q_tile=128,
+                num_tokens_per_page=self._page_size,
+                device=self.device,
+                with_lse=with_lse,
+                balanced_scheduler=_use_balanced_scheduler(self._causal),
+                enable_skip_softmax=False,
             )
         self._compiled_lse_variants.add(with_lse)
 

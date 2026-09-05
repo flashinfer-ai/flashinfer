@@ -116,3 +116,14 @@ def test_skip_softmax_has_a_distinct_jit_specialization(monkeypatch):
     assert observed_names[0][1].endswith("_skip0")
     assert observed_names[1][1].endswith("_skip1")
     compile_sm120_fmha_fp8_ragged_kernel.cache_clear()
+
+
+def test_skip_softmax_threshold_load_follows_pdl_dependency_wait():
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        SM120FusedMultiHeadAttentionFP8ForwardTMA,
+    )
+
+    kernel_source = inspect.getsource(SM120FusedMultiHeadAttentionFP8ForwardTMA.kernel)
+    wait = kernel_source.index("cute.arch.griddepcontrol_wait()")
+    threshold_load = kernel_source.index("skip_softmax_threshold[batch_idx]")
+    assert wait < threshold_load

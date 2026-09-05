@@ -2245,12 +2245,6 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             q_tile_idx = block_x
             q_head_idx = block_y
         batch_idx = block_z
-        skip_softmax_threshold_log2 = None
-        if cutlass.const_expr(skip_softmax_threshold is not None):
-            skip_softmax_threshold_log2 = cute.math.log2(
-                cutlass.Float32(skip_softmax_threshold[batch_idx]),
-                fastmath=True,
-            )
         q_seq_idx = q_tile_idx * self.q_tile
 
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2266,6 +2260,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         causal_q_offset = cutlass.Int32(0)
 
         cute.arch.griddepcontrol_wait()
+        # A dynamic threshold can be produced or updated by an earlier kernel.
+        # Keep its load after the PDL dependency wait so a dependent launch
+        # never observes the predecessor's stale value.
+        skip_softmax_threshold_log2 = None
+        if cutlass.const_expr(skip_softmax_threshold is not None):
+            skip_softmax_threshold_log2 = cute.math.log2(
+                cutlass.Float32(skip_softmax_threshold[batch_idx]),
+                fastmath=True,
+            )
         q_token_base = cutlass.Int32(cu_seqlens_q[batch_idx])
         seqlen_q = cutlass.Int32(cu_seqlens_q[batch_idx + 1]) - q_token_base
         num_heads_q = q.shape[1]
