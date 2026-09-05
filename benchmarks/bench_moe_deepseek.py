@@ -732,8 +732,6 @@ def bench_trtllm(
         RoutingRealizationKey,
     )
 
-    if precision not in ("nvfp4", "bf16"):
-        raise ValueError(f"Unsupported TRTLLM precision: {precision}")
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
 
@@ -778,7 +776,7 @@ def bench_trtllm(
             gemm2_weights=weights["gemm2_weights"],
         )
         logits_moe, routed_moe = trtllm_bf16_moe, trtllm_bf16_routed_moe
-    else:
+    elif precision == "nvfp4":
         from flashinfer import SfLayout, nvfp4_quantize
         from flashinfer.fused_moe import (
             trtllm_fp4_block_scale_moe,
@@ -893,6 +891,8 @@ def bench_trtllm(
         )
         logits_moe = trtllm_fp4_block_scale_moe
         routed_moe = trtllm_fp4_block_scale_routed_moe
+    else:
+        raise ValueError(f"Unsupported TRTLLM precision: {precision}")
 
     routing_ids = None
     routing_weights = None
