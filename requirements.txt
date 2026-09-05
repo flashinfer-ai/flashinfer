@@ -1,4 +1,10 @@
-apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2
+# Header-only ABI dependency: the version resolved at build time is the ABI our
+# compiled kernels need. 0.1.13/.post0/.post1 are ABI-divergent (object Optional<T>
+# became 16 bytes, changing the return storage of the virtual ModuleObj::GetFunction we
+# override) and are yanked upstream, so a resolver will not pick them; we rely on that
+# rather than carrying permanent exclusions. scripts/verify_jit_cache_abi.py checks a
+# built wheel actually loads on the floor declared here.
+apache-tvm-ffi>=0.1.10,<0.2
 click
 # cuda-python + nccl4py: runtime deps for the moe_ep EP transport backends
 # (default since the EP install became opt-out; CUDA-13 wheels only — see
