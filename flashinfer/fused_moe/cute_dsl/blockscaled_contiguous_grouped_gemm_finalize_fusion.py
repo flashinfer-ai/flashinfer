@@ -42,7 +42,7 @@ Key features:
 
 import functools
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -176,6 +176,32 @@ def create_finalize_fusion_tensors(
     return permuted_idx_to_expanded_idx, token_final_scales
 
 
+def gemm2_cta_tile_mn(mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+    """CTA output tile ``(M, N)`` matching GEMM2's ``tile_ready`` layout.
+
+    MMA-M 256 uses two CTAs along M, so the flag's M-tile is 128 rows.
+    """
+    cta_m = mma_tiler_mn[0] // (2 if mma_tiler_mn[0] == 256 else 1)
+    cta_n = mma_tiler_mn[1]
+    return cta_m, cta_n
+
+
+def gemm2_tile_ready_numel(
+    permuted_m: int,
+    n: int,
+    mma_tiler_mn: Tuple[int, int],
+) -> int:
+    """Number of int32 flags GEMM2 writes, one per CTA output tile.
+
+    Index is ``m_tile * num_n_tiles + n_tile``. The buffer must be zeroed on
+    the GEMM stream before each launch.
+    """
+    cta_m, cta_n = gemm2_cta_tile_mn(mma_tiler_mn)
+    num_m = (permuted_m + cta_m - 1) // cta_m
+    num_n = (n + cta_n - 1) // cta_n
+    return num_m * num_n
+
+
 # Kernel cache for compiled kernels (class-level to persist across calls)
 _finalize_kernel_cache: Dict[Tuple, Any] = {}
 
@@ -201,6 +227,7 @@ def _get_compiled_finalize_kernel(
     num_tiles_ptr,
     token_scales_ptr,
     a_per_token_scale_ptr,
+    tile_ready_ptr,
     max_active_clusters: int,
     stream,
     # Tactic parameters (compile-time - IN cache key)
@@ -222,6 +249,8 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    enable_tile_signal: bool = False,
+    store_permuted_c: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -257,6 +286,9 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        enable_tile_signal,
+        store_permuted_c,
+        max_active_clusters,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -279,6 +311,11 @@ def _get_compiled_finalize_kernel(
                     "use_fused_finalize=False is not supported by the Rubin "
                     "(SM107) finalize grouped GEMM kernel: it always performs "
                     "the fused atomic scatter-add."
+                )
+            if enable_tile_signal or store_permuted_c:
+                raise NotImplementedError(
+                    "enable_tile_signal and store_permuted_c are not supported "
+                    "by the Rubin (SM107) finalize grouped GEMM kernel."
                 )
             if final_scale_dtype is not cutlass.Float32:
                 # The Rubin kernel hardcodes self.final_scale_dtype =
@@ -307,6 +344,8 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                enable_tile_signal=enable_tile_signal,
+                store_permuted_c=store_permuted_c,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -319,7 +358,7 @@ def _get_compiled_finalize_kernel(
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
-        #  token_final_scales_ptr, [a_per_token_scale_ptr],
+        #  token_final_scales_ptr, [a_per_token_scale_ptr, tile_ready_ptr],
         #  m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
         compiled_gemm = cute.compile(
@@ -335,7 +374,7 @@ def _get_compiled_finalize_kernel(
             permuted_idx_ptr,
             num_tiles_ptr,
             token_scales_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr]),
+            *([] if is_rubin else [a_per_token_scale_ptr, tile_ready_ptr]),
             permuted_m,
             n,
             k,
@@ -381,6 +420,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    tile_ready: Optional[torch.Tensor] = None,
+    store_permuted_c: bool = False,
+    before_launch: Optional[Callable[[], None]] = None,
+    after_launch: Optional[Callable[[], None]] = None,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -417,6 +460,18 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sm_count: Number of SMs to use. Default: max available.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        tile_ready: Optional int32 flag buffer, one flag per CTA output tile.
+             When provided, GEMM2 release-stores 1 after each tile's store has
+             landed in HBM. Must be zeroed before launch; size at least
+             :func:`gemm2_tile_ready_numel`.
+        store_permuted_c: Write dense ``C[permuted_m, H]`` via ``blk_copy``
+             (identity row index, routing scale 1.0). Skips fused scatter.
+             Dest combine applies ``topk_weights``. Default: False.
+        before_launch: Optional callback after ``cute.compile`` and before the
+             GEMM2 grid is queued. Use this to JIT overlapping kernels without
+             launching a flag-waiter.
+        after_launch: Optional callback after the GEMM2 host launch returns.
+             Use this to queue a second-stream consumer that waits on flags.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -574,11 +629,19 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    output_rows = seq_len if use_fused_finalize else seq_len * topk
+    if store_permuted_c:
+        output_rows = permuted_m
+    elif use_fused_finalize:
+        output_rows = seq_len
+    else:
+        output_rows = seq_len * topk
 
     # Atomic fused finalize requires zero-initialized output.
+    # store_permuted_c and deterministic mode write each row once.
     if out is None:
-        allocator = torch.zeros if use_fused_finalize else torch.empty
+        allocator = (
+            torch.empty if (store_permuted_c or not use_fused_finalize) else torch.zeros
+        )
         out = allocator(
             (output_rows, n),
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
@@ -595,14 +658,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 f"out must have dtype {expected_out_dtype}, got {out.dtype}"
             )
 
-    # Get SM count
+    cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+    max_active_clusters = get_max_active_clusters(cluster_size)
     if sm_count is None:
         sm_count = get_num_sm(a.device)
-
-    # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
+    else:
+        max_from_sm = max(1, int(sm_count) // cluster_size)
+        if max_from_sm < max_active_clusters:
+            max_active_clusters = max_from_sm
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
@@ -653,6 +716,30 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     else:
         a_per_token_scale_ptr = None
 
+    enable_tile_signal = tile_ready is not None
+    if enable_tile_signal:
+        if tile_ready.dtype != torch.int32 or not tile_ready.is_contiguous():
+            raise ValueError("tile_ready must be a contiguous int32 CUDA tensor")
+        if tile_ready.device.type != "cuda":
+            raise ValueError("tile_ready must be on CUDA")
+        needed = gemm2_tile_ready_numel(permuted_m, n, mma_tiler_mn)
+        if int(tile_ready.numel()) < needed:
+            raise ValueError(
+                f"tile_ready must have at least {needed} flags "
+                f"(permuted_m={permuted_m}, n={n}, mma_tiler_mn={mma_tiler_mn}), "
+                f"got {int(tile_ready.numel())}"
+            )
+        tile_ready_ptr = make_ptr(
+            cutlass.Int32, tile_ready.data_ptr(), cute.AddressSpace.gmem
+        )
+    else:
+        tile_ready_ptr = None
+    if (enable_tile_signal or store_permuted_c) and is_rubin:
+        raise NotImplementedError(
+            "enable_tile_signal and store_permuted_c require the Blackwell "
+            "finalize kernel; Rubin is not supported."
+        )
+
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -676,6 +763,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         num_tiles_ptr=num_tiles_ptr,
         token_scales_ptr=token_scales_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
+        tile_ready_ptr=tile_ready_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         sf_vec_size=sf_vec_size,
@@ -693,15 +781,21 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        enable_tile_signal=enable_tile_signal,
+        store_permuted_c=store_permuted_c,
     )
+
+    # Compile (above) may device-sync. JIT overlapping kernels here, then
+    # queue GEMM2, then launch any flag-waiter (after_launch).
+    if before_launch is not None:
+        before_launch()
 
     # Execute kernel with runtime parameters.
     # Order must match the wrapper signature; the Rubin SM107 wrapper has no
-    # a_per_token_scale_ptr parameter (see the arity note at the compile site),
-    # so on Rubin the extra pointer must be omitted here too.
+    # a_per_token_scale_ptr / tile_ready_ptr parameters.
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  [a_per_token_scale_ptr], m, n, k, l, num_tokens, top_k, stream)
+    #  [a_per_token_scale_ptr, tile_ready_ptr], m, n, k, l, num_tokens, top_k, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -714,7 +808,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         permuted_idx_ptr,
         num_tiles_ptr,
         token_scales_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr]),
+        *([] if is_rubin else [a_per_token_scale_ptr, tile_ready_ptr]),
         permuted_m,
         n,
         k,
@@ -723,6 +817,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         topk,
         stream=stream,
     )
+    if after_launch is not None:
+        after_launch()
 
     return out
 
@@ -755,6 +851,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    tile_ready: Optional[torch.Tensor] = None,
+    store_permuted_c: bool = False,
+    before_launch: Optional[Callable[[], None]] = None,
+    after_launch: Optional[Callable[[], None]] = None,
 ) -> torch.Tensor:
     """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
     warnings.warn(
@@ -790,6 +890,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        tile_ready=tile_ready,
+        store_permuted_c=store_permuted_c,
+        before_launch=before_launch,
+        after_launch=after_launch,
     )
 
 

@@ -367,6 +367,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        enable_tile_signal: bool = False,
+        store_permuted_c: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -390,6 +392,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.enable_tile_signal = enable_tile_signal
+        self.store_permuted_c = store_permuted_c
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -647,6 +651,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        tile_ready: Optional[cute.Tensor],
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation in steps:
@@ -974,6 +979,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             permuted_idx_to_expanded_idx,
             token_final_scales,
             a_per_token_scale,
+            tile_ready,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1062,6 +1068,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        tile_ready: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1993,7 +2000,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     gather_tok = token_idx * is_valid_row
                     token_scale = token_final_scales[(gather_tok, topk_idx)]
                     output_idx = token_idx
-                    if cutlass.const_expr(not self.use_fused_finalize):
+                    if cutlass.const_expr(self.store_permuted_c):
+                        # Dense GEMM-M C: identity store, no routing scale
+                        # (dest combine applies topk_weights).
+                        token_scale = self.final_scale_dtype(1.0)
+                        output_idx = permuted_row
+                    elif cutlass.const_expr(not self.use_fused_finalize):
                         token_scale = self.final_scale_dtype(1.0)
                         output_idx = safe_idx
                     if cutlass.const_expr(self.use_a_per_token_scale):
@@ -2197,7 +2209,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         # is_valid_tensor_alignment requires each output row to
                         # end on a 16-byte boundary, matching the bulk-copy
                         # instruction's size and address requirements.
-                        if cutlass.const_expr(not self.use_fused_finalize):
+                        # Both dense permuted C and deterministic finalize write
+                        # each output row exactly once, so they store rather
+                        # than reduce.
+                        if cutlass.const_expr(
+                            self.store_permuted_c or not self.use_fused_finalize
+                        ):
                             blk_copy(
                                 scatter_out_offset,
                                 sC[reduce_row, None, 0],
@@ -2223,8 +2240,26 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             )
 
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if cutlass.const_expr(self.enable_tile_signal):
+                    # Destination-complete wait: C rows are visible in HBM
+                    # before the release flag store.
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
+
+                if cutlass.const_expr(self.enable_tile_signal):
+                    if epi_tidx == 0:
+                        num_n = (
+                            out.shape[1] + self.cta_tile_shape_mnk[1] - 1
+                        ) // self.cta_tile_shape_mnk[1]
+                        flag_idx = tile_info[0] * num_n + tile_info[1]
+                        cute.arch.store(
+                            tile_ready.iterator + flag_idx,
+                            cutlass.Int32(1),
+                            sem="release",
+                            scope="gpu",
+                        )
 
                 # Release the prefetched metadata slot for this tile.
                 meta_pipeline.consumer_release(meta_consumer_state)
@@ -2885,6 +2920,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        tile_ready_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
@@ -2918,7 +2954,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             ),
         )
         output_rows = num_tokens
-        if cutlass.const_expr(not self.use_fused_finalize):
+        if cutlass.const_expr(self.store_permuted_c):
+            output_rows = m
+        elif cutlass.const_expr(not self.use_fused_finalize):
             output_rows = num_tokens * top_k
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((output_rows, n, 1), order=(1, 0, 2))
@@ -2946,6 +2984,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        tile_ready = (
+            cute.make_tensor(
+                tile_ready_ptr,
+                layout=cute.make_layout(
+                    (
+                        ((m + self.mma_tiler[0] - 1) // self.mma_tiler[0])
+                        * ((n + self.mma_tiler[1] - 1) // self.mma_tiler[1]),
+                    )
+                ),
+            )
+            if cutlass.const_expr(self.enable_tile_signal)
+            else None
+        )
 
         return self(
             a,
@@ -2962,6 +3013,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
             a_per_token_scale=a_per_token_scale,
+            tile_ready=tile_ready,
             epilogue_op=epilogue_op,
         )
 

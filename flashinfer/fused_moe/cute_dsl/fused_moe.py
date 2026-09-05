@@ -70,8 +70,8 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
-from ...autotuner import AutoTuner
-from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...autotuner import AutoTuner, is_in_profile_measurement
+from ...cute_dsl.utils import convert_sf_to_mma_layout, get_num_sm
 from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
@@ -144,6 +144,94 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
 # =============================================================================
 # Core Implementation (Shared by Functional and Wrapper APIs)
 # =============================================================================
+
+# Must match TileReadyConsumerKernel default max_ctas. fused_moe cannot import moe_ep.
+_OVERLAP_CONSUMER_SMS = 8
+
+
+def _overlap_gemm2_sm_count(
+    device: torch.device, cluster_shape_mn: Tuple[int, int]
+) -> int:
+    """SMs left for GEMM2 after reserving persistent consumer CTAs."""
+    cluster_size = int(cluster_shape_mn[0]) * int(cluster_shape_mn[1])
+    if cluster_size < 1:
+        raise ValueError(f"invalid GEMM2 cluster_shape_mn={cluster_shape_mn}")
+    usable = int(get_num_sm(device)) - _OVERLAP_CONSUMER_SMS
+    usable = (usable // cluster_size) * cluster_size
+    return max(cluster_size, usable)
+
+
+def _publish_tile_signal_state(
+    tile_signal_state: Optional[Dict[str, Any]],
+    tile_ready: Optional[torch.Tensor],
+    permuted_idx: torch.Tensor,
+    gemm2_c: torch.Tensor,
+    gemm2_mma_tiler_mn: Tuple[int, int],
+    gemm2_cluster_shape_mn: Tuple[int, int],
+    num_non_exiting_tiles: torch.Tensor,
+) -> None:
+    """Zero flags, record gemm2_ready_event, stash maps for the consumer.
+
+    Compile the consumer after GEMM2 ``cute.compile`` (no launch). Queue GEMM2
+    next, then launch the consumer so a flag-waiter is never live across a
+    GEMM2 host sync or a persistent-grid occupancy check.
+    """
+    if tile_signal_state is None:
+        return
+    if tile_ready is None and tile_signal_state.get("on_gemm2_ready") is None:
+        return
+    if tile_ready is not None:
+        tile_ready.zero_()
+    event = tile_signal_state.get("gemm2_ready_event")
+    if event is None:
+        event = torch.cuda.Event()
+        tile_signal_state["gemm2_ready_event"] = event
+    event.record()
+    tile_signal_state["tile_ready"] = tile_ready
+    tile_signal_state["permuted_idx"] = permuted_idx
+    tile_signal_state["gemm2_c"] = gemm2_c
+    tile_signal_state["gemm2_mma_tiler_mn"] = gemm2_mma_tiler_mn
+    tile_signal_state["gemm2_cluster_shape_mn"] = gemm2_cluster_shape_mn
+    tile_signal_state["num_non_exiting_tiles"] = num_non_exiting_tiles
+    tile_signal_state["permuted_m"] = int(gemm2_c.shape[0])
+
+
+def _overlap_consumer_armed(tile_signal_state: Optional[Dict[str, Any]]) -> bool:
+    return (
+        tile_signal_state is not None
+        and tile_signal_state.get("on_gemm2_ready") is not None
+    )
+
+
+def _compile_overlap_consumer(tile_signal_state: Optional[Dict[str, Any]]) -> None:
+    """JIT the consumer without launching it. Skip CUDA-graph capture."""
+    if not _overlap_consumer_armed(tile_signal_state):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    assert tile_signal_state is not None
+    tile_signal_state["consumer_compile_only"] = True
+    try:
+        tile_signal_state["on_gemm2_ready"](tile_signal_state)
+    finally:
+        tile_signal_state["consumer_compile_only"] = False
+
+
+def _launch_overlap_consumer(tile_signal_state: Optional[Dict[str, Any]]) -> None:
+    """Launch the second-stream consumer if armed.
+
+    Skip CUDA-graph capture and autotune tactic profiling so ``shipped_rows``
+    counts one winner launch, not every profile replay.
+    """
+    if not _overlap_consumer_armed(tile_signal_state):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if is_in_profile_measurement():
+        return
+    assert tile_signal_state is not None
+    tile_signal_state["consumer_compile_only"] = False
+    tile_signal_state["on_gemm2_ready"](tile_signal_state)
 
 
 def validate_w4a8_inputs(
@@ -235,6 +323,10 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    tile_ready: Optional[torch.Tensor] = None,
+    tile_signal_state: Optional[Dict[str, Any]] = None,
+    store_permuted_c: bool = False,
+    gemm2_c: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -290,6 +382,11 @@ def _moe_core_impl(
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        tile_ready: Optional GEMM2 per-tile ready flags (int32).
+        tile_signal_state: Optional dict stashed for a second-stream consumer.
+        store_permuted_c: Write dense ``C[permuted_m, H]`` instead of fused
+            finalize scatter. Dest combine applies routing weights.
+        gemm2_c: Optional preallocated dense C workspace when store_permuted_c.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -344,7 +441,9 @@ def _moe_core_impl(
         )
 
     # Fused finalize overlaps output zeroing with GEMM1.
-    if use_async_memset and use_fused_finalize:
+    # store_permuted_c writes dense C and does not touch moe_output.
+    do_fused_memset = use_async_memset and use_fused_finalize and not store_permuted_c
+    if do_fused_memset:
         if aux_stream is None or main_event is None or memset_event is None:
             resources = _get_cuda_graph_resources()
             aux_stream = aux_stream or resources["aux_stream"]
@@ -382,7 +481,7 @@ def _moe_core_impl(
         kernel_num_non_exiting_tiles = num_non_exiting_tiles
 
     # Record event for async memset synchronization
-    if use_async_memset and use_fused_finalize:
+    if do_fused_memset:
         main_event.record()
         moe_output.record_stream(aux_stream)
 
@@ -456,8 +555,19 @@ def _moe_core_impl(
         )
 
     # Atomic finalize requires a zeroed token output. Deterministic finalize
-    # writes each route to a unique expanded row.
-    if use_fused_finalize:
+    # writes each route to a unique expanded row. store_permuted_c writes
+    # dense C[permuted_m, H] for a second-stream dest combine.
+    permuted_m = int(permuted_idx_to_expanded_idx.shape[0])
+    if store_permuted_c:
+        if gemm2_c is None or int(gemm2_c.shape[0]) < permuted_m:
+            gemm2_output = torch.empty(
+                (permuted_m, hidden_size),
+                dtype=output_dtype,
+                device=x.device,
+            )
+        else:
+            gemm2_output = gemm2_c[:permuted_m]
+    elif use_fused_finalize:
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
@@ -474,7 +584,22 @@ def _moe_core_impl(
             device=x.device,
         )
 
-    # Step 3: GEMM2 with optional atomic finalize
+    _publish_tile_signal_state(
+        tile_signal_state,
+        tile_ready,
+        permuted_idx_to_expanded_idx,
+        gemm2_output,
+        gemm2_mma_tiler_mn,
+        gemm2_cluster_shape_mn,
+        kernel_num_non_exiting_tiles,
+    )
+
+    # Step 3: GEMM2 with optional atomic finalize.
+    # Overlap: compile consumer after GEMM2 JIT, queue GEMM2, then launch
+    # the spinner. Leave consumer SMs out of the persistent GEMM2 grid.
+    gemm2_sm_count = None
+    if _overlap_consumer_armed(tile_signal_state):
+        gemm2_sm_count = _overlap_gemm2_sm_count(x.device, gemm2_cluster_shape_mn)
     blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a=intermediate,
         b=w2_weight,
@@ -497,12 +622,17 @@ def _moe_core_impl(
         mma_tiler=gemm2_mma_tiler,
         mma_inst_shape=gemm2_mma_inst_shape,
         cluster_shape_mn=gemm2_cluster_shape_mn,
+        sm_count=gemm2_sm_count,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        tile_ready=tile_ready,
+        store_permuted_c=store_permuted_c,
+        before_launch=lambda: _compile_overlap_consumer(tile_signal_state),
+        after_launch=lambda: _launch_overlap_consumer(tile_signal_state),
     )
 
     # Step 4: Deterministic routing-weight reduction
-    if not use_fused_finalize:
+    if not use_fused_finalize and not store_permuted_c:
         moe_unpermute(
             permuted_input=gemm2_output,
             output=moe_output,
@@ -855,6 +985,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            **kwargs,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1076,6 +1207,10 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    tile_ready: Optional[torch.Tensor] = None,
+    tile_signal_state: Optional[Dict[str, Any]] = None,
+    store_permuted_c: bool = False,
+    gemm2_c: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1116,6 +1251,10 @@ def _cute_dsl_fused_moe_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        tile_ready=tile_ready,
+        tile_signal_state=tile_signal_state,
+        store_permuted_c=store_permuted_c,
+        gemm2_c=gemm2_c,
     )
 
 

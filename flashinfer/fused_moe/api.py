@@ -1314,7 +1314,19 @@ class CuteDslConfig:
     """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+
+    Parameters
+    ----------
+    enable_tile_signal : bool
+        GEMM2 writes per-CTA ``tile_ready`` flags after each output tile lands
+        in HBM. Used by the fused-gemm2-combine overlap path.
+    store_permuted_c : bool
+        GEMM2 writes dense ``C[permuted_m, H]`` (identity store, routing
+        scale 1.0) instead of fused-finalize scatter into token rows.
     """
+
+    enable_tile_signal: bool = False
+    store_permuted_c: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -1351,7 +1363,13 @@ class CuteDslConfig:
         )
 
     def __repr__(self) -> str:
-        return "CuteDslConfig()"
+        parts = []
+        if self.enable_tile_signal:
+            parts.append(f"enable_tile_signal={self.enable_tile_signal!r}")
+        if self.store_permuted_c:
+            parts.append(f"store_permuted_c={self.store_permuted_c!r}")
+        inner = ", ".join(parts)
+        return f"CuteDslConfig({inner})"
 
 
 @dataclass(frozen=True)

@@ -69,9 +69,11 @@ class MoEEpSplitLayer(nn.Module):
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
             self._kernel_config = backend.kernel
+            self.skip_combine = bool(backend.skip_combine)
         else:
             self._comm_backend = backend
             self._kernel_config = IdentityConfig()
+            self.skip_combine = False
 
         self._kernel: SplitKernelBackend = create_split_kernel(self._kernel_config)
 
@@ -151,15 +153,39 @@ class MoEEpSplitLayer(nn.Module):
             )
         return self._fleet
 
-    def _inner_compute(self, dispatch: DispatchOutput) -> torch.Tensor:
+    def _inner_compute(
+        self, dispatch: DispatchOutput, t: "MoEEpTensors"
+    ) -> torch.Tensor:
         ctx = SplitKernelContext(
             expert_tensors=dispatch.expert_tensors,
             num_tokens=dispatch.get_num_tokens(),
             fleet_params=self._fleet_params,
             recv_topk_idx=dispatch.recv_topk_idx,
             recv_topk_weights=dispatch.recv_topk_weights,
+            dest_topk_ids=t.topk_ids,
+            dest_topk_weights=t.topk_weights,
+            dest_hidden_states=t.hidden_states,
         )
         return self._kernel.compute(ctx)
+
+    def _combine_or_overlap(
+        self,
+        handle,
+        expert_out: torch.Tensor,
+        t: "MoEEpTensors",
+    ) -> torch.Tensor:
+        if self.skip_combine:
+            self._kernel.wait_overlap()
+            return self._kernel.collect_overlap_combine(
+                t.hidden_states, t.topk_ids, t.topk_weights
+            )
+        combine = handle.combine(
+            CombineInputParams(
+                x=[expert_out],
+                out=torch.empty_like(t.hidden_states),
+            )
+        )
+        return combine.x
 
     def forward(self, t: "MoEEpTensors") -> torch.Tensor:
         ensure_bootstrap_dist_validated(self._bootstrap)
@@ -186,14 +212,8 @@ class MoEEpSplitLayer(nn.Module):
                         x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
                     )
                 )
-                expert_out = self._inner_compute(dispatch)
-                combine = handle.combine(
-                    CombineInputParams(
-                        x=[expert_out],
-                        out=torch.empty_like(t.hidden_states),
-                    )
-                )
-                result = combine.x
+                expert_out = self._inner_compute(dispatch, t)
+                result = self._combine_or_overlap(handle, expert_out, t)
             else:
                 ev = {
                     k: (
@@ -210,27 +230,22 @@ class MoEEpSplitLayer(nn.Module):
                 )
                 ev["dispatch"][1].record()
                 ev["compute"][0].record()
-                expert_out = self._inner_compute(dispatch)
+                expert_out = self._inner_compute(dispatch, t)
                 ev["compute"][1].record()
                 ev["combine"][0].record()
-                combine = handle.combine(
-                    CombineInputParams(
-                        x=[expert_out],
-                        out=torch.empty_like(t.hidden_states),
-                    )
-                )
+                result = self._combine_or_overlap(handle, expert_out, t)
                 ev["combine"][1].record()
                 torch.cuda.synchronize()
                 self.last_timings_ms = {
                     k: start.elapsed_time(end) for k, (start, end) in ev.items()
                 }
-                result = combine.x
         finally:
             handle.complete()
             handle.destroy()
         return result
 
     def destroy(self) -> None:
+        self._kernel.destroy()
         if self._fleet is not None:
             self._fleet.destroy()
             self._fleet = None
