@@ -894,6 +894,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
 
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int mbar_base = smem;
@@ -2148,6 +2149,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
 
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
+    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int mbar_base = smem;
