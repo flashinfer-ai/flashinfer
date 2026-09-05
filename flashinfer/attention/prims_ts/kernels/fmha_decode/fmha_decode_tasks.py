@@ -1002,13 +1002,10 @@ class DecodeGenTask(Task):
             self._kv_raw_tile_base = skipped_tiles + split_idx * total_kv_tiles
         else:
             self._kv_raw_tile_base = skipped_tiles
-        remaining_kv_tiles = cute.math.max(
-            total_kv_tiles - cutlass.Int32(self.cfg.num_insts_kv), cutlass.Int32(0)
+        loop_domain = _loop_domain_after_head(
+            total_kv_tiles,
+            num_insts_kv=self.cfg.num_insts_kv,
         )
-        num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
-        loop_domain = (
-            remaining_kv_tiles + num_insts_kv - cutlass.Int32(1)
-        ) // num_insts_kv
         # All tasks share the MMA-loop domain; tail-only tasks add a bias.
         return loop_domain + cutlass.Int32(self.domain_bias)
 
@@ -1174,23 +1171,19 @@ def create_load_task(
         with domain_loop(0, domain, 1, unroll=1):
             # Generic V-first profiles consume their retained route before the
             # matching K label replaces it.
+            route_metadata_by_label = {
+                "load_k0": (sparse_kv_metadata0, sparse_softmax_metadata0),
+                "load_k1": (sparse_kv_metadata1, sparse_softmax_metadata1),
+            }
             loop_routes = []
             for label in loop_labels:
-                route = None
-                sparse_softmax_metadata = None
-                if label == "load_k0":
-                    route = _resolve_and_store_sparse_route(
-                        sparse_kv_metadata0, FmhaStage.Loop
-                    )
-                    sparse_softmax_metadata = sparse_softmax_metadata0
-                elif label == "load_k1":
-                    route = _resolve_and_store_sparse_route(
-                        sparse_kv_metadata1, FmhaStage.Loop
-                    )
-                    sparse_softmax_metadata = sparse_softmax_metadata1
+                kv_metadata, softmax_metadata = route_metadata_by_label.get(
+                    label, (None, None)
+                )
+                route = _resolve_and_store_sparse_route(kv_metadata, FmhaStage.Loop)
                 _kv_load(label, FmhaStage.Loop)
                 if route is not None:
-                    loop_routes.append((sparse_softmax_metadata, route))
+                    loop_routes.append((softmax_metadata, route))
             for sparse_softmax_metadata, route in loop_routes:
                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
 
@@ -2094,31 +2087,9 @@ def create_mma_task_split_kv(
             section: FmhaStage,
         ) -> None:
             """Issue one scheduled PV wave using the selected phase work."""
-            _ = section
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
-                _consume_streamed_pv_fragments(
-                    smem_kv, tmem_p, tmem_o, "v_desc", vp_mma_label, cfg
-                )
-                return
-            tmem_p.wait()
-            p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1 = tmem_p.p_operands()
-            tmem_o.acquire()
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-                smem_kv.wait()
-                v_desc = smem_kv.v_desc()
-                getattr(tmem_o, vp_mma_label)(
-                    v_desc_0=v_desc,
-                    v_desc_1=v_desc,
-                    p_desc_0=p_desc_0,
-                    p_desc_1=p_desc_1,
-                    p_tmem_addr_0=p_tmem_addr_0,
-                    p_tmem_addr_1=p_tmem_addr_1,
-                    inst_idx=inst_idx,
-                    head_dim_stage_idx=head_dim_stage_idx,
-                )
-                smem_kv.release()
-            tmem_o.commit()
-            tmem_p.release()
+            _consume_staged_pv_mma(
+                smem_kv, tmem_p, tmem_o, "v_desc", vp_mma_label, inst_idx, section, cfg
+            )
 
         qk_mma(
             smem_k0,

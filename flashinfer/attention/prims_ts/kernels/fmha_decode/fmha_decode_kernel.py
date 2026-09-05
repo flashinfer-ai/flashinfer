@@ -1832,7 +1832,7 @@ def _build_decode_gen_schedule(
         [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
     )
     if cfg.streams_tmem_p_fragments:
-        # KV256's TMEM P operands use one-way per-fragment ready barriers.
+        # Streamed TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.
         eager_init_resources.extend([smem_p0, smem_p1])
 
@@ -1855,10 +1855,10 @@ def _has_unmodeled_tmem_p_alias_protocol(cfg: FmhaDecodeConfig) -> bool:
     """Whether exhaustive TS checking would report a known false P/S race.
 
     The staged D256 path selects one of two physical P/S stages at runtime.
-    Static KV256 instead orders streamed P fragments with private mbarriers and
+    Static streamed profiles instead order P fragments with private mbarriers and
     reuses the matching TmemO-full barrier as the next-QK overwrite credit.
     Those intra-work protocols are below TaskManager's resource transitions,
-    so its allocation-level checker cannot prove them. Persistent KV256 has
+    so its allocation-level checker cannot prove them. Persistent streaming has
     enough task-level ordering for the checker and remains covered.
     """
     return cfg.uses_staged_one_inst_tmem_p or (

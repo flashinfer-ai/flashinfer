@@ -57,7 +57,6 @@ from .helpers_common import (
     DecodeGenResourceBase,
     ResourceVars,
     _decode_gen_task_cache,
-    _keeps_col_base,
     _sparse_task_cache_route_begin,
     _sparse_task_cache_route_count,
     _warp_broadcast_i32,
@@ -66,7 +65,9 @@ from .helpers_common import (
 
 # Keeps staging uses the low four bits for structural KV64 validity. Bit 4
 # carries the conservative prepared summary that token masking can be skipped;
-# structural, tail, and causal masking remain independent.
+# structural, tail, and causal masking remain independent. The streamed Keeps
+# max pass derives its keep words from the token words directly, so the bit is
+# currently staged for the consumer but not read.
 _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
 # Keeps reserves bit 5 for the prepared route kind. The low four structural
 # validity bits and bit 4 keep their existing meaning.
@@ -1200,28 +1201,6 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 )
                 token_word3 = Uint32(
                     self._smem_words[stage_base + token_base + word1_idx + Int32(1)]
-                )
-            elif cutlass.const_expr(self.cfg.tile_size_q == 64):
-                lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-                local_word_base = _keeps_col_base(
-                    self.cfg,
-                    lane_idx,
-                    self.cfg.num_s_regs_per_thread,
-                ) >> Int32(5)
-                token_word0 = Uint32(
-                    self._smem_words[
-                        stage_base
-                        + Int32(self.staging_layout.token_words_word_offset)
-                        + local_word_base
-                    ]
-                )
-                token_word1 = Uint32(
-                    self._smem_words[
-                        stage_base
-                        + Int32(self.staging_layout.token_words_word_offset)
-                        + local_word_base
-                        + Int32(1)
-                    ]
                 )
             else:
                 token_word0 = Uint32(

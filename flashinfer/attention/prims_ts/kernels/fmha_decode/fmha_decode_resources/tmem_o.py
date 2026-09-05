@@ -59,7 +59,7 @@ def _pv_mma_operand_contract_for_config(
         cfg.headdim if cfg.head_dim_per_stage_kv == 0 else cfg.head_dim_kv_stage
     )
     if cfg.use_keeps_mma_ab:
-        if cfg.tile_size_kv == 256:
+        if cfg.uses_ws_2x2_datapath:
             # The WS 2x2 PV instruction exposes two spatial D128 partials as
             # one physical KV256 operation. Correction merges those spatial
             # halves after the two temporal decode streams are complete.
@@ -196,7 +196,7 @@ class TmemOResource(DecodeGenResourceBase):
         p_tmem_addr: Int32,
         fragment_idx: Constexpr[int],
     ) -> None:
-        """Issue one K32 fragment of a KV256 loop PV tile."""
+        """Issue one K32 fragment of a streamed loop PV tile."""
         self._vp_mma_fragment(
             stage_info,
             v_desc=v_desc,
@@ -215,7 +215,7 @@ class TmemOResource(DecodeGenResourceBase):
         p_tmem_addr: Int32,
         fragment_idx: Constexpr[int],
     ) -> None:
-        """Issue one K32 fragment of the final KV256 PV tile."""
+        """Issue one K32 fragment of the final streamed PV tile."""
         self._vp_mma_fragment(
             stage_info,
             v_desc=v_desc,
@@ -243,7 +243,7 @@ class TmemOResource(DecodeGenResourceBase):
         the plain M=128 instruction and advances V by one K16 slice per step.
         """
         cfg = self.cfg
-        assert cfg.streams_tmem_p_fragments and not cfg.use_fp8_qkv
+        assert cfg.streams_tmem_p_fragments
         v_desc = _freeze_smem_descriptor(v_desc)
 
         task_cache = _decode_gen_task_cache(stage_info)
@@ -271,7 +271,7 @@ class TmemOResource(DecodeGenResourceBase):
                     p_tmem_addr + Int32(local_k_step * 8), Int32
                 )
                 scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
-                if cutlass.const_expr(cfg.tile_size_kv == 256):
+                if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
                     # V holds four K64 atoms; jump between atoms every four
                     # K16 steps.
                     iter_v_desc = v_desc + Int32(

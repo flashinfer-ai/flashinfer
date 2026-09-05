@@ -1088,13 +1088,7 @@ class FmhaDecodeConfig:
         logical ownership). FP8 Q128 keeps the complete row because its P
         publication packs four values per column in one x16/x32 store.
         """
-        if self.tile_size_kv == 256:
-            return 32
-        if (
-            self.tile_size_q == 128
-            and self.uses_two_inst_tmem_p
-            and not self.use_fp8_qkv
-        ):
+        if self.uses_two_inst_tmem_p and not self.use_fp8_qkv:
             return 32
         return self.num_s_regs_per_thread
 
@@ -1102,6 +1096,30 @@ class FmhaDecodeConfig:
     def num_softmax_score_fragments(self) -> int:
         """Return score fragments used to cover one logical KV tile."""
         return self.num_s_regs_per_thread // self.softmax_score_fragment_regs
+
+    @property
+    def block_sparse_kv_atom_size(self) -> int:
+        """Return the K token span of one block-sparse route origin."""
+        assert self.use_block_sparse
+        return _block_sparse_kv_atom_size(self.kv_block_size)
+
+    @property
+    def softmax_fragments_per_route_atom(self) -> int:
+        """Return the streamed score fragments that share one route origin.
+
+        Route origins are staged per K64 atom, so a 128-token KV block spans
+        two origins; the fragment-to-origin mapping follows the atom.
+        """
+        return self.block_sparse_kv_atom_size // self.softmax_score_fragment_regs
+
+    @property
+    def uses_ws_2x2_datapath(self) -> bool:
+        """Whether QK and PV issue the WS 2x2 instruction over two lane halves.
+
+        KV256 exposes two spatial KV128 partials per logical Q row; every other
+        Keeps profile issues the plain CTA-local instruction.
+        """
+        return self.tile_size_kv == 256
 
     @property
     def num_packed_p_regs(self) -> int:
@@ -1309,6 +1327,13 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
                 "profile with coarse KV blocks and one load task"
+            )
+        if self.use_keeps_mma_ab and not self.streams_tmem_p_fragments:
+            # The block-sparse Keeps softmax and P passes exist only in their
+            # streamed K32-fragment form.
+            raise ValueError(
+                "block-sparse KeepsMmaAb requires a streamed TMEM-P profile "
+                "(Q64/KV256 or 16-bit Q128/KV128)"
             )
         if self.tile_size_q != selected_q_tile:
             raise ValueError(
@@ -1602,10 +1627,10 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        Q128/KV128 and sparse Q64/KV128 publish a complete packed-P row per
-        pipeline token. Q64/KV256 uses the same S-to-P aliasing contract but
-        streams four independently ready K32 fragments. Dense Q64/KV128 keeps
-        the base kernel's faster SMEM-P cadence.
+        FP8 Q128/KV128 publishes a complete packed-P row per pipeline token.
+        Q64/KV256 and 16-bit Q128/KV128 use the same S-to-P aliasing contract
+        but stream four independently ready K32 fragments. Q64/KV128 keeps the
+        base kernel's faster SMEM-P cadence.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -1616,11 +1641,6 @@ class FmhaDecodeConfig:
             and (
                 (self.tile_size_q == 128 and self.tile_size_kv == 128)
                 or (self.tile_size_q == 64 and self.tile_size_kv == 256)
-                or (
-                    self.use_block_sparse
-                    and self.tile_size_q == 64
-                    and self.tile_size_kv == 128
-                )
             )
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -1643,13 +1663,16 @@ class FmhaDecodeConfig:
     def defers_softmax_anchor_updates(self) -> bool:
         """Whether small row-max increases keep the previous exponent anchor.
 
-        Streamed KV256 tiles and block-sparse Keeps routes change the exact
-        row maximum often without changing it enough to justify rescaling the
-        live O tile; keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` makes the correction scale exactly
-        one and bounds 16-bit P by 2**8.
+        Keeps correction skips the in-place O rescale whenever the anchor is
+        unchanged, so keeping the prior anchor within
+        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
+        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
+        where that trade was measured to pay: KV256 tiles and block-sparse
+        routes, whose row maximum moves often but rarely by much.
         """
-        return self.tile_size_kv == 256 or self.use_block_sparse
+        return self.use_keeps_mma_ab and (
+            self.tile_size_kv == 256 or self.use_block_sparse
+        )
 
     @property
     def matches_kv256_task_topology(self) -> bool:

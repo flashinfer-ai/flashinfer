@@ -2526,7 +2526,19 @@ def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(ValueError, match="proxy routes require mask_type='dense'"):
         cfg.validate_block_sparse_profile(heads_q_per_kv=1)
 
+    # Exact routes accept causal masking; Q64 Keeps plans use KV256 routes.
     exact_causal_cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=64,
+        kv_block_size=64,
+        tile_size_q=64,
+        tile_size_kv=256,
+        use_keeps_mma_ab=True,
+        mask_type=CAUSAL,
+    )
+    exact_causal_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+    q64_kv128_keeps_cfg = FmhaDecodeConfig(
         use_block_sparse=True,
         groups_tokens_heads_q=True,
         q_block_size=64,
@@ -2534,9 +2546,9 @@ def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> No
         tile_size_q=64,
         tile_size_kv=128,
         use_keeps_mma_ab=True,
-        mask_type=CAUSAL,
     )
-    exact_causal_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+    with pytest.raises(ValueError, match="requires a streamed TMEM-P profile"):
+        q64_kv128_keeps_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
 
 
 def _validate_cpu_routing(
@@ -4091,7 +4103,7 @@ def test_public_block_sparse_correctness(
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
-    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128", "bk128-keeps"),
+    ids=lambda case: case.name,
 )
 @torch.no_grad()
 def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
