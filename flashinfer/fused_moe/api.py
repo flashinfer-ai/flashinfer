@@ -1667,8 +1667,10 @@ class MoEActivationPack:
 
     Activation encoding depends on ``QuantConfig.variant``:
 
-    * NVFP4: packed ``uint8 [M, H/2]`` values with
-      ``float8_e4m3fn [M, H/16]`` block scales.
+    * NVFP4 with ``TrtllmFp4Config`` or ``CuteDslConfig``: packed
+      ``uint8 [M, H/2]`` values with ``float8_e4m3fn [M, H/16]`` block scales.
+    * NVFP4 with ``CutlassNvfp4Config``: raw ``bfloat16 [M, H]`` values
+      without an activation scale.
     * MXFP4 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
       ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
       the TRTLLM FP4 launcher ABI.
@@ -1681,8 +1683,13 @@ class MoEActivationPack:
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
-    * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;
-      the calibrated scalar is folded into the backend's epilogue scales.
+    * FP8 per-tensor with ``TrtllmFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with no activation scale; the calibrated scalar is
+      folded into the TRT-LLM weight view.
+    * FP8 per-tensor with ``CutlassFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with a scalar ``float32`` dequantization scale. Obtain
+      both tensors from ``CutlassFp8PerTensorConfig.prepare_activations``.
+      This pack cannot be shared with the TRT-LLM per-tensor backend.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -1711,7 +1718,7 @@ class MoEActivationPack:
 
     # Backend-native activation payload; layouts documented above.
     hidden_states_q: Tensor
-    # Variant-specific scales documented above; None for BF16/per-tensor FP8.
+    # Variant-specific scales documented above; None for BF16 and TRT-LLM FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
