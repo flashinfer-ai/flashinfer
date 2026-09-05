@@ -161,6 +161,11 @@ from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .conv3d import (
+    pack_patchshift_conv3d_weight as pack_patchshift_conv3d_weight,
+)
+from .conv3d import patchshift_conv3d as patchshift_conv3d
+from .conv3d import prepare_patchshift_conv3d as prepare_patchshift_conv3d
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
