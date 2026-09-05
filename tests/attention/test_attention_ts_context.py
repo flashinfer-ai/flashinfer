@@ -32,7 +32,7 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
 )
 
-from cutlass import BFloat16, Float16, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
@@ -56,6 +56,12 @@ from flashinfer.utils import is_sm100a_supported
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="PrimTS context attention requires SM100 or SM103",
+)
+
+_REQUIRES_LDTM_STAT = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not context_module._default_uses_ldtm_stat(torch.cuda.current_device()),
+    reason="requires _default_uses_ldtm_stat",
 )
 
 _HEAD_DIM = 128
@@ -909,6 +915,78 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
         )
         is expected
     )
+
+
+def test_attention_ts_context_uses_ldtm_stat_default_is_off():
+    """FmhaTs stays off unless requested; the runner enables it on SM103/SM107."""
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
+        FmhaConfig,
+    )
+
+    assert FmhaConfig().uses_ldtm_stat is False
+
+    default_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+    )
+    assert default_fmha.cfg.uses_ldtm_stat is False
+
+    enabled_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        uses_ldtm_stat=True,
+    )
+    assert enabled_fmha.cfg.uses_ldtm_stat is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
+    """Context attention enables LDTM.STAT on B300 (SM103) and Rubin (SM107)."""
+    expected = torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+    assert (
+        context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
+    )
+
+
+@_REQUIRES_LDTM_STAT
+def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
+    """uses_ldtm_stat=True still builds the non-masked FMHA task graph."""
+    kernel = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        is_causal=False,
+        is_clc_dynamic=False,
+        uses_ldtm_stat=True,
+    )
+    assert kernel.cfg.uses_ldtm_stat is True
+    cfg = kernel.cfg
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        task_manager, *_ = build_fmha_task_manager(
+            cfg,
+            tile_sched_params=None,
+            tma_q_desc=None,
+            tma_k_desc=None,
+            tma_v_desc=None,
+            tma_o_desc=None,
+            cum_seqlen_q=None,
+            cum_seqlen_k=None,
+            num_kv_tiles=2,
+            q_offset=0,
+            g_page_idx_kv=None,
+            g_seq_lens_kv=None,
+            max_seq_len_kv=256,
+            is_persistent=True,
+            is_clc_dynamic=False,
+            exhaustive_deadlock_race_check=True,
+        )
+    assert task_manager is not None
 
 
 @pytest.mark.parametrize(
