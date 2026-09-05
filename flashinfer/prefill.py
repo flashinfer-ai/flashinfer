@@ -4438,12 +4438,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        # For NVFP4 KV, fuse q_scale and k_scale into sm_scale
+        # FA2/FA3 with a 16-bit query consumes unscaled FP8 KV values.
+        # Full-FP8 and other backends handle their scales separately.
+        apply_kv_scales = kv_cache_sf is not None or (
+            self._backend in ("fa2", "fa3") and is_float8(k) and not is_float8(q)
+        )
         if kv_cache_sf is not None:
             if q_scale is not None:
                 sm_scale *= q_scale
-            if k_scale is not None:
-                sm_scale *= k_scale
+        if apply_kv_scales and k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -4809,9 +4813,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
 
-        # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
+        # Apply global V calibration after attention, without changing the LSE.
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if kv_cache_sf is not None and v_scale is not None and not is_float_one:
+        if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
         return (out, lse) if return_lse else out
