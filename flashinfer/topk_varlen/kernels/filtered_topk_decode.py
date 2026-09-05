@@ -501,6 +501,10 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             _batch = row_id // self.next_n
             _off = row_id % self.next_n
             _eff = seqlen[_batch] - self.next_n + _off + 1
+            # FlashInfer-local: clamp the dynamic row length to the physical row
+            # width (input.shape[1] is symbolic, the compile bucket is wider); a
+            # length past the width used to read into the next rows.
+            _eff = min(_eff, input.shape[1])
             chunk_start = self.chunk_size_per_cta * cta_in_group
             row_start = chunk_start
             row_end = min(_eff, chunk_start + self.chunk_size_per_cta)
@@ -534,6 +538,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if not cutlass.const_expr(self.merge_blocks):
                 seq_len = seqlen[bidx // self.next_n]
                 row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+                # FlashInfer-local: same clamp to the physical row width
+                row_end = min(row_end, input.shape[1])
                 length = row_end - row_start
 
         if cutlass.const_expr(self.enable_multi_cta):
@@ -575,6 +581,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             _batch_check = bidx // self.next_n
             _off_check = bidx % self.next_n
             _eff_check = seqlen[_batch_check] - self.next_n + _off_check + 1
+            _eff_check = min(_eff_check, input.shape[1])  # FlashInfer-local clamp
             _needed_ctas = (
                 _eff_check + self.chunk_size_per_cta - 1
             ) // self.chunk_size_per_cta
