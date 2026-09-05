@@ -41,6 +41,7 @@ generic checks are insufficient.  See the docstring in
 import ast
 from collections import Counter
 import inspect
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
@@ -374,7 +375,7 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "BlockSparseTSWrapper.run",
-    ): 1,
+    ): 4,
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "BlockSparsePagedTSWrapper.run",
@@ -382,7 +383,7 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "block_sparse_attention",
-    ): 1,
+    ): 4,
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "block_sparse_attention_with_paged_kv_cache",
@@ -440,14 +441,13 @@ def test_attention_ts_trace_registry_coverage():
         if func.__module__.startswith("flashinfer.attention.prims_ts")
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
-    assert sum(discovered.values()) == 54
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
     """PrimTS constraints are valid expressions over defined axes."""
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
-        prims_ts_block_sparse_trace,
+        prims_ts_block_sparse_trace_dispatch,
         prims_ts_block_sparse_wrapper_trace_dispatch,
         prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_paged_block_sparse_wrapper_trace_dispatch,
@@ -469,7 +469,7 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
     block_sparse_templates = (
-        prims_ts_block_sparse_trace,
+        *prims_ts_block_sparse_trace_dispatch.templates,
         *prims_ts_paged_block_sparse_trace_dispatch.templates,
         *prims_ts_block_sparse_wrapper_trace_dispatch.templates,
         *prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates,
@@ -499,13 +499,103 @@ def test_attention_ts_trace_constraints_match_cache_axes():
 
 
 def test_prims_ts_block_sparse_trace_describes_gqa_contract():
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    from flashinfer.attention.prims_ts.block_sparse import (
+        BlockSparseTSWrapper,
+        block_sparse_attention,
+    )
     from flashinfer.trace.templates.attention import (
-        prims_ts_block_sparse_trace,
+        prims_ts_block_sparse_trace_dispatch,
         prims_ts_block_sparse_wrapper_trace_dispatch,
         prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_paged_block_sparse_wrapper_trace_dispatch,
     )
 
+    assert (
+        _TRACE_DISPATCHERS[block_sparse_attention.__wrapped__]
+        is prims_ts_block_sparse_trace_dispatch
+    )
+    assert (
+        _TRACE_DISPATCHERS[BlockSparseTSWrapper.run.__wrapped__]
+        is prims_ts_block_sparse_wrapper_trace_dispatch
+    )
+
+    one_shot_traces = {
+        template.name_prefix: template
+        for template in prims_ts_block_sparse_trace_dispatch.templates
+    }
+    assert set(one_shot_traces) == {
+        "prims_ts_block_sparse",
+        "prims_ts_block_sparse_bitmask",
+        "prims_ts_block_sparse_bsr_proxy",
+        "prims_ts_block_sparse_bitmask_proxy",
+    }
+    contiguous_wrapper_traces = {
+        template.name_prefix: template
+        for template in prims_ts_block_sparse_wrapper_trace_dispatch.templates
+    }
+    assert set(contiguous_wrapper_traces) == {
+        "prims_ts_block_sparse_wrapper",
+        "prims_ts_block_sparse_wrapper_bitmask",
+        "prims_ts_block_sparse_wrapper_bsr_proxy",
+        "prims_ts_block_sparse_wrapper_bitmask_proxy",
+    }
+    route_modes = {
+        ("bsr", False): ("", {"block_indptr", "block_indices"}),
+        ("bitmask", False): ("_bitmask", {"exact_block_bits"}),
+        ("bsr", True): (
+            "_bsr_proxy",
+            {"block_indptr", "block_indices", "k_summary", "v_summary"},
+        ),
+        ("bitmask", True): (
+            "_bitmask_proxy",
+            {"exact_block_bits", "k_summary", "v_summary"},
+        ),
+    }
+    all_route_inputs = {
+        "block_indptr",
+        "block_indices",
+        "exact_block_bits",
+        "k_summary",
+        "v_summary",
+    }
+    assert (
+        prims_ts_block_sparse_trace_dispatch()
+        is one_shot_traces["prims_ts_block_sparse"]
+    )
+    for (sparse_format, use_proxy_routes), (
+        suffix,
+        expected_inputs,
+    ) in route_modes.items():
+        one_shot_template = one_shot_traces[f"prims_ts_block_sparse{suffix}"]
+        wrapper_template = contiguous_wrapper_traces[
+            f"prims_ts_block_sparse_wrapper{suffix}"
+        ]
+        assert (
+            prims_ts_block_sparse_trace_dispatch(
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
+            )
+            is one_shot_template
+        )
+        wrapper = SimpleNamespace(
+            _plan_state=SimpleNamespace(
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
+            )
+        )
+        assert (
+            prims_ts_block_sparse_wrapper_trace_dispatch(self=wrapper)
+            is wrapper_template
+        )
+        for template in (one_shot_template, wrapper_template):
+            assert set(template.inputs) & all_route_inputs == expected_inputs
+            proxy_constraint = "mask_type is None or mask_type == 'dense'"
+            assert (proxy_constraint in template.constraints) == suffix.endswith(
+                "proxy"
+            )
+
+    prims_ts_block_sparse_trace = one_shot_traces["prims_ts_block_sparse"]
     constraints = set(prims_ts_block_sparse_trace.constraints)
     assert "num_qo_heads % num_kv_heads == 0" in constraints
     assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
@@ -538,6 +628,11 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     }
     for template in (tuple_trace, combined_trace):
         assert common_inputs <= template.inputs.keys()
+        assert {
+            "exact_block_bits",
+            "k_summary",
+            "v_summary",
+        }.isdisjoint(template.inputs)
         assert "paged KV" in template.description
         assert "max_seq_len_kv" in template.axes
         assert "seq_len_kv" not in template.axes
@@ -578,8 +673,9 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         is combined_trace
     )
 
-    contiguous_wrapper_trace = prims_ts_block_sparse_wrapper_trace_dispatch.templates[0]
-    assert contiguous_wrapper_trace.name_prefix == "prims_ts_block_sparse_wrapper"
+    contiguous_wrapper_trace = contiguous_wrapper_traces[
+        "prims_ts_block_sparse_wrapper"
+    ]
     wrapper_paged_templates = {
         template.name_prefix: template
         for template in prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates
