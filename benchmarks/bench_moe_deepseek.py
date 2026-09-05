@@ -699,39 +699,6 @@ def bench_cutlass(
     )
 
 
-def _trtllm_routing_inputs(inputs, routing_input_mode, distributions):
-    """Cache one pre-routed workload per input row for both TRTLLM dtypes."""
-    from flashinfer.fused_moe.da_tuner import (
-        RoutingRealizationFactory,
-        RoutingRealizationKey,
-    )
-
-    if routing_input_mode != "routed":
-        return None, None
-    # A factory caches by the complete realization key, including distribution.
-    # Keep it with this row's inputs so FP4/BF16 reuse identical tensors even
-    # after autotuning advances the RNG, and release it with the input row.
-    factory = inputs.get("_trtllm_routing_factory")
-    if factory is None:
-        factory = RoutingRealizationFactory()
-        inputs["_trtllm_routing_factory"] = factory
-    router_logits = inputs["router_logits"]
-    realized = factory.get_or_create(
-        RoutingRealizationKey(
-            device=torch.device(router_logits.device),
-            num_tokens=router_logits.shape[0],
-            distribution=distributions[0],
-            sample_index=0,
-            local_expert_offset=0,
-            num_local_experts=CFG.num_experts,
-            top_k=CFG.top_k,
-            routing_rule_fingerprint="bench_moe_deepseek:renormalize",
-            routed_scaling_factor=1.0,
-        )
-    )
-    return realized.expert_ids, realized.routing_weights
-
-
 def bench_trtllm(
     inputs,
     warmup=10,
@@ -760,6 +727,10 @@ def bench_trtllm(
             affect it.
     """
     from flashinfer.fused_moe import RoutingMethodType
+    from flashinfer.fused_moe.da_tuner import (
+        RoutingRealizationFactory,
+        RoutingRealizationKey,
+    )
 
     if precision not in ("nvfp4", "bf16"):
         raise ValueError(f"Unsupported TRTLLM precision: {precision}")
@@ -923,10 +894,32 @@ def bench_trtllm(
         logits_moe = trtllm_fp4_block_scale_moe
         routed_moe = trtllm_fp4_block_scale_routed_moe
 
-    routing_ids, routing_weights = _trtllm_routing_inputs(
-        inputs, routing_input_mode, distributions
-    )
+    routing_ids = None
+    routing_weights = None
     is_routed = routing_input_mode == "routed"
+    if is_routed:
+        # Share this row's cached routes across precisions, including after
+        # autotuning advances the RNG. Release the cache with the input row.
+        factory = inputs.get("_trtllm_routing_factory")
+        if factory is None:
+            factory = RoutingRealizationFactory()
+            inputs["_trtllm_routing_factory"] = factory
+        realized = factory.get_or_create(
+            RoutingRealizationKey(
+                device=torch.device(dev),
+                num_tokens=n,
+                distribution=distributions[0],
+                sample_index=0,
+                local_expert_offset=0,
+                num_local_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                routing_rule_fingerprint="bench_moe_deepseek:renormalize",
+                routed_scaling_factor=1.0,
+            )
+        )
+        routing_ids = realized.expert_ids
+        routing_weights = realized.routing_weights
+
     moe = routed_moe if is_routed else logits_moe
     moe_kwargs.update(
         routed_scaling_factor=1.0 if is_routed else CFG.routed_scaling_factor,
