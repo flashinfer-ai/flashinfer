@@ -1,6 +1,8 @@
 import abc
+import contextlib
 import dataclasses
 import functools
+import hashlib
 import logging
 import os
 from contextlib import nullcontext
@@ -411,6 +413,57 @@ class JitSpecNvcc(JitSpec):
     def is_ninja_generated(self) -> bool:
         return self.ninja_path.exists()
 
+    @property
+    def stamp_path(self) -> Path:
+        return self.ninja_path.parent / "flashinfer_jit.stamp"
+
+    def _stamp_digest(self) -> str:
+        """Digest of the build inputs the stamp vouches for.
+
+        Covers the exact ``build.ninja`` contents (toolkit path, flags,
+        absolute source list) plus the contents of every listed source file,
+        so editing a source in place invalidates the stamp even though the
+        ninja file is unchanged. Transitively included headers are NOT
+        hashed — that residual risk is why the stamp is opt-in and aimed at
+        restored caches of released packages, not editable checkouts.
+        """
+        h = hashlib.sha256(self.ninja_path.read_bytes())
+        for src in sorted(Path(s) for s in self.sources):
+            h.update(str(src).encode())
+            try:
+                h.update(src.read_bytes())
+            except OSError:
+                h.update(b"<unreadable>")
+        return h.hexdigest()
+
+    def _stamp_is_current(self) -> bool:
+        """Whether a trusted stamp proves the cached library is up to date.
+
+        Ninja judges staleness by file mtimes, so a JIT cache restored from an
+        archive (CI cache, baked container image, a copied ``$HOME``) under a
+        freshly installed package always rebuilds from scratch: the reinstalled
+        sources are newer than the restored objects even though every input is
+        byte-identical (#4884). When ``FLASHINFER_JIT_TRUST_CACHE_STAMP=1``,
+        trust a stamp of the exact ``build.ninja`` contents instead — the ninja
+        file embeds the toolkit path, all flags and the absolute source list,
+        so any real change to the build inputs changes the digest. Off by
+        default: mtime scanning stays authoritative for editable checkouts
+        where sources legitimately change within one version.
+        """
+        if os.environ.get("FLASHINFER_JIT_TRUST_CACHE_STAMP", "0") != "1":
+            return False
+        try:
+            return (
+                self.jit_library_path.exists()
+                and self.stamp_path.read_text().strip() == self._stamp_digest()
+            )
+        except OSError:
+            return False
+
+    def _write_stamp(self) -> None:
+        with contextlib.suppress(OSError):
+            self.stamp_path.write_text(self._stamp_digest() + "\n")
+
     def try_load(self) -> Optional[Any]:
         # Only the AOT artifact is known-valid without building.
         # The freshness of the JIT-path .so is owned by ninja's dependency scan,
@@ -443,6 +496,8 @@ class JitSpecNvcc(JitSpec):
         with lock:
             is_cold_build = not self.jit_library_path.exists()
             self.write_ninja()
+            if not is_cold_build and self._stamp_is_current():
+                return
             if is_cold_build:
                 logger.info_once(
                     "Building JIT module %s; this can take several minutes on "
@@ -450,6 +505,7 @@ class JitSpecNvcc(JitSpec):
                     self.name,
                 )
             run_ninja(self.build_dir, self.ninja_path, verbose)
+            self._write_stamp()
 
     def load(self, so_path: Optional[Path] = None):
         module = tvm_ffi.load_module(str(so_path or self.jit_library_path))
