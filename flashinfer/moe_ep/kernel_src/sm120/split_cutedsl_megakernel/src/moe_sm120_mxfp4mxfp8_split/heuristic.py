@@ -26,7 +26,7 @@ _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET = {
     32: 1,
     64: 2,
 }
-_DECODE_ROW_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+_DECODE_ROW_BUCKETS = (7, 16, 32, 64, 128, 168, 256, 320)
 
 # The N16 selector is production-ready for the validated decode buckets.
 # Dual-N8 is enabled only in the bounded full-width EP4 window where it is
@@ -406,9 +406,21 @@ def select_megamoe_config(
 
     shape.validate()
     rows = shape.expected_rows_per_expert
+    decode_bucket = _select_decode_row_bucket(shape.tokens_per_rank)
+    # DP4 decode reserves 25% admission headroom at global CC1024, producing
+    # at most 320 graph rows per rank. Keep that bucket on the latency-tuned
+    # N32 path instead of crossing the N64 expected-rows threshold at exactly
+    # 30 rows/expert for the DSV4-flash shape.
+    force_decode_n32 = (
+        decode_bucket == 320
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.ep_cross_numa_peer_count == 0
+        and rows <= 32.0
+    )
     # Offline RTX Pro 5000 scan: N32 wins through 28 rows/expert, N64
     # wins from 30 through 63, and N128 wins at 64 and above.
-    if rows < 30.0:
+    if force_decode_n32 or rows < 30.0:
         token_n = 32
     elif rows < 64.0:
         token_n = 64
@@ -576,7 +588,6 @@ def select_megamoe_config(
     explicit_tail_override = (
         overrides is not None and overrides.k2_tail_reclaim is not None
     )
-    decode_bucket = _select_decode_row_bucket(shape.tokens_per_rank)
     decode_bundle = (
         _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET.get(decode_bucket)
         if _ENABLE_PRODUCTION_DECODE_N16

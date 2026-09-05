@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 import pytest
 import torch
@@ -25,12 +26,75 @@ def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
         168: 168,
         169: 256,
         256: 256,
-        257: capacity,
+        257: 320,
+        320: 320,
         capacity: capacity,
     }
     for requested, bucket in expected.items():
         assert select_graph_compile_bucket(requested, capacity) == bucket
     assert select_graph_compile_bucket(None, capacity) == capacity
+    with warnings.catch_warnings(record=True) as caught:
+        assert select_graph_compile_bucket(4096, capacity) == capacity
+    assert not caught
+    with pytest.warns(RuntimeWarning, match="falling back to workspace capacity"):
+        assert select_graph_compile_bucket(321, capacity) == capacity
+
+
+def test_sm120_w4a8_dp4_decode_320_uses_n32_and_unique_cache_key() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    from moe_sm120_mxfp4mxfp8_split.api import (
+        MegaMoEProblemSpec,
+        select_compile_spec,
+    )
+
+    def spec(tokens_per_rank: int):
+        return select_compile_spec(
+            problem=MegaMoEProblemSpec(
+                tokens_per_rank=tokens_per_rank,
+                num_topk=6,
+                num_total_experts=256,
+                hidden=4096,
+                intermediate=8192,
+                expert_parallel_size=4,
+                expert_parallel_rank=0,
+                data_parallel_size=4,
+            ),
+            ep_same_numa_peer_count=3,
+            ep_cross_numa_peer_count=0,
+            num_sms=110,
+            sm_min_partition=8,
+            sm_partition_alignment=8,
+        )
+
+    spec256 = spec(256)
+    spec320 = spec(320)
+    assert spec320.kernel.k1_tile == (64, 32, 128)
+    assert spec320.kernel.k2_tile == (64, 32, 128)
+    assert spec320.kernel.ready_queue_bundle == 4
+    assert (spec320.kernel.k1_sms, spec320.kernel.k2_sms) == (72, 38)
+    assert spec320.cache_key != spec256.cache_key
+
+
+def test_sm120_w4a8_frontend_graph_cache_key_includes_bucket() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    weights = (
+        (torch.empty(1), torch.empty(1)),
+        (torch.empty(1), torch.empty(1)),
+    )
+    output = torch.empty(1)
+    key256 = runtime._frontend_graph_cache_key(weights, output, 256)
+    key320 = runtime._frontend_graph_cache_key(weights, output, 320)
+    assert key256[:-1] == key320[:-1]
+    assert key256[-1] == 256
+    assert key320[-1] == 320
+    assert key256 != key320
 
 
 def _packed_e2m1(

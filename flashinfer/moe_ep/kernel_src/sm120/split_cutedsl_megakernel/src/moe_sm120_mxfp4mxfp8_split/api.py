@@ -23,9 +23,10 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump for every generated-kernel code path or opaque workspace change. This
-# Revision 22 hoists the exact N32 SFB slot dispatch out of the production K2
-# K mainloop and keeps its SSA value isolated from the trace fallback.
-KERNEL_CACHE_ABI = 22
+# Revision 23 adds the 320-row DP4 decode specialization. The bucket is part
+# of the problem record, while the ABI bump also invalidates any standalone
+# 320-row artifacts compiled with the former N64 heuristic.
+KERNEL_CACHE_ABI = 23
 
 
 @dataclass(frozen=True)

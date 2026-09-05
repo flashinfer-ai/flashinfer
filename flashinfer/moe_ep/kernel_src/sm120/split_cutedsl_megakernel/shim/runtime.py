@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +22,8 @@ from .staging import ACTIVATION_DTYPE
 from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
 
 
-DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256, 320)
+_WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
 
 
 def select_graph_compile_bucket(
@@ -43,7 +45,7 @@ def select_graph_compile_bucket(
             f"compile token count {requested_tokens_per_rank} is outside "
             f"workspace capacity {workspace_capacity}"
         )
-    return next(
+    selected = next(
         (
             bucket
             for bucket in DECODE_GRAPH_COMPILE_BUCKETS
@@ -51,6 +53,24 @@ def select_graph_compile_bucket(
         ),
         workspace_capacity,
     )
+    if (
+        selected == workspace_capacity
+        and requested_tokens_per_rank < workspace_capacity
+        and requested_tokens_per_rank <= 2 * DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and workspace_capacity not in _WARNED_DECODE_CAPACITY_FALLBACKS
+    ):
+        _WARNED_DECODE_CAPACITY_FALLBACKS.add(workspace_capacity)
+        warnings.warn(
+            "SM120 W4A8 MegaMoE decode compile request "
+            f"({requested_tokens_per_rank} rows) exceeds the largest dedicated "
+            f"decode graph bucket ({DECODE_GRAPH_COMPILE_BUCKETS[-1]}); "
+            f"falling back to workspace capacity ({workspace_capacity}). "
+            "Decode performance may regress because this selects the prefill "
+            "kernel heuristic.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -694,6 +714,18 @@ def allocate_workspace(
     return workspace
 
 
+def _frontend_graph_cache_key(
+    transformed_weights: TransformedWeights,
+    graph_output: torch.Tensor,
+    compile_bucket: int,
+) -> tuple[int, ...]:
+    (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
+    return tuple(
+        tensor.data_ptr()
+        for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
+    ) + (graph_output.data_ptr(), compile_bucket)
+
+
 def run_split_mega_moe(
     workspace: MegaMoESm120W4A8Workspace,
     transformed_weights: TransformedWeights,
@@ -704,10 +736,9 @@ def run_split_mega_moe(
         raise RuntimeError("W4A8 workspace has been destroyed")
     (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
     graph_output = workspace.output if output is None else output
-    weight_key = tuple(
-        tensor.data_ptr()
-        for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
-    ) + (graph_output.data_ptr(), workspace._compile_bucket)
+    weight_key = _frontend_graph_cache_key(
+        transformed_weights, graph_output, workspace._compile_bucket
+    )
     frontend = workspace._frontends.get(weight_key)
     if frontend is None:
         frontend = MegaMoESm120W4A8Frontend(
