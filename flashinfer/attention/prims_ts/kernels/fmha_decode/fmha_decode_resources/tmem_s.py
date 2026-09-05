@@ -1472,8 +1472,30 @@ class TmemSResource(DecodeGenResourceBase):
                     tile_is_unmasked,
                     fragment_idx=fragment_idx,
                 )
+                if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+                    # The rolled P loop reloads scores without mask logic, so a
+                    # masked tile writes its masked fragment back in place.
+                    # The branch is warp-uniform: the loader above already
+                    # selected its mask policy on the same predicate.
+                    if not tile_is_unmasked:
+                        fragment_addr = (
+                            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+                            + Int32(self._alloc.offset)
+                            + self._softmax_loop_stage_slot_offset(stage_info)
+                            + Int32(fragment_idx * num_s_regs)
+                        )
+                        _keeps_tcgen05_st(
+                            cfg,
+                            prims.make_tmem_ptr(fragment_addr, Float32),
+                            s_vals.data_ptr().load(count=num_s_regs, alignment=4),
+                            offset=cfg.tile_size_kv // 2,
+                        )
                 fragment_max = self._reduce_keeps_fragment_max(s_vals)
                 tile_max = cute.math.max(tile_max, fragment_max, ftz=True)
+            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+                if not tile_is_unmasked:
+                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+                    cute.arch.fence_view_async_tmem_store()
 
             new_max = cute.math.max(old_max, tile_max, ftz=True)
             if old_max != _neg_max_f32():

@@ -422,20 +422,15 @@ def _consume_staged_qk_mma(
     cfg: FmhaDecodeConfig,
 ) -> None:
     """Consume all K head-dim stages for one QK MMA wave."""
+    # Streamed KV256 aliases P with the S columns this QK overwrites. The
+    # preceding same-instance PV reads P as its TMEM A operand from the same
+    # issuing thread, and the tensor core interlocks that read against a later
+    # MMA's accumulator write, so no completion wait is needed before QK.
+    _ = aliased_p
     tmem_s.acquire()
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
         smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
-        if cutlass.const_expr(
-            cfg.streams_tmem_p_fragments
-            and head_dim_stage_idx == 0
-            and (section == FmhaStage.Loop or cfg.use_persistent_scheduler)
-        ):
-            # Wait as late as possible: K staging overlaps the previous PV,
-            # but QK cannot overwrite the matching S/P alias until PV is done.
-            # Static HEAD has no previous tile; persistent HEAD may follow the
-            # same CTA's tail from another logical work tile and must wait.
-            aliased_p.wait_until_reusable_before_qk()
         if cfg.uses_q_desc_ref:
             getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
                 kv_desc=kv_desc,
@@ -2933,7 +2928,19 @@ def create_softmax0_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local0.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+                # One rolled loop streams every K32 probability fragment; the
+                # fragment body exists once in the instruction stream.
+                if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                    smem_p0.compute_proxy_route_p_fragments(
+                        new_max_arr=new_max_arr,
+                        route_flags=sparse_route_flags,
+                        route_origin0=sparse_origin0,
+                        route_origin1=sparse_origin1,
+                    )
+                else:
+                    smem_p0.compute_p_fragments(new_max_arr=new_max_arr)
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # Publish one K32 probability fragment at a time so PV can
                 # consume early fragments while later scores are processed.
                 for fragment_idx in range(cfg.num_softmax_score_fragments):
@@ -3177,7 +3184,17 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+                if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                    smem_p1.compute_proxy_route_p_fragments(
+                        new_max_arr=new_max_arr,
+                        route_flags=sparse_route_flags,
+                        route_origin0=sparse_origin0,
+                        route_origin1=sparse_origin1,
+                    )
+                else:
+                    smem_p1.compute_p_fragments(new_max_arr=new_max_arr)
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 for fragment_idx in range(cfg.num_softmax_score_fragments):
                     s_arr = tmem_s1.load_softmax_p_fragment(
                         fragment_idx=fragment_idx,

@@ -1615,6 +1615,17 @@ class FmhaDecodeConfig:
         return self.uses_two_inst_tmem_p and self.num_softmax_score_fragments > 1
 
     @property
+    def loops_softmax_p_fragments(self) -> bool:
+        """Whether streamed P fragments come from one rolled runtime loop.
+
+        KV256 masks scores in place during the max pass, so the P pass can
+        reload fragments without per-fragment mask logic and keep a single
+        copy of the exponentiation body in the instruction stream. The FP8
+        operand path still materializes P through its dedicated helpers.
+        """
+        return self.streams_tmem_p_fragments and not self.use_fp8_qkv
+
+    @property
     def matches_kv256_task_topology(self) -> bool:
         """Whether task roles match KV256's validated 16-warp layout."""
         return all(

@@ -59,6 +59,7 @@ from .helpers_common import (
     _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
+    _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
     _named_barrier_arrive,
     _neg_max_f32,
@@ -78,11 +79,27 @@ from .helpers_softmax import (
     _compute_fp8_p_regs_and_local_sums,
     _compute_fp8_p_regs_and_local_sums_dense,
     _compute_p_values_and_local_sums_dense,
+    _ex2_emulation_packed_f32x2,
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
 from .smem_block_sparse_metadata import _SOFTMAX_ROUTE_IS_PROXY_FLAG
 from .tmem_s import TmemSResource
+
+# Number of the 16 score pairs per streamed KV256 fragment whose exponentials
+# run as FMA polynomials instead of MUFU. The MUFU issue rate bounds the
+# fragment otherwise, while the FMA pipe is nearly idle in the softmax warps.
+# Larger shares grow the fragment body and the softmax warps become
+# instruction-fetch bound again, so one quarter is the measured optimum.
+KV_TILE_256_EX2_EMULATED_PAIRS = 4
+_KV_TILE_256_PAIRS_PER_FRAGMENT = 16
+
+
+def _pair_uses_ex2_emulation(pair_idx: int) -> bool:
+    """Spread the emulated pairs evenly across a fragment's 16 pairs."""
+    count = KV_TILE_256_EX2_EMULATED_PAIRS
+    pairs = _KV_TILE_256_PAIRS_PER_FRAGMENT
+    return ((pair_idx + 1) * count) // pairs != (pair_idx * count) // pairs
 
 
 @dataclass(kw_only=True)
@@ -361,6 +378,10 @@ class SmemPResource(DecodeGenResourceBase):
                 (self.scale_softmax_log2, self.scale_softmax_log2),
                 (minus_max_scale, minus_max_scale),
             )
+            # This body is instantiated once per fragment and instance, so the
+            # FMA-pipe exponential is left to the rolled fragment loop: here its
+            # extra instructions would be replicated and the softmax warps
+            # become instruction-fetch bound.
             p0 = Float32(cute.math.exp2(p0, fastmath=True))
             p1 = Float32(cute.math.exp2(p1, fastmath=True))
             s_arr[value_idx] = p0
@@ -502,6 +523,215 @@ class SmemPResource(DecodeGenResourceBase):
             route_origin0=route_origin0,
             route_origin1=route_origin1,
         )
+
+    @producer_work
+    @cute.jit
+    def compute_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+    ) -> None:
+        """Stream every ordinary KV256 K32 fragment from one rolled loop."""
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=Int32(0),
+            route_origin0=Int32(0),
+            route_origin1=Int32(0),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_proxy_route_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        route_flags: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
+    ) -> None:
+        """Stream every proxy-capable KV256 K32 fragment from one rolled loop."""
+        assert self.cfg.use_block_sparse_proxy_routes
+        route_is_proxy = Int32(
+            (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
+        )
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=route_is_proxy,
+            route_origin0=route_origin0,
+            route_origin1=route_origin1,
+        )
+
+    @cute.jit
+    def _compute_p_fragments_impl(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        route_is_proxy: Int32,
+        route_origin0: Int32,
+        route_origin1: Int32,
+    ) -> None:
+        """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
+
+        The unrolled per-fragment path replicates the exponentiation body for
+        every fragment and both softmax instances, which makes the softmax warps
+        instruction-fetch bound. Here the fragment index is a runtime loop
+        variable, so the body exists once and only the TMEM column offset, the
+        fragment barrier, and the proxy tail bookkeeping depend on it. The max
+        pass has already written masked scores back to TMEM, so the reload
+        needs no mask logic of its own.
+        """
+        _ = stage_info
+        cfg = self.cfg
+        assert cfg.loops_softmax_p_fragments
+        assert cfg.softmax_score_fragment_regs == 32
+        assert self._tmem_alloc.offset == self.tmem_s_ref._alloc.offset
+
+        new_max = new_max_arr[0]
+        safe_new_max = new_max
+        if safe_new_max == _neg_max_f32():
+            safe_new_max = Float32(0.0)
+        minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
+        tmem_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
+        fragment_cols = cfg.softmax_score_fragment_regs // 2
+        tidx, _, _ = cute.arch.thread_idx()
+        publishes_fragment = (tidx & Int32(31)) == Int32(0)
+
+        total_sum = Float32(0.0)
+        for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
+            fragment = Int32(fragment_idx)
+            loaded = _keeps_tcgen05_ld(
+                cfg,
+                prims.make_tmem_ptr(tmem_base + fragment * Int32(32), Float32),
+                num=32,
+                offset=cfg.tile_size_kv // 2,
+            )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            s_arr = cutlass.Array(Float32, 32, space=cutlass.AddressSpace.rmem)
+            for score_idx in cutlass.range_constexpr(32):
+                s_arr[score_idx] = loaded[score_idx]
+
+            local_sum = self._exponentiate_fragment_pairs(s_arr, minus_max_scale)
+            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                if route_is_proxy != Int32(0):
+                    local_sum = self._proxy_fragment_sum(
+                        local_sum,
+                        s_arr,
+                        fragment_origin=self._runtime_fragment_origin(
+                            fragment, route_origin0, route_origin1
+                        ),
+                    )
+
+            packed_p = (
+                s_arr.data_ptr()
+                .load(count=32, alignment=4)
+                .to(cfg.q_dtype)
+                .bitcast(Int32)
+            )
+            _keeps_tcgen05_st(
+                cfg,
+                prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_cols), Int32),
+                packed_p,
+                offset=cfg.tmem_p_cols_per_inst,
+            )
+            cute.arch.fence_view_async_tmem_store()
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            if publishes_fragment:
+                prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
+            total_sum += local_sum
+        self.tmem_s_ref.store_p_local_sum(0, total_sum)
+
+    @cute.jit
+    def _runtime_fragment_origin(
+        self, fragment: Int32, route_origin0: Int32, route_origin1: Int32
+    ) -> Int32:
+        """Return the K32 origin of a fragment selected at runtime."""
+        fragment_origin = Int32(route_origin0)
+        if fragment >= Int32(2):
+            fragment_origin = Int32(route_origin1)
+        return fragment_origin + (fragment & Int32(1)) * Int32(32)
+
+    @cute.jit
+    def _exponentiate_fragment_pairs(
+        self, s_arr: cutlass.Array, minus_max_scale: Float32
+    ) -> Float32:
+        """Turn one fragment of scaled scores into probabilities in place.
+
+        Returns the fragment's probability sum. Eight independent chains keep
+        the denominator update off one long dependency chain, and a configurable
+        subset of pairs runs its exponentials on the FMA pipe.
+        """
+        sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
+        for chain_idx in cutlass.range_constexpr(8):
+            sum_chains[chain_idx] = Float32(0.0)
+        for pair_idx in cutlass.range_constexpr(16):
+            value_idx = pair_idx * 2
+            p0, p1 = cute.arch.fma_packed_f32x2(
+                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                (self.scale_softmax_log2, self.scale_softmax_log2),
+                (minus_max_scale, minus_max_scale),
+            )
+            if cutlass.const_expr(_pair_uses_ex2_emulation(pair_idx)):
+                p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
+            else:
+                p0 = Float32(cute.math.exp2(p0, fastmath=True))
+                p1 = Float32(cute.math.exp2(p1, fastmath=True))
+            s_arr[value_idx] = p0
+            s_arr[value_idx + 1] = p1
+            chain_idx = (pair_idx & 3) * 2
+            sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
+                cute.arch.add_packed_f32x2(
+                    (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
+                    (p0, p1),
+                )
+            )
+        sum01 = cute.arch.add_packed_f32x2(
+            (sum_chains[0], sum_chains[1]),
+            (sum_chains[2], sum_chains[3]),
+        )
+        sum23 = cute.arch.add_packed_f32x2(
+            (sum_chains[4], sum_chains[5]),
+            (sum_chains[6], sum_chains[7]),
+        )
+        total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
+        return Float32(total_pair[0] + total_pair[1])
+
+    @cute.jit
+    def _proxy_fragment_sum(
+        self,
+        local_sum: Float32,
+        s_arr: cutlass.Array,
+        *,
+        fragment_origin: Int32,
+    ) -> Float32:
+        """Weight a proxy fragment's sum by the token mass each summary stands for.
+
+        KC stores one mean K vector per semantic KV block while VC stores its V
+        sum. P itself stays unweighted for PV; only the denominator accounts
+        for the represented token count, with the final summary covering the
+        shorter tail block.
+        """
+        cfg = self.cfg
+        num_summaries, tail_len = _block_sparse_proxy_summary_geometry(
+            cfg.static_seq_len_kv,
+            cfg.kv_block_size,
+        )
+        local_sum *= Float32(cfg.kv_block_size)
+        tail_delta = tail_len - cfg.kv_block_size
+        if cutlass.const_expr(tail_delta != 0):
+            final_summary_idx = num_summaries - 1
+            final_summary_offset = Int32(final_summary_idx) - fragment_origin
+            if final_summary_offset >= Int32(0) and final_summary_offset < Int32(32):
+                # Proxy fragment origins are K32-aligned in summary coordinates,
+                # so the tail's in-fragment lane is a compile-time constant even
+                # though route ownership is decided at runtime.
+                tail_lane = final_summary_idx % 32
+                local_sum += Float32(tail_delta) * Float32(s_arr[tail_lane])
+        return local_sum
 
     @cute.jit
     def _compute_keeps_p(
