@@ -51,10 +51,6 @@ from ...placeholder_helpers import (
     _placeholder_smem_array,
 )
 from .helpers_common import (
-    Constexpr,
-    DecodeGenResourceBase,
-    ResourceVars,
-    ffma2,
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_KV_RAW_TILE_BASE,
     _TASK_CACHE_KV_VALID_TILE_END,
@@ -62,6 +58,10 @@ from .helpers_common import (
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
+    Constexpr,
+    DecodeGenResourceBase,
+    DescriptorValue,
+    ResourceVars,
     _clamp_valid_tile_idx,
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
@@ -80,6 +80,7 @@ from .helpers_common import (
     _q_row_token_and_local_head,
     _q_group_token_base,
     _softmax_tile_idx,
+    ffma2,
 )
 from .smem_block_sparse_metadata import (
     _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG,
@@ -374,7 +375,7 @@ class TmemSResource(DecodeGenResourceBase):
         MMA-K slice.
         """
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_qkv and crosses_64b_chunk):
+        if cutlass.const_expr(not cfg.use_fp8_q and crosses_64b_chunk):
             k_desc = k_desc + Int32(8 * cfg.tile_size_kv - 6)
             if cutlass.const_expr(cfg.tile_size_q >= 16):
                 q_desc = q_desc + Int32(8 * cfg.tile_size_q - 6)
@@ -540,7 +541,7 @@ class TmemSResource(DecodeGenResourceBase):
         stage_info: StageInfo,
         *,
         q_desc: prims.Tcgen05SmemDesc,
-        kv_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
         """Issue HEAD QK MMA into the initial S slot."""
@@ -561,7 +562,7 @@ class TmemSResource(DecodeGenResourceBase):
         stage_info: StageInfo,
         *,
         q_desc: prims.Tcgen05SmemDesc,
-        kv_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
         """Issue LOOP QK MMA into the next producer S slot."""
@@ -581,7 +582,7 @@ class TmemSResource(DecodeGenResourceBase):
         self,
         stage_info: StageInfo,
         *,
-        kv_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
         """Issue guarded persistent HEAD QK without a routed Q descriptor."""
@@ -600,7 +601,7 @@ class TmemSResource(DecodeGenResourceBase):
         self,
         stage_info: StageInfo,
         *,
-        kv_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
         """Issue guarded persistent LOOP QK without a routed Q descriptor."""
@@ -619,7 +620,7 @@ class TmemSResource(DecodeGenResourceBase):
         stage_info: StageInfo,
         *,
         q_desc: prims.Tcgen05SmemDesc,
-        kv_desc: prims.Tcgen05SmemDesc,
+        kv_desc: DescriptorValue,
         stage_slot_offset: Int32,
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
@@ -630,7 +631,10 @@ class TmemSResource(DecodeGenResourceBase):
         local descriptor helpers below.
         """
         cfg = self.cfg
-        k_desc = _freeze_smem_descriptor(kv_desc)
+        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            k_desc = prims.make_tmem_ptr(kv_desc, Int32)
+        else:
+            k_desc = _freeze_smem_descriptor(kv_desc)
         q_desc = _freeze_smem_descriptor(q_desc)
         q_desc, head_dim_stage_idx = self._q_desc_for_head_dim_stage(
             q_desc, head_dim_stage_idx
@@ -688,11 +692,18 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                     scale_d = True
                     if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step(cfg)):
-                        k_desc, q_desc = self._advance_qk_descs_after_mma_k(
-                            k_desc,
-                            q_desc,
-                            crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
-                        )
+                        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            k_desc = prims.make_tmem_ptr(
+                                kv_desc + Int32((ki + 1) * _mma_k_step(cfg) // 4),
+                                Int32,
+                            )
+                            q_desc = q_desc + Int32(2)
+                        else:
+                            k_desc, q_desc = self._advance_qk_descs_after_mma_k(
+                                k_desc,
+                                q_desc,
+                                crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
+                            )
         else:
             mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step(cfg)
             if prims.elect_sync():
@@ -718,9 +729,15 @@ class TmemSResource(DecodeGenResourceBase):
             # closed form therefore adds each boundary jump minus that +2.
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
             for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
-                if cutlass.const_expr(cfg.use_fp8_qkv):
+                if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                    iter_k_desc = prims.make_tmem_ptr(
+                        kv_desc + ki * Int32(_mma_k_step(cfg) // 4), Int32
+                    )
+                    q_desc_offset = ki * Int32(2)
+                elif cutlass.const_expr(cfg.use_fp8_q):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
+                    iter_k_desc = k_desc + k_desc_offset
                 else:
                     chunk_idx = (ki * Int32(_mma_k_step(cfg))) // Int32(64)
                     k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)
@@ -730,7 +747,7 @@ class TmemSResource(DecodeGenResourceBase):
                         else 56
                     )
                     q_desc_offset = ki * Int32(2) + chunk_idx * Int32(q_chunk_extra)
-                iter_k_desc = k_desc + k_desc_offset
+                    iter_k_desc = k_desc + k_desc_offset
                 iter_q_desc = q_desc + q_desc_offset
                 if prims.elect_sync():
                     if cutlass.const_expr(q_is_a):
@@ -2274,8 +2291,8 @@ class TmemSResource(DecodeGenResourceBase):
         """Fold local P sums into the running online-softmax denominators."""
         cfg = self.cfg
         # ConsTailWork: denominator update runs after P has been materialized,
-        # so the resource-owned local sum matches the P payload consumed by BMM2.
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        # so local_sum_arr represents the exact P payload consumed by BMM2.
+        if cutlass.const_expr(cfg.use_fp8_q):
             # FP8 uses TmemSoftmaxGlobal to update sums after P
             # quantization, so this stage only copies the corrected sums
             # back into the running state. This keeps the denominator
@@ -2320,7 +2337,7 @@ class TmemSResource(DecodeGenResourceBase):
                 cfg.has_static_dense_full_kv_tiles
                 and cfg.tile_size_q in (16, 32)
                 and not cfg.use_keeps_mma_ab
-                and not cfg.use_fp8_qkv
+                and not cfg.use_fp8_q
                 and cfg.q_tiles_are_full
             ):
                 for pair_idx in cutlass.range_constexpr(pair_width):

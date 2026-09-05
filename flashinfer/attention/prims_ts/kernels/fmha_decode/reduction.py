@@ -334,7 +334,7 @@ def _attention_sink_log2_lse(
         dtype=Float32,
     )
     sink_lse = sink_ptr.load() * Float32(1.4426950408889634)
-    if cutlass.const_expr(cfg.use_fp8_qkv):
+    if cutlass.const_expr(cfg.use_fp8_q):
         sink_lse += Float32(math.log2(448.0))
     return sink_lse
 

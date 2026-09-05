@@ -38,25 +38,22 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_config import FmhaDecodeConfig
 from ...placeholder_helpers import _placeholder_smem_array
+from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
-    Constexpr,
-    DecodeGenResourceBase,
-    ResourceVars,
-    fadd2,
-    ffma2,
-    fmul2,
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
+    Constexpr,
+    DecodeGenResourceBase,
+    ResourceVars,
+    _attention_sink_head_stride,
     _decode_gen_task_cache,
     _keeps_col_base,
     _keeps_row_idx,
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
-    _attention_sink_head_stride,
     _local_head_from_q_output_row,
     _logical_head_batch,
     _logical_q_group_idx,
@@ -69,6 +66,9 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
+    fadd2,
+    ffma2,
+    fmul2,
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
@@ -984,7 +984,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_q):
             # Since P is scaled to [0, 448] for Fused GMEM/cluster FP8-Q,
             # divide the partial O by 448 before narrowing it to 16 bits,
             # and restore after the partials have been reduced in FP32.
@@ -2739,7 +2739,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
 
         if cutlass.const_expr(
-            cfg.use_fp8_qkv
+            cfg.use_fp8_q
             and cfg.use_fp8_output
             and cfg.tile_size_q == 128
             and cfg.headdim == 128
@@ -2816,7 +2816,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             partial_norm_scale = Float32(1.0)
             if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                 partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
-            elif cutlass.const_expr(cfg.use_fp8_qkv):
+            elif cutlass.const_expr(cfg.use_fp8_q):
                 partial_norm_scale = Float32(1.0 / 448.0)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
@@ -2866,7 +2866,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                             ),
                         )
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_q
                     ):
                         partial_pair = fmul2(
                             (partial_norm_scale, partial_norm_scale), partial_pair
@@ -3376,9 +3376,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
         )
-        base_addr1 = self._swaps_o_stage_base_addr(
-            tmem_row_base, o_base_col, tail_o_stage_idx_1
-        )
+        base_addr1 = base_addr0
+        if cutlass.const_expr(cfg.num_insts_kv != 1):
+            base_addr1 = self._swaps_o_stage_base_addr(
+                tmem_row_base, o_base_col, tail_o_stage_idx_1
+            )
         o0_vals, o1_vals = self._swaps_load_two_o_stage_chunks(
             base_addr0,
             base_addr1,
@@ -3391,6 +3393,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Split-KV tail: separate reduction stores normalized 16-bit O
             # plus log2-LSE; fused GMEM/cluster retains unnormalized O plus
             # max/sum state.
+            # Fused GMEM/CGA divides FP8-Q partials by the E4M3 P quantization
+            # scale before narrowing; other fused partials remain unnormalized.
             logical_h_k_idx, logical_b_idx = _logical_head_batch(
                 stage_info, self.h_k_idx, self.b_idx
             )
@@ -3402,7 +3406,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_q):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
                     norm_scale = Float32(1.0 / 448.0)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
@@ -3418,19 +3422,21 @@ class TmemCorrResource(DecodeGenResourceBase):
             for pair_idx in cutlass.range_constexpr(output_pair_regs):
                 # Separate reduction includes this split's reciprocal sum;
                 # fused reduction delays normalization until the final merge.
+                # FP8-Q fused reduction removes the 448x P quantization scale
+                # so the unnormalized numerator fits the 16-bit scratch.
                 scale_base = ((pair_idx % (2 * q_repeats)) // 2) * 2
                 reg_base = pair_idx * 2
                 partial_scale0 = (
                     (final_scale0[scale_base], final_scale0[scale_base + 1])
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_q
                     )
                     else (exp_scale0[scale_base], exp_scale0[scale_base + 1])
                 )
                 partial_scale1 = (
                     (final_scale1[scale_base], final_scale1[scale_base + 1])
                     if cutlass.const_expr(
-                        cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                        cfg.use_separate_reduction_kernel or cfg.use_fp8_q
                     )
                     else (exp_scale1[scale_base], exp_scale1[scale_base + 1])
                 )
@@ -3838,9 +3844,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
         )
-        base_addr1 = self._swaps_o_stage_base_addr(
-            tmem_row_base, o_base_col, tail_o_stage_idx_1
-        )
+        base_addr1 = base_addr0
+        if cutlass.const_expr(cfg.num_insts_kv != 1):
+            base_addr1 = self._swaps_o_stage_base_addr(
+                tmem_row_base, o_base_col, tail_o_stage_idx_1
+            )
         output_pair_regs = cfg.num_fp16_output_regs
         output_f32_regs = output_pair_regs * 2
         num_o_chunks = cfg.headdim // 64
@@ -3867,7 +3875,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_q):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
                     norm_scale = Float32(1.0 / 448.0)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
@@ -3879,6 +3887,8 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             # Store normalized 16-bit O for the standalone reducer, or preserve
             # unnormalized 16-bit O for fused GMEM/cluster reduction.
+            # FP8-Q fused reduction removes the 448x P quantization scale before
+            # storing the unnormalized O numerator in the 16-bit scratch.
             regs_partial_o = cutlass.Array(
                 Int32,
                 cfg.num_fp16_output_regs,
@@ -3887,14 +3897,14 @@ class TmemCorrResource(DecodeGenResourceBase):
             partial_scale0_pair = (
                 (final_scale0[0], final_scale0[1])
                 if cutlass.const_expr(
-                    cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_q
                 )
                 else (exp_scale0[0], exp_scale0[1])
             )
             partial_scale1_pair = (
                 (final_scale1[0], final_scale1[1])
                 if cutlass.const_expr(
-                    cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv
+                    cfg.use_separate_reduction_kernel or cfg.use_fp8_q
                 )
                 else (exp_scale1[0], exp_scale1[1])
             )
@@ -4161,7 +4171,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         # KeepsMmaAb path overrides the base because O is allocated by TmemO.
         task_cache = _decode_gen_task_cache(stage_info)
         tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-        o_base_col = 2 * cfg.tmem_s_cols + 2 * cfg.tmem_stats_cols
+        # Use the allocator-owned O offset. The two-instance Swaps layout has
+        # the same value as the historical formula, while one-instance mixed
+        # profiles omit the second S/stats allocation and therefore start O
+        # earlier in TMEM.
+        o_base_col = self.tmem_o_ref._alloc.offset
 
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             # KeepsMmaAb has one softmax scale group for this path. Compute the
@@ -4395,8 +4409,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         # private resource attributes across a persistent work-tile loop.
         task_cache = _decode_gen_task_cache(stage_info)
         tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-        o_base_col = 2 * cfg.tmem_s_cols + 2 * cfg.tmem_stats_cols
+        o_base_col = self.tmem_o_ref._alloc.offset
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+
+        if cutlass.const_expr(not self._owns_final_epilogue()):
+            return
 
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             # KeepsMmaAb finalization is owned by the last active K/V instance.
@@ -4447,9 +4464,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
             return
 
-        if cutlass.const_expr(self.inst_id != 1):
-            # SwapsMmaAb tail uses instance 1 to combine inst0/inst1 final O
-            # stages. Instance 0 exits after publishing its stats.
+        if cutlass.const_expr(cfg.num_insts_kv != 1 and self.inst_id != 1):
+            # Two-instance SwapsMmaAb uses instance 1 to combine inst0/inst1
+            # final O stages. Its instance 0 exits after publishing stats;
+            # one-instance mixed-precision profiles finalize on instance 0.
             return
 
         if cutlass.const_expr(cfg.tile_size_q in (16, 32)):
