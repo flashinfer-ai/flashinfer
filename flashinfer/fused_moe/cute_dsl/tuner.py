@@ -768,6 +768,14 @@ class CuteDslFusedMoERunner(TunableRunner):
                     gemm2_tactic
                 )
 
+                # A multi-CTA cluster needs the tile count rounded up to a
+                # multiple of cluster_shape_m so every cluster reaches the
+                # barrier uniformly, and the tile-metadata buffers initialized
+                # past num_non_exiting_tiles to match. Neither is implemented,
+                # so skip these tactics rather than fail at launch.
+                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                    return False
+
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,
