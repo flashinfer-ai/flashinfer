@@ -876,8 +876,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``prims-ts`` backend uses the task-scheduled decode kernel on SM100a/SM103a.
             It is the only backend that accepts ``is_causal=False`` with
-            ``q_len_per_req > 1``. It requires ``kv_layout="HND"`` and does not
-            support ``use_cuda_graph=True``.
+            ``q_len_per_req > 1`` and requires ``kv_layout="HND"``. Both modes
+            carve scratch from ``float_workspace_buffer`` and stage the planned
+            KV lengths in a reusable device buffer. Under ``use_cuda_graph`` it
+            runs the dynamic kernel variant, bounded by the kv-token capacity of
+            ``paged_kv_indices_buffer``.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -924,7 +927,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
         )
         self._kv_lens_buffer: Optional[torch.Tensor] = None
-        if backend in ("trtllm-gen", "cute-dsl"):
+        if backend in ("trtllm-gen", "cute-dsl", "prims-ts"):
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
@@ -986,15 +989,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "prims-ts decode backend requires kv_layout='HND'"
                 )
-            # The delegate snapshots seq_lens, scratch, and the compiled kernel
-            # at plan time, so a captured run() does not follow a later plan().
-            if use_cuda_graph:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support use_cuda_graph=True"
-                )
-            from .attention.prims_ts import BatchDecodePagedTSWrapper
+            # The delegate specializes its kernel on plan-time metadata, so it
+            # cannot back a captured run() that must follow later plan() calls.
+            # Under CUDA graph the wrapper drives the functional entry point
+            # with a static kv-length bound and wrapper-owned scratch instead.
+            self._prims_ts_graph_key: Optional[Tuple[Any, ...]] = None
+            self._prims_ts_workspace: Optional[torch.Tensor] = None
+            self._prims_ts_max_kv_len: Optional[int] = None
+            if not use_cuda_graph:
+                from .attention.prims_ts import BatchDecodePagedTSWrapper
 
-            self._prims_ts_wrapper = BatchDecodePagedTSWrapper()
+                self._prims_ts_wrapper = BatchDecodePagedTSWrapper()
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -1031,6 +1036,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+        if self._backend == "prims-ts":
+            self._prims_ts_graph_key = None
+            self._prims_ts_workspace = None
 
     @flashinfer_api
     def workspace_size(
@@ -1744,22 +1752,49 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "(indptr, last_page_len, page_size); seq_lens must match them"
                     )
             self._max_kv_len = int(max(kv_lens_arr_host).item())
-            self._prims_ts_wrapper.plan(
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                seq_len_q=q_len_per_req,
-                q_data_type=q_data_type,
-                kv_data_type=kv_data_type,
-                o_data_type=o_data_type,
-                mask_type="causal" if is_causal else "dense",
-                window_left=window_left,
-                max_kv_len=self._max_kv_len,
-            )
+            mask_type: Literal["dense", "causal"] = "causal" if is_causal else "dense"
+            if self._use_cuda_graph:
+                self._plan_prims_ts_graph(
+                    kv_lens_arr_host,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    q_len_per_req=q_len_per_req,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                    o_data_type=o_data_type,
+                    mask_type=mask_type,
+                    window_left=window_left,
+                    non_blocking=non_blocking,
+                )
+            else:
+                required_size = len(kv_lens_arr_host)
+                if required_size > self._kv_lens_buffer.shape[0]:
+                    self._kv_lens_buffer = torch.empty(
+                        (required_size,), dtype=torch.int32, device=self.device
+                    )
+                self._kv_lens_buffer[:required_size].copy_(
+                    kv_lens_arr_host, non_blocking=non_blocking
+                )
+                self._prims_ts_wrapper.plan(
+                    self._paged_kv_indptr_buf,
+                    self._paged_kv_indices_buf,
+                    self._paged_kv_last_page_len_buf,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    seq_len_q=q_len_per_req,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                    o_data_type=o_data_type,
+                    mask_type=mask_type,
+                    window_left=window_left,
+                    max_kv_len=self._max_kv_len,
+                    seq_lens=self._kv_lens_buffer[:required_size],
+                    workspace_buffer=self._float_workspace_buffer,
+                )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
@@ -1924,6 +1959,99 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._q_len_per_req = q_len_per_req
         self._is_causal = is_causal
+
+    def _plan_prims_ts_graph(
+        self,
+        kv_lens_arr_host: torch.Tensor,
+        *,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        q_len_per_req: int,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
+        mask_type: Literal["dense", "causal"],
+        window_left: int,
+        non_blocking: bool,
+    ) -> None:
+        from .attention.prims_ts import (
+            get_prims_ts_batch_decode_workspace_size,
+            warm_prims_ts_batch_decode,
+        )
+        from .attention.prims_ts.decode import _DECODE_MAX_KV_LEN
+
+        # The functional path needs a static kv-length bound that is part of
+        # the compiled key. Policy and scratch do not depend on it, and any
+        # request whose pages fit the index buffer stays under its capacity,
+        # so the capacity is a free bound that never changes between plans.
+        max_kv_len = min(
+            int(self._paged_kv_indices_buf.numel()) * page_size, _DECODE_MAX_KV_LEN
+        )
+        batch_size = len(kv_lens_arr_host)
+        if batch_size > self._kv_lens_buffer.shape[0]:
+            self._kv_lens_buffer = torch.empty(
+                (batch_size,), dtype=torch.int32, device=self.device
+            )
+        self._kv_lens_buffer[:batch_size].copy_(
+            kv_lens_arr_host, non_blocking=non_blocking
+        )
+        key = (
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            max_kv_len,
+            q_len_per_req,
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            mask_type,
+            window_left,
+        )
+        if key != self._prims_ts_graph_key:
+            required = get_prims_ts_batch_decode_workspace_size(
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                max_kv_len,
+                seq_len_q=q_len_per_req,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                out_dtype=o_data_type,
+                mask_type=mask_type,
+                window_left=window_left,
+                device=self.device,
+            )
+            if required > self._float_workspace_buffer.numel():
+                raise ValueError(
+                    f"prims-ts CUDA graph plan needs {required} workspace bytes, "
+                    f"float_workspace_buffer has {self._float_workspace_buffer.numel()}"
+                )
+            warm_prims_ts_batch_decode(
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                max_kv_len,
+                seq_len_q=q_len_per_req,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                out_dtype=o_data_type,
+                mask_type=mask_type,
+                window_left=window_left,
+                device=self.device,
+            )
+            workspace = self._float_workspace_buffer[:required].view(torch.int8)
+            workspace.zero_()
+            self._prims_ts_workspace = workspace
+            self._prims_ts_graph_key = key
+        self._prims_ts_max_kv_len = max_kv_len
 
     begin_forward = plan
 
@@ -2354,13 +2482,33 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 packed_shape = (actual_batch_size, q_len_per_req, q.size(1), q.size(2))
                 q = q.view(packed_shape)
                 out = out.view(packed_shape[:-1] + (out.size(-1),))
-            out = self._prims_ts_wrapper.run(
-                q,
-                (k_cache, v_cache),
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0 if v_scale is None else float(v_scale),
-                out=out,
-            )
+            bmm2_scale = 1.0 if v_scale is None else float(v_scale)
+            if self._use_cuda_graph:
+                from .attention.prims_ts import prims_ts_batch_decode_with_kv_cache
+
+                out = prims_ts_batch_decode_with_kv_cache(
+                    q,
+                    (k_cache, v_cache),
+                    self._prims_ts_workspace,
+                    self._paged_kv_indptr_buf,
+                    self._paged_kv_indices_buf,
+                    self._kv_lens_buffer[:actual_batch_size],
+                    self._prims_ts_max_kv_len,
+                    seq_len_q=q_len_per_req,
+                    mask_type="causal" if self._is_causal else "dense",
+                    window_left=self._window_left,
+                    bmm1_scale=sm_scale,
+                    bmm2_scale=bmm2_scale,
+                    out=out,
+                )
+            else:
+                out = self._prims_ts_wrapper.run(
+                    q,
+                    (k_cache, v_cache),
+                    bmm1_scale=sm_scale,
+                    bmm2_scale=bmm2_scale,
+                    out=out,
+                )
             return (
                 out.view(-1, out.size(-2), out.size(-1)) if q_len_per_req > 1 else out
             )
