@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -32,6 +34,7 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
+import flashinfer.sparse as sparse_module
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
 
@@ -396,7 +399,469 @@ def test_variable_block_sparse_attention_wrapper(
     )
 
 
+def _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads):
+    """Gather the routed KV entries and run dense attention on them."""
+    pages = k_cache.shape[0]
+    if layout == "HND":
+        flat_k = k_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
+        flat_v = v_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
+    else:
+        flat_k = k_cache.reshape(pages * page_size, num_kv_heads, -1)
+        flat_v = v_cache.reshape(pages * page_size, num_kv_heads, -1)
+    rows, width = route.shape
+    heads = q.shape[1]
+    group = heads // num_kv_heads
+    k = flat_k[route.reshape(-1)].reshape(rows, width, num_kv_heads, -1)
+    v = flat_v[route.reshape(-1)].reshape(rows, width, num_kv_heads, -1)
+    k = k.repeat_interleave(group, dim=2).float()
+    v = v.repeat_interleave(group, dim=2).float()
+    logits = torch.einsum("rhd,rwhd->rhw", q.float(), k) / math.sqrt(q.shape[-1])
+    return torch.einsum("rhw,rwhd->rhd", torch.softmax(logits, dim=-1), v).to(q.dtype)
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_block_sparse_paged_route(num_kv_heads, layout, page_size):
+    """A route of physical slots over a cache that still stores whole pages.
+
+    The wrapper must divide each index back into (page, entry); reading it as
+    a page id would address a different token, which the reference catches.
+    """
+    torch.manual_seed(42)
+    num_qo_heads, head_dim, pages, rows, width = 8, 128, 12, 6, 9
+    entries = pages * page_size
+    device = "cuda:0"
+    shape = (
+        (pages, page_size, num_kv_heads, head_dim)
+        if layout == "NHD"
+        else (pages, num_kv_heads, page_size, head_dim)
+    )
+    k_cache = torch.randn(*shape, dtype=torch.float16, device=device)
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.float16, device=device)
+    # scatter the route so consecutive entries land in different pages, and
+    # repeat one page so several entries share it
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        kv_layout=layout,
+    )
+    wrapper.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+        kv_cache_page_size=page_size,
+    )
+    out = wrapper.run(q, k_cache, v_cache)
+    ref = _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_block_sparse_paged_route_rejects_bad_geometry():
+    """Every bound the kernel cannot check for itself has to raise here."""
+    device = "cuda:0"
+    num_qo_heads, num_kv_heads, head_dim, pages, page_size = 4, 2, 128, 8, 16
+    entries = pages * page_size
+    rows, width = 4, 5
+    k_cache = torch.randn(
+        pages, num_kv_heads, page_size, head_dim, dtype=torch.float16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.float16, device=device)
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    def make_plan(**overrides):
+        wrapper = flashinfer.BlockSparseAttentionWrapper(
+            workspace, kv_layout=overrides.pop("kv_layout", "HND")
+        )
+        kwargs = dict(
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float16,
+            kv_cache_page_size=page_size,
+        )
+        kwargs.update(overrides)
+        indices = kwargs.pop("indices", route.reshape(-1).contiguous())
+        wrapper.plan(indptr, indices, rows, entries, 1, 1, **kwargs)
+        return wrapper
+
+    # a negative route element is loaded as a huge uint32
+    negative = route.clone()
+    negative[0, 0] = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        make_plan(indices=negative.reshape(-1).contiguous())
+
+    # one past the last entry is still out of bounds
+    past_end = route.clone()
+    past_end[0, 0] = entries
+    with pytest.raises(ValueError, match="out of bound"):
+        make_plan(indices=past_end.reshape(-1).contiguous())
+
+    # HND describes a paged cache; without one there is no page axis
+    with pytest.raises(ValueError, match="HND"):
+        make_plan(kv_cache_page_size=None)
+
+    # a route of slots needs a logical block of one entry
+    with pytest.raises(ValueError, match="C must be 1"):
+        flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND").plan(
+            indptr,
+            route.reshape(-1).contiguous(),
+            rows,
+            entries,
+            1,
+            2,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float16,
+            kv_cache_page_size=page_size,
+        )
+
+    # a value cache the route can read past
+    wrapper = make_plan()
+    with pytest.raises(ValueError, match="KV entries"):
+        wrapper.run(q, k_cache, v_cache[:-1])
+
+    # both caches are large enough on their own, but the route addresses one
+    # cache and the kernel takes its geometry from the other
+    wide_k = torch.cat([k_cache, k_cache], dim=0)
+    with pytest.raises(ValueError, match="pages"):
+        wrapper.run(q, wide_k, v_cache)
+
+    # the page size the tensor carries has to be the planned one
+    with pytest.raises(ValueError, match="entries per page"):
+        wrapper.run(q, k_cache[:, :, :-1], v_cache[:, :, :-1])
+
+    # a cache too small for the planned route would be read past the end
+    small = flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND")
+    small.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+        kv_cache_page_size=page_size,
+    )
+    with pytest.raises(ValueError, match="KV entries"):
+        small.run(q, k_cache[:-1], v_cache[:-1])
+
+
 if __name__ == "__main__":
     # This test verifies the INT32_T overflow issue.
     for seq_len in [16 * 1024, 32 * 1024, 40 * 1024, 48 * 1024, 64 * 1024]:
         test_block_sparse_attention(128, 128, seq_len, seq_len, 1, 1, 128, False)
+
+
+DEV = "cuda:0"
+
+requires_cuda_sm80 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(DEV)[0] < 8,
+    reason="the FA2 large-head path starts at sm_80",
+)
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
+    """A one-byte cache of any supported width reads on this architecture.
+
+    The FA2 large-head path rebuilds a quantized cache from raw bytes before
+    the dots, which does not depend on the architecture the bytes were written
+    for. This pins that down for the widths the read paths claim.
+    """
+    num_qo_heads, num_kv_heads, page_size = 8, 1, 64
+    rows, width, pages = 4, 64, 8
+    g = torch.Generator(device=DEV).manual_seed(head_dim)
+
+    keys = (
+        torch.randn(
+            pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=DEV,
+            generator=g,
+        )
+        * 0.3
+    )
+    values = torch.randn_like(keys) * 0.3
+    scale = 0.5
+    if kv_dtype == torch.float8_e4m3fn:
+        keys = (keys.float() / scale).to(kv_dtype)
+        values = (values.float() / scale).to(kv_dtype)
+        run_kwargs = {"k_scale": scale, "v_scale": scale}
+        # The reference reads the same bytes, dequantized ahead of time.
+        ref_keys = (keys.float() * scale).to(torch.bfloat16)
+        ref_values = (values.float() * scale).to(torch.bfloat16)
+    else:
+        run_kwargs = {}
+        ref_keys, ref_values = keys, values
+
+    query = torch.randn(
+        rows, num_qo_heads, head_dim, dtype=torch.bfloat16, device=DEV, generator=g
+    )
+    route = torch.randint(
+        0, pages * page_size, (rows, width), dtype=torch.int32, device=DEV, generator=g
+    )
+    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=DEV)
+    mask = torch.ones(rows * width, 1, 1, dtype=torch.bool, device=DEV)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+
+    def run(k, v, dtype, **kwargs):
+        wrapper = flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND")
+        wrapper.plan(
+            indptr,
+            route.reshape(-1).contiguous(),
+            rows,
+            pages * page_size,
+            1,
+            1,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=mask,
+            q_data_type=torch.bfloat16,
+            kv_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            kv_cache_page_size=page_size,
+        )
+        return wrapper.run(query, k, v, **kwargs)
+
+    out = run(keys, values, kv_dtype, **run_kwargs)
+    expected = run(ref_keys, ref_values, torch.bfloat16)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_paged_fp8_cache_sizes_its_default_scales_by_the_head_count(layout):
+    """A higher-precision query over an FP8 paged cache, with no explicit
+    per-head scales.
+
+    The defaults were sized from ``k.shape[1]``. For a raw paged cache that
+    axis is the page size under NHD and the head count only by coincidence, so
+    a page size below the head count handed the kernel a scale tensor shorter
+    than the head it indexes by. The shape here is page_size 1 against four KV
+    heads, the smallest that axis gets.
+
+    What it checks is the tensor the wrapper builds, not the attention output:
+    the FA2 module this runs on takes the scales in its signature and does not
+    apply them, so a short one is passed but never dereferenced and nothing
+    downstream moves. Reading them is the FA3 path, which needs SM90.
+    """
+    torch.manual_seed(7)
+    num_qo_heads, num_kv_heads, head_dim = 8, 4, 128
+    page_size, pages, rows, width = 1, 32, 4, 8
+    entries = pages * page_size
+    device = "cuda:0"
+    shape = (
+        (pages, page_size, num_kv_heads, head_dim)
+        if layout == "NHD"
+        else (pages, num_kv_heads, page_size, head_dim)
+    )
+    k_cache = torch.randn(*shape, dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    v_cache = torch.randn(*shape, dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        kv_layout=layout,
+    )
+    wrapper.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+        kv_cache_page_size=page_size,
+    )
+
+    seen = []
+    inner = wrapper._cached_module.paged_run
+
+    def spy(*args, **kwargs):
+        seen.extend(
+            a
+            for a in args
+            if isinstance(a, torch.Tensor) and a.dtype == torch.float32 and a.ndim == 1
+        )
+        return inner(*args, **kwargs)
+
+    wrapper._cached_module.paged_run = spy
+    try:
+        wrapper.run(q, k_cache, v_cache)
+    finally:
+        wrapper._cached_module.paged_run = inner
+
+    # The module takes other float vectors too, so the check is that the two
+    # KV scales are there rather than that every vector is one of them. Sized
+    # from k.shape[1] they would be page_size long under NHD -- one element for
+    # four heads. HND puts the head count on that axis, so it passes either way
+    # and is here to show the coincidence rather than to catch anything.
+    widths = [t.numel() for t in seen]
+    assert widths.count(num_kv_heads) >= 2, widths
+
+
+@requires_cuda_sm80
+def test_a_second_plan_still_takes_a_page_size_after_auto_resolved(monkeypatch):
+    """plan() resolves "auto" and keeps the answer on the wrapper. Gating the
+    page size on that resolved value refused a second plan for a backend the
+    caller never named -- so a wrapper that first planned a flat route could not
+    then plan a paged one."""
+    device = "cuda:0"
+    rows, width, heads, head_dim = 4, 8, 4, 128
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        backend="auto",
+    )
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    indices = torch.zeros(rows * width, dtype=torch.int32, device=device)
+    common = dict(
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+    )
+    # First a flat route, which lets plan() resolve and store a backend.
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
+    # What it resolves to depends on the device: sm_80 gives fa2, which the
+    # gate accepts either way, so the case that matters is written out rather
+    # than waited for. This is what plan() leaves behind on sm_90.
+    wrapper._backend = "fa3"
+    assert wrapper._requested_backend == "auto"
+    # Then a paged one on the same wrapper. Gating on the resolved backend
+    # refuses this for an fa3 the caller never named.
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, kv_cache_page_size=1, **common)
+    assert wrapper._backend == "fa2"
+    # And back to a flat one. The paged plan left fa2 behind, which is not
+    # "auto", so a plan that does not reset first never resolves again -- it
+    # keeps every later flat route on whatever the paged one settled on.
+    #
+    # Comparing against what the resolver would return does not show that: on
+    # this device it returns fa2 as well, so a stale fa2 and a fresh one look
+    # the same. The resolver is intercepted instead, and the question becomes
+    # whether it was consulted at all.
+    calls = []
+    real = sparse_module.determine_attention_backend
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sparse_module, "determine_attention_backend", spy)
+    wrapper.plan(indptr, indices, rows, 64, 1, 1, **common)
+    assert calls, "the flat plan reused the paged plan's backend"
+    assert wrapper._requested_backend == "auto"
+
+
+@requires_cuda_sm80
+def test_a_caller_supplied_fp8_out_holds_the_scaled_result():
+    """`out=` is the caller's buffer, and folding `v_scale` into an 8-bit output
+    has to go through float32. Doing that by rebinding the local would return a
+    scaled tensor and leave the caller's holding the unscaled one.
+
+    An 8-bit output only exists on the cuda-core decode path -- the tensor-core
+    prefill generators refuse it -- so the plan here is what selects that path:
+    one head each side, a narrow route and no custom mask.
+    """
+    torch.manual_seed(3)
+    rows, width, entries, head_dim = 4, 8, 64, 128
+    k = torch.randn(entries, 1, head_dim, dtype=torch.float16, device=DEV)
+    v = torch.randn_like(k)
+    q = torch.randn(rows, 1, head_dim, dtype=torch.float16, device=DEV)
+    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=DEV)
+    indices = torch.randint(0, entries, (rows * width,), dtype=torch.int32, device=DEV)
+
+    def plan():
+        wrapper = flashinfer.BlockSparseAttentionWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            rows,
+            entries,
+            1,
+            1,
+            num_qo_heads=1,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float8_e4m3fn,
+        )
+        assert not wrapper._use_tensor_cores, "this case has to take the decode path"
+        return wrapper
+
+    scale = 2.0
+    buffer = torch.empty(rows, 1, head_dim, dtype=torch.float8_e4m3fn, device=DEV)
+    returned = plan().run(q, k, v, out=buffer, v_scale=scale)
+    unscaled = plan().run(q, k, v)
+    torch.cuda.synchronize()
+
+    # The caller's buffer is what came back, and it holds the scaled values --
+    # rebinding the local would leave it holding the unscaled ones.
+    assert returned.data_ptr() == buffer.data_ptr()
+    want = (unscaled.to(torch.float32) * scale).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(buffer.float(), want.float(), rtol=0, atol=0)
+    assert not torch.equal(buffer.float(), unscaled.float())

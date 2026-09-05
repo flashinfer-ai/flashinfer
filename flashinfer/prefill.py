@@ -35,6 +35,7 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
+    with_fa2_route_scalars,
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .page import get_seq_lens
@@ -547,6 +548,9 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
+                # Both entry points share one parameter list; a ragged run has
+                # no pages, so this is never read.
+                0,  # kv_logical_block_size
             )
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -703,6 +707,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        # Keep new parameters last: callers pass the ones above positionally.
+        kv_logical_block_size: int = 0,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -778,6 +784,7 @@ def get_batch_prefill_module(backend, *args):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
+                kv_logical_block_size,
             )
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -889,6 +896,8 @@ def get_batch_prefill_module(backend, *args):
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        # Keep new parameters last, as the real implementation does.
+        kv_logical_block_size: int = 0,
     ) -> None:
         pass
 
@@ -1812,7 +1821,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
-            self._jit_additional_scalar_names = list(jit_args[9])
+            # jit_args[9] is additional_scalar_names, which the module generator
+            # extends for FA2. The run arguments are built from this list, so it
+            # has to be extended the same way or the kernel is called with one
+            # scalar fewer than it was generated to take.
+            self._jit_additional_scalar_names = with_fa2_route_scalars(
+                backend, jit_args[9], jit_args[10]
+            )[0]
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
@@ -3255,6 +3270,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "scale_k_scalar": scale_k_scalar,
                         "scale_v_scalar": scale_v_scalar,
                         "token_pos_in_items_len": self._token_pos_in_items_len,
+                        # 0 keeps the paged contract: one index names one page.
+                        # A block-sparse route sets it to its own block size so
+                        # the kernel reads the indices as physical slots.
+                        "kv_logical_block_size": getattr(
+                            self, "_kv_logical_block_size", 0
+                        ),
                     }
                     # prepare_jit_additional_args returns one entry per declared
                     # tensor name plus any scalars the caller passed

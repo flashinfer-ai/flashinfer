@@ -37,6 +37,14 @@ namespace flashinfer {
 template <typename DType, typename IdType>
 struct paged_kv_t {
   uint_fastdiv page_size;
+  // How many KV entries one physical page of the cache holds.
+  //
+  // `page_size` above is the *logical* block an `indices` element names, which
+  // for a plain paged cache is the page itself -- the two are then equal and
+  // an index is a page id. A block-sparse route over the same cache uses a
+  // smaller logical block (one KV entry, in the limit), so its indices name
+  // flat slots that have to be divided back into (page, entry).
+  uint_fastdiv storage_page_size;
   uint32_t num_heads;
   uint32_t head_dim;
   uint32_t batch_size;
@@ -67,6 +75,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ paged_kv_t()
       : num_heads(0),
         page_size(),
+        storage_page_size(),
         head_dim(0),
         batch_size(0),
         stride_page(0),
@@ -102,6 +111,7 @@ struct paged_kv_t {
                                       IdType* last_page_len, IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
+        storage_page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
         indices(indices),
@@ -140,6 +150,7 @@ struct paged_kv_t {
                                       IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
+        storage_page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
         indices(indices),
@@ -166,6 +177,7 @@ struct paged_kv_t {
                                       IdType* last_page_len, IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
+        storage_page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
         indices(indices),
@@ -220,16 +232,41 @@ struct paged_kv_t {
     return head_idx * stride_h + entry_idx * stride_n + feat_idx;
   }
 
+  /*!
+   * \brief Resolve one route element into the physical (page, entry) it names.
+   *
+   * The route addresses entry `index * page_size + entry_idx` of the sequence,
+   * which the physical page size divides into a page and an offset. When the
+   * logical block is the page -- every plain paged cache -- that division
+   * returns `index` and `entry_idx` unchanged, so the common case skips it.
+   */
+  __device__ __forceinline__ void resolve_slot(IdType page_iter, uint32_t entry_idx,
+                                               uint32_t& page_idx_out,
+                                               uint32_t& entry_idx_out) const {
+    const uint32_t index = static_cast<uint32_t>(__ldg(indices + page_iter));
+    if (static_cast<uint32_t>(page_size) == static_cast<uint32_t>(storage_page_size)) {
+      page_idx_out = index;
+      entry_idx_out = entry_idx;
+    } else {
+      storage_page_size.divmod(index * static_cast<uint32_t>(page_size) + entry_idx, page_idx_out,
+                               entry_idx_out);
+    }
+  }
+
   __device__ __forceinline__ DType* get_k_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
-    return k_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    uint32_t page_idx, entry;
+    resolve_slot(page_iter, entry_idx, page_idx, entry);
+    return k_data + get_elem_offset(page_idx, head_idx, entry, feat_idx);
   }
 
   __device__ __forceinline__ size_t protective_get_kv_offset(IdType page_iter, uint32_t head_idx,
                                                              uint32_t entry_idx, uint32_t feat_idx,
                                                              IdType last_indptr) const {
     if (page_iter < last_indptr) {
-      return get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+      uint32_t page_idx, entry;
+      resolve_slot(page_iter, entry_idx, page_idx, entry);
+      return get_elem_offset(page_idx, head_idx, entry, feat_idx);
     } else {
       return 0;
     }
@@ -243,7 +280,9 @@ struct paged_kv_t {
 
   __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
-    return v_data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    uint32_t page_idx, entry;
+    resolve_slot(page_iter, entry_idx, page_idx, entry);
+    return v_data + get_v_elem_offset(page_idx, head_idx, entry, feat_idx);
   }
 
   __device__ __forceinline__ size_t protective_get_k_offset(IdType page_iter, uint32_t head_idx,
@@ -256,7 +295,9 @@ struct paged_kv_t {
                                                             uint32_t entry_idx, uint32_t feat_idx,
                                                             IdType last_indptr) const {
     if (page_iter < last_indptr) {
-      return get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+      uint32_t page_idx, entry;
+      resolve_slot(page_iter, entry_idx, page_idx, entry);
+      return get_v_elem_offset(page_idx, head_idx, entry, feat_idx);
     } else {
       return 0;
     }
