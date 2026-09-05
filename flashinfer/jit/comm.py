@@ -352,3 +352,40 @@ def gen_dcp_alltoall_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_dcp_lse_reduce_module() -> JitSpec:
+    """Build the NCCL-symmetric-memory DCP A2A + LSE-reduce op."""
+    from torch.utils.cpp_extension import include_paths, library_paths
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]
+    )
+    extra_includes = [pathlib.Path(path) for path in include_paths(device_type="cuda")]
+    extra_ldflags = [f"-L{path}" for path in library_paths(device_type="cuda")]
+    extra_ldflags += [
+        "-ltorch",
+        "-ltorch_cpu",
+        "-ltorch_cuda",
+        "-lc10",
+        "-lc10_cuda",
+        "-lnccl",
+    ]
+
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        extra_includes.extend(
+            [
+                pathlib.Path(nccl_home) / "include",
+                pathlib.Path(nccl_home) / "include" / "nccl_device",
+            ]
+        )
+        extra_ldflags.insert(0, f"-L{pathlib.Path(nccl_home) / 'lib'}")
+
+    return gen_jit_spec(
+        "dcp_lse_reduce",
+        [jit_env.FLASHINFER_CSRC_DIR / "dcp_lse_reduce.cu"],
+        extra_include_paths=extra_includes,
+        extra_cuda_cflags=["-DUSE_NCCL"] + nvcc_flags,
+        extra_ldflags=extra_ldflags,
+    )
