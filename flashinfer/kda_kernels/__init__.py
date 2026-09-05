@@ -53,9 +53,13 @@ except (ImportError, RuntimeError):
 
 try:
     if _torch.cuda.is_available():
+        from ..compilation_context import get_visible_device_capabilities
         from ..cute_dsl.availability import is_cute_dsl_arch_supported as _dsl_arch_ok
 
-        if not _dsl_arch_ok(*_torch.cuda.get_device_capability(0)):
+        # NVML path when CUDA is not yet initialized (#4889); [0] keeps the
+        # previous "first visible device" semantics.
+        _caps = get_visible_device_capabilities()
+        if _caps and not _dsl_arch_ok(*_caps[0]):
             raise ImportError(
                 "installed CuTe DSL does not support this GPU architecture"
             )
