@@ -238,6 +238,18 @@ SM120 NVFP4 Attention
     nvfp4_attention_sm120_fwd
 
 
+SM120 QK MXFP8 / PV NVFP4 Attention
+------------------------------------
+
+.. currentmodule:: flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120
+
+.. autosummary::
+    :toctree: ../generated
+
+    qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv
+    qk_mxfp8_pv_nvfp4_attention_sm120_fwd
+
+
 flashinfer.mla
 ==============
 

@@ -168,6 +168,9 @@ from .blackwell_msa import load_blackwell_msa_module as load_blackwell_msa_modul
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )
+from .qk_mxfp8_pv_nvfp4_attention_sm120 import (
+    gen_qk_mxfp8_pv_nvfp4_attention_sm120_module as gen_qk_mxfp8_pv_nvfp4_attention_sm120_module,
+)
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
 from .blackwell_bgmv_moe import (
