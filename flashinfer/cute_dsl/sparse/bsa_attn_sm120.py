@@ -310,3 +310,271 @@ def bsa_attn_sm120_blk64_fwd(
 
     # out_t and lse_t are views of out/lse — kernel already wrote results in-place.
     return out, lse if return_lse else None
+
+
+_sm120_sage_compile_cache = get_jit_cache("bsa_fwd_sm120_sage")
+
+
+@flashinfer_api
+def bsa_attn_sm120_blk64_sage_fwd(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Forward pass for BSA block-sparse attention using the native SM120 Sage
+    QK-INT8 / PV-FP8 CuTe-DSL kernel (SM120/SM121 only, MHA only).
+
+    Unlike :func:`bsa_attn_sm120_blk64_fwd`, this function uses BHSD tensor
+    layout (batch, heads, seqlen, head_dim) throughout to match the layout
+    produced by :func:`flashinfer.quantize_sage_qkv_sm120` and upstream
+    Block-Sparse-Attention's native contract. It is a standalone function,
+    not wired into :class:`flashinfer.BlockSparseAttentionWrapper`: it does
+    not compute LSE and only supports MHA (``num_kv_heads == num_heads``).
+
+    Args:
+        q_int8: Query tensor (batch, num_heads, seqlen_q, 128), int8. Produced
+            by :func:`flashinfer.quantize_sage_q_sm120`.
+        k_int8: Key tensor (batch, num_heads, seqlen_k, 128), int8, channel
+            mean-centered. Produced by :func:`flashinfer.quantize_sage_kv_sm120`.
+        v_fp8: Value tensor (batch, num_heads, 128, ceil(seqlen_k/64)*64),
+            float8_e4m3fn, in Sage's HDS layout with the 16-token physical
+            permutation baked in. Produced by
+            :func:`flashinfer.quantize_sage_kv_sm120`.
+        q_scale: Per-32-token-group Q descale, (batch, num_heads,
+            ceil(seqlen_q/128)*4), float32.
+        k_scale: Per-K64-tile K descale, (batch, num_heads,
+            ceil(seqlen_k/64)), float32.
+        v_scale: Per-channel V descale, (batch, num_heads, 128), float32.
+        q2k_block_index: (batch, num_heads, num_q_blocks, max_kv_blocks) int32.
+        block_sparse_num: Number of KV blocks per Q block. Ignored when
+            q2k_block_nums is provided.
+        block_sizes: Actual token count per KV block, int32. Shape:
+            (num_kv_blocks,) or (batch, num_kv_blocks) or
+            (batch, num_heads, num_kv_blocks). Pass None to skip per-block
+            padding masking.
+        q2k_block_nums: Per-(batch, head, q_block) KV block count,
+            (batch, num_heads, num_q_blocks) int32. Optional.
+        softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
+        out: Pre-allocated output tensor (batch, num_heads, seqlen_q, 128),
+            bfloat16.
+    """
+    from .sm120_blk64.flash_fwd_sm120_sage import (  # noqa: PLC0415
+        BlockSparseAttnForwardSageSm120Blk64,
+    )
+
+    def _require_contiguous_cuda(name: str, tensor: torch.Tensor, device) -> None:
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    assert q_int8.dtype == torch.int8 and k_int8.dtype == torch.int8, (
+        "bsa_attn_sm120_blk64_sage_fwd requires int8 Q/K"
+    )
+    assert v_fp8.dtype == torch.float8_e4m3fn, (
+        "bsa_attn_sm120_blk64_sage_fwd requires float8_e4m3fn V"
+    )
+    assert q_int8.dim() == 4 and k_int8.dim() == 4 and v_fp8.dim() == 4
+
+    _require_contiguous_cuda("q_int8", q_int8, q_int8.device)
+    _require_contiguous_cuda("k_int8", k_int8, q_int8.device)
+    _require_contiguous_cuda("v_fp8", v_fp8, q_int8.device)
+    _require_contiguous_cuda("q_scale", q_scale, q_int8.device)
+    _require_contiguous_cuda("k_scale", k_scale, q_int8.device)
+    _require_contiguous_cuda("v_scale", v_scale, q_int8.device)
+    for name, tensor in (
+        ("q_scale", q_scale),
+        ("k_scale", k_scale),
+        ("v_scale", v_scale),
+    ):
+        if tensor.dtype != torch.float32:
+            raise ValueError(f"{name} must use torch.float32, got {tensor.dtype}")
+
+    major, minor = torch.cuda.get_device_capability(q_int8.device)
+    arch = major * 10 + minor
+    if arch // 10 != 12:
+        raise RuntimeError(
+            f"bsa_attn_sm120_blk64_sage_fwd (sm120_blk64 Sage) only supports "
+            f"SM120/SM121, current device is SM{arch}"
+        )
+
+    batch, num_heads, seqlen_q, head_dim = q_int8.shape
+    seqlen_k = k_int8.shape[2]
+
+    assert head_dim == 128, f"sm120_blk64 Sage requires head_dim=128, got {head_dim}"
+    if k_int8.shape != (batch, num_heads, seqlen_k, head_dim):
+        raise ValueError(
+            f"k_int8.shape {tuple(k_int8.shape)} must be "
+            f"(batch={batch}, num_heads={num_heads}, seqlen_k={seqlen_k}, head_dim={head_dim}) "
+            "(bsa_attn_sm120_blk64_sage_fwd only supports MHA: num_kv_heads must equal num_heads)"
+        )
+
+    padded_k = _ceil_div(seqlen_k, _BLOCK_SIZE) * _BLOCK_SIZE
+    if v_fp8.shape != (batch, num_heads, head_dim, padded_k):
+        raise ValueError(
+            f"v_fp8.shape {tuple(v_fp8.shape)} must be "
+            f"(batch={batch}, num_heads={num_heads}, head_dim={head_dim}, "
+            f"padded_seqlen_k={padded_k})"
+        )
+
+    num_q_blocks = _ceil_div(seqlen_q, _BLOCK_SIZE)
+    num_kv_blocks = _ceil_div(seqlen_k, _BLOCK_SIZE)
+
+    # Q scale granularity is 32-token groups padded to 4 groups per 128-token
+    # tile (independent of the 64-token block-sparse compute tile above).
+    num_q_scale_groups = _ceil_div(seqlen_q, 128) * 4
+    expected_scale_shapes = (
+        ("q_scale", q_scale, (batch, num_heads, num_q_scale_groups)),
+        ("k_scale", k_scale, (batch, num_heads, num_kv_blocks)),
+        ("v_scale", v_scale, (batch, num_heads, head_dim)),
+    )
+    for name, tensor, expected_shape in expected_scale_shapes:
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name}.shape {tuple(tensor.shape)} must be {expected_shape}"
+            )
+
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+
+    if out is not None:
+        assert out.dtype == torch.bfloat16, (
+            f"out.dtype ({out.dtype}) must be torch.bfloat16"
+        )
+        assert out.shape == (batch, num_heads, seqlen_q, head_dim), (
+            f"out.shape {tuple(out.shape)} must be "
+            f"(batch={batch}, num_heads={num_heads}, seqlen_q={seqlen_q}, head_dim={head_dim})"
+        )
+    if out is None:
+        out = torch.empty(
+            (batch, num_heads, seqlen_q, head_dim),
+            dtype=torch.bfloat16,
+            device=q_int8.device,
+        )
+
+    (
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    ) = _prepare_sm120_sparse_metadata(
+        q2k_block_index,
+        q2k_block_nums,
+        block_sizes,
+        block_sparse_num,
+        batch_size=batch,
+        num_heads=num_heads,
+        num_q_blocks=num_q_blocks,
+        num_kv_blocks=num_kv_blocks,
+        device=q_int8.device,
+    )
+
+    # BHSD -> kernel layout: Q/K/O (B,H,S,D) -> (S,D,H,B), leading_dim=1.
+    # V is already Sage's (B,H,D,padded_S) -> (D,S,H,B), leading_dim=1.
+    # Scales (B,H,G) -> (G,H,B), leading_dim=0.
+    q_t = q_int8.permute(2, 3, 1, 0)
+    k_t = k_int8.permute(2, 3, 1, 0)
+    v_t = v_fp8.permute(2, 3, 1, 0)
+    out_t = out.permute(2, 3, 1, 0)
+    q_scale_t = q_scale.permute(2, 1, 0)
+    k_scale_t = k_scale.permute(2, 1, 0)
+    v_scale_t = v_scale.permute(2, 1, 0)
+
+    q_cute = to_cute_tensor(q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
+    k_cute = to_cute_tensor(k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
+    v_cute = to_cute_tensor(v_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
+    out_cute = to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    q_scale_cute = to_cute_tensor(
+        q_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    k_scale_cute = to_cute_tensor(
+        k_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    v_scale_cute = to_cute_tensor(
+        v_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    block_sizes_cute = to_cute_tensor(
+        block_sizes_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+    fwd_kernel = BlockSparseAttnForwardSageSm120Blk64(
+        gqa_ratio=1,
+        head_dim=head_dim,
+        value_dim=head_dim,
+        blocksparse_blocksize_q=_BLOCK_SIZE,
+        blocksparse_blocksize_k=_BLOCK_SIZE,
+        has_block_sizes=has_block_sizes,
+        has_block_nums=has_block_nums,
+        block_sizes_mode=block_sizes_mode,
+    )
+
+    compile_key = (
+        "sm120_blk64_sage_fwd",
+        int(arch),
+        int(head_dim),
+        bool(has_block_nums),
+        bool(has_block_sizes),
+        int(block_sizes_mode),
+        q_t.stride(),
+        k_t.stride(),
+        v_t.stride(),
+        out_t.stride(),
+        q_scale_t.stride(),
+        k_scale_t.stride(),
+        v_scale_t.stride(),
+        q2k_t.stride(),
+        q2k_nums_t.stride(),
+        block_sizes_t.stride(),
+    )
+
+    args = (
+        q_cute,
+        k_cute,
+        v_cute,
+        out_cute,
+        q_scale_cute,
+        k_scale_cute,
+        v_scale_cute,
+        q2k_cute,
+        q2k_nums_cute,
+        cutlass.Int32(block_sparse_num),
+        block_sizes_cute,
+        cutlass.Float32(softmax_scale),
+        current_stream,
+    )
+
+    if compile_key not in _sm120_sage_compile_cache:
+        _sm120_sage_compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
+
+    if not is_fake_mode():
+        with torch.cuda.nvtx.range("bsa_attn_sm120_blk64_sage_fwd_kernel"):
+            _sm120_sage_compile_cache[compile_key](*args)
+
+    return out
