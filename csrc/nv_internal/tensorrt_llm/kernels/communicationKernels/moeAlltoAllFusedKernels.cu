@@ -130,19 +130,16 @@ uint64_t byteOffset(void const* pointer, uint8_t const* base) {
 }
 
 template <PreloadKernelSlot Slot, typename KernelFn>
-void preloadKernel(char const* name, KernelFn kernel_fn) {
-  int device = -1;
-  cudaError_t const device_error = cudaGetDevice(&device);
-  FLASHINFER_CHECK(device_error == cudaSuccess, "cudaGetDevice (", name,
-                   ") failed: ", cudaGetErrorString(device_error));
-  FLASHINFER_CHECK(device >= 0 && device < kMaxPreloadDevices, "CUDA device index (", device,
-                   ") is out of the preload cache range");
+void preloadKernel(char const* name, KernelFn kernel_fn, int device_id) {
+  FLASHINFER_CHECK(device_id >= 0 && device_id < kMaxPreloadDevices, "CUDA device index (",
+                   device_id, ") is out of the preload cache range");
 
   // Slot is part of this template specialization, so every fixed kernel owns
   // an independent per-device once flag. Steady-state calls avoid the global
-  // mutex and ordered-tree lookup that used to serialize prepare_combine.
+  // mutex, ordered-tree lookup, and CUDA runtime device query that used to
+  // serialize prepare_combine.
   static std::array<std::once_flag, kMaxPreloadDevices> preloaded_devices;
-  std::call_once(preloaded_devices[device], [name, kernel_fn] {
+  std::call_once(preloaded_devices[device_id], [name, kernel_fn] {
     cudaFuncAttributes attributes{};
     cudaError_t const error = cudaFuncGetAttributes(&attributes, kernel_fn);
     FLASHINFER_CHECK(error == cudaSuccess, "cudaFuncGetAttributes (", name,
@@ -181,12 +178,13 @@ int dtypeCode(nvinfer1::DataType dtype) {
   }
 }
 
-void preloadCombineKernel(int top_k) {
+void preloadCombineKernel(int top_k, int device_id) {
 #define PRELOAD_COMBINE_TOP_K(TOP_K)                                 \
   case TOP_K:                                                        \
     preloadKernel<PreloadKernelSlot::kCombineTopK##TOP_K>(           \
         "mnnvl_moe_alltoall_combine_top_k_" #TOP_K,                  \
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K); \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K,  \
+        device_id);                                                   \
     return
   switch (top_k) {
     PRELOAD_COMBINE_TOP_K(1);
@@ -289,26 +287,28 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   // CUDA lazy module loading may synchronize the device. Load every downstream
   // function before publication can enter its cross-rank wait.
   preloadKernel<PreloadKernelSlot::kStageCombine>(
-      "mnnvl_moe_alltoall_stage_combine", kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
+      "mnnvl_moe_alltoall_stage_combine", kernel_flashinfer_mnnvl_moe_alltoall_stage_combine,
+      params.device_id);
   if (!fuse_topk6_publication) {
     preloadKernel<PreloadKernelSlot::kPublishCombine>(
-        "mnnvl_moe_alltoall_publish_combine", kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
+        "mnnvl_moe_alltoall_publish_combine", kernel_flashinfer_mnnvl_moe_alltoall_publish_combine,
+        params.device_id);
   }
   if (useBf16TopK6Combine(params)) {
     preloadKernel<PreloadKernelSlot::kCombineBf16TopK6>(
         "mnnvl_moe_alltoall_combine_bf16_topk6",
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6);
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, params.device_id);
   } else if (useBf16TopK8Combine(params)) {
     preloadKernel<PreloadKernelSlot::kCombineBf16TopK8>(
         "mnnvl_moe_alltoall_combine_bf16_topk8",
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8, params.device_id);
   } else {
-    preloadCombineKernel(params.top_k);
+    preloadCombineKernel(params.top_k, params.device_id);
   }
   if (params.quant_mode != MoeA2ACombineQuantMode::NONE) {
     preloadKernel<PreloadKernelSlot::kQuantizeCombine>(
         "mnnvl_moe_alltoall_quantize_combine",
-        kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
+        kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, params.device_id);
   }
   auto* rank_workspace =
       localWorkspace(params.workspace, params.workspace_stride_bytes, params.ep_rank);

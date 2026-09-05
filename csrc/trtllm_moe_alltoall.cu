@@ -463,6 +463,7 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
 
   MoeA2ACombineParams params{};
   params.enable_pdl = enablePdl;
+  params.device_id = payload.device().device_id;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);

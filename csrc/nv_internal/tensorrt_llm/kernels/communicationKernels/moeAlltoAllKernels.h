@@ -183,6 +183,11 @@ enum class MoeA2ACombineSwizzleSFMode : uint32_t {
 struct MoeA2ACombineParams {
   bool enable_pdl;  // True: launch with programmatic dependent launch
 
+  // CUDA device that owns the payload/workspace. The public tensor boundary
+  // resolves this once so steady-state preload-cache probes do not call into
+  // the CUDA runtime for every MoE layer invocation.
+  int device_id;
+
   // EP configuration
   int ep_size;  // Number of EP ranks
   int ep_rank;  // Current EP rank

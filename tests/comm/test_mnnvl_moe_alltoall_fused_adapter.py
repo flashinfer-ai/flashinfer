@@ -637,17 +637,27 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
 
 
 def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
+    source_root = Path(__file__).resolve().parents[2] / "csrc"
     launcher_source = (
-        Path(__file__).resolve().parents[2]
-        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
+        source_root
+        / "nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
     ).read_text()
+    params_source = (
+        source_root
+        / "nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+    ).read_text()
+    adapter_source = (source_root / "trtllm_moe_alltoall.cu").read_text()
 
     assert "template <PreloadKernelSlot Slot, typename KernelFn>" in launcher_source
+    assert "int device_id;" in params_source
+    assert "params.device_id = payload.device().device_id;" in adapter_source
+    assert "KernelFn kernel_fn, int device_id" in launcher_source
     assert (
         "static std::array<std::once_flag, kMaxPreloadDevices> preloaded_devices;"
         in launcher_source
     )
-    assert "std::call_once(preloaded_devices[device]" in launcher_source
+    assert "std::call_once(preloaded_devices[device_id]" in launcher_source
+    assert "cudaGetDevice" not in launcher_source
     assert "preload_mutex" not in launcher_source
     assert "std::set<" not in launcher_source
 
