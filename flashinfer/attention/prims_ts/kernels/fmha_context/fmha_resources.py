@@ -27,8 +27,11 @@ and TAIL is the one-time cleanup and drain after LOOP exits.
 SMEM resources (TMA pipelines)
 ------------------------------
 - SmemQResource   : SMEM Q buffer, TmaUmma pipeline. Load -> MMA.
-- SmemKVResource  : SMEM KV buffer, TmaUmma pipeline. Load -> MMA. The D256
-                    depth is derived from the public SM100 SMEM capacity.
+- SmemKVResource  : SMEM K/V buffer, TmaUmma pipeline. Load -> MMA. The D256
+                    depth is derived from the public SM100 SMEM capacity. One
+                    instance holds both K and V when they share a dtype; a
+                    QK/PV dtype mismatch instantiates one K-only and one V-only
+                    instance, each sized from its own dtype.
 - SmemOResource   : One SMEM O buffer per Q/O instance, AsyncAsync pipeline.
                     Correction -> Epilogue.
 
@@ -231,6 +234,12 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
+    # One TMA pipeline has one expected-transaction byte count per stage, so K
+    # and V share a ring of kv_stage stages only while their dtype widths
+    # match. Mixed widths set split_kv_pipelines and size one ring per side.
+    split_kv_pipelines: bool = False
+    kv_stage_k: int = 3
+    kv_stage_v: int = 3
     mma_softmax_stage: int = 1
     # Use the two-stage loop-carried S/P schedule and an independent P-ready
     # handoff, allowing QK(i+1) and PV(i) to operate on opposite S/P stages.
@@ -250,6 +259,13 @@ class FmhaConfig:
     tma_copy_kv_elements: int = 0
     tma_copy_kv_granu_elems: int = 0
     tma_copy_kv_bytes: int = 0
+    # V-specific TMA copy granularity. V may use a different dtype than K,
+    # e.g. QK-BF16/PV-FP8, but these fields are otherwise ignored.
+    tma_copy_v_iters: int = 1
+    tma_copy_v_granu_inner: int = 128
+    tma_copy_v_stage_iters: int = 0
+    tma_copy_v_granu_elems: int = 0
+    tma_copy_v_bytes: int = 0
     tma_copy_o_iters: int = 1
     tma_copy_o_granu_inner: int = 0
     tma_copy_o_elements: int = 0
@@ -1062,14 +1078,36 @@ class GmemQKVResource(MemoryResource):
         return batch_coord, kv_tile_start, cached_seqlen_kv
 
 
-def _qkv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
-    """Return the byte width of one Q/K/V tile inner dimension."""
+def _qk_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+    """Return the byte width of one Q/K tile inner dimension."""
     return cfg.qk_mma_tiler[2] * cfg.q_dtype.width // 8
 
 
-def _qkv_smem_layout(cfg: FmhaConfig) -> int:
-    """Return the tcgen05 descriptor layout selector for Q/K/V SMEM tiles."""
-    inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
+def _pv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+    """Return the byte width of one P/V tile inner dimension."""
+    return cfg.pv_mma_tiler[1] * cfg.v_dtype.width // 8
+
+
+def _o_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+    """Return the byte width of one O tile inner dimension."""
+    return cfg.qk_mma_tiler[2] * cfg.o_dtype.width // 8
+
+
+def _qk_smem_layout(cfg: FmhaConfig) -> int:
+    """Return the tcgen05 descriptor layout selector for Q/K SMEM tiles."""
+    inner_dim_size = _qk_inner_dim_size_bytes(cfg)
+    if inner_dim_size % 128 == 0:
+        return 2
+    if inner_dim_size == 64:
+        return 4
+    if inner_dim_size == 32:
+        return 6
+    raise RuntimeError(f"Unsupported inner dimension size: {inner_dim_size}")
+
+
+def _pv_smem_layout(cfg: FmhaConfig) -> int:
+    """Return the tcgen05 descriptor layout selector for V SMEM tiles."""
+    inner_dim_size = _pv_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return 2
     if inner_dim_size == 64:
@@ -1091,22 +1129,22 @@ def _qk_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
 def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
     """Return V descriptor leading and stride byte offsets for PV MMA."""
     leading_byte_offset = 0
-    if cfg.tma_copy_qkv_iters != 1:
-        tma_copy_kv_iters = (
-            cfg.tma_copy_kv_stage_iters
+    if cfg.tma_copy_v_iters != 1:
+        tma_copy_v_iters = (
+            cfg.tma_copy_v_stage_iters
             if cfg.stage_kv_by_head_dim
-            else cfg.tma_copy_qkv_iters
+            else cfg.tma_copy_v_iters
         )
-        leading_byte_offset = cfg.tma_copy_kv_bytes // tma_copy_kv_iters
+        leading_byte_offset = cfg.tma_copy_v_bytes // tma_copy_v_iters
     stride_byte_offset = (
-        cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_qkv_iters
+        cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_v_iters
     )
     return leading_byte_offset, stride_byte_offset
 
 
 def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
     """Return the shared-memory swizzle used when staging O for TMA store."""
-    inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
+    inner_dim_size = _o_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return cutlass.Swizzle(3, 4, 3)
     if inner_dim_size == 64:
@@ -1254,7 +1292,7 @@ class SmemQResource(MemoryResource):
             sQ_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_qk_smem_layout(self.cfg),
         )
 
     @consumer_work(returns=desc_q0_base)
@@ -1528,17 +1566,16 @@ class SmemPageOffsetsKvResource(MemoryResource):
     ) -> set[str] | None:
         """Bind page-offset releases to the K/V TMA loads that consumed them."""
         if isinstance(downstream, SmemKVResource):
-            if self.cfg.reuses_page_table_windows:
-                if self.page_table_is_v:
-                    return {"v_load", "v_load_stage", "v_load_stage_cached"}
-                return {"k_load", "k_load_stage"}
-            return {
-                "k_load",
-                "v_load",
-                "k_load_stage",
-                "v_load_stage",
-                "v_load_stage_cached",
-            }
+            labels: set[str] = set()
+            binds_k = not (self.cfg.reuses_page_table_windows and self.page_table_is_v)
+            binds_v = not (
+                self.cfg.reuses_page_table_windows and not self.page_table_is_v
+            )
+            if downstream.holds_k and binds_k:
+                labels |= {"k_load", "k_load_stage"}
+            if downstream.holds_v and binds_v:
+                labels |= {"v_load", "v_load_stage", "v_load_stage_cached"}
+            return labels or None
         return None
 
 
@@ -1554,6 +1591,10 @@ class SmemKVResource(MemoryResource):
     K and V tiles alternate in the pipeline stages: K0, V0, K1, V1, ...
     Producer: LoadTask (TMA loads K/V tiles).
     Consumer: MmaTask (builds SMEM descriptors for QK and PV MMAs).
+
+    ``role="kv"`` shares one buffer and pipeline, which requires equal K and V
+    element widths. Mixed QK/PV dtypes instead build one ``role="k"`` and one
+    ``role="v"`` instance, each sized from its own dtype.
     """
 
     sK_array: cutlass.Array = field(init=False, default=None)
@@ -1566,6 +1607,7 @@ class SmemKVResource(MemoryResource):
         init=False, default=None
     )
     page_idx_kv: cute.Pointer | None = field(init=False, default=None)
+    role: Constexpr[str] = field(init=False, default="kv")
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -1580,10 +1622,19 @@ class SmemKVResource(MemoryResource):
         page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
         page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
         page_idx_kv: cute.Pointer | None = None,
+        role: str = "kv",
         **kwargs: Any,
     ) -> None:
-        """Bind K/V TMA descriptors and reserve shared SMEM staging."""
+        """Bind K/V TMA descriptors and reserve this role's SMEM staging."""
+        if role not in ("kv", "k", "v"):
+            raise ValueError(f"unsupported SmemKVResource role: {role}")
+        if role == "kv" and cfg.k_dtype.width != cfg.v_dtype.width:
+            raise ValueError(
+                "a shared K/V buffer requires K and V to have the same element "
+                f"width; got {cfg.k_dtype.width} and {cfg.v_dtype.width}"
+            )
         super().__init__(pipeline_config=pipeline_config, **kwargs)
+        self.role = role
         self.tma_k_desc = tma_k_desc
         self.tma_v_desc = tma_v_desc
         self.page_offsets_kv = page_offsets_kv
@@ -1592,12 +1643,14 @@ class SmemKVResource(MemoryResource):
         )
         self.page_idx_kv = page_idx_kv
         self.cfg = cfg
-        total_elements = cfg.sK_shape[0] * cfg.sK_shape[1]
-        size_bytes = total_elements * cfg.k_dtype.width // 8
+        # Every role stages pipeline_config.num_stages tiles; for "kv" that is
+        # cfg.kv_stage, which is cfg.sK_shape[0].
+        total_elements = pipeline_config.num_stages * cfg.sK_shape[1]
+        size_bytes = total_elements * self._buffer_dtype(cfg, role).width // 8
         self._alloc = SmemAllocation(
-            "smem_kv", size_bytes, alignment=cfg.buffer_align_bytes
+            f"smem_{role}", size_bytes, alignment=cfg.buffer_align_bytes
         )
-        self.sK_array = _placeholder_smem_array(cfg.k_dtype)
+        self.sK_array = _placeholder_smem_array(self._buffer_dtype(cfg, role))
         self.desc_k_base = TaskLocalVariable(
             dtype=cutlass.Int64,
             default=cutlass.Int64(0),
@@ -1609,6 +1662,21 @@ class SmemKVResource(MemoryResource):
             docs="SMEM descriptor base for the current V tile.",
         )
 
+    @staticmethod
+    def _buffer_dtype(cfg: FmhaConfig, role: str) -> type:
+        """Return the element type staged by a buffer with this role."""
+        return cfg.v_dtype if role == "v" else cfg.k_dtype
+
+    @property
+    def holds_k(self) -> bool:
+        """Return whether this buffer stages K tiles."""
+        return self.role in ("kv", "k")
+
+    @property
+    def holds_v(self) -> bool:
+        """Return whether this buffer stages V tiles."""
+        return self.role in ("kv", "v")
+
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Return the SMEM allocation required for staged K/V tiles."""
         return [self._alloc]
@@ -1617,10 +1685,10 @@ class SmemKVResource(MemoryResource):
     def _init_smem_state(self, stage_info: StageInfo) -> None:
         """Materialize K/V SMEM storage and descriptor dataflow slots."""
         smem_base = stage_info.context.smem_base
-        total_elements = self.cfg.sK_shape[0] * self.cfg.sK_shape[1]
+        total_elements = self.pipeline_config.num_stages * self.cfg.sK_shape[1]
         self.sK_array = cutlass.Array(
             smem_base.data_ptr() + self._alloc.offset,
-            dtype=self.cfg.k_dtype,
+            dtype=self._buffer_dtype(self.cfg, self.role),
             shape=(total_elements,),
             addrspace=3,
         )
@@ -1662,20 +1730,27 @@ class SmemKVResource(MemoryResource):
         ) * self.cfg.kv_tile_n
         smem_stage_elements = self.cfg.tma_copy_kv_elements
         sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
+        # V carries its own copy granularity because v_dtype may be narrower.
+        # The two sets coincide when the widths match.
+        if cutlass.const_expr(is_v):
+            d_granu_inner = self.cfg.tma_copy_v_granu_inner
+            d_iter_elems = self.cfg.tma_copy_v_granu_elems
+            stage_iters = self.cfg.tma_copy_v_stage_iters
+        else:
+            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
+            stage_iters = self.cfg.tma_copy_kv_stage_iters
 
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Paged-KV path: read pre-staged page IDs and issue one TMA per
             # (page fragment, d fragment). The descriptor is shaped
             # (d_inner, num_tokens_per_page, h_kv, total_pages); coords are
             # (d_off, 0, kv_head_coord, page_id). SMEM layout per stage matches
-            # the contiguous path: two d-halves (tma_copy_kv_granu_elems each)
-            # with page fragments concatenated along the seq axis inside each
-            # d-half.
+            # the contiguous path: two d-halves (d_iter_elems each) with page
+            # fragments concatenated along the seq axis inside each d-half.
             tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
             pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
-            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
             page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
-            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
             if prims.elect_sync():
                 # Only the elected TMA-issuing lane consumes page IDs. Loading
                 # the vector outside this guard made every lane perform the
@@ -1714,7 +1789,7 @@ class SmemKVResource(MemoryResource):
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])
-                    for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+                    for i in cutlass.range_constexpr(stage_iters):
                         d_offset = Int32(
                             head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                             + i * d_granu_inner
@@ -1729,9 +1804,8 @@ class SmemKVResource(MemoryResource):
             return
 
         if prims.elect_sync():
-            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
             seq_coord_kv = cuseqlen_k + seq_offset
-            for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+            for i in cutlass.range_constexpr(stage_iters):
                 d_offset = (
                     head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                     + i * d_granu_inner
@@ -1740,7 +1814,7 @@ class SmemKVResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_varlen):
                     kv_coords = (d_offset, kv_head_coord, seq_coord_kv)
                 prims.cp_async_bulk_tensor_shared_cta_global(
-                    sK_curr.subview(i * self.cfg.tma_copy_kv_granu_elems),
+                    sK_curr.subview(i * d_iter_elems),
                     tma_desc,
                     kv_coords,
                     stage_info.barrier,
@@ -1889,7 +1963,7 @@ class SmemKVResource(MemoryResource):
             sK_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_qk_smem_layout(self.cfg),
         )
         return desc_k_base
 
@@ -1904,7 +1978,7 @@ class SmemKVResource(MemoryResource):
             sK_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_pv_smem_layout(self.cfg),
         )
         return desc_v_base
 
@@ -4133,20 +4207,20 @@ class TmemOResource(MemoryResource):
                 k_dim_per_mma * self.cfg.v_dtype.width // self.cfg.qk_acc_dtype.width
             )
             tma_copy_iters_per_head_dim_stage = (
-                self.cfg.tma_copy_qkv_iters // num_head_dim_stages
+                self.cfg.tma_copy_v_iters // num_head_dim_stages
             )
             if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-                tma_copy_iters_per_head_dim_stage = self.cfg.tma_copy_kv_stage_iters
+                tma_copy_iters_per_head_dim_stage = self.cfg.tma_copy_v_stage_iters
             inc_bytes_v = (
                 k_dim_per_mma
                 * (pv_n_dim // tma_copy_iters_per_head_dim_stage)
                 * self.cfg.v_dtype.width
                 // 8
             )
-            kv_chunk_bytes = (
-                self.cfg.tma_copy_kv_bytes // self.cfg.tma_copy_kv_stage_iters
+            v_chunk_bytes = (
+                self.cfg.tma_copy_v_bytes // self.cfg.tma_copy_v_stage_iters
             )
-            head_dim_stage_bytes_v = kv_chunk_bytes * tma_copy_iters_per_head_dim_stage
+            head_dim_stage_bytes_v = v_chunk_bytes * tma_copy_iters_per_head_dim_stage
 
             # Select O buffer and P offset at trace time (compile-time constant)
             if cutlass.const_expr(self.cfg.single_qkv_instance or writes_o0):
