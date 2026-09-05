@@ -34,7 +34,10 @@ from flashinfer.cute_dsl.fp4_common import (
     cvt_w4a16_packed_e4m3_scale_to_f32,
     fmax_f32,
     fp4_dot4_sum_f32acc,
+    fp4_dot4_sum,
     fp4_dot8_sum_f32acc,
+    fp4_dot8_sum,
+    fp4_decode_4bytes,
     get_ptr_as_int64,
     ld_global_acquire_i32,
     ld_global_nc_u32,
@@ -83,9 +86,9 @@ def _direct_k_segments_for_k(k: int) -> int:
     return _align_up(k, 32 * _BLOCK_SIZE) // (32 * _BLOCK_SIZE)
 
 
-def _fc1_chunks_for_m(m: int, n: int) -> int:
+def _fc1_chunks_for_m(m: int, n: int, num_warps: int = _NUM_WARPS) -> int:
     rows_per_warp = max(1, int(m))
-    rows_per_chunk = max(_BLOCK_SIZE, _NUM_WARPS * rows_per_warp)
+    rows_per_chunk = max(_BLOCK_SIZE, int(num_warps) * rows_per_warp)
     chunks = max(1, int(n) // rows_per_chunk)
     while chunks > 1:
         i_chunk = int(n) // chunks
@@ -132,6 +135,7 @@ def _make_shape_config(
     num_topk: int,
     weight_E: int,
     is_gated: bool = True,
+    num_warps: int = _NUM_WARPS,
 ) -> _ShapeConfig:
     k_half = k // 2
     n_half = n // 2
@@ -143,10 +147,10 @@ def _make_shape_config(
     k_blocks = k // _BLOCK_SIZE
     k_segments = _direct_k_segments_for_k(k)
     k_segments_aligned = k_blocks == k_segments * 32
-    fc1_chunks = _fc1_chunks_for_m(m, n)
+    fc1_chunks = _fc1_chunks_for_m(m, n, num_warps)
     fc1_chunks_per_block = 16  # chunks per 128-wide swizzle block
     i_chunk = n // fc1_chunks
-    rows_per_warp_fc1 = i_chunk // _NUM_WARPS
+    rows_per_warp_fc1 = i_chunk // int(num_warps)
     smem_xh_stride = k_segments * (_BLOCK_SIZE // 2) + 1
     smem_xh_size = k_half + (k // (_BLOCK_SIZE * 8))
     inter_blocks = i_chunk // _BLOCK_SIZE
@@ -179,9 +183,11 @@ def _make_shape_config(
     )
 
 
-def _remake_shape_config_fc1(cfg: _ShapeConfig, fc1_chunks: int) -> _ShapeConfig:
+def _remake_shape_config_fc1(
+    cfg: _ShapeConfig, fc1_chunks: int, num_warps: int = _NUM_WARPS
+) -> _ShapeConfig:
     i_chunk = cfg.n // fc1_chunks
-    rows_per_warp_fc1 = i_chunk // _NUM_WARPS
+    rows_per_warp_fc1 = i_chunk // int(num_warps)
     smem_xh_stride = cfg.k_segments * (_BLOCK_SIZE // 2) + 1
     smem_xh_size = cfg.k_half + (cfg.k_dim // (_BLOCK_SIZE * 8))
     inter_blocks = i_chunk // _BLOCK_SIZE
@@ -336,6 +342,12 @@ class MoEDirectMicroKernel:
         single_token: bool = False,
         dynamic_down_scale: bool = False,
         compile_time_phase: int = 0,
+        enable_pdl: bool = False,
+        force_fc1_chunks: int = 0,
+        num_warps: int = _NUM_WARPS,
+        use_f16_dot: bool = False,
+        fc1_tasks_per_cta: int = 1,
+        rowmajor_fp4_intermediate: bool = False,
         w4a16_mode: bool = False,
         a8_mx_mode: bool = False,
         scale_format: str = "e4m3_k16",
@@ -346,9 +358,9 @@ class MoEDirectMicroKernel:
         w13_layout: str = "w13",
     ):
         activation = normalize_moe_activation(activation)
-        if int(compile_time_phase) not in {0, 1, 2}:
+        if int(compile_time_phase) not in {0, 1, 2, 3}:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
-        if scale_format not in {"e4m3_k16", "e8m0_k32"}:
+        if scale_format not in {"e4m3_k16", "e8m0_k32", "bf16_k16"}:
             raise ValueError(f"unsupported micro scale_format {scale_format!r}")
         if w4a16_mode and a8_mx_mode:
             raise ValueError("w4a16_mode and a8_mx_mode are mutually exclusive")
@@ -365,6 +377,7 @@ class MoEDirectMicroKernel:
             raise ValueError(f"unsupported micro w13_layout {w13_layout!r}")
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
+        self.scale_format_bf16_k16 = scale_format == "bf16_k16"
         self.e8m0_scale_layout = e8m0_scale_layout
         self.e8m0_scale_layout_logical = e8m0_scale_layout == "logical"
         self.w13_layout = w13_layout
@@ -387,6 +400,32 @@ class MoEDirectMicroKernel:
         self.single_token = single_token
         self.dynamic_down_scale = dynamic_down_scale
         self.compile_time_phase = int(compile_time_phase)
+        self.enable_pdl = bool(enable_pdl)
+        if self.enable_pdl and self.compile_time_phase not in (1, 2):
+            raise ValueError("PDL is only valid for split Direct Micro phases")
+        self.force_fc1_chunks = int(force_fc1_chunks)
+        if self.force_fc1_chunks < 0:
+            raise ValueError("force_fc1_chunks must be non-negative")
+        self.num_warps = int(num_warps)
+        if self.num_warps not in (4, 8, 16):
+            raise ValueError("num_warps must be one of 4, 8, or 16")
+        if self.compile_time_phase != 1 and self.num_warps != _NUM_WARPS:
+            raise ValueError("reduced-warp Direct Micro is currently FC1-only")
+        self.use_f16_dot = bool(use_f16_dot)
+        self.fc1_tasks_per_cta = int(fc1_tasks_per_cta)
+        if self.fc1_tasks_per_cta < 1:
+            raise ValueError("fc1_tasks_per_cta must be positive")
+        if self.fc1_tasks_per_cta != 1 and self.compile_time_phase != 1:
+            raise ValueError("packed FC1 tasks are currently phase-1 only")
+        self.rowmajor_fp4_intermediate = bool(rowmajor_fp4_intermediate)
+        if self.rowmajor_fp4_intermediate and (
+            self.compile_time_phase != 2 or w4a16_mode or a8_mx_mode
+        ):
+            raise ValueError(
+                "row-major FP4 intermediate is only valid for NVFP4 phase 2"
+            )
+        if self.scale_format_bf16_k16 and not self.rowmajor_fp4_intermediate:
+            raise ValueError("BF16 K/16 scales require row-major FP4 phase 2")
         self.w4a16_mode = w4a16_mode
         # a8_mx: quantize-dequantize activations through E4M3 with per-32
         # UE8M0 block scales (no global scale) so decode numerics track the
@@ -396,7 +435,7 @@ class MoEDirectMicroKernel:
         self.m_const = 0
         self.m1_fc2_onepass = False
         self.m1_fc2_rows_per_cta = _K_PER_CTA * 2
-        self.launch_block_dim = _BLOCK_DIM
+        self.launch_block_dim = self.num_warps * 32
         self.grid_x = 0
 
     @property
@@ -410,6 +449,12 @@ class MoEDirectMicroKernel:
             self.single_token,
             self.dynamic_down_scale,
             self.compile_time_phase,
+            self.enable_pdl,
+            self.force_fc1_chunks,
+            self.num_warps,
+            self.use_f16_dot,
+            self.fc1_tasks_per_cta,
+            self.rowmajor_fp4_intermediate,
             self.w4a16_mode,
             self.a8_mx_mode,
             self.scale_format,
@@ -436,7 +481,27 @@ class MoEDirectMicroKernel:
         x2: Uint32,
         x3: Uint32,
     ) -> Float32:
+        if cutlass.const_expr(self.use_f16_dot):
+            return fp4_dot4_sum(u_packed, x0, x1, x2, x3)
         return fp4_dot4_sum_f32acc(u_packed, x0, x1, x2, x3)
+
+    @cute.jit
+    def _fc2_activation_dot(
+        self,
+        weight_packed: Uint32,
+        x0: Uint32,
+        x1: Uint32,
+        x2: Uint32,
+        x3: Uint32,
+        activation_scale: Float32,
+    ) -> Float32:
+        if cutlass.const_expr(self.rowmajor_fp4_intermediate):
+            a0, a1, a2, a3 = fp4_decode_4bytes(x0)
+            return (
+                self._fp4_dot4_for_math(weight_packed, a0, a1, a2, a3)
+                * activation_scale
+            )
+        return self._fp4_dot4_for_math(weight_packed, x0, x1, x2, x3)
 
     @cute.jit
     def _scale_byte_to_f32(self, byte: Uint32) -> Float32:
@@ -536,6 +601,19 @@ class MoEDirectMicroKernel:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Float32:
+        if cutlass.const_expr(self.use_f16_dot):
+            return fp4_dot8_sum(
+                u_a,
+                u_b,
+                Uint32(smem_xh[xh_base + Int32(0)]),
+                Uint32(smem_xh[xh_base + Int32(1)]),
+                Uint32(smem_xh[xh_base + Int32(2)]),
+                Uint32(smem_xh[xh_base + Int32(3)]),
+                Uint32(smem_xh[xh_base + Int32(4)]),
+                Uint32(smem_xh[xh_base + Int32(5)]),
+                Uint32(smem_xh[xh_base + Int32(6)]),
+                Uint32(smem_xh[xh_base + Int32(7)]),
+            )
         return _block_dot_hfma2_f32acc(u_a, u_b, smem_xh, xh_base)
 
     @cute.jit
@@ -548,6 +626,19 @@ class MoEDirectMicroKernel:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(self.use_f16_dot):
+            xh0 = Uint32(smem_xh[xh_base + Int32(0)])
+            xh1 = Uint32(smem_xh[xh_base + Int32(1)])
+            xh2 = Uint32(smem_xh[xh_base + Int32(2)])
+            xh3 = Uint32(smem_xh[xh_base + Int32(3)])
+            xh4 = Uint32(smem_xh[xh_base + Int32(4)])
+            xh5 = Uint32(smem_xh[xh_base + Int32(5)])
+            xh6 = Uint32(smem_xh[xh_base + Int32(6)])
+            xh7 = Uint32(smem_xh[xh_base + Int32(7)])
+            return (
+                fp4_dot8_sum(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7),
+                fp4_dot8_sum(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7),
+            )
         return _block_dot_hfma2_pair_f32acc(
             up_a, up_b, gate_a, gate_b, smem_xh, xh_base
         )
@@ -569,10 +660,14 @@ class MoEDirectMicroKernel:
         xh7: Uint32,
     ) -> Tuple[Float32, Float32]:
         """Paired up/gate fp4_dot8 over pre-loaded activation registers."""
-        up = fp4_dot8_sum_f32acc(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
-        gate = fp4_dot8_sum_f32acc(
-            gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7
-        )
+        if cutlass.const_expr(self.use_f16_dot):
+            up = fp4_dot8_sum(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+            gate = fp4_dot8_sum(gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+        else:
+            up = fp4_dot8_sum_f32acc(up_a, up_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+            gate = fp4_dot8_sum_f32acc(
+                gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7
+            )
         return up, gate
 
     @cute.jit
@@ -582,6 +677,14 @@ class MoEDirectMicroKernel:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Float32:
+        if cutlass.const_expr(self.use_f16_dot):
+            return fp4_dot4_sum(
+                u_val,
+                Uint32(smem_xh[xh_base + Int32(0)]),
+                Uint32(smem_xh[xh_base + Int32(1)]),
+                Uint32(smem_xh[xh_base + Int32(2)]),
+                Uint32(smem_xh[xh_base + Int32(3)]),
+            )
         return _block_dot4_f32acc(u_val, smem_xh, xh_base)
 
     @cute.jit
@@ -592,6 +695,15 @@ class MoEDirectMicroKernel:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(self.use_f16_dot):
+            xh0 = Uint32(smem_xh[xh_base + Int32(0)])
+            xh1 = Uint32(smem_xh[xh_base + Int32(1)])
+            xh2 = Uint32(smem_xh[xh_base + Int32(2)])
+            xh3 = Uint32(smem_xh[xh_base + Int32(3)])
+            return (
+                fp4_dot4_sum(up_val, xh0, xh1, xh2, xh3),
+                fp4_dot4_sum(gate_val, xh0, xh1, xh2, xh3),
+            )
         return _block_dot4_pair_f32acc(up_val, gate_val, smem_xh, xh_base)
 
     @classmethod
@@ -638,9 +750,15 @@ class MoEDirectMicroKernel:
         device: torch.device | None = None,
     ):
         cfg = _make_shape_config(
-            m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
+            m=m,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            weight_E=weight_E,
+            is_gated=self.is_gated,
+            num_warps=self.num_warps,
         )
-        num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        num_fc1_chunks = _fc1_chunks_for_m(m, n, self.num_warps)
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -666,9 +784,19 @@ class MoEDirectMicroKernel:
             ):
                 a8_chunks -= 1
             num_fc1_chunks = a8_chunks
-        cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
+        if self.force_fc1_chunks:
+            if (
+                n % self.force_fc1_chunks != 0
+                or (n // self.force_fc1_chunks) % _BLOCK_SIZE != 0
+            ):
+                raise ValueError("force_fc1_chunks must divide N into 16-row chunks")
+            num_fc1_chunks = self.force_fc1_chunks
+        cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks, self.num_warps)
 
-        fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
+        fc1_work_items = m * cfg.num_topk * cfg.fc1_chunks
+        fc1_tasks = (
+            fc1_work_items + self.fc1_tasks_per_cta - 1
+        ) // self.fc1_tasks_per_cta
         w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
         m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
         m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
@@ -687,6 +815,15 @@ class MoEDirectMicroKernel:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
+        elif self.compile_time_phase == 3:
+            # Token-pipelined Direct keeps every FC1 and FC2 task resident so
+            # CTAs can wait on per-token readiness without blocking unscheduled
+            # producers.  Unlike phase 0, no all-grid barrier is used.
+            grid_x = max(1, fc1_tasks, fc2_tasks)
+            if grid_x > int(max_active_ctas):
+                raise ValueError(
+                    "token-pipelined Direct Micro exceeds the resident CTA cap"
+                )
         elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
@@ -699,11 +836,24 @@ class MoEDirectMicroKernel:
             # The per-32 block scale reads the partner 16-block; the FC2
             # intermediate chunk must hold whole 32-blocks.
             raise ValueError("a8_mx micro mode requires i_chunk % 32 == 0")
+        if self.compile_time_phase == 3 and (m < 2 or self.w4a16_mode):
+            raise ValueError(
+                "token-pipelined Direct Micro currently requires NVFP4 M>=2"
+            )
+        if self.fc1_tasks_per_cta > 1 and (
+            cfg.k_segments == 2 or cfg.fc1_chunks % self.fc1_tasks_per_cta != 0
+        ):
+            raise ValueError(
+                "packed FC1 tasks require aligned chunks and k_segments != 2"
+            )
         self._cfg = cfg
         self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
         self.m1_fc2_rows_per_cta = m1_fc2_rows
-        self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
+        if self.compile_time_phase == 1:
+            self.launch_block_dim = self.num_warps * 32
+        else:
+            self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
 
     @cute.jit
@@ -1206,10 +1356,13 @@ class MoEDirectMicroKernel:
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
             if cutlass.const_expr(
-                self.w4a16_mode
-                and (not self.is_gated)
-                and cfg.k_dim == 2688
-                and cfg.n == 1856
+                self.scale_format_bf16_k16
+                or (
+                    self.w4a16_mode
+                    and (not self.is_gated)
+                    and cfg.k_dim == 2688
+                    and cfg.n == 1856
+                )
             ):
                 scale_lane = router_w
             else:
@@ -1581,7 +1734,9 @@ class MoEDirectMicroKernel:
         lane: Int32,
         w2_base_addr: Int64,
         w2s_base_addr: Int64,
+        w2_scales_tensor: cute.Tensor,
         intermediate: cute.Tensor,
+        intermediate_scales: cute.Tensor,
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
@@ -1759,35 +1914,58 @@ class MoEDirectMicroKernel:
                             prefetch_global_l2(
                                 w2s_base_addr + next_ebase_sf + next_bsf_off3
                             )
-                kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
-                # See _m1_fc2_rowpair_wide: mask the intermediate tail read for
-                # non-256-aligned n (0 weight * NaN tail = NaN). constexpr-gated.
-                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
-                    xh0 = (
-                        Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-                        if w_valid > Int32(0)
-                        else Uint32(0)
+                activation_scale = Float32(1.0)
+                if cutlass.const_expr(self.rowmajor_fp4_intermediate):
+                    routed_row = t * Int32(cfg.num_topk) + Int32(kk)
+                    packed_per_row = Int32(cfg.n // 8)
+                    scales_per_row = Int32(cfg.n // 16)
+                    xh0 = Uint32(
+                        intermediate[
+                            routed_row * packed_per_row + Int32(nc * 32) + lane
+                        ]
                     )
-                    xh1 = (
-                        Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-                        if w_valid > Int32(0)
-                        else Uint32(0)
-                    )
-                    xh2 = (
-                        Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-                        if w_valid > Int32(0)
-                        else Uint32(0)
-                    )
-                    xh3 = (
-                        Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
-                        if w_valid > Int32(0)
-                        else Uint32(0)
+                    xh1 = Uint32(0)
+                    xh2 = Uint32(0)
+                    xh3 = Uint32(0)
+                    activation_scale = Float32(
+                        intermediate_scales[
+                            routed_row * scales_per_row
+                            + Int32(nc * 16)
+                            + (lane >> Int32(1))
+                        ]
                     )
                 else:
-                    xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-                    xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-                    xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-                    xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    kk_off = (
+                        token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
+                    )
+                    # See _m1_fc2_rowpair_wide: mask the intermediate tail read
+                    # for non-256-aligned n (0 weight * NaN tail = NaN).
+                    if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                        xh0 = (
+                            Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                            if w_valid > Int32(0)
+                            else Uint32(0)
+                        )
+                        xh1 = (
+                            Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                            if w_valid > Int32(0)
+                            else Uint32(0)
+                        )
+                        xh2 = (
+                            Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                            if w_valid > Int32(0)
+                            else Uint32(0)
+                        )
+                        xh3 = (
+                            Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                            if w_valid > Int32(0)
+                            else Uint32(0)
+                        )
+                    else:
+                        xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                        xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                        xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                        xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
                 u_packed0 = (
                     ld_global_nc_u32(
                         w2_base_addr
@@ -1799,7 +1977,19 @@ class MoEDirectMicroKernel:
                     if w_valid > Int32(0)
                     else Uint32(0)
                 )
-                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                if cutlass.const_expr(self.scale_format_bf16_k16):
+                    scale_index0 = (
+                        Int64(eid) * Int64(cfg.k_dim * (cfg.n // 16))
+                        + Int64(k_row0) * Int64(cfg.n // 16)
+                        + Int64(nc * 16)
+                        + Int64(lane >> Int32(1))
+                    )
+                    bsf_f0 = (
+                        Float32(w2_scales_tensor[scale_index0])
+                        if w_valid > Int32(0)
+                        else Float32(0.0)
+                    )
+                elif cutlass.const_expr(self.scale_format_e8m0_k32):
                     ebase_w2p = Int64(eid) * Int64((cfg.n // 32) * cfg.k_dim)
                     kb32_i = (chunk_base + lane * Int32(4)) >> Int32(4)
                     bsf_f0 = (
@@ -1848,7 +2038,9 @@ class MoEDirectMicroKernel:
                 out_acc0 = (
                     out_acc0
                     + bsf_f0
-                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                    * self._fc2_activation_dot(
+                        u_packed0, xh0, xh1, xh2, xh3, activation_scale
+                    )
                     * scale_lane
                 )
 
@@ -1863,7 +2055,19 @@ class MoEDirectMicroKernel:
                     if w_valid > Int32(0)
                     else Uint32(0)
                 )
-                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                if cutlass.const_expr(self.scale_format_bf16_k16):
+                    scale_index1 = (
+                        Int64(eid) * Int64(cfg.k_dim * (cfg.n // 16))
+                        + Int64(k_row1) * Int64(cfg.n // 16)
+                        + Int64(nc * 16)
+                        + Int64(lane >> Int32(1))
+                    )
+                    bsf_f1 = (
+                        Float32(w2_scales_tensor[scale_index1])
+                        if w_valid > Int32(0)
+                        else Float32(0.0)
+                    )
+                elif cutlass.const_expr(self.scale_format_e8m0_k32):
                     bsf_f1 = (
                         self._ld_e8m0_scale(
                             w2s_base_addr,
@@ -1910,7 +2114,9 @@ class MoEDirectMicroKernel:
                 out_acc1 = (
                     out_acc1
                     + bsf_f1
-                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                    * self._fc2_activation_dot(
+                        u_packed1, xh0, xh1, xh2, xh3, activation_scale
+                    )
                     * scale_lane
                 )
 
@@ -1925,7 +2131,19 @@ class MoEDirectMicroKernel:
                     if w_valid > Int32(0)
                     else Uint32(0)
                 )
-                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                if cutlass.const_expr(self.scale_format_bf16_k16):
+                    scale_index2 = (
+                        Int64(eid) * Int64(cfg.k_dim * (cfg.n // 16))
+                        + Int64(k_row2) * Int64(cfg.n // 16)
+                        + Int64(nc * 16)
+                        + Int64(lane >> Int32(1))
+                    )
+                    bsf_f2 = (
+                        Float32(w2_scales_tensor[scale_index2])
+                        if w_valid > Int32(0)
+                        else Float32(0.0)
+                    )
+                elif cutlass.const_expr(self.scale_format_e8m0_k32):
                     bsf_f2 = (
                         self._ld_e8m0_scale(
                             w2s_base_addr,
@@ -1972,7 +2190,9 @@ class MoEDirectMicroKernel:
                 out_acc2 = (
                     out_acc2
                     + bsf_f2
-                    * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3)
+                    * self._fc2_activation_dot(
+                        u_packed2, xh0, xh1, xh2, xh3, activation_scale
+                    )
                     * scale_lane
                 )
 
@@ -1987,7 +2207,19 @@ class MoEDirectMicroKernel:
                     if w_valid > Int32(0)
                     else Uint32(0)
                 )
-                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                if cutlass.const_expr(self.scale_format_bf16_k16):
+                    scale_index3 = (
+                        Int64(eid) * Int64(cfg.k_dim * (cfg.n // 16))
+                        + Int64(k_row3) * Int64(cfg.n // 16)
+                        + Int64(nc * 16)
+                        + Int64(lane >> Int32(1))
+                    )
+                    bsf_f3 = (
+                        Float32(w2_scales_tensor[scale_index3])
+                        if w_valid > Int32(0)
+                        else Float32(0.0)
+                    )
+                elif cutlass.const_expr(self.scale_format_e8m0_k32):
                     bsf_f3 = (
                         self._ld_e8m0_scale(
                             w2s_base_addr,
@@ -2034,7 +2266,9 @@ class MoEDirectMicroKernel:
                 out_acc3 = (
                     out_acc3
                     + bsf_f3
-                    * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3)
+                    * self._fc2_activation_dot(
+                        u_packed3, xh0, xh1, xh2, xh3, activation_scale
+                    )
                     * scale_lane
                 )
 
@@ -2074,6 +2308,8 @@ class MoEDirectMicroKernel:
         tidx, _, _ = cute.arch.thread_idx()
         gdim_x, _, _ = cute.arch.grid_dim()
         if cutlass.const_expr(self.compile_time_phase == 2):
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_wait()
             self._run_fc2(
                 Int32(bidx_x),
                 Int32(gdim_x),
@@ -2084,6 +2320,7 @@ class MoEDirectMicroKernel:
                 w2_scales,
                 w2_alphas,
                 intermediate,
+                down_input_scale,
                 topk_ids,
                 topk_weights,
                 scatter_output,
@@ -2093,6 +2330,23 @@ class MoEDirectMicroKernel:
         m1_epoch0 = Int32(0)
         if cutlass.const_expr(self.m_const == 1):
             m1_epoch0 = ld_global_acquire_i32(get_ptr_as_int64(barrier_epoch, Int32(0)))
+        pipeline_fc1_epoch0 = Int32(0)
+        pipeline_fc2_epoch0 = Int32(0)
+        pipeline_fc1_token = Int32(0)
+        pipeline_fc2_token = Int32(0)
+        if cutlass.const_expr(self.compile_time_phase == 3):
+            fc1_tasks_per_token = Int32(cfg.num_topk * cfg.fc1_chunks)
+            fc2_tasks_per_token = Int32(cfg.k_dim // (_K_PER_CTA * 4))
+            pipeline_fc1_token = Int32(bidx_x) // fc1_tasks_per_token
+            pipeline_fc2_token = Int32(bidx_x) // fc2_tasks_per_token
+            if pipeline_fc1_token < m_val:
+                pipeline_fc1_epoch0 = ld_global_acquire_i32(
+                    get_ptr_as_int64(barrier_epoch, pipeline_fc1_token)
+                )
+            if pipeline_fc2_token < m_val:
+                pipeline_fc2_epoch0 = ld_global_acquire_i32(
+                    get_ptr_as_int64(barrier_epoch, pipeline_fc2_token)
+                )
 
         if cutlass.const_expr(cfg.k_segments == 2):
             smem_xh_ptr = cute.arch.alloc_smem(Uint32, 2 * cfg.smem_xh_size)
@@ -2104,9 +2358,9 @@ class MoEDirectMicroKernel:
             smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(cfg.smem_xh_size))
         smem_int_ptr = cute.arch.alloc_smem(Float32, cfg.i_chunk)
         smem_int = cute.make_tensor(smem_int_ptr, cute.make_layout(cfg.i_chunk))
-        reduce_scratch_ptr = cute.arch.alloc_smem(Float32, _NUM_WARPS)
+        reduce_scratch_ptr = cute.arch.alloc_smem(Float32, self.num_warps)
         reduce_scratch = cute.make_tensor(
-            reduce_scratch_ptr, cute.make_layout(_NUM_WARPS)
+            reduce_scratch_ptr, cute.make_layout(self.num_warps)
         )
 
         warp_id = tidx // Int32(32)
@@ -2119,6 +2373,14 @@ class MoEDirectMicroKernel:
         # ===================================================================
         fc1_task_count = m_val * Int32(cfg.num_topk * cfg.fc1_chunks)
         fc1_task = Int32(bidx_x)
+        fc1_task_stride = Int32(gdim_x)
+        fc1_task_stop = fc1_task_count
+        if cutlass.const_expr(self.fc1_tasks_per_cta > 1):
+            fc1_task = Int32(bidx_x * self.fc1_tasks_per_cta)
+            fc1_task_stride = Int32(1)
+            fc1_task_stop = fc1_task + Int32(self.fc1_tasks_per_cta)
+            if fc1_task_stop > fc1_task_count:
+                fc1_task_stop = fc1_task_count
         if cutlass.const_expr(cfg.k_segments == 2):
             buf_idx = Int32(0)
             # Pre-loop: quantize first task into buf[0]
@@ -2181,11 +2443,11 @@ class MoEDirectMicroKernel:
                             v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
                             f0, f1 = quant_dequant_2(v0, v1, sf_val, eff_scale)
                             smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(f0, f1)
-                    in_blk += Int32(_BLOCK_DIM)
+                    in_blk += Int32(self.num_warps * 32)
                 cute.arch.sync_threads()
         else:
             prev_t = Int32(-1)
-        while fc1_task < fc1_task_count:
+        while fc1_task < fc1_task_stop:
             if cutlass.const_expr(
                 self.w4a16_mode
                 and self.m_const == 9
@@ -2287,7 +2549,7 @@ class MoEDirectMicroKernel:
                                 smem_xh[phys_base + Int32(i)] = pack_f32x2_to_f16x2(
                                     f0, f1
                                 )
-                        in_blk += Int32(_BLOCK_DIM)
+                        in_blk += Int32(self.num_warps * 32)
                     if cutlass.const_expr(self.share_input_across_experts):
                         prev_t = t
                 cute.arch.sync_threads()
@@ -4432,11 +4694,11 @@ class MoEDirectMicroKernel:
 
             # Look-ahead: quantize next task into other buffer (k_segments==2 only)
             if cutlass.const_expr(cfg.k_segments == 2):
-                next_task = fc1_task + Int32(gdim_x)
+                next_task = fc1_task + fc1_task_stride
                 need_quant_next = Int32(0)
                 t_next = t
                 next_route = route_idx
-                if next_task < fc1_task_count:
+                if next_task < fc1_task_stop:
                     next_route = next_task // Int32(cfg.fc1_chunks)
                     t_next = next_route // Int32(cfg.num_topk)
                     need_quant_next = Int32(1)
@@ -4506,7 +4768,7 @@ class MoEDirectMicroKernel:
                                 smem_xh[next_buf_base + phys_base + Int32(i)] = (
                                     pack_f32x2_to_f16x2(f0, f1)
                                 )
-                        in_blk += Int32(_BLOCK_DIM)
+                        in_blk += Int32(self.num_warps * 32)
 
             cute.arch.sync_threads()
 
@@ -4520,14 +4782,14 @@ class MoEDirectMicroKernel:
                     if v < Float32(0.0):
                         abs_v = -v
                     local_max = fmax_f32(local_max, abs_v)
-                    scan_idx += Int32(_BLOCK_DIM)
+                    scan_idx += Int32(self.num_warps * 32)
                 warp_max = warp_reduce(local_max, fmax_f32)
                 if lane == Int32(0):
                     reduce_scratch[warp_id] = warp_max
                 cute.arch.sync_threads()
                 tile_amax = Float32(0.0)
                 if warp_id == Int32(0):
-                    if lane < Int32(_NUM_WARPS):
+                    if lane < Int32(self.num_warps):
                         tile_amax = reduce_scratch[lane]
                     tile_amax = warp_reduce(tile_amax, fmax_f32)
                     if lane == Int32(0):
@@ -4644,9 +4906,51 @@ class MoEDirectMicroKernel:
             if cutlass.const_expr(cfg.k_segments == 2):
                 if need_quant_next > Int32(0):
                     buf_idx = Int32(1) - buf_idx
-            fc1_task += Int32(gdim_x)
+            fc1_task += fc1_task_stride
 
         if cutlass.const_expr(self.compile_time_phase == 1):
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.sync_threads()
+                cute.arch.griddepcontrol_launch_dependents()
+            return
+
+        if cutlass.const_expr(self.compile_time_phase == 3):
+            fc1_tasks_per_token = Int32(cfg.num_topk * cfg.fc1_chunks)
+            fc2_tasks_per_token = Int32(cfg.k_dim // (_K_PER_CTA * 4))
+            fc2_task_count = m_val * fc2_tasks_per_token
+            cute.arch.sync_threads()
+            threadfence()
+            if Int32(bidx_x) < fc1_task_count:
+                _token_publish_fc1_ready(
+                    barrier_count,
+                    barrier_epoch,
+                    pipeline_fc1_token,
+                    pipeline_fc1_epoch0,
+                    fc1_tasks_per_token,
+                    is_cta_leader,
+                )
+            if Int32(bidx_x) < fc2_task_count:
+                _token_wait_fc1_ready(
+                    barrier_epoch,
+                    pipeline_fc2_token,
+                    pipeline_fc2_epoch0,
+                    is_cta_leader,
+                )
+            self._run_fc2(
+                bidx_x,
+                gdim_x,
+                warp_id,
+                lane,
+                m_val,
+                w2_weights,
+                w2_scales,
+                w2_alphas,
+                intermediate,
+                down_input_scale,
+                topk_ids,
+                topk_weights,
+                scatter_output,
+            )
             return
 
         if cutlass.const_expr(self.m_const == 1):
@@ -4674,6 +4978,7 @@ class MoEDirectMicroKernel:
             w2_scales,
             w2_alphas,
             intermediate,
+            down_input_scale,
             topk_ids,
             topk_weights,
             scatter_output,
@@ -4691,6 +4996,7 @@ class MoEDirectMicroKernel:
         w2_scales: cute.Tensor,
         w2_alphas: cute.Tensor,
         intermediate: cute.Tensor,
+        intermediate_scales: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
         scatter_output: cute.Tensor,
@@ -4784,14 +5090,22 @@ class MoEDirectMicroKernel:
                         topk_weights,
                         scatter_output,
                     )
-                elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
+                elif cutlass.const_expr(
+                    self.scale_format_bf16_k16 or cfg.fc2_n_chunks > 1
+                ):
+                    # BF16 K/16 scales pair with the row-major FP4
+                    # intermediate.  The narrow path below assumes packed
+                    # FP4 intermediates and E4M3 byte scales, so even the
+                    # single-N-chunk BF16 case must use the wide decoder.
                     self._m2_fc2_rowquad_wide(
                         fc2_task,
                         warp_id,
                         lane,
                         w2_base_addr,
                         w2s_base_addr,
+                        w2_scales,
                         intermediate,
+                        intermediate_scales,
                         w2_alphas,
                         topk_ids,
                         topk_weights,
@@ -4856,16 +5170,31 @@ class MoEDirectMicroKernel:
             )
         w1_alphas = cute.make_tensor(w1a_ptr, cute.make_layout(Int32(cfg.weight_E)))
         input_gs = cute.make_tensor(a1_ptr, cute.make_layout(Int32(cfg.weight_E)))
-        down_input_scale = cute.make_tensor(
-            a2_ptr, cute.make_layout(Int32(cfg.weight_E))
-        )
-        intermediate = cute.make_tensor(
-            inter_ptr, cute.make_layout(Int32(m_val * cfg.inter_u32))
-        )
+        if cutlass.const_expr(self.rowmajor_fp4_intermediate):
+            down_input_scale = cute.make_tensor(
+                cute.recast_ptr(a2_ptr, dtype=BFloat16),
+                cute.make_layout(Int32(m_val * cfg.num_topk * (cfg.n // _BLOCK_SIZE))),
+            )
+            intermediate = cute.make_tensor(
+                inter_ptr,
+                cute.make_layout(Int32(m_val * cfg.num_topk * (cfg.n // 8))),
+            )
+        else:
+            down_input_scale = cute.make_tensor(
+                a2_ptr, cute.make_layout(Int32(cfg.weight_E))
+            )
+            intermediate = cute.make_tensor(
+                inter_ptr, cute.make_layout(Int32(m_val * cfg.inter_u32))
+            )
         w2_weights = cute.make_tensor(
             w2_ptr, cute.make_layout(Int64(cfg.weight_E * cfg.k_dim * cfg.n_half))
         )
-        if cutlass.const_expr(self.scale_format_e8m0_k32):
+        if cutlass.const_expr(self.scale_format_bf16_k16):
+            w2_scales = cute.make_tensor(
+                cute.recast_ptr(w2s_ptr, dtype=BFloat16),
+                cute.make_layout(Int64(cfg.weight_E * cfg.k_dim * (cfg.n // 16))),
+            )
+        elif cutlass.const_expr(self.scale_format_e8m0_k32):
             w2_scales = cute.make_tensor(
                 w2s_ptr,
                 cute.make_layout(Int64(cfg.weight_E * (cfg.n // 32) * cfg.k_dim)),
@@ -4914,11 +5243,16 @@ class MoEDirectMicroKernel:
             # The fused and FC1-only bodies use 512-thread CTAs;
             # the FC2-only m=1 specialization is a 256-thread independent CTA.
             # One block per SM preserves each variant's register budget.
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=(
+                _NUM_WARPS // self.num_warps
+                if self.compile_time_phase == 1 and self.num_warps < _NUM_WARPS
+                else 1
+            ),
             # The fused phase crosses a software all-CTA barrier between FC1
             # and FC2, so require whole-grid admission; resident CTAs must not
             # spin while peers remain queued. Split phases have no barrier.
-            cooperative=self.compile_time_phase == 0,
+            cooperative=self.compile_time_phase in (0, 3),
+            use_pdl=self.enable_pdl,
             stream=stream,
         )
 
@@ -4991,6 +5325,12 @@ def build_direct_micro_kernel(
     single_token: bool = False,
     dynamic_down_scale: bool = False,
     compile_time_phase: int = 0,
+    enable_pdl: bool = False,
+    force_fc1_chunks: int = 0,
+    num_warps: int = _NUM_WARPS,
+    use_f16_dot: bool = False,
+    fc1_tasks_per_cta: int = 1,
+    rowmajor_fp4_intermediate: bool = False,
     w4a16_mode: bool = False,
     a8_mx_mode: bool = False,
     scale_format: str = "e4m3_k16",
@@ -5019,6 +5359,12 @@ def build_direct_micro_kernel(
         single_token=single_token,
         dynamic_down_scale=dynamic_down_scale,
         compile_time_phase=compile_time_phase,
+        enable_pdl=enable_pdl,
+        force_fc1_chunks=force_fc1_chunks,
+        num_warps=num_warps,
+        use_f16_dot=use_f16_dot,
+        fc1_tasks_per_cta=fc1_tasks_per_cta,
+        rowmajor_fp4_intermediate=rowmajor_fp4_intermediate,
         w4a16_mode=w4a16_mode,
         a8_mx_mode=a8_mx_mode,
         scale_format=scale_format,

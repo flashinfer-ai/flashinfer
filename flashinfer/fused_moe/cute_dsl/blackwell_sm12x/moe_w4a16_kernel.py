@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cache
 from typing import Any, Callable
 
 import cuda.bindings.driver as cuda
@@ -19,7 +20,9 @@ from .moe_w4a16_compiler import (
     compile as cached_compile,
 )
 from .moe_w4a16_fp4_helpers import (
+    atomic_add_global_acq_rel_i32,
     atomic_add_global_i32,
+    atomic_add_shared_i32,
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
     bfloat2_broadcast_lane,
@@ -168,6 +171,7 @@ def _fake_m_for_specialization(size_m: int) -> int:
 # for each specialization.  These register counts were measured from the local
 # SM121 JIT output and keep launch occupancy stable across refactors.
 _W4A16_REGS_SM121 = {
+    (128, 1, 16, 2, True): 118,
     (256, 1, 8, 8, True): 118,
     (256, 1, 16, 4, True): 118,
     (256, 1, 16, 8, True): 118,
@@ -328,16 +332,15 @@ def _determine_blocks_per_sm(
         int(max_shared_mem) // (smem_bytes + 1536),
     )
     if uses_m_block_8:
-        # Small-M (moe_block_size==8) TC-decode is weight-bandwidth/overhead
-        # bound, not parallelism bound (only m*top_k route-blocks of GEMM work).
-        # The fused FC1->activation->FC2 path crosses several grid barriers whose
-        # tid==0 atomic-counter increment serializes across all grid_x CTAs, so an
-        # oversized grid pays barrier-atomic latency proportional to grid_x for no
-        # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
-        # barrier participant count while still covering the machine for the
-        # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        # One route row (M=1, top-k=8) is barrier/launch bound and benefits from
+        # one persistent CTA per SM.  From 16 routed rows onward, however, that
+        # cap forces every FC1/FC2 phase through extra whole-tile waves.  Admit a
+        # second resident CTA when the measured register/smem limits permit it;
+        # the fused grid selector below still chooses the smallest grid at the
+        # minimum critical-path wave count, so this does not blindly launch the
+        # full occupancy cap.
+        decode_residency_cap = 2 if int(problem_m) >= 16 else 1
+        blocks_per_sm_limit = max(min(blocks_per_sm_limit, decode_residency_cap), 1)
     elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
@@ -501,6 +504,17 @@ class W4A16TopKSumCompileResult:
 
 
 @dataclass(frozen=True)
+class W4A16RoutePackCompileResult:
+    compiled: Callable[..., Any]
+    num_experts: int
+    block_size: int
+    hidden_size: int
+    clear_output: bool
+    clear_ctas: int
+    clear_lock_words: int
+
+
+@dataclass(frozen=True)
 class W4A16FusedMoeCompileResult:
     compiled: Callable[..., Any]
     size_m: int
@@ -528,6 +542,12 @@ class W4A16FusedMoeCompileResult:
     direct_topk_routes: bool = False
     scale_format: str = "e4m3_k16"
     tc_decode_fused_sum: bool = False
+    tc_pair_activation: bool = False
+    tc_packed_pipeline: bool = False
+    tc_zero_output: bool = True
+    direct_group_routes: bool = False
+    inline_route_pack: bool = False
+    schedule_whole_tiles: bool = False
     collect_activation_amax: bool = False
 
 
@@ -552,6 +572,7 @@ class W4A16GemmKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
+        fast_math: bool = True,
         epilogue_activation: str | None = None,
         weight_layout: str = "packed",
         scale_format: str = "e4m3_k16",
@@ -559,6 +580,8 @@ class W4A16GemmKernel:
         source_n_rotation: int = 0,
         single_token_route_fast_path: bool = False,
         direct_topk_routes: bool = False,
+        direct_group_routes: bool = False,
+        block_expert_ids_are_topk_ids: bool = False,
         fused_topk_sum: bool = False,
         fused_sum_topk: int = 1,
         schedule_whole_tiles: bool = False,
@@ -642,6 +665,7 @@ class W4A16GemmKernel:
         self.moe_block_size = int(moe_block_size)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
+        self.fast_math = bool(fast_math)
         self.epilogue_relu2 = epilogue_activation == "relu2"
         self.weight_layout = weight_layout
         self.weight_layout_nf3 = weight_layout == "nf3_2p1"
@@ -681,6 +705,10 @@ class W4A16GemmKernel:
         self.source_n_rotation = int(source_n_rotation)
         self.single_token_route_fast_path = bool(single_token_route_fast_path)
         self.direct_topk_routes = bool(direct_topk_routes)
+        self.direct_group_routes = bool(direct_group_routes)
+        self.block_expert_ids_are_topk_ids = bool(block_expert_ids_are_topk_ids)
+        if self.direct_group_routes and not self.direct_topk_routes:
+            raise ValueError("direct_group_routes requires direct_topk_routes")
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
@@ -688,10 +716,6 @@ class W4A16GemmKernel:
         # the split-K tail machinery entirely. Requires the host to bound the
         # wave count; used by the exact-geometry hybrid decode schedule.
         self.schedule_whole_tiles = bool(schedule_whole_tiles)
-        if self.schedule_whole_tiles and not self.direct_topk_routes:
-            raise ValueError("schedule_whole_tiles requires direct_topk_routes")
-        if self.fused_topk_sum and not self.direct_topk_routes:
-            raise ValueError("fused_topk_sum requires direct_topk_routes")
         if self.fused_topk_sum and self.fused_sum_topk < 1:
             raise ValueError("fused_sum_topk must be >= 1")
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
@@ -804,6 +828,7 @@ class W4A16GemmKernel:
             self.cta_threads,
             self.moe_block_size,
             self.element_dtype,
+            self.fast_math,
             self.epilogue_relu2,
             self.weight_layout,
             self.scale_format,
@@ -811,6 +836,8 @@ class W4A16GemmKernel:
             self.source_n_rotation,
             self.single_token_route_fast_path,
             self.direct_topk_routes,
+            self.direct_group_routes,
+            self.block_expert_ids_are_topk_ids,
             self.fused_topk_sum,
             self.fused_sum_topk,
             self.cta_m_blocks,
@@ -1013,6 +1040,7 @@ class W4A16GemmKernel:
             a_bf16_flat,
             b_i32_flat,
             c_bf16_flat,
+            c_bf16_flat,
             scales_i32_flat,
             global_scale,
             packed_route_indices,
@@ -1034,6 +1062,7 @@ class W4A16GemmKernel:
         a_bf16_flat: cute.Tensor,
         b_i32_flat: cute.Tensor,
         c_bf16_flat: cute.Tensor,
+        pair_activated_bf16_flat: cute.Tensor,
         scales_i32_flat: cute.Tensor,
         global_scale: cute.Tensor,
         packed_route_indices: cute.Tensor,
@@ -1048,10 +1077,13 @@ class W4A16GemmKernel:
         grid_x: Int32,
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
+        pair_activation: cutlass.Constexpr[bool] = False,
     ):
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
-        if cutlass.const_expr(not self.direct_topk_routes):
+        if cutlass.const_expr(
+            (not self.block_expert_ids_are_topk_ids) and (not self.direct_topk_routes)
+        ):
             route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
                 self.moe_block_size
             )
@@ -1201,11 +1233,63 @@ class W4A16GemmKernel:
                     )
                 else:
                     if cutlass.const_expr(self.direct_topk_routes):
-                        expert_idx = packed_route_indices[route_block_idx].to(Int32)
+                        expert_idx = self._resolve_direct_expert(
+                            packed_route_indices,
+                            smem_base,
+                            tid,
+                            route_block_idx,
+                        )
                     else:
-                        expert_idx = block_expert_ids[route_block_idx].to(Int32)
+                        if cutlass.const_expr(self.block_expert_ids_are_topk_ids):
+                            expert_idx = Int32(-1)
+                            route_count = active_size_m * Int32(self.top_k)
+                            raw_route_off = Int32((self.sh_valid_count_off + 1) * 16)
+                            if tid < route_count:
+                                st_shared_i32(
+                                    smem_base + raw_route_off + tid * Int32(4),
+                                    block_expert_ids[tid].to(Int32),
+                                )
+                            cute.arch.sync_threads()
+                            if tid == Int32(0):
+                                mask0 = Uint32(0)
+                                mask1 = Uint32(0)
+                                route = Int32(0)
+                                while route < route_count:
+                                    route_expert = ld_shared_i32_relaxed(
+                                        smem_base + raw_route_off + route * Int32(4)
+                                    )
+                                    bit = route_expert
+                                    if route_expert < Int32(32):
+                                        mask0 |= Uint32(1) << Uint32(bit)
+                                    else:
+                                        bit -= Int32(32)
+                                        mask1 |= Uint32(1) << Uint32(bit)
+                                    route += Int32(1)
+                                ordinal = Int32(0)
+                                expert = Int32(0)
+                                while expert < Int32(self.num_experts):
+                                    mask = mask0
+                                    bit = expert
+                                    if expert >= Int32(32):
+                                        mask = mask1
+                                        bit -= Int32(32)
+                                    if ((mask >> Uint32(bit)) & Uint32(1)) != Uint32(0):
+                                        if ordinal == route_block_idx:
+                                            expert_idx = expert
+                                        ordinal += Int32(1)
+                                    expert += Int32(1)
+                                st_shared_i32(
+                                    smem_base + Int32(self.sh_valid_count_off * 16),
+                                    expert_idx,
+                                )
+                            cute.arch.sync_threads()
+                            expert_idx = ld_shared_i32_relaxed(
+                                smem_base + Int32(self.sh_valid_count_off * 16)
+                            )
+                        else:
+                            expert_idx = block_expert_ids[route_block_idx].to(Int32)
                     if expert_idx >= Int32(0):
-                        self._run_tile(
+                        block_valid_rows = self._run_tile(
                             a_bf16_flat,
                             b_i32_flat,
                             c_bf16_flat,
@@ -1227,6 +1311,17 @@ class W4A16GemmKernel:
                             lock_slot,
                             active_size_m,
                         )
+                        if cutlass.const_expr(pair_activation):
+                            self._complete_pair_activation(
+                                c_bf16_flat,
+                                pair_activated_bf16_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                output_n_tile,
+                                block_valid_rows,
+                            )
 
             if has_work != Int32(0):
                 if in_tail_region == Int32(0):
@@ -1240,6 +1335,100 @@ class W4A16GemmKernel:
                         route_block_idx += Int32(1)
 
     @cute.jit
+    def _cast_pair_activation_elem(self, value: cutlass.Float32):
+        if cutlass.const_expr(self.is_fp16):
+            return cutlass.Float16(value)
+        return cutlass.BFloat16(value)
+
+    @cute.jit
+    def _complete_pair_activation(
+        self,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+        output_n_tile: Int32,
+        block_valid_rows: Int32,
+    ):
+        """Activate an FC1 gate/up tile as soon as both halves are available."""
+        pair_tiles = Int32(self.n_tiles // 2)
+        pair_tile = output_n_tile
+        if pair_tile >= pair_tiles:
+            pair_tile -= pair_tiles
+        pair_slot = route_block_idx * pair_tiles + pair_tile
+
+        # _run_tile ends with a CTA barrier after all output stores.  Publish
+        # those stores through one acquire-release atomic per tile; the second
+        # half to arrive owns the activation for this pair.  The counter is
+        # intentionally monotonic: two arrivals per graph replay preserve its
+        # parity, avoiding a separate clear kernel during CUDA Graph replay.
+        if tid == Int32(0):
+            pair_addr = get_ptr_as_int64(locks_i32_flat, pair_slot)
+            old = atomic_add_global_acq_rel_i32(pair_addr, Int32(1))
+            st_shared_i32(
+                smem_base + Int32(self.sh_valid_count_off * 16 + 4),
+                old & Int32(1),
+            )
+        cute.arch.sync_threads()
+        is_second = ld_shared_i32_relaxed(
+            smem_base + Int32(self.sh_valid_count_off * 16 + 4)
+        )
+        if is_second != Int32(0):
+            item = tid
+            while item < block_valid_rows * Int32(self.tile_n):
+                row = item // Int32(self.tile_n)
+                col = item - row * Int32(self.tile_n)
+                route_index = ld_shared_i32_relaxed(
+                    smem_base + Int32(self.sh_route_off * 16) + row * Int32(4)
+                )
+                logical_col = pair_tile * Int32(self.tile_n) + col
+                row_base = route_index * Int32(self.size_n)
+                gate = fc1_bf16_flat[row_base + logical_col].to(cutlass.Float32)
+                up = fc1_bf16_flat[row_base + Int32(self.size_n // 2) + logical_col].to(
+                    cutlass.Float32
+                )
+                if cutlass.const_expr(self.fast_math):
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=True)
+                else:
+                    exp_neg_gate = cute.math.exp(-gate, fastmath=False)
+                silu = gate / (cutlass.Float32(1.0) + exp_neg_gate)
+                activated_bf16_flat[
+                    route_index * Int32(self.size_n // 2) + logical_col
+                ] = self._cast_pair_activation_elem(
+                    self._cast_pair_activation_elem(silu)
+                    * self._cast_pair_activation_elem(up)
+                )
+                item += Int32(self.cta_threads)
+        cute.arch.sync_threads()
+        return is_second
+
+    @cute.jit
+    def _resolve_direct_expert(
+        self,
+        packed_route_indices: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+    ) -> Int32:
+        if cutlass.const_expr(not self.direct_group_routes):
+            return packed_route_indices[route_block_idx].to(Int32)
+        if tid == Int32(0):
+            expert = packed_route_indices[route_block_idx].to(Int32)
+            leader = Int32(1)
+            prior = Int32(0)
+            while prior < route_block_idx:
+                if packed_route_indices[prior].to(Int32) == expert:
+                    leader = Int32(0)
+                prior += Int32(1)
+            if leader == Int32(0):
+                expert = Int32(-1)
+            st_shared_i32(smem_base + Int32(self.sh_valid_count_off * 16), expert)
+        cute.arch.sync_threads()
+        return ld_shared_i32_relaxed(smem_base + Int32(self.sh_valid_count_off * 16))
+
+    @cute.jit
     def _read_moe_block_data(
         self,
         packed_route_indices: cute.Tensor,
@@ -1247,23 +1436,110 @@ class W4A16GemmKernel:
         smem_base: Int32,
         tid: Int32,
         route_block_idx: Int32,
+        expert_idx: Int32,
         global_scale_f32: cutlass.Float32,
         active_size_m: Int32,
     ) -> Int32:
+        if cutlass.const_expr(self.block_expert_ids_are_topk_ids):
+            if tid == Int32(0):
+                valid = Int32(0)
+                route = Int32(0)
+                route_count = active_size_m * Int32(self.top_k)
+                raw_route_off = Int32((self.sh_valid_count_off + 1) * 16)
+                while route < route_count:
+                    route_expert = ld_shared_i32_relaxed(
+                        smem_base + raw_route_off + route * Int32(4)
+                    )
+                    if route_expert == expert_idx:
+                        st_shared_i32(
+                            smem_base
+                            + Int32(self.sh_route_off * 16)
+                            + valid * Int32(4),
+                            route,
+                        )
+                        st_shared_i32(
+                            smem_base
+                            + Int32(self.sh_rd_route_off * 16)
+                            + valid * Int32(4),
+                            route // Int32(self.top_k),
+                        )
+                        if cutlass.const_expr(self.mul_topk_weights):
+                            topk = (
+                                topk_weights_flat[route].to(cutlass.Float32)
+                                * global_scale_f32
+                            )
+                            st_shared_u32(
+                                smem_base
+                                + Int32(self.sh_topk_off * 16)
+                                + valid * Int32(4),
+                                self._broadcast_f32_to_elem2(topk),
+                            )
+                        valid += Int32(1)
+                    route += Int32(1)
+                st_shared_i32(smem_base + Int32(self.sh_valid_count_off * 16), valid)
+            cute.arch.sync_threads()
+            return ld_shared_i32_relaxed(
+                smem_base + Int32(self.sh_valid_count_off * 16)
+            )
+
         if cutlass.const_expr(self.direct_topk_routes):
             if tid == Int32(0):
-                idx = route_block_idx
-                st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
-                rd_row = idx // Int32(self.top_k)
-                st_shared_i32(smem_base + Int32(self.sh_rd_route_off * 16), rd_row)
-                if cutlass.const_expr(self.mul_topk_weights):
-                    topk = topk_weights_flat[idx].to(cutlass.Float32) * global_scale_f32
-                    st_shared_u32(
-                        smem_base + Int32(self.sh_topk_off * 16),
-                        self._broadcast_f32_to_elem2(topk),
+                valid = Int32(0)
+                if cutlass.const_expr(self.direct_group_routes):
+                    expert = packed_route_indices[route_block_idx].to(Int32)
+                    idx = route_block_idx
+                    route_count = active_size_m * Int32(self.top_k)
+                    while idx < route_count:
+                        if packed_route_indices[idx].to(
+                            Int32
+                        ) == expert and valid < Int32(self.moe_block_size):
+                            st_shared_i32(
+                                smem_base
+                                + Int32(self.sh_route_off * 16)
+                                + valid * Int32(4),
+                                idx,
+                            )
+                            st_shared_i32(
+                                smem_base
+                                + Int32(self.sh_rd_route_off * 16)
+                                + valid * Int32(4),
+                                idx // Int32(self.top_k),
+                            )
+                            if cutlass.const_expr(self.mul_topk_weights):
+                                topk = (
+                                    topk_weights_flat[idx].to(cutlass.Float32)
+                                    * global_scale_f32
+                                )
+                                st_shared_u32(
+                                    smem_base
+                                    + Int32(self.sh_topk_off * 16)
+                                    + valid * Int32(4),
+                                    self._broadcast_f32_to_elem2(topk),
+                                )
+                            valid += Int32(1)
+                        idx += Int32(1)
+                else:
+                    idx = route_block_idx
+                    st_shared_i32(smem_base + Int32(self.sh_route_off * 16), idx)
+                    st_shared_i32(
+                        smem_base + Int32(self.sh_rd_route_off * 16),
+                        idx // Int32(self.top_k),
                     )
+                    if cutlass.const_expr(self.mul_topk_weights):
+                        topk = (
+                            topk_weights_flat[idx].to(cutlass.Float32)
+                            * global_scale_f32
+                        )
+                        st_shared_u32(
+                            smem_base + Int32(self.sh_topk_off * 16),
+                            self._broadcast_f32_to_elem2(topk),
+                        )
+                    valid = Int32(1)
+                st_shared_i32(smem_base + Int32(self.sh_valid_count_off * 16), valid)
             cute.arch.sync_threads()
-            return Int32(1)
+            return ld_shared_i32_relaxed(
+                smem_base + Int32(self.sh_valid_count_off * 16)
+            )
 
         if cutlass.const_expr(self.single_token_route_fast_path):
             if tid == Int32(0):
@@ -1375,7 +1651,7 @@ class W4A16GemmKernel:
         active_size_m: Int32,
     ):
         if cutlass.const_expr(self.uses_m_block_8):
-            self._run_tile_m8(
+            return self._run_tile_m8(
                 a_bf16_flat,
                 b_i32_flat,
                 c_bf16_flat,
@@ -1398,7 +1674,7 @@ class W4A16GemmKernel:
                 active_size_m,
             )
         else:
-            self._run_tile_large_m(
+            return self._run_tile_large_m(
                 a_bf16_flat,
                 b_i32_flat,
                 c_bf16_flat,
@@ -1446,6 +1722,7 @@ class W4A16GemmKernel:
             smem_base,
             tid,
             route_block_idx,
+            expert_idx,
             global_scale_f32,
             active_size_m,
         )
@@ -1701,6 +1978,7 @@ class W4A16GemmKernel:
             lock_slot,
             True,
         )
+        return block_valid_rows
 
     @cute.jit
     def _run_tile_large_m(
@@ -1883,6 +2161,7 @@ class W4A16GemmKernel:
             lock_slot,
             False,
         )
+        return block_valid_rows
 
     @cute.jit
     def _run_mma_pipeline(
@@ -4119,6 +4398,7 @@ class W4A16FusedMoeKernel:
         w13_layout: str = "w13",
         direct_topk_routes: bool = False,
         tc_decode_fused_sum: bool = False,
+        tc_pair_activation: bool = False,
         tc_zero_output: bool = True,
         collect_activation_amax: bool = False,
         schedule_whole_tiles: bool = False,
@@ -4140,10 +4420,16 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        self.tc_pair_activation = bool(tc_pair_activation)
         # When two TC-decode launches share one pre-zeroed output (the NF3 hybrid
         # runs an NVFP4 launch then an NF3 launch into the same tensor), only the
         # first must zero it. Default True preserves single-launch behavior.
         self.tc_zero_output = bool(tc_zero_output)
+        self.tc_packed_pipeline = bool(
+            self.tc_pair_activation
+            and not bool(direct_topk_routes)
+            and not self.tc_zero_output
+        )
         self.collect_activation_amax = bool(collect_activation_amax)
         if self.collect_activation_amax and bool(direct_topk_routes):
             raise ValueError("activation amax collection requires route-packed W4A16")
@@ -4151,10 +4437,12 @@ class W4A16FusedMoeKernel:
             raise ValueError(
                 "activation amax collection is incompatible with TC-decode"
             )
-        if self.tc_decode_fused_sum and not bool(direct_topk_routes):
-            raise ValueError("tc_decode_fused_sum requires direct_topk_routes")
         if self.tc_decode_fused_sum and element_dtype != "bf16":
             raise ValueError("tc_decode_fused_sum currently requires bf16 activations")
+        if self.tc_pair_activation and (
+            activation != "silu" or swiglu_limit is not None or element_dtype != "bf16"
+        ):
+            raise ValueError("tc_pair_activation requires bf16 silu without clamping")
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
         self.size_m = int(size_m)
@@ -4180,7 +4468,24 @@ class W4A16FusedMoeKernel:
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
         self.direct_topk_routes = bool(direct_topk_routes)
-        self.schedule_whole_tiles = bool(schedule_whole_tiles)
+        # Expert-direct small-M schedule: route_block_idx is the expert id.
+        # Since top-k ids are unique per token and M<=8, each expert owns at
+        # most one M8 block and can collect its routes locally without a global
+        # route-pack pass.
+        self.inline_route_pack = False
+        self.enable_pdl = bool(self.tc_pair_activation and not self.direct_topk_routes)
+        if self.inline_route_pack and self.num_experts > 64:
+            raise ValueError("inline W4A16 route packing supports at most 64 experts")
+        # Runtime direct-route grouping was measurably fast on a few duplicate
+        # expert patterns, but racecheck exposed an inter-CTA read/write hazard.
+        # Keep the implementation dormant until it has a formally synchronized
+        # publication protocol; public small-M dispatch uses compact packed
+        # routes for those shapes instead.
+        self.direct_group_routes = False
+        self.schedule_whole_tiles = bool(
+            schedule_whole_tiles
+            or (self.tc_pair_activation and self.direct_topk_routes)
+        )
         fc1_source_n_rotation = (
             int(intermediate_size)
             if (weight_layout == "modelopt" and w13_layout == "w13" and is_gated)
@@ -4198,6 +4503,7 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
+            fast_math=fast_math,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
             scale_format=scale_format,
@@ -4205,6 +4511,8 @@ class W4A16FusedMoeKernel:
             source_n_rotation=fc1_source_n_rotation,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
+            direct_group_routes=self.direct_group_routes,
+            block_expert_ids_are_topk_ids=self.inline_route_pack,
             schedule_whole_tiles=self.schedule_whole_tiles,
         )
         self.fc2 = W4A16GemmKernel(
@@ -4219,11 +4527,14 @@ class W4A16FusedMoeKernel:
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             element_dtype=element_dtype,
+            fast_math=fast_math,
             weight_layout=weight_layout,
             scale_format=scale_format,
             w13_layout=w13_layout,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
+            direct_group_routes=self.direct_group_routes,
+            block_expert_ids_are_topk_ids=self.inline_route_pack,
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
@@ -4236,8 +4547,61 @@ class W4A16FusedMoeKernel:
         self.sms = self.fc1.sms
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
+        if self.tc_pair_activation:
+            # The generic planner adds 1536 bytes of headroom per CTA and pins
+            # every m8 kernel to one CTA/SM.  For the paired Direct kernel the
+            # compiled fused body allocates exactly ``shared_words * 4`` bytes;
+            # the 64x256 / 32x512 decode tiles therefore fit two resident CTAs
+            # on SM120 (49,408 B max, 118 GPR/thread).  Two-way residency turns
+            # the M6-M8 192-256 tile workloads from two waves into one.
+            if torch.cuda.is_available():
+                pair_max_shared_mem = int(
+                    getattr(
+                        torch.cuda.get_device_properties(torch.cuda.current_device()),
+                        "shared_memory_per_block_optin",
+                        _DEFAULT_MAX_SHARED_MEM,
+                    )
+                )
+            else:
+                pair_max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+            pair_max_regs = max(
+                _w4a16_num_regs(
+                    cta_threads=gemm.cta_threads,
+                    cta_m_blocks=gemm.cta_m_blocks,
+                    cta_n_blocks=gemm.cta_n_blocks,
+                    cta_k_blocks=gemm.cta_k_blocks,
+                    uses_m_block_8=gemm.uses_m_block_8,
+                    weight_layout=gemm.weight_layout,
+                )
+                for gemm in (self.fc1, self.fc2)
+            )
+            pair_residency = min(
+                pair_max_shared_mem // max(self.shared_words * 4, 1),
+                _DEVICE_MAX_REG_BYTES // max(pair_max_regs * self.cta_threads * 4, 1),
+            )
+            if pair_residency >= 2:
+                self.blocks_per_sm = min(int(pair_residency), 4)
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        if self.tc_pair_activation:
+            pair_route_blocks = (
+                routed_rows if self.direct_topk_routes else int(max_m_blocks)
+            )
+            pair_slots = pair_route_blocks * (self.fc1.n_tiles // 2)
+            if self.fc1.n_tiles % 2 != 0 or pair_slots > self.barrier_count_off:
+                raise ValueError(
+                    "tc_pair_activation pair counters exceed the lock workspace"
+                )
+            self.pipeline_ready_off = pair_slots
+            if (
+                self.tc_packed_pipeline
+                and self.pipeline_ready_off + int(max_m_blocks) > self.barrier_count_off
+            ):
+                raise ValueError(
+                    "packed TC pipeline readiness counters exceed the lock workspace"
+                )
+        else:
+            self.pipeline_ready_off = 0
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -4262,6 +4626,11 @@ class W4A16FusedMoeKernel:
             self.fast_math,
             self.direct_topk_routes,
             self.tc_zero_output,
+            self.tc_pair_activation,
+            self.tc_packed_pipeline,
+            self.direct_group_routes,
+            self.inline_route_pack,
+            self.enable_pdl,
             self.collect_activation_amax,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -4358,7 +4727,8 @@ class W4A16FusedMoeKernel:
             # activation, and FC2. Require whole-grid admission so unrelated
             # work cannot occupy an SM while resident CTAs wait for peers that
             # have not been scheduled yet.
-            cooperative=True,
+            cooperative=not self.tc_packed_pipeline,
+            use_pdl=self.enable_pdl,
             stream=stream,
         )
 
@@ -4392,6 +4762,8 @@ class W4A16FusedMoeKernel:
         tid = Int32(tidx)
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -4462,6 +4834,33 @@ class W4A16FusedMoeKernel:
         fc1_emit_tile: cutlass.Constexpr = None,
         fc2_emit_tile: cutlass.Constexpr = None,
     ):
+        if cutlass.const_expr(self.tc_packed_pipeline):
+            self._run_tc_packed_pipeline(
+                a_bf16_flat,
+                w13_i32_flat,
+                w2_i32_flat,
+                fc1_bf16_flat,
+                activated_bf16_flat,
+                fc2_bf16_flat,
+                w13_scales_i32_flat,
+                w2_scales_i32_flat,
+                w13_global_scale,
+                w2_global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights_flat,
+                fc1_c_tmp_f32_flat,
+                fc2_c_tmp_f32_flat,
+                locks_i32_flat,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+            )
+            return
+
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
         # barrier, FC2. The emit hooks delegate per-tile expert resolution and
@@ -4501,6 +4900,7 @@ class W4A16FusedMoeKernel:
                 a_bf16_flat,
                 w13_i32_flat,
                 fc1_bf16_flat,
+                activated_bf16_flat,
                 w13_scales_i32_flat,
                 w13_global_scale,
                 packed_route_indices,
@@ -4515,21 +4915,24 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
                 fc1_emit_tile,
+                self.tc_pair_activation,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
-            self._run_activation(
-                fc1_bf16_flat,
-                activated_bf16_flat,
-                tid,
-                cta,
-                grid_x,
-                active_m,
-            )
+            if cutlass.const_expr(not self.tc_pair_activation):
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
+                self._run_activation(
+                    fc1_bf16_flat,
+                    activated_bf16_flat,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
         else:
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,
                 w13_i32_flat,
                 activated_bf16_flat,
+                activated_bf16_flat,
                 w13_scales_i32_flat,
                 w13_global_scale,
                 packed_route_indices,
@@ -4544,6 +4947,7 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
                 fc1_emit_tile,
+                False,
             )
         self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
@@ -4568,6 +4972,7 @@ class W4A16FusedMoeKernel:
             activated_bf16_flat,
             w2_i32_flat,
             fc2_bf16_flat,
+            fc2_bf16_flat,
             w2_scales_i32_flat,
             w2_global_scale,
             packed_route_indices,
@@ -4582,7 +4987,125 @@ class W4A16FusedMoeKernel:
             grid_x,
             active_m * Int32(self.top_k),
             fc2_emit_tile,
+            False,
         )
+
+    @cute.jit
+    def _run_tc_packed_pipeline(
+        self,
+        a_bf16_flat: cute.Tensor,
+        w13_i32_flat: cute.Tensor,
+        w2_i32_flat: cute.Tensor,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        fc2_bf16_flat: cute.Tensor,
+        w13_scales_i32_flat: cute.Tensor,
+        w2_scales_i32_flat: cute.Tensor,
+        w13_global_scale: cute.Tensor,
+        w2_global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        """Pipeline packed FC1 tiles into FC2 using per-expert readiness."""
+        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
+            self.moe_block_size
+        )
+
+        fc1_task = cta
+        fc1_tasks = route_blocks * Int32(self.fc1.n_tiles)
+        while fc1_task < fc1_tasks:
+            route_block_idx = fc1_task // Int32(self.fc1.n_tiles)
+            output_n_tile = fc1_task - route_block_idx * Int32(self.fc1.n_tiles)
+            expert_idx = block_expert_ids[route_block_idx].to(Int32)
+            block_valid_rows = self.fc1._run_tile(
+                a_bf16_flat,
+                w13_i32_flat,
+                fc1_bf16_flat,
+                w13_scales_i32_flat,
+                w13_global_scale,
+                packed_route_indices,
+                topk_weights_flat,
+                fc1_c_tmp_f32_flat,
+                locks_i32_flat,
+                smem_base,
+                tid,
+                route_block_idx,
+                expert_idx,
+                output_n_tile,
+                Int32(0),
+                Int32(self.fc1.k_tiles),
+                Int32(1),
+                Int32(0),
+                Int32(0),
+                active_m,
+            )
+            self.fc1._complete_pair_activation(
+                fc1_bf16_flat,
+                activated_bf16_flat,
+                locks_i32_flat,
+                smem_base,
+                tid,
+                route_block_idx,
+                output_n_tile,
+                block_valid_rows,
+            )
+            if tid == Int32(0):
+                ready_addr = get_ptr_as_int64(
+                    locks_i32_flat,
+                    Int32(self.pipeline_ready_off) + route_block_idx,
+                )
+                atomic_add_global_acq_rel_i32(ready_addr, Int32(1))
+            cute.arch.sync_threads()
+            fc1_task += grid_x
+
+        fc2_task = cta
+        fc2_tasks = route_blocks * Int32(self.fc2.n_tiles)
+        while fc2_task < fc2_tasks:
+            route_block_idx = fc2_task // Int32(self.fc2.n_tiles)
+            output_n_tile = fc2_task - route_block_idx * Int32(self.fc2.n_tiles)
+            if tid == Int32(0):
+                ready_addr = get_ptr_as_int64(
+                    locks_i32_flat,
+                    Int32(self.pipeline_ready_off) + route_block_idx,
+                )
+                ready = ld_global_acquire_i32(ready_addr)
+                while ready < Int32(self.fc1.n_tiles):
+                    ready = ld_global_acquire_i32(ready_addr)
+            cute.arch.sync_threads()
+            expert_idx = block_expert_ids[route_block_idx].to(Int32)
+            self.fc2._run_tile(
+                activated_bf16_flat,
+                w2_i32_flat,
+                fc2_bf16_flat,
+                w2_scales_i32_flat,
+                w2_global_scale,
+                packed_route_indices,
+                topk_weights_flat,
+                fc2_c_tmp_f32_flat,
+                locks_i32_flat,
+                smem_base,
+                tid,
+                route_block_idx,
+                expert_idx,
+                output_n_tile,
+                Int32(0),
+                Int32(self.fc2.k_tiles),
+                Int32(1),
+                Int32(0),
+                Int32(0),
+                active_m * Int32(self.top_k),
+            )
+            fc2_task += grid_x
 
     @cute.jit
     def _grid_barrier(
@@ -4988,10 +5511,193 @@ class W4A16TopKSumKernel:
             output_flat[idx] = self._cast_elem(acc)
 
 
+class W4A16RoutePackKernel:
+    """Small route packer with an optional concurrent token-output clear."""
+
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        block_size: int,
+        hidden_size: int,
+        clear_output: bool,
+        clear_ctas: int,
+        clear_lock_words: int,
+    ):
+        if not 1 <= num_experts <= 64:
+            raise ValueError("small route pack supports num_experts in [1, 64]")
+        if block_size != 8:
+            raise ValueError("small route pack requires block_size=8")
+        self.num_experts = int(num_experts)
+        self.block_size = int(block_size)
+        self.hidden_size = int(hidden_size)
+        self.clear_output = bool(clear_output)
+        self.clear_ctas = int(clear_ctas) if self.clear_output else 1
+        self.clear_lock_words = int(clear_lock_words) if self.clear_output else 0
+        if self.clear_output and self.hidden_size <= 0:
+            raise ValueError("route-pack output clear requires hidden_size > 0")
+        if not 1 <= self.clear_ctas <= 32:
+            raise ValueError("route-pack clear_ctas must be in [1, 32]")
+        self.cta_threads = 64
+
+    @property
+    def __cache_key__(self) -> tuple[int, int, int, bool, int, int]:
+        return (
+            self.num_experts,
+            self.block_size,
+            self.hidden_size,
+            self.clear_output,
+            self.clear_ctas,
+            self.clear_lock_words,
+        )
+
+    @cute.jit
+    def _warp_inclusive(self, value: Int32, lane: Int32) -> Int32:
+        for scan_stage in cutlass.range_constexpr(5):
+            scan_offset = Int32(1 << scan_stage)
+            scan_value = cute.arch.shuffle_sync(
+                value,
+                lane - scan_offset,
+            )
+            if lane >= scan_offset:
+                value += scan_value
+        return value
+
+    @cute.jit
+    def __call__(
+        self,
+        topk_ids_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        output_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        routed_rows: cutlass.Int32,
+        active_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            topk_ids_flat,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            output_flat,
+            locks_i32_flat,
+            routed_rows,
+            active_m,
+        ).launch(
+            grid=(self.clear_ctas, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            use_pdl=True,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        topk_ids_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        output_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        routed_rows: cutlass.Int32,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 577],
+                16,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        shared = cute.make_tensor(
+            storage.words.data_ptr(),
+            layout=cute.make_layout((577,), stride=(1,)),
+        )
+        if cta == Int32(0):
+            # All 64 lanes participate in the ballots below.  Initialize the
+            # full counter bank even when the model has fewer than 64 experts.
+            shared[tid] = Int32(0)
+            cute.arch.sync_threads()
+
+            if tid < routed_rows:
+                route_expert = topk_ids_flat[tid].to(Int32)
+                if route_expert >= Int32(0) and route_expert < Int32(self.num_experts):
+                    slot = atomic_add_shared_i32(
+                        smem_base + route_expert * Int32(4),
+                        Int32(1),
+                    )
+                    if slot < Int32(self.block_size):
+                        shared[
+                            Int32(64) + route_expert * Int32(self.block_size) + slot
+                        ] = tid
+            cute.arch.sync_threads()
+
+            matches = shared[tid].to(Int32)
+            if matches > Int32(self.block_size):
+                matches = Int32(self.block_size)
+            present = (matches > Int32(0)).to(Int32)
+            lane = tid & Int32(31)
+            warp = tid >> Int32(5)
+            active_mask = cute.arch.vote_ballot_sync(present != Int32(0))
+            lower_present = Int32(0)
+            if warp == Int32(1):
+                lower_present = (shared[lane] > Int32(0)).to(Int32)
+            lower_mask = cute.arch.vote_ballot_sync(lower_present != Int32(0))
+            lane_mask = (Uint32(1) << Uint32(lane)) - Uint32(1)
+            block = Int32(cute.arch.popc(active_mask & lane_mask))
+            if warp == Int32(1):
+                block += Int32(cute.arch.popc(lower_mask))
+
+            if tid < Int32(self.num_experts) and present != Int32(0):
+                block_expert_ids[block] = tid
+                out = block * Int32(self.block_size)
+                end = out + Int32(self.block_size)
+                slot = Int32(0)
+                while slot < matches:
+                    packed_route_indices[out] = shared[
+                        Int32(64) + tid * Int32(self.block_size) + slot
+                    ].to(Int32)
+                    out += Int32(1)
+                    slot += Int32(1)
+                while out < end:
+                    packed_route_indices[out] = routed_rows
+                    out += Int32(1)
+            if tid == Int32(32):
+                packed_route_count[Int32(0)] = Int32(self.block_size) * (
+                    Int32(cute.arch.popc(lower_mask))
+                    + Int32(cute.arch.popc(active_mask))
+                )
+
+        if cutlass.const_expr(self.clear_output):
+            item = cta * Int32(self.cta_threads) + tid
+            stride = Int32(self.clear_ctas * self.cta_threads)
+            total = active_m * Int32(self.hidden_size)
+            zero = cutlass.BFloat16(0.0)
+            while item < total:
+                output_flat[item] = zero
+                item += stride
+            lock_item = cta * Int32(self.cta_threads) + tid
+            while lock_item < Int32(self.clear_lock_words):
+                locks_i32_flat[lock_item] = Int32(0)
+                lock_item += stride
+        cute.arch.griddepcontrol_launch_dependents()
+
+
 _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+_ROUTE_PACK_CACHE: dict[tuple, W4A16RoutePackCompileResult] = {}
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -5068,6 +5774,9 @@ def compile_w4a16_gemm(
     max_m_blocks: int,
     element_dtype: str = "bf16",
     scale_format: str = "e4m3_k16",
+    weight_layout: str = "packed",
+    w13_layout: str = "w13",
+    source_n_rotation: int = 0,
 ) -> W4A16GemmCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -5087,7 +5796,10 @@ def compile_w4a16_gemm(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        weight_layout=weight_layout,
         scale_format=scale_format,
+        w13_layout=w13_layout,
+        source_n_rotation=source_n_rotation,
     )
     cache_key = (
         "w4a16_gemm",
@@ -5110,11 +5822,18 @@ def compile_w4a16_gemm(
         (compile_size_m * size_k,),
         assumed_align=16,
     )
-    b_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (size_k // 16) * (size_n // 16 * 32),),
-        assumed_align=16,
-    )
+    if weight_layout == "modelopt":
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * size_n * (size_k // 2),),
+            assumed_align=16,
+        )
+    else:
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (size_k // 16) * (size_n // 16 * 32),),
+            assumed_align=16,
+        )
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (compile_size_m * top_k * size_n,),
@@ -5205,7 +5924,9 @@ def compile_w4a16_gemm(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         blocks_per_sm=kernel.blocks_per_sm,
+        weight_layout=weight_layout,
         scale_format=scale_format,
+        w13_layout=w13_layout,
     )
     _CACHE[cache_key] = result
     return result
@@ -5235,6 +5956,8 @@ def compile_w4a16_fused_moe(
     w13_layout: str = "w13",
     direct_topk_routes: bool = False,
     tc_decode_fused_sum: bool = False,
+    tc_pair_activation: bool = False,
+    tc_zero_output: bool = True,
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
 ) -> W4A16FusedMoeCompileResult:
@@ -5258,6 +5981,8 @@ def compile_w4a16_fused_moe(
         w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
     tc_decode_fused_sum = bool(tc_decode_fused_sum)
+    tc_pair_activation = bool(tc_pair_activation)
+    tc_zero_output = bool(tc_zero_output)
     collect_activation_amax = bool(collect_activation_amax)
     if collect_activation_amax and (direct_topk_routes or tc_decode_fused_sum):
         raise ValueError(
@@ -5492,7 +6217,7 @@ def compile_w4a16_fused_moe(
             ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
             ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
         ):
-            if not _candidate_tile_fits(
+            forced_tile_fits = _candidate_tile_fits(
                 problem_n=forced_pn,
                 problem_k=forced_pk,
                 cta_m_blocks=_covering_count(moe_block_size, 16),
@@ -5503,7 +6228,27 @@ def compile_w4a16_fused_moe(
                 scale_format=scale_format,
                 weight_layout=weight_layout,
                 allow_logical_tail=allow_native_logical_tail,
+            )
+            if (
+                not forced_tile_fits
+                and bool(tc_pair_activation)
+                and forced_tk == 32
+                and forced_tn in (256, 512)
+                and forced_pn % forced_tn == 0
+                and forced_pk % forced_tk == 0
+                and forced_tk % _scale_group_size(scale_format) == 0
             ):
+                forced_tile_fits = (
+                    _shared_memory_footprint(
+                        cta_m_blocks=_covering_count(moe_block_size, 16),
+                        tile_n=forced_tn,
+                        tile_k=forced_tk,
+                        scale_format=scale_format,
+                        weight_layout=weight_layout,
+                    )
+                    <= int(max_shared_mem) - 512
+                )
+            if not forced_tile_fits:
                 raise ValueError(
                     f"force_tile_config {name} tile "
                     f"(tile_k={forced_tk}, tile_n={forced_tn}) does not fit "
@@ -5535,6 +6280,8 @@ def compile_w4a16_fused_moe(
         w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        tc_pair_activation=tc_pair_activation,
+        tc_zero_output=tc_zero_output,
         collect_activation_amax=collect_activation_amax,
     )
     cache_key = (
@@ -5554,9 +6301,13 @@ def compile_w4a16_fused_moe(
     compile_size_m = _fake_m_for_specialization(size_m)
     compile_routed_rows = int(compile_size_m) * int(top_k)
     compile_route_blocks = compile_routed_rows if direct_topk_routes else 1
+    if kernel.inline_route_pack:
+        compile_route_blocks = int(num_experts)
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     packed_route_fake_elements = (
-        compile_routed_rows if direct_topk_routes else compile_route_slots
+        compile_routed_rows
+        if (direct_topk_routes or kernel.inline_route_pack)
+        else compile_route_slots
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     if weight_layout == "modelopt":
@@ -5651,7 +6402,7 @@ def compile_w4a16_fused_moe(
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_blocks,),
+        (compile_routed_rows if kernel.inline_route_pack else compile_route_blocks,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -5752,6 +6503,12 @@ def compile_w4a16_fused_moe(
         direct_topk_routes=kernel.direct_topk_routes,
         scale_format=scale_format,
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        tc_pair_activation=bool(tc_pair_activation),
+        tc_packed_pipeline=bool(kernel.tc_packed_pipeline),
+        tc_zero_output=bool(tc_zero_output),
+        direct_group_routes=bool(kernel.direct_group_routes),
+        inline_route_pack=bool(kernel.inline_route_pack),
+        schedule_whole_tiles=bool(kernel.schedule_whole_tiles),
         collect_activation_amax=collect_activation_amax,
     )
     _FUSED_CACHE[cache_key] = result
@@ -5763,6 +6520,7 @@ def clear_w4a16_kernel_cache() -> None:
     _FUSED_CACHE.clear()
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
+    _ROUTE_PACK_CACHE.clear()
     clear_compile_cache()
 
 
@@ -5889,6 +6647,188 @@ def compile_w4a16_topk_sum(
     return result
 
 
+def compile_w4a16_route_pack(
+    *,
+    num_experts: int,
+    block_size: int = 8,
+    hidden_size: int = 0,
+    clear_output: bool = False,
+    clear_ctas: int = 8,
+    clear_lock_words: int = 0,
+) -> W4A16RoutePackCompileResult:
+    device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    kernel = W4A16RoutePackKernel(
+        num_experts=num_experts,
+        block_size=block_size,
+        hidden_size=hidden_size,
+        clear_output=clear_output,
+        clear_ctas=clear_ctas,
+        clear_lock_words=clear_lock_words,
+    )
+    cache_key = ("w4a16_route_pack", device, kernel.__cache_key__)
+    cached = _ROUTE_PACK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    topk_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (64,), assumed_align=16
+    )
+    packed_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_experts * block_size,), assumed_align=16
+    )
+    experts_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_experts,), assumed_align=16
+    )
+    count_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (1,), assumed_align=4
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (max(hidden_size * 8, 1),), assumed_align=16
+    )
+    locks_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (max(clear_lock_words, 1),), assumed_align=16
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = cached_compile(
+        kernel,
+        topk_fake,
+        packed_fake,
+        experts_fake,
+        count_fake,
+        output_fake,
+        locks_fake,
+        1,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.route_pack",
+            1,
+            cache_key,
+        ),
+    )
+    result = W4A16RoutePackCompileResult(
+        compiled=compiled,
+        num_experts=num_experts,
+        block_size=block_size,
+        hidden_size=hidden_size,
+        clear_output=bool(clear_output),
+        clear_ctas=int(clear_ctas) if clear_output else 1,
+        clear_lock_words=int(clear_lock_words) if clear_output else 0,
+    )
+    _ROUTE_PACK_CACHE[cache_key] = result
+    return result
+
+
+def run_w4a16_route_pack(
+    topk_ids: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    output: torch.Tensor,
+    locks: torch.Tensor,
+    *,
+    num_experts: int,
+    block_size: int = 8,
+    clear_output: bool = False,
+    clear_ctas: int = 8,
+    clear_lock_words: int = 0,
+    stream=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not 1 <= int(num_experts) <= 64:
+        raise ValueError("num_experts must be in [1, 64]")
+    if int(block_size) != 8:
+        raise ValueError("route packing requires block_size=8")
+    if topk_ids.ndim != 2 or topk_ids.dtype != torch.int32:
+        raise TypeError("topk_ids must be a 2D torch.int32 tensor")
+    if topk_ids.numel() < 1 or topk_ids.numel() > 64:
+        raise ValueError("topk_ids must contain between 1 and 64 route ids")
+    if output.ndim != 2 or output.shape[0] > int(block_size):
+        raise ValueError("route-pack output must be 2D with at most block_size rows")
+    if output.dtype != torch.bfloat16:
+        raise TypeError("route-pack output must be torch.bfloat16")
+    tensors = {
+        "topk_ids": topk_ids,
+        "packed_route_indices": packed_route_indices,
+        "block_expert_ids": block_expert_ids,
+        "packed_route_count": packed_route_count,
+        "output": output,
+        "locks": locks,
+    }
+    device = topk_ids.device
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    for name in (
+        "packed_route_indices",
+        "block_expert_ids",
+        "packed_route_count",
+        "locks",
+    ):
+        if tensors[name].dtype != torch.int32:
+            raise TypeError(f"{name} must be torch.int32")
+    if int(topk_ids.shape[0]) != int(output.shape[0]):
+        raise ValueError("topk_ids and output must have the same token count")
+    if int(packed_route_indices.numel()) < int(num_experts) * int(block_size):
+        raise ValueError(
+            "packed_route_indices is smaller than num_experts * block_size"
+        )
+    if int(block_expert_ids.numel()) < int(num_experts):
+        raise ValueError("block_expert_ids is smaller than num_experts")
+    if int(packed_route_count.numel()) < 1:
+        raise ValueError("packed_route_count must hold at least one element")
+    if int(clear_lock_words) < 0:
+        raise ValueError("clear_lock_words must be non-negative")
+    if clear_output and int(locks.numel()) < int(clear_lock_words):
+        raise ValueError(
+            "locks is smaller than clear_lock_words: "
+            f"{int(locks.numel())} < {int(clear_lock_words)}"
+        )
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        route_values = topk_ids.view(-1)
+        min_route = int(route_values.min().item())
+        max_route = int(route_values.max().item())
+        if min_route < 0 or max_route >= int(num_experts):
+            raise ValueError(
+                f"topk_ids must be in [0, {int(num_experts) - 1}], "
+                f"got [{min_route}, {max_route}]"
+            )
+        counts = torch.bincount(route_values, minlength=int(num_experts))
+        if int(counts.max().item()) > int(block_size):
+            raise ValueError(
+                "an expert receives more routes than route-pack block_size="
+                f"{int(block_size)}"
+            )
+    if stream is not None and int(stream) != int(current_cuda_stream()):
+        raise ValueError("route packing requires the current CUDA stream")
+    route_pack = compile_w4a16_route_pack(
+        num_experts=num_experts,
+        block_size=block_size,
+        hidden_size=int(output.shape[-1]),
+        clear_output=clear_output,
+        clear_ctas=clear_ctas,
+        clear_lock_words=clear_lock_words,
+    )
+    stream = current_cuda_stream() if stream is None else stream
+    route_pack.compiled(
+        topk_ids.view(-1),
+        packed_route_indices,
+        block_expert_ids,
+        packed_route_count,
+        output.view(-1),
+        locks.view(-1),
+        int(topk_ids.numel()),
+        int(output.shape[0]),
+        cuda.CUstream(stream),
+    )
+    return packed_route_indices, block_expert_ids, packed_route_count
+
+
 def _w4a16_fused_moe_launch_flat(
     a_input: torch.Tensor,
     w13_arg: torch.Tensor,
@@ -5937,6 +6877,8 @@ def _w4a16_fused_moe_launch_flat(
     fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    tc_pair_activation: bool,
+    tc_zero_output: bool,
     collect_activation_amax: bool,
     stream_int: int,
 ) -> None:
@@ -5970,6 +6912,8 @@ def _w4a16_fused_moe_launch_flat(
         w13_layout=w13_layout,
         direct_topk_routes=bool(direct_topk_routes),
         tc_decode_fused_sum=bool(tc_decode_fused_sum),
+        tc_pair_activation=bool(tc_pair_activation),
+        tc_zero_output=bool(tc_zero_output),
         collect_activation_amax=collect_activation_amax,
         # The custom-op boundary cannot carry the compiled launch object. Re-pin
         # its selected geometry so tile-specific packs (notably NF3) resolve the
@@ -6017,6 +6961,19 @@ def _w4a16_fused_moe_launch_flat(
             sms=sms,
         ),
         cuda.CUstream(stream_int),
+    )
+
+
+@cache
+def _best_whole_tile_grid(fc1_mn_tiles: int, fc2_mn_tiles: int, cap: int) -> int:
+    """Cache the cooperative-grid search for a fixed tile geometry."""
+
+    def critical_path(grid: int) -> int:
+        return -(-int(fc1_mn_tiles) // grid) + -(-int(fc2_mn_tiles) // grid)
+
+    return min(
+        range(1, int(cap) + 1),
+        key=lambda grid: (critical_path(grid), grid),
     )
 
 
@@ -6070,11 +7027,11 @@ def _w4a16_fused_persistent_grid_x(
             return max(cap, 1)
         fc2_mn_tiles = route_blocks * (hidden // fc2_tile_n)
 
-        def whole_tile_critical_path(grid: int) -> int:
-            return -(-fc1_mn_tiles // grid) + -(-fc2_mn_tiles // grid)
-
-        candidates = sorted({int(cap), min(fc1_mn_tiles, int(cap))})
-        return min(candidates, key=lambda g: (whole_tile_critical_path(g), g))
+        # Search every legal cooperative-grid size.  The old two-candidate
+        # heuristic missed the common asymmetric case (for example FC1=96,
+        # FC2=128, cap=188): 128 CTAs keep both phases single-wave while
+        # avoiding 60 idle participants in the software grid barrier.
+        return _best_whole_tile_grid(int(fc1_mn_tiles), int(fc2_mn_tiles), int(cap))
     waves = (fc1_mn_tiles + cap - 1) // cap
     if waves <= 0:
         return max(cap, 1)
@@ -6145,6 +7102,8 @@ def _w4a16_fused_moe_launch_op(
     fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    tc_pair_activation: bool,
+    tc_zero_output: bool,
     stream_int: int,
 ) -> None:
     _w4a16_fused_moe_launch_flat(
@@ -6195,6 +7154,8 @@ def _w4a16_fused_moe_launch_op(
         fc2_tile_n=fc2_tile_n,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        tc_pair_activation=tc_pair_activation,
+        tc_zero_output=tc_zero_output,
         collect_activation_amax=False,
         stream_int=stream_int,
     )
@@ -6247,6 +7208,8 @@ def _w4a16_fused_moe_launch_fake(
     fc2_tile_n: int,
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
+    tc_pair_activation: bool,
+    tc_zero_output: bool,
     stream_int: int,
 ) -> None:
     return None
@@ -6360,6 +7323,8 @@ def _w4a16_fused_moe_calibrated_launch_op(
         fc2_tile_n=fc2_tile_n,
         direct_topk_routes=False,
         tc_decode_fused_sum=False,
+        tc_pair_activation=False,
+        tc_zero_output=True,
         collect_activation_amax=True,
         stream_int=stream_int,
     )
@@ -6701,6 +7666,7 @@ def run_w4a16_moe(
     swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
+    routes_prepacked: bool = False,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -6790,6 +7756,11 @@ def run_w4a16_moe(
     # ``tc_decode_fused_sum``; accept it through the binding path. A runtime
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
+    tc_decode_m_cap = (
+        _W4A16_SMALL_M_DIRECT_MAX_M
+        if bool(getattr(fused_launch, "tc_pair_activation", False))
+        else _TC_DECODE_MAX_M
+    )
     use_tc_decode = bool(
         (not collect_activation_amax)
         and (fused_launch is None or preplanned_tc_decode)
@@ -6799,7 +7770,7 @@ def run_w4a16_moe(
         and element_dtype == "bf16"
         and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.is_cuda
-        and int(m) <= _TC_DECODE_MAX_M
+        and int(m) <= tc_decode_m_cap
     )
     if use_tc_decode and topk_ids.dtype != torch.int32:
         # The inline direct-topk route path needs int32 route indices.
@@ -6828,8 +7799,24 @@ def run_w4a16_moe(
             "int32 topk_ids without expert_map"
         )
 
-    # TC-decode requires the inline direct-topk route path (no route-pack).
-    use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
+    # A preplanned paired kernel may consume the compact expert-packed route
+    # blocks while retaining the fused FC2 top-k epilogue. Runtime-selected
+    # TC decode still uses inline direct routes; only an explicitly compiled
+    # packed launch opts into this experimental schedule.
+    preplanned_packed_tc_decode = bool(
+        preplanned_tc_decode
+        and fused_launch is not None
+        and not bool(getattr(fused_launch, "direct_topk_routes", False))
+    )
+    use_tc_decode = bool(
+        use_tc_decode and (use_direct_topk_routes or preplanned_packed_tc_decode)
+    )
+    inline_route_pack = bool(
+        use_tc_decode
+        and preplanned_packed_tc_decode
+        and bool(getattr(fused_launch, "tc_pair_activation", False))
+        and bool(getattr(fused_launch, "inline_route_pack", False))
+    )
 
     # A preplanned TC-decode launch atomically accumulates FC2 partials into the
     # (pre-zeroed) output and emits no separate top-k sum. If it was selected but
@@ -6838,7 +7825,7 @@ def run_w4a16_moe(
     if preplanned_tc_decode and not use_tc_decode:
         raise RuntimeError(
             "preplanned TC-decode W4A16 launch requires small-M packed bf16 "
-            f"decode (m <= {_TC_DECODE_MAX_M}, cuda int32/int64 topk_ids, "
+            f"decode (m <= {tc_decode_m_cap}, cuda int32/int64 topk_ids, "
             "no expert_map)"
         )
 
@@ -6871,6 +7858,30 @@ def run_w4a16_moe(
             block_expert_ids = packed_route_indices
         if packed_route_count is None:
             packed_route_count = packed_route_indices
+    elif inline_route_pack:
+        # Expert-direct scheduling aliases both route arguments to the raw IDs.
+        # Each expert CTA collects its <=M matching rows locally; no global
+        # route list or route-count publication is needed.
+        packed_route_indices = topk_ids.view(-1)
+        block_expert_ids = topk_ids.view(-1)
+        if packed_route_count is None:
+            packed_route_count = packed_route_indices
+        route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
+        required_m_blocks = int(getattr(fused_launch, "max_m_blocks", 0))
+    elif routes_prepacked:
+        if (
+            packed_route_indices is None
+            or block_expert_ids is None
+            or packed_route_count is None
+        ):
+            raise ValueError(
+                "routes_prepacked requires packed route indices, expert ids, "
+                "and route count"
+            )
+        if expert_map is not None:
+            raise ValueError("routes_prepacked does not support expert_map")
+        route_slots_for_scratch = int(packed_route_indices.numel())
+        required_m_blocks = int(block_expert_ids.numel())
     else:
         packed_route_indices, block_expert_ids, packed_route_count = (
             pack_topk_routes_by_expert(
@@ -7017,6 +8028,12 @@ def run_w4a16_moe(
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
+    if routes_prepacked and bool(getattr(fused, "tc_packed_pipeline", False)):
+        # The route-pack prologue normally clears this lock workspace.  A
+        # caller that supplies prepacked routes bypasses that kernel, so reset
+        # all counters before the current FC1/FC2 pipeline (and capture this
+        # reset when the caller is building a CUDA Graph).
+        prepared.workspace.zero_()
     if weight_layout == "nf3_2p1":
         prepared_tiles = (
             int(getattr(prepared, "fc1_tile_n", 0)),
@@ -7146,6 +8163,8 @@ def run_w4a16_moe(
             *launch_tail,
             bool(use_direct_topk_routes),
             bool(use_tc_decode),
+            bool(getattr(fused, "tc_pair_activation", False)),
+            bool(getattr(fused, "tc_zero_output", True)),
             int(stream),
         )
 
@@ -7181,6 +8200,7 @@ __all__ = [
     "W4A16FusedMoeCompileResult",
     "W4A16GemmCompileResult",
     "W4A16TopKSumCompileResult",
+    "W4A16RoutePackCompileResult",
     "W4A16FusedMoeKernel",
     "W4A16ActivationKernel",
     "W4A16GemmKernel",
@@ -7190,6 +8210,8 @@ __all__ = [
     "compile_w4a16_fused_moe",
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
+    "compile_w4a16_route_pack",
     "pack_topk_routes_by_expert",
     "run_w4a16_moe",
+    "run_w4a16_route_pack",
 ]
