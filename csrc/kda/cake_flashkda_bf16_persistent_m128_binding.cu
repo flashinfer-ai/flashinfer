@@ -55,7 +55,6 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckFlashKDATarget(device_id);
-  CheckFlashKDAPersistentDevice(device_id);
 
   const int64_t num_seqs =
       CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
@@ -71,16 +70,24 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
   TVM_FFI_ICHECK(task_offsets.ndim() == 1 && task_offsets.numel() >= 2)
       << "task_offsets must contain one entry per worker plus its terminal offset";
   const int64_t worker_count = task_offsets.numel() - 1;
+  int32_t major = 0;
+  int32_t minor = 0;
   int32_t sm_count = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
   CheckCuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id),
             "cudaDeviceGetAttribute(multiProcessorCount)");
-  TVM_FFI_ICHECK(sm_count == 148 || sm_count == 152)
-      << "persistent FlashKDA is validated only on 148-SM B200 or 152-SM GB200; got " << sm_count
-      << " SMs";
+  const bool validated_device =
+      major == 10 && (minor == 0 || minor == 3) && (sm_count == 148 || sm_count == 152);
+  TVM_FFI_ICHECK(validated_device)
+      << "persistent FlashKDA is validated only on CC10.0/CC10.3 with 148/152 SMs; got CC" << major
+      << "." << minor << " with " << sm_count << " SMs";
   TVM_FFI_ICHECK(total_tasks > sm_count && worker_count > 0 && worker_count <= sm_count)
       << "persistent FlashKDA requires N * H > physical SM count and at most one worker per SM";
-  TVM_FFI_ICHECK(use_initial_state == 1 && initial_state.data_ptr() == final_state.data_ptr())
-      << "persistent FlashKDA requires one caller-owned in-place state tensor";
+  TVM_FFI_ICHECK(use_initial_state == 1 && store_final_state == 1)
+      << "persistent FlashKDA requires initial and final state tensors";
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
