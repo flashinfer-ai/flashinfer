@@ -121,7 +121,6 @@ def _wrap_tma(ret):
 
 
 from ..delta_rule_dsl.varlen_helper import (
-    chunks_for_len,
     varlen_chunk_idx,
     varlen_chunk_valid_len,
 )
@@ -854,7 +853,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         # ------------------------------------------------------------------
         # Launch
         # ------------------------------------------------------------------
-        grid_shape = (h_r * h_qv * max_cp_chunks_per_seq, num_seqs, 1)
+        num_sab_heads = h_r * h_qv
+        num_sab_heads_fdd = cute.fast_divmod_create_divisor_v2(num_sab_heads)
+        cp_chunk_len_fdd = cute.fast_divmod_create_divisor_v2(cp_chunk_len)
+        grid_shape = (num_sab_heads * max_cp_chunks_per_seq, num_seqs, 1)
 
         self.kernel(
             tiled_mma_qk,
@@ -875,8 +877,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             state_checkpoints,
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
-            cp_chunk_len,
-            h_r * h_qv,
+            cp_chunk_len_fdd,
+            num_sab_heads_fdd,
             scale,
             q_smem_layout_staged,
             k_smem_layout_staged,
@@ -908,21 +910,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         cu_seqlens: cute.Tensor,
         seq_idx: cutlass.Int32,
         flat_work_idx: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
-        cp_chunk_len: cutlass.Int32,
+        num_sab_heads_fdd: cute.FastDivmodDivisorV2,
+        cp_chunk_len_fdd: cute.FastDivmodDivisorV2,
     ):
-        head_idx = flat_work_idx % num_sab_heads
-        chunk_idx = flat_work_idx // num_sab_heads
+        chunk_idx, head_idx = divmod(flat_work_idx, num_sab_heads_fdd)
+        cp_chunk_len = cp_chunk_len_fdd.divisor
         seq_start = cutlass.Int32(cu_seqlens[seq_idx])
         seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
         seq_len = seq_end - seq_start
-        num_cp_chunks = chunks_for_len(seq_len, cp_chunk_len)
+        num_cp_chunks = (seq_len + cp_chunk_len - cutlass.Int32(1)) // cp_chunk_len_fdd
         valid_chunk_len = cutlass.Int32(0)
         if chunk_idx < num_cp_chunks:
             valid_chunk_len = varlen_chunk_valid_len(seq_len, chunk_idx, cp_chunk_len)
         seq_token_offset = chunk_idx * cp_chunk_len
         tok_offset = seq_start + seq_token_offset
-        cp_chunk_idx = varlen_chunk_idx(seq_idx, seq_start, chunk_idx, cp_chunk_len)
+        prefix_items = seq_idx
+        if seq_start < prefix_items:
+            prefix_items = seq_start
+        cp_chunk_idx = (
+            prefix_items + (seq_start - prefix_items) // cp_chunk_len_fdd + chunk_idx
+        )
         t_blocks_per_cp_chunk = cute.ceil_div(cp_chunk_len, self.b_t)
         t_block_start = varlen_chunk_idx(
             seq_idx, seq_start, chunk_idx * t_blocks_per_cp_chunk, self.b_t
@@ -971,8 +978,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         mStateCheckpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         checkpoint_every_n_tokens: cutlass.Int32,
-        cp_chunk_len: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
+        cp_chunk_len_fdd: cute.FastDivmodDivisorV2,
+        num_sab_heads_fdd: cute.FastDivmodDivisorV2,
         scale: cutlass.Float32,
         # SMEM staged layouts (needed to view shared_storage tensor buffers)
         q_smem_layout_staged: cute.ComposedLayout,
@@ -1021,7 +1028,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             t_block_start,
             seq_len,
             seq_token_offset,
-        ) = self.get_cp_work(cu_seqlens, bidy, bidx, num_sab_heads, cp_chunk_len)
+        ) = self.get_cp_work(
+            cu_seqlens, bidy, bidx, num_sab_heads_fdd, cp_chunk_len_fdd
+        )
         # ------------------------------------------------------------------
         # TMA descriptor GMEM workspace - one q/k/v/o descriptor set per CTA.
         # Slots: Q=0, K=1, V=2, T=3, O=4.
@@ -1932,19 +1941,55 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         cT = cute.make_identity_tensor((self.b_t, self.b_t))
         tTcT = thr_t_s2r.partition_D(cT)
         tTcT = thr_t_s2r.retile(tTcT)
-        for i in cutlass.range_constexpr(cute.size(tTrT)):
-            t, s = tTcT[i]
-            pred = s >= t
-            if is_final_block:
-                pred = pred and s < valid_tokens and t < valid_tokens
-            gamma = cutlass.Float32(0.0)
-            if pred:
-                gamma = cute.math.exp2(
-                    sCumsumlog[s, 0, gate_handle.index]
-                    - sCumsumlog[t, 0, gate_handle.index],
-                    fastmath=True,
+        tQKrScale = cute.make_rmem_tensor_like(tTR_cS, self.acc_dtype)
+        # The flattened copy fragment modes are (s2, t8, s8, s16, 1, 1).
+        # Reorder and group them by full-block matrix semantics: M=t8 and
+        # N=(s2, s8, s16), leaving the inert copy modes untouched.
+        mn_mode_order = [1, 0, 2, 3, 4, 5]
+        fragment_layout = cute.flatten(cute.make_layout(tTcT.shape))
+        mn_layout = cute.group_modes(
+            cute.select(fragment_layout, mode=mn_mode_order), 1, 4
+        )
+        mn_coord_layout = cute.group_modes(
+            cute.select(cute.flatten(tTcT.layout), mode=mn_mode_order), 1, 4
+        )
+        tTcT_mn = cute.make_tensor(tTcT.iterator, mn_coord_layout)
+        tTrT_mn = cute.make_tensor(tTrT.iterator, mn_layout)
+        tQKrScale_mn = cute.make_tensor(tQKrScale.iterator, mn_layout)
+
+        m_shape, n_shape = mn_layout.shape[:2]
+        tMLog = cute.make_rmem_tensor((cute.size(m_shape),), self.acc_dtype)
+        n0 = cute.idx2crd(0, n_shape)
+        for m in cutlass.range_constexpr(cute.size(tMLog)):
+            t, _ = tTcT_mn[m, n0, 0, 0]
+            tMLog[m] = sCumsumlog[t, 0, gate_handle.index]
+
+        tNLog = cute.make_rmem_tensor((cute.size(n_shape),), self.acc_dtype)
+        for n in cutlass.range_constexpr(cute.size(tNLog)):
+            n_coord = cute.idx2crd(n, n_shape)
+            _, s = tTcT_mn[0, n_coord, 0, 0]
+            tNLog[n] = sCumsumlog[s, 0, gate_handle.index]
+
+        for m in cutlass.range_constexpr(cute.size(m_shape)):
+            for n in cutlass.range_constexpr(cute.size(n_shape)):
+                n_coord = cute.idx2crd(n, n_shape)
+                coord = m, n_coord, 0, 0
+                t, s = tTcT_mn[coord]
+                valid = cutlass.Boolean(True)
+                if cutlass.const_expr(is_final_block):
+                    valid = s < valid_tokens and t < valid_tokens
+                gate_delta = tNLog[n] - tMLog[m]
+                t_gamma = cutlass.Float32(0.0)
+                qk_gamma = cutlass.Float32(0.0)
+                if valid:
+                    if s >= t:
+                        t_gamma = cute.math.exp2(gate_delta, fastmath=True)
+                    if t >= s:
+                        qk_gamma = cute.math.exp2(-gate_delta, fastmath=True)
+                tTrT_mn[coord] = self.io_dtype(
+                    -t_gamma * cutlass.Float32(tTrT_mn[coord])
                 )
-            tTrT[i] = self.io_dtype(-gamma * cutlass.Float32(tTrT[i]))
+                tQKrScale_mn[coord] = qk_gamma
 
         sAinv_t = cute.make_tensor(
             sAinv_mn.iterator,
@@ -1989,18 +2034,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 tQKrQK[None, 0, sub],
             )
             for i in cutlass.range(32):
-                s, t = tTR_cS[i, 0, sub]
-                pred = s >= t
-                if is_final_block:
-                    pred = pred and s < valid_tokens and t < valid_tokens
-                gamma = cutlass.Float32(0.0)
-                if pred:
-                    gamma = cute.math.exp2(
-                        sCumsumlog[s, 0, gate_handle.index]
-                        - sCumsumlog[t, 0, gate_handle.index],
-                        fastmath=True,
-                    )
-                tQKrQK_out[i, 0, sub] = self.io_dtype(tQKrQK[i, 0, sub] * gamma * scale)
+                tQKrQK_out[i, 0, sub] = self.io_dtype(
+                    tQKrQK[i, 0, sub] * tQKrScale[i] * scale
+                )
             cute.copy(
                 tiled_qk_r2s,
                 tQrQK[None, 0, sub],
@@ -2091,15 +2127,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         for chunk_in_pair in range(2):
             chunk_idx = pair_idx * 2 + chunk_in_pair
             valid_tokens = chunk_len - chunk_idx * self.b_t
-            pipeline_args = self.compute_group_0_cp(
-                tidx,
-                tmem_ptr,
-                scale,
-                mma_args,
-                smem_args,
-                pipeline_args,
-                (chunk_idx >= num_valid_chunks - 1, valid_tokens),
-            )
+            if chunk_idx >= num_valid_chunks - 1:
+                pipeline_args = self.compute_group_0_cp(
+                    tidx,
+                    tmem_ptr,
+                    scale,
+                    mma_args,
+                    smem_args,
+                    pipeline_args,
+                    (True, valid_tokens),
+                )
+            else:
+                pipeline_args = self.compute_group_0_cp(
+                    tidx,
+                    tmem_ptr,
+                    scale,
+                    mma_args,
+                    smem_args,
+                    pipeline_args,
+                    (False, valid_tokens),
+                )
         return pipeline_args
 
     @cute.jit
@@ -2388,6 +2435,12 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tRT_tCcState = thr_state_r2t.partition_S(cState)
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, mS_init.element_type)
+        state_g2r_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyG2ROp(),
+            mS_init.element_type,
+            num_bits_per_copy=128,
+            invariant=True,
+        )
 
         if cutlass.const_expr(mS_indices is not None):
             state_idx = mS_indices[batch_idx]
@@ -2401,10 +2454,21 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tGR_tCrState.shape[2]):
             # 1. Load S_init state_dtype GMEM -> state_dtype registers
-            cute.autovec_copy(
-                tGR_tCgState[None, 0, sub],
+            state_src = tGR_tCgState[None, 0, sub]
+            state_src_ptr = state_src.iterator
+            state_src_aligned = cute.make_tensor(
+                cute.make_ptr(
+                    state_src_ptr.dtype,
+                    state_src_ptr.toint(),
+                    state_src_ptr.memspace,
+                    assumed_align=16,
+                ),
+                state_src.layout,
+            )
+            cute.copy(
+                state_g2r_atom,
+                state_src_aligned,
                 tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
             if cutlass.const_expr(self.acc_dtype != mS_init.element_type):
                 tRT_tCrState[None, 0, sub].store(
