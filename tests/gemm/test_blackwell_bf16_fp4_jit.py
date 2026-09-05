@@ -37,8 +37,6 @@ def _integration_manifest(target: str) -> dict:
     for index, variant in enumerate(legacy["variants"]):
         component = variant["component"]
         ir_symbol = f"synthetic_ir_{component}"
-        if ir_symbol not in ir_symbols:
-            ir_symbols.append(ir_symbol)
         arg_plan_kind, prepared_abi, stage = (
             blackwell_jit._INTEGRATION_COMPONENT_METADATA[component]
         )
@@ -50,6 +48,8 @@ def _integration_manifest(target: str) -> dict:
         if component == "cute_warp_mma_m16_bf16":
             grid_mode = "flat_overflow"
             ir_symbol = blackwell_jit._INTEGRATION_M16_WINNER_IR_SYMBOL
+        if ir_symbol not in ir_symbols:
+            ir_symbols.append(ir_symbol)
         arg_plan = blackwell_jit._expected_integration_arg_plan(component)
         kernel = {
             "arg_plan": arg_plan,
