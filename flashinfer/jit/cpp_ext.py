@@ -194,7 +194,12 @@ def build_cuda_cflags(
     cuda_cflags: List[str] = []
     cc_env = os.environ.get("CC")
     if cc_env is not None:
-        cuda_cflags += ["-ccbin", cc_env]
+        # Quote so a host-compiler path containing spaces (e.g. a Windows
+        # "C:\Program Files\...\cl.exe") survives shell tokenization of the
+        # generated ninja command. Strip any quotes the user already supplied
+        # first so a pre-quoted value is not double-quoted. See #3515.
+        cc_env = cc_env.strip().strip("\"'")
+        cuda_cflags += ["-ccbin", f'"{cc_env}"']
     cuda_cflags += [
         "$common_cflags",
         "--compiler-options=-fPIC",
