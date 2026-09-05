@@ -38,11 +38,16 @@ from .sm120_mma import (
     MMA_N,
     SWAP_AB_INTERLEAVE,
     issue_m64n8k32_mxfp8,
+    issue_m64n8k32_mxfp8_packed_sfb,
     make_sm120_ldmatrix_atom,
     make_swapab_m64n8k128_tiled_mma,
     shift_fp4_fragment_for_mxf8f6f4,
 )
-from .sm120_ptx_helpers import clamp_gate_upper_f32, clamp_symmetric_f32
+from .sm120_ptx_helpers import (
+    clamp_gate_upper_f32,
+    clamp_symmetric_f32,
+    lds_b32_raw,
+)
 from .split_timestamp import (
     FIELD_FIRST_WORK,
     FIELD_FIRST_TILE_ID,
@@ -4592,6 +4597,13 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             tCrSFB = sm100_utils.partition_fragment_SFB(
                 sSFB[None, None, 0], thr_mma, tidx
             )
+            if cutlass.const_expr(self.mma_tiler[1] == 32):
+                # Four packed K128 scale words, one for each N8 output group.
+                # The runtime N32 slot is folded into the SMEM load address.
+                rSFBCompact = cute.make_rmem_tensor((16,), self.sf_dtype)
+                rSFBCompactI32 = cute.recast_tensor(
+                    rSFBCompact, cutlass.Int32
+                )
 
             atom_copy_ldmatrix_A = make_sm120_ldmatrix_atom(
                 self.a_dtype,
@@ -4881,11 +4893,33 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         tCsSFA_p_filtered[None, 0, 0],
                         tCrSFA_copy_view_filtered[None, 0, 0],
                     )
-                    cute.copy(
-                        smem_tiled_copy_SFB,
-                        tCsSFB_p_filtered[None, None, 0],
-                        tCrSFB_copy_view_filtered[None, 0, 0, None],
-                    )
+                    if cutlass.const_expr(self.mma_tiler[1] == 32):
+                        n32_tile_slot = (
+                            work_tile_info.tile_n_idx % cutlass.Int32(4)
+                        )
+                        for ng in cutlass.range_constexpr(0, 4):
+                            lane_scale_row = (
+                                n32_tile_slot * cutlass.Int32(32)
+                                + cutlass.Int32(ng * 8)
+                                + lane_idx // cutlass.Int32(4)
+                            )
+                            sfb_lane_byte_base = (
+                                (lane_scale_row % cutlass.Int32(32))
+                                * cutlass.Int32(16)
+                                + (lane_scale_row // cutlass.Int32(32))
+                                * cutlass.Int32(4)
+                            )
+                            rSFBCompactI32[ng] = lds_b32_raw(
+                                sSFB.iterator
+                                + sfb_lane_byte_base
+                                + handle_b.index * cutlass.Int32(512)
+                            )
+                    else:
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, 0, 0, None],
+                        )
                     tCrSFB_mma_lo = tCrSFB
                     tCrSFB_mma_hi = tCrSFB
                     sfb_tile_slot = cutlass.Int32(0)
@@ -4899,13 +4933,6 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         )
                         sfb_tile_slot = (
                             work_tile_info.tile_n_idx % cutlass.Int32(2)
-                        )
-                    elif cutlass.const_expr(self.mma_tiler[1] == 32):
-                        # Four N32 CTAs share one N128 SFB TMA tile. Keep slot
-                        # zero on the original fast path; only hot-expert tail
-                        # tiles use an explicit static sfb_n_group fallback.
-                        sfb_tile_slot = (
-                            work_tile_info.tile_n_idx % cutlass.Int32(4)
                         )
 
                     if trace_k_detail != cutlass.Int32(0):
@@ -4935,51 +4962,31 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 tCsSFA_p_filtered[None, 0, k_inner_next],
                                 tCrSFA_copy_view_filtered[None, 0, k_inner_next],
                             )
-                            cute.copy(
-                                smem_tiled_copy_SFB,
-                                tCsSFB_p_filtered[None, None, k_inner_next],
-                                tCrSFB_copy_view_filtered[
-                                    None, 0, k_inner_next, None
-                                ],
-                            )
+                            if cutlass.const_expr(self.mma_tiler[1] != 32):
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, k_inner_next],
+                                    tCrSFB_copy_view_filtered[
+                                        None, 0, k_inner_next, None
+                                    ],
+                                )
                         if cutlass.const_expr(self.mma_tiler[1] == 32):
-                            if sfb_tile_slot == cutlass.Int32(0):
-                                for ng in cutlass.range_constexpr(0, n_groups):
-                                    issue_m64n8k32_mxfp8(
-                                        tiled_mma,
-                                        accumulators[None, None, ng],
-                                        tCrA,
-                                        tCrB,
-                                        tCrSFA,
-                                        tCrSFB,
-                                        n_group=ng,
-                                        active_n_groups=n_groups,
-                                        sfa_m_group=0,
-                                        k_inner=k_inner_mma,
-                                        a_dtype=self.a_dtype,
-                                        b_dtype=self.b_dtype,
-                                        sf_dtype=self.sf_dtype,
-                                    )
-                            else:
-                                for sfb_slot in cutlass.range_constexpr(1, 4):
-                                    if sfb_tile_slot == cutlass.Int32(sfb_slot):
-                                        for ng in cutlass.range_constexpr(0, n_groups):
-                                            issue_m64n8k32_mxfp8(
-                                                tiled_mma,
-                                                accumulators[None, None, ng],
-                                                tCrA,
-                                                tCrB,
-                                                tCrSFA,
-                                                tCrSFB,
-                                                n_group=ng,
-                                                active_n_groups=n_groups,
-                                                sfb_n_group=sfb_slot * n_groups + ng,
-                                                sfa_m_group=0,
-                                                k_inner=k_inner_mma,
-                                                a_dtype=self.a_dtype,
-                                                b_dtype=self.b_dtype,
-                                                sf_dtype=self.sf_dtype,
-                                            )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                issue_m64n8k32_mxfp8_packed_sfb(
+                                    tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    rSFBCompactI32[ng],
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=k_inner_mma,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
                         else:
                             for ng in cutlass.range_constexpr(0, n_groups):
                                 if sfb_tile_slot == cutlass.Int32(1):
