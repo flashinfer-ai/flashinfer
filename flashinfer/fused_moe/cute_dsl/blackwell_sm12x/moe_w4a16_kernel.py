@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -9,14 +10,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
 from .moe_w4a16_compiler import (
-    KernelCompileSpec,
     clear_compile_cache,
-    compile as cached_compile,
 )
 from .moe_w4a16_fp4_helpers import (
     atomic_add_global_i32,
@@ -75,6 +73,7 @@ from .moe_w4a16_fp4_helpers import (
     warp_reduce,
 )
 from flashinfer.cute_dsl.utils import current_cuda_stream, make_ptr
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .moe_w4a16_route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
@@ -4942,10 +4941,19 @@ class W4A16TopKSumKernel:
     def __call__(
         self,
         fc2_ptr: cute.Pointer,
-        output_ptr: cute.Pointer,
+        output_anchor: cute.Tensor,
         active_m: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        # ``output`` travels as a shape-[1] DLTensor rather than a typed
+        # pointer: it is the only device-carrying param in the TVM-FFI
+        # signature, and the env-stream lookup anchors on it (raw pointers
+        # carry no device, and the builder raises at compile time without
+        # one -- see the direct-micro barrier notes in #4701). Only the
+        # base address is taken from the anchor; the full output buffer is
+        # addressed through the dynamically-shaped tensor rebuilt below, so
+        # the baked [1] shape never bounds a device-side access.
+        output_ptr = output_anchor.iterator
         fc2_flat = cute.make_tensor(
             fc2_ptr,
             layout=cute.make_layout(
@@ -4992,6 +5000,64 @@ _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+
+
+# ---------------------------------------------------------------------------
+# On-disk kernel cache
+#
+# The W4A16 kernels adopt the shared on-disk CuTe-DSL cache (#3874, #4029;
+# docs/design_docs/cute_dsl_kernel_cache.md) the same way the b12x MMA
+# kernels (#4331) and the direct-micro kernel (#4701) do: TVM-FFI compiles
+# are exported as ``.o`` and a fresh process JITLinks them instead of
+# re-running the MLIR pipeline. The in-process caches above stay as the
+# first lookup layer.
+#
+# Deliberately a *separate* module directory from ``b12x_moe`` and
+# ``b12x_moe_direct_micro``: a module's ``meta.json`` carries one
+# ``source_sha256`` for every kernel in its directory and a mismatch wipes
+# the whole directory, so sharing a module across adopters with different
+# source lists would make them alternately invalidate each other.
+_CUTE_DSL_MODULE = "b12x_moe_w4a16"
+
+
+def _w4a16_kernel_source_files() -> tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache.
+
+    Every module contributing device code to the W4A16 kernels: this file,
+    the shared W4A16 device helpers, and the CuTe-DSL utilities the host
+    entries are built from. The list is shared by all kernels of the
+    module; a change wipes and lazily rebuilds the whole module directory.
+    """
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from . import (
+        moe_w4a16_activations,
+        moe_w4a16_fp4_helpers,
+        moe_w4a16_route_pack,
+    )
+
+    return (
+        __file__,
+        moe_w4a16_activations.__file__,
+        moe_w4a16_fp4_helpers.__file__,
+        moe_w4a16_route_pack.__file__,
+        cute_dsl_utils.__file__,
+    )
+
+
+def _w4a16_disk_kernel_name(prefix: str, facts: str, cache_key: tuple) -> str:
+    """On-disk kernel name: readable facts plus a digest of the full cache key.
+
+    The kernel-name string is the sole per-kernel disk-cache key (the module
+    ``meta.json`` guards only arch / DSL version / source hashes), so the
+    name must be injective over every compile fact. The readable ``facts``
+    are for humans; injectivity is carried by the digest of ``cache_key`` --
+    the same key that already gates the in-process caches, so its coverage
+    of the codegen parameters is a pre-existing invariant rather than one
+    this naming layer introduces.
+    """
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:12]
+    return f"{prefix}_{facts}_{digest}"
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -5103,11 +5169,14 @@ def compile_w4a16_gemm(
         )
 
     compile_size_m = _fake_m_for_specialization(size_m)
-    compile_route_blocks = 1
-    compile_route_slots = compile_route_blocks * int(moe_block_size)
+    # Extent policy (see compile_w4a16_fused_moe): only m-independent tensors
+    # with real size contracts bake true extents; every m-, route- or
+    # scratch-capacity tensor bakes (1,) barrier-style, since extents are
+    # exact-checked by TVM-FFI but never bound a device-side access, and an
+    # extent varying with an unkeyed fact would poison artifact reuse.
     a_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_size_m * size_k,),
+        (1,),
         assumed_align=16,
     )
     b_fake = cute.runtime.make_fake_compact_tensor(
@@ -5117,7 +5186,7 @@ def compile_w4a16_gemm(
     )
     c_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_size_m * top_k * size_n,),
+        (1,),
         assumed_align=16,
     )
     scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -5139,12 +5208,12 @@ def compile_w4a16_gemm(
     )
     packed_routes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_slots,),
+        (1,),
         assumed_align=16,
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_blocks,),
+        (1,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -5154,49 +5223,56 @@ def compile_w4a16_gemm(
     )
     topk_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (compile_size_m * top_k,),
+        (1,),
         assumed_align=4,
     )
     c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (
-            max(
-                size_n * compile_route_slots,
-                4 * 256 * moe_block_size * 256,
-            ),
-        ),
+        (1,),
         assumed_align=16,
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256,),
+        (1,),
         assumed_align=16,
     )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        a_fake,
-        b_fake,
-        c_fake,
-        scales_fake,
-        global_scale_fake,
-        packed_routes_fake,
-        block_experts_fake,
-        route_count_fake,
-        topk_fake,
-        c_tmp_fake,
-        locks_fake,
-        Int32(compile_size_m),
-        Int32(1),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.gemm",
-            1,
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            a_fake,
+            b_fake,
+            c_fake,
+            scales_fake,
+            global_scale_fake,
+            packed_routes_fake,
+            block_experts_fake,
+            route_count_fake,
+            topk_fake,
+            c_tmp_fake,
+            locks_fake,
+            Int32(compile_size_m),
+            Int32(1),
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _w4a16_disk_kernel_name(
+            "gemm",
+            f"{element_dtype}_e{num_experts}_n{size_n}"
+            f"_k{size_k}_t{top_k}_b{moe_block_size}",
             cache_key,
         ),
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16GemmCompileResult(
         compiled=compiled,
@@ -5551,13 +5627,16 @@ def compile_w4a16_fused_moe(
             blocks_per_sm=kernel.blocks_per_sm,
         )
 
-    compile_size_m = _fake_m_for_specialization(size_m)
-    compile_routed_rows = int(compile_size_m) * int(top_k)
-    compile_route_blocks = compile_routed_rows if direct_topk_routes else 1
-    compile_route_slots = compile_route_blocks * int(moe_block_size)
-    packed_route_fake_elements = (
-        compile_routed_rows if direct_topk_routes else compile_route_slots
-    )
+    # Extent policy: TVM-FFI exact-checks every DLTensor's baked extent at
+    # call time, extents never bound a device-side access (the kernels
+    # index through stride math bounded by their scalar arguments), and
+    # the kernel cache key does not track the m bucket -- one artifact is
+    # shared across m for a given specialization. So only m-independent
+    # tensors with real size contracts (weights, scales, global scales,
+    # activation_amax) bake true extents; every m-, route- or
+    # scratch-capacity tensor bakes (1,) barrier-style (#4701), since any
+    # extent that varies with an unkeyed fact would poison cross-m reuse
+    # of the cached artifact.
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     if weight_layout == "modelopt":
         w13_fake = cute.runtime.make_fake_compact_tensor(
@@ -5595,17 +5674,17 @@ def compile_w4a16_fused_moe(
         )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_routed_rows * fc1_cols,),
+        (1,),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_routed_rows * intermediate_size,),
+        (1,),
         assumed_align=16,
     )
     fc2_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_routed_rows * hidden_size,),
+        (1,),
         assumed_align=16,
     )
     w13_scales_fake = cute.runtime.make_fake_compact_tensor(
@@ -5646,12 +5725,12 @@ def compile_w4a16_fused_moe(
     )
     packed_routes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (packed_route_fake_elements,),
+        (1,),
         assumed_align=16,
     )
     block_experts_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (compile_route_blocks,),
+        (1,),
         assumed_align=16,
     )
     route_count_fake = cute.runtime.make_fake_compact_tensor(
@@ -5665,65 +5744,82 @@ def compile_w4a16_fused_moe(
         assumed_align=4,
     )
     topk_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    # Pure scratch: the historical max(..., 4*256*mbs*256) extents were
+    # fiction (the real allocation follows packed_gemm_scratch_elements
+    # and is far smaller), and TVM-FFI exact-checks baked extents at
+    # call time. Bake (1,) barrier-style (#4701): the kernel reaches the
+    # full buffer through stride math bounded by its scalar arguments,
+    # so the extent never bounds an access.
     fc1_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (
-            max(
-                fc1_cols * compile_route_slots,
-                4 * 256 * moe_block_size * 256,
-            ),
-        ),
+        (1,),
         assumed_align=16,
     )
     fc2_c_tmp_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (
-            max(
-                hidden_size * compile_route_slots,
-                4 * 256 * moe_block_size * 256,
-            ),
-        ),
+        (1,),
         assumed_align=16,
     )
+    # Same fiction class as the c_tmp extents: 4*256+2 assumed a
+    # <=256-SM part, while the real workspace allocation follows
+    # sms*4+2 and is smaller on smaller parts. Bake (1,).
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256 + 2,),
+        (1,),
         assumed_align=16,
     )
 
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        a_fake,
-        w13_fake,
-        w2_fake,
-        fc1_fake,
-        activated_fake,
-        fc2_fake,
-        w13_scales_fake,
-        w2_scales_fake,
-        w13_global_fake,
-        w2_global_fake,
-        packed_routes_fake,
-        block_experts_fake,
-        route_count_fake,
-        activation_amax_fake,
-        0,
-        topk_fake,
-        fc1_c_tmp_fake,
-        fc2_c_tmp_fake,
-        locks_fake,
-        1,
-        1,
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.fused_moe",
+    # A fake stream + --enable-tvm-ffi so the compile can round-trip through
+    # the on-disk cache (see the topk-sum entry for the full rationale).
+    # OptLevel(3) is preserved as an option string: this is the
+    # performance-critical kernel and its opt level is an explicit choice.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            a_fake,
+            w13_fake,
+            w2_fake,
+            fc1_fake,
+            activated_fake,
+            fc2_fake,
+            w13_scales_fake,
+            w2_scales_fake,
+            w13_global_fake,
+            w2_global_fake,
+            packed_routes_fake,
+            block_experts_fake,
+            route_count_fake,
+            activation_amax_fake,
+            0,
+            topk_fake,
+            fc1_c_tmp_fake,
+            fc2_c_tmp_fake,
+            locks_fake,
             1,
+            1,
+            stream_fake,
+            options="--opt-level 3 --enable-tvm-ffi",
+        )
+
+    # The on-disk artifact name must be injective over every compile fact;
+    # ``cache_key`` carries the kernel's full ``__cache_key__`` (tiles,
+    # flags, swiglu scalars, row bucket), so the readable facts are suffixed
+    # with a digest of it.
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _w4a16_disk_kernel_name(
+            "fused",
+            f"{element_dtype}_e{num_experts}_t{top_k}"
+            f"_h{hidden_size}_i{intermediate_size}_b{moe_block_size}",
             cache_key,
         ),
-        dsl_compile_options=OptLevel(3),
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
@@ -5779,7 +5875,7 @@ def compile_w4a16_activation(
 ) -> W4A16ActivationCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     activation = normalize_moe_activation(activation)
-    is_gated = validate_activation(activation)
+    validate_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
         activation,
         swiglu_limit,
@@ -5804,32 +5900,57 @@ def compile_w4a16_activation(
     if cached is not None:
         return replace(cached, rows=rows)
 
-    w13_shards = 2 if is_gated else 1
-    compile_rows = _fake_m_for_specialization(rows)
+    # Extent policy (see compile_w4a16_fused_moe): the row bucket is not
+    # part of the cache key -- the in-process cache deliberately reuses one
+    # compiled kernel across rows via ``replace(cached, rows=rows)`` -- so
+    # the m-varying extents bake (1,) and one artifact serves every rows
+    # value. The kernel bounds all accesses by its ``active_rows`` scalar.
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_rows * w13_shards * intermediate_size,),
+        (1,),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_rows * intermediate_size,),
+        (1,),
         assumed_align=16,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        fc1_fake,
-        activated_fake,
-        Int32(compile_rows),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.activation",
-            1,
+
+    # TVM-FFI env-stream compile through the on-disk cache (see the topk-sum
+    # entry for the full rationale). fc1/activated are already DLTensor
+    # params, so they double as the env-stream anchors; their baked fake
+    # shapes never bound a device-side access (the kernel indexes by
+    # ``active_rows``), so launches pass views of the real buffers cut to
+    # the baked shapes.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            fc1_fake,
+            activated_fake,
+            Int32(1),
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    # The on-disk artifact name must be injective over every compile fact.
+    # ``cache_key`` also carries the swiglu scalars, fast-math and gating
+    # flags; the row bucket is deliberately excluded so one artifact can
+    # be reused across rows. The readable facts are suffixed with a digest
+    # of the full key.
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _w4a16_disk_kernel_name(
+            "activation",
+            f"{element_dtype}_i{intermediate_size}_{activation}",
             cache_key,
         ),
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16ActivationCompileResult(
         compiled=compiled,
@@ -5858,7 +5979,11 @@ def compile_w4a16_topk_sum(
         return cached
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    output_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    output_anchor_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        (1,),
+        assumed_align=16,
+    )
     kernel = W4A16TopKSumKernel(
         topk=topk,
         hidden_size=hidden_size,
@@ -5867,17 +5992,32 @@ def compile_w4a16_topk_sum(
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
-    compiled = cached_compile(
-        kernel,
-        fc2_fake,
-        output_fake,
-        1,
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.topk_sum",
+
+    # A fake stream rather than ``current_cuda_stream()``: a live stream
+    # handle baked into an exported ``.o`` is meaningless to the process
+    # that reloads it. ``--enable-tvm-ffi`` is mandatory, not a tuning
+    # choice: JitSpecCuteDsl exports with ``export_to_c()`` and reloads
+    # with ``load_module(..., enable_tvm_ffi=True)``, so a kernel compiled
+    # without it cannot round-trip through the disk cache.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            fc2_fake,
+            output_anchor_fake,
             1,
-            cache_key,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _w4a16_disk_kernel_name(
+            "topk_sum", f"{element_dtype}_t{topk}_h{hidden_size}", cache_key
         ),
+        compile_fn,
+        extra_key_files=_w4a16_kernel_source_files(),
     )
     result = W4A16TopKSumCompileResult(
         compiled=compiled,
@@ -5944,9 +6084,6 @@ def _w4a16_fused_moe_launch_flat(
     collect_activation_amax = bool(collect_activation_amax)
     if collect_activation_amax and activation_amax is None:
         raise ValueError("activation_amax is required for calibrated W4A16 launch")
-    activation_amax_arg = (
-        activation_amax.view(-1) if activation_amax is not None else w13_global_scale
-    )
     fused = compile_w4a16_fused_moe(
         size_m=size_m,
         hidden_size=hidden_size,
@@ -5976,36 +6113,65 @@ def _w4a16_fused_moe_launch_flat(
         # identical cache entry instead of silently recompiling with auto tiles.
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
     )
+    # TVM-FFI launch ABI (see compile_w4a16_fused_moe): pointer params travel
+    # as raw ``data_ptr()`` ints; exact-shape DLTensor params (weights,
+    # scales, global scales, a real activation_amax) pass full flat views --
+    # TVM-FFI's own shape check against the baked fake shapes is the loud
+    # assert for them; capacity-style DLTensor params are cut to the exact
+    # lengths the kernel was compiled against. There is no stream argument:
+    # the kernel compiled against a TVM-FFI env stream, which supplies the
+    # caller's current stream.
+    if stream_int != int(current_cuda_stream()):
+        raise ValueError(
+            "W4A16 fused MoE launch requires the current CUDA stream: the "
+            "TVM-FFI env-stream ABI cannot target another stream"
+        )
+
+    # TVM-FFI exact-checks every DLTensor's baked extent at call time, yet
+    # extents never bound a device-side access (stride math bounded by the
+    # scalar arguments; the pre-FFI launch passed buffers whose sizes bore
+    # no relation to the fakes). So each DLTensor view is cut to the exact
+    # baked extent: m-independent params (weights, scales, global scales,
+    # activation_amax) bake their real sizes and their cuts equal the full
+    # buffers; m-bucketed capacity params bake bucket-sized extents every
+    # in-bucket runtime buffer covers; pure scratch is baked (1,).
+    def _cut(buf: torch.Tensor, length: int, name: str) -> torch.Tensor:
+        flat = buf.view(-1)
+        if flat.numel() < length:
+            raise ValueError(
+                f"W4A16 fused MoE launch: {name} holds {flat.numel()} "
+                f"elements; the compiled specialization requires >= {length}"
+            )
+        return flat[:length]
+
+    amax_len = num_experts * 2
+    if activation_amax is not None:
+        activation_amax_arg = _cut(activation_amax, amax_len, "activation_amax")
+    else:
+        # const_expr-dead when amax collection is off; any F32 device buffer
+        # covers the baked (2 * num_experts) extent, so borrow the FC1 scratch.
+        activation_amax_arg = _cut(fc1_scratch, amax_len, "activation_amax stand-in")
+
     fused.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            a_input.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        w13_arg,
-        w2_arg,
-        fc1_out,
-        activated,
-        fc2_out,
-        w13_scale_i32,
-        w2_scale_i32,
-        w13_global_scale,
-        w2_global_scale,
-        packed_route_indices,
-        block_expert_ids,
-        packed_route_count,
+        a_input.data_ptr(),
+        w13_arg.view(-1),
+        w2_arg.view(-1),
+        _cut(fc1_out, 1, "fc1_out"),
+        _cut(activated, 1, "activated"),
+        _cut(fc2_out, 1, "fc2_out"),
+        w13_scale_i32.view(-1),
+        w2_scale_i32.view(-1),
+        w13_global_scale.view(-1),
+        w2_global_scale.view(-1),
+        _cut(packed_route_indices, 1, "packed_route_indices"),
+        _cut(block_expert_ids, 1, "block_expert_ids"),
+        _cut(packed_route_count, 1, "packed_route_count"),
         activation_amax_arg,
         int(layer_idx),
-        make_ptr(
-            cutlass.Float32,
-            topk_weights.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        fc1_scratch,
-        fc2_scratch,
-        workspace,
+        topk_weights.data_ptr(),
+        _cut(fc1_scratch, 1, "fc1_scratch"),
+        _cut(fc2_scratch, 1, "fc2_scratch"),
+        _cut(workspace, 1, "workspace locks"),
         m,
         _w4a16_fused_persistent_grid_x(
             fused=fused,
@@ -6016,7 +6182,6 @@ def _w4a16_fused_moe_launch_flat(
             direct_topk_routes=bool(direct_topk_routes),
             sms=sms,
         ),
-        cuda.CUstream(stream_int),
     )
 
 
@@ -6432,21 +6597,24 @@ def _w4a16_topk_sum_launch_flat(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
     )
+    # TVM-FFI ABI (see ``compile_w4a16_topk_sum``): the fc2 pointer travels
+    # as a raw ``data_ptr()`` int, ``output`` as a length-1 view of the real
+    # output buffer (the DLTensor anchor the env-stream lookup needs; the
+    # kernel takes only the base address from it), and there is no stream
+    # argument -- the kernel compiled against
+    # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
+    # the caller's current stream and the parameter is absent from the
+    # compiled signature. ``.view(-1)`` never copies (it raises instead), so
+    # the anchor is guaranteed to alias the real output storage.
+    if stream_int != int(current_cuda_stream()):
+        raise ValueError(
+            "W4A16 top-k sum launch requires the current CUDA stream: the "
+            "TVM-FFI env-stream ABI cannot target another stream"
+        )
     sum_kernel.compiled(
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            fc2_out.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            _cutlass_element_dtype(element_dtype),
-            output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
+        fc2_out.data_ptr(),
+        output.view(-1)[:1],
         m,
-        cuda.CUstream(stream_int),
     )
 
 
