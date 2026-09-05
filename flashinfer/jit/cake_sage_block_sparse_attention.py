@@ -103,12 +103,16 @@ def _source_path(relative_path: str) -> Path:
     try:
         suffix = relative.relative_to(prefix)
     except ValueError as exc:
-        raise RuntimeError(f"generated source escaped {_GENERATED_ROOT}: {relative_path}") from exc
+        raise RuntimeError(
+            f"generated source escaped {_GENERATED_ROOT}: {relative_path}"
+        ) from exc
     path = _get_csrc_dir() / suffix
     inventory = {item["path"]: item for item in _manifest()["files"]}
     receipt = inventory.get(relative.as_posix())
     if not isinstance(receipt, dict) or not path.is_file():
-        raise FileNotFoundError(f"generated source is absent from the manifest: {relative_path}")
+        raise FileNotFoundError(
+            f"generated source is absent from the manifest: {relative_path}"
+        )
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != receipt.get("sha256"):
         raise RuntimeError(f"generated source hash mismatch: {relative_path}")

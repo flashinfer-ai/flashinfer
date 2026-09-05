@@ -277,9 +277,7 @@ def _make_block_sizes(params, *, batch: int, heads: int, k_blocks: int, device):
         sizes[-1] = valid_last
         return sizes
     if mode == 2:
-        sizes = torch.full(
-            (batch, k_blocks), _BLOCK, dtype=torch.int32, device=device
-        )
+        sizes = torch.full((batch, k_blocks), _BLOCK, dtype=torch.int32, device=device)
         sizes[:, -1] = valid_last
         return sizes
     sizes = torch.full(
@@ -336,16 +334,12 @@ def _make_inputs(params, *, device):
             dtype=torch.float32,
             device=device,
         )
-        token_code = (
-            (torch.arange(padded_k, device=device) % 16).float() - 7.5
-        ) / 4.0
+        token_code = ((torch.arange(padded_k, device=device) % 16).float() - 7.5) / 4.0
         channel_code = (torch.arange(_HEAD_DIM, device=device).float() % 8) / 32.0
         logical_v = token_code.view(1, 1, 1, padded_k) + channel_code.view(
             1, 1, _HEAD_DIM, 1
         )
-        logical_v = logical_v.expand(
-            batch, heads, _HEAD_DIM, padded_k
-        ).contiguous()
+        logical_v = logical_v.expand(batch, heads, _HEAD_DIM, padded_k).contiguous()
         v_scale = torch.ones(
             (batch, heads, _HEAD_DIM), dtype=torch.float32, device=device
         )
@@ -419,12 +413,12 @@ def _make_inputs(params, *, device):
     query_coord = torch.arange(q_blocks, dtype=torch.int64, device=device).view(
         1, 1, q_blocks, 1
     )
-    slot = torch.arange(
-        selected_blocks, dtype=torch.int64, device=device
-    ).view(1, 1, 1, selected_blocks)
-    q2k = (
-        (batch_coord * 3 + head_coord * 5 + query_coord * 7 + slot) % k_blocks
-    ).to(torch.int32)
+    slot = torch.arange(selected_blocks, dtype=torch.int64, device=device).view(
+        1, 1, 1, selected_blocks
+    )
+    q2k = ((batch_coord * 3 + head_coord * 5 + query_coord * 7 + slot) % k_blocks).to(
+        torch.int32
+    )
     q2k = q2k.contiguous()
     q2k_nums = torch.full(
         (batch, heads, q_blocks),
@@ -539,17 +533,13 @@ def _reference(inputs):
                         * inputs["K_scale"][batch_idx, head_idx, block]
                     )
                     v_parts.append(
-                        v[batch_idx, head_idx]
-                        .index_select(1, tokens)
-                        .transpose(0, 1)
+                        v[batch_idx, head_idx].index_select(1, tokens).transpose(0, 1)
                     )
                 if not k_parts:
                     continue
                 key = torch.cat(k_parts, dim=0)
                 value = torch.cat(v_parts, dim=0)
-                scores = (
-                    q[batch_idx, head_idx, q_start:q_end] @ key.transpose(0, 1)
-                )
+                scores = q[batch_idx, head_idx, q_start:q_end] @ key.transpose(0, 1)
                 scores.mul_(float(inputs["softmax_scale"]))
                 result = torch.softmax(scores, dim=-1) @ value
                 output[batch_idx, head_idx, q_start:q_end] = result.to(output.dtype)
@@ -572,9 +562,7 @@ def test_cake_sage_block_sparse_attention(case):
     workspace_storage, workspace = _aligned_workspace(device=inputs["Q"].device)
     expected = _reference(inputs)
     softmax_scale = (
-        None
-        if params["softmax_scale"] == "default"
-        else float(params["softmax_scale"])
+        None if params["softmax_scale"] == "default" else float(params["softmax_scale"])
     )
 
     returned = bsa_attn_sm120_blk64_sage_fwd(
@@ -604,6 +592,4 @@ def test_cake_sage_block_sparse_attention(case):
     atol, rtol = (
         (3.0e-3, 0.0) if bool(params["position_sensitive"]) else (1.0e-2, 1.0e-2)
     )
-    torch.testing.assert_close(
-        returned.float(), expected.float(), atol=atol, rtol=rtol
-    )
+    torch.testing.assert_close(returned.float(), expected.float(), atol=atol, rtol=rtol)

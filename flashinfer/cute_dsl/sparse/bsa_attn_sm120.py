@@ -348,7 +348,10 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
 
     if backend != "cake":
         raise ValueError(f"unsupported SM120 Sage backend: {backend!r}")
-    if type(uniform_block_count) is not bool or type(contiguous_block_indices) is not bool:
+    if (
+        type(uniform_block_count) is not bool
+        or type(contiguous_block_indices) is not bool
+    ):
         raise TypeError("uniform_block_count and contiguous_block_indices must be bool")
     if contiguous_block_indices and not uniform_block_count:
         raise ValueError("contiguous_block_indices requires uniform_block_count")
@@ -377,14 +380,20 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
 
     capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
     if capability != (12, 0):
-        raise RuntimeError(f"SM120 Sage attention requires compute capability 12.0, got {capability}")
+        raise RuntimeError(
+            f"SM120 Sage attention requires compute capability 12.0, got {capability}"
+        )
     if q_int8.dtype != torch.int8 or k_int8.dtype != torch.int8:
         raise TypeError("q_int8 and k_int8 must use torch.int8")
     if v_fp8.dtype != torch.float8_e4m3fn:
         raise TypeError("v_fp8 must use torch.float8_e4m3fn")
     if out.dtype != torch.bfloat16:
         raise TypeError("out must use torch.bfloat16")
-    for name, tensor in (("q_scale", q_scale), ("k_scale", k_scale), ("v_scale", v_scale)):
+    for name, tensor in (
+        ("q_scale", q_scale),
+        ("k_scale", k_scale),
+        ("v_scale", v_scale),
+    ):
         if tensor.dtype != torch.float32:
             raise TypeError(f"{name} must use torch.float32")
     if tma_descriptor_workspace.dtype != torch.uint8:
@@ -397,7 +406,11 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
     batch, heads, seqlen_q, head_dim = (int(value) for value in q_int8.shape)
     if batch < 1 or heads < 1 or seqlen_q < 1 or head_dim != 128:
         raise ValueError("q_int8 must have positive B/H/Sq and head dimension 128")
-    if k_int8.ndim != 4 or tuple(k_int8.shape[:2]) != (batch, heads) or int(k_int8.shape[3]) != 128:
+    if (
+        k_int8.ndim != 4
+        or tuple(k_int8.shape[:2]) != (batch, heads)
+        or int(k_int8.shape[3]) != 128
+    ):
         raise ValueError("k_int8 must be BHSD MHA with head dimension 128")
     seqlen_k = int(k_int8.shape[2])
     if seqlen_k < 1:
@@ -415,7 +428,11 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         raise ValueError("k_scale has an invalid shape")
     if tuple(v_scale.shape) != (batch, heads, 128):
         raise ValueError("v_scale has an invalid shape")
-    if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (batch, heads, q_blocks):
+    if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
+        batch,
+        heads,
+        q_blocks,
+    ):
         raise ValueError("q2k_block_index must be [B,H,ceil(Sq/64),capacity]")
     if q2k_block_index.dtype != torch.int32 or int(q2k_block_index.shape[-1]) < 1:
         raise ValueError("q2k_block_index must be int32 with positive capacity")
@@ -498,7 +515,9 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
     try:
         args = [bindings[name] for _kind, name in record["arg_plan"]]
     except KeyError as exc:
-        raise RuntimeError(f"generated argument plan names an unknown binding: {exc}") from exc
+        raise RuntimeError(
+            f"generated argument plan names an unknown binding: {exc}"
+        ) from exc
     with tvm_ffi.use_torch_stream():
         getattr(module, str(record["ffi_entry"]))(*args)
     return out
