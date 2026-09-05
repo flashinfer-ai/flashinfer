@@ -290,6 +290,8 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         # ``enrich_work_tile_info`` to its existing fc2-only peek shape and
         # this pointer is not carried through MLIR.
         fc1_ready_counter_ptr: Optional[Pointer] = None,
+        token_cluster_size: int = 1,
+        fc1_done_per_cta_token: bool = False,
     ):
         super().__init__(workspace=None)
         if sf_vec_size <= 0:
@@ -303,6 +305,8 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         # passthrough.  Net IR is identical.
         self.fc2_spin_threshold = Int32(fc2_spin_threshold)
         self.fc1_ready_counter_ptr = fc1_ready_counter_ptr
+        self.token_cluster_size = token_cluster_size
+        self.fc1_done_per_cta_token = fc1_done_per_cta_token
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -347,6 +351,8 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         result.fc1_done_counter_ptr = new_ptr
         result.fc2_spin_threshold = new_threshold
         result.fc1_ready_counter_ptr = new_ready_ptr
+        result.token_cluster_size = self.token_cluster_size
+        result.fc1_done_per_cta_token = self.fc1_done_per_cta_token
         return result
 
     # --------------------------------------------------------------
@@ -360,49 +366,55 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
     ) -> SwapABSwigluFp4Fc12WorkTileInfo:
         """Pack a non-blocking counter peek into ``phase_and_peek``.
 
-        - fc2 tiles always peek the fc1->fc2 ``fc1_done_counter`` at
-          ``cumulative_token_block_count + tile_n_idx`` against
-          ``self.fc2_spin_threshold`` (work-tile-invariant const).
-        - fc1 tiles peek the dispatch->fc1 ``fc1_ready_counter`` at the
-          same slot index (``tile_n_idx``) but with ``valid_tokens_in_cta_tile`` as threshold
-          (per-tile dynamic).  This branch only emits when
-          ``self.fc1_ready_counter_ptr is not None`` (MegaMoE mode).
+        - fc2 tiles peek the fc1->fc2 counter at either the legacy cluster
+          token-block slot or, when requested, a CTA-token slot.
+        - fc1 tiles only use the legacy single-CTA-token peek. A multi-CTA
+          token cluster must wait for the complete cluster count in token_comm
+          because dispatch arrivals are not ordered by destination row.
         """
         # Invalid tiles keep (None_ | 0); do not index an arbitrary counter slot.
         is_valid = base_work.is_valid_tile
 
         new_phase_and_peek = base_work.phase_and_peek
         if is_valid:
-            # Same slot index for both phases -- fc1 release-add (dispatch
-            # pull) and fc2 release-add (fc1 epi) target the per-task-tile
-            # counter slot indexed by ``cumulative_token_block_count + tile_n_idx``.
-            counter_slot = (
-                base_work.cumulative_token_block_count + base_work.tile_n_idx
+            ready_counter_slot = (
+                base_work.cumulative_token_block_count
+                + base_work.tile_n_idx // Int32(self.token_cluster_size)
             )
+            done_counter_slot = ready_counter_slot
+            if cutlass.const_expr(self.fc1_done_per_cta_token):
+                done_counter_slot = (
+                    Int32(self.token_cluster_size)
+                    * base_work.cumulative_token_block_count
+                    + base_work.tile_n_idx
+                )
             is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
             is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
 
-            # MegaMoE-only: fc1 phase peek on fc1_ready_counter.  Threshold
-            # is dynamic (per-tile valid count) because dispatch does not
-            # pull padding tokens, so the counter's terminal value matches
-            # the tile's valid_tokens_in_cta_tile (cluster_tile_m for full
-            # tiles, less for an expert's last partial tile).
+            # MegaMoE-only: the single-token-CTA case can prove readiness from
+            # the CTA count. Multi-CTA token clusters defer to token_comm's
+            # full-cluster threshold instead of assuming ordered arrivals.
             if cutlass.const_expr(self.fc1_ready_counter_ptr is not None):
                 if is_fc1:
-                    counter_ptr = self.fc1_ready_counter_ptr + counter_slot
-                    peek_ready = spin_wait(
-                        counter_ptr,
-                        lambda v: v >= base_work.valid_tokens_in_cta_tile,
-                        peek_only=True,
-                    )
-                    peek_bit = Int32(0)
-                    if peek_ready:
-                        peek_bit = Int32(PeekReadyBit)
-                    new_phase_and_peek = base_work.phase_and_peek | peek_bit
+                    if cutlass.const_expr(self.token_cluster_size == 1):
+                        counter_ptr = (
+                            self.fc1_ready_counter_ptr + ready_counter_slot
+                        )
+                        peek_ready = spin_wait(
+                            counter_ptr,
+                            lambda v: v >= base_work.valid_tokens_in_cta_tile,
+                            peek_only=True,
+                        )
+                        peek_bit = Int32(0)
+                        if peek_ready:
+                            peek_bit = Int32(PeekReadyBit)
+                        new_phase_and_peek = (
+                            base_work.phase_and_peek | peek_bit
+                        )
 
             # fc2 tiles can skip the later TMA-B spin (existing path).
             if is_fc2:
-                counter_ptr = self.fc1_done_counter_ptr + counter_slot
+                counter_ptr = self.fc1_done_counter_ptr + done_counter_slot
                 # peek_only=True: single ld.cg + cmp, returns Boolean.
                 # ``self.fc2_spin_threshold`` was Int32-coerced in __init__.
                 peek_ready = spin_wait(
@@ -555,6 +567,7 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
         fc2_spin_threshold: Union[int, Int32],
         fc1_ready_counter_ptr: Optional[Pointer] = None,
         cluster_m: int = 1,
+        fc1_done_per_cta_token: bool = False,
     ):
         super().__init__(
             sf_vec_size=sf_vec_size,
@@ -563,6 +576,7 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
             fc1_ready_counter_ptr=fc1_ready_counter_ptr,
         )
         self.cluster_m = cluster_m
+        self.fc1_done_per_cta_token = fc1_done_per_cta_token
         GluMxFp8WorkTileInfo._cluster_m = cluster_m
 
     def __new_from_mlir_values__(
@@ -575,7 +589,9 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
         result.fc1_done_counter_ptr = base.fc1_done_counter_ptr
         result.fc2_spin_threshold = base.fc2_spin_threshold
         result.fc1_ready_counter_ptr = base.fc1_ready_counter_ptr
+        result.token_cluster_size = base.token_cluster_size
         result.cluster_m = self.cluster_m
+        result.fc1_done_per_cta_token = self.fc1_done_per_cta_token
         return result
 
     @cute.jit
@@ -627,6 +643,12 @@ class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
                 fc2_counter_slot = (
                     base_work.cumulative_token_block_count + base_work.fc1_counter_index
                 )
+                if cutlass.const_expr(self.fc1_done_per_cta_token):
+                    fc2_counter_slot = (
+                        Int32(self.cluster_m)
+                        * base_work.cumulative_token_block_count
+                        + base_work.tile_m_idx
+                    )
                 counter_ptr = self.fc1_done_counter_ptr + fc2_counter_slot
                 peek_ready = spin_wait(
                     counter_ptr,

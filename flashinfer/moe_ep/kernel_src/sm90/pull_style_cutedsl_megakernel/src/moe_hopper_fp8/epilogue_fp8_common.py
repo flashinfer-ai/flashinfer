@@ -13,7 +13,78 @@ from cutlass.cutlass_dsl import Int64
 
 from common.megamoe_constants import Log2E
 from common.moe_utils import fmax, fmin
+from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from src.token_comm import TokenSrcMetadata
+
+
+@cute.jit
+def advance_pipeline_state(state, iterations):
+    """Bulk-advance a pipeline state across one inactive task."""
+    if iterations < state.stages and (
+        state._index + iterations >= state.stages
+    ):
+        state._phase ^= 1
+    if iterations >= state.stages and (
+        ((state._index + iterations) // state.stages) % 2 == 1
+    ):
+        state._phase ^= 1
+    state._index = (state._index + iterations) % state.stages
+    state._count += iterations
+    return state
+
+
+@cute.jit
+def advance_skipped_task_state(
+    work_tile_info,
+    ab_consumer_state,
+    k_tile_cnt_fc1,
+    k_tile_cnt_fc2,
+):
+    """Skip one producer task without touching its full/empty barriers."""
+    k_tile_cnt = k_tile_cnt_fc1
+    if work_tile_info.phase != cutlass.Int32(BlockPhase.Linear1):
+        k_tile_cnt = k_tile_cnt_fc2
+    return advance_pipeline_state(ab_consumer_state, k_tile_cnt)
+
+
+@cute.jit
+def consume_initial_pingpong_work(
+    sched_consumer,
+    warpgroup_idx,
+    ab_consumer_state,
+    k_tile_cnt_fc1,
+    k_tile_cnt_fc2,
+):
+    work_tile_info = sched_consumer.consume_work()
+    if warpgroup_idx == cutlass.Int32(1):
+        if work_tile_info.is_valid_tile:
+            ab_consumer_state = advance_skipped_task_state(
+                work_tile_info,
+                ab_consumer_state,
+                k_tile_cnt_fc1,
+                k_tile_cnt_fc2,
+            )
+            work_tile_info = sched_consumer.consume_work()
+    return sched_consumer, work_tile_info, ab_consumer_state
+
+
+@cute.jit
+def consume_next_pingpong_work(
+    sched_consumer,
+    ab_consumer_state,
+    k_tile_cnt_fc1,
+    k_tile_cnt_fc2,
+):
+    work_tile_info = sched_consumer.consume_work()
+    if work_tile_info.is_valid_tile:
+        ab_consumer_state = advance_skipped_task_state(
+            work_tile_info,
+            ab_consumer_state,
+            k_tile_cnt_fc1,
+            k_tile_cnt_fc2,
+        )
+        work_tile_info = sched_consumer.consume_work()
+    return sched_consumer, work_tile_info, ab_consumer_state
 
 
 @cute.jit
@@ -103,6 +174,30 @@ def tma_store_fc1_output(
     if tile_has_valid:
         with cute.arch.elect_one():
             cute.copy(tma_atom_fc1_output, bSG_sC, bSG_g)
+
+
+@cute.jit
+def tma_store_fc2_output(
+    sD,
+    stage_idx,
+    tma_atom_fc2_output: cute.CopyAtom,
+    g_fc2_output_subtile_view: cute.Tensor,
+    valid_tokens,
+) -> None:
+    """Issue one WG-private BF16 FC2 TMA store for a non-empty token tile."""
+    sD_stage = cute.slice_(sD, (None, None, stage_idx))
+    g_fc2_output_2d = cute.slice_(g_fc2_output_subtile_view, (None, None, 0))
+    bSG_sD, bSG_g = cpasync.tma_partition(
+        tma_atom_fc2_output,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sD_stage, 0, 2),
+        cute.group_modes(g_fc2_output_2d, 0, 2),
+    )
+
+    if valid_tokens > cutlass.Int32(0):
+        with cute.arch.elect_one():
+            cute.copy(tma_atom_fc2_output, bSG_sD, bSG_g)
 
 
 @cute.jit

@@ -343,6 +343,26 @@ def red_add_release_sys_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def red_add_release_gpu_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
+    """``red.release.gpu.global.add.u64`` via raw int64 byte address.
+
+    Same fire-and-forget pattern as the ``.sys`` sibling, at device scope:
+    for rank-local publishes consumed by same-GPU acquire loads (a ``.sys``
+    release would drain outstanding NVLink stores on every call).
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), val.ir_value()],
+        "red.release.gpu.global.add.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
     """``red.relaxed.sys.global.add.u64`` via raw int64 byte address.
 
