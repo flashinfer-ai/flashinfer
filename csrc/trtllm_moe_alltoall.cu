@@ -649,8 +649,7 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),
       static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK),
-      get_stream(expertIds.device()),
-      enablePdl);
+      get_stream(expertIds.device()), enablePdl);
 
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)

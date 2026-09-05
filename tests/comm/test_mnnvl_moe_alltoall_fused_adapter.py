@@ -651,7 +651,10 @@ def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
     assert "template <PreloadKernelSlot Slot, typename KernelFn>" in launcher_source
     assert "int device_id;" in params_source
     assert "params.device_id = payload.device().device_id;" in adapter_source
-    assert "ffi::CUDADeviceGuard device_guard(payload.device().device_id);" in adapter_source
+    assert (
+        "ffi::CUDADeviceGuard device_guard(payload.device().device_id);"
+        in adapter_source
+    )
     assert "auto stream = get_stream(payload.device());" in adapter_source
     assert "CHECK_DEVICE(payload, workspace);" in adapter_source
     assert "KernelFn kernel_fn, int device_id" in launcher_source
@@ -1164,9 +1167,7 @@ def _run_public_mpi2_cycle():
                 payload_in_workspace=payload_in_workspace,
                 routes_by_rank=_TOPK6_ROUTES_BY_RANK,
                 num_experts=12,
-                mismatch_current_device=(
-                    not payload_in_workspace and repeat == 1
-                ),
+                mismatch_current_device=(not payload_in_workspace and repeat == 1),
             )
     _run_public_combine_round(
         topk8_collective,
