@@ -13,12 +13,17 @@ Two knob classes:
   * **correctness knobs** change a code path / output, so an autotuner must keep
     the value it validated against (``in_kernel_fc2_reduce``, ``token_back_mode``,
     ``non_ubulk_fc2_store``, ``load_balance_mode``, ``mma_tiler_mnk``,
-    ``cluster_shape_mnk``).  ``in_kernel_fc2_reduce`` additionally makes the
-    output accumulation order nondeterministic (validate with a tolerance);
-    :mod:`.autotune` sweeps it for NVFP4 because the sym-heap output serves
-    both modes;
+    ``cluster_shape_mnk``);
   * **perf knobs** do not change the output and are free to sweep for speed
     (``group_hint``, ``flag_batch``, ``epi_flag_batch``).
+
+``in_kernel_fc2_reduce`` additionally makes the output accumulation order
+nondeterministic, and the values it can take depend on the kernel:
+  * NVFP4 / MXFP8 its value is invisible to the caller, either value is allowed if the user specifies enable_in_kernel_fc2_reduce
+  * BF16 / mixed BF16xMXFP8 size their ``combine_output`` buffer from it, which also decides
+    whether the caller may take a workspace output view. The value must match the value of `enable_in_kernel_fc2_reduce` to ensure the expected behaviour.
+
+Other knobs are set from the usual flow: pinned dict, the knob cache, or :func:`default_knobs`.
 
 The shim configs differ slightly per dtype (NVFP4 uses ``token_back_mode``;
 MXFP8 uses the ``token_back_by_dispatch`` bool and has no ``non_ubulk_fc2_store``),
@@ -30,7 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # --- knob value-sets (mirror inference_solver._correctness_knobs / _perf_knobs) ---
 
@@ -74,8 +79,9 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
 # --- token-count heuristic: default perf/tile tactic per compile-time size ----
 # Keyed on the buffer's ``num_max_tokens`` (the kernel compiles once for that
 # size, so the tile/cluster/schedule are fixed at compile).  Sets only the
-# perf/tile knobs; ``in_kernel_fc2_reduce`` and ``combine_format`` stay owned by
-# the config / caller.
+# perf/tile knobs; ``in_kernel_fc2_reduce`` is left unset (opt in via the
+# session's permission plus an autotune sweep) and ``combine_format`` stays
+# owned by the caller.
 #
 # NVFP4 profiles from measured winners (online autotune, 4x GB200, 256 experts,
 # top-8, hidden 7168, inter 2048, 2026-07-14).  The dominant axis is
@@ -164,48 +170,138 @@ _BF16_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "static",
 }
 
+_BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 128, 128),
+    "transform_buffer": "tmem",
+    "accumulator_overlap": False,
+    "transform_k_tile": 128,
+    "cluster_shape_mnk": (2, 1, 1),
+    "flag_batch": 1,
+    "epi_flag_batch": (1, 1),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "static",
+}
 
-def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
-    """Default perf/tile knobs for a compile-time token count (buffer size).
 
-    NVFP4: four measured profiles keyed on token count -- <512 small-batch
-    latency (128-wide N tile, ``epi_warps``), 512..1023 mid
+def _nvfp4_default_knobs(
+    num_tokens: int, *, combine_dtype: str, enable_in_kernel_fc2_reduce: bool
+) -> Dict[str, Any]:
+    """Four measured profiles keyed on token count.
+
+    <512 small-batch latency (128-wide N tile, ``epi_warps``), 512..1023 mid
     (``reuse_dispatch_warps``), 1024..2047 mid-large (256-wide N tile,
     ``standalone_warps``), >=2048 large throughput (``flag_batch=8``,
     ``reuse_dispatch_warps``).  See the profile dicts above for measurement
     provenance.
 
-    ``dtype="mxfp8"`` -> two measured profiles: <2048 tokens
-    ``_MXFP8_TOKEN_KNOBS`` (epi_warps), >=2048 ``_MXFP8_LARGE_TOKEN_KNOBS``
-    (reuse_dispatch_warps, -14.5% at 2048 — re-derived 2026-07-15).  No
-    ``mma_tiler_mnk``: the MXFP8 kernel hard-requires
-    ``mma_tiler (M, N) = (256, 256)``.
+    Re-validated 2026-07-15 on the corrected K-major weight layout: the online
+    autotuner confirmed all four non-ikr defaults within run noise (64/512/1024
+    tokens: <=1.2%); the only wins were ikr candidates at >=2048 (-4..5%),
+    which stay OPT-IN because ikr makes the output accumulation order
+    nondeterministic (autotune keeps it when it measures fastest; leave
+    ``enable_in_kernel_fc2_reduce=False`` for bit-reproducibility).
+    """
+    if num_tokens < 512:
+        knobs = dict(_SMALL_TOKEN_KNOBS)
+    elif num_tokens < 1024:
+        knobs = dict(_MID_TOKEN_KNOBS)
+    elif num_tokens < 2048:
+        knobs = dict(_MID_LARGE_TOKEN_KNOBS)
+    else:
+        knobs = dict(_LARGE_TOKEN_KNOBS)
+    if combine_dtype != "bf16":
+        # The profiles pick the token-back mode freely, but a quantized combine
+        # wire is only wired for dispatch-warp token-back, and cannot carry ikr
+        # at all.
+        knobs["token_back_mode"] = "reuse_dispatch_warps"
+        enable_in_kernel_fc2_reduce = False
 
-    ``dtype="bf16"`` -> one validated fixed MMA/cluster geometry.
+    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    return knobs
 
-    NVFP4 profiles were re-validated 2026-07-15 on the corrected K-major
-    weight layout: the online autotuner confirmed all four non-ikr defaults
-    within run noise (64/512/1024 tokens: <=1.2%); the only wins were
-    ikr candidates at >=2048 (-4..5%), which stay OPT-IN because ikr makes
-    the output accumulation order nondeterministic (autotune keeps it when
-    it measures fastest; pin ``in_kernel_fc2_reduce=False`` for
-    bit-reproducibility).
+
+def _mxfp8_default_knobs(
+    num_tokens: int, *, enable_in_kernel_fc2_reduce: bool
+) -> Dict[str, Any]:
+    """Two measured profiles.
+
+    <2048 tokens ``_MXFP8_TOKEN_KNOBS`` (epi_warps), >=2048
+    ``_MXFP8_LARGE_TOKEN_KNOBS`` (reuse_dispatch_warps, -14.5% at 2048 —
+    re-derived 2026-07-15).  No ``mma_tiler_mnk``: the MXFP8 kernel
+    hard-requires ``mma_tiler (M, N) = (256, 256)``.
+    """
+    knobs = dict(_MXFP8_LARGE_TOKEN_KNOBS if num_tokens >= 2048 else _MXFP8_TOKEN_KNOBS)
+    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    if enable_in_kernel_fc2_reduce:
+        knobs["token_back_mode"] = "epi_warps"
+    return knobs
+
+
+def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+    """One validated fixed MMA/cluster geometry."""
+    knobs = dict(_BF16_TOKEN_KNOBS)
+    # Match the user's requested IKR mode
+    knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    if enable_in_kernel_fc2_reduce:
+        # IKR requires reuse dispatch warps
+        knobs["token_back_mode"] = "reuse_dispatch_warps"
+    return knobs
+
+
+# TODO: Actually implement some heuristics
+def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+    """The default mixed implementation tuple (``is_valid_bf16_mxfp8``)."""
+    knobs = dict(_BF16_MXFP8_TOKEN_KNOBS)
+    # Match the user's requested IKR mode
+    knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
+    return knobs
+
+
+def default_knobs(
+    num_tokens: int,
+    *,
+    dtype: str = "nvfp4",
+    combine_dtype: str = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
+) -> Dict[str, Any]:
+    """Default perf/tile knobs for a compile-time token count (buffer size).
+
+    Dispatches to the per-dtype pickers above, which carry the measurement
+    provenance.  ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` are
+    session axes the profile is made valid against, so the result is always
+    directly applicable to that session.  On NVFP4/MXFP8 permitting ikr also
+    selects it; BF16 and mixed own ikr on the session, so there the profile
+    restates the flag's value and constrains the token-back carrier to match
+    it.  Only NVFP4 has quantized combine.
 
     Returns a fresh dict each call.
     """
     if dtype == "bf16":
-        return dict(_BF16_TOKEN_KNOBS)
+        return _bf16_default_knobs(
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
+    if dtype == "bf16_mxfp8":
+        return _bf16_mxfp8_default_knobs(
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
     if dtype == "mxfp8":
-        if num_tokens >= 2048:
-            return dict(_MXFP8_LARGE_TOKEN_KNOBS)
-        return dict(_MXFP8_TOKEN_KNOBS)
-    if num_tokens < 512:
-        return dict(_SMALL_TOKEN_KNOBS)
-    if num_tokens < 1024:
-        return dict(_MID_TOKEN_KNOBS)
-    if num_tokens < 2048:
-        return dict(_MID_LARGE_TOKEN_KNOBS)
-    return dict(_LARGE_TOKEN_KNOBS)
+        return _mxfp8_default_knobs(
+            num_tokens, enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
+    if dtype == "nvfp4":
+        return _nvfp4_default_knobs(
+            num_tokens,
+            combine_dtype=combine_dtype,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        )
+    # Never fall through to the NVFP4 ladder: callers key on element kinds
+    # (``mxfp8_e4m3``, ``bf16_mxfp8_e4m3``, ...) and must map them first.
+    raise ValueError(
+        f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
+        "'bf16', or 'bf16_mxfp8'."
+    )
 
 
 def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
@@ -248,6 +344,14 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
         knobs.get("mma_tiler_mnk", (256, 256, 64)) == (256, 256, 64)
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
+        and knobs.get("force_static_sched", True)
+        and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
+        and knobs.get("token_back_mode", "epi_warps")
+        in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+        and not (
+            knobs.get("in_kernel_fc2_reduce", False)
+            and knobs.get("token_back_mode", "epi_warps") == "epi_warps"
+        )
         and is_valid(
             {
                 **knobs,
@@ -255,6 +359,87 @@ def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
                 "cluster_shape_mnk": (2, 1, 1),
             }
         )
+    )
+
+
+def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
+    """Validate the implementation tuples accepted by mixed MXFP8/BF16 MegaMoE."""
+
+    from ..src.moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
+        Sm100SwapABMxfp8Bf16Fc12Kernel,
+    )
+
+    _BF16_MXFP8_IMPLS = Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs
+
+    impl = (
+        knobs.get("mma_tiler_mnk", (256, 128, 128)),
+        knobs.get("transform_buffer", "tmem"),
+        knobs.get("accumulator_overlap", False),
+        knobs.get("transform_k_tile", 128),
+    )
+    return (
+        impl in _BF16_MXFP8_IMPLS
+        and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
+        and knobs.get("use_2cta_instrs", True)
+        and knobs.get("token_back_mode", "epi_warps")
+        in ("epi_warps", "reuse_dispatch_warps")
+        and knobs.get("clc_bundle_size") is None
+        and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
+    )
+
+
+def _effective_knobs(config: Any, knobs: Dict[str, Any]) -> Dict[str, Any]:
+    """``knobs`` merged onto ``config``'s values -- the post-``with_knobs`` state."""
+    current = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+    return {**current, **knobs}
+
+
+def _ikr_knob_agrees_with_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Check if the knobs dict conflicts with the ikr setting in the config."""
+    return (
+        knobs.get("in_kernel_fc2_reduce", config.in_kernel_fc2_reduce)
+        == config.in_kernel_fc2_reduce
+    )
+
+
+def describe_invalid_knobs(
+    config: Any,
+    knobs: Dict[str, Any],
+    predicate: Callable[[Any, Dict[str, Any]], bool],
+) -> str:
+    """Name what makes ``knobs`` unusable for ``config`` (error / log text).
+
+    Probes each entry on its own so an individually-illegal knob is named by
+    value; knobs that are legal alone and illegal together say so instead.
+    """
+    reasons: List[str] = []
+    if not _ikr_knob_agrees_with_config(config, knobs):
+        reasons.append(
+            f"in_kernel_fc2_reduce={knobs['in_kernel_fc2_reduce']!r} contradicts the "
+            f"provided user config; BF16 and BF16xMXFP8 supports_output_view depends on this setting"
+        )
+    if not predicate(config, {}):
+        reasons.append("the session config is itself outside the supported knob space")
+    else:
+        for key, value in knobs.items():
+            if key != "in_kernel_fc2_reduce" and not predicate(config, {key: value}):
+                reasons.append(f"{key}={value!r} is unsupported")
+    if not reasons:
+        reasons.append("the combination is unsupported (each knob is legal alone)")
+    return "; ".join(reasons)
+
+
+def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate BF16 knobs against the requested configuration."""
+    return _ikr_knob_agrees_with_config(config, knobs) and is_valid_bf16(
+        _effective_knobs(config, knobs)
+    )
+
+
+def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate mixed BF16/MXFP8 knobs against a session's IKR setting."""
+    return _ikr_knob_agrees_with_config(config, knobs) and is_valid_bf16_mxfp8(
+        _effective_knobs(config, knobs)
     )
 
 
@@ -310,8 +495,12 @@ __all__ = [
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
     "default_knobs",
+    "describe_invalid_knobs",
     "is_valid",
     "is_valid_bf16",
+    "is_valid_bf16_for_config",
+    "is_valid_bf16_mxfp8",
+    "is_valid_bf16_mxfp8_for_config",
     "iter_candidates",
     "with_knobs",
 ]
