@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from build_utils import get_git_version
+from build_utils import get_cuda_tile_compile_dependency_requirements, get_git_version
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
@@ -813,13 +813,7 @@ def _install_cuda_tile_compile_deps() -> None:
     first time the user calls a cuTile kernel — a better failure mode than
     aborting the install entirely.
     """
-    wheels = [
-        "nvidia-cuda-nvcc<13.4,>=13.2",
-        "nvidia-cuda-tileiras<13.4,>=13.2",
-        "nvidia-nvvm<13.4,>=13.2",
-        "nvidia-nvjitlink<14,>=13.3",
-        "nvidia-cuda-crt<13.4,>=13.2",
-    ]
+    wheels = get_cuda_tile_compile_dependency_requirements()
 
     if _compile_deps_installed(wheels):
         print("[BUILD] cuda-tile compile deps already installed; skipping", flush=True)

@@ -37,6 +37,8 @@ def _uses_trace_decorator(node: ast.AST) -> bool:
             "id",
             getattr(decorator.func, "attr", None),
         )
+        # Literal match on purpose: @flashinfer_experimental_api(trace=...) is
+        # excluded so experimental APIs never enter the stable inventory.
         if name == "flashinfer_api" and any(
             keyword.arg == "trace" for keyword in decorator.keywords
         ):
@@ -47,7 +49,10 @@ def _uses_trace_decorator(node: ast.AST) -> bool:
 def _registration_modules_from_source() -> set[str]:
     package_root = Path(__file__).parents[2] / "flashinfer"
     modules: set[str] = set()
+    experimental_root = package_root / "experimental"
     for path in package_root.rglob("*.py"):
+        if experimental_root in path.parents:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         if not any(_uses_trace_decorator(node) for node in ast.walk(tree)):
             continue

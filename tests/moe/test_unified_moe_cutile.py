@@ -15,6 +15,10 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Runner,
     ExecutionConfig,
     ExpertConfig,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -22,20 +26,104 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU,
     ReLU2,
     RoutingConfig,
+    SiLU,
+    SiTU,
     SwiGLU,
+    SwiGLUStep,
 )
 from flashinfer.fused_moe.runners import _validate_cutile_int32_routing
 from flashinfer.tllm_enums import ActivationType
 
-from .utils import compute_reference_moe
+from .utils import compute_reference_activation, compute_reference_moe
 
 
 # (num_experts, top_k, hidden_size, intermediate_size) from Qwen3.6-35B-A3B
 # (SwiGLU) and NVIDIA-Nemotron-3.5-Lightning-30B-A3B (ReLU2), respectively.
 _QWEN_MOE_SHAPE = (256, 8, 2048, 512)
 _NEMOTRON_MOE_SHAPE = (128, 6, 2688, 1856)
+
+_CUTILE_ACTIVATIONS = (
+    SwiGLU(),
+    SwiGLUStep(),
+    GeGLU(),
+    GeGLUTanh(),
+    SiTU(),
+    ReLU2(),
+    Identity(),
+    GELU(),
+    ReLU(),
+    SiLU(),
+)
+
+
+def test_cutile_activation_capabilities_and_scalar_lowering():
+    from flashinfer.fused_moe.cutile.activation import _activation_kernel_args
+
+    expected_classes = {type(activation) for activation in _CUTILE_ACTIVATIONS}
+    assert set(CuTileBf16Runner.supported_activation_classes) == expected_classes
+    assert set(CuTileNvfp4Runner.supported_activation_classes) == expected_classes
+    assert _activation_kernel_args(SwiGLU(alpha=1.7, beta=0.25, limit=6.0)) == (
+        int(ActivationType.Swiglu),
+        1.7,
+        0.25,
+        6.0,
+    )
+    assert _activation_kernel_args(SwiGLUStep(limit=5.0)) == (
+        int(ActivationType.SwigluStep),
+        5.0,
+        0.0,
+        0.0,
+    )
+    assert _activation_kernel_args(
+        SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=4.0)
+    ) == (int(ActivationType.Situ), 2.0, 0.0, 4.0)
+
+
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(alpha=1.7, beta=0.25, limit=6.0), GELU())
+)
+def test_batched_reference_matches_per_expert_reference(activation):
+    torch.manual_seed(0)
+    num_tokens, num_experts, top_k = 5, 4, 3
+    hidden_size, intermediate_size = 8, 6
+    hidden_states = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
+    w1 = torch.randn(
+        num_experts,
+        intermediate_size * (2 if activation.is_gated else 1),
+        hidden_size,
+        dtype=torch.bfloat16,
+    )
+    w2 = torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1, 3], [1, 2, 3], [0, 1, 2], [1, 2, 3], [0, 2, 3]],
+        dtype=torch.int32,
+    )
+    topk_weights = torch.rand(num_tokens, top_k)
+    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+
+    expected = torch.zeros(num_tokens, hidden_size, dtype=torch.float32)
+    for expert_id in torch.unique(topk_ids).tolist():
+        token_ids, slots = torch.where(topk_ids == expert_id)
+        gemm1 = (hidden_states[token_ids].float() @ w1[expert_id].float().T).to(
+            torch.bfloat16
+        )
+        intermediate = compute_reference_activation(
+            gemm1, activation, intermediate_size
+        )
+        expert_output = (intermediate @ w2[expert_id].T).float()
+        expected.index_add_(
+            0,
+            token_ids,
+            expert_output * topk_weights[token_ids, slots, None],
+        )
+
+    actual = compute_reference_moe(
+        hidden_states, topk_ids, topk_weights, w1, w2, activation
+    )
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
 
 
 def test_cutile_rejects_int64_routing_ranges():
@@ -159,6 +247,40 @@ def _force_cutile_int64(monkeypatch):
 
 @cutile_bf16_required
 @pytest.mark.parametrize(
+    "activation",
+    _CUTILE_ACTIVATIONS
+    + (
+        SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
+        SwiGLUStep(limit=5.0),
+        SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=4.0),
+    ),
+    ids=repr,
+)
+def test_cutile_activation_matches_torch(activation):
+    from flashinfer.fused_moe.cutile.activation import launch_activation
+
+    rows, intermediate_size = 3, 257
+    input_size = intermediate_size * (2 if activation.is_gated else 1)
+    canonical = torch.linspace(
+        -8.0,
+        8.0,
+        rows * input_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(rows, input_size)
+    kernel_input = canonical
+    if activation.is_gated:
+        up, gate = canonical.split(intermediate_size, dim=-1)
+        kernel_input = torch.cat((gate, up), dim=-1)
+    actual = torch.empty(rows, intermediate_size, dtype=torch.bfloat16, device="cuda")
+
+    launch_activation(kernel_input, actual, activation)
+    expected = compute_reference_activation(canonical, activation, intermediate_size)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
     ("override", "error"),
     (
         (
@@ -277,6 +399,26 @@ def test_cutile_workspace_covers_all_permute_shapes_in_bucket(
     (
         pytest.param(SwiGLU(), 1, 2, 1, 64, 96, id="decode"),
         pytest.param(ReLU2(), 7, 3, 2, 96, 160, id="non-power-of-two-experts"),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
+            5,
+            4,
+            2,
+            64,
+            64,
+            id="swiglu-parameters",
+        ),
+        pytest.param(GeGLU(), 5, 4, 2, 64, 64, id="geglu"),
+        pytest.param(
+            SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=4.0),
+            5,
+            4,
+            2,
+            64,
+            64,
+            id="situ-optional-parameters",
+        ),
+        pytest.param(GELU(), 5, 4, 2, 64, 64, id="gelu"),
         pytest.param(SwiGLU(), 33, 8, 4, 256, 128, id="top-k-4"),
         pytest.param(
             SwiGLU(),
@@ -364,7 +506,7 @@ def test_cutile_bf16_runner_matches_reference(
         topk_weights,
         canonical_w1,
         canonical_w2,
-        activation.type,
+        activation,
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-1)
@@ -483,7 +625,7 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
         routing_weights,
         canonical_w1,
         canonical_w2,
-        activation.type,
+        activation,
     )
     torch.testing.assert_close(output, expected, rtol=3e-2, atol=2e-1)
 
@@ -541,7 +683,7 @@ def test_cutile_bf16_runs_through_unified_layer(activation):
         routing_weights,
         canonical_w1,
         canonical_w2,
-        activation.type,
+        activation,
     )
 
     assert layer.winner_backend == "cutile_bf16"
@@ -708,9 +850,19 @@ cutile_nvfp4_required = pytest.mark.skipif(
     (
         (SwiGLU(), 128, False),
         (ReLU2(), 128, True),
-        (SwiGLU(), 768, True),
+        (SwiGLUStep(limit=5.0), 128, False),
+        (GeGLU(), 128, True),
+        (GeGLUTanh(), 128, False),
+        (SiTU(), 128, True),
+        (SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=4.0), 128, False),
+        (Identity(), 128, True),
+        (GELU(), 128, False),
+        (ReLU(), 128, True),
+        (SiLU(), 128, False),
+        (SwiGLU(alpha=1.7, beta=0.25, limit=6.0), 768, True),
         (ReLU2(), 768, False),
     ),
+    ids=lambda case: repr(case) if isinstance(case, ActivationConfig) else None,
 )
 def test_cutile_fused_activation_quantize_matches_unfused(
     activation, intermediate_size, scale_row_major
@@ -742,7 +894,7 @@ def test_cutile_fused_activation_quantize_matches_unfused(
     expected_scale.view(torch.uint8).fill_(0xA5)
     actual_scale.view(torch.uint8).copy_(expected_scale.view(torch.uint8))
 
-    activation_kernels.launch_activation(x, activation_out, activation.type)
+    activation_kernels.launch_activation(x, activation_out, activation)
     fp4._quantize(
         activation_out,
         expected_q,
@@ -753,7 +905,7 @@ def test_cutile_fused_activation_quantize_matches_unfused(
         x,
         actual_q,
         actual_scale,
-        activation.type,
+        activation,
         scale_row_major=scale_row_major,
     )
     torch.cuda.synchronize()
@@ -849,7 +1001,7 @@ def _make_nvfp4_case(
         routing_weights,
         w1_dequant,
         w2_dequant,
-        activation.type,
+        activation,
     )
     return config, activations, weights, expected
 
@@ -889,6 +1041,26 @@ def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch
             128,
             id="bucketed-small-gated-activation",
         ),
+        pytest.param(
+            SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
+            4,
+            4,
+            2,
+            128,
+            128,
+            id="swiglu-parameters",
+        ),
+        pytest.param(GeGLU(), 4, 4, 2, 128, 128, id="geglu"),
+        pytest.param(
+            SiTU(gate_scale=2.0, linear_scale=None, clamp_limit=4.0),
+            4,
+            4,
+            2,
+            128,
+            128,
+            id="situ",
+        ),
+        pytest.param(GELU(), 4, 4, 2, 128, 128, id="gelu"),
         pytest.param(SwiGLU(), 1, *_QWEN_MOE_SHAPE, id="qwen-tokens-1"),
         pytest.param(SwiGLU(), 128, *_QWEN_MOE_SHAPE, id="qwen-tokens-128"),
         pytest.param(ReLU2(), 1, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-1"),
@@ -1041,7 +1213,7 @@ def test_cutile_nvfp4_supports_dimensions_divisible_by_64(activation, fuse_gemm1
         routing_weights,
         reference_w1,
         w2_dequant,
-        activation.type,
+        activation,
     )
     if fuse_gemm1:
         unfused = runner.forward(
@@ -1133,7 +1305,7 @@ def test_cutile_nvfp4_sorted_io_matches_reference(monkeypatch):
         routing_weights,
         w1_dequant,
         w2_dequant,
-        ActivationType.Relu2,
+        ReLU2(),
     )
     torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
     torch.testing.assert_close(fused, expected, rtol=0.25, atol=1.0)

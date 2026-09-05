@@ -34,11 +34,17 @@ import cuda.tile as ct
 import torch
 
 from ...cutile.cutile_common import cached_replace_hints
-from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import _apply_activation, _validate_activation, launch_activation
+from ..api import ActivationConfig
+from .activation import (
+    _activation_kernel_args,
+    _apply_ungated_activation,
+    _validate_activation,
+    launch_activation,
+)
 from .indexing import needs_int64_indexing
 
+ConstFloat: TypeAlias = ct.Constant[float]
 ConstInt: TypeAlias = ct.Constant[int]
 ConstBool: TypeAlias = ct.Constant[bool]
 
@@ -498,6 +504,9 @@ def _grouped_gemm_bf16_impl(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
     USE_INT64: ConstBool,
 ):
     initial_m_block = ct.bid(0)
@@ -553,8 +562,12 @@ def _grouped_gemm_bf16_impl(
             # fused and unfused paths have the same precision boundary.
             values = ct.astype(accumulator, OUT.dtype)
             if ACTIVATION_TYPE != _NO_ACTIVATION:
-                values = _apply_activation(
-                    ct.astype(values, ct.float32), ACTIVATION_TYPE
+                values = _apply_ungated_activation(
+                    ct.astype(values, ct.float32),
+                    ACTIVATION_TYPE,
+                    ACTIVATION_PARAM1,
+                    ACTIVATION_PARAM2,
+                    ACTIVATION_PARAM3,
                 )
             ct.scatter(
                 OUT,
@@ -582,6 +595,9 @@ def _grouped_gemm_bf16(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
 ):
     _grouped_gemm_bf16_impl(
         X,
@@ -597,6 +613,9 @@ def _grouped_gemm_bf16(
         TILE_N,
         TILE_K,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
         False,
     )
 
@@ -616,6 +635,9 @@ def _grouped_gemm_bf16_i64(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
 ):
     _grouped_gemm_bf16_impl(
         X,
@@ -631,6 +653,9 @@ def _grouped_gemm_bf16_i64(
         TILE_N,
         TILE_K,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
         True,
     )
 
@@ -852,10 +877,10 @@ def _grouped_gemm(
     top_k: int,
     block_size: int,
     config: GemmConfig,
-    activation_type: ActivationType | None = None,
+    activation: ActivationConfig | None = None,
 ) -> None:
-    if activation_type is not None:
-        activation_type = _validate_activation(activation_type)
+    if activation is not None:
+        activation = _validate_activation(activation)
     num_assignment_rows = output.shape[0]
     n = output.shape[1]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
@@ -883,10 +908,10 @@ def _grouped_gemm(
             block_size,
             config.tile_n,
             config.tile_k,
-            (
-                _NO_ACTIVATION
-                if activation_type is None
-                else int(ActivationType(activation_type))
+            *(
+                (_NO_ACTIVATION, 0.0, 0.0, 0.0)
+                if activation is None
+                else _activation_kernel_args(activation)
             ),
         ),
     )
@@ -901,7 +926,7 @@ def run_moe(
     output: torch.Tensor,
     workspace: Workspace,
     *,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     block_size: int,
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
@@ -916,7 +941,8 @@ def run_moe(
         topk_ids, w1.shape[0], block_size, workspace
     )
     activation_out = workspace.activation_out[:num_assignments]
-    if activation_type.is_gated:
+    activation = _validate_activation(activation)
+    if activation.is_gated:
         gemm1_out = workspace.gemm1_out[:num_assignments]
         _grouped_gemm(
             hidden_states,
@@ -929,7 +955,7 @@ def run_moe(
             block_size=block_size,
             config=gemm1_config,
         )
-        launch_activation(gemm1_out, activation_out, activation_type)
+        launch_activation(gemm1_out, activation_out, activation)
     else:
         _grouped_gemm(
             hidden_states,
@@ -941,7 +967,7 @@ def run_moe(
             top_k=top_k,
             block_size=block_size,
             config=gemm1_config,
-            activation_type=activation_type,
+            activation=activation,
         )
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(

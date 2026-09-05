@@ -18,10 +18,6 @@ from flashinfer.mla._core import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
-from flashinfer.mla._sparse_mla_sm120 import (
-    _decode_dsv3_2_tuning_config,
-    _decode_dsv4_tuning_config,
-)
 from flashinfer.tllm_enums import (
     DtypeTrtllmGen,
     Fp8QuantizationType,
@@ -901,12 +897,95 @@ def test_tuning_overrides_preserve_tensor_initializers():
             ),
         ),
         tensor_initializers=((0, initializer),),
+        profiling_repeat=100,
     )
 
     with autotune(tune_mode=False, tuning_buckets=(100, 200)):
         overridden = tuner._apply_tuning_overrides(config)
 
     assert overridden.tensor_initializers == config.tensor_initializers
+    assert overridden.profiling_repeat == 100
+
+
+def test_tuning_config_profiling_repeat_override(monkeypatch):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 10)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+
+    default_config = TuningConfig(use_cold_l2_cache=True)
+    override_config = TuningConfig(use_cold_l2_cache=True, profiling_repeat=3)
+    inputs = [torch.ones(1)]
+
+    assert tuner._get_profiling_repeat(default_config) == 10
+    assert tuner._get_profiling_repeat(override_config) == 3
+    assert len(tuner._prepare_input_tensors_with_batches(inputs, override_config)) == 4
+
+    default_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), default_config)
+    override_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), override_config)
+    # Repeat controls measurement precision, not tactic compatibility.
+    assert default_key.file_key == override_key.file_key
+
+    with pytest.raises(ValueError, match="profiling_repeat must be positive"):
+        tuner._get_profiling_repeat(TuningConfig(profiling_repeat=0))
+
+
+def test_tuning_config_profiling_repeat_controls_measurement(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("profiling requires CUDA")
+
+    class CountingRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=(0,))
+            self.calls = 0
+
+        def forward(self, inputs, tactic=0, **kwargs):
+            del tactic, kwargs
+            self.calls += 1
+            inputs[0].add_(1)
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "warmup", 0)
+    monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
+    runner = CountingRunner()
+    config = TuningConfig(profiling_repeat=3)
+
+    tuner._profile_single_kernel(runner, [torch.zeros(1, device="cuda")], 0, config)
+
+    assert runner.calls == 3
+
+
+def test_tuning_config_profiling_repeat_reuses_bounded_cuda_arena(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("profile arena requires CUDA")
+
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 768)
+    inputs = [torch.zeros(256, dtype=torch.float32, device="cuda")]
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        profiling_repeat=100,
+        profile_arena_input_indices=(0,),
+    )
+
+    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+
+    # One lane carries 1024 bytes and the cold-L2 target is 1792 bytes, so two
+    # lanes per A/B arena suffice. All 100 timed replays remain scheduled and
+    # traverse A0, B0, A1, B1 instead of skipping half the lanes when the lane
+    # count is even.
+    assert len(batches) == 100
+    data_ptrs = [batch[0].data_ptr() for batch in batches]
+    assert data_ptrs[:4] == data_ptrs[4:8]
+    assert len(set(data_ptrs)) == 4
+
+    storages = {
+        batch[0].untyped_storage().data_ptr(): batch[0].untyped_storage().nbytes()
+        for batch in batches
+    }
+    assert len(storages) == 2
+    assert sum(storages.values()) == 2 * 2 * 1024
+    assert sum(storages.values()) < 2 * 100 * 1024
 
 
 def test_autotune_context_round_up(monkeypatch):
@@ -1161,9 +1240,13 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
         for input_index in (0, 1, 2, 3):
             assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
     for input_index in (0, 1, 2, 3):
-        assert (
-            len({batch[input_index].data_ptr() for batch in schedule}) == tuner.repeat
-        )
+        pointers = [batch[input_index].data_ptr() for batch in schedule]
+        num_physical_buffers = len(set(pointers))
+        assert 2 <= num_physical_buffers <= tuner.repeat
+        assert num_physical_buffers % 2 == 0
+        assert pointers == [
+            pointers[index % num_physical_buffers] for index in range(tuner.repeat)
+        ]
     assert torch.count_nonzero(inputs[1]).item() == 0
     assert torch.count_nonzero(inputs[2]).item() == 0
     sorted_ids = schedule[0][1].sort(dim=1).values
@@ -2002,19 +2085,6 @@ def test_mla_decode_tuning_config_is_memoized(
             )
     finally:
         _mla_decode_tuning_config.cache_clear()
-
-
-def test_sparse_mla_tuning_config_initializer_indices():
-    """Sparse MLA configs retain each initializer's original input index."""
-
-    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
-        0,
-        1,
-        6,
-        8,
-        9,
-    }
-    assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():
