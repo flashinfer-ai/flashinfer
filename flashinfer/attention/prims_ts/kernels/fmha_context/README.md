@@ -11,11 +11,12 @@ launch from logical work, task topology, live-metadata requirements, causal
 domain structure, and GPU capacity. Paired, live-ragged, and zero-offset
 triangular contiguous domains use CLC. Immutable single-instance
 bottom-right-offset domains launch directly within one resident wave and use
-static persistence above one wave. Paged causal plans use CLC because their
-request lengths remain per-run inputs; dense paged plans select a direct or
-persistent launch from their logical work and topology. A positive causal left
-window selects an internal head-paired GQA mapping; other cases use the
-query-paired mapping.
+static persistence above one wave. Paged causal plans use CLC under the default
+dynamic-length contract; an explicit exact-uniform contract permits a static
+schedule where the remaining topology allows it. Dense paged plans select a
+direct or persistent launch from their logical work and topology. A positive
+causal left window selects an internal head-paired GQA mapping; other cases use
+the query-paired mapping.
 
 ## Public APIs
 
@@ -35,7 +36,8 @@ support for other PrimTS APIs.
 Both reusable wrappers use a static-spec lifecycle. `plan()` receives only
 device, capacity, head, dtype, mask, window, and default-scale information. The
 contiguous plan also freezes its `packed` storage-mode choice (`False` for fixed
-BSHD, `True` for packed THD); the paged plan additionally receives page size.
+BSHD, `True` for packed THD); the paged plan additionally receives page size
+and optional `uniform_packed_lengths` / `has_q_offset` metadata contracts.
 Neither plan retains Q/K/V tensors or request metadata. Every `run()` supplies
 the current tensors and metadata: packed
 contiguous offsets, per-token variable-window bounds for fixed-shape inputs, or
@@ -147,22 +149,31 @@ from the live offsets. Fixed variable-window plans likewise receive current
 bounds are reduced to per-CTA minima; end bounds remain per-token inputs. The
 contiguous wrapper owns the mutable scratch used for that start reduction.
 
-Paged wrapper planning fixes only static capacities and compile-time semantics.
-Each run may provide different valid Q offsets, block-table rows, K/V lengths,
-and physical page IDs without another plan. The batch remains exact; Q deltas
-stay positive and within `max_seq_len_q`, K/V lengths stay within
-`max_kv_len`, and the final Q offset matches the packed Q/O extent. For causal
-attention, every per-run `Sq[b]` is no greater than `Sk[b]`. The kernel derives
-the request-local causal offset and active page range from per-run metadata.
+Paged wrapper planning fixes static capacities and one compile-time metadata
+contract. The conservative defaults, `uniform_packed_lengths=False` and
+`has_q_offset=True`, allow each run to provide different valid Q offsets,
+block-table rows, K/V lengths, and physical page IDs without another plan. The
+batch remains exact; Q deltas stay positive and within `max_seq_len_q`, K/V
+lengths stay within `max_kv_len`, and the final Q offset matches the packed Q/O
+extent. For causal attention, every per-run `Sq[b]` is no greater than `Sk[b]`.
+
+`uniform_packed_lengths=True` is a caller promise that every Q delta equals
+`max_seq_len_q` and every K/V length equals `max_kv_len`.
+`has_q_offset=False` is a separate causal promise that `Sq[b] == Sk[b]` for
+every request; dense attention ignores and canonicalizes this flag. These
+promises compile exactly one narrower specialization rather than a runtime
+choice between kernels. Re-plan before changing a promise. The one-shot paged
+API already reads the metadata and derives the tightest valid flags for its
+temporary plan.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
 dtypes, devices, scales, output, aliasing, page-table strides, sequence
 lengths, and active page IDs. Those metadata checks read device values back to
 the host and may synchronize. `validate=False` skips validation and host
 readback; callers using that path must enforce every dtype, device, shape,
-stride, alignment, value, aliasing, and lifetime obligation because invalid
-offsets, lengths, or page IDs can produce incorrect results or out-of-bounds
-access.
+stride, alignment, value, aliasing, lifetime, and selected plan-promise
+obligation because invalid offsets, lengths, page IDs, or false compile-time
+promises can produce incorrect results or out-of-bounds access.
 CUDA Graph capture requires `validate=False` plus stable tensor shapes,
 strides, and addresses, although values may change between completed replays.
 
@@ -279,7 +290,8 @@ assert out.shape == q.shape
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
-run-time tensor shape, stride, and address stable, and pass a preallocated,
+run-time tensor shape, stride, and address stable, preserve any explicit
+`uniform_packed_lengths` / `has_q_offset` promises, and pass a preallocated,
 non-overlapping `out`. Callers must keep storage unmodified until queued work
 completes. Before running on a CUDA stream that is not already ordered after the
 planning stream, the caller must establish that dependency. Keep the wrapper and
@@ -295,9 +307,10 @@ all captured runtime tensors alive until every graph using that plan is destroye
   query heads that share a K/V head.
 - Attention sinks, custom masks, and mixed Q/K/V dtypes are not exposed.
 - Re-plan either wrapper after changing a static capacity, head or dtype
-  geometry, mask, window, or default scale; page size is also static for paged
-  plans. Request tensors and metadata may change between completed runs while
-  remaining within the static plan.
+  geometry, mask, window, or default scale; page size and explicit metadata
+  promises are also static for paged plans. Request tensors and metadata may
+  change between completed runs while remaining within the static plan and its
+  promises.
 - A variable-window wrapper owns mutable CTA-minimum scratch, so its launches
   must not overlap across streams or captured graphs. Replanning either wrapper
   replaces plan-owned tensors and invalidates graphs captured from the prior

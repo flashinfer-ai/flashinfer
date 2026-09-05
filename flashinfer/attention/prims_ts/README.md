@@ -25,9 +25,11 @@ output/workspace ownership, examples, limitations, and validation commands.
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
 capacity, shape, dtype, and storage-mode specialization without retaining
-request tensors or metadata. Context `run()` receives current packed offsets or
-fixed-table paged metadata; per-token variable-window bounds for fixed-shape
-inputs are also per-run. Both context wrappers own their default scale tensors;
+request tensors or metadata. Paged context plans may additionally freeze
+explicit exact-uniform-length or zero-causal-offset promises. Context `run()`
+receives current packed offsets or fixed-table paged metadata; per-token
+variable-window bounds for fixed-shape inputs are also per-run. Both context
+wrappers own their default scale tensors;
 contiguous variable-window plans additionally own mutable scratch that reduces
 only start bounds to per-CTA minima, while paged context owns no other
 workspace. Runtime validation is enabled by default; callers that have already
