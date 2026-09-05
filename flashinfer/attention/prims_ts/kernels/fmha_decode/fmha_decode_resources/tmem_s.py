@@ -44,7 +44,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from ...._block_sparse.common import _MAX_KV_ATOM_SIZE
 from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
-from ..fmha_decode_constants import KV_TILE_256_RESCALE_THRESHOLD_LOG2
+from ..fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
 from ...tcgen05_compat import tcgen05_mma_ws
 from ...placeholder_helpers import (
     _placeholder_local_array,
@@ -104,13 +104,6 @@ from .helpers_softmax import (
     _u32_to_float_for_atomic_max,
     _wspro_reduce_max4,
 )
-
-# A block-sparse route often changes the exact row maximum without changing it
-# enough to justify rescaling the live O tile. Keeping the prior anchor within
-# this bound makes the correction scale exactly one and bounds FP16/BF16 P by
-# 2**8. As in the FlashInfer/TRT-LLM policy, this assumes normal model logits
-# rather than adversarial values outside the qualified probability bound.
-_BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 = 8.0
 
 
 def _swaps_uses_origin0_k32_full_guard(cfg: FmhaDecodeConfig) -> bool:
@@ -898,23 +891,32 @@ class TmemSResource(DecodeGenResourceBase):
     ) -> None:
         """Publish a masked Keeps row and its updated softmax anchor."""
 
-        new_anchor = cute.math.max(old_max, tile_max, ftz=True)
-        if cutlass.const_expr(
-            self.cfg.use_block_sparse and _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 > 0.0
-        ):
-            # Online softmax only requires a common finite reference for P,
-            # sum, and O; it does not require the exact row maximum. Defer a
-            # small anchor increase so correction can skip a TMEM O rescale.
-            rescale_log2 = (old_max - new_anchor) * self.scale_softmax_log2
-            if (old_max != _neg_max_f32()) and (
-                rescale_log2 >= Float32(-_BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2)
-            ):
-                new_anchor = old_max
         old_max_arr[0] = old_max
         sum_arr[0] = running_sum
-        new_max_arr[0] = new_anchor
+        new_max_arr[0] = self._softmax_anchor(old_max, tile_max)
         for reg_idx in cutlass.range_constexpr(self.cfg.num_s_regs_per_thread):
             s_arr[reg_idx] = s_vals[reg_idx]
+
+    @cute.jit
+    def _softmax_anchor(self, old_max: Float32, tile_max: Float32) -> Float32:
+        """Return the exponent reference max for the tile's P pass.
+
+        Online softmax only requires a common finite reference for P, the
+        running sum, and O; it does not require the exact row maximum.
+        Profiles that defer anchor updates keep the previous reference while
+        the tile raises it by less than ``SOFTMAX_RESCALE_THRESHOLD_LOG2``
+        log2 units, so correction can skip the in-place TMEM O rescale. The
+        16-bit P path represents the bounded values above one, and the
+        numerator and denominator stay in the same scale frame. Larger jumps
+        still rebase to keep P comfortably in range.
+        """
+        new_max = cute.math.max(old_max, tile_max, ftz=True)
+        if cutlass.const_expr(self.cfg.defers_softmax_anchor_updates):
+            if old_max != _neg_max_f32():
+                max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
+                if max_delta_log2 >= Float32(-SOFTMAX_RESCALE_THRESHOLD_LOG2):
+                    new_max = old_max
+        return new_max
 
     @cute.jit
     def _mask_and_store_sparse_keeps_atom(
@@ -1472,7 +1474,7 @@ class TmemSResource(DecodeGenResourceBase):
                     tile_is_unmasked,
                     fragment_idx=fragment_idx,
                 )
-                if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+                if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                     # The rolled P loop reloads scores without mask logic, so a
                     # masked tile writes its masked fragment back in place.
                     # The branch is warp-uniform: the loader above already
@@ -1492,21 +1494,12 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                 fragment_max = self._reduce_keeps_fragment_max(s_vals)
                 tile_max = cute.math.max(tile_max, fragment_max, ftz=True)
-            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 if not tile_is_unmasked:
                     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
                     cute.arch.fence_view_async_tmem_store()
 
-            new_max = cute.math.max(old_max, tile_max, ftz=True)
-            if old_max != _neg_max_f32():
-                # Keeping the previous reference max avoids an in-place O
-                # rescale when the new tile raises it only modestly. The
-                # 16-bit P path can represent the bounded values above one; the
-                # numerator and denominator remain in the same scale frame.
-                # Large jumps still rebase to keep P comfortably in range.
-                max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
-                if max_delta_log2 >= Float32(-KV_TILE_256_RESCALE_THRESHOLD_LOG2):
-                    new_max = old_max
+            new_max = self._softmax_anchor(old_max, tile_max)
             old_max_arr[0] = old_max
             sum_arr[0] = running_sum
             new_max_arr[0] = new_max
@@ -1635,47 +1628,6 @@ class TmemSResource(DecodeGenResourceBase):
             s_arr,
         )
         return old_max_arr, sum_arr, new_max_arr, s_arr
-
-    @consumer_work(returns=s_arr, work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def load_softmax_p_fragment(
-        self,
-        stage_info: StageInfo,
-        *,
-        fragment_idx: Constexpr[int],
-        s_arr: cutlass.Array,
-    ) -> cutlass.Array:
-        """Reload and mask one KV256 K32 fragment for P materialization."""
-        if cutlass.const_expr(self.cfg.use_block_sparse):
-            return self._load_block_sparse_softmax_p_fragment(
-                stage_info,
-                fragment_idx=fragment_idx,
-                s_arr=s_arr,
-            )
-        (
-            seq_len_kv,
-            logical_q_group_idx,
-            element_mask_end_idx,
-            tile_offset_k,
-            window_start_idx,
-            is_valid_effective_tile,
-            is_masked_final_wave,
-            tile_is_unmasked,
-        ) = self._resolve_keeps_tile_context(stage_info)
-        self._load_keeps_fragment(
-            stage_info,
-            s_arr,
-            tile_offset_k,
-            element_mask_end_idx,
-            window_start_idx,
-            seq_len_kv,
-            logical_q_group_idx,
-            is_valid_effective_tile,
-            is_masked_final_wave,
-            tile_is_unmasked,
-            fragment_idx=fragment_idx,
-        )
-        return s_arr
 
     @cute.jit
     def _compute_softmax_loop_swaps(
@@ -2524,43 +2476,10 @@ class TmemSResource(DecodeGenResourceBase):
             ftz=True,
         )
         old_max = new_max_arr[0]
-        new_max = cute.math.max(old_max, tile_max, ftz=True)
-        if old_max != _neg_max_f32():
-            max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
-            if max_delta_log2 >= Float32(-KV_TILE_256_RESCALE_THRESHOLD_LOG2):
-                new_max = old_max
+        new_max = self._softmax_anchor(old_max, tile_max)
         old_max_arr[0] = old_max
         new_max_arr[0] = new_max
         return old_max_arr, sum_arr, new_max_arr, s_arr
-
-    @cute.jit
-    def _load_block_sparse_softmax_p_fragment(
-        self,
-        stage_info: StageInfo,
-        *,
-        fragment_idx: Constexpr[int],
-        s_arr: cutlass.Array,
-    ) -> cutlass.Array:
-        """Reload one full or already-predicated sparse KV256 fragment for P."""
-
-        assert self.cfg.tile_size_kv == 256
-        task_cache = _decode_gen_task_cache(stage_info)
-        score_tmem_addr = (
-            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self._alloc.offset)
-            + self._softmax_loop_stage_slot_offset(stage_info)
-            + Int32(fragment_idx * 32)
-        )
-        loaded = _keeps_tcgen05_ld(
-            self.cfg,
-            prims.make_tmem_ptr(score_tmem_addr, Float32),
-            num=32,
-            offset=self.cfg.tile_size_kv // 2,
-        )
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-        for score_idx in cutlass.range_constexpr(32):
-            s_arr[score_idx] = loaded[score_idx]
-        return s_arr
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit

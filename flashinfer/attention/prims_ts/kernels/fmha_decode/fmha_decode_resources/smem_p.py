@@ -86,19 +86,18 @@ from .helpers_softmax import (
 from .smem_block_sparse_metadata import _SOFTMAX_ROUTE_IS_PROXY_FLAG
 from .tmem_s import TmemSResource
 
-# Number of the 16 score pairs per streamed KV256 fragment whose exponentials
-# run as FMA polynomials instead of MUFU. The MUFU issue rate bounds the
-# fragment otherwise, while the FMA pipe is nearly idle in the softmax warps.
-# Larger shares grow the fragment body and the softmax warps become
-# instruction-fetch bound again, so one quarter is the measured optimum.
+# Tunable: number of score pairs per streamed fragment whose exponentials run
+# as FMA polynomials instead of MUFU. The MUFU issue rate bounds the fragment
+# otherwise, while the FMA pipe is nearly idle in the softmax warps. Larger
+# shares grow the fragment body and the softmax warps become instruction-fetch
+# bound again, so one quarter of the 16 pairs is the measured optimum.
 KV_TILE_256_EX2_EMULATED_PAIRS = 4
-_KV_TILE_256_PAIRS_PER_FRAGMENT = 16
 
 
-def _pair_uses_ex2_emulation(pair_idx: int) -> bool:
-    """Spread the emulated pairs evenly across a fragment's 16 pairs."""
+def _pair_uses_ex2_emulation(pair_idx: int, pairs_per_fragment: int) -> bool:
+    """Spread the emulated pairs evenly across a fragment's score pairs."""
     count = KV_TILE_256_EX2_EMULATED_PAIRS
-    pairs = _KV_TILE_256_PAIRS_PER_FRAGMENT
+    pairs = pairs_per_fragment
     return ((pair_idx + 1) * count) // pairs != (pair_idx * count) // pairs
 
 
@@ -341,189 +340,6 @@ class SmemPResource(DecodeGenResourceBase):
                 local_sum += Float32(tail_delta) * tail_p
         return local_sum
 
-    @cute.jit
-    def _compute_p_fragment_impl(
-        self,
-        stage_info: StageInfo,
-        *,
-        fragment_idx: Constexpr[int],
-        new_max_arr: cutlass.Array,
-        s_arr: cutlass.Array,
-        route_is_proxy: Int32,
-        route_origin0: Int32,
-        route_origin1: Int32,
-    ) -> None:
-        """Convert one KV256 K32 score fragment into its selected P storage."""
-        cfg = self.cfg
-        assert cfg.streams_tmem_p_fragments
-        assert not cfg.use_fp8_qkv
-        assert cfg.softmax_score_fragment_regs == 32
-
-        new_max = new_max_arr[0]
-        safe_new_max = new_max
-        if safe_new_max == _neg_max_f32():
-            safe_new_max = Float32(0.0)
-        minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
-
-        # Eight independent chains keep the denominator update off one long
-        # dependency chain. Reuse s_arr for probabilities so only one K32 score
-        # fragment remains live while P is packed.
-        sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-        for chain_idx in cutlass.range_constexpr(8):
-            sum_chains[chain_idx] = Float32(0.0)
-        for pair_idx in cutlass.range_constexpr(16):
-            value_idx = pair_idx * 2
-            p0, p1 = cute.arch.fma_packed_f32x2(
-                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                (self.scale_softmax_log2, self.scale_softmax_log2),
-                (minus_max_scale, minus_max_scale),
-            )
-            # This body is instantiated once per fragment and instance, so the
-            # FMA-pipe exponential is left to the rolled fragment loop: here its
-            # extra instructions would be replicated and the softmax warps
-            # become instruction-fetch bound.
-            p0 = Float32(cute.math.exp2(p0, fastmath=True))
-            p1 = Float32(cute.math.exp2(p1, fastmath=True))
-            s_arr[value_idx] = p0
-            s_arr[value_idx + 1] = p1
-            chain_idx = (pair_idx & 3) * 2
-            sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
-                cute.arch.add_packed_f32x2(
-                    (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
-                    (p0, p1),
-                )
-            )
-
-        # Collapse the eight reduction chains before packing P and publishing
-        # its barrier. This keeps only one sum scalar live across STTM instead
-        # of overlapping the full reduction state with packed P and addresses.
-        sum01 = cute.arch.add_packed_f32x2(
-            (sum_chains[0], sum_chains[1]),
-            (sum_chains[2], sum_chains[3]),
-        )
-        sum23 = cute.arch.add_packed_f32x2(
-            (sum_chains[4], sum_chains[5]),
-            (sum_chains[6], sum_chains[7]),
-        )
-        total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
-        local_sum = Float32(total_pair[0] + total_pair[1])
-
-        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-            if route_is_proxy != Int32(0):
-                # KC stores one mean K vector per semantic KV block while VC
-                # stores its V sum. Keep P itself unweighted for PV, and
-                # account for represented token mass only in the denominator.
-                num_summaries, tail_len = _block_sparse_proxy_summary_geometry(
-                    cfg.static_seq_len_kv,
-                    cfg.kv_block_size,
-                )
-                local_sum *= Float32(cfg.kv_block_size)
-                final_summary_idx = num_summaries - 1
-                tail_delta = tail_len - cfg.kv_block_size
-                if cutlass.const_expr(tail_delta != 0):
-                    fragment_origin = Int32(route_origin0)
-                    if cutlass.const_expr(fragment_idx >= 2):
-                        fragment_origin = Int32(route_origin1)
-                    fragment_origin += Int32((fragment_idx % 2) * 32)
-                    final_summary_offset = Int32(final_summary_idx) - fragment_origin
-                    if final_summary_offset >= Int32(
-                        0
-                    ) and final_summary_offset < Int32(32):
-                        # Proxy fragment origins are K32-aligned in summary
-                        # coordinates, so the tail's in-fragment lane is a
-                        # compile-time constant even though route ownership is
-                        # decided at runtime.  Keeping this index fixed avoids
-                        # materializing the whole FP32 probability array in
-                        # local memory.
-                        tail_lane = final_summary_idx % 32
-                        local_sum += Float32(tail_delta) * Float32(s_arr[tail_lane])
-
-        packed_p = (
-            s_arr.data_ptr().load(count=32, alignment=4).to(cfg.q_dtype).bitcast(Int32)
-        )
-        fragment_cols = cfg.softmax_score_fragment_regs // 2
-        p_tmem_addr = (
-            self._tmem_base_addr
-            + Int32(self._tmem_alloc.offset)
-            + Int32(fragment_idx * fragment_cols)
-        )
-        _keeps_tcgen05_st(
-            cfg,
-            prims.make_tmem_ptr(p_tmem_addr, Int32),
-            packed_p,
-            offset=cfg.tmem_p_cols_per_inst,
-        )
-        # This lowers to the warp-collective tcgen05.wait::st. The explicit
-        # proxy fence then makes every lane's completed STTM visible through
-        # the lane-0 mbarrier publication consumed by the MMA warp.
-        cute.arch.fence_view_async_tmem_store()
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-
-        if cutlass.const_expr(cfg.streams_tmem_p_fragments):
-            # Streamed KV256 aliases P with the score tile that produced it.
-            # Each softmax warp publishes its rows after the TMEM store drains.
-            tidx, _, _ = cute.arch.thread_idx()
-            if (tidx & Int32(31)) == Int32(0):
-                prims.mbarrier_arrive(
-                    self._fragment_ready.data_ptr() + Int32(fragment_idx)
-                )
-
-        if cutlass.const_expr(fragment_idx != 0):
-            local_sum += self.tmem_s_ref.load_p_local_sum(0)
-        self.tmem_s_ref.store_p_local_sum(0, local_sum)
-
-    # Task Scheduling treats every non-constexpr work argument as required.
-    # Keep the established exact-only ABI separate from the proxy route
-    # transport while sharing the generated P implementation.
-    @producer_work
-    @cute.jit
-    def compute_p_fragment(
-        self,
-        stage_info: StageInfo,
-        *,
-        fragment_idx: Constexpr[int],
-        new_max_arr: cutlass.Array,
-        s_arr: cutlass.Array,
-    ) -> None:
-        """Convert one ordinary KV256 K32 score fragment into its TMEM P slice."""
-        self._compute_p_fragment_impl(
-            stage_info,
-            fragment_idx=fragment_idx,
-            new_max_arr=new_max_arr,
-            s_arr=s_arr,
-            route_is_proxy=Int32(0),
-            route_origin0=Int32(0),
-            route_origin1=Int32(0),
-        )
-
-    @producer_work
-    @cute.jit
-    def compute_proxy_route_p_fragment(
-        self,
-        stage_info: StageInfo,
-        *,
-        fragment_idx: Constexpr[int],
-        new_max_arr: cutlass.Array,
-        s_arr: cutlass.Array,
-        route_flags: Int32,
-        route_origin0: Int32,
-        route_origin1: Int32,
-    ) -> None:
-        """Convert one proxy-capable fragment with conditional proxy weighting."""
-        assert self.cfg.use_block_sparse_proxy_routes
-        route_is_proxy = Int32(
-            (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
-        )
-        self._compute_p_fragment_impl(
-            stage_info,
-            fragment_idx=fragment_idx,
-            new_max_arr=new_max_arr,
-            s_arr=s_arr,
-            route_is_proxy=route_is_proxy,
-            route_origin0=route_origin0,
-            route_origin1=route_origin1,
-        )
-
     @producer_work
     @cute.jit
     def compute_p_fragments(
@@ -577,19 +393,21 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
-        The unrolled per-fragment path replicates the exponentiation body for
-        every fragment and both softmax instances, which makes the softmax warps
-        instruction-fetch bound. Here the fragment index is a runtime loop
-        variable, so the body exists once and only the TMEM column offset, the
-        fragment barrier, and the proxy tail bookkeeping depend on it. The max
-        pass has already written masked scores back to TMEM, so the reload
-        needs no mask logic of its own.
+        The fragment index is a runtime loop variable, so the exponentiation
+        body exists once in the instruction stream and only the TMEM column
+        offset, the fragment barrier, and the proxy tail bookkeeping depend on
+        it. Unrolling the fragments would replicate that body for every
+        fragment and both softmax instances and leave the softmax warps
+        instruction-fetch bound. The max pass has already written masked
+        scores back to TMEM, so the reload needs no mask logic of its own.
         """
         _ = stage_info
         cfg = self.cfg
-        assert cfg.loops_softmax_p_fragments
-        assert cfg.softmax_score_fragment_regs == 32
+        assert cfg.streams_tmem_p_fragments
         assert self._tmem_alloc.offset == self.tmem_s_ref._alloc.offset
+        # One FP32 score per column, two packed 16-bit probabilities per column.
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragment_cols = fragment_regs // 2
 
         new_max = new_max_arr[0]
         safe_new_max = new_max
@@ -597,7 +415,6 @@ class SmemPResource(DecodeGenResourceBase):
             safe_new_max = Float32(0.0)
         minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
         tmem_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
-        fragment_cols = cfg.softmax_score_fragment_regs // 2
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
@@ -606,13 +423,17 @@ class SmemPResource(DecodeGenResourceBase):
             fragment = Int32(fragment_idx)
             loaded = _keeps_tcgen05_ld(
                 cfg,
-                prims.make_tmem_ptr(tmem_base + fragment * Int32(32), Float32),
-                num=32,
+                prims.make_tmem_ptr(
+                    tmem_base + fragment * Int32(fragment_regs), Float32
+                ),
+                num=fragment_regs,
                 offset=cfg.tile_size_kv // 2,
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            s_arr = cutlass.Array(Float32, 32, space=cutlass.AddressSpace.rmem)
-            for score_idx in cutlass.range_constexpr(32):
+            s_arr = cutlass.Array(
+                Float32, fragment_regs, space=cutlass.AddressSpace.rmem
+            )
+            for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = loaded[score_idx]
 
             local_sum = self._exponentiate_fragment_pairs(s_arr, minus_max_scale)
@@ -628,7 +449,7 @@ class SmemPResource(DecodeGenResourceBase):
 
             packed_p = (
                 s_arr.data_ptr()
-                .load(count=32, alignment=4)
+                .load(count=fragment_regs, alignment=4)
                 .to(cfg.q_dtype)
                 .bitcast(Int32)
             )
@@ -649,11 +470,22 @@ class SmemPResource(DecodeGenResourceBase):
     def _runtime_fragment_origin(
         self, fragment: Int32, route_origin0: Int32, route_origin1: Int32
     ) -> Int32:
-        """Return the K32 origin of a fragment selected at runtime."""
+        """Return the token origin of a fragment selected at runtime.
+
+        Each lane's fragments cover two KV blocks in order: the first block's
+        fragments start at ``route_origin0``, the second block's at
+        ``route_origin1``, and consecutive fragments within a block advance by
+        one fragment width.
+        """
+        cfg = self.cfg
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragments_per_block = cfg.kv_block_size // fragment_regs
         fragment_origin = Int32(route_origin0)
-        if fragment >= Int32(2):
+        if fragment >= Int32(fragments_per_block):
             fragment_origin = Int32(route_origin1)
-        return fragment_origin + (fragment & Int32(1)) * Int32(32)
+        return fragment_origin + (fragment % Int32(fragments_per_block)) * Int32(
+            fragment_regs
+        )
 
     @cute.jit
     def _exponentiate_fragment_pairs(
@@ -665,17 +497,20 @@ class SmemPResource(DecodeGenResourceBase):
         the denominator update off one long dependency chain, and a configurable
         subset of pairs runs its exponentials on the FMA pipe.
         """
+        pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(8):
             sum_chains[chain_idx] = Float32(0.0)
-        for pair_idx in cutlass.range_constexpr(16):
+        for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
             p0, p1 = cute.arch.fma_packed_f32x2(
                 (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
                 (self.scale_softmax_log2, self.scale_softmax_log2),
                 (minus_max_scale, minus_max_scale),
             )
-            if cutlass.const_expr(_pair_uses_ex2_emulation(pair_idx)):
+            if cutlass.const_expr(
+                _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
+            ):
                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
             else:
                 p0 = Float32(cute.math.exp2(p0, fastmath=True))
@@ -716,6 +551,7 @@ class SmemPResource(DecodeGenResourceBase):
         shorter tail block.
         """
         cfg = self.cfg
+        fragment_regs = cfg.softmax_score_fragment_regs
         num_summaries, tail_len = _block_sparse_proxy_summary_geometry(
             cfg.static_seq_len_kv,
             cfg.kv_block_size,
@@ -725,11 +561,13 @@ class SmemPResource(DecodeGenResourceBase):
         if cutlass.const_expr(tail_delta != 0):
             final_summary_idx = num_summaries - 1
             final_summary_offset = Int32(final_summary_idx) - fragment_origin
-            if final_summary_offset >= Int32(0) and final_summary_offset < Int32(32):
-                # Proxy fragment origins are K32-aligned in summary coordinates,
-                # so the tail's in-fragment lane is a compile-time constant even
-                # though route ownership is decided at runtime.
-                tail_lane = final_summary_idx % 32
+            if final_summary_offset >= Int32(0) and final_summary_offset < Int32(
+                fragment_regs
+            ):
+                # Proxy fragment origins are fragment-aligned in summary
+                # coordinates, so the tail's in-fragment lane is a compile-time
+                # constant even though route ownership is decided at runtime.
+                tail_lane = final_summary_idx % fragment_regs
                 local_sum += Float32(tail_delta) * Float32(s_arr[tail_lane])
         return local_sum
 
@@ -752,7 +590,7 @@ class SmemPResource(DecodeGenResourceBase):
         BMM2.
         """
         cfg = self.cfg
-        # KV256 uses compute_p_fragment so only one K32 score fragment is live.
+        # KV256 streams K32 fragments through the rolled fragment loop instead.
         assert not cfg.streams_tmem_p_fragments
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
@@ -1690,25 +1528,3 @@ class SmemPResource(DecodeGenResourceBase):
             self._tmem_alloc.offset + fragment_idx * fragment_cols
         )
         return p_tmem_addr
-
-    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def wait_until_reusable_before_qk(self, stage_info: StageInfo) -> None:
-        """Wait until the previous same-instance PV has stopped reading P.
-
-        KV256 aliases each streamed P instance with its next S accumulator.
-        The existing two-stage O pipeline commits stage ``inst_id`` only when
-        the matching PV completes, so its full barrier is also the P-reuse
-        credit. The S producer phase supplies the generation: the first QK
-        waits on the initially complete opposite parity, and every later QK
-        waits for the preceding PV without another commit or barrier.
-        """
-        _ = stage_info
-        cfg = self.cfg
-        assert cfg.streams_tmem_p_fragments
-        assert cfg.o_stages == cfg.num_insts_kv == 2
-        barrier = self.tmem_o_ref.pipeline.sync_object_full.get_barrier(
-            Int32(self.inst_id)
-        )
-        _wait_for_mbarrier_phase(barrier, self.tmem_s_ref.producer_state.phase)
-        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)

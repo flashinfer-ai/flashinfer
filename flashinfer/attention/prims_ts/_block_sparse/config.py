@@ -195,9 +195,13 @@ def _select_block_sparse_scheduler(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
-    use_proxy_routes: bool,
 ) -> tuple[int, bool]:
-    """Select the Q tile and scheduler without depending on KV storage."""
+    """Select the Q tile and scheduler without depending on KV storage.
+
+    Proxy routes add one summary route per row on top of the exact routes and
+    see the same per-tile fixed cost the persistent scheduler amortizes, so
+    the selection does not depend on the route kind.
+    """
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
     q_tile_size = _select_block_sparse_q_tile_size(
@@ -205,10 +209,6 @@ def _select_block_sparse_scheduler(
         heads_q_per_kv=heads_q_per_kv,
         kv_block_size=kv_block_size,
     )
-    # Proxy routes add one summary route per row on top of the exact routes,
-    # so they see the same per-tile fixed cost the persistent scheduler
-    # amortizes; both route kinds share one scheduler selection.
-    _ = use_proxy_routes
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
@@ -472,9 +472,9 @@ def _resolve_block_sparse_launch_spec(
 
     ``max_row_route_capacity`` is a conservative prepared-route bound. Live
     index values and physical-tail morphology never specialize this cache
-    entry. Proxy routes use the direct grid; exact routes retain the common
-    automatic scheduler. An unsupported persistent profile falls back to its
-    valid static counterpart.
+    entry. Proxy and exact routes share one scheduler selection. An
+    unsupported persistent profile falls back to its valid static
+    counterpart.
     """
 
     q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
@@ -489,7 +489,6 @@ def _resolve_block_sparse_launch_spec(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         max_row_route_capacity=max_row_route_capacity,
-        use_proxy_routes=use_proxy_routes,
     )
     compile_key = _BlockSparseCompileKey(
         device_index=device_index,

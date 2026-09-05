@@ -1621,19 +1621,26 @@ class FmhaDecodeConfig:
 
     @property
     def streams_tmem_p_fragments(self) -> bool:
-        """Whether P is published as independently ready TMEM fragments."""
+        """Whether P is published as independently ready TMEM fragments.
+
+        Streamed profiles produce their K32 fragments from one rolled runtime
+        loop: the max pass writes masked scores back to TMEM, so the P pass
+        reloads each fragment without mask logic and the exponentiation body
+        exists once in the instruction stream.
+        """
         return self.uses_two_inst_tmem_p and self.num_softmax_score_fragments > 1
 
     @property
-    def loops_softmax_p_fragments(self) -> bool:
-        """Whether streamed P fragments come from one rolled runtime loop.
+    def defers_softmax_anchor_updates(self) -> bool:
+        """Whether small row-max increases keep the previous exponent anchor.
 
-        KV256 masks scores in place during the max pass, so the P pass can
-        reload fragments without per-fragment mask logic and keep a single
-        copy of the exponentiation body in the instruction stream. The FP8
-        operand path still materializes P through its dedicated helpers.
+        Streamed KV256 tiles and block-sparse Keeps routes change the exact
+        row maximum often without changing it enough to justify rescaling the
+        live O tile; keeping the prior anchor within
+        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` makes the correction scale exactly
+        one and bounds 16-bit P by 2**8.
         """
-        return self.streams_tmem_p_fragments and not self.use_fp8_qkv
+        return self.tile_size_kv == 256 or self.use_block_sparse
 
     @property
     def matches_kv256_task_topology(self) -> bool:
@@ -2221,17 +2228,6 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
             f"q_stages={cfg.q_stages}, kv_stages={cfg.kv_stages} require "
             f"{pipeline_smem_bytes} bytes, limit is "
             f"{pipeline_smem_budget_bytes} bytes"
-        )
-    if (
-        cfg.use_persistent_scheduler
-        and not cfg.use_split_kv
-        and not cfg.use_attention_sinks
-        and cfg.kv_stages != KV_TILE_256_SHARED_FIFO_STAGES
-    ):
-        raise ValueError(
-            "persistent KV256 requires kv_stages="
-            f"{KV_TILE_256_SHARED_FIFO_STAGES} for the rotating shared-KV "
-            f"exchange, got {cfg.kv_stages}"
         )
     if not cfg.supports_grouped_keeps:
         raise ValueError(

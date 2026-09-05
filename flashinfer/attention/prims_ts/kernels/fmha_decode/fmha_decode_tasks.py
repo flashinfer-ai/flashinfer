@@ -117,14 +117,18 @@ def _schedule_with_optional_resources(
     return traced
 
 
-def _block_sparse_route_loop_domain(
-    route_count: cutlass.Int32,
+def _loop_domain_after_head(
+    total_kv_tiles: cutlass.Int32,
     *,
     num_insts_kv: int,
 ) -> cutlass.Int32:
-    """Return LOOP iterations after HEAD reserves one candidate per instance."""
+    """Return LOOP iterations after HEAD reserves one KV tile per instance.
 
-    remaining = route_count - cutlass.Int32(num_insts_kv)
+    Dense tiles and block-sparse routes share this recurrence; only the tile
+    count's source differs.
+    """
+
+    remaining = total_kv_tiles - cutlass.Int32(num_insts_kv)
     remaining = cute.math.max(remaining, cutlass.Int32(0))
     insts = cutlass.Int32(num_insts_kv)
     return (remaining + insts - cutlass.Int32(1)) // insts
@@ -313,19 +317,19 @@ def _produce_staged_page_offsets(
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
-    aliased_p: MemoryResource,
     q_desc: Any,
     k_desc_label: str,
     qk_mma_label: str,
     section: FmhaStage,
     cfg: FmhaDecodeConfig,
 ) -> None:
-    """Consume all K head-dim stages for one QK MMA wave."""
-    # Streamed KV256 aliases P with the S columns this QK overwrites. The
-    # preceding same-instance PV reads P as its TMEM A operand from the same
-    # issuing thread, and the tensor core interlocks that read against a later
-    # MMA's accumulator write, so no completion wait is needed before QK.
-    _ = aliased_p
+    """Consume all K head-dim stages for one QK MMA wave.
+
+    Streamed KV256 aliases P with the S columns this QK overwrites. The
+    preceding same-instance PV reads P as its TMEM A operand from the same
+    issuing thread, and the tensor core interlocks that read against a later
+    MMA's accumulator write, so no completion wait is needed before QK.
+    """
     tmem_s.acquire()
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
         smem_kv.wait()
@@ -889,7 +893,7 @@ class DecodeGenTask(Task):
             self._kv_valid_tile_end = route_count
             self._kv_window_start = cutlass.Int32(0)
 
-            loop_domain = _block_sparse_route_loop_domain(
+            loop_domain = _loop_domain_after_head(
                 route_count,
                 num_insts_kv=self.cfg.num_insts_kv,
             )
@@ -927,14 +931,10 @@ class DecodeGenTask(Task):
             self._kv_window_start = cutlass.Int32(0)
             self._kv_valid_tile_end = total_kv_tiles
             self._kv_raw_tile_base = cutlass.Int32(0)
-            remaining_kv_tiles = cute.math.max(
-                total_kv_tiles - cutlass.Int32(self.cfg.num_insts_kv),
-                cutlass.Int32(0),
+            loop_domain = _loop_domain_after_head(
+                total_kv_tiles,
+                num_insts_kv=self.cfg.num_insts_kv,
             )
-            num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
-            loop_domain = (
-                remaining_kv_tiles + num_insts_kv - cutlass.Int32(1)
-            ) // num_insts_kv
             return loop_domain + cutlass.Int32(self.domain_bias)
 
         # Decode the logical Q tile with the configured physical split fanout,
@@ -1136,22 +1136,17 @@ def create_load_task(
                 smem_page_offsets.wait()
             else:
                 _page_offsets_consume(smem_page_offsets)
-        if sparse_kv_metadata0 is None:
-            for label in ("load_k0", "load_k1"):
-                _kv_load(label, FmhaStage.Head)
-        else:
-            route0 = _resolve_and_store_sparse_route(
-                sparse_kv_metadata0, FmhaStage.Head
-            )
-            _kv_load("load_k0", FmhaStage.Head)
-            route1 = _resolve_and_store_sparse_route(
-                sparse_kv_metadata1, FmhaStage.Head
-            )
-            _kv_load("load_k1", FmhaStage.Head)
-            # Issue both K tiles before either metadata FIFO can backpressure
-            # the load warp, matching the split-resource sparse cadence.
-            _publish_sparse_softmax_route(sparse_softmax_metadata0, route0)
-            _publish_sparse_softmax_route(sparse_softmax_metadata1, route1)
+        # Dense profiles have no route metadata: the resolve and publish
+        # helpers are no-ops for ``None`` resources, so one cadence serves
+        # both dense and block-sparse loads.
+        route0 = _resolve_and_store_sparse_route(sparse_kv_metadata0, FmhaStage.Head)
+        _kv_load("load_k0", FmhaStage.Head)
+        route1 = _resolve_and_store_sparse_route(sparse_kv_metadata1, FmhaStage.Head)
+        _kv_load("load_k1", FmhaStage.Head)
+        # Issue both K tiles before either metadata FIFO can backpressure
+        # the load warp, matching the split-resource sparse cadence.
+        _publish_sparse_softmax_route(sparse_softmax_metadata0, route0)
+        _publish_sparse_softmax_route(sparse_softmax_metadata1, route1)
 
         # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set.
         # When P aliases the consumed S columns, MMA must consume each V/P pair
@@ -1163,32 +1158,27 @@ def create_load_task(
             else ("load_k0", "load_v0", "load_k1", "load_v1")
         )
         with domain_loop(0, domain, 1, unroll=1):
-            if sparse_kv_metadata0 is None:
-                for label in loop_labels:
-                    _kv_load(label, FmhaStage.Loop)
-            else:
-                # Follow the dense stage order exactly. Generic V-first
-                # profiles consume their retained route before the matching K
-                # label replaces it.
-                loop_routes = []
-                for label in loop_labels:
-                    route = None
-                    sparse_softmax_metadata = None
-                    if label == "load_k0":
-                        route = _resolve_and_store_sparse_route(
-                            sparse_kv_metadata0, FmhaStage.Loop
-                        )
-                        sparse_softmax_metadata = sparse_softmax_metadata0
-                    elif label == "load_k1":
-                        route = _resolve_and_store_sparse_route(
-                            sparse_kv_metadata1, FmhaStage.Loop
-                        )
-                        sparse_softmax_metadata = sparse_softmax_metadata1
-                    _kv_load(label, FmhaStage.Loop)
-                    if route is not None:
-                        loop_routes.append((sparse_softmax_metadata, route))
-                for sparse_softmax_metadata, route in loop_routes:
-                    _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+            # Generic V-first profiles consume their retained route before the
+            # matching K label replaces it.
+            loop_routes = []
+            for label in loop_labels:
+                route = None
+                sparse_softmax_metadata = None
+                if label == "load_k0":
+                    route = _resolve_and_store_sparse_route(
+                        sparse_kv_metadata0, FmhaStage.Loop
+                    )
+                    sparse_softmax_metadata = sparse_softmax_metadata0
+                elif label == "load_k1":
+                    route = _resolve_and_store_sparse_route(
+                        sparse_kv_metadata1, FmhaStage.Loop
+                    )
+                    sparse_softmax_metadata = sparse_softmax_metadata1
+                _kv_load(label, FmhaStage.Loop)
+                if route is not None:
+                    loop_routes.append((sparse_softmax_metadata, route))
+            for sparse_softmax_metadata, route in loop_routes:
+                _publish_sparse_softmax_route(sparse_softmax_metadata, route)
 
         # TAIL: after no more future K tiles are needed, load the final two V
         # tiles consumed by the final BMM2 calls.
@@ -2567,7 +2557,6 @@ def create_mma_task(
         _consume_staged_qk_mma(
             smem_kv,
             tmem_s0,
-            smem_p0,
             q_desc,
             "k_desc_0",
             "qk_mma_head",
@@ -2577,7 +2566,6 @@ def create_mma_task(
         _consume_staged_qk_mma(
             smem_kv,
             tmem_s1,
-            smem_p1,
             q_desc,
             "k_desc_1",
             "qk_mma_head",
@@ -2604,7 +2592,6 @@ def create_mma_task(
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s0,
-                smem_p0,
                 q_desc,
                 "k_desc_0",
                 "qk_mma_loop",
@@ -2636,7 +2623,6 @@ def create_mma_task(
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s1,
-                smem_p1,
                 q_desc,
                 "k_desc_1",
                 "qk_mma_loop",
@@ -2859,7 +2845,7 @@ def create_softmax0_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local0.commit()
-            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # One rolled loop streams every K32 probability fragment; the
                 # fragment body exists once in the instruction stream.
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
@@ -2871,29 +2857,6 @@ def create_softmax0_task(
                     )
                 else:
                     smem_p0.compute_p_fragments(new_max_arr=new_max_arr)
-            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
-                # Publish one K32 probability fragment at a time so PV can
-                # consume early fragments while later scores are processed.
-                for fragment_idx in range(cfg.num_softmax_score_fragments):
-                    s_arr = tmem_s0.load_softmax_p_fragment(
-                        fragment_idx=fragment_idx,
-                        s_arr=s_arr,
-                    )
-                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                        smem_p0.compute_proxy_route_p_fragment(
-                            fragment_idx=fragment_idx,
-                            new_max_arr=new_max_arr,
-                            s_arr=s_arr,
-                            route_flags=sparse_route_flags,
-                            route_origin0=sparse_origin0,
-                            route_origin1=sparse_origin1,
-                        )
-                    else:
-                        smem_p0.compute_p_fragment(
-                            fragment_idx=fragment_idx,
-                            new_max_arr=new_max_arr,
-                            s_arr=s_arr,
-                        )
             else:
                 # Wait for a free P stage before entering the ordered window so
                 # BMM2 backpressure on this group's P pipeline cannot extend the
@@ -3115,7 +3078,7 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
-            if cutlass.const_expr(cfg.loops_softmax_p_fragments):
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                     smem_p1.compute_proxy_route_p_fragments(
                         new_max_arr=new_max_arr,
@@ -3125,27 +3088,6 @@ def create_softmax1_task(
                     )
                 else:
                     smem_p1.compute_p_fragments(new_max_arr=new_max_arr)
-            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
-                for fragment_idx in range(cfg.num_softmax_score_fragments):
-                    s_arr = tmem_s1.load_softmax_p_fragment(
-                        fragment_idx=fragment_idx,
-                        s_arr=s_arr,
-                    )
-                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                        smem_p1.compute_proxy_route_p_fragment(
-                            fragment_idx=fragment_idx,
-                            new_max_arr=new_max_arr,
-                            s_arr=s_arr,
-                            route_flags=sparse_route_flags,
-                            route_origin0=sparse_origin0,
-                            route_origin1=sparse_origin1,
-                        )
-                    else:
-                        smem_p1.compute_p_fragment(
-                            fragment_idx=fragment_idx,
-                            new_max_arr=new_max_arr,
-                            s_arr=s_arr,
-                        )
             else:
                 # Wait for a free P stage before entering the ordered window so
                 # BMM2 backpressure on this group's P pipeline cannot extend the

@@ -2177,6 +2177,30 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
+@pytest.mark.parametrize("persistent", (False, True))
+def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
+    persistent: bool,
+) -> None:
+    """Only KV256 splits its scores into streamed K32 P fragments.
+
+    Streamed profiles share one rolled fragment loop whose geometry follows
+    the fragment register count, so the profile property and the fragment
+    count are pinned together. Single-fragment profiles keep the complete
+    score row and never stream.
+    """
+
+    kv256 = _make_contiguous_kv256_config(persistent=persistent)
+    assert kv256.streams_tmem_p_fragments
+    assert kv256.softmax_score_fragment_regs == 32
+    assert kv256.num_softmax_score_fragments == 4
+    assert kv256.kv_block_size % kv256.softmax_score_fragment_regs == 0
+
+    kv128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
+    assert kv128.tile_size_kv != 256
+    assert kv128.num_softmax_score_fragments == 1
+    assert not kv128.streams_tmem_p_fragments
+
+
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
     None
 ):
@@ -2263,12 +2287,7 @@ def test_attention_ts_decode_kv256_rejects_incompatible_profile_overrides(
     ("persistent", "use_attention_sinks", "expected_error"),
     (
         pytest.param(False, False, None, id="static"),
-        pytest.param(
-            True,
-            False,
-            "persistent KV256 requires kv_stages=3",
-            id="persistent-direct",
-        ),
+        pytest.param(True, False, None, id="persistent-direct"),
         pytest.param(True, True, None, id="persistent-sinks"),
     ),
 )
@@ -2277,7 +2296,11 @@ def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
     use_attention_sinks: bool,
     expected_error: str | None,
 ) -> None:
-    """Keep KV2 where work boundaries make its fixed exchange safe."""
+    """Two K/V stages are legal for every KV256 scheduler.
+
+    The tail exchange owns its own SMEM, so no scheduler needs a spare ring
+    stage for it; the pipeline depth is a pure throughput tunable.
+    """
 
     config_args = {
         "kv_stages": 2,

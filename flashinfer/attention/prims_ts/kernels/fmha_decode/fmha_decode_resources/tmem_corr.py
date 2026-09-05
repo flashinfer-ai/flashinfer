@@ -895,113 +895,117 @@ class TmemCorrResource(DecodeGenResourceBase):
         return merged_vals
 
     @cute.jit
-    def _store_final_o_vec16(
+    def _store_final_o_columns(
         self,
         final_o_dst,
         output_vals: cutlass.Array,
         norm_scale: Float32,
-        o_is_32b_aligned: cutlass.Boolean,
+        *,
+        count: Constexpr[int],
+        sector_aligned: cutlass.Boolean,
     ) -> None:
-        """Pack 16 contiguous output columns and store them as one 32-byte sector.
+        """Scale, pack, and store ``count`` contiguous final output columns.
 
-        The 256-bit store needs a 32-byte-aligned destination; misaligned output
-        buffers fall back to two 16-byte stores of the same packed registers.
-        FP8 output keeps the 8-element packing path.
+        FP8 output packs four values per register and writes eight columns per
+        8-byte store. 16-bit output packs pairs; sixteen columns fill one
+        32-byte sector and go out as a single 256-bit store when the
+        destination is sector aligned, otherwise every eight columns use one
+        16-byte store. Callers choose ``count`` per path: the KV256 tail owns
+        whole rows per lane and pays for half-written sectors, while the
+        split-KV reducers write eight-column fragments.
         """
         cfg = self.cfg
+        assert count % 8 == 0
         if cutlass.const_expr(cfg.use_fp8_output):
-            self._store_final_o_vec8(final_o_dst, output_vals, norm_scale)
-            upper_vals = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-            for elem in cutlass.range_constexpr(8):
-                upper_vals[elem] = output_vals[8 + elem]
-            self._store_final_o_vec8(
-                final_o_dst + Int32(8 * cfg.o_dtype_bytes // 4),
-                upper_vals,
-                norm_scale,
-            )
+            for chunk_idx in cutlass.range_constexpr(count // 8):
+                fp8_regs = self._pack_fp8_output_quads(
+                    output_vals, norm_scale, chunk_idx * 8
+                )
+                (final_o_dst + Int32(chunk_idx * 2)).store(
+                    fp8_regs.data_ptr().load(count=2, alignment=4),
+                    alignment=8,
+                )
         else:
-            final_regs = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
-            for reg_idx in cutlass.range_constexpr(8):
-                pair = fmul2(
-                    (norm_scale, norm_scale),
-                    (
-                        output_vals[reg_idx * 2],
-                        output_vals[reg_idx * 2 + 1],
-                    ),
-                )
-                if cutlass.const_expr(cfg.use_bf16_output):
-                    final_regs[reg_idx] = _pack_float2_to_bf16(pair[0], pair[1])
+            final_regs = self._pack_final_o_regs(output_vals, norm_scale, count)
+            if cutlass.const_expr(count == 16):
+                if sector_aligned:
+                    final_o_dst.store(
+                        final_regs.data_ptr().load(count=8, alignment=4),
+                        alignment=32,
+                    )
                 else:
-                    final_regs[reg_idx] = _pack_float2_to_fp16(pair[0], pair[1])
-            if o_is_32b_aligned:
-                final_o_dst.store(
-                    final_regs.data_ptr().load(count=8, alignment=4),
-                    alignment=32,
-                )
+                    self._store_16bit_output_chunks(final_o_dst, final_regs, count)
             else:
-                final_o_dst.store(
-                    final_regs.data_ptr().load(count=4, alignment=4),
-                    alignment=16,
-                )
-                (final_o_dst + Int32(4)).store(
-                    (final_regs.data_ptr() + Int32(4)).load(count=4, alignment=4),
-                    alignment=16,
-                )
+                self._store_16bit_output_chunks(final_o_dst, final_regs, count)
 
     @cute.jit
-    def _store_final_o_vec8(
+    def _store_16bit_output_chunks(
         self,
         final_o_dst,
-        output_vals: cutlass.Array,
-        norm_scale: Float32,
+        final_regs: cutlass.Array,
+        count: Constexpr[int],
     ) -> None:
-        """Pack one contiguous 8-element output fragment to the final O dtype."""
-        cfg = self.cfg
-        if cutlass.const_expr(cfg.use_fp8_output):
-            final_pairs = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-            for pair_idx in cutlass.range_constexpr(4):
-                val_base = pair_idx * 2
-                pair = fmul2(
-                    (norm_scale, norm_scale),
-                    (output_vals[val_base], output_vals[val_base + 1]),
-                )
-                final_pairs[val_base] = pair[0]
-                final_pairs[val_base + 1] = pair[1]
-            final_fp8_regs = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
-            final_fp8_regs[0] = _pack_float4_to_fp8_e4m3(
-                final_pairs[0],
-                final_pairs[1],
-                final_pairs[2],
-                final_pairs[3],
-            )
-            final_fp8_regs[1] = _pack_float4_to_fp8_e4m3(
-                final_pairs[4],
-                final_pairs[5],
-                final_pairs[6],
-                final_pairs[7],
-            )
-            final_o_dst.store(
-                final_fp8_regs.data_ptr().load(count=2, alignment=4),
-                alignment=8,
-            )
-        else:
-            final_regs = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-            for reg_idx in cutlass.range_constexpr(4):
-                pair = fmul2(
-                    (norm_scale, norm_scale),
-                    (
-                        output_vals[reg_idx * 2],
-                        output_vals[reg_idx * 2 + 1],
-                    ),
-                )
-                if cutlass.const_expr(cfg.use_bf16_output):
-                    final_regs[reg_idx] = _pack_float2_to_bf16(pair[0], pair[1])
-                else:
-                    final_regs[reg_idx] = _pack_float2_to_fp16(pair[0], pair[1])
-            final_o_dst.store(
-                final_regs.data_ptr().load(count=4, alignment=4),
+        """Store packed 16-bit output columns as 16-byte chunks of eight columns."""
+        for chunk_idx in cutlass.range_constexpr(count // 8):
+            (final_o_dst + Int32(chunk_idx * 4)).store(
+                (final_regs.data_ptr() + Int32(chunk_idx * 4)).load(
+                    count=4, alignment=4
+                ),
                 alignment=16,
             )
+
+    @cute.jit
+    def _pack_fp8_output_quads(
+        self,
+        output_vals: cutlass.Array,
+        norm_scale: Float32,
+        first_col: Constexpr[int],
+    ) -> cutlass.Array:
+        """Scale eight output columns from ``first_col`` into two FP8 registers."""
+        final_pairs = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
+        for pair_idx in cutlass.range_constexpr(4):
+            val_base = pair_idx * 2
+            pair = fmul2(
+                (norm_scale, norm_scale),
+                (
+                    output_vals[first_col + val_base],
+                    output_vals[first_col + val_base + 1],
+                ),
+            )
+            final_pairs[val_base] = pair[0]
+            final_pairs[val_base + 1] = pair[1]
+        fp8_regs = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
+        fp8_regs[0] = _pack_float4_to_fp8_e4m3(
+            final_pairs[0], final_pairs[1], final_pairs[2], final_pairs[3]
+        )
+        fp8_regs[1] = _pack_float4_to_fp8_e4m3(
+            final_pairs[4], final_pairs[5], final_pairs[6], final_pairs[7]
+        )
+        return fp8_regs
+
+    @cute.jit
+    def _pack_final_o_regs(
+        self,
+        output_vals: cutlass.Array,
+        norm_scale: Float32,
+        count: Constexpr[int],
+    ) -> cutlass.Array:
+        """Scale ``count`` output columns and pack them as 16-bit pairs."""
+        cfg = self.cfg
+        final_regs = cutlass.Array(Int32, count // 2, space=cutlass.AddressSpace.rmem)
+        for reg_idx in cutlass.range_constexpr(count // 2):
+            pair = fmul2(
+                (norm_scale, norm_scale),
+                (
+                    output_vals[reg_idx * 2],
+                    output_vals[reg_idx * 2 + 1],
+                ),
+            )
+            if cutlass.const_expr(cfg.use_bf16_output):
+                final_regs[reg_idx] = _pack_float2_to_bf16(pair[0], pair[1])
+            else:
+                final_regs[reg_idx] = _pack_float2_to_fp16(pair[0], pair[1])
+        return final_regs
 
     @cute.jit
     def _store_softmax_normalized_o_vec8(
@@ -1028,7 +1032,13 @@ class TmemCorrResource(DecodeGenResourceBase):
             mem_space=1,
             dtype=Int32,
         )
-        self._store_final_o_vec8(final_o_dst, output_vals, norm_scale)
+        self._store_final_o_columns(
+            final_o_dst,
+            output_vals,
+            norm_scale,
+            count=8,
+            sector_aligned=cutlass.Boolean(False),
+        )
 
     @cute.jit
     def _softmax_output_row_state(
@@ -2387,6 +2397,97 @@ class TmemCorrResource(DecodeGenResourceBase):
         return cutlass.Vector.from_elements(combined, Float32)
 
     @cute.jit
+    def _store_kv_tile_256_direct_fragment(
+        self,
+        own_vals: cutlass.Array,
+        peer_vals,
+        *,
+        fragment_col: Constexpr[int],
+        dst_row_base: Int64,
+        norm_scale: Float32,
+        valid_output_row: cutlass.Boolean,
+        o_is_32b_aligned: cutlass.Boolean,
+    ) -> None:
+        """Merge one D32 fragment with its peer half and write the final output.
+
+        Sixteen columns go out per store so each lane writes one full 32-byte
+        sector. Adjacent lanes own adjacent rows, so 16-byte stores would leave
+        every sector half-written twice.
+        """
+        cfg = self.cfg
+        for vector_pair in cutlass.range_constexpr(2):
+            pair_col = vector_pair * 16
+            merged_vals = self._merge_kv_tile_256_peer_fragment(
+                own_vals,
+                peer_vals,
+                pair_col,
+                16,
+            )
+            if valid_output_row:
+                output_col = fragment_col + pair_col
+                dst_offset = dst_row_base + Int32(output_col * cfg.o_dtype_bytes)
+                final_o_dst = cutlass.inttoptr(
+                    self.o_ptr.toint() + cutlass.Int64(dst_offset),
+                    mem_space=1,
+                    dtype=Int32,
+                )
+                self._store_final_o_columns(
+                    final_o_dst,
+                    merged_vals,
+                    norm_scale,
+                    count=16,
+                    sector_aligned=o_is_32b_aligned,
+                )
+
+    @cute.jit
+    def _store_kv_tile_256_partial_fragment(
+        self,
+        own_vals: cutlass.Array,
+        peer_vals,
+        *,
+        fragment_col: Constexpr[int],
+        partial_row_base: Int64,
+        partial_scale: Float32,
+        valid_output_row: cutlass.Boolean,
+    ) -> None:
+        """Merge one D32 fragment with its peer half and write the split-KV partial."""
+        cfg = self.cfg
+        partial_o_uses_bf16 = (
+            cfg.use_bf16_separate_partial_o
+            if cfg.use_separate_reduction_kernel
+            else cfg.use_bf16_output
+        )
+        for vector_idx in cutlass.range_constexpr(4):
+            vector_col = vector_idx * 8
+            output_vals = self._merge_kv_tile_256_peer_fragment(
+                own_vals,
+                peer_vals,
+                vector_col,
+                8,
+            )
+            if valid_output_row:
+                output_col = fragment_col + vector_col
+                scaled_values: tuple = ()
+                for elem in cutlass.range_constexpr(0, 8, 2):
+                    scaled_values += fmul2(
+                        (partial_scale, partial_scale),
+                        (output_vals[elem], output_vals[elem + 1]),
+                    )
+                scaled_vector = cutlass.Vector.from_elements(scaled_values, Float32)
+                if cutlass.const_expr(partial_o_uses_bf16):
+                    packed = scaled_vector.to(cutlass.BFloat16).bitcast(Int32)
+                else:
+                    packed = scaled_vector.to(cutlass.Float16).bitcast(Int32)
+                partial_o_dst = cutlass.inttoptr(
+                    self.partial_o_ptr.toint()
+                    + partial_row_base
+                    + Int64(output_col * cfg.o_dtype_bytes),
+                    mem_space=1,
+                    dtype=Int32,
+                )
+                partial_o_dst.store(packed, alignment=16)
+
+    @cute.jit
     def _kv_tile_256_merge_spatial_output(
         self,
         *,
@@ -2414,11 +2515,6 @@ class TmemCorrResource(DecodeGenResourceBase):
         serializing the complete D128 upper and lower halves.
         """
         cfg = self.cfg
-        partial_o_uses_bf16 = (
-            cfg.use_bf16_separate_partial_o
-            if cfg.use_separate_reduction_kernel
-            else cfg.use_bf16_output
-        )
         output_exchange_base = Int32(
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
         )
@@ -2504,70 +2600,24 @@ class TmemCorrResource(DecodeGenResourceBase):
                     count=32, alignment=16
                 )
                 if cutlass.const_expr(not cfg.use_split_kv):
-                    # Direct output: merge and store 16 columns per instruction so
-                    # each lane writes one full 32-byte sector. Adjacent lanes own
-                    # adjacent rows, so 16-byte stores would leave every sector
-                    # half-written twice.
-                    for vector_pair in cutlass.range_constexpr(2):
-                        pair_col = vector_pair * 16
-                        merged_vals = self._merge_kv_tile_256_peer_fragment(
-                            own_vals,
-                            peer_vals,
-                            pair_col,
-                            16,
-                        )
-                        if valid_output_row:
-                            output_col = fragment_col + pair_col
-                            dst_offset = dst_row_base + Int32(
-                                output_col * cfg.o_dtype_bytes
-                            )
-                            final_o_dst = cutlass.inttoptr(
-                                self.o_ptr.toint() + cutlass.Int64(dst_offset),
-                                mem_space=1,
-                                dtype=Int32,
-                            )
-                            self._store_final_o_vec16(
-                                final_o_dst,
-                                merged_vals,
-                                norm_scale,
-                                o_is_32b_aligned,
-                            )
+                    self._store_kv_tile_256_direct_fragment(
+                        own_vals,
+                        peer_vals,
+                        fragment_col=fragment_col,
+                        dst_row_base=dst_row_base,
+                        norm_scale=norm_scale,
+                        valid_output_row=valid_output_row,
+                        o_is_32b_aligned=o_is_32b_aligned,
+                    )
                 else:
-                    for vector_idx in cutlass.range_constexpr(4):
-                        vector_col = vector_idx * 8
-                        output_vals = self._merge_kv_tile_256_peer_fragment(
-                            own_vals,
-                            peer_vals,
-                            vector_col,
-                            8,
-                        )
-                        if valid_output_row:
-                            output_col = fragment_col + vector_col
-                            scaled_values: tuple = ()
-                            for elem in cutlass.range_constexpr(0, 8, 2):
-                                scaled_values += fmul2(
-                                    (partial_scale, partial_scale),
-                                    (output_vals[elem], output_vals[elem + 1]),
-                                )
-                            scaled_vector = cutlass.Vector.from_elements(
-                                scaled_values, Float32
-                            )
-                            if cutlass.const_expr(partial_o_uses_bf16):
-                                packed = scaled_vector.to(cutlass.BFloat16).bitcast(
-                                    Int32
-                                )
-                            else:
-                                packed = scaled_vector.to(cutlass.Float16).bitcast(
-                                    Int32
-                                )
-                            partial_o_dst = cutlass.inttoptr(
-                                self.partial_o_ptr.toint()
-                                + partial_row_base
-                                + Int64(output_col * cfg.o_dtype_bytes),
-                                mem_space=1,
-                                dtype=Int32,
-                            )
-                            partial_o_dst.store(packed, alignment=16)
+                    self._store_kv_tile_256_partial_fragment(
+                        own_vals,
+                        peer_vals,
+                        fragment_col=fragment_col,
+                        partial_row_base=partial_row_base,
+                        partial_scale=partial_scale,
+                        valid_output_row=valid_output_row,
+                    )
 
         if cutlass.const_expr(cfg.use_split_kv):
             if valid_output_row:
