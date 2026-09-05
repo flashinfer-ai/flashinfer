@@ -51,6 +51,9 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
     build_fmha_task_manager,
 )
+from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
+    FmhaConfig,
+)
 from flashinfer.utils import is_sm100a_supported
 
 
@@ -535,6 +538,8 @@ def _plan_paged_wrapper(
     max_kv_len: Optional[int] = None,
     extra_page_columns: int = 0,
     row_stride_multiplier: int = 1,
+    uniform_packed_lengths: bool = False,
+    has_q_offset: bool = True,
 ) -> _NativePagedMetadata:
     """Compile a conservative paged plan and return its per-run metadata."""
 
@@ -562,6 +567,8 @@ def _plan_paged_wrapper(
         window_left=reference.window_left,
         sm_scale=reference.sm_scale,
         output_scale=reference.output_scale,
+        uniform_packed_lengths=uniform_packed_lengths,
+        has_q_offset=has_q_offset,
     )
     return metadata
 
@@ -915,6 +922,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "window_left",
         "sm_scale",
         "output_scale",
+        "uniform_packed_lengths",
+        "has_q_offset",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -936,6 +945,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert plan_parameters["uniform_packed_lengths"].default is False
+    assert plan_parameters["has_q_offset"].default is True
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
@@ -1085,6 +1096,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         q_dtype=torch.float16,
         kv_dtype=torch.float16,
         output_dtype=torch.float16,
+        uniform_packed_lengths=False,
+        has_q_offset=False,
     )
 
     def resolve(*args, **kwargs):
@@ -1123,6 +1136,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert resolve_kwargs["block_tables"] is block_tables
     assert resolve_kwargs["seq_lens_kv"] is seq_lens_kv
     assert calls["plan"]["max_kv_len"] == 65
+    assert calls["plan"]["uniform_packed_lengths"] is False
+    assert calls["plan"]["has_q_offset"] is False
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
@@ -1484,6 +1499,95 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     assert wrapper._plan_state.geometry.packed_dense_k_mask is True
 
 
+def test_attention_ts_context_paged_explicit_uniform_plan_compiles_once(
+    monkeypatch,
+) -> None:
+    """One explicit metadata contract selects one compiled specialization."""
+
+    compile_specs = []
+    launches = []
+
+    def fake_compile(compile_spec):
+        compile_specs.append(compile_spec)
+        marker = "uniform" if compile_spec.uniform_packed_lengths else "dynamic"
+
+        def compiled(*args):
+            launches.append((marker, args))
+
+        return compiled, (("marker", marker),)
+
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_paged_context_scheduler",
+        lambda geometry: (
+            "static_persistent"
+            if geometry.uniform_packed_lengths
+            else "clc_dynamic_persistent"
+        ),
+    )
+    monkeypatch.setattr(context_module, "_get_compiled_paged_context", fake_compile)
+
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper.plan(
+        device="cuda:0",
+        batch_size=2,
+        max_seq_len_q=64,
+        max_kv_len=64,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        mask_type="causal",
+        uniform_packed_lengths=True,
+        has_q_offset=False,
+    )
+
+    assert len(compile_specs) == 1
+    assert compile_specs[0].uniform_packed_lengths is True
+    assert compile_specs[0].has_q_offset is False
+    state = wrapper._plan_state
+    assert state is not None
+    assert state.geometry.uniform_packed_lengths is True
+    assert state.geometry.has_q_offset is False
+    assert dict(state.policy)["marker"] == "uniform"
+    assert not hasattr(state, "uniform_compiled")
+    assert not hasattr(state, "uniform_policy")
+
+    k_cache = torch.empty((4, 2, 32, 128), dtype=torch.float16)
+    v_cache = torch.empty_like(k_cache)
+    full_q = torch.empty((128, 4, 128), dtype=torch.float16)
+    partial_q = torch.empty((127, 4, 128), dtype=torch.float16)
+    full_metadata = tuple(torch.empty(1) for _ in range(3))
+    partial_metadata = tuple(torch.empty(2) for _ in range(3))
+
+    wrapper.run(
+        full_q,
+        k_cache,
+        v_cache,
+        *full_metadata,
+        out=torch.empty_like(full_q),
+        validate=False,
+    )
+    wrapper.run(
+        partial_q,
+        k_cache,
+        v_cache,
+        *partial_metadata,
+        out=torch.empty_like(partial_q),
+        validate=False,
+    )
+
+    assert [marker for marker, _args in launches] == ["uniform", "uniform"]
+    assert launches[0][1][7] is full_metadata[1]
+    assert launches[1][1][7] is partial_metadata[1]
+
+
 def test_attention_ts_context_failed_paged_replan_retains_previous_state(
     monkeypatch,
 ) -> None:
@@ -1587,6 +1691,8 @@ def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
 def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     monkeypatch,
 ) -> None:
+    """Explicit metadata promises cause no validation or host reads when disabled."""
+
     def fail(*_args, **_kwargs):
         pytest.fail("validate=False reached an explicit runtime validator")
 
@@ -1600,7 +1706,11 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     launched = []
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
-        geometry=SimpleNamespace(output_dtype=out.dtype),
+        geometry=SimpleNamespace(
+            output_dtype=out.dtype,
+            uniform_packed_lengths=True,
+            has_q_offset=False,
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *args: launched.append(args),
@@ -1798,6 +1908,8 @@ def _validate_paged_metadata_on_cpu(
     seq_lens_kv: tuple[int, ...] = (33, 64),
     max_kv_len: int = 65,
     row_stride_extra: int = 0,
+    uniform_packed_lengths: bool = False,
+    has_q_offset: bool = True,
 ) -> None:
     """Exercise metadata value checks without requiring a CUDA device."""
 
@@ -1809,6 +1921,8 @@ def _validate_paged_metadata_on_cpu(
         max_kv_len=max_kv_len,
         page_size=32,
         mask_type="causal",
+        uniform_packed_lengths=uniform_packed_lengths,
+        has_q_offset=has_q_offset,
     )
     compact_block_tables = torch.tensor(block_tables, dtype=torch.int32)
     if row_stride_extra:
@@ -1853,6 +1967,64 @@ def test_attention_ts_context_paged_validation_allows_fixed_stride_extra_padding
         seq_lens_kv=(33, 32),
         max_kv_len=33,
         row_stride_extra=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            {
+                "qo_indptr": (0, 63, 127),
+                "seq_lens_kv": (64, 64),
+                "uniform_packed_lengths": True,
+            },
+            "uniform_packed_lengths",
+            id="uniform-q-length",
+        ),
+        pytest.param(
+            {
+                "qo_indptr": (0, 64, 128),
+                "seq_lens_kv": (64, 63),
+                "uniform_packed_lengths": True,
+            },
+            "uniform_packed_lengths",
+            id="uniform-kv-length",
+        ),
+        pytest.param(
+            {
+                "qo_indptr": (0, 32, 64),
+                "seq_lens_kv": (33, 32),
+                "has_q_offset": False,
+            },
+            "has_q_offset",
+            id="unexpected-causal-q-offset",
+        ),
+    ),
+)
+def test_attention_ts_context_paged_validation_enforces_declared_length_contract(
+    monkeypatch,
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _validate_paged_metadata_on_cpu(
+            monkeypatch,
+            max_kv_len=64,
+            **overrides,
+        )
+
+
+def test_attention_ts_context_paged_validation_defaults_allow_dynamic_lengths(
+    monkeypatch,
+) -> None:
+    _validate_paged_metadata_on_cpu(
+        monkeypatch,
+        qo_indptr=(0, 2, 5),
+        seq_lens_kv=(33, 64),
+        max_kv_len=64,
+        uniform_packed_lengths=False,
+        has_q_offset=True,
     )
 
 
@@ -2798,6 +2970,118 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
     assert context_module._paged_context_compile_spec(causal_geometry) != (
         context_module._paged_context_compile_spec(dense_geometry)
     )
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "expected"),
+    [
+        pytest.param(
+            {"use_paged_kv": False},
+            False,
+            id="nonpaged",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": False,
+                "is_causal": True,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+            },
+            True,
+            id="dynamic-paged",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": False,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+            },
+            True,
+            id="uniform-dense",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "has_q_offset": True,
+                "uniform_seq_len_q": 896,
+                "uniform_seq_len_k": 1024,
+            },
+            True,
+            id="uniform-causal-q-offset",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "uniform_seq_len_q": 1000,
+                "uniform_seq_len_k": 1000,
+            },
+            True,
+            id="uniform-partial-k-tile",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "uniform_seq_len_q": 384,
+                "uniform_seq_len_k": 384,
+            },
+            True,
+            id="uniform-odd-paired-domain",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+            },
+            False,
+            id="uniform-qwen-1024-query-paired",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+                "num_qkv_instances": 1,
+            },
+            False,
+            id="uniform-d256-single",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": True,
+                "is_causal": True,
+                "uniform_seq_len_q": 1000,
+                "uniform_seq_len_k": 1000,
+                "num_qkv_instances": 1,
+            },
+            True,
+            id="uniform-d256-single-partial",
+        ),
+    ],
+)
+def test_attention_ts_context_paged_v_tail_clear_policy(
+    config_overrides,
+    expected,
+):
+    """Only complete exact-uniform causal grids omit the V-tail clear."""
+
+    cfg = FmhaConfig(kv_tile_n=128, q_tile_m=128, **config_overrides)
+
+    assert cfg.needs_paged_v_tail_clear is expected
 
 
 def test_attention_ts_context_paged_rejects_variable_window_before_compile(

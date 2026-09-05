@@ -818,7 +818,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         device=device,
         dtype=q_init_dtype,
     )
-    qo_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * s_qo
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q.shape = }")
 
@@ -1026,7 +1025,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         # PrimTS accepts compact HND pages, so preserve the logical values in a
         # backend-specific compact cache.
         prims_ts_kv_cache = kv_cache.contiguous()
-        prims_ts_out = torch.empty_like(q, dtype=o_data_type)
+        prims_ts_q_shape = (
+            (batch_size, num_qo_heads, head_dim_qk)
+            if s_qo == 1
+            else (batch_size, s_qo, num_qo_heads, head_dim_qk)
+        )
+        prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
             device,
@@ -1037,7 +1041,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             page_size,
             s_kv,
             max_seq_len_q=s_qo,
-            packed_query=True,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=o_data_type,
@@ -1121,12 +1125,16 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 out_dtype=o_data_type,
             )
         elif backend == "prims-ts":
+            runtime_q = (
+                q.view(batch_size, num_qo_heads, head_dim_qk)
+                if s_qo == 1
+                else q.view(batch_size, s_qo, num_qo_heads, head_dim_qk)
+            )
             result = backend_wrappers[backend].run(
-                q,
+                runtime_q,
                 kv_cache,
                 actual_seq_lens_kv.flatten(),
                 block_tables,
-                qo_indptr=qo_indptr,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=out,
@@ -1208,13 +1216,17 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if run_refcheck and "prims-ts" in outputs and is_cuda_graph_compatible:
+        prims_ts_runtime_q = (
+            q.view(batch_size, num_qo_heads, head_dim_qk)
+            if s_qo == 1
+            else q.view(batch_size, s_qo, num_qo_heads, head_dim_qk)
+        )
         graph_output = _replay_cuda_graph_once(
             lambda: backend_wrappers["prims-ts"].run(
-                q,
+                prims_ts_runtime_q,
                 prims_ts_kv_cache,
                 actual_seq_lens_kv.flatten(),
                 block_tables,
-                qo_indptr=qo_indptr,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=prims_ts_out,
@@ -1760,6 +1772,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
             output_scale=prims_ts_output_scale,
+            uniform_packed_lengths=not args.random_actual_seq_len,
+            has_q_offset=causal and s_qo != s_kv,
         )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
@@ -3453,7 +3467,14 @@ def testBatchMLAPagedAttentionWrapper(args):
     prims_ts_out = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
-        prims_ts_out = torch.empty_like(q_nope, dtype=torch.bfloat16)
+        prims_ts_out = torch.empty(
+            batch_size,
+            s_qo,
+            num_qo_heads,
+            head_dim_ckv,
+            device=device,
+            dtype=torch.bfloat16,
+        )
         backend_wrappers["prims-ts"] = prims_ts.BatchMLADecodePagedTSWrapper()
         backend_wrappers["prims-ts"].plan(
             device,
@@ -3464,7 +3485,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             page_size,
             s_kv,
             max_seq_len_q=s_qo,
-            packed_query=True,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=torch.bfloat16,
@@ -3605,11 +3626,15 @@ def testBatchMLAPagedAttentionWrapper(args):
             return (
                 backend_wrappers[backend]
                 .run(
-                    q,
+                    q.view(
+                        batch_size,
+                        s_qo,
+                        num_qo_heads,
+                        head_dim_ckv + head_dim_kpe,
+                    ),
                     kv_cache,
                     block_tables,
                     actual_seq_lens_kv.flatten(),
-                    qo_indptr=qo_indptr,
                     bmm1_scale=sm_scale,
                     bmm2_scale=1.0,
                     out=out,
@@ -3753,11 +3778,15 @@ def testBatchMLAPagedAttentionWrapper(args):
     if run_refcheck and "prims-ts" in outputs and is_cuda_graph_compatible:
         graph_output = _replay_cuda_graph_once(
             lambda: backend_wrappers["prims-ts"].run(
-                q,
+                q.view(
+                    batch_size,
+                    s_qo,
+                    num_qo_heads,
+                    head_dim_ckv + head_dim_kpe,
+                ),
                 kv_cache,
                 block_tables,
                 actual_seq_lens_kv.flatten(),
-                qo_indptr=qo_indptr,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 out=prims_ts_out,
