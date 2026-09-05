@@ -21,13 +21,13 @@ position pos::
 
     logits[b*next_n+t, pos] = Σ_h w[b*next_n+t,h] · relu(Q[b,t,h,:]@K[pos,:]ᵀ)
 
-where K is paged via ``block_table``.  ReLU is applied per head, *before*
+where K is paged via ``block_tables``.  ReLU is applied per head, *before*
 weighting and reduction -- not to the sum, so the output is not clamped to be
 non-negative.  FP8 multiplies the result by the per-token KV scale
 (``· scale[pos]``); FP4 folds its per-(token, K-group) UE8M0 scales into
 dequantizing Q and K, so it has no trailing scale factor.
 
-Both kernels are Blackwell (SM100/SM103) only.
+Both kernels run on datacentre Blackwell (SM100/SM103) and Rubin (SM107).
 """
 
 import torch
@@ -43,27 +43,27 @@ def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
-def _make_paged_block_table(context_lens, block_size, device):
-    """Random paged block table + total block count for a batch of context lens.
+def _make_paged_block_table(seq_lens, block_size, device):
+    """Random paged block table + total block count for a batch of seq_lens.
 
-    Sized for the kernel's access pattern: it reads ceil(ctx/128) compute tiles *
-    (128 // block_size) physical blocks per row, which exceeds ceil(ctx/block_size)
-    when ctx is not a multiple of 128. The extra columns default to physical index
-    0 (a valid pool block); those positions are beyond ctx (masked), so this avoids
-    an out-of-bounds block_table / KV read."""
-    n_blk = (context_lens + block_size - 1) // block_size
-    kern_blk = ((context_lens + 127) // 128) * (128 // block_size)
-    total = int(n_blk.sum().item()) + context_lens.shape[0] * 2
+    Sized for the kernel's access pattern: it reads ceil(seq_len/128) compute tiles *
+    (128 // block_size) physical blocks per row, which exceeds ceil(seq_len/block_size)
+    when seq_len is not a multiple of 128. The extra columns default to physical index
+    0 (a valid pool block); those positions are beyond seq_len (masked), so this avoids
+    an out-of-bounds block_tables / KV read."""
+    n_blk = (seq_lens + block_size - 1) // block_size
+    kern_blk = ((seq_lens + 127) // 128) * (128 // block_size)
+    total = int(n_blk.sum().item()) + seq_lens.shape[0] * 2
     max_blk = int(kern_blk.max().item())
-    block_table = torch.zeros(
-        (context_lens.shape[0], max_blk), dtype=torch.int32, device=device
+    block_tables = torch.zeros(
+        (seq_lens.shape[0], max_blk), dtype=torch.int32, device=device
     )
     pool = torch.randperm(total, device=device, dtype=torch.int32)
     off = 0
     for i, nb in enumerate(n_blk.tolist()):
-        block_table[i, :nb] = pool[off : off + nb]
+        block_tables[i, :nb] = pool[off : off + nb]
         off += nb
-    return block_table, total
+    return block_tables, total
 
 
 def _pack_fused_kv_fp8(kv_fp8, kv_scales, block_size, head_dim):
@@ -90,9 +90,9 @@ def _fp8_paged_mqa_logits_reference(
     q,
     kv_fused,
     weights,
-    context_lens,
-    block_table,
-    max_context_len,
+    block_tables,
+    seq_lens,
+    max_seq_len,
     output_dtype=torch.float32,
 ):
     """Pure-torch reference operating on the packed FP8 API inputs.
@@ -119,28 +119,28 @@ def _fp8_paged_mqa_logits_reference(
 
     q_f32 = q.float()
     logits = torch.full(
-        (B * next_n, max_context_len), float("-inf"), device=device, dtype=output_dtype
+        (B * next_n, max_seq_len), float("-inf"), device=device, dtype=output_dtype
     )
     for b in range(B):
-        ctx = int(context_lens[b].item())
-        q_pos = torch.arange(ctx - next_n, ctx, device=device)
+        seq_len = int(seq_lens[b].item())
+        q_pos = torch.arange(seq_len - next_n, seq_len, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].to(output_dtype)
-        for blk in range((ctx + block_size - 1) // block_size):
-            phys = int(block_table[b, blk].item())
+        for blk in range((seq_len + block_size - 1) // block_size):
+            phys = int(block_tables[b, blk].item())
             k = kv_fp8[phys].float()
             sc = scales[phys].to(output_dtype)
             kpos = torch.arange(blk * block_size, (blk + 1) * block_size, device=device)
-            mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
+            mask = (kpos[None, :] < seq_len) & (kpos[None, :] <= q_pos[:, None])
             qk = torch.matmul(q_f32[b].permute(1, 0, 2), k.T)
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
             qk = torch.relu(qk).to(output_dtype)
             weighted = (w.T[:, :, None] * qk).sum(dim=0) * sc[None, :]
-            # max_context_len is a free axis and need not be page-aligned, so
-            # the last physical page can extend past the output width. Clip
+            # max_seq_len is a free axis and need not be block-aligned, so
+            # the last physical block can extend past the output width. Clip
             # both the destination and the right-hand side to it.
             s = blk * block_size
-            e = min(s + block_size, max_context_len)
-            if s >= max_context_len:
+            e = min(s + block_size, max_seq_len)
+            if s >= max_seq_len:
                 break
             width = e - s
             logits[b * next_n : (b + 1) * next_n, s:e] = torch.where(
@@ -158,15 +158,15 @@ def _paged_mqa_logits_masked_check(
     reference_outputs,
     actual_outputs,
     *,
-    context_lens=None,
+    seq_lens=None,
     next_n=None,
     rtol=2e-2,
     atol=2e-2,
     **_unused,
 ):
-    """Compare kernel logits vs reference over the causal, in-context region.
+    """Compare kernel logits vs reference over the causal, within-length region.
 
-    Positions beyond each row's causal limit (and the SPLIT_KV-padded padding the
+    Positions beyond each row's causal limit (and the padded trailing columns the
     kernel may write) are excluded.  A non-finite *reference* is tolerated --
     that is the fp8/fp4 accumulation-order argument -- but a non-finite *actual*
     is a kernel failure and fails the check.  Excluding both sides symmetrically
@@ -187,14 +187,12 @@ def _paged_mqa_logits_masked_check(
         return False
     device = ref.device
     rows, max_len = ref.shape
-    if context_lens is None or next_n is None:
+    if seq_lens is None or next_n is None:
         neginf_mask = torch.zeros((rows, max_len), dtype=torch.bool, device=device)
     else:
         positions = torch.arange(max_len, device=device).unsqueeze(0).expand(rows, -1)
         offsets = torch.arange(rows, device=device)
-        limits = (
-            context_lens[offsets // next_n] - next_n + offsets % next_n
-        ).unsqueeze(1)
+        limits = (seq_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
         neginf_mask = ~(positions <= limits)
 
     r = ref.float().masked_fill(neginf_mask, 0)
@@ -242,16 +240,14 @@ def _fp8_paged_mqa_logits_init(
     num_heads: int = 64,
     head_dim: int = 128,
     block_size: int = 64,
-    max_context_len: int = 4096,
+    max_seq_len: int = 4096,
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build valid inputs for ``flashinfer.fp8_paged_mqa_logits`` (fixed context)."""
+    """Build valid inputs for ``flashinfer.fp8_paged_mqa_logits`` (all rows at max_seq_len)."""
     torch.manual_seed(seed)
-    context_lens = torch.full(
-        (batch_size,), max_context_len, dtype=torch.int32, device=device
-    )
-    block_table, num_blocks = _make_paged_block_table(context_lens, block_size, device)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    block_tables, num_blocks = _make_paged_block_table(seq_lens, block_size, device)
 
     q = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
         torch.float8_e4m3fn
@@ -268,9 +264,9 @@ def _fp8_paged_mqa_logits_init(
         "q": q,
         "kv_fused": kv_fused,
         "weights": weights,
-        "context_lens": context_lens,
-        "block_table": block_table,
-        "max_context_len": max_context_len,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": max_seq_len,
     }
 
 
@@ -286,7 +282,8 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
     name_prefix="fp8_paged_mqa_logits",
     description=(
         "FP8 paged MQA logits: weighted dot-product attention scores against a paged "
-        "KV cache, with per-token FP32 KV scales. Blackwell (SM100/SM103) only."
+        "KV cache, with per-token FP32 KV scales. Datacentre Blackwell "
+        "(SM100/SM103) and Rubin (SM107)."
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
@@ -298,11 +295,11 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             abbrev="D", description="Head dimension (FP8 elements per row)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV block."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim + 4)."
         ),
-        "max_context_len": Var(description="Maximum KV sequence length."),
+        "max_seq_len": Var(description="Maximum KV sequence length."),
     },
     inputs={
         "q": Tensor(
@@ -320,19 +317,19 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             dtype="float32",
             description="Per-head mixing weights.",
         ),
-        "context_lens": Tensor(
-            ["batch_size"], dtype="int32", description="Per-request KV length."
-        ),
-        "block_table": Tensor(
+        "block_tables": Tensor(
             ["batch_size", "max_blocks_per_seq"],
             dtype="int32",
             description="Paged block indices.",
         ),
-        "max_context_len": Scalar("int32", description="Maximum KV sequence length."),
+        "seq_lens": Tensor(
+            ["batch_size"], dtype="int32", description="Per-request KV length."
+        ),
+        "max_seq_len": Scalar("int32", description="Maximum KV sequence length."),
     },
     outputs={
         "logits": Tensor(
-            ["num_rows", "max_context_len"],
+            ["num_rows", "max_seq_len"],
             dtype="float32",
             description="Attention-score logits.",
         ),
@@ -342,7 +339,7 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
         "block_row_bytes == head_dim + 4",
         "num_kv_heads == 1",
     ],
-    tags=["status:verified", "arch:sm100"],
+    tags=["status:verified", "arch:sm100", "arch:sm103", "arch:sm107"],
     reference=_fp8_paged_mqa_logits_reference,
     check=_paged_mqa_logits_masked_check,
     init=_fp8_paged_mqa_logits_init,
@@ -442,12 +439,12 @@ def _pack_kv_cache_fp4(kv_cache):
 @torch.no_grad()
 def _fp4_paged_mqa_logits_reference(
     q,
-    sf_q,
+    q_sf,
     kv_fused,
     weights,
-    context_lens,
-    block_table,
-    max_context_len,
+    block_tables,
+    seq_lens,
+    max_seq_len,
     output_dtype=torch.bfloat16,
 ):
     """Pure-torch reference for the packed FP4 API inputs.
@@ -482,7 +479,7 @@ def _fp4_paged_mqa_logits_reference(
 
     # Dequantize Q.
     q_codes = q.reshape(B * next_n * H, half_D)
-    q_sf = sf_q.reshape(B * next_n * H, 1)
+    q_sf = q_sf.reshape(B * next_n * H, 1)
     q_deq = (
         _cast_back_from_fp4(q_codes, q_sf, gran_k=32)
         .view(B, next_n, H, head_dim)
@@ -490,26 +487,26 @@ def _fp4_paged_mqa_logits_reference(
     )
 
     logits = torch.full(
-        (B * next_n, max_context_len), float("-inf"), device=device, dtype=torch.float32
+        (B * next_n, max_seq_len), float("-inf"), device=device, dtype=torch.float32
     )
     for b in range(B):
-        ctx = int(context_lens[b].item())
-        q_pos = torch.arange(ctx - next_n, ctx, device=device)
+        seq_len = int(seq_lens[b].item())
+        q_pos = torch.arange(seq_len - next_n, seq_len, device=device)
         w = weights[b * next_n : (b + 1) * next_n, :].transpose(0, 1).contiguous()
-        n_blk = (ctx + block_size - 1) // block_size
-        blocks = block_table[b, :n_blk]
+        n_blk = (seq_len + block_size - 1) // block_size
+        blocks = block_tables[b, :n_blk]
         kx = kv_deq[blocks].permute(2, 3, 0, 1).reshape(1, head_dim, -1)
         qx = q_deq[b].transpose(0, 1)  # [H, next_n, D]
         s = torch.matmul(qx, kx).to(torch.float32)  # [H, next_n, total_len]
         total_len = n_blk * block_size
         kpos = torch.arange(0, total_len, device=device)
-        mask = (kpos[None, :] < ctx) & (kpos[None, :] <= q_pos[:, None])
+        mask = (kpos[None, :] < seq_len) & (kpos[None, :] <= q_pos[:, None])
         s = torch.where(mask[None, :, :], s, float("-inf"))
         s = torch.relu(s) * w[..., None]
         s = s.sum(dim=0)
-        # max_context_len is a free axis and need not be page-aligned, so
-        # total_len (a whole number of pages) can exceed the output width.
-        end = min(total_len, max_context_len)
+        # max_seq_len is a free axis and need not be block-aligned, so
+        # total_len (a whole number of blocks) can exceed the output width.
+        end = min(total_len, max_seq_len)
         logits[b * next_n : (b + 1) * next_n, :end] = torch.where(
             (kpos[None, :] <= q_pos[:, None])[:, :end], s[:, :end], float("-inf")
         )
@@ -534,16 +531,14 @@ def _fp4_paged_mqa_logits_init(
     num_heads: int = 64,
     head_dim: int = 128,
     block_size: int = 64,
-    max_context_len: int = 4096,
+    max_seq_len: int = 4096,
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build valid inputs for ``flashinfer.fp4_paged_mqa_logits`` (fixed context)."""
+    """Build valid inputs for ``flashinfer.fp4_paged_mqa_logits`` (all rows at max_seq_len)."""
     torch.manual_seed(seed)
-    context_lens = torch.full(
-        (batch_size,), max_context_len, dtype=torch.int32, device=device
-    )
-    block_table, num_blocks = _make_paged_block_table(context_lens, block_size, device)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    block_tables, num_blocks = _make_paged_block_table(seq_lens, block_size, device)
 
     q_bf = torch.randn(
         batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
@@ -559,16 +554,16 @@ def _fp4_paged_mqa_logits_init(
     q_fp4 = q_packed.view(torch.uint8).view(
         batch_size, next_n, num_heads, head_dim // 2
     )
-    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_sf = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
     kv_fused, _ = _pack_kv_cache_fp4(kv_cache)
     return {
         "q": q_fp4,
-        "sf_q": sf_q,
+        "q_sf": q_sf,
         "kv_fused": kv_fused,
         "weights": weights,
-        "context_lens": context_lens,
-        "block_table": block_table,
-        "max_context_len": max_context_len,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": max_seq_len,
     }
 
 
@@ -591,7 +586,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
     description=(
         "FP4 (MXFP4) paged MQA logits: weighted dot-product attention scores against a "
         "paged KV cache, with block-scaled FP4 Q/K and per-(token, K-group) UE8M0 scale "
-        "factors. Blackwell (SM100/SM103) only."
+        "factors. Datacentre Blackwell (SM100/SM103) and Rubin (SM107)."
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
@@ -603,11 +598,11 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             abbrev="Dp", description="Packed head bytes (head_dim // 2)."
         ),
         "num_kv_heads": Const(abbrev="", description="KV heads (MQA => 1)."),
-        "block_size": Const(abbrev="bs", description="Tokens per physical KV page."),
+        "block_size": Const(abbrev="bs", description="Tokens per physical KV block."),
         "block_row_bytes": Const(
             abbrev="", description="Fused KV row bytes (head_dim//2 + 4)."
         ),
-        "max_context_len": Var(description="Maximum KV sequence length."),
+        "max_seq_len": Var(description="Maximum KV sequence length."),
     },
     inputs={
         "q": Tensor(
@@ -615,10 +610,10 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             dtype="uint8",
             description="Query, FP4 e2m1 (two per byte).",
         ),
-        "sf_q": Tensor(
+        "q_sf": Tensor(
             ["batch_size", "next_n", "num_heads"],
             dtype="int32",
-            description="Query UE8M0 scale factors (4 packed per token).",
+            description="Query UE8M0 scale factors (4 packed per (token, head) int32).",
         ),
         "kv_fused": Tensor(
             ["num_blocks", "block_size", "num_kv_heads", "block_row_bytes"],
@@ -630,19 +625,19 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
             dtype="float32",
             description="Per-head mixing weights.",
         ),
-        "context_lens": Tensor(
-            ["batch_size"], dtype="int32", description="Per-request KV length."
-        ),
-        "block_table": Tensor(
+        "block_tables": Tensor(
             ["batch_size", "max_blocks_per_seq"],
             dtype="int32",
             description="Paged block indices.",
         ),
-        "max_context_len": Scalar("int32", description="Maximum KV sequence length."),
+        "seq_lens": Tensor(
+            ["batch_size"], dtype="int32", description="Per-request KV length."
+        ),
+        "max_seq_len": Scalar("int32", description="Maximum KV sequence length."),
     },
     outputs={
         "logits": Tensor(
-            ["num_rows", "max_context_len"],
+            ["num_rows", "max_seq_len"],
             dtype="bfloat16",
             description="Attention-score logits.",
         ),
@@ -652,7 +647,7 @@ fp4_paged_mqa_logits_trace = TraceTemplate(
         "block_row_bytes == packed_head_dim + 4",
         "num_kv_heads == 1",
     ],
-    tags=["status:verified", "arch:sm100"],
+    tags=["status:verified", "arch:sm100", "arch:sm103", "arch:sm107"],
     reference=_fp4_paged_mqa_logits_reference,
     check=_paged_mqa_logits_masked_check,
     init=_fp4_paged_mqa_logits_init,

@@ -40,20 +40,20 @@ from tests.attn_scores.test_attn_scores import (
 DEVICE = "cuda"
 
 
-def _skip_if_not_sm100():
+def _skip_if_no_paged_mqa_support():
     if not is_sm100a_supported(torch.device(DEVICE)):
-        pytest.skip("paged MQA logits requires SM100a (B200)")
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers to build valid packed inputs from given context_lens
+# Helpers to build valid packed inputs from given seq_lens
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _build_fp8(context_lens, next_n, block_size, seed=0, num_heads=64, head_dim=128):
+def _build_fp8(seq_lens, next_n, block_size, seed=0, num_heads=64, head_dim=128):
     torch.manual_seed(seed)
-    B = context_lens.shape[0]
-    block_table, ntb = _make_paged_kv(B, block_size, context_lens, DEVICE)
+    B = seq_lens.shape[0]
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, DEVICE)
     q = torch.randn(B, next_n, num_heads, head_dim, device=DEVICE).to(
         torch.float8_e4m3fn
     )
@@ -63,7 +63,7 @@ def _build_fp8(context_lens, next_n, block_size, seed=0, num_heads=64, head_dim=
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     weights = torch.randn(B * next_n, num_heads, device=DEVICE)
     kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, head_dim)
-    return q, kv_fp8, scale, weights, kv_fused, block_table
+    return q, kv_fp8, scale, weights, kv_fused, block_tables
 
 
 def _cmp_fp8(
@@ -82,11 +82,14 @@ def _cmp_fp8(
         kv_fused.shape[1],
         out_dtype=torch.float32,
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, bt, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, bt, cl, max_ml)
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     v = valid & fin
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     max_abs = (o[v] - r[v]).abs().max().item() if v.any() else 0.0
@@ -94,7 +97,7 @@ def _cmp_fp8(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A) Schedule kernel: GPU vs CPU bit-exact under adversarial batch/context
+# A) Schedule kernel: GPU vs CPU bit-exact under adversarial batch/length
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -113,8 +116,8 @@ def _cmp_fp8(
 )
 def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     """The on-GPU schedule kernel must be BIT-EXACT vs the CPU reference for every
-    batch size (incl. non-multiples of 32) and adversarial context distributions."""
-    _skip_if_not_sm100()
+    batch size (incl. non-multiples of 32) and adversarial sequence-length distributions."""
+    _skip_if_no_paged_mqa_support()
     from flashinfer.attn_scores.attn_scores import (
         _cached_num_sms,
         _compute_schedule_metadata,
@@ -158,7 +161,7 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# B) Context lengths at block / SPLIT_KV boundaries (± 1)
+# B) Sequence lengths at block / SPLIT_KV boundaries (± 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -169,8 +172,8 @@ def test_adv_schedule_gpu_vs_cpu(batch_size, dist):
     [1, 2, 3, 33, 64, 127, 128, 129, 255, 256, 257, 383, 384, 512, 640, 1024, 1025],
 )
 def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
-    """Boundary context lengths (block/128/256 multiples and ±1) must stay correct."""
-    _skip_if_not_sm100()
+    """Boundary sequence lengths (block/128/256 multiples and ±1) must stay correct."""
+    _skip_if_no_paged_mqa_support()
     if ctx < next_n:
         pytest.skip("ctx must be >= next_n for a valid causal window")
     cl = torch.full((4,), ctx, dtype=torch.int32, device=DEVICE)
@@ -181,14 +184,14 @@ def test_adv_context_boundaries_fp8(block_size, next_n, ctx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C) Skewed / variable context lengths (schedule load imbalance)
+# C) Skewed / variable sequence lengths (schedule load imbalance)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("next_n", [1, 2])
 def test_adv_skewed_varlen_fp8(next_n):
     """One very long sequence + many short ones (schedule stress)."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     B, block_size = 16, 64
     cl = torch.full((B,), 128, dtype=torch.int32, device=DEVICE)
     cl[0] = 32768
@@ -209,7 +212,7 @@ def test_adv_skewed_varlen_fp8(next_n):
 )
 def test_adv_degenerate_values_fp8(mode):
     """Degenerate inputs must not NaN and must match the reference."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(3)
@@ -217,7 +220,7 @@ def test_adv_degenerate_values_fp8(mode):
     ctx = 2048
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = ctx + 8
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
 
     q_f = torch.randn(B, next_n, H, D, device=DEVICE)
     kv = torch.randn(ntb, block_size, D, device=DEVICE)
@@ -241,9 +244,9 @@ def test_adv_degenerate_values_fp8(mode):
     kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
 
     ref = _ref_fp8_paged_mqa_logits(
-        q, kv_fp8, scale, weights, cl, block_table, max_ml, block_size
+        q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, block_table, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
 
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     assert torch.isfinite(out.float()[valid]).all(), (
@@ -252,6 +255,9 @@ def test_adv_degenerate_values_fp8(mode):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     # zero_weights/zero_q -> all-zero logits -> cosine is 0 by construction
     assert diff < 0.02, f"cosine diff {diff:.3e} ({mode})"
@@ -264,14 +270,14 @@ def test_adv_degenerate_values_fp8(mode):
 
 def test_adv_determinism_fp8():
     """Identical inputs must yield bitwise-identical output across calls."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     cl = torch.randint(500, 4096, (8,), dtype=torch.int32, device=DEVICE)
     max_ml = 4096
     q, kv_fp8, scale, w, kv_fused, bt = _build_fp8(cl, 2, 64, seed=11)
-    o1 = fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml).clone()
-    o2 = fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml).clone()
+    o1 = fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml).clone()
+    o2 = fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml).clone()
     valid = _valid_causal_mask(cl, 2, max_ml, DEVICE)
     assert torch.equal(o1[valid], o2[valid]), (
         "kernel is non-deterministic in the valid region"
@@ -287,8 +293,8 @@ def test_adv_determinism_fp8():
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("ctx", [128, 129, 256, 257, 1024])
 def test_adv_fp4_boundaries(block_size, next_n, ctx):
-    """FP4: boundary contexts across all block_size (SF layout correctness)."""
-    _skip_if_not_sm100()
+    """FP4: boundary sequence lengths across all block_size (SF layout correctness)."""
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
     if ctx < next_n:
@@ -297,13 +303,13 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     B, H, D = 4, 64, 128
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
     kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, H)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, H)
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
     q_sim = (
         _cast_back_from_fp4(q_pk, sf_qp, gran_k=32)
@@ -312,15 +318,15 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     )
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, cl, block_table, max_ml
+        q_sim.float(), kv_sim.float(), weights, cl, block_tables, max_ml
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
-        sf_q,
+        q_sf,
         kv_fused,
         weights,
+        block_tables,
         cl,
-        block_table,
         max_ml,
         output_dtype=torch.float32,
     )
@@ -331,32 +337,35 @@ def test_adv_fp4_boundaries(block_size, next_n, ctx):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.05, f"FP4 cosine diff {diff:.3e} ctx={ctx} block_size={block_size}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G) max next_n with small / boundary contexts
+# G) max next_n with small / boundary sequence lengths
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("ctx", [8, 64, 128, 129, 256, 257])
 def test_adv_fp4_max_next_n_small_ctx(ctx):
-    """FP4 at the largest supported next_n with small/boundary contexts."""
-    _skip_if_not_sm100()
+    """FP4 at the largest supported next_n with small/boundary sequence lengths."""
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits
 
     torch.manual_seed(ctx)
     B, next_n, H, D, block_size = 4, 3, 64, 128, 64
     cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
     max_ml = max(ctx + 8, 512)
-    block_table, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
     q_bf = torch.randn(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
     kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
     weights = torch.randn(B * next_n, H, device=DEVICE)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, H)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, H)
     kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
     q_sim = (
         _cast_back_from_fp4(q_pk, sf_qp, gran_k=32)
@@ -365,15 +374,15 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
     )
 
     ref = _ref_fp4_paged_mqa_logits(
-        q_sim.float(), kv_sim.float(), weights, cl, block_table, max_ml
+        q_sim.float(), kv_sim.float(), weights, cl, block_tables, max_ml
     )
     out = fp4_paged_mqa_logits(
         q_fp4,
-        sf_q,
+        q_sf,
         kv_fused,
         weights,
+        block_tables,
         cl,
-        block_table,
         max_ml,
         output_dtype=torch.float32,
     )
@@ -381,18 +390,21 @@ def test_adv_fp4_max_next_n_small_ctx(ctx):
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.05, f"FP4 next_n={next_n} cosine diff {diff:.3e} ctx={ctx}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# H) Shared physical blocks across rows (block_table reuse)
+# H) Shared physical blocks across rows (block_tables reuse)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_adv_shared_physical_blocks_fp8():
     """All rows point at the SAME physical blocks (KV sharing) — must be correct."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
 
     torch.manual_seed(5)
@@ -414,11 +426,14 @@ def test_adv_shared_physical_blocks_fp8():
     ref = _ref_fp8_paged_mqa_logits(
         q, kv_fp8, scale, weights, cl, bt, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, cl, bt, max_ml)
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, bt, cl, max_ml)
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     o = out.float().masked_fill(~valid, 0)
     r = ref.float().masked_fill(~valid, 0)
     fin = torch.isfinite(o) & torch.isfinite(r)
+    assert torch.isfinite(o[torch.isfinite(r)]).all(), (
+        "kernel produced non-finite logits at positions the reference keeps finite"
+    )
     diff = _calc_cosine_diff(o.masked_fill(~fin, 0), r.masked_fill(~fin, 0))
     assert diff < 0.02, f"shared-block cosine diff {diff:.3e}"
 
@@ -430,8 +445,8 @@ def test_adv_shared_physical_blocks_fp8():
 
 def test_adv_guards_raise():
     """Adversarial malformed inputs on the guarded paths must raise ValueError."""
-    _skip_if_not_sm100()
-    from flashinfer import padded_context_len, fp8_paged_mqa_logits
+    _skip_if_no_paged_mqa_support()
+    from flashinfer import padded_seq_len, fp8_paged_mqa_logits
 
     B, next_n, block_size = 2, 1, 64
     ctx = 1024
@@ -441,26 +456,26 @@ def test_adv_guards_raise():
 
     # Undersized out= (would OOB-write) -> ValueError
     bad = torch.empty((B * next_n, max_ml), device=DEVICE, dtype=torch.float32)
-    assert padded_context_len(max_ml) > max_ml
-    with pytest.raises(ValueError, match="padded_context_len"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, out=bad)
+    assert padded_seq_len(max_ml) > max_ml
+    with pytest.raises(ValueError, match="padded_seq_len"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, out=bad)
 
     # FP8 bf16 output unsupported
     with pytest.raises(ValueError, match="float32, float16"):
         fp8_paged_mqa_logits(
-            q, kv_fused, w, cl, bt, max_ml, output_dtype=torch.bfloat16
+            q, kv_fused, w, bt, cl, max_ml, output_dtype=torch.bfloat16
         )
 
     # CPU / int64 index tensors
-    with pytest.raises(ValueError, match="context_lens"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl.cpu(), bt, max_ml)
-    with pytest.raises(ValueError, match="block_table"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt.to(torch.int64), max_ml)
+    with pytest.raises(ValueError, match="seq_lens"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl.cpu(), max_ml)
+    with pytest.raises(ValueError, match="block_tables"):
+        fp8_paged_mqa_logits(q, kv_fused, w, bt.to(torch.int64), cl, max_ml)
 
 
 def test_adv_new_guards_raise():
     """Guards added after the adversarial review must raise ValueError (not OOB/crash)."""
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import (
         compute_paged_mqa_logits_schedule,
         fp4_paged_mqa_logits,
@@ -475,45 +490,41 @@ def test_adv_new_guards_raise():
 
     # (#2) fp8 e5m2 q rejected
     with pytest.raises(ValueError, match="float8_e4m3fn"):
-        fp8_paged_mqa_logits(q.view(torch.float8_e5m2), kv_fused, w, cl, bt, max_ml)
+        fp8_paged_mqa_logits(q.view(torch.float8_e5m2), kv_fused, w, bt, cl, max_ml)
 
     # (#3) kv_fused wrong last dim (misreads scale region)
     bad_kv = kv_fused[..., :-1].contiguous()
     with pytest.raises(ValueError, match="kv_fused"):
-        fp8_paged_mqa_logits(q, bad_kv, w, cl, bt, max_ml)
+        fp8_paged_mqa_logits(q, bad_kv, w, bt, cl, max_ml)
 
-    # (#1) context_lens / block_table row count != B
+    # (#1) seq_lens / block_tables row count != B
     with pytest.raises(ValueError, match="batch_size"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl[:-1], bt, max_ml)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl[:-1], max_ml)
     with pytest.raises(ValueError, match="batch_size"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt[:-1].contiguous(), max_ml)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt[:-1].contiguous(), cl, max_ml)
 
     # (#4) caller schedule_meta of the wrong size
     bad_sched = torch.zeros((4, 2), dtype=torch.int32, device=DEVICE)
     with pytest.raises(ValueError, match="schedule_meta"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, schedule_meta=bad_sched)
+        fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, schedule_meta=bad_sched)
     # correct schedule_meta passes the guard
     good = compute_paged_mqa_logits_schedule(cl)
-    fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, schedule_meta=good)
+    fp8_paged_mqa_logits(q, kv_fused, w, bt, cl, max_ml, schedule_meta=good)
 
-    # (#6/#9) num_epi_subtiles < 1
-    with pytest.raises(ValueError, match="num_epi_subtiles"):
-        fp8_paged_mqa_logits(q, kv_fused, w, cl, bt, max_ml, num_epi_subtiles=0)
-
-    # FP4-specific guards: q must be uint8, sf_q must be int32 [B, next_n, H]
+    # FP4-specific guards: q must be uint8, q_sf must be int32 [B, next_n, H]
     q_bf = torch.randn(B, next_n, 64, 128, device=DEVICE, dtype=torch.bfloat16)
     q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, 128), gran_k=32)
     q_fp4 = q_pk.view(torch.uint8).view(B, next_n, 64, 64)
-    sf_q = sf_qp.view(torch.int32).view(B, next_n, 64)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, 64)
     kv_cache = torch.randn(
         kv_fp8.shape[0], block_size, 1, 128, device=DEVICE, dtype=torch.bfloat16
     )
     kv_fused4, _ = _kv_cache_cast_to_fp4(kv_cache)
     with pytest.raises(ValueError, match="uint8"):
-        fp4_paged_mqa_logits(q_fp4.float(), sf_q, kv_fused4, w, cl, bt, max_ml)
-    with pytest.raises(ValueError, match="sf_q"):
+        fp4_paged_mqa_logits(q_fp4.float(), q_sf, kv_fused4, w, bt, cl, max_ml)
+    with pytest.raises(ValueError, match="q_sf"):
         fp4_paged_mqa_logits(
-            q_fp4, sf_q[..., :-1].contiguous(), kv_fused4, w, cl, bt, max_ml
+            q_fp4, q_sf[..., :-1].contiguous(), kv_fused4, w, bt, cl, max_ml
         )
 
 
@@ -538,11 +549,11 @@ def test_adv_zero_length_row_not_executed(variant):
     An all-zero batch cannot show this: its schedule has start == end, so the
     iterator is never entered. Regression for PR #4365 review r3824813393.
     """
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import (
         fp4_paged_mqa_logits,
         fp8_paged_mqa_logits,
-        padded_context_len,
+        padded_seq_len,
     )
 
     B, next_n, block_size, H, D = 2, 1, 128, 64, 128
@@ -551,13 +562,13 @@ def test_adv_zero_length_row_not_executed(variant):
 
     cl = torch.tensor([128, 0], dtype=torch.int32, device=DEVICE)
     width = max(-(-int(c) // 128) for c in cl.tolist()) * (128 // block_size)
-    block_table = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
+    block_tables = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
     ntb = 4
     w = torch.ones(B * next_n, H, device=DEVICE, dtype=torch.float32)
     dtype = torch.float32 if variant == "fp8" else torch.bfloat16
 
     out = torch.full(
-        (B * next_n, padded_context_len(max_ml)),
+        (B * next_n, padded_seq_len(max_ml)),
         SENTINEL,
         device=DEVICE,
         dtype=dtype,
@@ -566,20 +577,20 @@ def test_adv_zero_length_row_not_executed(variant):
     if variant == "fp8":
         q = torch.zeros(B, next_n, H, D, device=DEVICE).to(torch.float8_e4m3fn)
         kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=DEVICE)
-        fp8_paged_mqa_logits(q, kv, w, cl, block_table, max_ml, out=out)
+        fp8_paged_mqa_logits(q, kv, w, block_tables, cl, max_ml, out=out)
     else:
         q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=DEVICE)
-        sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=DEVICE)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=DEVICE)
         kv = torch.zeros(
             ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=DEVICE
         )
         fp4_paged_mqa_logits(
             q,
-            sf_q,
+            q_sf,
             kv,
             w,
+            block_tables,
             cl,
-            block_table,
             max_ml,
             output_dtype=torch.bfloat16,
             out=out,
@@ -613,7 +624,7 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
     Per-row weights differ, so consuming the wrong row's W is unmissable.
     Regression for PR #4365 review r3824800923 / r3824808841.
     """
-    _skip_if_not_sm100()
+    _skip_if_no_paged_mqa_support()
     from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import _cached_num_sms
     from flashinfer.utils import get_device_index
@@ -672,15 +683,15 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
             q,
             _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, D),
             weights,
-            cl,
             bt,
+            cl,
             max_ml,
         )
     else:
         q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
         q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
         q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
-        sf_q = sf_q_packed.view(torch.int32).view(B, next_n, H)
+        q_sf = sf_q_packed.view(torch.int32).view(B, next_n, H)
         q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(
             B, next_n, H, D
         )
@@ -693,11 +704,11 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
         )
         out = fp4_paged_mqa_logits(
             q_fp4,
-            sf_q,
+            q_sf,
             kv_fused,
             weights,
-            cl,
             bt,
+            cl,
             max_ml,
             output_dtype=torch.float32,
         )
@@ -710,6 +721,9 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
         a = out[b, :n].float()
         r = ref[b, :n].float()
         finite = torch.isfinite(a) & torch.isfinite(r)
+        assert torch.isfinite(a[torch.isfinite(r)]).all(), (
+            f"row {b}: non-finite kernel logits where the reference is finite"
+        )
         assert finite.any(), f"row {b} produced no finite logits"
         scale = float(r[finite].abs().max()) or 1.0
         rel = float((a[finite] - r[finite]).abs().max()) / scale
@@ -718,3 +732,105 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
             f"{rel:.2e} relative: the row after a skipped zero-length row is "
             "consuming the skipped row's Q/weights"
         )
+
+
+def test_adv_fp4_next_n4_split_zero_and_short_rows():
+    """Interspersed zero-work ATOMS must not desync the FP4 split's prefetch.
+
+    Under an atom split a "row" the task iterators traverse is a q_atom, and
+    its length is ctx - (num_atoms-1-i)*atom -- which is zero or NEGATIVE for
+    a short-but-nonzero native row (here ctx=2 at next_n=4: the leading atom
+    of the 2-atom split sees 0). The producer lookahead must skip exactly the
+    atoms the consumers skip, on the per-atom length with a <= 0 test; a
+    lookahead reading the native ctx (or testing == 0) stages the skipped
+    atom's Q/SF_Q/W and the atom after the gap consumes them -- wrong logits,
+    no hang, the same failure mode
+    test_adv_interspersed_zero_row_uses_correct_q pins for num_atoms == 1.
+
+    The shape combines every skip trigger: a native zero row (all atoms
+    skipped), a ctx=2 row (leading atoms skipped, trailing atom live), and a
+    num_sms*256 row so one CTA's range spans the gaps. Trailing zeros cannot
+    expose the bug. Weights are distinct per (b, t) so any row mixup is
+    unmissable. The decomposition is the fixed internal rule, so on Blackwell
+    this exercises the 2-atom split (the only split that can execute) and on
+    Rubin the direct path, where zero-work atoms coincide with zero rows.
+    """
+    _skip_if_no_paged_mqa_support()
+    from flashinfer import fp4_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_num_sms
+    from flashinfer.utils import get_device_index
+
+    from tests.attn_scores.test_attn_scores import (
+        _cast_back_from_fp4,
+        _kv_cache_cast_to_fp4,
+        _per_token_cast_to_fp4,
+        _ref_fp4_paged_mqa_logits,
+    )
+
+    torch.manual_seed(11)
+    S = _cached_num_sms(get_device_index(torch.device(DEVICE)))
+    H, D, block_size, next_n = 64, 128, 64, 4
+    ctx = [128, 0, 2, S * 256]
+    B = len(ctx)
+    max_ml = max(ctx)
+
+    cl = torch.tensor(ctx, dtype=torch.int32, device=DEVICE)
+    nblk = [-(-c // block_size) for c in ctx]
+    bt = torch.zeros((B, max(nblk)), dtype=torch.int32, device=DEVICE)
+    run = 0
+    for b, n in enumerate(nblk):
+        for j in range(n):
+            bt[b, j] = run
+            run += 1
+    ntb = max(run, 1)
+
+    # distinct per (b, t): consuming a neighbouring atom's W is unmissable
+    weights = torch.empty(B * next_n, H, device=DEVICE, dtype=torch.float32)
+    for i in range(B * next_n):
+        weights[i] = float(i + 1)
+
+    q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = sf_q_packed.view(torch.int32).view(B, next_n, H)
+    q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(B, next_n, H, D)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, cl, bt, max_ml
+    )
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        bt,
+        cl,
+        max_ml,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    # Per (b, t) output row: valid positions are pos <= ctx[b] - next_n + t,
+    # so ctx=2 has none for t in {0, 1} and 1-2 positions for t in {2, 3}.
+    for b, n in enumerate(ctx):
+        for t in range(next_n):
+            limit = n - next_n + t + 1  # count of valid positions
+            if limit <= 0:
+                continue
+            row = b * next_n + t
+            a = out[row, :limit].float()
+            r = ref[row, :limit].float()
+            finite = torch.isfinite(a) & torch.isfinite(r)
+            assert torch.isfinite(a[torch.isfinite(r)]).all(), (
+                f"row {row}: non-finite kernel logits where the reference is finite"
+            )
+            assert finite.any(), f"row {row} produced no finite logits"
+            scale = float(r[finite].abs().max()) or 1.0
+            rel = float((a[finite] - r[finite]).abs().max()) / scale
+            assert rel < 1e-3, (
+                f"row (b={b}, t={t}, ctx={n}) differs from the reference by "
+                f"{rel:.2e} relative: an atom after a zero-work atom is "
+                "consuming the skipped atom's Q/weights"
+            )
