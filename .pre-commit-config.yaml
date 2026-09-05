@@ -54,6 +54,7 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
+        files: ^(?!csrc/cake_moe_finalize_allreduce_fusion/)
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break parity with their producer manifests.
         exclude: |
