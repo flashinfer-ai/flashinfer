@@ -2253,8 +2253,8 @@ def test_moe_nvfp4_unswizzled_input_sf():
 @pytest.mark.parametrize("quantized_input", [False])
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu],
-    ids=["swiglu"],
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["swiglu", "relu2"],
 )
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
@@ -2279,6 +2279,9 @@ def test_moe_nvfp4_unaligned_hidden_size(
     When hidden_size/sf_block_size is not a multiple of 4, block_scale_interleave
     pads the scale columns, inflating numel(). This caused weight_scale_vec_size
     to be computed incorrectly (e.g. 31 instead of 32). See issue #2847.
+
+    Relu2 covers the non-gated FC1 SF shape check (issue #4653): the 160/192
+    intermediate sizes pad the FC1 SF rows to 256, which the check rejected.
     """
     if top_k > num_experts:
         pytest.skip(
