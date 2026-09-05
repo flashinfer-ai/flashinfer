@@ -83,7 +83,7 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
-    backend: Literal["auto", "cute-dsl", "cake"] = "auto",
+    backend: Literal["auto", "cute-dsl", "cake", "cudnn"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -102,7 +102,7 @@ def recurrent_kda(
     selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
     contracts and keeps Cake as the feature-complete fallback; use
     ``backend="cake"`` to select and benchmark the generated portfolio
-    explicitly.
+    explicitly, and ``backend="cudnn"`` to run cuDNN's fused SM100 engine.
     Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
     frozen Cake specialization automatically. The Cake path accepts any
     positive runtime head count, so Kimi-Linear tensor parallelism maps global
@@ -258,7 +258,7 @@ def recurrent_kda(
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
-        backend (Literal["auto", "cute-dsl", "cake"]):
+        backend (Literal["auto", "cute-dsl", "cake", "cudnn"]):
             Implementation backend. ``"auto"`` selects the architecture-
             appropriate CuTe DSL kernel for supported ordinary multi-token
             prefill, including the SM120 backend and SM100-family state
@@ -270,6 +270,12 @@ def recurrent_kda(
             The SM100-family kernel additionally needs
             ``nvidia-cutlass-dsl>=4.7``; below that ``"auto"`` uses Cake there
             and ``"cute-dsl"`` raises :class:`ImportError`.
+            ``"cudnn"`` runs cuDNN's fused SM100 linear-attention engine
+            through :func:`flashinfer.cudnn.cudnn_recurrent_kda`, and raises
+            ``NotImplementedError`` carrying the reason when that engine cannot
+            serve the call. It is never selected implicitly, and it covers
+            ordinary multi-token prefill only: no speculative decode, no state
+            pool, no ``initial_state_source``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -282,9 +288,52 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
-    if backend not in ("auto", "cute-dsl", "cake"):
+    if backend not in ("auto", "cute-dsl", "cake", "cudnn"):
         raise ValueError(
-            f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
+            f"backend must be 'auto', 'cute-dsl', 'cake', or 'cudnn', got {backend!r}"
+        )
+    if backend == "cudnn":
+        from .cudnn import cudnn_recurrent_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("prefill_workspace", prefill_workspace is not None),
+                ("ssm_state_indices", ssm_state_indices is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                'recurrent_kda(backend="cudnn") does not support '
+                + ", ".join(unsupported)
+            )
+        return cudnn_recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            beta_is_logit=beta_is_logit,
+            output=output,
         )
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
