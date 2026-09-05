@@ -1286,16 +1286,16 @@ def _print_header(
     use_fused_finalize=True,
 ):
     """Print benchmark header."""
-    table_width = 159 if use_per_token_activation else 198
+    table_width = 173 if use_per_token_activation else 212
     print("\n" + "=" * table_width)
     if use_per_token_activation:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4/BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     else:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4/BF16 "
+            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     print("=" * table_width)
@@ -1326,7 +1326,9 @@ def _print_header(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
     )
-    print("TRTLLM NVFP4/BF16 finalize: native (unaffected by --no-fused-finalize).")
+    print(
+        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
+    )
     if use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
     print("-" * table_width)
@@ -1337,11 +1339,11 @@ def _print_header(
             f"{'CuteDSL W4A16':^15} | "
             f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
-            f"{'Speedup vs NVFP4':^18} | "
-            f"{'Speedup vs BF16':^18} | "
-            f"{'Winner':^8} | "
+            f"{'Speedup vs TRTLLM NVFP4':^23} | "
+            f"{'Speedup vs TRTLLM BF16':^23} | "
+            f"{'Winner':^12} | "
             f"{'Active':^7} | "
-            f"{'Stats':^14}"
+            f"{'Stats':^15}"
         )
         print(
             f"{'':>6} | "
@@ -1349,11 +1351,11 @@ def _print_header(
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
-            f"{'W4A4':>8}  {'W4A16':>8} | "
-            f"{'W4A4':>8}  {'W4A16':>8} | "
-            f"{'':^8} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
+            f"{'':^12} | "
             f"{'experts':^7} | "
-            f"{'min/max/median':^14}"
+            f"{'min/max/median':^15}"
         )
     else:
         print(
@@ -1364,11 +1366,11 @@ def _print_header(
             f"{'TRTLLM NVFP4':^15} | "
             f"{'TRTLLM BF16':^15} | "
             f"{'Speedup vs CUTLASS':^18} | "
-            f"{'Speedup vs NVFP4':^18} | "
-            f"{'Speedup vs BF16':^18} | "
-            f"{'Winner':^8} | "
+            f"{'Speedup vs TRTLLM NVFP4':^23} | "
+            f"{'Speedup vs TRTLLM BF16':^23} | "
+            f"{'Winner':^12} | "
             f"{'Active':^7} | "
-            f"{'Stats':^14}"
+            f"{'Stats':^15}"
         )
         print(
             f"{'':>6} | "
@@ -1378,11 +1380,11 @@ def _print_header(
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'ms':>7} {'TFLOPS':>7} | "
             f"{'W4A4':>8}  {'W4A16':>8} | "
-            f"{'W4A4':>8}  {'W4A16':>8} | "
-            f"{'W4A4':>8}  {'W4A16':>8} | "
-            f"{'':^8} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
+            f"{'W4A4':>11} {'W4A16':>11} | "
+            f"{'':^12} | "
             f"{'experts':^7} | "
-            f"{'min/max/median':^14}"
+            f"{'min/max/median':^15}"
         )
     print("-" * table_width)
 
@@ -1416,8 +1418,6 @@ def _print_row(results, histogram_record):
     winner = {
         "CuteDSL W4A4": "W4A4",
         "CuteDSL W4A16": "W4A16",
-        "TRTLLM NVFP4": "NVFP4",
-        "TRTLLM BF16": "BF16",
     }.get(winner, winner)
 
     active_experts = f"{histogram_record['active_local_experts']:>3}"
@@ -1434,11 +1434,11 @@ def _print_row(results, histogram_record):
             f"{w4a16.latency_ms:>7.3f} {w4a16.tflops:>7.1f} | "
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
-            f"{speedups:>18} | "
-            f"{bf16_speedups_text:>18} | "
-            f"{winner:^8} | "
+            f"{speedups:>23} | "
+            f"{bf16_speedups_text:>23} | "
+            f"{winner:^12} | "
             f"{active_experts:>7} | "
-            f"{stats:>14}"
+            f"{stats:>15}"
         )
     else:
         cutlass_speedups = (
@@ -1457,17 +1457,17 @@ def _print_row(results, histogram_record):
             f"{nvfp4.latency_ms:>7.3f} {nvfp4.tflops:>7.1f} | "
             f"{bf16.latency_ms:>7.3f} {bf16.tflops:>7.1f} | "
             f"{cutlass_speedups_text:>18} | "
-            f"{nvfp4_speedups_text:>18} | "
-            f"{bf16_speedups_text:>18} | "
-            f"{winner:^8} | "
+            f"{nvfp4_speedups_text:>23} | "
+            f"{bf16_speedups_text:>23} | "
+            f"{winner:^12} | "
             f"{active_experts:>7} | "
-            f"{stats:>14}"
+            f"{stats:>15}"
         )
 
 
 def _print_footer(use_per_token_activation):
     """Print benchmark footer."""
-    table_width = 159 if use_per_token_activation else 198
+    table_width = 173 if use_per_token_activation else 212
     print("-" * table_width)
     print(
         "Speedup > 1.0 means that CuTe DSL mode is faster than the comparison backend"
@@ -1712,7 +1712,7 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
-    print("CuteDSL modes: W4A4 and W4A16; TRTLLM baselines: NVFP4 and BF16")
+    print("CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4 and TRTLLM BF16")
     print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CUDA profiler capture: {args.profile_cuda}")
     print(
@@ -1720,7 +1720,9 @@ def main():
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
     )
 
-    print("TRTLLM NVFP4/BF16 finalize: native (unaffected by --no-fused-finalize).")
+    print(
+        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
+    )
 
     run_benchmark(
         token_counts=tokens,
