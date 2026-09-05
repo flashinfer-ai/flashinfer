@@ -52,6 +52,8 @@ def run_gemm_test(args):
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
         return testMmBf16(args)
+    elif args.routine == "mm_bf16_dual_weight":
+        return testMmBf16DualWeight(args)
     elif args.routine == "bmm_bf16":
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
@@ -160,6 +162,7 @@ def parse_gemm_args(line, parser):
             "tinygemm",
             "cutile",
             "trtllm_low_latency",
+            "dual-bf16",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -210,6 +213,13 @@ def parse_gemm_args(line, parser):
             args.backends = ["cute-dsl"]
         if not has_input_dtype_arg:
             args.input_dtype = "bfloat16"
+    if args.routine == "mm_bf16_dual_weight":
+        if not has_backends_arg:
+            args.backends = ["dual-bf16"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
+        if not has_mat2_dtype_arg:
+            args.mat2_dtype = "float32"
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
@@ -2294,6 +2304,186 @@ def testMmBf16(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+def testMmBf16DualWeight(args):
+    """Benchmark dual-BF16 against an IEEE FP32 PyTorch/cuBLAS baseline."""
+    device = get_device(args)
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (10, 0):
+        raise ValueError(
+            "mm_bf16_dual_weight requires exact SM100; "
+            f"got compute capability {capability[0]}.{capability[1]}"
+        )
+
+    m, n, k = args.m, args.n, args.k
+    if k % 128 != 0:
+        raise ValueError(f"mm_bf16_dual_weight requires k % 128 == 0; got {k}")
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"mm_bf16_dual_weight requires input_dtype=bfloat16; got {args.input_dtype}"
+        )
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    if mat2_dtype != torch.float32:
+        raise ValueError(
+            f"mm_bf16_dual_weight requires mat2_dtype=float32; got {args.mat2_dtype}"
+        )
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(
+            f"mm_bf16_dual_weight supports bfloat16 or float32 output; got {out_dtype}"
+        )
+    supported_backends = {"dual-bf16", "cublas"}
+    backends = list(dict.fromkeys(args.backends))
+    unsupported_backends = set(backends) - supported_backends
+    if unsupported_backends:
+        raise ValueError(
+            "mm_bf16_dual_weight benchmark supports only dual-bf16 and cublas; "
+            f"got {sorted(unsupported_backends)}"
+        )
+
+    a = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    # The source operation is BF16 x FP32. cuBLAS receives the same activation
+    # values converted to FP32 before timing, matching the standalone kernel's
+    # original FP32 baseline. Weight preprocessing is also outside timing.
+    a_fp32 = a.float()
+    weight_fp32 = torch.randn(n, k, device=device, dtype=torch.float32)
+    weight_high, weight_low = flashinfer.prepare_dual_bf16_weights(weight_fp32)
+    workspace_size = flashinfer.dual_bf16_weight_gemm_workspace_size(m, n, k, device)
+    workspace = torch.empty(max(workspace_size, 1), device=device, dtype=torch.uint8)
+    outputs = {
+        "dual-bf16": torch.empty(m, n, device=device, dtype=out_dtype),
+        "cublas": torch.empty(m, n, device=device, dtype=torch.float32),
+    }
+
+    def run(backend, out_tensor):
+        if backend == "dual-bf16":
+            return flashinfer.mm_bf16_dual_weight(
+                a,
+                weight_high,
+                weight_low,
+                out_dtype=out_dtype,
+                out=out_tensor,
+                workspace_buffer=workspace,
+            )
+        if backend == "cublas":
+            return torch.mm(a_fp32, weight_fp32.T, out=out_tensor)
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    preferred_blas_library = getattr(
+        torch.backends.cuda, "preferred_blas_library", None
+    )
+    old_preferred_blas = (
+        preferred_blas_library() if preferred_blas_library is not None else None
+    )
+    timings = {}
+    try:
+        # Prevent the FP32 baseline from silently using TF32 tensor cores.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        if preferred_blas_library is not None:
+            preferred_blas_library("cublas")
+        for backend in backends:
+            run(backend, outputs[backend])
+
+        if args.refcheck:
+            high = torch.mm(a.float(), weight_high.float().T)
+            low = torch.mm(a.float(), weight_low.float().T)
+            dual_reference = (high + low / 256.0).to(out_dtype)
+            dual_output = outputs["dual-bf16"]
+            if "dual-bf16" in backends:
+                cosine = F.cosine_similarity(
+                    dual_reference.reshape(-1), dual_output.reshape(-1), dim=0
+                )
+                if cosine < 0.99 and not args.allow_output_mismatch:
+                    raise AssertionError(
+                        "mm_bf16_dual_weight output mismatch: "
+                        f"cosine_similarity={float(cosine)}"
+                    )
+
+            fp32_reference = (
+                outputs["cublas"]
+                if "cublas" in backends
+                else torch.mm(a_fp32, weight_fp32.T)
+            )
+            if "dual-bf16" in backends:
+                approximation_cosine = F.cosine_similarity(
+                    fp32_reference.reshape(-1), dual_output.float().reshape(-1), dim=0
+                )
+                if args.verbose >= 1:
+                    print(
+                        "[ACCURACY] dual-bf16 vs FP32 cuBLAS: "
+                        f"cosine_similarity={float(approximation_cosine):.8f}"
+                    )
+                if approximation_cosine < 0.99 and not args.allow_output_mismatch:
+                    raise AssertionError(
+                        "dual-BF16 approximation mismatch against FP32 cuBLAS: "
+                        f"cosine_similarity={float(approximation_cosine)}"
+                    )
+
+        for backend in backends:
+            timings[backend] = bench_gpu_time(
+                fn=run,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                sleep_after_run=True,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=not args.no_cuda_graph,
+                cold_l2_cache=True,
+                input_args=(backend, outputs[backend]),
+            )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+        if preferred_blas_library is not None:
+            preferred_blas_library(old_preferred_blas.name.lower())
+
+    results = []
+    medians = {}
+    for backend in backends:
+        median_time = np.median(timings[backend])
+        std_time = np.std(timings[backend])
+        medians[backend] = median_time
+        if backend == "dual-bf16":
+            # The dual representation performs two BF16 GEMMs.
+            problem_flops = 4 * m * n * k
+            problem_bytes = (
+                m * k * torch.bfloat16.itemsize
+                + 2 * n * k * torch.bfloat16.itemsize
+                + m * n * out_dtype.itemsize
+            )
+            backend_out_dtype = out_dtype
+        else:
+            problem_flops = 2 * m * n * k
+            problem_bytes = (
+                m * k * torch.float32.itemsize
+                + n * k * torch.float32.itemsize
+                + m * n * torch.float32.itemsize
+            )
+            backend_out_dtype = torch.float32
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            result = defaultdict(str)
+            result["routine"] = args.routine
+            result["median_time"] = median_time
+            result["std_time"] = std_time
+            result["tflops"] = tflops
+            result["tb_per_sec"] = tb_per_sec
+            result["m"] = m
+            result["n"] = n
+            result["k"] = k
+            result["out_dtype"] = str(backend_out_dtype)
+            result["backend"] = backend
+            result["case_tag"] = args.case_tag
+            results.append(result)
+
+    if "dual-bf16" in medians and "cublas" in medians:
+        speedup = medians["cublas"] / medians["dual-bf16"]
+        print(f"[SPEEDUP] dual-bf16 vs FP32 cuBLAS: {speedup:.3f}x")
+    return results
 
 
 def testTinygemmBf16(args):

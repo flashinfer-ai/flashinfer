@@ -28,6 +28,12 @@ from .gemm_bf16_fp4 import (
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
 
+from .gemm_dual_bf16_weight import (
+    dual_bf16_weight_gemm_workspace_size as dual_bf16_weight_gemm_workspace_size,
+    mm_bf16_dual_weight as mm_bf16_dual_weight,
+    prepare_dual_bf16_weights as prepare_dual_bf16_weights,
+)
+
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
@@ -139,6 +145,9 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "dual_bf16_weight_gemm_workspace_size",
+        "mm_bf16_dual_weight",
+        "prepare_dual_bf16_weights",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",

@@ -257,6 +257,116 @@ mm_bf16_trace = TraceTemplate(
 )
 
 
+def _prepare_dual_bf16_weights_reference(weight):
+    """Split FP32 weights into high and scaled-residual BF16 tensors."""
+    weight_contiguous = weight.contiguous()
+    weight_high = weight_contiguous.to(torch.bfloat16)
+    weight_low = ((weight_contiguous - weight_high.float()) * 256.0).to(torch.bfloat16)
+    return weight_high.contiguous(), weight_low.contiguous()
+
+
+def _prepare_dual_bf16_weights_init(
+    *,
+    N: int = 256,
+    K: int = 256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an FP32 weight for ``flashinfer.prepare_dual_bf16_weights``."""
+    torch.manual_seed(seed)
+    return {
+        "weight": torch.randn(N, K, dtype=torch.float32, device=device),
+    }
+
+
+prepare_dual_bf16_weights_trace = TraceTemplate(
+    op_type="prepare_dual_bf16_weights",
+    description=(
+        "Split an FP32 weight into a BF16 high component and a scaled BF16 "
+        "residual component."
+    ),
+    axes={
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "weight": Tensor(["N", "K"]),
+    },
+    outputs={
+        "weight_high": Tensor(["N", "K"], dtype="bfloat16"),
+        "weight_low": Tensor(["N", "K"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "weight:dual-bf16"],
+    reference=_prepare_dual_bf16_weights_reference,
+    init=_prepare_dual_bf16_weights_init,
+)
+
+
+def _mm_bf16_dual_weight_reference(
+    A, weight_high, weight_low, out=None, out_dtype=None, **_unused
+):
+    """Reference for BF16 activations and dual-BF16 residual weights."""
+    high = torch.mm(A.float(), weight_high.float().T)
+    low = torch.mm(A.float(), weight_low.float().T)
+    resolved_dtype = out.dtype if out is not None else (out_dtype or torch.bfloat16)
+    return (high + low / 256.0).to(resolved_dtype)
+
+
+def _mm_bf16_dual_weight_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_dual_weight``."""
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(N, K, dtype=torch.float32, device=device)
+    weight_high = weight.to(torch.bfloat16)
+    weight_low = ((weight - weight_high.float()) * 256.0).to(torch.bfloat16)
+    return {
+        "a": a,
+        "weight_high": weight_high,
+        "weight_low": weight_low,
+    }
+
+
+mm_bf16_dual_weight_trace = TraceTemplate(
+    op_type="gemm_bf16_dual_weight",
+    description=(
+        "GEMM C = A @ (weight_high + weight_low / 256).T. "
+        "Activation and both weight components are BF16."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "weight_high": Tensor(["N", "K"]),
+        "weight_low": Tensor(["N", "K"]),
+        "out": Tensor(["M", "N"], optional=True),
+        "out_dtype": Scalar("dtype", optional=True),
+    },
+    outputs={
+        "C": Tensor(
+            ["M", "N"],
+            param="out",
+            dtype="bfloat16",
+            dtype_from="out",
+            dtype_from_scalar="out_dtype",
+        ),
+    },
+    tags=["status:verified", "architecture:sm100", "weight:dual-bf16"],
+    reference=_mm_bf16_dual_weight_reference,
+    check=_gemm_check,
+    init=_mm_bf16_dual_weight_init,
+)
+
+
 def _mm_fp8_init(
     *,
     M: int,

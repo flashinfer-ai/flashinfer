@@ -28,6 +28,8 @@ packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
+gemm_bf16_dual_weight_N256_K256.json
+prepare_dual_bf16_weights_N256_K256.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
@@ -410,6 +412,13 @@ for N, K in ((4096, 4096), (256, 7168)):
     ).T  # [K, N] column-major; b.T is contiguous
     with contextlib.suppress(Exception):
         flashinfer.mm_bf16(a, b, backend="auto")
+
+# ── GEMM bf16 x dual-bf16 weight (SM100) ─────────────────────────────────────
+if torch.cuda.get_device_capability() == (10, 0):
+    dual_a = torch.randn(128, 256, dtype=torch.bfloat16, device=device)
+    dual_weight = torch.randn(256, 256, dtype=torch.float32, device=device)
+    dual_high, dual_low = flashinfer.prepare_dual_bf16_weights(dual_weight)
+    flashinfer.mm_bf16_dual_weight(dual_a, dual_high, dual_low)
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
 # Trace is dumped before kernel launch; suppress SM100-only runtime failures.
