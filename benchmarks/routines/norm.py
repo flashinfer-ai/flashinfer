@@ -1095,6 +1095,19 @@ def testLayernormQuant(args):
 
     def run_backend(backend, out_tensor, input_tensor, gamma, beta):
         if backend == "cuda":
+            # Call the CUDA JIT module directly: the public API dispatches to
+            # the CuTe-DSL kernel by default, so both arms can be timed in
+            # one process.
+            flashinfer.norm.get_norm_module().layernorm_quant(
+                out_tensor,
+                input_tensor,
+                gamma,
+                beta,
+                scale,
+                eps,
+            )
+            return out_tensor
+        elif backend == "cute-dsl":
             flashinfer.norm.layernorm_quant(
                 out_tensor,
                 input_tensor,
@@ -1113,17 +1126,23 @@ def testLayernormQuant(args):
         layernorm_output = torch.nn.functional.layer_norm(
             input_tensor.float(), (hidden_size,), weight=gamma, bias=beta, eps=eps
         )
-        # The kernel rounds the normalized value to bf16 before scaling and
-        # casting to fp8; mirror that so 1-ulp fp8 differences do not trip the
-        # tight refcheck tolerance.
-        layernorm_output = layernorm_output.to(input_dtype).float()
-        reference_output = (
-            (layernorm_output / scale)
+        # The CUDA kernel rounds the normalized value to bf16 before scaling
+        # and again before casting to fp8; the CuTe-DSL kernel stays in fp32.
+        # Mirror each so 1-ulp fp8 differences do not trip the tight refcheck
+        # tolerance.
+        cuda_ref = (
+            (layernorm_output.to(input_dtype).float() / scale)
             .to(input_dtype)
             .float()
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
+        cute_ref = (
+            (layernorm_output / scale)
+            .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
+            .to(out_dtype)
+        )
+        reference_outputs = {"cuda": cuda_ref, "cute-dsl": cute_ref}
         has_reference_output = True
 
     # Storage for timing results and outputs
@@ -1153,7 +1172,7 @@ def testLayernormQuant(args):
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
                 # Compare in float for FP8 outputs
-                ref_float = reference_output.float()
+                ref_float = reference_outputs[tested_backends[i]].float()
                 out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
