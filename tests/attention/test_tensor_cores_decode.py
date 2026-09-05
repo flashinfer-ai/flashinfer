@@ -53,6 +53,277 @@ def warmup_jit():
     yield
 
 
+def _assert_uniform_no_split_plan(
+    wrapper,
+    batch_size: int,
+    q_len_per_req: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+):
+    plan = list(wrapper._plan_info)
+    assert len(plan) == 15
+    assert plan[13:] == [1, 0]
+
+    group_size = num_qo_heads // num_kv_heads
+    cta_tile_q = plan[3]
+    tiles_per_request = (q_len_per_req * group_size + cta_tile_q - 1) // cta_tile_q
+    expected_grid = batch_size * tiles_per_request
+    assert plan[0] == expected_grid
+
+    host_workspace = wrapper._pin_memory_int_workspace_buffer
+
+    def read_int32(offset):
+        return host_workspace[offset : offset + expected_grid * 4].view(torch.int32)
+
+    expected_request_indices = torch.arange(
+        batch_size, dtype=torch.int32
+    ).repeat_interleave(tiles_per_request)
+    expected_qo_tile_indices = torch.arange(
+        tiles_per_request, dtype=torch.int32
+    ).repeat(batch_size)
+    expected_kv_tile_indices = torch.zeros(expected_grid, dtype=torch.int32)
+
+    assert torch.equal(read_int32(plan[4]), expected_request_indices)
+    assert torch.equal(read_int32(plan[5]), expected_qo_tile_indices)
+    assert torch.equal(read_int32(plan[6]), expected_kv_tile_indices)
+    return plan
+
+
+@pytest.mark.parametrize("use_fast_plan", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,num_qo_heads,num_kv_heads,head_dim,expected_grid",
+    [
+        (1, 1, 16, 16, 128, 1),
+        (2, 1, 16, 2, 128, 2),
+        (8, 1, 128, 1, 256, 16),
+        (2, 3, 16, 2, 128, 2),
+    ],
+)
+def test_cuda_graph_uniform_no_split_plan_uses_initialized_grid(
+    use_fast_plan: bool,
+    batch_size: int,
+    q_len_per_req: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    expected_grid: int,
+):
+    page_size = 1
+    kv_len = max(q_len_per_req, 4)
+    total_num_pages = batch_size * kv_len
+    kv_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * kv_len
+    )
+    kv_indices = torch.arange(total_num_pages, dtype=torch.int32, device="cuda:0")
+    kv_last_page_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+    workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"
+    )
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty_like(kv_indptr),
+        paged_kv_indices_buffer=torch.empty_like(kv_indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(kv_last_page_len),
+        backend="fa2",
+    )
+
+    plan_args = (
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+    plan_kwargs = {
+        "q_data_type": torch.float16,
+        "kv_data_type": torch.float16,
+        "disable_split_kv": True,
+        "q_len_per_req": q_len_per_req,
+    }
+
+    wrapper._pin_memory_int_workspace_buffer.fill_(0xA5)
+    wrapper.plan(*plan_args, **plan_kwargs)
+    torch.cuda.current_stream().synchronize()
+    regular_plan = _assert_uniform_no_split_plan(
+        wrapper, batch_size, q_len_per_req, num_qo_heads, num_kv_heads
+    )
+    plan_type = type(wrapper._plan_info)
+
+    if use_fast_plan:
+        wrapper._pin_memory_int_workspace_buffer.fill_(0xA5)
+        flashinfer.fast_decode_plan(
+            wrapper,
+            *plan_args,
+            **plan_kwargs,
+            global_override_indptr_cpu=kv_indptr.cpu(),
+        )
+        torch.cuda.current_stream().synchronize()
+        assert type(wrapper._plan_info) is plan_type
+        assert list(wrapper._plan_info) == regular_plan
+
+    plan = _assert_uniform_no_split_plan(
+        wrapper, batch_size, q_len_per_req, num_qo_heads, num_kv_heads
+    )
+    assert plan[0] == expected_grid
+
+
+@pytest.mark.parametrize("use_fast_plan", [False, True])
+@pytest.mark.parametrize("q_len_per_req", [1, 3])
+def test_cuda_graph_uniform_no_split_replan_replay(
+    use_fast_plan: bool, q_len_per_req: int
+):
+    torch.manual_seed(42)
+    batch_size = 2
+    num_qo_heads = 16
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 1
+    dtype = torch.float16
+    short_kv_len = max(2, q_len_per_req)
+    long_kv_len = 129
+
+    def build_kv_layout(kv_len):
+        indptr = (
+            torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * kv_len
+        )
+        indices = torch.arange(batch_size * kv_len, dtype=torch.int32, device="cuda:0")
+        last_page_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+        return indptr, indices, last_page_len
+
+    short_layout = build_kv_layout(short_kv_len)
+    long_layout = build_kv_layout(long_kv_len)
+    max_num_pages = batch_size * long_kv_len
+    kv_data = torch.randn(
+        max_num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device="cuda:0",
+    )
+    q = torch.randn(
+        batch_size * q_len_per_req,
+        num_qo_heads,
+        head_dim,
+        dtype=dtype,
+        device="cuda:0",
+    )
+
+    graph_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        graph_workspace,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            max_num_pages, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+        backend="fa2",
+    )
+
+    def plan_graph(layout, fast):
+        indptr, indices, last_page_len = layout
+        wrapper._pin_memory_int_workspace_buffer.fill_(0xA5)
+        if fast:
+            wrapper._paged_kv_indptr_buf.copy_(indptr)
+            wrapper._paged_kv_indices_buf[: len(indices)].copy_(indices)
+            wrapper._paged_kv_last_page_len_buf.copy_(last_page_len)
+            flashinfer.fast_decode_plan(
+                wrapper,
+                indptr,
+                indices,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+                disable_split_kv=True,
+                q_len_per_req=q_len_per_req,
+                global_override_indptr_cpu=indptr.cpu(),
+            )
+        else:
+            wrapper.plan(
+                indptr,
+                indices,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+                disable_split_kv=True,
+                q_len_per_req=q_len_per_req,
+            )
+        torch.cuda.current_stream().synchronize()
+        return _assert_uniform_no_split_plan(
+            wrapper, batch_size, q_len_per_req, num_qo_heads, num_kv_heads
+        )
+
+    if use_fast_plan:
+        plan_graph(short_layout, False)
+    short_plan = plan_graph(short_layout, use_fast_plan)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            out = wrapper.run(q, kv_data)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = wrapper.run(q, kv_data, out=out)
+
+    reference_workspace = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"
+    )
+    reference_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        reference_workspace, "NHD", use_tensor_cores=True, backend="fa2"
+    )
+
+    def reference(layout):
+        indptr, indices, last_page_len = layout
+        reference_wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            disable_split_kv=True,
+            q_len_per_req=q_len_per_req,
+        )
+        return reference_wrapper.run(q, kv_data)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, reference(short_layout), rtol=1e-3, atol=1e-3)
+
+    long_plan = plan_graph(long_layout, use_fast_plan)
+    assert long_plan == short_plan
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, reference(long_layout), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("kv_len", [54, 128, 999, 32789])
 @pytest.mark.parametrize("num_kv_heads", [4, 8])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
