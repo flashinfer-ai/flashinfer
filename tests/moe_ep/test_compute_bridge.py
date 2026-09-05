@@ -21,7 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from flashinfer.fused_moe import QuantVariant  # noqa: E402
+from flashinfer.fused_moe import QuantConfig, QuantFormat  # noqa: E402
 from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (  # noqa: E402
     build_activation_pack,
     build_activation_pack_rank_major,
@@ -46,7 +46,7 @@ def test_bf16_pack_shapes_and_routing():
     pack = build_activation_pack(
         et,
         local_expert_offset=offset,
-        quant_variant=QuantVariant.BF16,
+        quant=QuantConfig(),
     )
 
     m = num_local_experts * cap
@@ -87,7 +87,7 @@ def test_rank_major_pack_faithful_routing_and_masking():
         recv_w,
         num_local_experts=num_local_experts,
         local_expert_offset=offset,
-        quant_variant=QuantVariant.BF16,
+        quant=QuantConfig(),
     )
 
     assert pack.hidden_states_q.shape == (m, hidden)
@@ -130,7 +130,7 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
         recv_w,
         num_local_experts=num_local_experts,
         local_expert_offset=offset,
-        quant_variant=QuantVariant.BF16,
+        quant=QuantConfig(),
     )
 
     assert torch.all(pack.topk_ids == offset)
@@ -147,7 +147,7 @@ def test_build_activation_pack_rank_major_rejects_2d():
             idx,
             w,
             num_local_experts=4,
-            quant_variant=QuantVariant.BF16,
+            quant=QuantConfig(),
         )
 
 
@@ -165,7 +165,7 @@ def test_reshape_for_combine_roundtrips():
 def test_build_activation_pack_rejects_2d():
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        build_activation_pack(bad, quant_variant=QuantVariant.BF16)
+        build_activation_pack(bad, quant=QuantConfig())
 
 
 def test_packed_mxfp8_dispatch_width_uses_supported_transport_rows():
@@ -185,14 +185,14 @@ def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
     expert_tensors = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
     direct = build_activation_pack(
         expert_tensors,
-        quant_variant=QuantVariant.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
     )
 
     flat = expert_tensors.reshape(num_local_experts * cap, hidden)
     payload = pack_mxfp8_dispatch_payload(flat)
     packed = build_activation_pack(
         payload.reshape(num_local_experts, cap, -1),
-        quant_variant=QuantVariant.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         mxfp8_dispatch=True,
         hidden_size=hidden,
     )
@@ -215,7 +215,7 @@ def test_nvfp4_pack_quantizes():
     pack = build_activation_pack(
         et,
         local_expert_offset=0,
-        quant_variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
 
     m = num_local_experts * cap
@@ -233,7 +233,7 @@ def test_w4a16_pack_preserves_bf16_activation():
     pack = build_activation_pack(
         et,
         local_expert_offset=0,
-        quant_variant=QuantVariant.W4A16,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
     )
 
     flat = et.reshape(num_local_experts * cap, hidden)

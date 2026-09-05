@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantConfig
 
 
 _NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
@@ -73,7 +73,7 @@ def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
     local_expert_offset: int = 0,
-    quant_variant: "QuantVariant",
+    quant: "QuantConfig",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
     mxfp8_dispatch: bool = False,
@@ -89,9 +89,10 @@ def build_activation_pack(
         Global id of this rank's first local expert.  Synthesized expert ids are
         ``(row // cap) + local_expert_offset``; the compute runner subtracts the same
         offset, so the two must agree (they share one :class:`MoEConfig`).
-    quant_variant : QuantVariant
-        Activation and weight quantization contract. NVFP4 quantizes the
-        dispatched BF16 activations; BF16 and W4A16 carry them unchanged.
+    quant : QuantConfig
+        Weight / activation / output formats. NVFP4 activations quantize the
+        dispatched BF16 rows; BF16 activations (including both W4A16 encodings)
+        pass them through.
     per_token_activation : bool
         Use per-token NVFP4 activation scaling when quantizing the input.
     global_scale : torch.Tensor, optional
@@ -119,7 +120,7 @@ def build_activation_pack(
         flat,
         selected_experts,
         final_scales,
-        quant_variant=quant_variant,
+        quant=quant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
         mxfp8_dispatch=mxfp8_dispatch,
@@ -134,7 +135,7 @@ def build_activation_pack_rank_major(
     *,
     num_local_experts: int,
     local_expert_offset: int = 0,
-    quant_variant: "QuantVariant",
+    quant: "QuantConfig",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
     mxfp8_dispatch: bool = False,
@@ -173,7 +174,7 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
-    quant_variant, per_token_activation, global_scale :
+    quant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
     if recv_tensors.dim() != 3:
@@ -218,7 +219,7 @@ def build_activation_pack_rank_major(
         flat,
         selected_experts,
         final_scales,
-        quant_variant=quant_variant,
+        quant=quant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
         mxfp8_dispatch=mxfp8_dispatch,
@@ -231,7 +232,7 @@ def _quantize_and_pack(
     selected_experts: torch.Tensor,
     final_scales: torch.Tensor,
     *,
-    quant_variant: "QuantVariant",
+    quant: "QuantConfig",
     per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
     mxfp8_dispatch: bool,
@@ -242,13 +243,15 @@ def _quantize_and_pack(
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
     """
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantFormat
 
+    pair = quant.pair
+    activation = pair[1]
     device = flat.device
     per_token_scale = None
-    if per_token_activation and quant_variant is not QuantVariant.NVFP4:
-        raise ValueError("per-token activation scaling requires QuantVariant.NVFP4")
-    if quant_variant is QuantVariant.NVFP4:
+    if per_token_activation and activation is not QuantFormat.NVFP4:
+        raise ValueError("per-token activation scaling requires NVFP4 activations")
+    if activation is QuantFormat.NVFP4:
         from flashinfer.quantization.fp4_quantization import (
             fp4_quantize,
             nvfp4_quantize,
@@ -295,7 +298,7 @@ def _quantize_and_pack(
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
-    elif quant_variant is QuantVariant.MXFP4:
+    elif activation is QuantFormat.MXFP8:
         from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 
         if mxfp8_dispatch:
@@ -321,12 +324,15 @@ def _quantize_and_pack(
             hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
                 flat.shape[0], flat.shape[1] // 32
             )
-    elif quant_variant in (QuantVariant.BF16, QuantVariant.W4A16):
-        # BF16 and W4A16 runners consume the dispatched activations directly.
+    elif activation is QuantFormat.BF16:
+        # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat
         hidden_states_scale = None
     else:
-        raise ValueError(f"fused_moe split bridge does not support {quant_variant!r}")
+        raise ValueError(
+            f"fused_moe split bridge does not support weight={pair[0].name}, "
+            f"activation={pair[1].name}"
+        )
 
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,

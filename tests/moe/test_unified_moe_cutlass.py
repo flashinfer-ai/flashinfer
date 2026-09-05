@@ -48,6 +48,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     RoutingInputMode,
@@ -171,7 +172,7 @@ def test_moe_runner_enforces_lifecycle_order():
     events = []
 
     class Runner(MoERunner):
-        supported_quant_variants = (QuantVariant.BF16,)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
         supported_activation_classes = (SwiGLU,)
 
         def _check_support(self):
@@ -207,7 +208,7 @@ def test_moe_runner_enforces_lifecycle_order():
 
 def test_failed_support_check_does_not_authorize_build():
     class Runner(MoERunner):
-        supported_quant_variants = (QuantVariant.NVFP4,)
+        supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
         def get_valid_tactics(self, inputs, profile):
             return [-1]
@@ -1131,9 +1132,17 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     events = []
 
     class RecordingRunner:
-        supported_quant_variants = (QuantVariant.BF16,)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+        supported_output_formats = (QuantFormat.BF16,)
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         backend_key = "recording"
+
+        @classmethod
+        def supports_quant(cls, quant):
+            return (
+                quant.pair in cls.supported_quant_variants
+                and quant.output in cls.supported_output_formats
+            )
 
         def __init__(self, config, device):
             events.append("init")
@@ -1608,7 +1617,7 @@ def _make_w4a16_case(num_tokens: int = 16, activation=None):
     ).to(torch.int32)
     topk_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.W4A16),
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
         activation=activation,

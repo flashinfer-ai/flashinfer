@@ -216,6 +216,7 @@ from flashinfer.fused_moe.api import (
     MoEConfig,
     MoEFinalizeConfig,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
@@ -1354,6 +1355,22 @@ def _handler_for(cfg):
     return _HANDLER_BY_ID[cfg.variant]
 
 
+def _quant_config_for_handler(handler) -> QuantConfig:
+    """Expand a fuzz handler into three-axis ``QuantConfig``.
+
+    ``QuantVariant.W4A16`` is TRTLLM/CUTLASS MXFP4×BF16 except the b12x contract
+    handler, which uses NVFP4 weights.
+    """
+    if handler.variant is QuantVariant.W4A16:
+        w4a16_weight = (
+            QuantFormat.NVFP4
+            if B12xW4A16Config in handler.candidate_configs
+            else QuantFormat.MXFP4
+        )
+        return QuantConfig.from_variant(handler.variant, w4a16_weight=w4a16_weight)
+    return QuantConfig(variant=handler.variant)
+
+
 def _activation_for(cfg):
     return {
         "swiglu": SwiGLU(),
@@ -2235,10 +2252,13 @@ def test_contract_curated_seeds_match_declared_capabilities():
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
         runner_type = _BACKEND_RUNNERS[config_type]
-        assert handler.variant in runner_type.supported_quant_variants
+        assert (
+            _quant_config_for_handler(handler).pair
+            in runner_type.supported_quant_variants
+        )
         by_quant = runner_type.supported_activation_classes_by_quant
         activations = (
-            by_quant[handler.variant]
+            by_quant[_quant_config_for_handler(handler).pair]
             if by_quant
             else runner_type.supported_activation_classes
         )
@@ -2904,7 +2924,7 @@ def test_unified_moe_fuzz(cfg):
             topk_group=cfg.topk_group or None,
             routed_scaling_factor=cfg.routed_scaling or None,
         ),
-        quant=QuantConfig(variant=handler.variant),
+        quant=_quant_config_for_handler(handler),
         experts=ExpertConfig(
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
@@ -3265,7 +3285,7 @@ def test_autotune_cache_coherence(base, variant):
     layer = MoELayer(
         MoEConfig(
             routing=RoutingConfig(num_experts=E, top_k=top_k),
-            quant=QuantConfig(variant=variant),
+            quant=QuantConfig.from_variant(variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
             activation=SwiGLU(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),
