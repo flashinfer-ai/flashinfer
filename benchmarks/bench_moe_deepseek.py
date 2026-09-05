@@ -45,6 +45,13 @@ Usage:
     python bench_moe_deepseek.py --num-tokens 128 \
         --profile-cuda --profile-backend cute-dsl
 
+    # Nsight Systems: trace individual graph kernels after tuning/warmup.
+    # The moe NVTX range excludes the separately labeled cold-L2 flush.
+    nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none \
+        --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop \
+        -o moe_bf16 python bench_moe_deepseek.py --num-tokens 32 --ep 8 \
+        --profile-cuda --profile-backend trtllm-bf16 --profile-iters 20
+
     # CuTe DSL finalize modes (TRTLLM keeps its native finalize)
     python bench_moe_deepseek.py --functional-api  # atomic fused (default)
     python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
@@ -311,10 +318,12 @@ def _measure_or_profile(
     l2_flush = torch.empty(2 * get_l2_cache_size(), device="cuda", dtype=torch.int8)
     torch.cuda.cudart().cudaProfilerStart()
     for _ in range(profile_iters):
-        l2_flush.zero_()
-        torch.cuda.synchronize()
-        runner()
-        torch.cuda.synchronize()
+        with torch.cuda.nvtx.range("l2_flush"):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+        with torch.cuda.nvtx.range("moe"):
+            runner()
+            torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     if use_cuda_graph:
         torch.cuda.synchronize()
