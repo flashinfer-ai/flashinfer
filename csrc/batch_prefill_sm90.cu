@@ -236,6 +236,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
             << "K and V must have same page stride for sparse attention";
         TVM_FFI_ICHECK_EQ(params.k_stride_n, params.v_stride_n)
             << "K and V must have same stride_n for sparse attention";
+        TVM_FFI_ICHECK_EQ(paged_k_cache.size(0), paged_v_cache.size(0))
+            << "K and V must have the same number of pages";
+        params.num_pages = paged_k_cache.size(0);
         params.nnz_qo = q.size(0);
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = num_kv_heads;
