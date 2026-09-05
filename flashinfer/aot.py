@@ -45,6 +45,7 @@ from .jit.attention import (
     gen_trtllm_fmha_v2_sm120_module,
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
+from .jit.sparse_pre_indexer import gen_sparse_pre_indexer_module
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
@@ -827,6 +828,7 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            gen_sparse_pre_indexer_module(),
             gen_topk_module(),
         ]
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
