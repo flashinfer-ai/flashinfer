@@ -693,6 +693,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 comm_backend_for_handle_transfer=comm_backend,
                 enable_multicast=False,
                 allocate_signal_pads=False,
+                # Local TRT-LLM IPC does not require GDR, which is
+                # unavailable on consumer Blackwell GPUs.
+                gpu_direct_rdma_capable=False,
             )
             ptrs = handle.get_buffer_ptrs_host()
             symm_refs.append(handle)
