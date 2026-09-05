@@ -179,4 +179,14 @@ class TorchDistBackend:
         cur_group, _ = self._dist.new_subgroups_by_enumeration(
             _split_partition(all_info)
         )  # pyright: ignore
+        # new_group() does not synchronize the ranks by default (torch only runs
+        # its post-init store barrier when TORCH_DIST_INIT_BARRIER=1), so a rank
+        # can return from a sub-group rendezvous while a peer is still inside it.
+        # With gloo the rendezvous is eager: the peer that is still connecting
+        # then sees "connectFullMesh failed ... Connection closed by peer" as soon
+        # as the rank that raced ahead tears its process group down or exits.
+        # Barrier on the parent group so Split() is collective *and* synchronizing,
+        # matching MPI_Comm_split (and MPIBackend.Split) semantics. Split happens
+        # once at setup, so the cost is irrelevant.
+        self.barrier()
         return TorchDistBackend(group=cur_group)  # pyright: ignore
