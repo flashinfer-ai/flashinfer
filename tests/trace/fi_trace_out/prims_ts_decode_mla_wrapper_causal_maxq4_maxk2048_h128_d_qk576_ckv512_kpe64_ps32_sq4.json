@@ -75,6 +75,9 @@
     "kv_lora_rank == 512",
     "page_size in (16, 32, 64, 128)",
     "block_tables.shape[0] == batch_size",
+    "max_pages_per_seq * page_size >= max_kv_len",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_kv_len",
     "seq_len_q >= 1"
   ],
   "inputs": {

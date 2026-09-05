@@ -140,8 +140,6 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
-    ready_event: torch.cuda.Event
-    ready_stream_handle: int
 
 
 @dataclass(frozen=True)
@@ -177,59 +175,6 @@ class _PagedContextPlanState:
     output_scale: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
-    ready_event: torch.cuda.Event
-    ready_stream_handle: int
-
-
-def _record_context_plan_ready_event(
-    stream: torch.cuda.Stream,
-) -> torch.cuda.Event:
-    """Record the event that closes every plan-owned GPU operation."""
-
-    event = torch.cuda.Event(external=True)
-    event.record(stream)
-    return event
-
-
-def _resolve_context_plan_stream(
-    device: torch.device,
-    *,
-    api_name: str,
-) -> torch.cuda.Stream:
-    """Resolve the target-device stream and reject planning during capture."""
-
-    with torch.cuda.device(device):
-        stream = torch.cuda.current_stream(device)
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                f"{api_name} planning is unsupported during CUDA Graph capture"
-            )
-    return stream
-
-
-def _wait_for_context_plan(
-    state: _ContextPlanState | _PagedContextPlanState,
-    stream: torch.cuda.Stream,
-) -> None:
-    """Make plan-owned tensors ready on one run stream."""
-
-    if stream.device != state.geometry.device:
-        raise ValueError("run stream must share the planned CUDA device")
-    if stream.cuda_stream != state.ready_stream_handle:
-        stream.wait_event(state.ready_event)
-
-
-def _record_context_tensors(
-    stream: torch.cuda.Stream,
-    *tensors: Optional[torch.Tensor],
-) -> None:
-    """Extend allocator lifetimes through one asynchronous eager launch."""
-
-    recorded: set[int] = set()
-    for tensor in tensors:
-        if tensor is not None and id(tensor) not in recorded:
-            tensor.record_stream(stream)
-            recorded.add(id(tensor))
 
 
 _ContextScheduler = Literal[
@@ -688,7 +633,7 @@ def _read_indptr(
     *,
     expected_total: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Copy plan metadata once and validate strictly positive row lengths."""
+    """Read cumulative offsets and validate strictly positive row lengths."""
 
     values = tuple(int(value) for value in indptr.tolist())
     if values[0] != 0:
@@ -710,7 +655,7 @@ def _read_int32_values(
     *,
     expected_count: int,
 ) -> tuple[int, ...]:
-    """Copy one plan-time metadata vector after validating its extent."""
+    """Read one metadata vector after validating its extent."""
 
     if tensor.numel() != expected_count:
         raise ValueError(
@@ -1225,7 +1170,7 @@ def _resolve_context_plan_geometry(
     )
 
 
-def _resolve_paged_one_shot_inputs(
+def _resolve_paged_geometry(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -2235,11 +2180,11 @@ class BatchPrefillTSWrapper:
     CUDA-graph-capturable when the caller guarantees the complete runtime
     contract and stable addresses. Replanning replaces plan-owned tensors and
     invalidates graphs captured from the previous plan; all prior launches and
-    replays must finish before ``plan`` is called again. Eager launches wait
-    for plan-stream initialization and record every launch tensor on the run
-    stream; callers must still avoid mutating storage while work is pending.
-    Keep the wrapper and all captured runtime tensors alive until every graph
-    using the current plan is destroyed.
+    replays must finish before ``plan`` is called again. Keep the wrapper and
+    all captured runtime tensors alive until every graph using the current
+    plan is destroyed. Before running on a CUDA stream that is not already
+    ordered after the planning stream, the caller must establish that
+    dependency.
     """
 
     @flashinfer_api
@@ -2274,8 +2219,8 @@ class BatchPrefillTSWrapper:
         use those bounds as their exact tensor extents. ``batch_size`` is exact.
         Calling ``plan`` again replaces all plan-owned tensors and invalidates
         CUDA graphs captured from the previous plan. Complete every launch and
-        replay that uses the previous plan before replanning. Planning may
-        allocate and compile, and is unsupported during CUDA Graph capture.
+        replay that uses the previous plan before replanning. Planning
+        allocates and compiles; complete it before CUDA Graph capture.
 
         Parameters
         ----------
@@ -2328,10 +2273,6 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
-        plan_stream = _resolve_context_plan_stream(
-            geometry.device,
-            api_name="BatchPrefillTSWrapper",
-        )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -2376,8 +2317,6 @@ class BatchPrefillTSWrapper:
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
         compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
-        ready_event = _record_context_plan_ready_event(plan_stream)
-
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             scale_softmax_log2=scale_tensor,
@@ -2387,8 +2326,6 @@ class BatchPrefillTSWrapper:
             variable_window_cta_starts=variable_window_cta_starts,
             compiled=compiled,
             policy=policy,
-            ready_event=ready_event,
-            ready_stream_handle=plan_stream.cuda_stream,
         )
 
     @flashinfer_api
@@ -2462,9 +2399,6 @@ class BatchPrefillTSWrapper:
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
             )
-        run_stream = torch.cuda.current_stream(geometry.device)
-        _wait_for_context_plan(state, run_stream)
-
         if geometry.mask_type == "variable_window":
             if (
                 variable_window_token_starts is None
@@ -2484,7 +2418,10 @@ class BatchPrefillTSWrapper:
             else:
                 runtime_window_starts = variable_window_token_starts.flatten()
                 runtime_window_ends = variable_window_token_ends.flatten()
-            runtime_window_cta_starts = state.variable_window_cta_starts
+            runtime_window_cta_starts = _refresh_variable_window_cta_starts(
+                runtime_window_starts,
+                state=state,
+            )
         else:
             if (
                 variable_window_token_starts is not None
@@ -2551,26 +2488,6 @@ class BatchPrefillTSWrapper:
                 out,
                 *alias_inputs,
             )
-        _record_context_tensors(
-            run_stream,
-            state.variable_window_padded_starts,
-            q,
-            k,
-            v,
-            out,
-            scale_softmax_log2,
-            output_scale,
-            runtime_qo_indptr,
-            runtime_kv_indptr,
-            runtime_window_starts,
-            runtime_window_ends,
-            runtime_window_cta_starts,
-        )
-        if geometry.mask_type == "variable_window":
-            _refresh_variable_window_cta_starts(
-                runtime_window_starts,
-                state=state,
-            )
         state.compiled(
             q,
             k,
@@ -2602,11 +2519,11 @@ class BatchPrefillPagedTSWrapper:
     synchronize. With caller-owned output, ``validate=False`` performs no
     allocation, metadata readback, or synchronization and is suitable for
     CUDA graph capture when the caller already enforces the full contract.
-    Eager launches wait for plan-stream initialization and record every launch
-    tensor on the run stream. Replanning invalidates captured graphs; prior
-    launches and replays must finish before ``plan`` is called again. Keep the
-    wrapper and all captured runtime tensors alive until every graph using the
-    current plan is destroyed.
+    Replanning invalidates captured graphs; prior launches and replays must
+    finish before ``plan`` is called again. Keep the wrapper and all captured
+    runtime tensors alive until every graph using the current plan is destroyed.
+    Before running on a CUDA stream that is not already ordered after the
+    planning stream, the caller must establish that dependency.
     """
 
     @flashinfer_api
@@ -2652,8 +2569,8 @@ class BatchPrefillPagedTSWrapper:
         columns, including any inactive padding columns. Calling ``plan``
         again replaces plan-owned tensors and invalidates CUDA graphs captured
         from the previous plan. Complete every prior launch and replay before
-        replanning. Planning may allocate and compile, and is unsupported
-        during CUDA Graph capture.
+        replanning. Planning allocates and compiles; complete it before CUDA
+        Graph capture.
 
         Parameters
         ----------
@@ -2706,10 +2623,6 @@ class BatchPrefillPagedTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
-        plan_stream = _resolve_context_plan_stream(
-            geometry.device,
-            api_name="BatchPrefillPagedTSWrapper",
-        )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -2729,8 +2642,6 @@ class BatchPrefillPagedTSWrapper:
         compiled, policy = _get_compiled_paged_context(
             _paged_context_compile_spec(geometry)
         )
-        ready_event = _record_context_plan_ready_event(plan_stream)
-
         # Publish one immutable state object only after every fallible step.
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
@@ -2738,8 +2649,6 @@ class BatchPrefillPagedTSWrapper:
             output_scale=output_scale_tensor,
             compiled=compiled,
             policy=policy,
-            ready_event=ready_event,
-            ready_stream_handle=plan_stream.cuda_stream,
         )
 
     @flashinfer_api
@@ -2830,9 +2739,6 @@ class BatchPrefillPagedTSWrapper:
                 total_q=int(q.shape[0]),
                 num_physical_pages=int(k_cache.shape[0]),
             )
-        run_stream = torch.cuda.current_stream(geometry.device)
-        _wait_for_context_plan(state, run_stream)
-
         if scale_softmax_log2 is None:
             scale_softmax_log2 = state.scale_softmax_log2
         elif validate:
@@ -2867,18 +2773,6 @@ class BatchPrefillPagedTSWrapper:
                 ("scale_softmax_log2", scale_softmax_log2),
                 ("output_scale", output_scale),
             )
-        _record_context_tensors(
-            run_stream,
-            q,
-            k_cache,
-            v_cache,
-            out,
-            qo_indptr,
-            block_tables,
-            seq_lens_kv,
-            scale_softmax_log2,
-            output_scale,
-        )
         state.compiled(
             q,
             k_cache,
@@ -3086,7 +2980,7 @@ def batch_prefill_with_paged_kv_cache(
             "during CUDA graph capture; plan BatchPrefillPagedTSWrapper before "
             "capture"
         )
-    geometry = _resolve_paged_one_shot_inputs(
+    geometry = _resolve_paged_geometry(
         q,
         k_cache,
         v_cache,

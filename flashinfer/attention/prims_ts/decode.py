@@ -1016,12 +1016,12 @@ def _csr_to_block_tables(
 ) -> torch.Tensor:
     """Materialize canonical CSR page IDs as a native fixed page table.
 
-    The caller has already synchronized to validate CSR values. Equal-width
-    rows are exposed as a zero-copy view only when their actual CSR extents
-    equal the native table capacity. Otherwise a temporary dense table copies
-    each active prefix from its true CSR row start. Its inactive tail is
-    deliberately invalid; the native kernel must bound every access by
-    ``seq_lens``.
+    The caller has already synchronized to materialize and validate CSR row
+    offsets and logical lengths. Equal-width rows are exposed as a zero-copy
+    view only when their actual CSR extents equal the native table capacity.
+    Otherwise a temporary dense table copies each active prefix from its true
+    CSR row start. Its inactive tail is deliberately invalid; the native kernel
+    must bound every access by ``seq_lens``.
     """
 
     if paged_kv_indices.ndim != 1:
@@ -2724,9 +2724,8 @@ class BatchDecodePagedTSWrapper:
         values back to the host. This is the safe public default.
         ``validate=False`` treats every run argument as a trusted binding,
         performs no explicit wrapper validation, and remains free of metadata
-        device-to-host synchronization. Lifecycle enforcement, K/V view
-        selection, scale forwarding, and optional output allocation are
-        unavoidable in both modes.
+        device-to-host synchronization. K/V view selection, scale forwarding,
+        and optional output allocation are unavoidable in both modes.
 
         Packed plans require ``qo_indptr`` with ``B + 1`` int32 offsets. Fixed
         plans require ``qo_indptr`` to be omitted. All metadata tensors belong

@@ -1373,7 +1373,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         seq_lens: Optional[torch.Tensor]
-            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+            A 1D tensor indicating the K/V sequence length of each prompt with
+            shape ``[batch_size]``. Most backends require uint32; ``prims-ts``
+            accepts uint32, int32, or int64 and stages the values in int32
+            device storage.
         block_tables: Optional[torch.Tensor]
             A 2D block table with shape
             ``[batch_size, max_num_blocks_per_seq]``. For ``prims-ts`` this is

@@ -280,10 +280,10 @@ assert out.shape == q.shape
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
 run-time tensor shape, stride, and address stable, and pass a preallocated,
-non-overlapping `out`. Eager runs wait for plan initialization across streams
-and call `record_stream` on every launch tensor; callers must still keep
-storage unmodified until the queued work completes. Keep the wrapper and all
-captured runtime tensors alive until every graph using that plan is destroyed.
+non-overlapping `out`. Callers must keep storage unmodified until queued work
+completes. Before running on a CUDA stream that is not already ordered after the
+planning stream, the caller must establish that dependency. Keep the wrapper and
+all captured runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 

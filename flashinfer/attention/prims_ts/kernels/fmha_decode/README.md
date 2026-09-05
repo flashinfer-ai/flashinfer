@@ -32,7 +32,8 @@ Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
 carry the wrapper's plan-owned query mode and output dtype.
 
-Prefer the reusable wrapper when a static cache geometry is used repeatedly.
+Prefer the reusable wrapper when static attention geometry and capacity are
+used repeatedly.
 `plan()` receives the device, exact batch and head geometry, page size, static
 Q and K/V bounds, dtypes, mask, and window. It compiles the specialization and
 either binds an optional caller-owned workspace or allocates private scratch;
@@ -45,10 +46,11 @@ lifetime precondition.
 
 An optional host sequence-length list or CPU tensor passed to `plan()` is
 specialization evidence, not run-time metadata. It may prove that every row is
-exactly `max_kv_len` or that every configured split is full. Every subsequent
-run must preserve whichever predicate was selected. Default run validation
-rechecks that predicate; with `validate=False`, preserving it is the caller's
-responsibility. Omit plan-time `seq_lens` when those properties are not stable.
+exactly `max_kv_len` or that the full configured split-CTA fanout is active for
+every batch/Q group. Every subsequent run must preserve whichever predicate was
+selected. Default run validation rechecks that predicate; with
+`validate=False`, preserving it is the caller's responsibility. Omit plan-time
+`seq_lens` when those properties are not stable.
 Sliding-window plans retain run-time K/V lengths because leading-tile skips
 change the effective domain; persistent Q-dependent causal plans do the same
 while recycling the task graph. These are automatic implementation choices.
@@ -143,11 +145,13 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-K/V lengths, fixed-table page IDs, and packed-Q offsets are per-run inputs
-loaded on every run and graph replay. Their storage and values may change
-between completed launches without recompiling while the static plan contract
-remains satisfied. CUDA Graph replay additionally requires stable captured
-addresses and shapes.
+K/V lengths, fixed-table page IDs, and packed-Q offsets are per-run bindings.
+Page IDs and packed-Q offsets are loaded on every run and graph replay. K/V
+lengths are also loaded unless uniform-max plan evidence makes them a
+compile-time constant. Their storage and values may change between completed
+launches without recompiling while the selected plan predicate remains
+satisfied. CUDA Graph replay additionally requires stable captured addresses
+and shapes.
 
 | Source | Responsibility |
 | --- | --- |

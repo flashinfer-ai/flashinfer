@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import inspect
 import itertools
@@ -652,90 +651,6 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 
 
-class _FakeCudaStream:
-    """Minimal CUDA-stream stand-in for allocation-free CPU contract tests."""
-
-    def __init__(self, *, handle: int = 17) -> None:
-        self.device = torch.device("cpu")
-        self.cuda_stream = handle
-        self.waited_events: list[object] = []
-
-    def wait_event(self, event: object) -> None:
-        self.waited_events.append(event)
-
-
-def _enable_context_cpu_lifecycle(monkeypatch):
-    """Substitute stream/event bookkeeping while retaining wrapper behavior."""
-
-    stream = _FakeCudaStream()
-    ready_events = []
-    recorded_tensor_calls = []
-
-    def record_ready_event(actual_stream):
-        assert actual_stream is stream
-        event = object()
-        ready_events.append(event)
-        return event
-
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_context_plan_stream",
-        lambda _device, *, api_name: stream,
-    )
-    monkeypatch.setattr(
-        context_module, "_record_context_plan_ready_event", record_ready_event
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_record_context_tensors",
-        lambda *args: recorded_tensor_calls.append(args),
-    )
-    return stream, ready_events, recorded_tensor_calls
-
-
-def test_attention_ts_context_plan_ready_event_is_external_and_recorded(
-    monkeypatch,
-) -> None:
-    calls = {}
-
-    class FakeEvent:
-        def record(self, stream) -> None:
-            calls["record_stream"] = stream
-
-    event = FakeEvent()
-
-    def make_event(**kwargs):
-        calls["event_kwargs"] = kwargs
-        return event
-
-    monkeypatch.setattr(torch.cuda, "Event", make_event)
-    stream = _FakeCudaStream()
-
-    assert context_module._record_context_plan_ready_event(stream) is event
-    assert calls == {
-        "event_kwargs": {"external": True},
-        "record_stream": stream,
-    }
-
-
-def test_attention_ts_context_plan_ready_wait_is_cross_stream_only() -> None:
-    ready_event = object()
-    state = SimpleNamespace(
-        geometry=SimpleNamespace(device=torch.device("cpu")),
-        ready_event=ready_event,
-        ready_stream_handle=17,
-    )
-    plan_stream = _FakeCudaStream(handle=17)
-    other_stream = _FakeCudaStream(handle=23)
-
-    context_module._wait_for_context_plan(state, plan_stream)
-    context_module._wait_for_context_plan(state, other_stream)
-
-    assert plan_stream.waited_events == []
-    assert other_stream.waited_events == [ready_event]
-
-
 def test_attention_ts_context_storage_span_includes_stride_and_offset() -> None:
     storage = torch.empty(64, dtype=torch.bfloat16)
     tensor = storage.as_strided((2, 3), (10, 2), storage_offset=3)
@@ -768,7 +683,6 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
 ) -> None:
     """The contiguous wrapper checks runtime metadata and plan-owned scales."""
 
-    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
     monkeypatch.setattr(
         context_module, "_validate_runtime_inputs", lambda *_a, **_k: None
     )
@@ -802,7 +716,6 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
         wrapper = BatchPrefillTSWrapper()
         wrapper._plan_state = context_module._ContextPlanState(
             geometry=SimpleNamespace(
-                device=torch.device("cpu"),
                 output_dtype=out.dtype,
                 packed=True,
                 mask_type="dense",
@@ -814,8 +727,6 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
             variable_window_cta_starts=empty_i32,
             compiled=lambda *_: None,
             policy=(),
-            ready_event=object(),
-            ready_stream_handle=run_stream.cuda_stream,
         )
 
         with pytest.raises(
@@ -837,7 +748,6 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
 ) -> None:
     """The paged wrapper checks every per-run and plan-owned allocation."""
 
-    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
     monkeypatch.setattr(
         context_module, "_validate_paged_runtime_inputs", lambda *_: None
     )
@@ -875,15 +785,11 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
             plan_owned[aliased_name] = out
         wrapper = BatchPrefillPagedTSWrapper()
         wrapper._plan_state = context_module._PagedContextPlanState(
-            geometry=SimpleNamespace(
-                device=torch.device("cpu"), output_dtype=out.dtype
-            ),
+            geometry=SimpleNamespace(output_dtype=out.dtype),
             scale_softmax_log2=plan_owned["scale_softmax_log2"],
             output_scale=plan_owned["output_scale"],
             compiled=lambda *_: None,
             policy=(),
-            ready_event=object(),
-            ready_stream_handle=run_stream.cuda_stream,
         )
 
         with pytest.raises(
@@ -1084,56 +990,6 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert context_module._ContextPlanState.__dataclass_params__.frozen is True
 
 
-@pytest.mark.parametrize(
-    ("wrapper_type", "compile_name"),
-    (
-        (BatchPrefillTSWrapper, "_get_compiled_context"),
-        (BatchPrefillPagedTSWrapper, "_get_compiled_paged_context"),
-    ),
-    ids=("contiguous", "paged"),
-)
-def test_attention_ts_context_reusable_plan_rejects_capture_before_side_effects(
-    monkeypatch,
-    wrapper_type,
-    compile_name: str,
-) -> None:
-    """Capture rejection precedes plan-owned allocations and kernel JIT."""
-
-    wrapper = wrapper_type()
-    stream = _FakeCudaStream()
-    monkeypatch.setattr(
-        context_module,
-        "_resolve_cuda_device",
-        lambda _device: (torch.device("cpu"), 0),
-    )
-    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-
-    def fail_after_capture_check(*_args, **_kwargs):
-        pytest.fail("capture rejection occurred after a plan side effect")
-
-    monkeypatch.setattr(torch, "tensor", fail_after_capture_check)
-    monkeypatch.setattr(torch, "empty", fail_after_capture_check)
-    monkeypatch.setattr(context_module, compile_name, fail_after_capture_check)
-
-    with pytest.raises(
-        RuntimeError,
-        match=rf"{wrapper_type.__name__} planning is unsupported during CUDA Graph capture",
-    ):
-        wrapper.plan(
-            device="cuda:0",
-            batch_size=1,
-            max_seq_len_q=1,
-            max_kv_len=1,
-            num_qo_heads=1,
-            num_kv_heads=1,
-            head_dim=128,
-            q_dtype=torch.float16,
-            kv_dtype=torch.float16,
-        )
-
-
 def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
     parameters = inspect.signature(batch_prefill_with_paged_kv_cache).parameters
     required_parameters = (
@@ -1237,7 +1093,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
 
     monkeypatch.setattr(
         context_module,
-        "_resolve_paged_one_shot_inputs",
+        "_resolve_paged_geometry",
         resolve,
     )
     monkeypatch.setattr(context_module, "BatchPrefillPagedTSWrapper", StubWrapper)
@@ -1310,7 +1166,7 @@ def test_attention_ts_context_paged_one_shot_validates_fixed_table(
     block_tables = torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32)
     seq_lens_kv = torch.tensor((17, 65), dtype=torch.int32)
 
-    geometry = context_module._resolve_paged_one_shot_inputs(
+    geometry = context_module._resolve_paged_geometry(
         q,
         k_cache,
         v_cache,
@@ -1349,7 +1205,7 @@ def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
     v_cache = torch.empty_like(k_cache)
 
     with pytest.raises(ValueError, match=match):
-        context_module._resolve_paged_one_shot_inputs(
+        context_module._resolve_paged_geometry(
             q,
             k_cache,
             v_cache,
@@ -1368,7 +1224,6 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
 ) -> None:
     compile_calls = []
     launch_calls = []
-    run_stream, ready_events, _ = _enable_context_cpu_lifecycle(monkeypatch)
 
     def compiled(*args):
         launch_calls.append(args)
@@ -1381,6 +1236,11 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     monkeypatch.setattr(context_module, "_get_compiled_context", fake_compile)
 
@@ -1399,8 +1259,6 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
     )
     state = wrapper._plan_state
     assert state is not None
-    assert state.ready_event is ready_events[0]
-    assert state.ready_stream_handle == run_stream.cuda_stream
 
     first = (
         torch.empty((8, 4, 128), dtype=torch.float16),
@@ -1460,16 +1318,19 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
     monkeypatch,
 ) -> None:
     launch_calls = []
-    run_stream, _, recorded_tensor_calls = _enable_context_cpu_lifecycle(monkeypatch)
 
     def compiled(*args):
-        assert len(recorded_tensor_calls) == 1
         launch_calls.append(args)
 
     monkeypatch.setattr(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     monkeypatch.setattr(
         context_module,
@@ -1491,17 +1352,6 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
     )
     state = wrapper._plan_state
     assert state is not None
-    refresh = context_module._refresh_variable_window_cta_starts
-
-    def refresh_after_lifetime_record(*args, **kwargs):
-        assert len(recorded_tensor_calls) == 1
-        return refresh(*args, **kwargs)
-
-    monkeypatch.setattr(
-        context_module,
-        "_refresh_variable_window_cta_starts",
-        refresh_after_lifetime_record,
-    )
     q = torch.empty((2, 3, 2, 128), dtype=torch.float16)
     k = torch.empty((2, 4, 1, 128), dtype=torch.float16)
     v = torch.empty_like(k)
@@ -1532,16 +1382,6 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
     assert launch[9].data_ptr() == ends.data_ptr()
     assert launch[10] is state.variable_window_cta_starts
     assert state.variable_window_padded_starts is not None
-    assert len(recorded_tensor_calls) == 1
-    recorded_stream, *recorded_tensors = recorded_tensor_calls[0]
-    assert recorded_stream is run_stream
-    expected_recorded_tensors = (state.variable_window_padded_starts, *launch)
-    assert all(
-        actual is expected
-        for actual, expected in zip(
-            recorded_tensors, expected_recorded_tensors, strict=True
-        )
-    )
     assert not hasattr(state, "variable_window_token_starts")
     assert not hasattr(state, "variable_window_token_ends")
 
@@ -1551,7 +1391,6 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
 ) -> None:
     compile_calls = []
     launch_calls = []
-    run_stream, ready_events, _ = _enable_context_cpu_lifecycle(monkeypatch)
 
     def compiled(*args):
         launch_calls.append(args)
@@ -1564,6 +1403,11 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_paged_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     monkeypatch.setattr(context_module, "_get_compiled_paged_context", fake_compile)
 
@@ -1581,8 +1425,6 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     )
     first_state = wrapper._plan_state
     assert first_state is not None
-    assert first_state.ready_event is ready_events[0]
-    assert first_state.ready_stream_handle == run_stream.cuda_stream
     with pytest.raises(ValueError, match="max_kv_len must be positive"):
         wrapper.plan(
             device="cuda:0",
@@ -1646,7 +1488,6 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
     monkeypatch,
 ) -> None:
     compile_count = 0
-    _enable_context_cpu_lifecycle(monkeypatch)
 
     def fake_compile(*_key):
         nonlocal compile_count
@@ -1659,6 +1500,11 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_paged_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     monkeypatch.setattr(context_module, "_get_compiled_paged_context", fake_compile)
     plan_kwargs = dict(
@@ -1688,7 +1534,6 @@ def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
 ) -> None:
     compile_count = 0
     launch_count = 0
-    _enable_context_cpu_lifecycle(monkeypatch)
 
     def fake_compile(*_key):
         nonlocal compile_count
@@ -1706,6 +1551,11 @@ def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     monkeypatch.setattr(context_module, "_get_compiled_context", fake_compile)
     plan_kwargs = dict(
@@ -1737,8 +1587,6 @@ def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
 def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     monkeypatch,
 ) -> None:
-    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
-
     def fail(*_args, **_kwargs):
         pytest.fail("validate=False reached an explicit runtime validator")
 
@@ -1752,13 +1600,11 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     launched = []
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
-        geometry=SimpleNamespace(device=torch.device("cpu"), output_dtype=out.dtype),
+        geometry=SimpleNamespace(output_dtype=out.dtype),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *args: launched.append(args),
         policy=(),
-        ready_event=object(),
-        ready_stream_handle=run_stream.cuda_stream,
     )
     inputs = tuple(torch.empty(1) for _ in range(6))
     scale_softmax_log2 = torch.empty(1)
@@ -1794,7 +1640,6 @@ def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
 ) -> None:
     """Value checks remain active for each validated per-run scale override."""
 
-    run_stream, _, _ = _enable_context_cpu_lifecycle(monkeypatch)
     monkeypatch.setattr(
         context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
     )
@@ -1815,8 +1660,6 @@ def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
         output_scale=torch.tensor((0.5,), dtype=torch.float32),
         compiled=lambda *args: launched.append(args),
         policy=(),
-        ready_event=object(),
-        ready_stream_handle=run_stream.cuda_stream,
     )
     inputs = tuple(torch.empty(1) for _ in range(6))
     invalid_scale = torch.tensor((invalid_value,), dtype=torch.float32)
@@ -1834,12 +1677,11 @@ def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
     assert launched == []
 
 
-def test_attention_ts_context_paged_run_forwards_valid_scales_and_lifecycle(
+def test_attention_ts_context_paged_run_forwards_valid_scales(
     monkeypatch,
 ) -> None:
-    """Validated overrides are forwarded after the plan/event lifetime fence."""
+    """Validated per-run scale overrides are forwarded to the launch."""
 
-    run_stream, _, recorded_tensor_calls = _enable_context_cpu_lifecycle(monkeypatch)
     monkeypatch.setattr(
         context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
     )
@@ -1849,11 +1691,8 @@ def test_attention_ts_context_paged_run_forwards_valid_scales_and_lifecycle(
     monkeypatch.setattr(context_module, "_validate_tensor", lambda *_a, **_k: None)
 
     launched = []
-    ready_event = object()
 
     def compiled(*args):
-        assert run_stream.waited_events == [ready_event]
-        assert len(recorded_tensor_calls) == 1
         launched.append(args)
 
     plan_scale_softmax_log2 = torch.tensor((0.125,), dtype=torch.float32)
@@ -1867,8 +1706,6 @@ def test_attention_ts_context_paged_run_forwards_valid_scales_and_lifecycle(
         output_scale=plan_output_scale,
         compiled=compiled,
         policy=(),
-        ready_event=ready_event,
-        ready_stream_handle=run_stream.cuda_stream + 1,
     )
     q, k_cache, v_cache, qo_indptr, block_tables, seq_lens_kv = (
         torch.empty(1) for _ in range(6)
@@ -1891,27 +1728,6 @@ def test_attention_ts_context_paged_run_forwards_valid_scales_and_lifecycle(
     )
 
     assert returned is out
-    assert run_stream.waited_events == [ready_event]
-    assert len(recorded_tensor_calls) == 1
-    recorded_stream, *recorded_tensors = recorded_tensor_calls[0]
-    assert recorded_stream is run_stream
-    expected_recorded_tensors = (
-        q,
-        k_cache,
-        v_cache,
-        out,
-        qo_indptr,
-        block_tables,
-        seq_lens_kv,
-        scale_softmax_log2,
-        output_scale,
-    )
-    assert all(
-        actual is expected
-        for actual, expected in zip(
-            recorded_tensors, expected_recorded_tensors, strict=True
-        )
-    )
     assert len(launched) == 1
     expected_launch = (
         q,
@@ -1956,8 +1772,6 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),
-        ready_event=object(),
-        ready_stream_handle=0,
     )
     placeholder = torch.empty(0)
 
@@ -2946,6 +2760,11 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         context_module,
         "_resolve_cuda_device",
         lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(
+        context_module,
+        "_resolve_paged_context_scheduler",
+        lambda _geometry: "static_persistent",
     )
     common = dict(
         device="cuda:0",
@@ -3978,8 +3797,6 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    assert wrapper._plan_state is not None
-    assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
 
     for _ in range(2):
         output = _run_wrapper(wrapper, case)
@@ -4756,141 +4573,6 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     graph.replay()
     torch.cuda.synchronize()
     _assert_context_correct(output, case.reference)
-
-
-@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
-@pytest.mark.arch_blackwell
-@_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_plan_ready_event_orders_cross_stream_run(
-    monkeypatch,
-    paged: bool,
-) -> None:
-    """A run stream consumes plan state without explicitly waiting on its stream."""
-
-    if paged:
-        paged_case = _make_paged_context_case(
-            q_lengths=(33, 17),
-            k_lengths=(129, 97),
-            num_qo_heads=8,
-            num_kv_heads=2,
-            head_dim=128,
-            qkv_dtype=torch.bfloat16,
-            mask_type="causal",
-            page_size=32,
-            output_dtype=torch.bfloat16,
-            output_scale=1.0,
-            seed=2026090402,
-        )
-        reference = paged_case.reference
-        metadata = _make_native_paged_metadata(paged_case)
-        wrapper_type = BatchPrefillPagedTSWrapper
-        compile_name = "_get_compiled_paged_context"
-        plan_kwargs = dict(
-            device=reference.q.device,
-            batch_size=len(reference.q_lengths),
-            max_seq_len_q=max(reference.q_lengths),
-            max_kv_len=max(reference.k_lengths),
-            num_qo_heads=int(reference.q.shape[1]),
-            num_kv_heads=int(paged_case.k_cache.shape[1]),
-            head_dim=int(reference.q.shape[2]),
-            q_dtype=reference.q.dtype,
-            kv_dtype=paged_case.k_cache.dtype,
-            out_dtype=reference.output_dtype,
-            page_size=paged_case.page_size,
-            mask_type=reference.mask_type,
-            window_left=reference.window_left,
-            sm_scale=reference.sm_scale,
-            output_scale=reference.output_scale,
-        )
-        run_args = (
-            reference.q,
-            paged_case.k_cache,
-            paged_case.v_cache,
-            metadata.qo_indptr,
-            metadata.block_tables,
-            metadata.seq_lens_kv,
-        )
-    else:
-        reference = _make_context_case(
-            q_lengths=(65,),
-            k_lengths=(65,),
-            num_qo_heads=8,
-            num_kv_heads=2,
-            qkv_dtype=torch.bfloat16,
-            packed=False,
-            mask_type="causal",
-            output_dtype=torch.bfloat16,
-            output_scale=1.0,
-            device="cuda",
-            seed=2026090403,
-        )
-        wrapper_type = BatchPrefillTSWrapper
-        compile_name = "_get_compiled_context"
-        plan_kwargs = dict(
-            device=reference.q.device,
-            batch_size=len(reference.q_lengths),
-            max_seq_len_q=max(reference.q_lengths),
-            max_kv_len=max(reference.k_lengths),
-            num_qo_heads=int(reference.q.shape[-2]),
-            num_kv_heads=int(reference.k.shape[-2]),
-            head_dim=int(reference.q.shape[-1]),
-            q_dtype=reference.q.dtype,
-            kv_dtype=reference.k.dtype,
-            out_dtype=reference.output_dtype,
-            packed=False,
-            mask_type=reference.mask_type,
-            window_left=reference.window_left,
-            sm_scale=reference.sm_scale,
-            output_scale=reference.output_scale,
-        )
-        run_args = (
-            reference.q,
-            reference.k,
-            reference.v,
-            reference.qo_indptr,
-            reference.kv_indptr,
-        )
-
-    # Compile the exact specialization before introducing the plan-stream
-    # delay, so the delayed plan performs no JIT work that could synchronize.
-    warmup_wrapper = wrapper_type()
-    warmup_wrapper.plan(**plan_kwargs)
-    output = torch.full_like(reference.q, float("nan"), dtype=reference.output_dtype)
-    torch.cuda.synchronize()
-
-    get_compiled = getattr(context_module, compile_name)
-
-    def get_compiled_after_plan_stream_delay(*args):
-        compiled = get_compiled(*args)
-        torch.cuda._sleep(1_000_000_000)
-        return compiled
-
-    monkeypatch.setattr(
-        context_module, compile_name, get_compiled_after_plan_stream_delay
-    )
-    plan_stream = torch.cuda.Stream()
-    run_stream = torch.cuda.Stream()
-    wrapper = wrapper_type()
-
-    with torch.cuda.stream(plan_stream):
-        wrapper.plan(**plan_kwargs)
-    state = wrapper._plan_state
-    assert state is not None
-    assert state.ready_stream_handle == plan_stream.cuda_stream
-    assert state.ready_stream_handle != run_stream.cuda_stream
-    assert not state.ready_event.query()
-
-    complete = torch.cuda.Event()
-    with torch.cuda.stream(run_stream):
-        returned = wrapper.run(*run_args, out=output, validate=False)
-        complete.record()
-
-    assert returned is output
-    complete.synchronize()
-    # No run_stream.wait_stream(plan_stream) was issued above. Completion of
-    # the run therefore proves that the wrapper consumed its plan-ready event.
-    assert state.ready_event.query()
-    _assert_context_correct(output, reference)
 
 
 @pytest.mark.arch_blackwell

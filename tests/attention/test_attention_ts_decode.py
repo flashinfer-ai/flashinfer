@@ -4880,7 +4880,7 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
             qo_indptr=qo_indptr,
             max_seq_len_q=1 if packed_query else None,
         )
-        output = _run_case(wrapper, case)
+        output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case)
         wrappers.append(wrapper)
 

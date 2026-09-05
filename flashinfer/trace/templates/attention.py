@@ -1169,6 +1169,7 @@ def _make_prims_ts_decode_wrapper_trace(
             [
                 "len_qo_indptr == batch_size + 1",
                 "total_q == qo_indptr[-1].item()",
+                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
             ]
             if q_mode == _Q_PACKED
             else []
@@ -1654,11 +1655,15 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "kv_lora_rank == 512",
             "page_size in (16, 32, 64, 128)",
             "block_tables.shape[0] == batch_size",
+            "max_pages_per_seq * page_size >= max_kv_len",
+            "min(seq_lens) >= 1",
+            "max(seq_lens) <= max_kv_len",
             *(["kv_pad_dim == 1"] if rank4_cache else []),
             *(
                 [
                     "len_qo_indptr == batch_size + 1",
                     "total_q == qo_indptr[-1].item()",
+                    "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
                 ]
                 if packed_query
                 else ["seq_len_q >= 1"]

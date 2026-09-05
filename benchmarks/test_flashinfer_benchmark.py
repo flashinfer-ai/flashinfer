@@ -518,56 +518,6 @@ def test_prims_ts_ragged_context_adapter_contract(
     assert benchmark_outputs[0].shape == q.shape
 
 
-def test_prims_ts_ragged_context_graph_refcheck_binds_runtime_metadata(
-    monkeypatch, mocked_prims_ts_benchmark
-):
-    """The explicit graph-refcheck launch uses the allocation-free run contract."""
-
-    install_wrapper, _ = mocked_prims_ts_benchmark
-    wrapper = install_wrapper("BatchPrefillTSWrapper")
-    _use_deterministic_ones(monkeypatch)
-    monkeypatch.setattr(
-        attention_routine,
-        "_replay_cuda_graph_once",
-        lambda launch, _out: launch(),
-    )
-    monkeypatch.setattr(
-        attention_routine,
-        "_validate_prims_ts_context_samples",
-        lambda **_kwargs: (1, 0.0),
-    )
-    args = _parse_prims_ts_case(
-        "BatchPrefillWithRaggedKVCacheWrapper",
-        [
-            "--batch_size",
-            "2",
-            "--s_qo",
-            "3",
-            "--s_kv",
-            "3",
-            "--num_qo_heads",
-            "2",
-            "--num_kv_heads",
-            "1",
-            "--head_dim_qk",
-            "128",
-            "--head_dim_vo",
-            "128",
-            "--causal",
-        ],
-    )
-    args.no_cuda_graph = False
-    args.refcheck = True
-
-    attention_routine.testBatchPrefillWithRaggedKVCacheWrapper(args)
-
-    assert len(wrapper.run_calls) == 3
-    replay_args, replay_kwargs = wrapper.run_calls[-1]
-    assert replay_args[3].tolist() == [0, 3, 6]
-    assert replay_args[4].tolist() == [0, 3, 6]
-    assert replay_kwargs["validate"] is False
-
-
 @pytest.mark.parametrize(
     ("spec_dec_mask", "expected_plan_mask", "expected_recorded_causal"),
     (("causal", "causal", True), ("full", "dense", False)),
@@ -632,7 +582,7 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
     assert workspace_buffer.dtype == torch.int8
     assert plan_kwargs == {
         "max_seq_len_q": 3,
-        "packed_query": False,
+        "packed_query": True,
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
@@ -650,17 +600,17 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
         runtime_seq_lens,
         runtime_block_tables,
     ) = run_args
-    assert runtime_q.shape == (2, 3, 2, 128)
+    assert runtime_q.shape == (6, 2, 128)
     assert runtime_kv_cache.shape == (2, 2, 1, 16, 128)
     assert runtime_kv_cache.is_contiguous()
     assert runtime_seq_lens.tolist() == [16, 16]
     assert runtime_block_tables.tolist() == [[0], [1]]
+    assert run_kwargs["qo_indptr"].tolist() == [0, 3, 6]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128))
     assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == runtime_q.shape
     assert run_kwargs["validate"] is False
-    # The public benchmark schema remains packed even though PrimTS receives
-    # the rank-4 multi-query form.
+    # The benchmark and PrimTS both use packed multi-query storage.
     assert benchmark_outputs[0].shape == (6, 2, 128)
 
 
@@ -748,7 +698,7 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     assert workspace_buffer.dtype == torch.int8
     assert plan_kwargs == {
         "max_seq_len_q": 3,
-        "packed_query": False,
+        "packed_query": True,
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
@@ -757,14 +707,15 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
 
     run_args, run_kwargs = wrapper.run_calls[0]
     runtime_q, runtime_kv_cache, runtime_block_tables, runtime_seq_lens = run_args
-    assert runtime_q.shape == (2, 3, 2, 576)
+    assert runtime_q.shape == (6, 2, 576)
     assert runtime_kv_cache.shape == (2, 16, 576)
     assert runtime_kv_cache.is_contiguous()
     assert runtime_block_tables.shape == (2, 1)
     assert runtime_seq_lens.tolist() == [16, 16]
+    assert run_kwargs["qo_indptr"].tolist() == [0, 3, 6]
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(192))
     assert run_kwargs["bmm2_scale"] == 1.0
-    assert run_kwargs["out"].shape == (2, 3, 2, 512)
+    assert run_kwargs["out"].shape == (6, 2, 512)
     assert run_kwargs["out"].dtype == torch.bfloat16
     assert run_kwargs["validate"] is False
     assert benchmark_outputs[0].shape == (6, 2, 512)
