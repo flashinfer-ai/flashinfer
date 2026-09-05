@@ -1570,7 +1570,7 @@ def test_moe_mxfp8_mxfp4(
     alpha,
     beta,
     limit,
-    use_autotune,
+    use_autotune=False,
 ):
     """
     Test MoE with MXFP8 activations and MXFP4 weights.
@@ -1680,6 +1680,25 @@ def test_moe_mxfp8_mxfp4(
     )
 
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() not in [(12, 0), (12, 1)],
+    reason="Regression test is specific to SM120/SM121 autotuning",
+)
+def test_moe_mxfp8_mxfp4_autotune_sm120():
+    test_moe_mxfp8_mxfp4(
+        batch_size=1,
+        hidden_size=128,
+        num_experts=2,
+        top_k=2,
+        intermediate_size=128,
+        otype=torch.bfloat16,
+        alpha=None,
+        beta=None,
+        limit=None,
+        use_autotune=True,
+    )
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
