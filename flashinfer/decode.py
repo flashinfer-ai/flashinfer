@@ -1206,10 +1206,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 module = self._jit_module
             else:
                 if backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
+                    # Decode tiles are far shorter than the fa3 query tile, so the
+                    # fa2 tensor-core kernel is the faster choice whenever it
+                    # supports the dtypes; only an FP8 query needs fa3.
+                    if q_data_type in {torch.float8_e4m3fn, torch.float8_e5m2}:
                         backend = determine_attention_backend(
                             self.device,
                             PosEncodingMode[pos_encoding_mode].value,
@@ -1821,10 +1821,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = self._jit_module
             else:
                 if self._backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
+                    # See workspace_size(): fa2 is the faster tensor-core decode
+                    # kernel unless the query itself is FP8.
+                    if q_data_type in {torch.float8_e4m3fn, torch.float8_e5m2}:
                         self._backend = determine_attention_backend(
                             self.device,
                             PosEncodingMode[pos_encoding_mode].value,

@@ -213,15 +213,15 @@ def gen_fa3(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> Iterator[JitSpec]:
-    if dtype_q != dtype_kv:
-        return  # fa3 template do not support mixed precision
+    if dtype_q != dtype_kv and not (dtype_q.itemsize == 2 and dtype_kv.itemsize == 1):
+        return  # fa3 supports mixed precision only as a 16-bit query with an fp8 KV cache
     if dtype_q.itemsize == 2:
         if dtype_q != dtype_o:
-            return  # for fp16, dtype_o must be the same as dtype_q/dtype_kv
+            return  # for fp16, dtype_o must be the same as dtype_q
 
-    if dtype_kv.itemsize == 1:
+    if dtype_q.itemsize == 1:
         if head_dim_qk == 192 or head_dim_qk == 64:
-            return  # (192, 128) & (64, 64) not supported for fp8 yet.
+            return  # (192, 128) & (64, 64) not supported for fp8 query yet.
 
     yield gen_batch_prefill_module(
         backend="fa3",
@@ -331,6 +331,29 @@ def gen_attention(
                 dtype_q=dtype_qkv,
                 dtype_kv=dtype_qkv,
                 dtype_o=dtype_o,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=use_logits_soft_cap,
+            )
+        # FA3 with a 16-bit query and an fp8 KV cache (K/V dequantized in the kernel)
+        for (
+            (head_dim_qk, head_dim_vo),
+            dtype_qo,
+            dtype_kv,
+            use_sliding_window,
+            use_logits_soft_cap,
+        ) in product(
+            fa3_head_dim_,
+            f16_dtype_,
+            f8_dtype_,
+            use_sliding_window_,
+            use_logits_soft_cap_,
+        ):
+            yield from gen_fa3(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
                 head_dim_qk=head_dim_qk,
                 head_dim_vo=head_dim_vo,
                 use_sliding_window=use_sliding_window,

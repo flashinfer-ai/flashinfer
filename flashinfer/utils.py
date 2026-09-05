@@ -468,10 +468,13 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
-    # FA3 FP8 KV cache currently requires FP8 query.
+    # FA3 supports an FP8 KV cache with either an FP8 query (FP8 tensor cores) or a
+    # 16-bit query (K/V dequantized to the query dtype in the kernel).
     if dtype_kv in {torch.float8_e4m3fn, torch.float8_e5m2} and dtype_q not in {
         torch.float8_e4m3fn,
         torch.float8_e5m2,
+        torch.float16,
+        torch.bfloat16,
     }:
         return False
     # FA3 does not support NVFP4 KV cache (uint8 packed FP4).
