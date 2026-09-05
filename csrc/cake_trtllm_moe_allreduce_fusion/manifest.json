@@ -44,7 +44,7 @@
     "dynamic_smem_bytes": 256
   },
   "schema_version": 1,
-  "source_sha256": "9264cdba8a6d9a2a222d4fdbf514e0043f381d53da135cb240ad28a42432518e",
+  "source_sha256": "2f84020f7bc56de3aef2fb4539abc9ab2ae72d4509faae64dc2abb8463473f80",
   "workspace_protocol": {
     "flag_region_bytes_by_world_size": {
       "2": 2048,
