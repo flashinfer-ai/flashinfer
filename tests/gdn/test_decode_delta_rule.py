@@ -4171,6 +4171,53 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     return a, b, A_log, dt_bias
 
 
+def test_decode_pretranspose_accepts_naturally_aligned_parameter_views():
+    """BF16 decode must accept contiguous parameter slices with scalar alignment."""
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    B, H, HV, D = 1, 4, 24, 128
+    dev = torch.device("cuda")
+
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    a = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=dev)
+    b = torch.randn_like(a)
+    state = torch.zeros(2, HV, D, D, dtype=torch.bfloat16, device=dev)
+    indices = torch.ones(B, dtype=torch.int32, device=dev)
+
+    # Slicing at offset one preserves contiguity but guarantees only the
+    # scalar dtype alignment, not a 32-byte allocation alignment.
+    A_log = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    dt_bias = torch.randn(HV + 1, dtype=torch.bfloat16, device=dev)[1:]
+    assert A_log.is_contiguous() and A_log.data_ptr() % 32 == 4
+    assert dt_bias.is_contiguous() and dt_bias.data_ptr() % 32 == 2
+
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        a=a,
+        b=b,
+        initial_state_indices=indices,
+    )
+    out_view, state_view = gated_delta_rule_decode_pretranspose(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=state.clone(),
+        **kwargs,
+    )
+    out_aligned, state_aligned = gated_delta_rule_decode_pretranspose(
+        A_log=A_log.clone(),
+        dt_bias=dt_bias.clone(),
+        initial_state=state.clone(),
+        **kwargs,
+    )
+    torch.testing.assert_close(out_view, out_aligned, atol=0, rtol=0)
+    torch.testing.assert_close(state_view, state_aligned, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
