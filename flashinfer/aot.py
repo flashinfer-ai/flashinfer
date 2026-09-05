@@ -46,6 +46,7 @@ from .jit.attention import (
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
+from .jit.sparse_scores import gen_sparse_scores_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -829,6 +830,16 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # The scorer multiplies with m16n8k16, so it is only built where that
+        # exists; without it here an AOT-only install has no artifact to load.
+        # has_sm80 means "an 8.x target is in the build", which is narrower than
+        # what the kernel needs: every 9.x/10.x/12.x target has m16n8k16 too.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
+            jit_specs.append(gen_sparse_scores_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:
