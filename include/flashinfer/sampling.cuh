@@ -617,7 +617,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     bool greater_than_u_diff[VEC_SIZE];
 #ifdef FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
 #else
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .template FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
@@ -1943,7 +1943,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     }
     sum_relu_q_minus_p +=
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-            .Sum<VEC_SIZE>(relu_q_minus_p);
+            .template Sum<VEC_SIZE>(relu_q_minus_p);
     __syncthreads();
   }
   if (tx == 0) {
