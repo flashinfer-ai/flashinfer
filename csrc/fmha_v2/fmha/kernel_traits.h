@@ -207,7 +207,8 @@ struct Kernel_traits_ {
   // The version.
   enum { VERSION = VERSION_ };
 
-  // The mask version: padding (2), causal (3), sliding_window_causal (4), custom_mask (5).
+  // The mask version: padding (2), causal (3), sliding_window_causal (4),
+  // bidirectional_sliding_window (5), custom_mask (6).
   enum { MASK_VERSION = MASK_VERSION_ };
 
   // Whether use causal mask or not.
@@ -216,8 +217,11 @@ struct Kernel_traits_ {
   // Whether use the sliding window attention or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4 };
 
+  // Whether use the bidirectional sliding window attention or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5 };
+
   // Whether use the custom mask or not.
-  enum { CUSTOM_MASK = MASK_VERSION_ == 5 };
+  enum { CUSTOM_MASK = MASK_VERSION_ == 6 };
 
   // Do we use LDGSTS for Q, K or V.
   enum { USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u };
@@ -401,10 +405,13 @@ struct Kernel_traits_fmhca_ {
   enum { MASK_VERSION = VERSION_ };
 
   // Whether use causal mask or not.
-  enum { CAUSAL_MASK = MASK_VERSION >= 3 };
+  enum { CAUSAL_MASK = MASK_VERSION == 3 || MASK_VERSION == 4 };
 
   // Whether use the sliding window attention or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION == 4 };
+
+  // Whether use the bidirectional sliding window attention or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION == 5 };
 
   // Do we use LDGSTS for Q, K or V.
   enum { USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u };
@@ -535,10 +542,13 @@ struct Kernel_traits_interleaved_v2_ {
   enum { MASK_VERSION = MASK_VERSION_ };
 
   // Whether use causal mask or not.
-  enum { CAUSAL_MASK = MASK_VERSION_ >= 3 };
+  enum { CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4 };
 
   // Whether use the sliding window attention or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4 };
+
+  // Whether use the bidirectional sliding window attention or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5 };
 
   // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
   enum { CTAS_PER_HEAD = CTAS_PER_HEAD_ };

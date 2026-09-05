@@ -45,8 +45,9 @@ template <
     int NUM_COMPUTE_GROUPS_,
     // The number of data warpgroups (TMA).
     int DMA2COMPUTE_DEPTH_,
-    // The attention mask type: padding (0), causal (1), sliding_window_causal (2), custom_mask (3).
-    // See fused_multihead_attention_kernel.h for description.
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4). See
+    // fused_multihead_attention_kernel.h for description.
     int ATTENTION_MASK_TYPE_ = 0,
     // Is head interleaved ?
     // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
@@ -170,11 +171,13 @@ struct Kernel_traits {
   // The number of warpgroups in the K dimension.
   enum { WARP_GROUP_K = 1 };
 
-  // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2), custom_mask
-  // (3).
+  // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+  // bidirectional_sliding_window_attention (3), custom_mask (4).
   enum { CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2) };
 
-  enum { SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 };
+  enum { SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 || ATTENTION_MASK_TYPE_ == 3 };
+
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 3 };
 
   // Is head interleaved ?
   // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
@@ -189,8 +192,8 @@ struct Kernel_traits {
   // Are we applying softcapping scale for qk products ?
   enum { ENABLE_BMM1_SOFTCAPPING_SCALE = ENABLE_BMM1_SOFTCAPPING_SCALE_ };
 
-  // Use the custom mask input ( attention_mask_type == 3.)
-  enum { USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 3 };
+  // Use the custom mask input ( attention_mask_type == 4.)
+  enum { USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 4 };
 
   // Are we enabling skip softmax attention feature?
   enum { ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_ };
@@ -432,8 +435,9 @@ template <  // The step size in query sequence dimension (M of BMM1 and BMM2).
     int NUM_COMPUTE_GROUPS_,
     // The number of data warpgroups (TMA).
     int DMA2COMPUTE_DEPTH_,
-    // The attention mask type: padding (0), causal (1), sliding_window_causal (2).
-    // See fused_multihead_attention_kernel.h for description.
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4). See
+    // fused_multihead_attention.h for description.
     int ATTENTION_MASK_TYPE_ = 0,
     // Is head interleaved ?
     // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).

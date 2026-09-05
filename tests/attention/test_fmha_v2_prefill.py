@@ -184,6 +184,9 @@ def attention_ref_torch(
                 keep &= (q_indices + offset) >= kv_indices
             if window_left >= 0:
                 keep &= kv_indices >= (q_indices + offset - window_left)
+                if not causal:
+                    # Bidirectional SWA: also drop keys to the right of i + window_left.
+                    keep &= kv_indices <= (q_indices + offset + window_left)
             drop_mask = ~keep
 
         # Batch the per-head math by KV-head group: identical formula, but one
@@ -1308,6 +1311,125 @@ def test_trtllm_fmha_v2_prefill(
     )
 
 
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("max_seq_len", [512])
+@pytest.mark.parametrize("num_qo_heads", [8])
+@pytest.mark.parametrize("num_kv_heads", [2, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("input_layout", "page_size"),
+    [
+        ("PACKED_QKV", None),
+        ("CONTIGUOUS_Q_KV", None),
+        ("Q_PAGED_KV_NHD", 32),
+    ],
+)
+@pytest.mark.parametrize("window_left", [0, 64, 127])
+def test_trtllm_fmha_v2_prefill_bidirectional_sliding_window(
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: Optional[int],
+    dtype: torch.dtype,
+    window_left: int,
+) -> None:
+    """Each query attends to [i - window_left, i + window_left], not causal left-window."""
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout=input_layout,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=dtype,
+        o_dtype=dtype,
+        causal=False,
+        mask_mode="bidirectional_sliding_window",
+        window_left=window_left,
+        logits_soft_cap=0.0,
+        pos_encoding_mode=None,
+        save_softmax_stats=False,
+        skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+def test_trtllm_fmha_v2_prefill_bidirectional_sliding_window_rejected() -> None:
+    """Bidirectional SWA requires window_left and cannot be combined with chunked masking."""
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm12x_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_qo_heads, head_dim = 8, 64
+    seq_len = 32
+    query = torch.randn(seq_len, 3, num_qo_heads, head_dim, dtype=dtype, device=device)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    workspace = _get_workspace_buffer()
+
+    with pytest.raises(ValueError, match="window_left"):
+        trtllm_fmha_v2_prefill(
+            query,
+            "PACKED_QKV",
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=seq_len,
+            max_kv_len=seq_len,
+            bmm1_scale=1.0 / math.sqrt(head_dim),
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=cu_seqlens,
+            cum_seq_lens_kv=cu_seqlens,
+            mask_mode="bidirectional_sliding_window",
+            window_left=-1,
+        )
+
+    with pytest.raises(ValueError, match="chunked"):
+        trtllm_fmha_v2_prefill(
+            query,
+            "PACKED_QKV",
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=seq_len,
+            max_kv_len=seq_len,
+            bmm1_scale=1.0 / math.sqrt(head_dim),
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=cu_seqlens,
+            cum_seq_lens_kv=cu_seqlens,
+            mask_mode="bidirectional_sliding_window",
+            window_left=8,
+            chunked_attention_size=16,
+        )
+
+    with pytest.raises(ValueError, match="causal masking"):
+        trtllm_fmha_v2_prefill(
+            query,
+            "PACKED_QKV",
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=seq_len,
+            max_kv_len=seq_len,
+            bmm1_scale=1.0 / math.sqrt(head_dim),
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=cu_seqlens,
+            cum_seq_lens_kv=cu_seqlens,
+            mask_mode="padding",
+            window_left=8,
+        )
+
+
 @pytest.mark.parametrize("input_layout", ["Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"])
 @pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -1438,6 +1560,7 @@ def test_trtllm_fmha_v2_prefill_non_interleaved_kv(
         (False, -1, "PADDING"),
         (True, 127, "SLIDING_WINDOW"),
         (True, 1024, "SLIDING_WINDOW"),
+        (False, 127, "bidirectional_sliding_window"),
     ],
 )
 def test_trtllm_fmha_v2_prefill_sm120_large_head_dim(
@@ -1456,7 +1579,8 @@ def test_trtllm_fmha_v2_prefill_sm120_large_head_dim(
     """SM120 (Blackwell) coverage for large head dims with mixed mask modes.
 
     Exercises GQA at ``head_dim`` 256 and 512 with ``CAUSAL``, ``PADDING``
-    (bidirectional), and ``SLIDING_WINDOW`` (windowed causal) masks, over the
+    (full bidirectional), ``SLIDING_WINDOW`` (windowed causal), and
+    ``bidirectional_sliding_window`` (symmetric window) masks, over the
     contiguous and paged-KV (NHD) layouts.
 
     These cover the newly-enabled paths: hd512 on SM120 and the
