@@ -7,7 +7,7 @@ supporting multiple payloads per collective operation.
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 
 import torch
 import functools
@@ -24,6 +24,7 @@ from ..tllm_enums import SfLayout
 # csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
 # derived from kMaxRanks there). A single word covers up to 64 ranks.
 MOE_A2A_RANK_MASK_WORDS = 1
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
 
 
 def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
@@ -68,9 +69,19 @@ class _A2AState:
 
 
 @functools.cache
-def get_moe_alltoall_module():
-    """Get or build the MOE A2A JIT module."""
-    module = gen_moe_alltoall_module().build_and_load()
+def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 0):
+        return "sm100a"
+    if capability == (10, 3):
+        return "sm103a"
+    return "legacy"
+
+
+@functools.cache
+def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
+    """Build or load the legacy or exact-architecture all-to-all module."""
+    module = gen_moe_alltoall_module(target).build_and_load()
 
     @register_custom_op(
         "flashinfer::moe_a2a_initialize",
@@ -349,6 +360,22 @@ def get_moe_alltoall_module():
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
     )
+
+
+def get_moe_alltoall_module():
+    """Return the legacy or exact-architecture module for the current device."""
+    device_index = torch.cuda.current_device()
+    return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
+
+
+def _clear_moe_alltoall_module_cache() -> None:
+    _moe_alltoall_target.cache_clear()
+    _get_moe_alltoall_module_for_target.cache_clear()
+
+
+get_moe_alltoall_module.cache_clear = (  # type: ignore[attr-defined]
+    _clear_moe_alltoall_module_cache
+)
 
 
 @flashinfer_api
@@ -631,8 +658,10 @@ def moe_a2a_combine(
         Optional output data type.  Currently supports ``torch.bfloat16``,
         ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
     output_scales : Optional[torch.Tensor]
-        Optional output scale tensor for quantized outputs.  Currently
-        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        Contiguous CUDA scale tensor for quantized outputs.  MXFP8 and MXFP4 use
+        UE8M0 scales packed in ``torch.uint8`` with vector size 32; NVFP4 uses
+        UE4M3 scales in ``torch.float8_e4m3fn`` with vector size 16.  Its extent
+        must exactly match ``sf_layout``, including layout padding.
     output_scalar_scale : float
         Per-tensor global scale applied before FP4 block scaling
         (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
@@ -833,6 +862,11 @@ class MoeAlltoAll:
                 max_num_tokens,
                 eplb_stats_num_experts,
             )
+            # ``moe_a2a_initialize`` synchronizes this rank's workspace memset.
+            # Do not let a peer publish into that workspace until every rank has
+            # completed the same initialization, or a late memset can erase the
+            # peer's first completion epoch.
+            MnnvlMemory.allocated_map[mnnvl_mem.ptr].comm.barrier()
             cls._WORKSPACE_CACHE[key] = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": max_num_tokens,
@@ -1395,6 +1429,7 @@ class MoeAlltoAll:
 
 __all__ = [
     "MoeAlltoAll",
+    "moe_a2a_active_rank_mask",
     "moe_a2a_combine",
     "moe_a2a_dispatch",
     "moe_a2a_get_workspace_size_per_rank",
