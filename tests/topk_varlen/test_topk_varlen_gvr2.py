@@ -521,7 +521,16 @@ def test_gvr2_workspace_override():
 
 def _assert_family(rows, msl_c, top_k, next_n, cr, want):
     """The varlen launcher must admit the same family the free route picks."""
-    key = (rows, msl_c, top_k, msl_c, next_n, cr, _host._arch_token())
+    key = (
+        rows,
+        msl_c,
+        top_k,
+        msl_c,
+        next_n,
+        cr,
+        _host._arch_token(),
+        _host._sm_count(),
+    )
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
@@ -532,7 +541,10 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want):
     "rows,msl_c,top_k,next_n,cr,family",
     [
         (8, 131072, 1024, 4, 4, "reg_clus"),  # clustered register-resident
-        (8, 6144, 512, 1, 4, "reg"),  # register-resident
+        (8, 6144, 512, 1, 4, "reg"),  # register-resident (local VPT=2 rung)
+        (8, 8192, 512, 1, 1, "reg"),  # local VPT=2 rung, top of its band
+        (256, 8192, 512, 1, 1, "reg"),  # local b > 148 BLK=512 rung (upstream: main)
+        (8, 12288, 512, 1, 1, "reg"),  # upstream VPT=4 rung, unchanged
         (8, 3072, 512, 1, 4, "reg"),  # regimg flavor (cached as "reg")
         (64, 131072, 1024, 1, 1, "clus"),  # CS=2 cluster split
         (32, 131072, 1024, 1, 1, "clus"),  # CS=4 cluster split
@@ -697,6 +709,33 @@ def test_gvr2_auto_selects_gvr2():
     assert order[0] == "gvr_2"
     assert "gvr" in order
     _check_varlen_rows(logits, indices, [8192] * 4, 512)
+
+
+@requires_gvr2
+def test_gvr2_auto_selects_gvr2_hint_free():
+    """fp32 WITHOUT pre_idx: auto still picks gvr_2 (hint-free it beats every
+    radix backend 1.5-5x on the measured grid) and never admits gvr (V1
+    needs the hint); the one carved-out cell (K >= 2048, N <= 4096, one row)
+    ranks radix_filter first where it is available, gvr_2 right behind, and a
+    real hint puts gvr_2 back in front."""
+    logits = torch.randn(4, 8192, dtype=torch.float32, device=_DEV)
+    seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=_DEV)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, 512, backend="auto")
+    order = flashinfer.top_k_varlen.suitable_auto_backends
+    assert order[0] == "gvr_2" and "gvr" not in order
+    _check_varlen_rows(logits, indices, [8192] * 4, 512)
+    tiny = torch.randn(1, 4096, dtype=torch.float32, device=_DEV)
+    one = torch.full((1,), 4096, dtype=torch.int32, device=_DEV)
+    indices, _ = flashinfer.top_k_varlen(tiny, one, 2048, backend="auto")
+    order = flashinfer.top_k_varlen.suitable_auto_backends
+    if "radix_filter" in order:
+        assert order[:2] == ["radix_filter", "gvr_2"]
+    else:
+        assert order[0] == "gvr_2"
+    _check_varlen_rows(tiny, indices, [4096], 2048)
+    hint = torch.zeros(1, 2048, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(tiny, one, 2048, pre_idx=hint, backend="auto")
+    assert flashinfer.top_k_varlen.suitable_auto_backends[0] == "gvr_2"
 
 
 @requires_gvr2
@@ -1145,3 +1184,221 @@ def test_gvr2_route_pure_and_total():
                 assert plan["kernel"] in ("main", "reg", "regimg", "clus", "reg_clus")
                 assert plan["block"] >= 128
                 assert plan["grid"][0] >= 1
+
+
+# ---------------------------------------------------------------------------
+# hint-free gvr_2 (FlashInfer-local: pre_idx=None runs on a cached arange
+# anchor) + the FlashInfer-local route() rungs in the 4K < n <= 8K band
+# ---------------------------------------------------------------------------
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "kv,next_n,cr,top_k",
+    [
+        ([8192, 5000, 300, 1], 1, 1, 512),  # reg VPT=2 rung + short rows
+        ([8192 * 4, 6000 * 4, 2048 * 4], 2, 4, 512),  # MTP rows, cr=4
+        ([65536, 40000, 1000], 1, 1, 1024),  # reg_clus band
+        ([262144, 100000, 2047], 1, 1, 2048),  # main/clus band, K=2048
+        ([4096] * 200 + [100] * 56, 1, 1, 512),  # b > 148 BLK=512 rung
+    ],
+)
+def test_gvr2_hint_free_exact(kv, next_n, cr, top_k):
+    """pre_idx=None is exact on every family (the hint only steers sampling);
+    short rows take the identity path, tails are -1, poisoned padding is
+    never read."""
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(kv, next_n, cr, top_k, seed=7)
+    indices, values = _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        next_n=next_n,
+        compress_ratio=cr,
+        return_values=True,
+    )
+    _check_varlen_rows(logits, indices, n_r, top_k, values)
+
+
+@requires_gvr2
+def test_gvr2_hint_free_cuda_graph_replay():
+    """Hint-free calls replay under CUDA graphs: the arange table is a stable
+    per-(device, k) address, growth happens only eagerly (refused under
+    capture), and seq_lens contents may change between replays."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    top_k, n = 512, 8192
+    kv_a = [8192, 4096, 700, 8192]
+    logits, seq_lens, _, n_r_a, _ = _make_varlen_case(
+        kv_a, 1, 1, top_k, seed=3, msl_c=n
+    )
+    out = torch.empty(len(kv_a), top_k, dtype=torch.int32, device=_DEV)
+    # eager call: compiles the launcher and sizes the table
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits, out, n_r_a, top_k)
+    # grow / shrink rows between replays
+    kv_b = [3000, 8192, 8192, 100]
+    seq_lens.copy_(torch.tensor(kv_b, dtype=torch.int32, device=_DEV))
+    n_r_b = _row_valid_lens(kv_b, len(kv_b), 1, 1, n)
+    for r in range(len(kv_b)):
+        logits[r, n_r_b[r] :] = 3e38
+        logits[r, : n_r_b[r]] = torch.randn(n_r_b[r], device=_DEV) - 2.0
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits, out, n_r_b, top_k)
+    # table growth under capture is refused: warm the launcher at a larger
+    # batch WITH a hint (table untouched), then capture hint-free
+    big = (
+        4 * len(kv_a) + _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0]
+    )
+    logits_b = torch.randn(big, n, device=_DEV)
+    seq_b = torch.full((big,), n, dtype=torch.int32, device=_DEV)
+    hint = torch.zeros(big, top_k, dtype=torch.int32, device=_DEV)
+    out_b = torch.empty(big, top_k, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits_b, seq_b, top_k, hint, out_indices=out_b)
+    torch.cuda.synchronize()
+    g2 = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with (
+        pytest.raises(RuntimeError, match="hint-free gvr_2"),
+        torch.cuda.stream(s),
+        torch.cuda.graph(g2, stream=s),
+    ):
+        _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
+    torch.cuda.synchronize()
+    # warmup_varlen sizes the table for its largest batch, so the same
+    # capture then succeeds
+    _host.warmup_varlen(top_k, n, num_rows_list=(big,))
+    g3 = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g3, stream=s):
+        _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
+    torch.cuda.current_stream().wait_stream(s)
+    g3.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits_b, out_b, [n] * big, top_k)
+
+
+@requires_gvr2
+def test_gvr2_hint_free_host_requires_top_k():
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    logits = torch.randn(2, 4096, device=_DEV)
+    kv = torch.full((2,), 4096, dtype=torch.int32, device=_DEV)
+    out = torch.empty(2, 512, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="top_k is required"):
+        _host.run_varlen(logits, None, kv, out)
+    hint = torch.zeros(2, 1024, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="top_k=512 != pre_idx"):
+        _host.run_varlen(logits, hint, kv, out, top_k=512)
+
+
+def test_gvr2_route_local_rungs():
+    """The two FlashInfer-local rungs (4K < n <= 8K): VPT=2 for b <= 148,
+    BLK=512/VPT=4/MINB=2 for 148 < b <= 296 (one wave) — with NBH == IMGOFF
+    (asserted at launch) — the main slab beyond one wave, and the upstream
+    VPT=4 rung untouched above 8K."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    for k in (512, 1024, 2048):
+        for n in (4100, 6144, 8192):
+            p = _host.route(8, n, _round64(n), k)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 2, 1), (
+                n,
+                k,
+                p["tpl"],
+            )
+            assert p["rt"]["IMGOFF"] == p["tpl"][7]
+            p = _host.route(256, n, _round64(n), k)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (512, 4, 2), (
+                n,
+                k,
+                p["tpl"],
+            )
+            assert p["rt"]["IMGOFF"] == p["tpl"][7] == _host.NB
+            assert _host.route(296, n, _round64(n), k)["tpl"][:3] == (512, 4, 2)
+            # second wave only for the upper half of the band (n4 >= 1536)
+            second = "reg" if n >= 6144 else "main"
+            assert _host.route(297, n, _round64(n), k)["kernel"] == second
+            assert _host.route(512, n, _round64(n), k)["kernel"] == second
+            assert _host.route(592, n, _round64(n), k)["kernel"] == second
+            assert _host.route(593, n, _round64(n), k)["kernel"] == "main"
+        p = _host.route(8, 12288, 12288, k)
+        assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 4, 1)
+        p = _host.route(256, 12288, 12288, k)
+        assert p["kernel"] == "main"
+    # the lossless static/dynamic factorization must still hold on the new rungs
+    for b, n in ((8, 8192), (256, 8192), (149, 5000), (148, 5000)):
+        assert _host.route_split(b, n, _round64(n), 512) == _host.route(
+            b, n, _round64(n), 512
+        )
+
+
+def test_gvr2_route_sm_count_aware():
+    """FlashInfer-local: the register band is sized by the device SM count
+    (`sms`; B200 148, B300 160, Rubin 208) — rows in (148, sms] are one wave
+    of 1024-thread CTAs there — while the streaming constants stay at
+    upstream's 148, so plans outside the register band are identical for
+    every sms. Default sms=148 reproduces the B200 dispatch exactly."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    for k in (512, 1024, 2048):
+        for sms in (160, 208):
+            # rows between 148 and sms: wide on this part -> register rungs
+            p = _host.route(sms, 8192, 8192, k, sms=sms)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 2, 1), (
+                k,
+                sms,
+                p["tpl"],
+            )
+            assert p["rt"]["QC"] == _host.QUADC  # the b > sms flag follows sms too
+            p = _host.route(sms, 12288, 12288, k, sms=sms)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 4, 1), (
+                k,
+                sms,
+                p["tpl"],
+            )
+            assert (
+                _host.route(sms, 12288, 12288, k)["kernel"] == "main"
+            )  # default 148: slab
+            # wave cutoffs of the BLK=512 rung scale with sms: one wave for the
+            # whole band, a second wave (<= 4*sms) only from n=6144 up
+            for n_, b_, want in (
+                (8192, 2 * sms, "reg"),
+                (6140, 2 * sms, "reg"),
+                (8192, 4 * sms, "reg"),
+                (6144, 4 * sms, "reg"),
+                (8192, 4 * sms + 1, "main"),
+                (6140, 2 * sms + 1, "main"),
+            ):
+                p = _host.route(b_, n_, n_, k, sms=sms)
+                assert p["kernel"] == want, (k, sms, n_, b_, p["kernel"])
+                if want == "reg":
+                    assert p["tpl"][:3] == (512, 4, 2)
+            # streaming half untouched by sms (b > sms, n outside the register band)
+            for b, n in ((sms + 1, 131072), (192, 131072), (256, 32768), (400, 65536)):
+                assert _host.route(b, n, n, k, sms=sms) == _host.route(b, n, n, k)
+            # the lossless static/dynamic factorization holds for every sms
+            for b, n in ((sms, 8192), (sms + 8, 8192), (2 * sms, 6144), (192, 131072)):
+                assert _host.route_split(b, n, _round64(n), k, sms=sms) == _host.route(
+                    b, n, _round64(n), k, sms=sms
+                )
+    # sms is part of the launcher cache key (a heterogeneous process must not
+    # reuse a plan sized for another part's SM count)
+    assert (
+        _host._sm_count()
+        == torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        if torch.cuda.is_available()
+        else True
+    )
