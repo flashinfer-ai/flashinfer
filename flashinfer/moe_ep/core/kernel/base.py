@@ -23,6 +23,9 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    dest_topk_ids: Optional["torch.Tensor"] = None
+    dest_topk_weights: Optional["torch.Tensor"] = None
+    dest_hidden_states: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):
@@ -69,6 +72,23 @@ class SplitKernelBackend(ABC):
 
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+    def wait_overlap(self) -> None:  # noqa: B027 - intentional no-op default
+        """Wait for an overlapping second-stream consumer, if any."""
+
+    def collect_overlap_combine(
+        self,
+        hidden_states: "torch.Tensor",
+        topk_ids: "torch.Tensor",
+        topk_weights: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Dest-side combine after overlap ship. Default: unused."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement overlap combine"
+        )
+
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
+        """Release kernel-owned workspace (inbox, streams)."""
 
 
 class MegaKernelBackend(ABC):
