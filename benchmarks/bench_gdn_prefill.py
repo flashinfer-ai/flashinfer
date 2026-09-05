@@ -105,6 +105,8 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
     N = len(endpoints)
     T = endpoints[-1]
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int64, device=device)
+    starts = (0,) + tuple(endpoints[:-1])
+    max_seqlen = max(end - start for start, end in zip(starts, endpoints, strict=True))
 
     q = torch.randn((T, h_qk, d), dtype=dtype, device=device)
     k = F.normalize(
@@ -140,6 +142,7 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
             False,
             None,
             state_out,
+            max_seqlen=max_seqlen,
         )
         rotation_buffer_idx += 1
 
