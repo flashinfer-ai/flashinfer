@@ -1199,10 +1199,11 @@ def get_prims_ts_batch_mla_decode_workspace_size(
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
-    The arguments resolve the same policy and private scratch layout as
-    :func:`prims_ts_batch_mla_decode_with_kv_cache`, without compiling a
-    kernel. ``max_seq_len_q`` is the
-    static per-request Q bound for both fixed and packed-query launches;
+    The arguments define the static geometry used to resolve the same automatic
+    policy and private scratch layout as
+    :func:`prims_ts_batch_mla_decode_with_kv_cache`, without compiling a kernel.
+    ``max_seq_len_q`` is the static per-request Q bound for both fixed and
+    packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
     supplied, the bound is one. The returned byte count includes both split-KV
     scratch and the internal FP32 LSE tensor. Allocate a contiguous
@@ -1463,9 +1464,10 @@ def prims_ts_batch_mla_decode_with_kv_cache(
     per-request Q length must also be no greater than the corresponding live
     ``seq_lens`` value. Warm the planned topology before CUDA graph
     capture and provide ``out`` to avoid an output allocation. Captured graphs
-    must retain stable ``qo_indptr`` storage; its values may change only while
-    that packed-offset contract and the captured query/output extent remain
-    valid. No backend fallback or scheduling knob is exposed.
+    must retain stable ``block_tables``, ``seq_lens``, and, for packed Q,
+    ``qo_indptr`` storage. Values may change only between completed replays
+    while the runtime metadata contracts and captured query/output extents
+    remain valid. No backend fallback or scheduling knob is exposed.
 
     Parameters
     ----------
@@ -1749,7 +1751,6 @@ class BatchMLADecodePagedTSWrapper:
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
         )
-        compiled = _get_compiled_mla_decode(compile_spec)
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
             spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1765,6 +1766,7 @@ class BatchMLADecodePagedTSWrapper:
                 required_bytes=workspace_layout.total_bytes,
             )
         workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
+        compiled = _get_compiled_mla_decode(compile_spec)
 
         # Publish only after validation, compilation, allocation, and binding
         # succeed, so a failed re-plan leaves the previous plan usable.
@@ -1924,6 +1926,11 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
+
+    This helper reads ``seq_lens`` and, for packed Q, ``qo_indptr`` on the host
+    to derive plan bounds, then constructs a temporary wrapper. Invoke it
+    outside CUDA Graph capture. Capture-sensitive callers should pre-plan
+    :class:`BatchMLADecodePagedTSWrapper` and use ``run(validate=False)``.
 
     Parameters
     ----------

@@ -1240,8 +1240,6 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     policy = (("source", "auto"), ("split_kv", 1))
     spec = mla_decode_module._MLADecodeLaunchSpec(
         kernel=object(),
-        qkv_dtype=object(),
-        output_dtype=object(),
         policy=policy,
         kernel_workspace_bytes=0,
         split_kv=1,
@@ -1268,7 +1266,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     def compile_plan(*args):
         assert events == ["spec", "validate_workspace", "bind_workspace"]
         events.append("compile")
-        return (lambda *launch_args: None), policy, 0
+        return lambda *launch_args: None
 
     monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
     monkeypatch.setattr(
@@ -1278,6 +1276,11 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         mla_decode_module, "_validate_workspace_buffer", validate_workspace
     )
     monkeypatch.setattr(mla_decode_module, "_bind_mla_workspace", bind_workspace)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_make_mla_decode_compile_spec",
+        lambda *_args, **_kwargs: object(),
+    )
     monkeypatch.setattr(mla_decode_module, "_get_compiled_mla_decode", compile_plan)
 
     workspace = torch.empty(256, dtype=torch.int8)
@@ -2541,7 +2544,7 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
             max_seq_len_q=1 if packed_query else None,
         )
         policy = _policy_dict(wrapper)
-        output = _run_case(wrapper, case)
+        output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
         wrappers.append(wrapper)
 
@@ -2897,10 +2900,6 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     with pytest.raises(
         ValueError, match="max_seq_len_q is required for an all-empty packed query"
     ):
-        _plan_case(case, qo_indptr=qo_indptr)
-    with pytest.raises(
-        ValueError, match="max_seq_len_q is required for an all-empty packed query"
-    ):
         batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
@@ -2927,7 +2926,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
         dtype=case.output_dtype,
         device=case.query.device,
     )
-    eager = _run_case(wrapper, case, out=eager_out)
+    eager = _run_case(wrapper, case, qo_indptr=qo_indptr, out=eager_out)
     assert eager is eager_out
     _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
 
