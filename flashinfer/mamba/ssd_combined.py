@@ -289,14 +289,29 @@ class SSDCombined:
     ):
         from ..utils import get_compute_capability
 
+        if backend not in ("cute", "cake", "vibecuda"):
+            raise ValueError(
+                f"SSDCombined backend must be 'cute', 'cake', or 'vibecuda', "
+                f"got {backend!r}"
+            )
+
         major, minor = get_compute_capability(torch.device("cuda"))
+        if backend == "vibecuda":
+            # The VibeCUDA kernels are plain CUDA + mma.sync m16n8k16 (bf16/f16,
+            # fp32 accumulators) with cp.async staging, available on every
+            # SM80+ part.
+            if major < 8:
+                raise ValueError(
+                    f"SSDCombined backend='vibecuda' requires SM80 or newer "
+                    f"for cp.async and mma.sync bf16. Got SM{major}{minor}."
+                )
         # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
         # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
         # Blackwell (SM120/SM121) lacks tcgen05, so reject it here with a clear message
         # instead of a cryptic cute-dsl "expects ... sm_100a ... got sm_120a" OpError.
         # SM107 (Rubin) shares major=10 but is not yet supported by this kernel, so
         # reject it explicitly rather than letting it slip through the major check.
-        if major not in (10, 11) or (major, minor) == (10, 7):
+        elif major not in (10, 11) or (major, minor) == (10, 7):
             raise ValueError(
                 f"SSDCombined requires datacenter Blackwell (SM100/SM103/SM110) "
                 f"for tcgen05 MMA. Got SM{major}{minor}."
@@ -316,14 +331,32 @@ class SSDCombined:
         self._state_torch_dtype = state_dtype
         self._backend = backend
 
-        if backend not in ("cute", "cake"):
-            raise ValueError(
-                f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
-            )
         if backend == "cake":
             from .cake_ssd_combined import CakeSSDCombined
 
             self._cake_runner = CakeSSDCombined(
+                chunk_size,
+                nheads,
+                headdim,
+                dstate,
+                ngroups,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                has_d=has_d,
+                d_has_hdim=d_has_hdim,
+                has_initial_states=has_initial_states,
+                has_varlen=has_varlen,
+                has_z=has_z,
+                seq_idx_dtype=seq_idx_dtype,
+            )
+            self._seq_cumsum_key = None
+            self._seq_cumsum_buf = None
+            return
+
+        if backend == "vibecuda":
+            from .ssd_vibecuda import VibeCUDASSDCombined
+
+            self._vibecuda_runner = VibeCUDASSDCombined(
                 chunk_size,
                 nheads,
                 headdim,
@@ -687,6 +720,28 @@ class SSDCombined:
                 "selective checkpoint state outputs require SSDCombined backend='cake'"
             )
 
+        if self._backend == "vibecuda":
+            return self._vibecuda_runner.run(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                seq_chunk_cumsum=seq_chunk_cumsum,
+                update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+                out=out,
+                return_final_states=return_final_states,
+            )
+
         _, _, ngroups, dstate = B.shape
 
         # Triton kernel outputs dt_processed directly in io_dtype (bf16),
@@ -906,6 +961,7 @@ def ssd_combined_fwd(
     checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
+    backend: str = "cake",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
@@ -955,6 +1011,7 @@ def ssd_combined_fwd(
             allocated when omitted.
         return_final_states: Whether to return the final state for every batch
             element or packed sequence.
+        backend: Kernel backend, one of ``"cake"`` (default) or ``"vibecuda"``.
 
     Returns:
         A pair containing token-major output with shape
@@ -985,7 +1042,7 @@ def ssd_combined_fwd(
         has_varlen=seq_idx is not None,
         has_z=z is not None,
         seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
-        backend="cake",
+        backend=backend,
     )
     device_index = x.device.index
     if device_index is None:
