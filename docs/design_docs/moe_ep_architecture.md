@@ -227,6 +227,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
+| `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
@@ -241,6 +242,44 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant.variant`); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
+
+For serving several token capacities with one layer and one transformed weight
+set, allocate explicit profiles before capture:
+
+```python
+decode_workspace = layer.create_workspace(max_tokens_per_rank=256)
+prefill_workspace = layer.create_workspace(max_tokens_per_rank=4096)
+
+decode_out = layer.forward(decode_inputs, workspace=decode_workspace)
+prefill_out = layer.forward(prefill_inputs, workspace=prefill_workspace)
+
+# Explicit opt-in when a graph needs a stable borrowed output address.
+decode_view = layer.forward(
+    decode_inputs,
+    workspace=decode_workspace,
+    return_workspace_view=True,
+)
+```
+
+Creation and destruction are collective across EP ranks and must occur in the
+same order. A handle belongs to the layer that created it and accepts any live
+token count up to its capacity. Only one live handle per capacity is allowed on
+a layer. If an explicit handle is created for the
+`FleetParams.max_tokens_per_rank` capacity, it becomes the same logical profile
+selected by `workspace=None`; FlashInfer transfers/reuses the default allocation
+rather than acquiring an aliasing pool reference. `workspace=` selects capacity
+but preserves the existing owned-output default; request
+`return_workspace_view=True` explicitly when a supported backend and CUDA Graph
+need a stable borrowed output address.
+
+Warm each handle with `layer.warmup(..., workspace=handle)` before capturing a
+separate CUDA graph for it. Before `destroy()`, synchronize all uses and retire
+graphs that reference the handle. Physical workspaces are process-pooled across
+compatible layers, so handles are capacity profiles, not concurrency-isolation
+lanes: pooled profiles must execute under stream ordering. Calls without an
+explicit handle preserve the original lazy default-workspace behavior.
+Do not rely on Python garbage collection for cleanup: call `layer.destroy()`
+collectively and explicitly on every EP rank.
 
 ## Architecture
 
@@ -312,7 +351,8 @@ Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe
 | Process runtime | layer init (if `auto_bootstrap`) | layer destroy (ref-counted) |
 | Fleet | first split forward | layer destroy |
 | Handle | each split forward | end of forward |
-| Mega workspace | first mega forward | layer destroy |
+| Default mega workspace | first mega forward | layer destroy |
+| Explicit mega workspace | `create_workspace()` | handle or layer destroy |
 
 ## Usage
 
