@@ -1675,6 +1675,16 @@ def main():
         parser.error("--profile-iters must be positive")
     if args.profile_cuda != (args.profile_backend is not None):
         parser.error("--profile-cuda and --profile-backend must be specified together")
+    if backends and args.profile_backend is not None:
+        profile_backend = (
+            "cutedsl"
+            if args.profile_backend in ("cute-dsl", "cute-dsl-w4a16")
+            else args.profile_backend
+        )
+        if profile_backend not in backends:
+            parser.error(
+                f"--profile-backend {args.profile_backend} is excluded by --backends"
+            )
     if args.profile_backend == "cutlass" and args.use_per_token_activation:
         parser.error("CUTLASS does not consume the per-token activation scale")
     if not is_sm100_family():
