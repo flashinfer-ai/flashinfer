@@ -28,7 +28,10 @@ a tightly-allocated pool with the same data.
 
 from __future__ import annotations
 
+import os
 import random
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -190,3 +193,26 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
         atol=0.0,
         rtol=0.0,
     )
+
+
+def _run_import_with_no_cuda_devices(module: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    return subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_import_gdn_decode_without_cuda_device() -> None:
+    """Importing must not query a CUDA device (regression of #3262/#3293, reintroduced by #3502)."""
+    result = _run_import_with_no_cuda_devices("flashinfer.gdn_decode")
+    assert result.returncode == 0, result.stderr
+
+
+def test_import_flashinfer_without_cuda_device() -> None:
+    result = _run_import_with_no_cuda_devices("flashinfer")
+    assert result.returncode == 0, result.stderr
