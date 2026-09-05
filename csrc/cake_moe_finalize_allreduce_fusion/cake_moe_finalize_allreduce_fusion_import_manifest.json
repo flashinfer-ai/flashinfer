@@ -1,0 +1,7695 @@
+{
+  "artifact_kind": "source_only",
+  "build_contract": {
+    "architecture_source": "modules[].arch",
+    "binary_payloads": false,
+    "target_infrastructure": {
+      "binding_runtime": "flashinfer_tvm_ffi_utils",
+      "headers_owned_by_target": true,
+      "required_headers": [
+        "tvm_ffi_utils.h"
+      ]
+    },
+    "translation_unit_model": "separate_device_and_binding"
+  },
+  "contract": {
+    "architectures": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "dtypes": [
+      "float16",
+      "bfloat16"
+    ],
+    "hidden_dim": 7168,
+    "launch_grid": {
+      "grid_y": 1,
+      "grid_z": 1
+    },
+    "max_lamport_comm_bytes": 2145386496,
+    "operator": "trtllm_moe_finalize_allreduce_fusion",
+    "output_profiles": [
+      "110",
+      "111"
+    ],
+    "pdl": [
+      false,
+      true
+    ],
+    "shared_expert": [
+      false,
+      true
+    ],
+    "top_k": [
+      4,
+      8
+    ],
+    "workspace_abi": "flashinfer_pointer_table",
+    "world_sizes": [
+      2,
+      4,
+      8
+    ]
+  },
+  "files": [
+    {
+      "bytes": 24566,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+      "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+      "sha256": "ef2cb7295342d8d520dab89e0faecbb0e7fe365b9e2515a84efd2f0578ef731c"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+      "sha256": "6138c3140ace99b669d455ec75c66a8c8caecbf8f8a8aea198949eaf0864f9fb"
+    },
+    {
+      "bytes": 28948,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+      "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+      "sha256": "e5d2c83dbeb4be7a83d204da4c816bc8bc3b0357a082173a9fafc3a79d9ad99b"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+      "sha256": "b9ed1fff5d2fcab6dd6e01e656aac5f2b5d9a9a89fc039a835b397aade94f31f"
+    },
+    {
+      "bytes": 29164,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+      "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+      "sha256": "a33d9fa6f4b6ece95b4b094e11d95670305f0ddb34349fd7f7044728045118f5"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+      "sha256": "a521356552336645d8c48ff42264701972ad5e398eed1ad62b0f09c8059e6bd5"
+    },
+    {
+      "bytes": 33546,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+      "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+      "sha256": "49e7644de70752990bd8bcf1b95e8c05149b97a66e111da08c9643f3604a2502"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+      "sha256": "e6123217282476714de3db127fc303f33ebede79a49a6dbf6f899143fefdebb0"
+    },
+    {
+      "bytes": 38385,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+      "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+      "sha256": "b76d0791d21226dd9ca541515c201368404aeaab6be458513cf913f69986ae3e"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+      "sha256": "9253fc7e1573d190fc3f296f69f4c18e8cb4b3d83989ab17df2cbe0510234504"
+    },
+    {
+      "bytes": 42767,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+      "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+      "sha256": "1feed71fc12cdb37bd12375123e90ada4b93f4c6636a9010cbdf47872fb5acdc"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+      "sha256": "efc849ad19e8377927cc72de37be641fa7d71cb0624d69c1314bb8925dc29843"
+    },
+    {
+      "bytes": 26663,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+      "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+      "sha256": "4a5df6d90508be78925491dba6c6b376a667bca2a188e81e10419ad6d1ff48f8"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+      "sha256": "19ec800de3e0d00be8ec65c486a44773ac23fcc209d9588a0cfafd78580e85df"
+    },
+    {
+      "bytes": 31101,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+      "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+      "sha256": "02d131cf7007daeba7ae2fcdf06e98f78714cf437fc68d50eb5bb2ad6f634ea9"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+      "sha256": "8d4e857b05f192d5a0b8d94d7c4218e2339fd52cb6c51b81b3d2d7c4b5ef656c"
+    },
+    {
+      "bytes": 31837,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+      "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+      "sha256": "2efa96992d6f166599bec59f9918d91ed34e223b92a9f761bcc5dff95afe4de7"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+      "sha256": "f83fee7bcc02b5167f18865d8ed9a27d469bd542b53e4b0f6e91dda5873cb49a"
+    },
+    {
+      "bytes": 36275,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+      "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+      "sha256": "80682604a6b535f743e423524f0456178655ab99f3228668d4af536fb772a771"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+      "sha256": "50b9f46bb3a622032d8a953811e157b54b85fd947e576fb8217ccdc1b91fb754"
+    },
+    {
+      "bytes": 42200,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+      "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+      "sha256": "6d2c4cd95414eebb09bb87fc0c6e6de7b3fda76874debc94c04cd2add3c817fd"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+      "sha256": "8e76133ed17970b0115b31c3f7b5e88f7ec01675da2280b856ce89ca8ff45671"
+    },
+    {
+      "bytes": 46638,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+      "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+      "sha256": "a08772d9230bf923ff8f7f3a8c7414bc9f51fc176d0be8e7330ddc1629e43dfe"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+      "sha256": "9ce585c24df4f632d6d0718ac1bfdddc2026062dacb57e0d85087a7f91db7868"
+    },
+    {
+      "bytes": 24566,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+      "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+      "sha256": "ef2cb7295342d8d520dab89e0faecbb0e7fe365b9e2515a84efd2f0578ef731c"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+      "sha256": "6138c3140ace99b669d455ec75c66a8c8caecbf8f8a8aea198949eaf0864f9fb"
+    },
+    {
+      "bytes": 28948,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+      "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+      "sha256": "e5d2c83dbeb4be7a83d204da4c816bc8bc3b0357a082173a9fafc3a79d9ad99b"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+      "sha256": "b9ed1fff5d2fcab6dd6e01e656aac5f2b5d9a9a89fc039a835b397aade94f31f"
+    },
+    {
+      "bytes": 29164,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+      "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+      "sha256": "a33d9fa6f4b6ece95b4b094e11d95670305f0ddb34349fd7f7044728045118f5"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+      "sha256": "a521356552336645d8c48ff42264701972ad5e398eed1ad62b0f09c8059e6bd5"
+    },
+    {
+      "bytes": 33546,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+      "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+      "sha256": "49e7644de70752990bd8bcf1b95e8c05149b97a66e111da08c9643f3604a2502"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+      "sha256": "e6123217282476714de3db127fc303f33ebede79a49a6dbf6f899143fefdebb0"
+    },
+    {
+      "bytes": 38385,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+      "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+      "sha256": "b76d0791d21226dd9ca541515c201368404aeaab6be458513cf913f69986ae3e"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+      "sha256": "9253fc7e1573d190fc3f296f69f4c18e8cb4b3d83989ab17df2cbe0510234504"
+    },
+    {
+      "bytes": 42767,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+      "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+    },
+    {
+      "bytes": 12016,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+      "sha256": "1feed71fc12cdb37bd12375123e90ada4b93f4c6636a9010cbdf47872fb5acdc"
+    },
+    {
+      "bytes": 12150,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+      "sha256": "efc849ad19e8377927cc72de37be641fa7d71cb0624d69c1314bb8925dc29843"
+    },
+    {
+      "bytes": 26663,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+      "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+      "sha256": "4a5df6d90508be78925491dba6c6b376a667bca2a188e81e10419ad6d1ff48f8"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+      "sha256": "19ec800de3e0d00be8ec65c486a44773ac23fcc209d9588a0cfafd78580e85df"
+    },
+    {
+      "bytes": 31101,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+      "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+      "sha256": "02d131cf7007daeba7ae2fcdf06e98f78714cf437fc68d50eb5bb2ad6f634ea9"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+      "sha256": "8d4e857b05f192d5a0b8d94d7c4218e2339fd52cb6c51b81b3d2d7c4b5ef656c"
+    },
+    {
+      "bytes": 31837,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+      "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+      "sha256": "2efa96992d6f166599bec59f9918d91ed34e223b92a9f761bcc5dff95afe4de7"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+      "sha256": "f83fee7bcc02b5167f18865d8ed9a27d469bd542b53e4b0f6e91dda5873cb49a"
+    },
+    {
+      "bytes": 36275,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+      "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+      "sha256": "80682604a6b535f743e423524f0456178655ab99f3228668d4af536fb772a771"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+      "sha256": "50b9f46bb3a622032d8a953811e157b54b85fd947e576fb8217ccdc1b91fb754"
+    },
+    {
+      "bytes": 42200,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+      "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+      "sha256": "6d2c4cd95414eebb09bb87fc0c6e6de7b3fda76874debc94c04cd2add3c817fd"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+      "sha256": "8e76133ed17970b0115b31c3f7b5e88f7ec01675da2280b856ce89ca8ff45671"
+    },
+    {
+      "bytes": 46638,
+      "kind": "device_source",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+      "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+    },
+    {
+      "bytes": 12012,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+      "sha256": "a08772d9230bf923ff8f7f3a8c7414bc9f51fc176d0be8e7330ddc1629e43dfe"
+    },
+    {
+      "bytes": 12146,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+      "sha256": "9ce585c24df4f632d6d0718ac1bfdddc2026062dacb57e0d85087a7f91db7868"
+    }
+  ],
+  "library": "flashinfer",
+  "modules": [
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 24566,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+          "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+          "sha256": "ef2cb7295342d8d520dab89e0faecbb0e7fe365b9e2515a84efd2f0578ef731c"
+        }
+      ],
+      "closure_sha256": "a18980407b10f5c2c3dd5bcdb7f7a3faf8c784a1fcbf0a449fb233efc3e77f6d",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 24566,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+          "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+          "sha256": "6138c3140ace99b669d455ec75c66a8c8caecbf8f8a8aea198949eaf0864f9fb"
+        }
+      ],
+      "closure_sha256": "81c6dd80646e85800b7e5c2eab242a95ab2e011c56ed40f31a4e471222eef6b0",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 28948,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+          "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+          "sha256": "e5d2c83dbeb4be7a83d204da4c816bc8bc3b0357a082173a9fafc3a79d9ad99b"
+        }
+      ],
+      "closure_sha256": "414a5ac7e6570a4757f02ed9712d59024e9171f55d961551cf808dcd2a44b395",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 28948,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+          "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+          "sha256": "b9ed1fff5d2fcab6dd6e01e656aac5f2b5d9a9a89fc039a835b397aade94f31f"
+        }
+      ],
+      "closure_sha256": "1dbe6d9ba7b6e99440dce7deaf4133e2b7a1d7fe118c218a04d8089e88144cfe",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 29164,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+          "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+          "sha256": "a33d9fa6f4b6ece95b4b094e11d95670305f0ddb34349fd7f7044728045118f5"
+        }
+      ],
+      "closure_sha256": "c54bdd576eaec26643183c5327e4f4f6d5020dbaa595c6dabc6170d0e1837331",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 29164,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+          "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+          "sha256": "a521356552336645d8c48ff42264701972ad5e398eed1ad62b0f09c8059e6bd5"
+        }
+      ],
+      "closure_sha256": "a58727691f8a030cd044b641f68619d6c917c2f07039f150897e586234e06267",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33546,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+          "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+          "sha256": "49e7644de70752990bd8bcf1b95e8c05149b97a66e111da08c9643f3604a2502"
+        }
+      ],
+      "closure_sha256": "c01c72a0b37d2f6056ec50a164fbfc62835bfb2544f3eb2f1322c559ad96c7ea",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33546,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+          "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+          "sha256": "e6123217282476714de3db127fc303f33ebede79a49a6dbf6f899143fefdebb0"
+        }
+      ],
+      "closure_sha256": "f4ef647ae2e3d67e31390179502d5d12f24d8830f6160a1ddac69c9104e1a608",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 38385,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+          "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+          "sha256": "b76d0791d21226dd9ca541515c201368404aeaab6be458513cf913f69986ae3e"
+        }
+      ],
+      "closure_sha256": "8858b32a8a499e10b5493524db81b24a395312bd12326ed0704eba636723a223",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 38385,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+          "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+          "sha256": "9253fc7e1573d190fc3f296f69f4c18e8cb4b3d83989ab17df2cbe0510234504"
+        }
+      ],
+      "closure_sha256": "49339ad0361950f59bff45056f878a12cd10f6e46c2ab91ad397d88172680897",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42767,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+          "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+          "sha256": "1feed71fc12cdb37bd12375123e90ada4b93f4c6636a9010cbdf47872fb5acdc"
+        }
+      ],
+      "closure_sha256": "21ebbed0eb608855ccf65009e95a18a07f26f29ba40d8507e032d5435fb4b874",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42767,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+          "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+          "sha256": "efc849ad19e8377927cc72de37be641fa7d71cb0624d69c1314bb8925dc29843"
+        }
+      ],
+      "closure_sha256": "457632e46587d397f261a1f80302023b36b8496fbf146a1ec9399e6646dbb2d5",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 26663,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+          "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+          "sha256": "4a5df6d90508be78925491dba6c6b376a667bca2a188e81e10419ad6d1ff48f8"
+        }
+      ],
+      "closure_sha256": "15ad18c4825249ebd12757166b69f76d67bac201c3b249525b0d3014a1aa389d",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 26663,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+          "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+          "sha256": "19ec800de3e0d00be8ec65c486a44773ac23fcc209d9588a0cfafd78580e85df"
+        }
+      ],
+      "closure_sha256": "3cb3633f7d0c5299ca581296197ee5105d3ac7650ce6bfc98d055a2828d9de09",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31101,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+          "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+          "sha256": "02d131cf7007daeba7ae2fcdf06e98f78714cf437fc68d50eb5bb2ad6f634ea9"
+        }
+      ],
+      "closure_sha256": "25264d30b843fc5e69538703aaa641d837f6f3ffaeaeab5d74736057a6bb51e8",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31101,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+          "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+          "sha256": "8d4e857b05f192d5a0b8d94d7c4218e2339fd52cb6c51b81b3d2d7c4b5ef656c"
+        }
+      ],
+      "closure_sha256": "8f22ee6de66f965abd154d771b3cc08229101a29895bbebb38b73a02f60d3668",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31837,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+          "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+          "sha256": "2efa96992d6f166599bec59f9918d91ed34e223b92a9f761bcc5dff95afe4de7"
+        }
+      ],
+      "closure_sha256": "bf1f47551e2df6e44d78bed078db65c1a8ed3c6c562a5bf6ed322fa360ff3cbc",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31837,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+          "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+          "sha256": "f83fee7bcc02b5167f18865d8ed9a27d469bd542b53e4b0f6e91dda5873cb49a"
+        }
+      ],
+      "closure_sha256": "f7e43190edee24cf64e0f6e08abcc1d779c6066bf709eda82d87258434845543",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 36275,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+          "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+          "sha256": "80682604a6b535f743e423524f0456178655ab99f3228668d4af536fb772a771"
+        }
+      ],
+      "closure_sha256": "99117c67e85c266d6dade30eec9f57ba2b60cf86c95feb5496c981f3e1d03eb1",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 36275,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+          "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+          "sha256": "50b9f46bb3a622032d8a953811e157b54b85fd947e576fb8217ccdc1b91fb754"
+        }
+      ],
+      "closure_sha256": "4beb2a8d7fb5f4ed5fa5d13e63bfb9bae847ddcc8c4f9445443e4b06a5d6cbf0",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42200,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+          "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+          "sha256": "6d2c4cd95414eebb09bb87fc0c6e6de7b3fda76874debc94c04cd2add3c817fd"
+        }
+      ],
+      "closure_sha256": "8865c34f505e44eac068fce51ec06c1bc4ac12a6a291aa7e8a466bef37ab66a5",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42200,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+          "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+          "sha256": "8e76133ed17970b0115b31c3f7b5e88f7ec01675da2280b856ce89ca8ff45671"
+        }
+      ],
+      "closure_sha256": "ea2fb921cbecd040fc0c8984dd9999166fe4a5cecf8ae6864bbde23bbbfed991",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 46638,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+          "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+          "sha256": "a08772d9230bf923ff8f7f3a8c7414bc9f51fc176d0be8e7330ddc1629e43dfe"
+        }
+      ],
+      "closure_sha256": "e1132d177f1104a46423401365e83f763d94b763574c0339f4b9405253753bb5",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 46638,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+          "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+          "sha256": "9ce585c24df4f632d6d0718ac1bfdddc2026062dacb57e0d85087a7f91db7868"
+        }
+      ],
+      "closure_sha256": "da8c4d63d61f57cd6c176fefd70a1e5607ea2dc2caae2dee5995813e818e6643",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_100a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 24566,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+          "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+          "sha256": "ef2cb7295342d8d520dab89e0faecbb0e7fe365b9e2515a84efd2f0578ef731c"
+        }
+      ],
+      "closure_sha256": "183c40fbd9545d505b6ea0e32a2b24431b30866e90e16fa096f764383b4ec134",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 24566,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu",
+          "sha256": "de301f554748d098f13139b1786686cea10ebee87fb9ef7e9a14203899915088"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+          "sha256": "6138c3140ace99b669d455ec75c66a8c8caecbf8f8a8aea198949eaf0864f9fb"
+        }
+      ],
+      "closure_sha256": "a14326ba83c9adcd074288b70e9516fac5c64f4be1c89793109f1177069280e1",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 28948,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+          "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+          "sha256": "e5d2c83dbeb4be7a83d204da4c816bc8bc3b0357a082173a9fafc3a79d9ad99b"
+        }
+      ],
+      "closure_sha256": "d7a510ff3b2bfcc9232a375091c341b824000d8ad3c818d82fd53198d11d0546",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 28948,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu",
+          "sha256": "57294ff76ecbe29f8c5f4a1e611c2092cd25c8f3b11269e5359bef4df96d787a"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+          "sha256": "b9ed1fff5d2fcab6dd6e01e656aac5f2b5d9a9a89fc039a835b397aade94f31f"
+        }
+      ],
+      "closure_sha256": "051a3c9f9e68a2635b31c8e081de3c0a6f87d521d2896711fec266462b3f0515",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 29164,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+          "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+          "sha256": "a33d9fa6f4b6ece95b4b094e11d95670305f0ddb34349fd7f7044728045118f5"
+        }
+      ],
+      "closure_sha256": "9f0f07e044557ddd1bf2e192bce3aa2efda622e623dec3de78f16b535a4c041b",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 29164,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu",
+          "sha256": "5a649e81b8f6a34c3ae067b662b8e4557d84709496a8e766efcacd057a551dbd"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+          "sha256": "a521356552336645d8c48ff42264701972ad5e398eed1ad62b0f09c8059e6bd5"
+        }
+      ],
+      "closure_sha256": "8bdb4faede17238e4fcc283b361b6aeda16b8787c1e2c1074182c31773768dbc",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33546,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+          "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+          "sha256": "49e7644de70752990bd8bcf1b95e8c05149b97a66e111da08c9643f3604a2502"
+        }
+      ],
+      "closure_sha256": "07b971267eb57dc4f48d28e105dca05bdee70b92111fe9d93726fbfcfb1ddb36",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 33546,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu",
+          "sha256": "0d2987910fa187eceb989f5f678e0a420af95fdb9070d1bef2a7e09875d42946"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+          "sha256": "e6123217282476714de3db127fc303f33ebede79a49a6dbf6f899143fefdebb0"
+        }
+      ],
+      "closure_sha256": "98a262bbea3c376c120e6453d9fb45015935948735aaca362bc9598067f2071e",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 38385,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+          "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+          "sha256": "b76d0791d21226dd9ca541515c201368404aeaab6be458513cf913f69986ae3e"
+        }
+      ],
+      "closure_sha256": "652c6fcba6883ff13ce26705f24a450a528bf707718e7f118bcfecec7363b490",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 38385,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu",
+          "sha256": "99f60fa185a6e33d359167a1cfe0b15f4b741c5787365325104c0b96d25e7222"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+          "sha256": "9253fc7e1573d190fc3f296f69f4c18e8cb4b3d83989ab17df2cbe0510234504"
+        }
+      ],
+      "closure_sha256": "b7faf899a80480db69818822a7fd75437741de24dca19e48b27bd8bbcdd82007",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42767,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+          "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+        },
+        {
+          "bytes": 12016,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+          "sha256": "1feed71fc12cdb37bd12375123e90ada4b93f4c6636a9010cbdf47872fb5acdc"
+        }
+      ],
+      "closure_sha256": "9c4e674a1dd98073fd43eb6b8886ab3fce73e7d0a13e2e35d9754848bacd0b7a",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42767,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu",
+          "sha256": "9c0e3a932d4da310aa4a517a900152c714d65609c659b8db2747bc5ff829b298"
+        },
+        {
+          "bytes": 12150,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+          "sha256": "efc849ad19e8377927cc72de37be641fa7d71cb0624d69c1314bb8925dc29843"
+        }
+      ],
+      "closure_sha256": "00ce12eb9ddf85e9e6f5d0cd0dbfc68a957ee225bf4008148339afbf39b16744",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "bfloat16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_bfloat16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 26663,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+          "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+          "sha256": "4a5df6d90508be78925491dba6c6b376a667bca2a188e81e10419ad6d1ff48f8"
+        }
+      ],
+      "closure_sha256": "870591daf578bb73d09bd80cd834a022a90a232db46e84cbb0867dbf77269696",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 26663,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu",
+          "sha256": "18f80bb5df62893b5d593f2bc33e5b7eef1a04a582abaf8bbe78f1e14a03704d"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+          "sha256": "19ec800de3e0d00be8ec65c486a44773ac23fcc209d9588a0cfafd78580e85df"
+        }
+      ],
+      "closure_sha256": "e7dc226c9a77bbe1684961f11409d2290020dc56ce4667fe9aae4e3044f5a7a7",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31101,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+          "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+          "sha256": "02d131cf7007daeba7ae2fcdf06e98f78714cf437fc68d50eb5bb2ad6f634ea9"
+        }
+      ],
+      "closure_sha256": "4296b464e5191654c3cfd29b8d60492d249d4daf8e1c398021e75921307beab1",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31101,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu",
+          "sha256": "e96aa77e0bf98db58b5adf29dc1f124ae28a5179549c7d6e8f07ec3b006bc0da"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+          "sha256": "8d4e857b05f192d5a0b8d94d7c4218e2339fd52cb6c51b81b3d2d7c4b5ef656c"
+        }
+      ],
+      "closure_sha256": "81871488889f3c6e436b70e90a3172bf3c984ae95bdf7f3c607eef3f3558612b",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws2_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws2_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 2
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws2_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31837,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+          "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+          "sha256": "2efa96992d6f166599bec59f9918d91ed34e223b92a9f761bcc5dff95afe4de7"
+        }
+      ],
+      "closure_sha256": "46a64b68a7cd8ddbe75b26ff82fae7a14a4dc02a0ad80ff901bdc66c1151f8bb",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 31837,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu",
+          "sha256": "342bbe997196c5ad634db54eff070fbd82cac8dc06f91d2d684771a5361113ab"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+          "sha256": "f83fee7bcc02b5167f18865d8ed9a27d469bd542b53e4b0f6e91dda5873cb49a"
+        }
+      ],
+      "closure_sha256": "f32bf6131377f14fc1da489e056df8ae07531f2185fb92997dae8844f7302f34",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 36275,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+          "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+          "sha256": "80682604a6b535f743e423524f0456178655ab99f3228668d4af536fb772a771"
+        }
+      ],
+      "closure_sha256": "f9d50c3762dfe203246e19262b429c9148af5e38105f399fa68749c01e96a39e",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 36275,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu",
+          "sha256": "d891948e28512c22ed1f5ade00cb40f57ac9440570d5b85c0e2636f5820fa463"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+          "sha256": "50b9f46bb3a622032d8a953811e157b54b85fd947e576fb8217ccdc1b91fb754"
+        }
+      ],
+      "closure_sha256": "decbc4116ab059362acdb3263262ac1232b4b5d4030c28be7925416093853278",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws4_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws4_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 4
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws4_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42200,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+          "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+          "sha256": "6d2c4cd95414eebb09bb87fc0c6e6de7b3fda76874debc94c04cd2add3c817fd"
+        }
+      ],
+      "closure_sha256": "01a8434696eb2dc93edcbdf61d2e36b0fd6f501730b47587640b0b894a359739",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 42200,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu",
+          "sha256": "c356c2cfe3365852dc37cb5b848487ec145afefd15a19110caa6e52fc573c9fb"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+          "sha256": "8e76133ed17970b0115b31c3f7b5e88f7ec01675da2280b856ce89ca8ff45671"
+        }
+      ],
+      "closure_sha256": "d9eb624f1bb3e2c831dab8da4ccf24f4724a8178e5175e943d859eb54330c18e",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o110",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o110_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "110",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o110_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 46638,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+          "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+        },
+        {
+          "bytes": 12012,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+          "sha256": "a08772d9230bf923ff8f7f3a8c7414bc9f51fc176d0be8e7330ddc1629e43dfe"
+        }
+      ],
+      "closure_sha256": "b4ee99c342d4c3de6eb20515be8eeba23b105490783d151f2e3adf43834eebfb",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": false
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl0",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl0",
+      "role": "finalize_pdl0",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": false,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl0_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "allreduce_in"
+        ],
+        [
+          "buffer",
+          "inverse_indices"
+        ],
+        [
+          "buffer",
+          "expert_scales"
+        ],
+        [
+          "buffer",
+          "shared_expert_output"
+        ],
+        [
+          "buffer",
+          "residual"
+        ],
+        [
+          "buffer",
+          "norm_weight"
+        ],
+        [
+          "buffer",
+          "residual_out"
+        ],
+        [
+          "buffer",
+          "norm_out"
+        ],
+        [
+          "buffer",
+          "quant_out"
+        ],
+        [
+          "buffer",
+          "scale_out"
+        ],
+        [
+          "buffer",
+          "workspace_tensor"
+        ],
+        [
+          "parameter",
+          "world_rank"
+        ],
+        [
+          "parameter",
+          "tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "has_shared_expert"
+        ],
+        [
+          "parameter",
+          "routed_scaling_factor"
+        ],
+        [
+          "parameter",
+          "epsilon"
+        ],
+        [
+          "parameter",
+          "weight_bias"
+        ],
+        [
+          "parameter",
+          "scale_factor"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "bc714470bc2c1c3c114375516eac5f1ffbdb11e2af3311cb2a6708aeb6f769c7",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 46638,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu",
+          "sha256": "af380c414090a6cb4297f8052c927f3b9ab5fecd17f1260d8543f08de95bc676"
+        },
+        {
+          "bytes": 12146,
+          "path": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+          "sha256": "9ce585c24df4f632d6d0718ac1bfdddc2026062dacb57e0d85087a7f91db7868"
+        }
+      ],
+      "closure_sha256": "56f5fbf272cc1450556d560f1b1b4f4c275a7d6435a4ecabe04991c0b6ec1a2a",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_trtllm_moe_finalize_float16_ws8_o111",
+      "launch": {
+        "block": [
+          224,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "default",
+        "cooperative": false,
+        "dynamic_smem_bytes": 256,
+        "use_pdl": true
+      },
+      "module_ident": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl1",
+      "name": "cake_trtllm_moe_finalize_float16_ws8_o111_pdl1",
+      "role": "finalize_pdl1",
+      "route": {
+        "dtype": "float16",
+        "hidden_dim": 7168,
+        "output_profile": "111",
+        "use_pdl": true,
+        "world_size": 8
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_pdl1_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_moe_finalize_allreduce_fusion/sm_103a/cake_trtllm_moe_finalize_float16_ws8_o111_device.cu"
+      }
+    }
+  ],
+  "name": "cake_moe_finalize_allreduce_fusion",
+  "producer": "cake",
+  "producer_revision": null,
+  "schema": "cake.library_export.v1"
+}
