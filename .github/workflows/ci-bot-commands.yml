@@ -21,7 +21,9 @@ permissions:
 
 jobs:
   handle-command:
-    # Only run on PR comments mentioning @flashinfer-bot
+    # Cheap pre-filter only. Workflow expressions have no regex, so this cannot
+    # tell a command from prose that mentions one; `Parse command` below is the
+    # authoritative match and every handler step is gated on its output.
     if: |
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@flashinfer-bot')
@@ -100,13 +102,45 @@ jobs:
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          if echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun failed"; then
+          # A command counts only when it STARTS a line that is not inside a
+          # fenced code block. These matches used to be unanchored, so merely
+          # writing about a command ran it: on #4880 four review/progress comments
+          # that quoted the phrase in prose, a table cell, an inline code span or
+          # a ``` block each re-applied `run-ci`, and under
+          # `cancel-in-progress` that cancelled and restarted a ~4.5h GPU run.
+          #
+          # Reduce the body to the first line that IS a command, then classify it.
+          # Leading whitespace is allowed (indented commands are common); anything
+          # to the left of the handle - `>` for a quoted reply, `|` for a table
+          # cell, a backtick for an inline code span, prose - is not.
+          # A fence closes only on the delimiter that opened it: a ``` block may
+          # legitimately contain a ~~~ line as content, and treating that as the
+          # close would let a command later in the same block through -- exactly
+          # the bug this change exists to prevent.
+          #
+          # `|| CMD=""` because grep exits 1 when nothing matches, which is the
+          # normal case for an ordinary comment. Today the runner shell is
+          # `bash -e` without pipefail, so only grep's status could propagate;
+          # adding `shell: bash` or a `defaults.run.shell` later would enable
+          # pipefail and abort the step before it writes any command= output.
+          CMD=$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' \
+            | awk '
+                /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 } ; next }
+                /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 } ; next }
+                !f
+              ' \
+            | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+(run|rerun|stop)([[:space:]]|$)' \
+            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || CMD=""
+
+          # Same order as before: `rerun failed` must be tested before `rerun`.
+          # The trailing `([[:space:]]|$)` keeps `run` from matching `running`.
+          if echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+rerun[[:space:]]+failed([[:space:]]|$)'; then
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+rerun([[:space:]]|$)'; then
             echo "command=rerun" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot stop"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+stop([[:space:]]|$)'; then
             echo "command=stop" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+run([[:space:]]|$)'; then
             echo "command=run" >> "$GITHUB_OUTPUT"
           else
             echo "command=unknown" >> "$GITHUB_OUTPUT"
