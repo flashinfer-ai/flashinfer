@@ -18,7 +18,10 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from flashinfer.sampling import get_sampling_module
+from flashinfer.sampling import (
+    get_sampling_module,
+    softmax as sampling_softmax,
+)
 from flashinfer.utils import _get_cache_buf, device_support_pdl
 
 from .op import ParameterizedOp
@@ -391,20 +394,14 @@ class FusedTemperatureSoftmaxOp(ParameterizedOp):
         ):
             raise ValueError("Temperature must be positive float or a tensor array")
 
-        workspace_buffer = _get_cache_buf(
-            "softmax_workspace", 1024 * 1024, tensor.data.device
-        )
-
         enable_pdl = self.default_params.get("enable_pdl", None)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(tensor.data.device)
 
-        probs = get_sampling_module().softmax(
-            workspace_buffer,
-            tensor.data,
-            maybe_temperature_arr,
-            temperature_val,
-            enable_pdl,
+        # Keep fused pipelines on the public dispatch path so architecture-
+        # specific softmax routes match direct flashinfer.sampling.softmax.
+        probs = sampling_softmax(
+            logits=tensor.data, temperature=temperature, enable_pdl=enable_pdl
         )
 
         return TaggedTensor(probs, output_type)
