@@ -2,7 +2,9 @@ from pathlib import Path
 
 import torch
 
+from flashinfer.jit import core
 from flashinfer.jit import env as jit_env
+from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.jit.attention.modules import gen_customize_batch_prefill_module
 
 
@@ -53,6 +55,59 @@ def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
         assert f"uint32_t {field}_stride_page;" in generated
         assert f"uint32_t {field}_stride_h;" in generated
         assert f"uint32_t {field}_stride_n;" in generated
+
+
+def test_batch_prefill_generates_equal_and_independent_stride_specializations(
+    tmp_path, monkeypatch
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(
+        attention_modules.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(10, 3)},
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
+    monkeypatch.setattr(jit_env, "FLASHINFER_CSRC_DIR", repo_root / "csrc")
+
+    uri = "test_batch_prefill_stride_specializations"
+    spec = gen_customize_batch_prefill_module(
+        "fa2",
+        uri,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.int32,
+        64,
+        64,
+        [],
+        [],
+        [],
+        [],
+        "DefaultAttention",
+        "struct DefaultAttention {};",
+    )
+
+    assert spec.name == uri
+    paged = tmp_path / "generated" / uri / "batch_prefill_paged_kernel_mask_0.cu"
+    ragged = tmp_path / "generated" / uri / "batch_prefill_ragged_kernel_mask_0.cu"
+    binding = tmp_path / "generated" / uri / "batch_prefill.cu"
+    paged_text = paged.read_text()
+    assert (
+        paged_text.count("template cudaError_t BatchPrefillWithPagedKVCacheDispatched<")
+        == 6
+    )
+    assert paged_text.count("/*SAME_KV_STRIDES=*/true") == 3
+    assert paged_text.count("/*SAME_KV_STRIDES=*/false") == 3
+    assert (
+        ragged.read_text().count(
+            "template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<"
+        )
+        == 3
+    )
+    assert (
+        "DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES" in binding.read_text()
+    )
 
 
 def test_batch_prefill_nvfp4_requires_sf_tensors():
