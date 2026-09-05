@@ -521,7 +521,16 @@ def test_gvr2_workspace_override():
 
 def _assert_family(rows, msl_c, top_k, next_n, cr, want):
     """The varlen launcher must admit the same family the free route picks."""
-    key = (rows, msl_c, top_k, msl_c, next_n, cr, _host._arch_token())
+    key = (
+        rows,
+        msl_c,
+        top_k,
+        msl_c,
+        next_n,
+        cr,
+        _host._arch_token(),
+        _host._sm_count(),
+    )
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
@@ -1317,8 +1326,12 @@ def test_gvr2_route_local_rungs():
             )
             assert p["rt"]["IMGOFF"] == p["tpl"][7] == _host.NB
             assert _host.route(296, n, _round64(n), k)["tpl"][:3] == (512, 4, 2)
-            assert _host.route(297, n, _round64(n), k)["kernel"] == "main"
-            assert _host.route(512, n, _round64(n), k)["kernel"] == "main"
+            # second wave only for the upper half of the band (n4 >= 1536)
+            second = "reg" if n >= 6144 else "main"
+            assert _host.route(297, n, _round64(n), k)["kernel"] == second
+            assert _host.route(512, n, _round64(n), k)["kernel"] == second
+            assert _host.route(592, n, _round64(n), k)["kernel"] == second
+            assert _host.route(593, n, _round64(n), k)["kernel"] == "main"
         p = _host.route(8, 12288, 12288, k)
         assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 4, 1)
         p = _host.route(256, 12288, 12288, k)
@@ -1328,3 +1341,64 @@ def test_gvr2_route_local_rungs():
         assert _host.route_split(b, n, _round64(n), 512) == _host.route(
             b, n, _round64(n), 512
         )
+
+
+def test_gvr2_route_sm_count_aware():
+    """FlashInfer-local: the register band is sized by the device SM count
+    (`sms`; B200 148, B300 160, Rubin 208) — rows in (148, sms] are one wave
+    of 1024-thread CTAs there — while the streaming constants stay at
+    upstream's 148, so plans outside the register band are identical for
+    every sms. Default sms=148 reproduces the B200 dispatch exactly."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    for k in (512, 1024, 2048):
+        for sms in (160, 208):
+            # rows between 148 and sms: wide on this part -> register rungs
+            p = _host.route(sms, 8192, 8192, k, sms=sms)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 2, 1), (
+                k,
+                sms,
+                p["tpl"],
+            )
+            assert p["rt"]["QC"] == _host.QUADC  # the b > sms flag follows sms too
+            p = _host.route(sms, 12288, 12288, k, sms=sms)
+            assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 4, 1), (
+                k,
+                sms,
+                p["tpl"],
+            )
+            assert (
+                _host.route(sms, 12288, 12288, k)["kernel"] == "main"
+            )  # default 148: slab
+            # wave cutoffs of the BLK=512 rung scale with sms: one wave for the
+            # whole band, a second wave (<= 4*sms) only from n=6144 up
+            for n_, b_, want in (
+                (8192, 2 * sms, "reg"),
+                (6140, 2 * sms, "reg"),
+                (8192, 4 * sms, "reg"),
+                (6144, 4 * sms, "reg"),
+                (8192, 4 * sms + 1, "main"),
+                (6140, 2 * sms + 1, "main"),
+            ):
+                p = _host.route(b_, n_, n_, k, sms=sms)
+                assert p["kernel"] == want, (k, sms, n_, b_, p["kernel"])
+                if want == "reg":
+                    assert p["tpl"][:3] == (512, 4, 2)
+            # streaming half untouched by sms (b > sms, n outside the register band)
+            for b, n in ((sms + 1, 131072), (192, 131072), (256, 32768), (400, 65536)):
+                assert _host.route(b, n, n, k, sms=sms) == _host.route(b, n, n, k)
+            # the lossless static/dynamic factorization holds for every sms
+            for b, n in ((sms, 8192), (sms + 8, 8192), (2 * sms, 6144), (192, 131072)):
+                assert _host.route_split(b, n, _round64(n), k, sms=sms) == _host.route(
+                    b, n, _round64(n), k, sms=sms
+                )
+    # sms is part of the launcher cache key (a heterogeneous process must not
+    # reuse a plan sized for another part's SM count)
+    assert (
+        _host._sm_count()
+        == torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        if torch.cuda.is_available()
+        else True
+    )

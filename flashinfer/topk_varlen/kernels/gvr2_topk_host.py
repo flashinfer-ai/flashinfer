@@ -24,8 +24,9 @@ bound at the physical width and inflates only the routing value (DKG #60);
 declares; ``run_varlen`` rejects overlapping row layouts; ``run``/``run_ws``/
 ``run_varlen`` re-enter under the logits device and every compile passes an
 explicit ``--gpu-arch``; ``route()`` adds two register-kernel rungs in the
-4K < n <= 8K band (VPT=2 for b <= 148, BLK=512 for 148 < b <= 296 — see the inline
-note; DKG #61); ``run_varlen`` accepts ``pre_idx=None`` and runs
+4K < n <= 8K band (VPT=2 for b <= sms, BLK=512 for sms < b <= 2*sms) and sizes its
+register band by the device SM count ``sms`` instead of the hard-coded 148
+(see the inline note; DKG #61); ``run_varlen`` accepts ``pre_idx=None`` and runs
 hint-free on a cached ``arange(k)`` anchor (``_hint_free_pre_idx``).
 FlashInfer's ``top_k_varlen(backend="gvr_2")``
 calls ``run_varlen`` below; the batch-uniform ``run``/``run_ws`` entries are
@@ -83,6 +84,20 @@ def _device():
             import gvr2_topk_decode as _m
         _dev_mod = _m
     return _dev_mod
+
+
+_SM_COUNT = {}
+
+
+def _sm_count() -> int:
+    """SM count of the CURRENT device (per-device cache). FlashInfer-local
+    knob of ``route()``'s register-resident band (``wide`` / one-wave tests);
+    the streaming-path constants stay at upstream's 148 — see route()."""
+    d = torch.cuda.current_device()
+    v = _SM_COUNT.get(d)
+    if v is None:
+        v = _SM_COUNT[d] = int(torch.cuda.get_device_properties(d).multi_processor_count)
+    return v
 
 
 def _arch_token() -> str:
@@ -156,26 +171,33 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
-def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
-    FlashInfer-local deviations (both in the 4K < n <= 8K band, marked
-    inline): the wide VPT=2 rung and the 148 < b <= 296 BLK=512 register
-    rung."""
+    FlashInfer-local deviations, marked inline: the register-resident band
+    is sized by ``sms`` (the device SM count; upstream hard-codes 148) — the
+    ``wide`` one-wave test, QC/CURE and the one-wave cutoff of the BLK=512
+    rung — and the 4K < n <= 8K band has two extra rungs (wide VPT=2, and
+    sms < b <= 2*sms BLK=512). The streaming-path constants keep upstream's
+    148 on every part."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     # 148 is the B200 SM count, baked in by the upstream CUDA dispatch (route()
     # is a pure mirror of it). It only steers occupancy heuristics (one-wave
-    # tests, split factors, cluster sizing), never correctness: on Rubin
-    # (SM107, 208 SMs) the same constants are merely conservative. Retuning
-    # per-arch is a perf follow-up, not a functional requirement.
-    wide = b <= 148
+    # tests, split factors, cluster sizing), never correctness. FlashInfer-
+    # local: the REGISTER-band tests use the real SM count `sms` (B300 160,
+    # Rubin 208): rows in (148, sms] are one wave of 1024-thread CTAs there
+    # and the register kernels beat the slab by 1.4-1.8x (B300 12288 x 160:
+    # 7.2 -> 4.6 us; Rubin 12288 x 160-192: 5.6 -> 4.0 us; measured same-node
+    # vs sglang, DKG #61). The STREAMING constants below stay at 148: scaling
+    # them too made the 131072 x 192-256 slab cells 3-28% slower on both parts.
+    wide = b <= sms
 
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    QC = 1024 if b > 148 else QUADC
-    CURE = not (n < 2 * k and b > 148)
+    QC = 1024 if b > sms else QUADC
+    CURE = not (n < 2 * k and b > sms)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
@@ -285,15 +307,19 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     #   * wide (b <= 148): VPT=2 covers n4 <= 2048 exactly; the VPT=4 kernel
     #     iterates two empty float4 slots per thread in every pass and is
     #     ~18-20% slower (4.2 -> 3.4 us at n=8192, K=512).
-    #   * 148 < b <= 296 (one wave at MINB=2, two CTAs per SM): the
+    #   * sms < b <= 2*sms (one wave at MINB=2, two CTAs per SM): the
     #     BLK=512/VPT=4 register kernel beats the main slab by 1.3-1.7x
-    #     (8.0 -> 4.9 us at b=256, n=8192, K=512). Beyond one wave the two
-    #     trade places by shape (b=512: -13%..+12%), so the slab keeps it.
+    #     (8.0 -> 4.9 us at b=256, n=8192, K=512; Rubin 8192 x 400: 6.3 ->
+    #     4.2 us). A second wave (b <= 4*sms) still wins for the upper half
+    #     of the band (n >= 6144: B200 b=512 +11..12%, and the ragged-row
+    #     6144-8192 x 320-400 cells where the slab lost to sglang by up to
+    #     22%) but loses for the lower half (n=4160, b=512: -13%), so the
+    #     slab keeps that.
     # Reported upstream for adoption as DKG issue #61.
     if n4 <= 2048:
         if wide:
             return _reg(1024, 2, 1, 2 * NB)
-        if b <= 296:
+        if b <= 2 * sms or (b <= 4 * sms and n4 >= 1536):
             return _reg(512, 4, 2, NB)
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
@@ -524,11 +550,11 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_static(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
     reconstructible from (static, n) by route_dynamic."""
-    plan = route(b, n, npad, k)
+    plan = route(b, n, npad, k, sms=sms)
     st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
     for f in _DYN_RT[st["kernel"]]:
         st["rt"].pop(f)
@@ -614,10 +640,10 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     )
 
 
-def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_split(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
-    st = route_static(b, n, npad, k)
+    st = route_static(b, n, npad, k, sms=sms)
     dyn, smem = route_dynamic(st, n)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
@@ -763,7 +789,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token())
+    sms = _sm_count()
+    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token(), sms)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -784,7 +811,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k)
+    plan_free = route(num_rows, n_route, npad, k, sms=sms)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
@@ -1116,7 +1143,7 @@ _GVR_MAX_DEV = GVR_MAX_DEV
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
 def _build_launcher(b, n, npad, k):
-    rd = route(b, n, npad, k)
+    rd = route(b, n, npad, k, sms=_sm_count())
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1294,7 +1321,7 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    key = (b, n, npad, k, _arch_token())
+    key = (b, n, npad, k, _arch_token(), _sm_count())
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
         lc = _build_launcher(b, n, npad, k)
@@ -1566,7 +1593,7 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr, _arch_token())
+        key = (num_rows, npad, k, n_env, nn, cr, _arch_token(), _sm_count())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -1710,7 +1737,9 @@ def warmup_varlen(
     r = nn
     r_max = req_rows[-1]
     while r <= r_max:
-        plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
+        plan_free = route(
+            r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k), sms=_sm_count()
+        )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
         elif plan_free["kernel"] in ("reg", "regimg"):
