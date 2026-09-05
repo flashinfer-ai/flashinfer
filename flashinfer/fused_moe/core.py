@@ -1881,6 +1881,33 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 num_experts if num_experts is not None else num_local_experts
             )
 
+        def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+            # runner_hash is excluded from persisted (v2) file keys because it
+            # is not stable across processes, so every constructor-fixed option
+            # that selects a tactic but is NOT derivable from the profiled
+            # tensor shapes must be named here. Otherwise two runners with
+            # identical tensor profiles but different config (activation, weight
+            # layout, quantization, expert structure, ...) alias to one stored
+            # entry and clobber / mis-serve each other. Mirrors the CUTLASS
+            # MoERunner in get_cutlass_fused_moe_module. Enums -> int keeps the
+            # key JSON-round-trippable for the store's in-memory preload.
+            return (
+                int(self.top_k),
+                int(self.num_local_experts),
+                int(self.num_experts),
+                int(self.num_fused_shared_experts),
+                int(self.dtype_act),
+                int(self.dtype_weights),
+                int(self.fp8_quantization_type),
+                int(self.hidden_size),
+                int(self.intermediate_size),
+                int(self.activation_type),
+                bool(self.use_shuffled_weight),
+                int(self.weight_layout),
+                bool(self.use_packed_weights),
+                bool(self.use_per_token_scaling),
+            )
+
         def _make_tuning_config(
             self,
             moe_inputs: "MoeRunnerInputs",
