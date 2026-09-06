@@ -15,6 +15,8 @@
 """Strict paired benchmark for generated fused KDA decode kernels on B200."""
 
 import argparse
+import ast
+import gc
 import hashlib
 import importlib
 import importlib.metadata
@@ -25,6 +27,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -67,6 +70,33 @@ _OFFICIAL_SHAPES = (
 )
 _ABBA_ORDER = ("baseline", "candidate", "candidate", "baseline")
 _ORIGINAL_SHAPES = tuple(shape for shape in _OFFICIAL_SHAPES if shape[0] != 32)
+_FULL_DOMAIN_HEADS = (12, 24, 32, 48, 96)
+_FULL_DOMAIN_TAIL_ROWS = (384, 512, 768, 1024, 1536, 2048, 4096)
+_FULL_DOMAIN_SHAPES = tuple(
+    (num_heads, num_rows)
+    for num_heads in _FULL_DOMAIN_HEADS
+    for num_rows in range(1, 257)
+) + tuple(
+    (num_heads, num_rows)
+    for num_heads in _FULL_DOMAIN_HEADS
+    for num_rows in _FULL_DOMAIN_TAIL_ROWS
+)
+_FULL_DOMAIN_SCHEMA = "fused-kda-generated-full-domain-benchmark-v1"
+_FULL_DOMAIN_ROW_SCHEMA = "fused-kda-generated-full-domain-row-v1"
+_EXACT_PR_BASELINE_COMMIT = "fad4af96fac0714feb197044a7226d382cb58a31"
+_EXACT_PR_MERGE_COMMIT = "180f0d660aa05892fdaf77d2e4333dc1bb29d3ae"
+_EXACT_PR_BASELINE_SOURCE_SHA256 = (
+    "dd6cb13f54a823012fe57a12bfadf24c7b3177566a1832ae8eb7f5cfc7977f84"
+)
+_EXACT_PR_FALLBACK_SYMBOLS = (
+    "_aligned_tensor",
+    "_sigmoid",
+    "_fused_kda_decode_kernel",
+    "_fused_kda_decode_launch",
+    "_make_compile_inputs",
+    "_get_compiled_kernel",
+    "_check_cuda_tensor",
+)
 
 
 def _page_strides(num_heads):
@@ -627,10 +657,642 @@ def _run_paired_benchmark(args):
     )
 
 
+def _canonical_json_sha256(payload):
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_symbol_sha256(source_text, symbols):
+    tree = ast.parse(source_text)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    missing = sorted(set(symbols) - set(nodes))
+    if missing:
+        raise RuntimeError(f"baseline source is missing symbols: {missing}")
+    payload = "\n".join(
+        ast.dump(nodes[name], include_attributes=False) for name in symbols
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _attest_exact_pr_fallback(repo_root, implementation_path):
+    exact_source = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repo_root),
+            "show",
+            f"{_EXACT_PR_MERGE_COMMIT}:flashinfer/kda_kernels/fused_kda_decode.py",
+        ),
+        check=True,
+        capture_output=True,
+    ).stdout
+    exact_source_sha256 = hashlib.sha256(exact_source).hexdigest()
+    if exact_source_sha256 != _EXACT_PR_BASELINE_SOURCE_SHA256:
+        raise RuntimeError("exact PR baseline source identity is unavailable")
+    exact_symbol_sha256 = _source_symbol_sha256(
+        exact_source.decode("utf-8"), _EXACT_PR_FALLBACK_SYMBOLS
+    )
+    current_symbol_sha256 = _source_symbol_sha256(
+        implementation_path.read_text(encoding="utf-8"), _EXACT_PR_FALLBACK_SYMBOLS
+    )
+    if current_symbol_sha256 != exact_symbol_sha256:
+        raise RuntimeError("public fallback kernel symbols drifted from the exact PR")
+    return {
+        "commit": _EXACT_PR_BASELINE_COMMIT,
+        "merge_commit": _EXACT_PR_MERGE_COMMIT,
+        "source_sha256": exact_source_sha256,
+        "fallback_symbol_ast_sha256": exact_symbol_sha256,
+        "route": "generated selector forced to return None",
+    }
+
+
+def _full_domain_measurement_config(args, cupti_version):
+    return {
+        "timer": "bench_gpu_time",
+        "backend": "cupti",
+        "cupti_python_version": cupti_version,
+        "cuda_graph": True,
+        "cold_l2": True,
+        "interleaving": "abba",
+        "order": list(_ABBA_ORDER),
+        "graph_warmup_replays_per_cell": args.dry_run_iters,
+        "graph_warmup_replays_per_implementation": 2 * args.dry_run_iters,
+        "timed_replays_per_sample": args.repeat_iters,
+        "paired_samples": 2,
+        "timed_replays_per_implementation": 2 * args.repeat_iters,
+        "cell_reducer": "median",
+        "paired_speedup_reducer": "median",
+        "aggregate_reducer": "geometric_mean",
+    }
+
+
+def _full_domain_run_identity(repo_root, manifest_path):
+    benchmark_path = Path(__file__).resolve()
+    implementation_path = Path(_impl.__file__).resolve()
+    for description, source_path in (
+        ("benchmark", benchmark_path),
+        ("fused KDA implementation", implementation_path),
+        ("generated manifest", manifest_path),
+    ):
+        try:
+            source_path.relative_to(repo_root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"{description} is not loaded from the benchmark repository"
+            ) from error
+    git_status = subprocess.run(
+        ("git", "-C", str(repo_root), "status", "--porcelain"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if git_status:
+        raise RuntimeError("benchmark repository must be completely clean")
+    source_commit = subprocess.run(
+        ("git", "-C", str(repo_root), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if len(source_commit) != 40:
+        raise RuntimeError("benchmark source commit is not a full Git object ID")
+    shape_inventory = [
+        {"num_heads": heads, "num_rows": rows} for heads, rows in _FULL_DOMAIN_SHAPES
+    ]
+    return {
+        "source_commit": source_commit,
+        "benchmark_sha256": hashlib.sha256(benchmark_path.read_bytes()).hexdigest(),
+        "implementation_sha256": hashlib.sha256(
+            implementation_path.read_bytes()
+        ).hexdigest(),
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "shape_inventory": "dense rows 1..256 plus tail rows, for H=12,24,32,48,96",
+        "shape_count": len(_FULL_DOMAIN_SHAPES),
+        "shape_inventory_sha256": _canonical_json_sha256(shape_inventory),
+        "candidate_route": "public fused_kda_decode generated dispatcher",
+        "baseline": _attest_exact_pr_fallback(repo_root, implementation_path),
+    }
+
+
+def _full_domain_session_identity():
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    gpu_uuid, pci_bus_id = _query_single_visible_gpu_identity()
+    return {
+        "gpu": {
+            "name": properties.name,
+            "compute_capability": list(get_compute_capability(torch.device("cuda"))),
+            "sm_count": properties.multi_processor_count,
+            "uuid": gpu_uuid,
+            "pci_bus_id": pci_bus_id,
+        },
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_job_nodelist": os.environ.get("SLURM_JOB_NODELIST"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "managed_step_id": os.environ.get("CODESLACK_MANAGED_STEP_ID"),
+        "managed_step_attempt": os.environ.get("CODESLACK_STEP_ATTEMPT"),
+        "process_started_unix_seconds": time.time(),
+    }
+
+
+def _run_full_domain_cell(
+    args,
+    backend,
+    num_heads,
+    num_rows,
+    *,
+    capture_reference=False,
+    correctness_reference=None,
+):
+    inputs = _make_inputs(num_heads, num_rows)
+    variant_name = None
+    if backend == "baseline":
+        route_guard = mock.patch.object(
+            _impl, "_select_generated_variant", return_value=None
+        )
+        fallback_guard = mock.patch.object(
+            _impl, "_get_compiled_kernel", wraps=_impl._get_compiled_kernel
+        )
+    else:
+        variant = _impl._select_generated_variant(
+            x=inputs["x"],
+            conv_state=inputs["conv_state"],
+            raw_beta=inputs["raw_beta"],
+            state_indices=inputs["state_indices"],
+            state=inputs["state"],
+            output_gate=inputs["output_gate"],
+            lower_bound=inputs["lower_bound"],
+            norm_eps=inputs["norm_eps"],
+        )
+        if variant is None:
+            raise RuntimeError("candidate inputs did not select a generated variant")
+        variant_name = variant.name
+        route_guard = mock.patch.object(
+            _impl, "_select_generated_variant", wraps=_impl._select_generated_variant
+        )
+        fallback_guard = mock.patch.object(
+            _impl,
+            "_get_compiled_kernel",
+            side_effect=RuntimeError("candidate fell back to the exact PR kernel"),
+        )
+
+    with route_guard as route_mock, fallback_guard as fallback_mock:
+        fused_kda_decode(**inputs)
+        torch.cuda.synchronize()
+        correctness_snapshot = None
+        correctness = None
+        if capture_reference:
+            correctness_snapshot = {
+                name: inputs[name].detach().clone()
+                for name in ("output", "conv_state", "state")
+            }
+        if correctness_reference is not None:
+            torch.testing.assert_close(
+                inputs["output"], correctness_reference["output"], rtol=3e-2, atol=2e-2
+            )
+            torch.testing.assert_close(
+                inputs["conv_state"],
+                correctness_reference["conv_state"],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                inputs["state"], correctness_reference["state"], rtol=3e-2, atol=2e-3
+            )
+            correctness = {
+                "checked": True,
+                "candidate": "public generated dispatcher",
+                "reference": "exact PR fallback",
+                "output": {"rtol": 3e-2, "atol": 2e-2, "passed": True},
+                "conv_state": {"rtol": 0.0, "atol": 0.0, "passed": True},
+                "state": {"rtol": 3e-2, "atol": 2e-3, "passed": True},
+            }
+        with (
+            mock.patch.object(
+                testing_utils,
+                "bench_gpu_time_with_cuda_event",
+                side_effect=_forbid_timing_fallback,
+            ),
+            mock.patch.object(
+                testing_utils,
+                "bench_gpu_time_with_cudagraph",
+                side_effect=_forbid_timing_fallback,
+            ),
+        ):
+            samples = testing_utils.bench_gpu_time(
+                fused_kda_decode,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.repeat_iters,
+                enable_cupti=True,
+                use_cuda_graph=True,
+                input_kwargs=inputs,
+                cold_l2_cache=True,
+            )
+        torch.cuda.synchronize()
+        route_call_count = route_mock.call_count
+        fallback_call_count = fallback_mock.call_count
+
+    samples = _validate_samples(
+        [float(value) for value in samples],
+        args.repeat_iters,
+        f"h{num_heads}_rows{num_rows} {backend} cell",
+    )
+    if route_call_count < 1:
+        raise RuntimeError(f"{backend} cell did not exercise the public dispatcher")
+    if backend == "baseline" and fallback_call_count < 1:
+        raise RuntimeError("baseline cell did not exercise the exact PR fallback")
+    if backend == "candidate" and fallback_call_count != 0:
+        raise RuntimeError("candidate cell exercised the exact PR fallback")
+    del inputs
+    measurement = {
+        "backend": backend,
+        "variant_name": variant_name,
+        "route_call_count": route_call_count,
+        "fallback_call_count": fallback_call_count,
+        "median_ms": statistics.median(samples),
+        "samples_ms": samples,
+    }
+    return measurement, correctness_snapshot, correctness
+
+
+def _validate_full_domain_row(row, index, repeat_iters):
+    if not isinstance(row, dict) or set(row) != {
+        "shape",
+        "num_heads",
+        "num_rows",
+        "baseline_ms",
+        "candidate_ms",
+        "paired_speedups",
+        "speedup",
+        "correctness",
+        "measurements",
+    }:
+        raise RuntimeError("full-domain row schema is invalid")
+    num_heads, num_rows = _FULL_DOMAIN_SHAPES[index]
+    shape = f"h{num_heads}_rows{num_rows}"
+    if (
+        row["shape"] != shape
+        or row["num_heads"] != num_heads
+        or type(row["num_heads"]) is not int
+        or row["num_rows"] != num_rows
+        or type(row["num_rows"]) is not int
+    ):
+        raise RuntimeError("full-domain rows are not a contiguous shape prefix")
+    measurements = row["measurements"]
+    if not isinstance(measurements, list) or len(measurements) != 4:
+        raise RuntimeError(f"{shape} does not contain four ABBA cells")
+    candidate_variants = set()
+    for order_index, expected_backend in enumerate(_ABBA_ORDER):
+        cell = measurements[order_index]
+        if not isinstance(cell, dict) or set(cell) != {
+            "order_index",
+            "backend",
+            "variant_name",
+            "route_call_count",
+            "fallback_call_count",
+            "median_ms",
+            "samples_ms",
+        }:
+            raise RuntimeError(f"{shape} measurement schema is invalid")
+        if cell["order_index"] != order_index or cell["backend"] != expected_backend:
+            raise RuntimeError(f"{shape} measurement order is not exact ABBA")
+        samples = _validate_samples(
+            cell["samples_ms"], repeat_iters, f"{shape} cell {order_index}"
+        )
+        _require_close(
+            cell["median_ms"],
+            statistics.median(samples),
+            f"{shape} cell {order_index} median",
+        )
+        if type(cell["route_call_count"]) is not int or cell["route_call_count"] < 1:
+            raise RuntimeError(f"{shape} did not exercise the public dispatcher")
+        if expected_backend == "baseline":
+            if cell["variant_name"] is not None or cell["fallback_call_count"] < 1:
+                raise RuntimeError(f"{shape} baseline route proof is invalid")
+        else:
+            if (
+                not isinstance(cell["variant_name"], str)
+                or not cell["variant_name"]
+                or cell["fallback_call_count"] != 0
+            ):
+                raise RuntimeError(f"{shape} generated route proof is invalid")
+            candidate_variants.add(cell["variant_name"])
+    if len(candidate_variants) != 1:
+        raise RuntimeError(f"{shape} candidate cells selected different variants")
+    correctness = row["correctness"]
+    if (
+        not isinstance(correctness, dict)
+        or correctness.get("checked") is not True
+        or correctness.get("candidate") != "public generated dispatcher"
+        or correctness.get("reference") != "exact PR fallback"
+        or any(
+            correctness.get(name, {}).get("passed") is not True
+            for name in ("output", "conv_state", "state")
+        )
+    ):
+        raise RuntimeError(f"{shape} correctness evidence is invalid")
+    baseline_medians = [measurements[0]["median_ms"], measurements[3]["median_ms"]]
+    candidate_medians = [measurements[1]["median_ms"], measurements[2]["median_ms"]]
+    paired_speedups = [
+        baseline_medians[0] / candidate_medians[0],
+        baseline_medians[1] / candidate_medians[1],
+    ]
+    if not isinstance(row["paired_speedups"], list) or len(row["paired_speedups"]) != 2:
+        raise RuntimeError(f"{shape} paired speedups are invalid")
+    for pair_index, expected in enumerate(paired_speedups):
+        _require_close(
+            row["paired_speedups"][pair_index], expected, f"{shape} pair {pair_index}"
+        )
+    _require_close(
+        row["baseline_ms"], statistics.median(baseline_medians), f"{shape} baseline"
+    )
+    _require_close(
+        row["candidate_ms"],
+        statistics.median(candidate_medians),
+        f"{shape} candidate",
+    )
+    _require_close(
+        row["speedup"], statistics.median(paired_speedups), f"{shape} speedup"
+    )
+
+
+def _full_domain_rows_root(output_path):
+    return output_path.with_name(f"{output_path.name}.rows")
+
+
+def _full_domain_row_path(rows_root, index):
+    return rows_root / f"row-{index:04d}.json"
+
+
+def _load_full_domain_rows(rows_root, identity_sha256, repeat_iters):
+    if not rows_root.is_dir():
+        return [], []
+    row_files = sorted(rows_root.glob("row-*.json"))
+    expected_names = {
+        _full_domain_row_path(rows_root, index).name
+        for index in range(len(_FULL_DOMAIN_SHAPES))
+    }
+    unexpected = [path.name for path in row_files if path.name not in expected_names]
+    if unexpected:
+        raise RuntimeError(f"unexpected full-domain row receipts: {unexpected[:3]}")
+    rows = []
+    row_receipts = []
+    missing_seen = False
+    for index in range(len(_FULL_DOMAIN_SHAPES)):
+        path = _full_domain_row_path(rows_root, index)
+        if not path.is_file():
+            missing_seen = True
+            continue
+        if missing_seen:
+            raise RuntimeError("full-domain row receipts contain a gap")
+        receipt_bytes = path.read_bytes()
+        receipt = json.loads(receipt_bytes)
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "schema",
+            "identity_sha256",
+            "shape_index",
+            "session",
+            "row",
+        }:
+            raise RuntimeError(f"full-domain receipt {path.name} schema is invalid")
+        if (
+            receipt["schema"] != _FULL_DOMAIN_ROW_SCHEMA
+            or receipt["identity_sha256"] != identity_sha256
+            or receipt["shape_index"] != index
+        ):
+            raise RuntimeError(f"full-domain receipt {path.name} identity is invalid")
+        session = receipt["session"]
+        gpu = session.get("gpu") if isinstance(session, dict) else None
+        if (
+            not isinstance(gpu, dict)
+            or gpu.get("compute_capability") != [10, 0]
+            or "B200" not in str(gpu.get("name", "")).upper()
+        ):
+            raise RuntimeError(f"full-domain receipt {path.name} is not B200 evidence")
+        _validate_full_domain_row(receipt["row"], index, repeat_iters)
+        rows.append(receipt["row"])
+        row_receipts.append(
+            {"path": path.name, "sha256": hashlib.sha256(receipt_bytes).hexdigest()}
+        )
+    return rows, row_receipts
+
+
+def _summarize_full_domain(rows):
+    if len(rows) != len(_FULL_DOMAIN_SHAPES):
+        raise RuntimeError("full-domain summary requires every shape")
+    official_shapes = set(_OFFICIAL_SHAPES)
+    original_shapes = set(_ORIGINAL_SHAPES)
+    official_speedups = [
+        row["speedup"]
+        for row in rows
+        if (row["num_heads"], row["num_rows"]) in official_shapes
+    ]
+    original_speedups = [
+        row["speedup"]
+        for row in rows
+        if (row["num_heads"], row["num_rows"]) in original_shapes
+    ]
+    if len(official_speedups) != 21 or len(original_speedups) != 17:
+        raise RuntimeError("full-domain rows do not cover the official subsets")
+    speedups = [row["speedup"] for row in rows]
+    original17 = _geometric_mean(original_speedups)
+    minimum = min(speedups)
+    return {
+        "shape_count": len(rows),
+        "baseline_geomean_ms": _geometric_mean([row["baseline_ms"] for row in rows]),
+        "candidate_geomean_ms": _geometric_mean([row["candidate_ms"] for row in rows]),
+        "full_domain_geomean_speedup": _geometric_mean(speedups),
+        "official21_geomean_speedup": _geometric_mean(official_speedups),
+        "original17_geomean_speedup": original17,
+        "minimum_speedup": minimum,
+        "every_shape_faster": all(speedup > 1.0 for speedup in speedups),
+        "original17_at_least_1_10": original17 >= 1.10,
+        "minimum_at_least_1_01": minimum >= 1.01,
+    }
+
+
+def _write_full_domain_checkpoint(
+    output_path, *, status, identity, measurement, rows, row_receipts, summary=None
+):
+    payload = {
+        "schema": _FULL_DOMAIN_SCHEMA,
+        "status": status,
+        "identity": identity,
+        "measurement": measurement,
+        "progress": {
+            "completed_rows": len(rows),
+            "total_rows": len(_FULL_DOMAIN_SHAPES),
+            "next_shape": (
+                None
+                if len(rows) == len(_FULL_DOMAIN_SHAPES)
+                else {
+                    "num_heads": _FULL_DOMAIN_SHAPES[len(rows)][0],
+                    "num_rows": _FULL_DOMAIN_SHAPES[len(rows)][1],
+                }
+            ),
+        },
+        "row_receipts": row_receipts,
+    }
+    if summary is not None:
+        payload["summary"] = summary
+        payload["rows"] = rows
+    _write_json_atomic(output_path, payload)
+
+
+def _run_full_domain_benchmark(args):
+    cupti_version = _require_b200_and_cupti()
+    repo_root = Path(__file__).resolve().parents[1]
+    output_path = Path(args.output_json).resolve()
+    try:
+        output_path.relative_to(repo_root)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("--output-json must be outside the source repository")
+    manifest_path = (get_kda_csrc_dir() / _MANIFEST_FILENAME).resolve()
+    identity = _full_domain_run_identity(repo_root, manifest_path)
+    identity_sha256 = _canonical_json_sha256(identity)
+    measurement = _full_domain_measurement_config(args, cupti_version)
+    rows_root = _full_domain_rows_root(output_path)
+    rows_root.mkdir(parents=True, exist_ok=True)
+    rows, row_receipts = _load_full_domain_rows(
+        rows_root, identity_sha256, args.repeat_iters
+    )
+    if output_path.is_file():
+        checkpoint = json.loads(output_path.read_text(encoding="utf-8"))
+        if (
+            checkpoint.get("schema") != _FULL_DOMAIN_SCHEMA
+            or checkpoint.get("identity") != identity
+            or checkpoint.get("measurement") != measurement
+        ):
+            raise RuntimeError("full-domain checkpoint identity or protocol drifted")
+    if len(rows) == len(_FULL_DOMAIN_SHAPES):
+        summary = _summarize_full_domain(rows)
+        _write_full_domain_checkpoint(
+            output_path,
+            status="complete",
+            identity=identity,
+            measurement=measurement,
+            rows=rows,
+            row_receipts=row_receipts,
+            summary=summary,
+        )
+        print(f"checkpoint is already complete: {output_path}", flush=True)
+        return
+
+    session = _full_domain_session_identity()
+    started = time.monotonic()
+    starting_row_count = len(rows)
+    for shape_index in range(len(rows), len(_FULL_DOMAIN_SHAPES)):
+        num_heads, num_rows = _FULL_DOMAIN_SHAPES[shape_index]
+        measurements = []
+        correctness_reference = None
+        correctness = None
+        for order_index, backend in enumerate(_ABBA_ORDER):
+            cell, captured_reference, cell_correctness = _run_full_domain_cell(
+                args,
+                backend,
+                num_heads,
+                num_rows,
+                capture_reference=order_index == 0,
+                correctness_reference=(
+                    correctness_reference if order_index == 1 else None
+                ),
+            )
+            if captured_reference is not None:
+                if correctness_reference is not None:
+                    raise RuntimeError("correctness reference was captured twice")
+                correctness_reference = captured_reference
+            if cell_correctness is not None:
+                correctness = cell_correctness
+                del correctness_reference
+                correctness_reference = None
+            cell["order_index"] = order_index
+            measurements.append(cell)
+        if correctness_reference is not None or correctness is None:
+            raise RuntimeError("full-domain correctness comparison was not completed")
+        baseline_medians = [measurements[0]["median_ms"], measurements[3]["median_ms"]]
+        candidate_medians = [measurements[1]["median_ms"], measurements[2]["median_ms"]]
+        paired_speedups = [
+            baseline_medians[0] / candidate_medians[0],
+            baseline_medians[1] / candidate_medians[1],
+        ]
+        row = {
+            "shape": f"h{num_heads}_rows{num_rows}",
+            "num_heads": num_heads,
+            "num_rows": num_rows,
+            "baseline_ms": statistics.median(baseline_medians),
+            "candidate_ms": statistics.median(candidate_medians),
+            "paired_speedups": paired_speedups,
+            "speedup": statistics.median(paired_speedups),
+            "correctness": correctness,
+            "measurements": measurements,
+        }
+        _validate_full_domain_row(row, shape_index, args.repeat_iters)
+        row_path = _full_domain_row_path(rows_root, shape_index)
+        if row_path.exists():
+            raise RuntimeError(f"refusing to overwrite row receipt {row_path}")
+        receipt = {
+            "schema": _FULL_DOMAIN_ROW_SCHEMA,
+            "identity_sha256": identity_sha256,
+            "shape_index": shape_index,
+            "session": session,
+            "row": row,
+        }
+        _write_json_atomic(row_path, receipt)
+        receipt_bytes = row_path.read_bytes()
+        rows.append(row)
+        row_receipts.append(
+            {"path": row_path.name, "sha256": hashlib.sha256(receipt_bytes).hexdigest()}
+        )
+        _write_full_domain_checkpoint(
+            output_path,
+            status="in_progress",
+            identity=identity,
+            measurement=measurement,
+            rows=rows,
+            row_receipts=row_receipts,
+        )
+        new_rows = len(rows) - starting_row_count
+        print(
+            f"{row['shape']}: baseline={row['baseline_ms']:.6f} ms "
+            f"candidate={row['candidate_ms']:.6f} ms speedup={row['speedup']:.6f}x "
+            f"({len(rows)}/{len(_FULL_DOMAIN_SHAPES)})",
+            flush=True,
+        )
+        if shape_index % 32 == 31:
+            gc.collect()
+        if args.max_new_rows is not None and new_rows >= args.max_new_rows:
+            break
+        if (
+            args.max_runtime_seconds is not None
+            and time.monotonic() - started >= args.max_runtime_seconds
+        ):
+            break
+
+    if len(rows) == len(_FULL_DOMAIN_SHAPES):
+        summary = _summarize_full_domain(rows)
+        _write_full_domain_checkpoint(
+            output_path,
+            status="complete",
+            identity=identity,
+            measurement=measurement,
+            rows=rows,
+            row_receipts=row_receipts,
+            summary=summary,
+        )
+        print(json.dumps(summary, indent=2), flush=True)
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json")
-    parser.add_argument("--shapes", choices=("official21",), default="official21")
+    parser.add_argument(
+        "--shapes", choices=("official21", "full-domain"), default="official21"
+    )
     parser.add_argument(
         "--baseline", choices=("public-fallback",), default="public-fallback"
     )
@@ -641,6 +1303,8 @@ def _parse_args():
     parser.add_argument("--interleave", choices=("abba",), default="abba")
     parser.add_argument("--dry-run-iters", type=int, default=5)
     parser.add_argument("--repeat-iters", type=int, default=30)
+    parser.add_argument("--max-new-rows", type=int)
+    parser.add_argument("--max-runtime-seconds", type=float)
     parser.add_argument("--worker-backend", choices=("baseline", "candidate"))
     parser.add_argument("--worker-heads", type=int)
     parser.add_argument("--worker-rows", type=int)
@@ -648,6 +1312,10 @@ def _parse_args():
     args = parser.parse_args()
     if args.dry_run_iters < 1 or args.repeat_iters < 1:
         parser.error("iteration counts must be positive")
+    if args.max_new_rows is not None and args.max_new_rows < 1:
+        parser.error("--max-new-rows must be positive")
+    if args.max_runtime_seconds is not None and args.max_runtime_seconds <= 0:
+        parser.error("--max-runtime-seconds must be positive")
     if args.worker_backend is not None:
         if None in (args.worker_heads, args.worker_rows, args.worker_json):
             parser.error("worker mode requires heads, rows, and output JSON")
@@ -656,6 +1324,12 @@ def _parse_args():
             parser.error("--output-json is required")
         if not args.cuda_graph or not args.cold_l2:
             parser.error("--cuda-graph and --cold-l2 are required")
+        if args.shapes == "full-domain" and (
+            args.dry_run_iters != 5 or args.repeat_iters != 16
+        ):
+            parser.error(
+                "full-domain requires 5 warmups and 16 timed replays per ABBA cell"
+            )
     return args
 
 
@@ -663,6 +1337,8 @@ def main():
     args = _parse_args()
     if args.worker_backend is not None:
         _run_worker(args)
+    elif args.shapes == "full-domain":
+        _run_full_domain_benchmark(args)
     else:
         _run_paired_benchmark(args)
 
