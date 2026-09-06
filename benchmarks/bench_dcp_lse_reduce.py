@@ -52,30 +52,31 @@ def _max_rank_median(times_us: list[float], world_size: int) -> float:
     return max(per_rank_medians)
 
 
-def _reference_a2a_lse_reduce(
+def _nccl_a2a_lse_reduce(
     partial_o: torch.Tensor,
     partial_lse: torch.Tensor,
-    *,
-    cp_rank: int,
-    cp_size: int,
+    send_o: torch.Tensor,
+    send_lse: torch.Tensor,
+    recv_o: torch.Tensor,
+    recv_lse: torch.Tensor,
 ) -> torch.Tensor:
-    """All-gather reference for the unfused A2A + LSE-reduction baseline."""
-    all_o = [torch.empty_like(partial_o) for _ in range(cp_size)]
-    all_lse = [torch.empty_like(partial_lse) for _ in range(cp_size)]
-    dist.all_gather(all_o, partial_o)
-    dist.all_gather(all_lse, partial_lse)
-    recv_o = torch.stack([tensor[..., cp_rank, :] for tensor in all_o], dim=-2)
-    recv_lse = torch.stack([tensor[..., cp_rank] for tensor in all_lse], dim=-1)
-    recv_lse = torch.where(
-        torch.isnan(recv_lse) | torch.isposinf(recv_lse),
-        torch.full_like(recv_lse, float("-inf")),
-        recv_lse,
+    """Unfused NCCL all-to-all plus the LSE-weighted merge."""
+    send_o.copy_(partial_o.permute(2, 0, 1, 3))
+    send_lse.copy_(partial_lse.permute(2, 0, 1))
+    dist.all_to_all_single(recv_o, send_o)
+    dist.all_to_all_single(recv_lse, send_lse)
+    peer_o = recv_o.permute(1, 2, 0, 3)
+    peer_lse = recv_lse.permute(1, 2, 0)
+    peer_lse = torch.where(
+        torch.isnan(peer_lse) | torch.isposinf(peer_lse),
+        torch.full_like(peer_lse, float("-inf")),
+        peer_lse,
     )
-    lse_max = recv_lse.max(dim=-1, keepdim=True).values
+    lse_max = peer_lse.max(dim=-1, keepdim=True).values
     lse_max = torch.where(torch.isneginf(lse_max), torch.zeros_like(lse_max), lse_max)
-    weights = torch.exp2(recv_lse - lse_max)
+    weights = torch.exp2(peer_lse - lse_max)
     denom = weights.sum(dim=-1, keepdim=True)
-    output = (recv_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(1e-20)
+    output = (peer_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(1e-20)
     output = torch.where(denom == 0, torch.zeros_like(output), output)
     return output.to(partial_o.dtype)
 
@@ -118,8 +119,8 @@ def _benchmark_case(
         group=dist.group.WORLD,
     )
 
-    def eager_call() -> None:
-        decode_cp_a2a_lse_reduce(
+    def eager_call() -> torch.Tensor:
+        return decode_cp_a2a_lse_reduce(
             partial_o,
             partial_lse,
             workspace,
@@ -127,25 +128,24 @@ def _benchmark_case(
             cp_size=world_size,
         )
 
-    def baseline_call() -> None:
-        _reference_a2a_lse_reduce(
+    nccl_send_o = torch.empty_like(partial_o.permute(2, 0, 1, 3).contiguous())
+    nccl_recv_o = torch.empty_like(nccl_send_o)
+    nccl_send_lse = torch.empty_like(partial_lse.permute(2, 0, 1).contiguous())
+    nccl_recv_lse = torch.empty_like(nccl_send_lse)
+
+    def nccl_baseline_call() -> torch.Tensor:
+        return _nccl_a2a_lse_reduce(
             partial_o,
             partial_lse,
-            cp_rank=rank,
-            cp_size=world_size,
+            nccl_send_o,
+            nccl_send_lse,
+            nccl_recv_o,
+            nccl_recv_lse,
         )
 
     dist.barrier()
     eager_us = _measure(
         eager_call,
-        warmup=10,
-        samples=samples,
-        launches_per_sample=launches_per_sample,
-    )
-
-    dist.barrier()
-    baseline_us = _measure(
-        baseline_call,
         warmup=10,
         samples=samples,
         launches_per_sample=launches_per_sample,
@@ -168,6 +168,19 @@ def _benchmark_case(
         launches_per_sample=launches_per_sample,
     )
 
+    dist.barrier()
+    nccl_baseline_us = _measure(
+        nccl_baseline_call,
+        warmup=10,
+        samples=samples,
+        launches_per_sample=launches_per_sample,
+    )
+
+    # Verify the communication permutation and merge outside the timed loops.
+    torch.testing.assert_close(
+        eager_call(), nccl_baseline_call(), rtol=1e-2, atol=1e-3
+    )
+
     result = {
         "label": label,
         "world_size": world_size,
@@ -176,7 +189,9 @@ def _benchmark_case(
         "head_dim": head_dim,
         "dtype": str(dtype).removeprefix("torch."),
         "eager_max_rank_median_us": _max_rank_median(eager_us, world_size),
-        "baseline_max_rank_median_us": _max_rank_median(baseline_us, world_size),
+        "nccl_baseline_max_rank_median_us": _max_rank_median(
+            nccl_baseline_us, world_size
+        ),
         "graph_max_rank_median_us": _max_rank_median(graph_us, world_size),
     }
     if rank == 0:
