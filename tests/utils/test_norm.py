@@ -136,6 +136,58 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("shape", [(5, 111), (5, 1024), (3, 5, 64), (3, 5, 256)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("pattern", ["zero", "tiny", "sparse", "alternating", "large"])
+def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
+    """Exercise finite edge inputs and caller-owned output storage on the public API."""
+    hidden = shape[-1]
+    storage_shape = (*shape[:-1], hidden + 16) if padded else shape
+    input_storage = torch.full(storage_shape, -23, dtype=dtype, device="cuda")
+    output_storage = torch.full_like(input_storage, -23)
+    x = input_storage[..., 8:-8] if padded else input_storage
+    out = output_storage[..., 8:-8] if padded else output_storage
+    columns = torch.arange(hidden, device="cuda")
+    signs = (columns % 2 * 2 - 1).to(dtype)
+    if pattern == "zero":
+        x.zero_()
+    elif pattern == "tiny":
+        x.copy_(signs * 2**-14)
+    elif pattern == "sparse":
+        x.zero_()
+        x[..., hidden // 2] = 2
+    elif pattern == "alternating":
+        x.copy_(signs)
+    else:
+        # Finite in the input dtype and FP32 reduction, but not an FP16 square.
+        magnitude = 2**14 if dtype == torch.float16 else 2**30
+        x.copy_(signs * magnitude)
+    weight = ((columns % 9 - 4).float() / 4).to(dtype)
+    input_before = input_storage.clone()
+    weight_before = weight.clone()
+    expected = llama_rms_norm(x, weight)
+    assert torch.isfinite(expected).all()
+    tolerance = 1e-3 if dtype == torch.float16 else 1e-2
+
+    previous = None
+    for poison in (float("nan"), 17.0):
+        out.fill_(poison)
+        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=False)
+        torch.cuda.synchronize()
+        assert returned is out
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, expected, rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(input_storage, input_before, rtol=0, atol=0)
+        torch.testing.assert_close(weight, weight_before, rtol=0, atol=0)
+        if padded:
+            assert (output_storage[..., :8] == -23).all()
+            assert (output_storage[..., -8:] == -23).all()
+        if previous is not None:
+            torch.testing.assert_close(out, previous, rtol=0, atol=0)
+        previous = out.clone()
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
