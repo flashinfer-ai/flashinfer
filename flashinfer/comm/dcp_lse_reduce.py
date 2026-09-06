@@ -116,8 +116,14 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     size_bytes = decode_cp_a2a_lse_reduce_workspace_size(
         max_tokens, local_heads, cp_size, head_dim, dtype
     )
+    group_name = group if isinstance(group, str) else group.group_name
     symm_mem.set_backend("NCCL")
-    workspace = symm_mem.empty(size_bytes, dtype=torch.uint8, device="cuda")
+    # PyTorch's NCCL symmetric-memory communicator registry is keyed by the
+    # concrete CUDA device. Do not use the unindexed ``"cuda"`` device here:
+    # it would rendezvous through a separate registry entry from the process
+    # group's ``cuda:<local_rank>`` communicator.
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = symm_mem.empty(size_bytes, dtype=torch.uint8, device=device)
     # Initialize the local epoch and readiness words. The payload is fully
     # overwritten before every read; clearing it could race a peer's first put.
     workspace[: _dcp_lse_reduce_payload_offset(cp_size)].zero_()
@@ -125,7 +131,6 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     # enter the first fused kernel and publish a remote readiness value.
     torch.cuda.current_stream().synchronize()
     handle = symm_mem.rendezvous(workspace, group)
-    group_name = group if isinstance(group, str) else group.group_name
     _workspace_keepalive[workspace.data_ptr()] = (handle, group_name)
     return workspace
 

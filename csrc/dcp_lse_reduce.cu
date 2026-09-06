@@ -25,6 +25,10 @@ using c10d::symmetric_memory::NCCLSymmetricMemory;
 
 namespace {
 
+void CheckNccl(ncclResult_t result, const char* operation) {
+  TORCH_CHECK(result == ncclSuccess, operation, ": ", ncclGetErrorString(result));
+}
+
 template <typename T, bool BaseE>
 void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* workspace,
                   ncclWindow_t window, size_t signal_window_offset, size_t out_region_window_offset,
@@ -133,8 +137,8 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
   if (!devcomm_opt) {
     ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     ncclDevComm devcomm;
-    C10D_NCCL_CHECK(ncclDevCommCreate(comm, &reqs, &devcomm),
-                    "ncclDevCommCreate failed in decode_cp_a2a_lse_reduce");
+    CheckNccl(ncclDevCommCreate(comm, &reqs, &devcomm),
+              "ncclDevCommCreate failed in decode_cp_a2a_lse_reduce");
     devcomm_opt = manager.register_devcomm(group_name, devcomm, kDevcommKey);
   }
   ncclDevComm& devcomm = devcomm_opt->get();

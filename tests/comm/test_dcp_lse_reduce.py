@@ -52,8 +52,13 @@ def process_group():
         )
     created = False
     if not dist.is_initialized():
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        dist.init_process_group("nccl")
+        device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
+        torch.cuda.set_device(device)
+        dist.init_process_group("nccl", device_id=device)
+        # Symmetric memory needs the process group's NCCL host communicator,
+        # which is created by the first eager collective in released PyTorch.
+        warmup = torch.zeros(1, device=device)
+        dist.all_reduce(warmup)
         created = True
     yield
     if created:
