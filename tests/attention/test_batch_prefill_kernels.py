@@ -24,7 +24,11 @@ from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 
 def head_dim_512_supported() -> bool:
@@ -2468,3 +2472,120 @@ def test_paged_prefill_split_kv_empty_chunk(dtype):
     assert not o.isnan().any() and not lse.isnan().any()
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+def _ref_sliding_window_prefill(q, k, v, window_left, causal):
+    """fp32 reference with the visibility predicate of variants.cuh.
+
+    Query row qo_idx sits at position qo_idx + kv_len - qo_len; it sees key
+    kv_idx iff kv_idx >= q_pos - window_left (window_left >= 0) and, when
+    causal, kv_idx <= q_pos.
+    """
+    qo_len, num_qo_heads, head_dim = q.shape
+    kv_len, num_kv_heads, _ = k.shape
+    group_size = num_qo_heads // num_kv_heads
+    k32 = k.float().repeat_interleave(group_size, dim=1)
+    v32 = v.float().repeat_interleave(group_size, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k32) * head_dim**-0.5
+    q_pos = torch.arange(qo_len, device=q.device)[:, None] + (kv_len - qo_len)
+    k_pos = torch.arange(kv_len, device=q.device)[None, :]
+    visible = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    if window_left >= 0:
+        visible &= k_pos >= q_pos - window_left
+    if causal:
+        visible &= k_pos <= q_pos
+    scores = scores.masked_fill(~visible[None], float("-inf"))
+    return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v32)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window_left", [-1, 1, 64, 333])
+@pytest.mark.parametrize("qo_len,kv_len", [(300, 4096), (1024, 1024), (1, 512)])
+@pytest.mark.parametrize("group_size", [1, 4])
+@pytest.mark.parametrize("kv_kind", ["paged", "ragged"])
+@pytest.mark.parametrize("split_kv", ["auto", "fixed"])
+def test_batch_prefill_sliding_window(
+    backend, causal, window_left, qo_len, kv_len, group_size, kv_kind, split_kv
+):
+    # Regression test for #4972: with causal=False and a finite window_left
+    # the FA2 split-KV path sized each query tile's KV chunks for
+    # window_left + CTA_TILE_Q keys, although a non-causal tile attends every
+    # key up to kv_len, so the leading query tiles never saw the last keys.
+    # split_kv="fixed" forces 128-token chunks so the split-KV path is taken
+    # on any GPU; "auto" leaves the decision to the scheduler.
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda:0")):
+        pytest.skip("fa3 requires SM90")
+    if backend == "fa3" and split_kv == "fixed":
+        pytest.skip("fixed_split_size is an FA2 scheduler option")
+    num_kv_heads, head_dim, page_size = 2, 128, 16
+    num_qo_heads = num_kv_heads * group_size
+    dtype = torch.float16
+    torch.manual_seed(0)
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda:0")
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda:0")
+    v = torch.randn_like(k)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device="cuda:0")
+
+    if kv_kind == "paged":
+        num_pages = (kv_len + page_size - 1) // page_size
+        padded = num_pages * page_size
+        k_pages = torch.zeros(
+            padded, num_kv_heads, head_dim, dtype=dtype, device="cuda:0"
+        )
+        v_pages = torch.zeros_like(k_pages)
+        k_pages[:kv_len] = k
+        v_pages[:kv_len] = v
+        kv_data = torch.stack(
+            [
+                k_pages.view(num_pages, page_size, num_kv_heads, head_dim),
+                v_pages.view(num_pages, page_size, num_kv_heads, head_dim),
+            ],
+            dim=1,
+        )
+        plan_kwargs = (
+            {"fixed_split_size": 128 // page_size} if split_kv == "fixed" else {}
+        )
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", backend=backend
+        )
+        wrapper.plan(
+            qo_indptr,
+            torch.tensor([0, num_pages], dtype=torch.int32, device="cuda:0"),
+            torch.arange(num_pages, dtype=torch.int32, device="cuda:0"),
+            torch.tensor(
+                [(kv_len - 1) % page_size + 1], dtype=torch.int32, device="cuda:0"
+            ),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            **plan_kwargs,
+        )
+        o = wrapper.run(q, kv_data)
+    else:
+        plan_kwargs = {"fixed_split_size": 128} if split_kv == "fixed" else {}
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, "NHD", backend=backend
+        )
+        wrapper.plan(
+            qo_indptr,
+            torch.tensor([0, kv_len], dtype=torch.int32, device="cuda:0"),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            **plan_kwargs,
+        )
+        o = wrapper.run(q, k, v)
+
+    o_ref = _ref_sliding_window_prefill(q, k, v, window_left, causal)
+    torch.testing.assert_close(o.float(), o_ref, rtol=1e-3, atol=5e-3)
