@@ -27,6 +27,7 @@ dsv41_fp8_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
 dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
+gated_residual_rmsnorm_h8192.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
@@ -119,6 +120,7 @@ prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
+rmsnorm_sigmoid_gate_nh32_h64.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
@@ -308,6 +310,27 @@ x = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 res = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 w = torch.ones(5120, dtype=torch.bfloat16, device=device)
 flashinfer.fused_add_rmsnorm(x, res, w)
+
+# ── fused gated normalization (SM103) ──────────────────────────────
+if torch.cuda.get_device_capability() == (10, 3):
+    gated_h = 8192
+    gated_branch = torch.randn(8, gated_h, dtype=torch.bfloat16, device=device)
+    gated_residual = torch.randn(8, gated_h, dtype=torch.float32, device=device)
+    gated_weight = torch.randn(gated_h, dtype=torch.bfloat16, device=device)
+    gated_alpha = torch.randn(gated_h, dtype=torch.float32, device=device)
+    gated_beta = torch.randn(gated_h, dtype=torch.float32, device=device)
+    flashinfer.norm.gated_residual_rmsnorm(
+        gated_branch,
+        gated_residual,
+        gated_weight,
+        gated_alpha,
+        gated_beta,
+        1e-6,
+    )
+
+    gate_input = torch.randn(8, 32, 64, dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(gate_input)
+    flashinfer.norm.rmsnorm_sigmoid_gate(gate_input, gate)
 
 # ── rmsnorm_quant + fused_add_rmsnorm_quant (DeepSeek-V3 down-proj, h=7168) ──
 # Quantize to FP8 E4M3 after normalization; scale is per-tensor.

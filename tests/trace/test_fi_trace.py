@@ -535,6 +535,67 @@ def test_fused_add_rmsnorm_fi_trace():
     assert "residual" in defn["outputs"]
 
 
+def test_gated_residual_rmsnorm_fi_trace():
+    import flashinfer.norm
+
+    branch = torch.empty(2, 8192, dtype=torch.bfloat16)
+    residual = torch.empty(2, 8192, dtype=torch.float32)
+    weight = torch.empty(8192, dtype=torch.bfloat16)
+    gate = torch.empty(8192, dtype=torch.float32)
+    defn = flashinfer.norm.gated_residual_rmsnorm.fi_trace(
+        branch=branch,
+        residual=residual,
+        weight=weight,
+        alpha=gate,
+        beta=gate,
+        eps=1e-6,
+        gain_center=1.0,
+    )
+    _check_defn(
+        defn, "gated_residual_rmsnorm", "flashinfer.norm.gated_residual_rmsnorm"
+    )
+    assert defn["axes"]["hidden_size"]["value"] == 8192
+    assert defn["outputs"]["output"]["dtype"] == "float32"
+
+
+def test_rmsnorm_sigmoid_gate_fi_trace():
+    import flashinfer.norm
+
+    x = torch.empty(2, 32, 64, dtype=torch.bfloat16)
+    gate = torch.empty_like(x)
+    defn = flashinfer.norm.rmsnorm_sigmoid_gate.fi_trace(input=x, gate=gate, eps=1e-5)
+    _check_defn(defn, "rmsnorm_sigmoid_gate", "flashinfer.norm.rmsnorm_sigmoid_gate")
+    assert defn["axes"]["head_dim"]["value"] == 64
+    assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+
+
+def test_tp_moe_finalize_rmsnorm_fi_trace():
+    import flashinfer.comm
+
+    if not hasattr(flashinfer.comm, "tp_moe_finalize_rmsnorm"):
+        pytest.skip("TP MoE finalize dependencies are unavailable")
+    partial_rows = torch.empty(2, 8, 4096, dtype=torch.bfloat16)
+    expert_weights = torch.empty(2, 8, dtype=torch.bfloat16)
+    norm_weight = torch.empty(4096, dtype=torch.bfloat16)
+    output = torch.empty(2, 4096, dtype=torch.bfloat16)
+    defn = flashinfer.comm.tp_moe_finalize_rmsnorm.fi_trace(
+        partial_rows=partial_rows,
+        expert_weights=expert_weights,
+        norm_weight=norm_weight,
+        output=output,
+        eps=1e-8,
+        gain_center=1.0,
+        weight_before_norm=True,
+    )
+    _check_defn(
+        defn,
+        "tp_moe_finalize_rmsnorm",
+        "flashinfer.comm.tp_moe_finalize_rmsnorm",
+    )
+    assert defn["axes"]["num_experts"]["value"] == 8
+    assert defn["axes"]["hidden_size"]["value"] == 4096
+
+
 # ---------------------------------------------------------------------------
 # sampling
 # ---------------------------------------------------------------------------

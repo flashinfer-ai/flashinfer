@@ -36,11 +36,13 @@ from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
     fused_rmsnorm_silu_trace,
+    gated_residual_rmsnorm_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
     layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
+    rmsnorm_sigmoid_gate_trace,
     rmsnorm_trace,
 )
 from ..utils import (
@@ -72,6 +74,26 @@ if not _USE_CUDA_NORM:
     except (ImportError, AttributeError):
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
+
+try:
+    from .kernels.gated_residual_rmsnorm import (
+        gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+    )
+    from .kernels.rmsnorm_sigmoid_gate import (
+        rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+        supports_rmsnorm_sigmoid_gate,
+    )
+
+    _HAS_SM103_FUSED_NORM = True
+except (ImportError, AttributeError):
+    _HAS_SM103_FUSED_NORM = False
+
+    def supports_rmsnorm_sigmoid_gate(
+        dtype: torch.dtype,
+        head_dim: int,
+        device: torch.device | str | None = None,
+    ) -> bool:
+        return False
 
 
 @functools.cache
@@ -136,6 +158,217 @@ def _normalize_scale_tensor(
             f"scale must be a scalar tensor or shape (1,), got shape {tuple(scale.shape)}"
         )
     return scale.contiguous()
+
+
+_GATED_RESIDUAL_HIDDEN_SIZE = 8192
+_FUSED_NORM_ALIGNMENT = 16
+
+
+def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) -> bool:
+    return tensor.data_ptr() % alignment == 0
+
+
+def supports_gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+) -> bool:
+    """Return whether tensors satisfy the SM103 fused-kernel contract."""
+    tensors = (branch, residual, alpha, beta)
+    return (
+        _HAS_SM103_FUSED_NORM
+        and branch.ndim == 2
+        and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
+        and residual.shape == branch.shape
+        and (weight is None or weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,))
+        and alpha.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and branch.dtype == torch.bfloat16
+        and (weight is None or weight.dtype == torch.bfloat16)
+        and residual.dtype == torch.float32
+        and alpha.dtype == torch.float32
+        and beta.dtype == torch.float32
+        and all(
+            tensor.is_cuda
+            and tensor.is_contiguous()
+            and tensor.device == branch.device
+            and _is_aligned(tensor)
+            for tensor in tensors
+        )
+        and (
+            weight is None
+            or (
+                weight.is_cuda
+                and weight.is_contiguous()
+                and weight.device == branch.device
+                and _is_aligned(weight)
+            )
+        )
+        and torch.cuda.get_device_capability(branch.device) == (10, 3)
+    )
+
+
+@flashinfer_api(trace=gated_residual_rmsnorm_trace)
+def gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float = 1e-6,
+    gain_center: float = 0.0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Apply RMSNorm and blend a branch into a gated residual stream.
+
+    The operation is ``alpha * residual + beta * RMSNorm(branch)``. When
+    ``weight`` is supplied, ``weight + gain_center`` is applied to ``branch``
+    before its RMS reduction. When it is ``None``, the branch is unweighted.
+
+    This optimized implementation currently supports contiguous BF16 tensors
+    with hidden size 8192 on SM103 GPUs.
+
+    Parameters
+    ----------
+    branch, residual : torch.Tensor
+        Two-dimensional BF16 and FP32 tensors, respectively, with shape
+        ``(rows, 8192)``.
+    weight : Optional[torch.Tensor]
+        Optional BF16 pre-normalization weight with shape ``(8192,)``.
+    alpha, beta : torch.Tensor
+        FP32 gate tensors with shape ``(8192,)``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    gain_center : float
+        Constant added to ``weight`` in FP32.
+    out : Optional[torch.Tensor]
+        Optional FP32 output tensor with the same shape and layout as ``residual``.
+
+    Returns
+    -------
+    torch.Tensor
+        The fused result.
+    """
+    if not supports_gated_residual_rmsnorm(branch, residual, weight, alpha, beta):
+        raise ValueError("tensors do not satisfy the gated_residual_rmsnorm contract")
+    if out is not None and (
+        out.shape != branch.shape
+        or out.dtype != residual.dtype
+        or out.device != branch.device
+        or not out.is_contiguous()
+        or not _is_aligned(out)
+    ):
+        raise ValueError("out must match branch shape, dtype, device, and layout")
+    if out is None:
+        out = torch.empty_like(residual)
+    kernel_weight = branch.reshape(-1)[:_GATED_RESIDUAL_HIDDEN_SIZE]
+    if weight is not None:
+        kernel_weight = weight
+    _gated_residual_rmsnorm_impl(
+        branch,
+        residual,
+        kernel_weight,
+        alpha,
+        beta,
+        out,
+        eps,
+        gain_center,
+        weight is not None,
+    )
+    return out
+
+
+@register_custom_op("flashinfer::gated_residual_rmsnorm", mutates_args=("out",))
+def _gated_residual_rmsnorm_impl(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+) -> None:
+    _gated_residual_rmsnorm_cute(
+        branch,
+        residual,
+        weight,
+        alpha,
+        beta,
+        eps,
+        gain_center,
+        int(apply_weight_before_norm),
+        out,
+    )
+
+
+@register_fake_op("flashinfer::gated_residual_rmsnorm")
+def _gated_residual_rmsnorm_fake(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+) -> None:
+    return None
+
+
+@flashinfer_api(trace=rmsnorm_sigmoid_gate_trace)
+def rmsnorm_sigmoid_gate(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1e-5,
+) -> None:
+    r"""Apply per-head RMSNorm and a sigmoid gate to ``input`` in place.
+
+    The last dimension is normalized independently, multiplied by
+    ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
+    supports contiguous BF16 head rows of width 64 on SM103 GPUs.
+    """
+    if input.ndim not in (2, 3) or gate.shape != input.shape:
+        raise ValueError("input and gate must have matching 2-D or 3-D shapes")
+    if not supports_rmsnorm_sigmoid_gate(
+        input.dtype, input.shape[-1], device=input.device
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    if (
+        gate.dtype != torch.bfloat16
+        or not gate.is_cuda
+        or gate.device != input.device
+        or input.stride(-1) != 1
+        or gate.stride(-1) != 1
+        or (input.ndim == 3 and input.stride(1) != input.shape[-1])
+        or (gate.ndim == 3 and gate.stride(1) != gate.shape[-1])
+        or not _is_aligned(input)
+        or not _is_aligned(gate)
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    _rmsnorm_sigmoid_gate_impl(input, gate, eps)
+
+
+@register_custom_op("flashinfer::rmsnorm_sigmoid_gate", mutates_args=("input",))
+def _rmsnorm_sigmoid_gate_impl(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+) -> None:
+    _rmsnorm_sigmoid_gate_cute(input, gate, eps)
+
+
+@register_fake_op("flashinfer::rmsnorm_sigmoid_gate")
+def _rmsnorm_sigmoid_gate_fake(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+) -> None:
+    return None
 
 
 @flashinfer_api(trace=rmsnorm_trace)

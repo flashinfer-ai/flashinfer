@@ -20,6 +20,67 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
+def _tp_moe_finalize_rmsnorm_reference(
+    partial_rows,
+    expert_weights,
+    norm_weight,
+    eps,
+    gain_center,
+    weight_before_norm,
+    **_unused,
+):
+    """Single-rank reference treating ``partial_rows`` as already reduced."""
+    rows = partial_rows.to(torch.float32)
+    if weight_before_norm:
+        rows = rows * (norm_weight.to(torch.float32) + float(gain_center))
+    inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + float(eps))
+    normalized = (rows * inv_rms).to(torch.bfloat16)
+    if not weight_before_norm:
+        normalized = (
+            normalized.to(torch.float32)
+            * (norm_weight.to(torch.float32) + float(gain_center))
+        ).to(torch.bfloat16)
+    return (
+        normalized.to(torch.float32)
+        .mul(expert_weights.to(torch.float32).unsqueeze(-1))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+
+tp_moe_finalize_rmsnorm_trace = TraceTemplate(
+    op_type="tp_moe_finalize_rmsnorm",
+    name_prefix="tp_moe_finalize_rmsnorm",
+    description=(
+        "TP4 expert-row reduction, per-expert RMSNorm, and routing-weighted "
+        "finalize. The trace reference treats partial_rows as already reduced."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "partial_rows": Tensor(["num_tokens", "num_experts", "hidden_size"]),
+        "expert_weights": Tensor(["num_tokens", "num_experts"]),
+        "norm_weight": Tensor(["hidden_size"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="partial_rows",
+            param="output",
+        )
+    },
+    tags=["status:verified", "stage:comm", "fused", "tp4"],
+    reference=_tp_moe_finalize_rmsnorm_reference,
+)
+
+
+@torch.no_grad()
 def _allreduce_fusion_reference(
     input: torch.Tensor,
     workspace,

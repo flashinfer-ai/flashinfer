@@ -264,6 +264,14 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+from .norm import (
+    supports_gated_residual_rmsnorm as supports_gated_residual_rmsnorm,
+)
+from .norm import (
+    supports_rmsnorm_sigmoid_gate as supports_rmsnorm_sigmoid_gate,
+)
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
     nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
