@@ -39,7 +39,7 @@ import itertools
 import math
 import numbers
 import struct
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import torch
 
@@ -99,6 +99,7 @@ class _ContextGeometry:
     has_q_offset: bool
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
+    skip_softmax: bool
     q_shape: tuple[int, ...]
     kv_shape: tuple[int, ...]
 
@@ -127,6 +128,7 @@ class _PagedContextGeometry:
     uniform_packed_lengths: bool
     has_q_offset: bool
     packed_dense_k_mask: bool
+    skip_softmax: bool
     q_shape: tuple[int, ...]
     kv_shape: tuple[int, ...]
 
@@ -176,6 +178,7 @@ class _ContextCompileSpec:
     has_q_offset: bool
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
+    skip_softmax: bool
     scheduler: _ContextScheduler
 
 
@@ -199,6 +202,7 @@ class _PagedContextCompileSpec:
     uniform_packed_lengths: bool
     has_q_offset: bool
     packed_dense_k_mask: bool
+    skip_softmax: bool
     scheduler: _ContextScheduler
 
 
@@ -217,6 +221,7 @@ def _make_context_kernel(
     scheduler: _ContextScheduler,
     page_size: int | None = None,
     max_num_pages_per_seq_kv: int | None = None,
+    skip_softmax: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -261,6 +266,7 @@ def _make_context_kernel(
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
+        skip_softmax=skip_softmax,
         **paged_kwargs,
     )
 
@@ -456,6 +462,50 @@ def _validate_scale(value: object, name: str) -> float:
     if not math.isfinite(as_float32) or as_float32 <= 0.0:
         raise ValueError(f"{name} must be representable as a positive float32")
     return as_float32
+
+
+def _resolve_skip_softmax_threshold(
+    value: Optional[Union[float, torch.Tensor]],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Return the per-request ``float32[B]`` skip-softmax threshold tensor.
+
+    ``None`` selects the dense kernel. A Python scalar is expanded into a
+    plan-owned tensor, so its value is fixed for the plan and for any CUDA
+    graph that captures it. A caller-owned tensor is retained as a live input:
+    the caller may update its values in place between runs or replays while
+    keeping its storage stable. Finite, non-negative element values are a
+    caller contract; they are not validated to avoid host synchronization.
+    """
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        _validate_tensor(value, "skip_softmax_threshold")
+        if _device_index(value.device) != _device_index(device):
+            raise ValueError(
+                f"skip_softmax_threshold must be on {device}, got {value.device}"
+            )
+        if value.dtype != torch.float32:
+            raise TypeError("skip_softmax_threshold must have dtype torch.float32")
+        if tuple(value.shape) != (batch_size,):
+            raise ValueError(
+                "skip_softmax_threshold must have shape "
+                f"[{batch_size}], got {tuple(value.shape)}"
+            )
+        _validate_compact(value, "skip_softmax_threshold", "[B]")
+        _validate_alignment(value, "skip_softmax_threshold", 4)
+        return value
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(
+            "skip_softmax_threshold must be None, a non-negative Python scalar, "
+            "or a float32 CUDA tensor"
+        )
+    as_float = float(value)
+    if not math.isfinite(as_float) or as_float < 0.0:
+        raise ValueError("skip_softmax_threshold must be finite and non-negative")
+    return torch.full((batch_size,), as_float, dtype=torch.float32, device=device)
 
 
 def _validate_extent(value: int, name: str) -> int:
@@ -792,6 +842,7 @@ def _resolve_geometry(
     mask_type: str,
     window_left: int,
     output_dtype: torch.dtype,
+    skip_softmax: bool = False,
 ) -> _ContextGeometry:
     """Validate a plan and derive its semantic and storage geometry.
 
@@ -922,6 +973,7 @@ def _resolve_geometry(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         packed_dense_k_mask=packed_dense_k_mask,
+        skip_softmax=skip_softmax,
         q_shape=q_shape,
         kv_shape=kv_shape,
     )
@@ -940,6 +992,7 @@ def _resolve_paged_geometry(
     mask_type: str,
     window_left: int,
     output_dtype: torch.dtype,
+    skip_softmax: bool = False,
 ) -> tuple[_PagedContextGeometry, _PagedContextMetadata]:
     """Validate packed-Q paged-KV inputs and materialize their static ABI."""
 
@@ -1118,6 +1171,7 @@ def _resolve_paged_geometry(
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
         packed_dense_k_mask=packed_dense_k_mask,
+        skip_softmax=skip_softmax,
         q_shape=tuple(q.shape),
         kv_shape=tuple(k_cache.shape),
     )
@@ -1160,6 +1214,7 @@ def _make_context_scheduler_probe(
         scheduler="static_persistent",
         page_size=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+        skip_softmax=geometry.skip_softmax,
     )
     with torch.cuda.device(geometry.device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
@@ -1257,6 +1312,7 @@ def _context_compile_spec(geometry: _ContextGeometry) -> _ContextCompileSpec:
         has_q_offset=geometry.has_q_offset,
         causal_single_kv_tile=geometry.causal_single_kv_tile,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
+        skip_softmax=geometry.skip_softmax,
         scheduler=_resolve_context_scheduler(geometry),
     )
 
@@ -1281,6 +1337,7 @@ def _paged_context_compile_spec(
         uniform_packed_lengths=geometry.uniform_packed_lengths,
         has_q_offset=geometry.has_q_offset,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
+        skip_softmax=geometry.skip_softmax,
         scheduler=_resolve_paged_context_scheduler(geometry),
     )
 
@@ -1307,6 +1364,7 @@ def _get_compiled_context(
     has_q_offset = compile_spec.has_q_offset
     causal_single_kv_tile = compile_spec.causal_single_kv_tile
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
+    skip_softmax = compile_spec.skip_softmax
     scheduler = compile_spec.scheduler
 
     import cutlass
@@ -1336,6 +1394,7 @@ def _get_compiled_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
+        skip_softmax=skip_softmax,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1366,14 +1425,21 @@ def _get_compiled_context(
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
+        skip_softmax_threshold: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
+        static_skip_softmax: cutlass.Constexpr[bool],
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
+        # The dense specialization receives a one-element placeholder and
+        # never reads it.
+        threshold = (
+            skip_softmax_threshold if cutlass.const_expr(static_skip_softmax) else None
+        )
         if cutlass.const_expr(static_packed):
             fmha(
                 q,
@@ -1391,6 +1457,7 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                skip_softmax_threshold=threshold,
             )
         else:
             fmha(
@@ -1405,6 +1472,7 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                skip_softmax_threshold=threshold,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1463,6 +1531,7 @@ def _get_compiled_context(
     variable_window_cta_starts_fake = fake_compact(
         cutlass.Int32, variable_window_cta_shape, 4
     )
+    skip_softmax_threshold_fake = fake_compact(cutlass.Float32, (cute.sym_int(),), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1481,11 +1550,13 @@ def _get_compiled_context(
             variable_window_starts_fake,
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
+            skip_softmax_threshold_fake,
             stream_fake,
             max_active_clusters,
             packed,
             max_seq_len_q,
             max_seq_len_k,
+            skip_softmax,
             options=_COMPILE_OPTIONS,
         )
     policy = (
@@ -1494,6 +1565,7 @@ def _get_compiled_context(
         ("uniform_packed_lengths", uniform_packed_lengths),
         ("causal_single_kv_tile", causal_single_kv_tile),
         ("packed_dense_k_mask", packed_dense_k_mask),
+        ("skip_softmax", skip_softmax),
     )
     return compiled, policy
 
@@ -1520,6 +1592,7 @@ def _get_compiled_paged_context(
     uniform_packed_lengths = compile_spec.uniform_packed_lengths
     has_q_offset = compile_spec.has_q_offset
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
+    skip_softmax = compile_spec.skip_softmax
     scheduler = compile_spec.scheduler
 
     import cutlass
@@ -1550,6 +1623,7 @@ def _get_compiled_paged_context(
         scheduler=scheduler,
         page_size=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+        skip_softmax=skip_softmax,
     )
     fmha.cfg.has_varlen = True
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1577,11 +1651,18 @@ def _get_compiled_paged_context(
         kv_indptr: cute.Tensor,
         page_idx_kv: cute.Tensor,
         seq_lens_kv: cute.Tensor,
+        skip_softmax_threshold: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
+        static_skip_softmax: cutlass.Constexpr[bool],
     ) -> None:
+        # The dense specialization receives a one-element placeholder and
+        # never reads it.
+        threshold = (
+            skip_softmax_threshold if cutlass.const_expr(static_skip_softmax) else None
+        )
         fmha(
             q,
             k_cache,
@@ -1597,6 +1678,7 @@ def _get_compiled_paged_context(
             cutlass.Int32(static_max_seq_len_k),
             page_idx_kv,
             seq_lens_kv,
+            skip_softmax_threshold=threshold,
         )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1632,6 +1714,7 @@ def _get_compiled_paged_context(
         4,
     )
     seq_lens_fake = fake_compact(cutlass.Int32, (batch_size,), 4)
+    skip_softmax_threshold_fake = fake_compact(cutlass.Float32, (cute.sym_int(),), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     with torch.cuda.device(device_index):
@@ -1647,10 +1730,12 @@ def _get_compiled_paged_context(
             kv_indptr_fake,
             page_idx_fake,
             seq_lens_fake,
+            skip_softmax_threshold_fake,
             stream_fake,
             max_active_clusters,
             max_seq_len_q,
             max_seq_len_k,
+            skip_softmax,
             options=_COMPILE_OPTIONS,
         )
     policy = (
@@ -1660,6 +1745,7 @@ def _get_compiled_paged_context(
         ("page_size", page_size),
         ("causal_single_kv_tile", False),
         ("packed_dense_k_mask", packed_dense_k_mask),
+        ("skip_softmax", skip_softmax),
     )
     return compiled, policy
 
@@ -1783,6 +1869,7 @@ class BatchPrefillTSWrapper:
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
+        skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         """Validate semantics, establish Q/K capacities, and compile once.
 
@@ -1810,6 +1897,21 @@ class BatchPrefillTSWrapper:
             Scale applied to the attention output.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to the query dtype.
+        skip_softmax_threshold : float or torch.Tensor, optional
+            Skip-softmax threshold in the ordinary softmax domain. ``None``
+            selects the dense kernel. Any provided value, including zero,
+            selects the skip-enabled kernel: a 128-key K/V tile is skipped for
+            a 32-row query group when every row of the group satisfies
+            ``exp(sm_scale * (tile_max - running_max)) < threshold``. Skipped
+            tiles contribute zero probability mass and leave the running
+            maximum unchanged, and the PV MMA is bypassed once all four groups
+            of a 128-row query tile skip. A scalar applies to every request
+            and is fixed for the plan and for any CUDA graph that captures
+            it. A contiguous CUDA ``float32[B]`` tensor gives request ``b``
+            its own threshold and is retained as a live input: its storage
+            must stay valid and stable, while its values may be updated in
+            place between runs or graph replays. Values must be finite and
+            non-negative; tensor contents are not validated.
         """
 
         if out_dtype is None:
@@ -1827,6 +1929,7 @@ class BatchPrefillTSWrapper:
             mask_type=mask_type,
             window_left=window_left,
             output_dtype=resolved_out_dtype,
+            skip_softmax=skip_softmax_threshold is not None,
         )
         if mask_type == "variable_window":
             validated_window_starts, validated_window_ends = (
@@ -1874,6 +1977,17 @@ class BatchPrefillTSWrapper:
         output_scale_tensor = torch.tensor(
             [output_scale], dtype=torch.float32, device=geometry.device
         )
+        planned_skip_softmax_threshold = _resolve_skip_softmax_threshold(
+            skip_softmax_threshold,
+            batch_size=geometry.batch_size,
+            device=geometry.device,
+        )
+        if planned_skip_softmax_threshold is None:
+            # Uniform TVM-FFI signature; the dense specialization never reads
+            # this placeholder.
+            planned_skip_softmax_threshold = torch.empty(
+                1, dtype=torch.float32, device=geometry.device
+            )
         if geometry.packed:
             assert qo_indptr is not None and kv_indptr is not None
             planned_qo_indptr = qo_indptr
@@ -1902,6 +2016,7 @@ class BatchPrefillTSWrapper:
         self._variable_window_token_starts = planned_window_starts
         self._variable_window_token_ends = planned_window_ends
         self._variable_window_cta_starts = planned_window_cta_starts
+        self._skip_softmax_threshold = planned_skip_softmax_threshold
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -1943,6 +2058,7 @@ class BatchPrefillTSWrapper:
                 ("variable_window_token_starts", self._variable_window_token_starts),
                 ("variable_window_token_ends", self._variable_window_token_ends),
                 ("variable_window_cta_starts", self._variable_window_cta_starts),
+                ("skip_softmax_threshold", self._skip_softmax_threshold),
             )
         self._compiled(
             q,
@@ -1956,6 +2072,7 @@ class BatchPrefillTSWrapper:
             self._variable_window_token_starts,
             self._variable_window_token_ends,
             self._variable_window_cta_starts,
+            self._skip_softmax_threshold,
         )
         return out
 
@@ -2019,6 +2136,7 @@ class BatchPrefillPagedTSWrapper:
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
+        skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         """Snapshot K/V metadata, retain live Q offsets, and compile once.
 
@@ -2047,6 +2165,12 @@ class BatchPrefillPagedTSWrapper:
             Scale applied to the attention output.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to the query dtype.
+        skip_softmax_threshold : float or torch.Tensor, optional
+            Skip-softmax threshold in the ordinary softmax domain; see
+            :meth:`BatchPrefillTSWrapper.plan`. ``None`` selects the dense
+            kernel. A scalar is fixed for the plan; a contiguous CUDA
+            ``float32[B]`` tensor is retained live and may be updated in
+            place between runs or graph replays.
         """
 
         if out_dtype is None:
@@ -2067,6 +2191,7 @@ class BatchPrefillPagedTSWrapper:
             mask_type=mask_type,
             window_left=window_left,
             output_dtype=resolved_out_dtype,
+            skip_softmax=skip_softmax_threshold is not None,
         )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2081,6 +2206,17 @@ class BatchPrefillPagedTSWrapper:
         output_scale_tensor = torch.tensor(
             [output_scale], dtype=torch.float32, device=geometry.device
         )
+        planned_skip_softmax_threshold = _resolve_skip_softmax_threshold(
+            skip_softmax_threshold,
+            batch_size=geometry.batch_size,
+            device=geometry.device,
+        )
+        if planned_skip_softmax_threshold is None:
+            # Uniform TVM-FFI signature; the dense specialization never reads
+            # this placeholder.
+            planned_skip_softmax_threshold = torch.empty(
+                1, dtype=torch.float32, device=geometry.device
+            )
         logical_kv_indptr = torch.tensor(
             metadata.kv_indptr, dtype=torch.int32, device=geometry.device
         )
@@ -2114,6 +2250,7 @@ class BatchPrefillPagedTSWrapper:
         self._dense_page_idx_kv = dense_page_idx_kv
         self._scale_softmax_log2 = scale_tensor
         self._output_scale = output_scale_tensor
+        self._skip_softmax_threshold = planned_skip_softmax_threshold
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -2159,6 +2296,7 @@ class BatchPrefillPagedTSWrapper:
                 ("dense_page_idx_kv", self._dense_page_idx_kv),
                 ("scale_softmax_log2", self._scale_softmax_log2),
                 ("output_scale", self._output_scale),
+                ("skip_softmax_threshold", self._skip_softmax_threshold),
             )
         self._compiled(
             q,
@@ -2171,6 +2309,7 @@ class BatchPrefillPagedTSWrapper:
             self._logical_kv_indptr,
             self._dense_page_idx_kv,
             self._seq_lens_kv,
+            self._skip_softmax_threshold,
         )
         return out
 
@@ -2190,6 +2329,7 @@ def batch_prefill(
     sm_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
+    skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run one-shot fixed or packed-ragged task-scheduled context attention.
@@ -2223,6 +2363,9 @@ def batch_prefill(
         Scale applied to the attention output.
     out_dtype : torch.dtype, optional
         Requested output dtype.
+    skip_softmax_threshold : float or torch.Tensor, optional
+        Skip-softmax threshold in the ordinary softmax domain; see
+        :meth:`BatchPrefillTSWrapper.plan`. ``None`` selects the dense kernel.
     out : torch.Tensor, optional
         Caller-owned output tensor.
     """
@@ -2244,6 +2387,7 @@ def batch_prefill(
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=resolved_out_dtype,
+        skip_softmax_threshold=skip_softmax_threshold,
     )
     return wrapper.run(q, k, v, out=out)
 
@@ -2265,6 +2409,7 @@ def batch_prefill_with_paged_kv_cache(
     sm_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
+    skip_softmax_threshold: Optional[Union[float, torch.Tensor]] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run one-shot packed-Q context attention over separate HND page pools.
@@ -2300,6 +2445,9 @@ def batch_prefill_with_paged_kv_cache(
         Scale applied to the attention output.
     out_dtype : torch.dtype, optional
         Requested output dtype.
+    skip_softmax_threshold : float or torch.Tensor, optional
+        Skip-softmax threshold in the ordinary softmax domain; see
+        :meth:`BatchPrefillTSWrapper.plan`. ``None`` selects the dense kernel.
     out : torch.Tensor, optional
         Caller-owned output tensor.
     """
@@ -2322,6 +2470,7 @@ def batch_prefill_with_paged_kv_cache(
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=resolved_out_dtype,
+        skip_softmax_threshold=skip_softmax_threshold,
     )
     return wrapper.run(q, k_cache, v_cache, out=out)
 

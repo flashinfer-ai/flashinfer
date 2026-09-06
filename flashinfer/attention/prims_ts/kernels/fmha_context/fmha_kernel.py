@@ -47,6 +47,7 @@ Feature Support Matrix:
   | `S_q` / `S_kv`   | Query-paired causal requires `S_q <= S_kv`; arbitrary positive tails are supported             |
   | GQA              | Must satisfy `h_q % h_kv == 0`; causal GQA can use head-paired scheduling                    |
   | Sliding window   | `mask_type="causal", window_left=N`; left window only                                        |
+  | Skip softmax     | Optional per-request threshold; skipped K/V tiles bypass exp2, P conversion, and PV MMA     |
   | Scheduler modes  | Query-paired: static CTAs, persistent, CLC; head-paired: persistent, CLC                      |
 
 ASCII Flow Chart:
@@ -660,6 +661,8 @@ def build_context_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    skip_softmax_threshold: cute.Tensor | None = None,
+    seq_len_q: int | Int32 | None = None,
     g_page_idx_kv: cute.Pointer | None = None,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
@@ -690,7 +693,12 @@ def build_context_task_manager(
     is the base-2 softmax multiplier, normally
     ``softmax_scale * log2(e)``; FP8 callers can fold Q/K dequant scales into
     it. ``output_scale`` multiplies the final O store; FP8 output can fold the
-    V dequant scale and output quant scale into it.
+    V dequant scale and output quant scale into it. ``skip_softmax_threshold``
+    is the ``float32[B]`` per-request skip-softmax threshold consumed only by
+    ``cfg.skip_softmax`` specializations; the softmax resource converts it to
+    the log2 domain once per work tile. ``seq_len_q`` is the fixed-layout Q
+    length those specializations use to let padding rows abstain from the
+    skip vote; packed layouts derive it from ``cum_seqlen_q``.
 
     SMEM buffers are declared via ``SmemAllocation`` and bound from
     ``ResourceContext`` by auxiliary resource init work. The ``SmemAllocator``
@@ -1071,6 +1079,18 @@ def build_context_task_manager(
         else:
             work_queue = WorkQueue(**work_queue_kwargs)
 
+    # Skip softmax publishes one Int32 vote per softmax warp for every S/P
+    # stage of each instance. The MMA task reads the four words of an instance
+    # after the matching P-ready wait.
+    skip_softmax_vote_alloc: SmemAllocation | None = None
+    if cfg.skip_softmax:
+        skip_softmax_vote_alloc = SmemAllocation(
+            "smem_skip_softmax_vote",
+            dtype=cutlass.Int32,
+            count=cfg.skip_softmax_vote_words,
+            alignment=16,
+        )
+
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
         cfg=cfg,
@@ -1085,6 +1105,9 @@ def build_context_task_manager(
         variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
+        skip_softmax_threshold=skip_softmax_threshold,
+        skip_softmax_vote_alloc=skip_softmax_vote_alloc,
+        seq_len_q=seq_len_q,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1147,6 +1170,9 @@ def build_context_task_manager(
             variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
+            skip_softmax_threshold=skip_softmax_threshold,
+            skip_softmax_vote_alloc=skip_softmax_vote_alloc,
+            seq_len_q=seq_len_q,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1190,6 +1216,7 @@ def build_context_task_manager(
         tmem_o1_offset=cfg.tmem_o1_offset,
         tmem_vec0_resource=tmem_vec0,
         tmem_vec1_resource=tmem_vec1,
+        skip_softmax_vote_alloc=skip_softmax_vote_alloc,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -1478,6 +1505,8 @@ def build_context_task_manager(
     dealloc_mbar_alloc = smem_allocator.add(
         SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
     )
+    if skip_softmax_vote_alloc is not None:
+        smem_allocator.add(skip_softmax_vote_alloc)
     clc_response_alloc: SmemAllocation | None = None
     if is_clc_dynamic and clc_response_ptr is None:
         # Keep the CLC response inside the unified TS allocation. The kernel
@@ -1670,6 +1699,8 @@ def _infer_single_instance_kv_stages(
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes += cutlass.Int128.width // 8
+    if cfg.skip_softmax:
+        control_bytes += cfg.skip_softmax_vote_words * cutlass.Int32.width // 8
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
             cfg,
@@ -2215,6 +2246,8 @@ def build_fmha_task_manager(
     variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
+    skip_softmax_threshold: cute.Tensor | None = None,
+    seq_len_q: int | Int32 | None = None,
     q_offset: int | Int32 = 0,
     g_page_idx_kv: cute.Pointer | None = None,
     g_seq_lens_kv: cute.Pointer | None = None,
@@ -2305,6 +2338,8 @@ def build_fmha_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        skip_softmax_threshold=skip_softmax_threshold,
+        seq_len_q=seq_len_q,
         g_page_idx_kv=g_page_idx_kv,
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
@@ -2370,6 +2405,13 @@ class FmhaTs:
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
         extent fits one 128-token tile (default: False).
+    skip_softmax : bool, optional
+        Compile the skip-softmax specialization. Each softmax warp skips the
+        exponentiation, P conversion, and row-sum work of a K/V tile whose
+        scaled score gap to the running maximum is below the per-request
+        threshold, and the MMA task skips the PV MMA once every softmax warp of
+        the instance voted to skip. The launch then requires the
+        ``skip_softmax_threshold`` tensor (default: False).
     """
 
     def __init__(
@@ -2393,6 +2435,7 @@ class FmhaTs:
         num_tokens_per_page: int = 32,
         max_num_pages_per_seq_kv: int = 1,
         causal_single_kv_tile: bool = False,
+        skip_softmax: bool = False,
         exhaustive_deadlock_race_check: bool = True,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
@@ -2449,6 +2492,7 @@ class FmhaTs:
         if d > 128:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
+        cfg.skip_softmax = skip_softmax
         single_instance_persistent = (
             is_persistent and cfg.single_qkv_instance and not head_paired
         )
@@ -2601,6 +2645,7 @@ class FmhaTs:
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
+        skip_softmax_threshold: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -2608,7 +2653,9 @@ class FmhaTs:
         device tensors. Example host values are
         ``[math.log2(math.e) / math.sqrt(d)]`` for the softmax scale and
         ``[1.0]`` for FP16 output. FP8 callers may fold Q/K/V and output
-        quantization scales into these runtime tensors.
+        quantization scales into these runtime tensors. Skip-softmax
+        specializations also require ``skip_softmax_threshold``, a
+        ``float32[B]`` device tensor of e-based per-request thresholds.
         """
         cfg = self.cfg
         if cutlass.const_expr(cfg.has_variable_window):
@@ -2618,6 +2665,10 @@ class FmhaTs:
                 or variable_window_cta_starts is None
             ):
                 raise ValueError("VariableWindow requires start and end tensors")
+        if cutlass.const_expr(cfg.skip_softmax and skip_softmax_threshold is None):
+            raise ValueError(
+                "skip-softmax context requires the per-request threshold tensor"
+            )
 
         # Create TMA descriptors. Both query-paired and head-paired modes use
         # the same logical Q/K/V/O tensor-map boxes after FmhaConfig lowers the
@@ -2866,6 +2917,7 @@ class FmhaTs:
             variable_window_token_ends,
             variable_window_cta_starts,
             Int32(s_q),
+            skip_softmax_threshold,
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -2905,6 +2957,7 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None,
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
+        skip_softmax_threshold: cute.Tensor | None,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -2967,6 +3020,10 @@ class FmhaTs:
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            skip_softmax_threshold=skip_softmax_threshold,
+            # Fixed storage gives every request s_q rows, the same value that
+            # strides the variable-window row tables.
+            seq_len_q=variable_window_q_stride,
             q_offset=q_offset,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,

@@ -54,6 +54,7 @@ against the K/V lengths and page table translated and snapshotted by `plan()`.
 | Page size | 16, 32, 64, or 128 tokens |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
+| Skip softmax | Optional `skip_softmax_threshold`: `None` (dense), a scalar, or a live `float32[B]` tensor |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state |
 
@@ -74,6 +75,42 @@ least 4-byte aligned. A caller-provided `out` must not overlap Q, K, V, or any
 metadata retained by the plan. The launch conservatively rejects overlapping
 storage spans. The API returns O only; rowwise LSE and other softmax state
 remain internal to the kernel.
+
+## Skip softmax
+
+`skip_softmax_threshold` selects the skip-softmax specialization of the same
+kernel. `None` compiles the dense kernel. Any provided value, including zero,
+compiles the skip-enabled kernel, whose decision runs once per 128-key K/V
+tile for each 32-row query group of a softmax warp:
+
+```text
+skip the tile for the group  <=>  for every row of the group,
+    exp(sm_scale * (tile_max - running_max)) < skip_softmax_threshold
+```
+
+The threshold is expressed in the ordinary softmax domain; the kernel
+converts it to the log2 domain once per work tile. `tile_max` is the row's
+largest masked score in the tile and `running_max` is the row's current
+softmax maximum, so a row that has not met a valid key yet never votes to
+skip, and a zero threshold never skips. Only the rows inside the request
+vote; the TMA padding rows of a partial query tile abstain. A skipped tile
+contributes zero probability mass: the warp publishes an all-zero P tile
+without exponentiation, keeps its running maximum and denominator, and votes
+in shared memory. When all four softmax warps of a 128-row query tile skip,
+the MMA task also skips that tile's PV MMA. K and V tiles are still loaded, so
+the saving is in softmax and tensor-core work rather than in memory traffic.
+Skipping is an approximation chosen by the caller: larger thresholds skip
+more tiles and deviate further from dense attention.
+
+A Python scalar applies the same threshold to every request and is fixed for
+the plan. If such a plan is captured in a CUDA graph, the value is baked into
+the graph and cannot change between replays. A contiguous CUDA `float32[B]`
+tensor gives request `b` its own threshold and is retained as a live input:
+the caller owns its allocation and lifetime, keeps its address stable, and
+may update its values in place between runs or graph replays. The kernel only
+reads the tensor. Element values must be finite and non-negative; their
+contents are not validated to avoid host synchronization. The one-shot APIs
+accept the same forms.
 
 ## Tensor and metadata layouts
 
@@ -153,7 +190,11 @@ Q + contiguous or paged K/V
 
 The TS graph assigns load, MMA, softmax, correction, epilogue, page-offset,
 and scheduling work to cooperating tasks. Resources own the corresponding
-SMEM/TMEM buffers and pipeline state.
+SMEM/TMEM buffers and pipeline state. Skip-softmax specializations add one
+shared-memory vote word per softmax warp, S/P stage, and Q/KV instance: the
+softmax warp writes its vote before publishing P, and the MMA task reads the
+four words of an instance after the P-ready wait to decide whether to issue
+the PV MMA.
 
 Paged D256 uses topology-derived page-ID staging. For a dense static domain
 that is divisible by the complete staged window and whose exact SMEM footprint
@@ -243,6 +284,8 @@ non-overlapping `out`.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
 - Attention sinks, custom masks, and mixed Q/K/V dtypes are not exposed.
+- Skip softmax does not reduce K/V load traffic and exposes no skip
+  statistics; validate its accuracy impact for each threshold.
 - Re-plan after changing paged K/V metadata values. Live packed offsets may be
   updated only within their plan-time Q/K capacities, packed extents, and
   per-request causal contract.
@@ -252,7 +295,8 @@ non-overlapping `out`.
 The public suite covers fixed, ragged, and paged layouts; MHA/GQA; both head
 dimensions; `torch.float16`, `torch.bfloat16`, and `torch.float8_e4m3fn`
 inputs; dense, causal, and left-window masks; nonidentity pages; scheduler
-safety; CUDA graphs; and reference accuracy. Explicit input-to-output dtype
+safety; CUDA graphs; skip softmax against a tile-level emulation of its
+decisions; and reference accuracy. Explicit input-to-output dtype
 conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
 output state.
 

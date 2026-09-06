@@ -525,6 +525,7 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
         "variable_window_token_starts",
         "variable_window_token_ends",
         "variable_window_cta_starts",
+        "skip_softmax_threshold",
     )
 
     for aliased_name in (*argument_names, *retained_names):
@@ -574,6 +575,7 @@ def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
         "dense_page_idx_kv",
         "scale_softmax_log2",
         "output_scale",
+        "skip_softmax_threshold",
     )
 
     for aliased_name in (*argument_names, *retained_names):
@@ -3126,3 +3128,629 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     _assert_context_correct(graph_out, second)
+
+
+# ---------------------------------------------------------------------------
+# Skip softmax
+# ---------------------------------------------------------------------------
+
+_SKIP_SOFTMAX_KV_TILE = 128
+_SKIP_SOFTMAX_ROW_GROUP = 32
+
+
+@torch.no_grad()
+def _skip_softmax_reference(
+    case: _ContextCase,
+    thresholds: Sequence[float],
+) -> torch.Tensor:
+    """Emulate the kernel's warp-level skip-softmax algorithm in FP32.
+
+    The kernel decides per 128-key K/V tile and per 32-row query group whether
+    ``exp(sm_scale * (tile_max - running_max)) < threshold`` holds for every
+    valid row of the group; TMA padding rows past the request abstain. A
+    skipped tile adds no probability mass and leaves the running maximum
+    unchanged. Fully masked rows have a ``-inf`` tile maximum, so a row
+    without any valid key yet compares ``NaN`` and never votes to skip. This
+    oracle replays that decision sequence with the same comparison semantics
+    and normalizes like the kernel.
+    """
+
+    outputs = []
+    for batch_idx, (q_length, k_length) in enumerate(
+        zip(case.q_lengths, case.k_lengths, strict=True)
+    ):
+        threshold = float(thresholds[batch_idx])
+        q = _request_slice(case.q, case.q_lengths, batch_idx, packed=case.packed)
+        k = _request_slice(case.k, case.k_lengths, batch_idx, packed=case.packed)
+        v = _request_slice(case.v, case.k_lengths, batch_idx, packed=case.packed)
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        head_ratio = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(head_ratio, dim=1)
+        v = v.repeat_interleave(head_ratio, dim=1)
+        device = q.device
+        num_heads, head_dim = q.shape[1], q.shape[2]
+
+        num_k_tiles = -(-k_length // _SKIP_SOFTMAX_KV_TILE)
+        padded_k = num_k_tiles * _SKIP_SOFTMAX_KV_TILE
+        k_pad = torch.zeros((padded_k, num_heads, head_dim), device=device)
+        k_pad[:k_length] = k
+        v_pad = torch.zeros_like(k_pad)
+        v_pad[:k_length] = v
+
+        rows = torch.arange(q_length, device=device)
+        keys = torch.arange(padded_k, device=device)
+        if case.mask_type == "dense":
+            visible = (keys[None, :] < k_length).expand(q_length, padded_k)
+        elif case.mask_type == "causal":
+            right = k_length - q_length + rows
+            visible = keys[None, :] <= right[:, None]
+            if case.window_left >= 0:
+                visible &= keys[None, :] >= (right - case.window_left)[:, None]
+        else:
+            raise ValueError("skip-softmax oracle supports dense and causal masks")
+
+        scores = torch.einsum("qhd,khd->hqk", q, k_pad) * case.sm_scale
+        scores = scores.masked_fill(~visible[None], float("-inf"))
+        out = torch.zeros((q_length, num_heads, head_dim), device=device)
+        for row_begin in range(0, q_length, _SKIP_SOFTMAX_ROW_GROUP):
+            row_end = min(row_begin + _SKIP_SOFTMAX_ROW_GROUP, q_length)
+            group_scores = scores[:, row_begin:row_end]
+            group_visible = visible[row_begin:row_end]
+            group_rows = row_end - row_begin
+            running_max = torch.full(
+                (num_heads, group_rows), float("-inf"), device=device
+            )
+            row_sum = torch.zeros_like(running_max)
+            acc = torch.zeros((num_heads, group_rows, head_dim), device=device)
+            for tile_idx in range(num_k_tiles):
+                k_begin = tile_idx * _SKIP_SOFTMAX_KV_TILE
+                k_end = k_begin + _SKIP_SOFTMAX_KV_TILE
+                if not bool(group_visible[:, k_begin:k_end].any()):
+                    # Whether skipped or computed, a fully masked tile
+                    # contributes nothing and keeps every running statistic.
+                    continue
+                tile_scores = group_scores[:, :, k_begin:k_end]
+                tile_max = tile_scores.amax(dim=-1)
+                # exp(-inf) = 0 skips a masked row once it has a finite
+                # maximum; exp(NaN) and exp(inf) never compare below.
+                lane_skips = torch.exp(tile_max - running_max) < threshold
+                warp_skips = lane_skips.all(dim=-1)
+                new_max = torch.where(
+                    warp_skips[:, None],
+                    running_max,
+                    torch.maximum(running_max, tile_max),
+                )
+                no_valid_key = new_max == float("-inf")
+                safe_max = torch.where(no_valid_key, torch.zeros_like(new_max), new_max)
+                probabilities = torch.exp(tile_scores - safe_max[..., None])
+                correction = torch.where(
+                    no_valid_key,
+                    torch.ones_like(new_max),
+                    torch.exp(running_max - new_max),
+                )
+                keep = ~warp_skips[:, None]
+                row_sum = torch.where(
+                    keep, row_sum * correction + probabilities.sum(dim=-1), row_sum
+                )
+                tile_out = torch.einsum(
+                    "hqk,khd->hqd", probabilities, v_pad[k_begin:k_end]
+                )
+                acc = torch.where(
+                    keep[..., None], acc * correction[..., None] + tile_out, acc
+                )
+                running_max = new_max
+            out[row_begin:row_end] = (acc / row_sum[..., None]).permute(1, 0, 2)
+        outputs.append(out * case.output_scale)
+    return torch.cat(outputs) if case.packed else torch.stack(outputs)
+
+
+def _run_skip_softmax(
+    case: _ContextCase,
+    threshold,
+    *,
+    use_wrapper: bool,
+) -> torch.Tensor:
+    if use_wrapper:
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            case.q,
+            case.k,
+            case.v,
+            qo_indptr=case.qo_indptr,
+            kv_indptr=case.kv_indptr,
+            mask_type=case.mask_type,
+            window_left=case.window_left,
+            sm_scale=case.sm_scale,
+            output_scale=case.output_scale,
+            out_dtype=case.output_dtype,
+            skip_softmax_threshold=threshold,
+        )
+        assert dict(wrapper._policy)["skip_softmax"] is (threshold is not None)
+        return wrapper.run(case.q, case.k, case.v)
+    return batch_prefill(
+        case.q,
+        case.k,
+        case.v,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+        mask_type=case.mask_type,
+        window_left=case.window_left,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+        skip_softmax_threshold=threshold,
+    )
+
+
+def _run_skip_softmax_paged(
+    case: _PagedContextCase,
+    threshold,
+) -> torch.Tensor:
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper.plan(
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        case.qo_indptr,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        page_size=case.page_size,
+        mask_type=case.reference.mask_type,
+        window_left=case.reference.window_left,
+        sm_scale=case.reference.sm_scale,
+        output_scale=case.reference.output_scale,
+        out_dtype=case.reference.output_dtype,
+        skip_softmax_threshold=threshold,
+    )
+    assert dict(wrapper._policy)["skip_softmax"] is (threshold is not None)
+    return wrapper.run(case.reference.q, case.k_cache, case.v_cache)
+
+
+def test_attention_ts_context_skip_softmax_oracle_tracks_tile_decisions():
+    """Cold tiles are skipped per 32-row group and hot tiles reset the maximum."""
+
+    case = _make_context_case(
+        q_lengths=(64,),
+        k_lengths=(384,),
+        num_qo_heads=1,
+        num_kv_heads=1,
+        qkv_dtype=torch.float32,
+        packed=False,
+        mask_type="dense",
+        output_scale=1.0,
+        device="cpu",
+    )
+    case.q.zero_()
+    case.k.zero_()
+    case.v.zero_()
+    # Scores equal the first K component: tile 0 is warm, tile 1 is cold, and
+    # tile 2 is hot. Rows 32-63 negate the query, so their hot and cold tiles
+    # trade places.
+    case.q[0, :32, 0, 0] = 1.0
+    case.q[0, 32:, 0, 0] = -1.0
+    case.k[0, 0:128, 0, 0] = 10.0
+    case.k[0, 128:256, 0, 0] = 5.0
+    case.k[0, 256:384, 0, 0] = 30.0
+    case.v[0, 0:128, 0, 1] = 1.0
+    case.v[0, 128:256, 0, 2] = 1.0
+    case.v[0, 256:384, 0, 3] = 1.0
+
+    skipped = _skip_softmax_reference(case, thresholds=(1.5,))
+    dense = _context_reference(case)
+    assert not torch.allclose(skipped, dense)
+
+    def visible_reference(row_begin: int, row_end: int, tiles: tuple[int, ...]):
+        keys = torch.cat([torch.arange(t * 128, (t + 1) * 128) for t in tiles])
+        sub = replace(
+            case,
+            q=case.q[:, row_begin:row_end],
+            k=case.k[:, keys],
+            v=case.v[:, keys],
+            q_lengths=(row_end - row_begin,),
+            k_lengths=(len(keys),),
+        )
+        return _context_reference(sub)
+
+    # Rows 0-31 skip the cold middle tile; rows 32-63 skip the (negated) last.
+    torch.testing.assert_close(skipped[0, :32], visible_reference(0, 32, (0, 2))[0])
+    torch.testing.assert_close(skipped[0, 32:], visible_reference(32, 64, (0, 1))[0])
+    # A zero threshold never skips and a padded, uniform threshold matches
+    # the dense oracle.
+    torch.testing.assert_close(_skip_softmax_reference(case, thresholds=(0.0,)), dense)
+
+
+_SKIP_SOFTMAX_CASES = (
+    pytest.param(
+        torch.bfloat16,
+        False,
+        (300,),
+        (300,),
+        8,
+        2,
+        "causal",
+        -1,
+        128,
+        True,
+        id="fixed-bf16-causal-d128-wrapper",
+    ),
+    pytest.param(
+        torch.float16,
+        True,
+        (200, 45),
+        (300, 400),
+        4,
+        4,
+        "dense",
+        -1,
+        128,
+        False,
+        id="packed-fp16-dense-mixed-d128-one-shot",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        True,
+        (129, 257),
+        (257, 384),
+        8,
+        2,
+        "causal",
+        -1,
+        128,
+        False,
+        id="packed-bf16-causal-offset-d128-one-shot",
+    ),
+    pytest.param(
+        _FP8,
+        False,
+        (257,),
+        (385,),
+        8,
+        2,
+        "causal",
+        -1,
+        128,
+        True,
+        id="fixed-fp8-causal-offset-d128-wrapper",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        False,
+        (200,),
+        (400,),
+        8,
+        2,
+        "causal",
+        200,
+        128,
+        True,
+        id="fixed-bf16-window-head-paired-d128-wrapper",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        False,
+        (129,),
+        (385,),
+        8,
+        2,
+        "dense",
+        -1,
+        256,
+        True,
+        id="fixed-bf16-dense-d256-wrapper",
+    ),
+    pytest.param(
+        _FP8,
+        False,
+        (257,),
+        (257,),
+        8,
+        2,
+        "causal",
+        -1,
+        256,
+        True,
+        id="fixed-fp8-causal-d256-wrapper",
+    ),
+)
+
+
+def _make_skip_softmax_case(
+    qkv_dtype,
+    packed,
+    q_lengths,
+    k_lengths,
+    num_qo_heads,
+    num_kv_heads,
+    mask_type,
+    window_left,
+    head_dim,
+) -> _ContextCase:
+    case = _make_context_case(
+        q_lengths=q_lengths,
+        k_lengths=k_lengths,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        qkv_dtype=qkv_dtype,
+        packed=packed,
+        mask_type=mask_type,
+        head_dim=head_dim,
+        window_left=window_left,
+        output_dtype=torch.bfloat16 if qkv_dtype == _FP8 else qkv_dtype,
+        device="cuda",
+        seed=2026090401 + head_dim + int(packed) + sum(k_lengths),
+    )
+    return case
+
+
+@pytest.mark.parametrize(
+    (
+        "qkv_dtype",
+        "packed",
+        "q_lengths",
+        "k_lengths",
+        "num_qo_heads",
+        "num_kv_heads",
+        "mask_type",
+        "window_left",
+        "head_dim",
+        "use_wrapper",
+    ),
+    _SKIP_SOFTMAX_CASES,
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_zero_threshold_matches_dense(
+    qkv_dtype,
+    packed,
+    q_lengths,
+    k_lengths,
+    num_qo_heads,
+    num_kv_heads,
+    mask_type,
+    window_left,
+    head_dim,
+    use_wrapper,
+):
+    """A zero threshold selects the skip kernel but never skips a tile."""
+
+    case = _make_skip_softmax_case(
+        qkv_dtype,
+        packed,
+        q_lengths,
+        k_lengths,
+        num_qo_heads,
+        num_kv_heads,
+        mask_type,
+        window_left,
+        head_dim,
+    )
+    dense = _run_skip_softmax(case, None, use_wrapper=use_wrapper)
+    zero = _run_skip_softmax(case, 0.0, use_wrapper=use_wrapper)
+    _assert_context_correct(dense, case)
+    _assert_context_correct(zero, case)
+    assert torch.equal(zero, dense)
+
+
+@pytest.mark.parametrize(
+    (
+        "qkv_dtype",
+        "packed",
+        "q_lengths",
+        "k_lengths",
+        "num_qo_heads",
+        "num_kv_heads",
+        "mask_type",
+        "window_left",
+        "head_dim",
+        "use_wrapper",
+    ),
+    _SKIP_SOFTMAX_CASES,
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_matches_emulated_reference(
+    qkv_dtype,
+    packed,
+    q_lengths,
+    k_lengths,
+    num_qo_heads,
+    num_kv_heads,
+    mask_type,
+    window_left,
+    head_dim,
+    use_wrapper,
+):
+    """Skipped outputs follow the tile-level oracle and differ from dense."""
+
+    case = _make_skip_softmax_case(
+        qkv_dtype,
+        packed,
+        q_lengths,
+        k_lengths,
+        num_qo_heads,
+        num_kv_heads,
+        mask_type,
+        window_left,
+        head_dim,
+    )
+    # Random N(0, 0.2) inputs keep every tile-versus-running maximum gap far
+    # inside exp(gap) in [0.7, 1.4], so a threshold of 2 skips every K/V tile
+    # after a group's first one with a wide decision margin.
+    threshold = 2.0
+    actual = _run_skip_softmax(case, threshold, use_wrapper=use_wrapper)
+    expected = _skip_softmax_reference(case, thresholds=(threshold,) * len(q_lengths))
+    _assert_context_correct(actual, case, expected=expected)
+    dense = _context_reference(case)
+    skipped_distance = torch.linalg.vector_norm(actual.float() - expected)
+    dense_distance = torch.linalg.vector_norm(actual.float() - dense)
+    assert float(dense_distance) > 4.0 * float(skipped_distance)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_paged_matches_emulated_reference(
+    head_dim: int,
+):
+    case = _make_paged_context_case(
+        q_lengths=(129, 257),
+        k_lengths=(257, 385),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        seed=2026090402 + head_dim,
+    )
+    dense = _run_skip_softmax_paged(case, None)
+    zero = _run_skip_softmax_paged(case, 0.0)
+    _assert_context_correct(dense, case.reference)
+    assert torch.equal(zero, dense)
+    threshold = 2.0
+    actual = _run_skip_softmax_paged(case, threshold)
+    expected = _skip_softmax_reference(
+        case.reference, thresholds=(threshold, threshold)
+    )
+    _assert_context_correct(actual, case.reference, expected=expected)
+    assert not torch.equal(actual, dense)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_per_request_tensor_thresholds():
+    """Element ``b`` of a threshold tensor applies to request ``b`` only."""
+
+    case = _make_context_case(
+        q_lengths=(257, 300),
+        k_lengths=(385, 300),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        qkv_dtype=torch.bfloat16,
+        packed=True,
+        mask_type="causal",
+        device="cuda",
+        seed=2026090403,
+    )
+    thresholds = torch.tensor((0.0, 2.0), dtype=torch.float32, device="cuda")
+    actual = _run_skip_softmax(case, thresholds, use_wrapper=False)
+    expected = _skip_softmax_reference(case, thresholds=thresholds.tolist())
+    _assert_context_correct(actual, case, expected=expected)
+    dense = _run_skip_softmax(case, None, use_wrapper=False)
+    assert case.qo_indptr is not None
+    split = int(case.qo_indptr[1])
+    assert torch.equal(actual[:split], dense[:split])
+    assert not torch.equal(actual[split:], dense[split:])
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_tensor_updates_apply_on_graph_replay():
+    """A live threshold tensor is reread by each replay; a scalar is frozen."""
+
+    case = _make_context_case(
+        q_lengths=(300,),
+        k_lengths=(300,),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="causal",
+        device="cuda",
+        seed=2026090404,
+    )
+    dense = _run_skip_softmax(case, None, use_wrapper=True)
+    skipped = _skip_softmax_reference(case, thresholds=(2.0,))
+
+    thresholds = torch.zeros(1, dtype=torch.float32, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type=case.mask_type,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+        skip_softmax_threshold=thresholds,
+    )
+    assert wrapper._skip_softmax_threshold is thresholds
+    graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    graph = _capture_context_graph(wrapper, case.q, case.k, case.v, graph_out)
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_out, dense)
+
+    thresholds.fill_(2.0)
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_context_correct(graph_out, case, expected=skipped)
+    assert not torch.equal(graph_out, dense)
+
+    scalar_wrapper = BatchPrefillTSWrapper()
+    scalar_wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type=case.mask_type,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+        skip_softmax_threshold=0.0,
+    )
+    scalar_out = torch.full_like(graph_out, float("nan"))
+    scalar_graph = _capture_context_graph(
+        scalar_wrapper, case.q, case.k, case.v, scalar_out
+    )
+    scalar_out.fill_(float("nan"))
+    scalar_graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(scalar_out, dense)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_skip_softmax_rejects_invalid_thresholds():
+    case = _make_context_case(
+        q_lengths=(64, 64),
+        k_lengths=(64, 64),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=torch.bfloat16,
+        packed=True,
+        mask_type="dense",
+        device="cuda",
+        seed=2026090405,
+    )
+
+    def plan_with(threshold):
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            case.q,
+            case.k,
+            case.v,
+            qo_indptr=case.qo_indptr,
+            kv_indptr=case.kv_indptr,
+            mask_type=case.mask_type,
+            sm_scale=case.sm_scale,
+            skip_softmax_threshold=threshold,
+        )
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        plan_with(-1.0)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        plan_with(float("inf"))
+    with pytest.raises(TypeError, match="skip_softmax_threshold must be None"):
+        plan_with(True)
+    with pytest.raises(TypeError, match="dtype torch.float32"):
+        plan_with(torch.zeros(2, dtype=torch.float16, device="cuda"))
+    with pytest.raises(ValueError, match=r"shape \[2\]"):
+        plan_with(torch.zeros(3, dtype=torch.float32, device="cuda"))
+    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+        plan_with(torch.zeros(2, dtype=torch.float32))
+    with pytest.raises(ValueError, match="compact"):
+        plan_with(torch.zeros(4, dtype=torch.float32, device="cuda")[::2])

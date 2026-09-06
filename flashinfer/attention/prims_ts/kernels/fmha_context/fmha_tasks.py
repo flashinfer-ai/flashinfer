@@ -747,8 +747,8 @@ def create_mma_task(
 
                     to.acquire()
                     tp0.wait()
-                    tmem_p_base = tp0.p_base()
-                    to.set_p_base(tmem_p_base=tmem_p_base)
+                    tmem_p_base, p_stage_idx = tp0.p_base()
+                    to.set_p_base(tmem_p_base=tmem_p_base, p_stage_idx=p_stage_idx)
 
                     skv.wait()
                     desc_v_base = skv.v_desc()
@@ -773,8 +773,8 @@ def create_mma_task(
                 sq.release()
                 to.acquire()
                 tp0.wait()
-                tmem_p_base = tp0.p_base()
-                to.set_p_base(tmem_p_base=tmem_p_base)
+                tmem_p_base, p_stage_idx = tp0.p_base()
+                to.set_p_base(tmem_p_base=tmem_p_base, p_stage_idx=p_stage_idx)
                 for head_dim_stage_idx in range(num_head_dim_stages_v):
                     skv.wait()
                     desc_v_base = skv.v_desc()
@@ -1093,6 +1093,8 @@ def create_softmax_task(
                         sp.init_softmax_work_tile_state()
                     )
                     vec.init_store_work_tile_state()
+                    if tmem_sp.cfg.skip_softmax:
+                        sp.cache_skip_softmax_state()
                     if tmem_sp.uses_varlen_q_offset_cache:
                         q_offset = sp.cache_q_offset()
                     if tmem_sp.uses_packed_dense_k_mask:
@@ -1573,6 +1575,8 @@ def create_softmax_task(
             # Recompute per-tile SP/Vec TMEM state.
             old_row_max, row_max, row_sum, q_offset = sp.init_softmax_work_tile_state()
             vec.init_store_work_tile_state()
+            if tmem_sp.cfg.skip_softmax:
+                sp.cache_skip_softmax_state()
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
