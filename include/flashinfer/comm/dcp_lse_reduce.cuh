@@ -147,7 +147,7 @@ __device__ static inline float sanitize_lse(float l) {
 //   2. blocks publish complete destination payloads and release-store flags;
 //   3. block 0 acquire-waits for every source flag; unconditional grid sync;
 //   4. blocks are reassigned to output rows and perform the LSE merge.
-template <typename T, bool BASE_E>
+template <typename T, bool BASE_E, bool ROW_DISTRIBUTED>
 __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __restrict__ partial_lse,
                             unsigned char* __restrict__ workspace, ncclWindow_t window,
                             size_t signal_window_offset, size_t out_region_window_offset,
@@ -176,43 +176,66 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
   const size_t slot_out_window_offset = out_region_window_offset + slot * slot_out_bytes;
   const size_t slot_lse_window_offset = lse_region_window_offset + slot * slot_lse_bytes;
 
-  // Each destination is owned by one block. That block writes every row before
-  // publishing this source rank's readiness flag to the destination.
-  for (int dst = blockIdx.x; dst < nranks; dst += gridDim.x) {
-    for (int tile = 0; tile < num_entries; ++tile) {
+  if constexpr (ROW_DISTRIBUTED) {
+    // Split the (destination, row) work across the whole cooperative grid. At
+    // CP=4, one-block-per-destination leaves blocks idle once entries exceed
+    // the number of ranks. Publish only after all producers have flushed.
+    for (int work = blockIdx.x; work < nranks * num_entries; work += gridDim.x) {
+      const int dst = work / num_entries;
+      const int tile = work - dst * num_entries;
       const int token = tile / local_heads;
       const int local_head = tile - token * local_heads;
-      const size_t src_base = (((static_cast<size_t>(tile) * nranks + dst) * head_dim));
+      const size_t src_base = ((static_cast<size_t>(tile) * nranks + dst) * head_dim);
       const size_t dst_row =
           ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
-      T* dst_out = reinterpret_cast<T*>(
-          ncclGetLsaPointer(window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
-      float* dst_lse = reinterpret_cast<float*>(
-          ncclGetLsaPointer(window, slot_lse_window_offset + dst_row * sizeof(float), dst));
-
+      T* dst_out = reinterpret_cast<T*>(ncclGetLsaPointer(
+          window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
+      float* dst_lse = reinterpret_cast<float*>(ncclGetLsaPointer(
+          window, slot_lse_window_offset + dst_row * sizeof(float), dst));
       constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
       const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
       int4* dst4 = reinterpret_cast<int4*>(dst_out);
-      const int n4 = head_dim / kVec;
-      for (int d = threadIdx.x; d < n4; d += blockDim.x) {
-        dst4[d] = src4[d];
-      }
-      if (threadIdx.x == 0) {
-        *dst_lse = partial_lse[static_cast<size_t>(tile) * nranks + dst];
-      }
-      __syncthreads();
+      for (int d = threadIdx.x; d < head_dim / kVec; d += blockDim.x) dst4[d] = src4[d];
+      if (threadIdx.x == 0) *dst_lse = partial_lse[static_cast<size_t>(tile) * nranks + dst];
     }
-
-    // Conservatively flush every writer before the signaling thread publishes
-    // readiness. This can be relaxed after compute-sanitizer and perf testing.
     __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) {
+    grid.sync();
+    if (blockIdx.x < nranks && threadIdx.x == 0) {
+      const int dst = blockIdx.x;
       auto* dst_ready = reinterpret_cast<uint32_t*>(ncclGetLsaPointer(
           window, signal_window_offset + (slot * nranks + rank) * sizeof(uint32_t), dst));
       store_release_sys(dst_ready, signal_value);
     }
-    __syncthreads();
+  } else {
+    // For small row counts, a destination-owning block avoids the extra grid
+    // synchronization needed by the fully distributed send schedule.
+    for (int dst = blockIdx.x; dst < nranks; dst += gridDim.x) {
+      for (int tile = 0; tile < num_entries; ++tile) {
+        const int token = tile / local_heads;
+        const int local_head = tile - token * local_heads;
+        const size_t src_base = ((static_cast<size_t>(tile) * nranks + dst) * head_dim);
+        const size_t dst_row =
+            ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
+        T* dst_out = reinterpret_cast<T*>(ncclGetLsaPointer(
+            window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
+        float* dst_lse = reinterpret_cast<float*>(ncclGetLsaPointer(
+            window, slot_lse_window_offset + dst_row * sizeof(float), dst));
+        constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
+        const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
+        int4* dst4 = reinterpret_cast<int4*>(dst_out);
+        for (int d = threadIdx.x; d < head_dim / kVec; d += blockDim.x) dst4[d] = src4[d];
+        if (threadIdx.x == 0) *dst_lse = partial_lse[static_cast<size_t>(tile) * nranks + dst];
+        __syncthreads();
+      }
+      __threadfence_system();
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        auto* dst_ready = reinterpret_cast<uint32_t*>(ncclGetLsaPointer(
+            window, signal_window_offset + (slot * nranks + rank) * sizeof(uint32_t), dst));
+        store_release_sys(dst_ready, signal_value);
+      }
+      __syncthreads();
+    }
   }
 
   // Different threads wait for different source ranks. The grid sync must be

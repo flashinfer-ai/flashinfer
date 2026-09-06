@@ -29,17 +29,18 @@ void CheckNccl(ncclResult_t result, const char* operation) {
   TORCH_CHECK(result == ncclSuccess, operation, ": ", ncclGetErrorString(result));
 }
 
-template <typename T, bool BaseE>
-void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* workspace,
-                  ncclWindow_t window, size_t signal_window_offset, size_t out_region_window_offset,
-                  size_t out_region_local_offset, size_t slot_out_bytes,
-                  size_t lse_region_window_offset, size_t lse_region_local_offset,
-                  size_t slot_lse_bytes, at::Tensor& output, int rank, int cp_size, int num_tokens,
-                  int max_tokens, int local_heads, int head_dim, cudaStream_t stream) {
+template <typename T, bool BaseE, bool RowDistributed>
+void launch_fused_impl(const T* partial_o, const float* partial_lse, unsigned char* workspace,
+                       ncclWindow_t window, size_t signal_window_offset,
+                       size_t out_region_window_offset, size_t out_region_local_offset,
+                       size_t slot_out_bytes, size_t lse_region_window_offset,
+                       size_t lse_region_local_offset, size_t slot_lse_bytes, at::Tensor& output,
+                       int rank, int cp_size, int num_tokens, int max_tokens, int local_heads,
+                       int head_dim, cudaStream_t stream) {
   const size_t smem = static_cast<size_t>(cp_size) * sizeof(float);
   int blocks_per_sm = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks_per_sm, FusedKernel<T, BaseE>, kFusedBlockSize, smem));
+      &blocks_per_sm, FusedKernel<T, BaseE, RowDistributed>, kFusedBlockSize, smem));
   const cudaDeviceProp* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->cooperativeLaunch, "decode_cp_a2a_lse_reduce requires cooperative launch");
   const int max_cooperative_blocks = blocks_per_sm * props->multiProcessorCount;
@@ -68,9 +69,33 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
       &local_heads,
       &head_dim,
   };
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(FusedKernel<T, BaseE>),
-                                             dim3(grid_blocks), dim3(kFusedBlockSize), args, smem,
-                                             stream));
+  C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(FusedKernel<T, BaseE, RowDistributed>), dim3(grid_blocks),
+      dim3(kFusedBlockSize), args, smem, stream));
+}
+
+template <typename T, bool BaseE>
+void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* workspace,
+                  ncclWindow_t window, size_t signal_window_offset, size_t out_region_window_offset,
+                  size_t out_region_local_offset, size_t slot_out_bytes,
+                  size_t lse_region_window_offset, size_t lse_region_local_offset,
+                  size_t slot_lse_bytes, at::Tensor& output, int rank, int cp_size, int num_tokens,
+                  int max_tokens, int local_heads, int head_dim, cudaStream_t stream) {
+  if (num_tokens * local_heads >= 16) {
+    launch_fused_impl<T, BaseE, true>(partial_o, partial_lse, workspace, window,
+                                      signal_window_offset, out_region_window_offset,
+                                      out_region_local_offset, slot_out_bytes,
+                                      lse_region_window_offset, lse_region_local_offset,
+                                      slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens,
+                                      local_heads, head_dim, stream);
+  } else {
+    launch_fused_impl<T, BaseE, false>(partial_o, partial_lse, workspace, window,
+                                       signal_window_offset, out_region_window_offset,
+                                       out_region_local_offset, slot_out_bytes,
+                                       lse_region_window_offset, lse_region_local_offset,
+                                       slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens,
+                                       local_heads, head_dim, stream);
+  }
 }
 
 }  // namespace
