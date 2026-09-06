@@ -1037,8 +1037,7 @@ def _load_full_domain_rows(
     identity_sha256,
     repeat_iters,
     *,
-    inherited_count=0,
-    inherited_identity_sha256=None,
+    inherited_identity_sha256_by_row=None,
 ):
     if not rows_root.is_dir():
         return [], []
@@ -1070,9 +1069,13 @@ def _load_full_domain_rows(
             "row",
         }:
             raise RuntimeError(f"full-domain receipt {path.name} schema is invalid")
-        expected_identity_sha256 = (
-            inherited_identity_sha256 if index < inherited_count else identity_sha256
-        )
+        if (
+            inherited_identity_sha256_by_row is not None
+            and index < len(inherited_identity_sha256_by_row)
+        ):
+            expected_identity_sha256 = inherited_identity_sha256_by_row[index]
+        else:
+            expected_identity_sha256 = identity_sha256
         if (
             receipt["schema"] != _FULL_DOMAIN_ROW_SCHEMA
             or receipt["identity_sha256"] != expected_identity_sha256
@@ -1093,6 +1096,89 @@ def _load_full_domain_rows(
             {"path": path.name, "sha256": hashlib.sha256(receipt_bytes).hexdigest()}
         )
     return rows, row_receipts
+
+
+def _checkpoint_receipt_identity_sha256_by_row(
+    checkpoint_path,
+    checkpoint,
+    *,
+    seen_paths=None,
+):
+    """Resolve immutable receipt identities through an inheritance chain."""
+
+    seen = set() if seen_paths is None else set(seen_paths)
+    resolved_path = checkpoint_path.resolve()
+    if resolved_path in seen:
+        raise RuntimeError("full-domain checkpoint inheritance contains a cycle")
+    seen.add(resolved_path)
+    identity = checkpoint.get("identity")
+    progress = checkpoint.get("progress")
+    if not isinstance(identity, dict) or not isinstance(progress, dict):
+        raise RuntimeError("inherited checkpoint identity or progress is invalid")
+    completed_rows = progress.get("completed_rows")
+    if (
+        type(completed_rows) is not int
+        or completed_rows < 1
+        or completed_rows > len(_FULL_DOMAIN_SHAPES)
+    ):
+        raise RuntimeError("inherited checkpoint completed row count is invalid")
+    identity_sha256 = _canonical_json_sha256(identity)
+    identities = [identity_sha256] * completed_rows
+    inheritance = checkpoint.get("inheritance")
+    if inheritance is None:
+        return identities
+    if not isinstance(inheritance, dict) or set(inheritance) != {
+        "manifest_path",
+        "manifest_sha256",
+        "predecessor_checkpoint",
+        "predecessor_identity_sha256",
+        "completed_rows",
+        "inherited_route_names",
+    }:
+        raise RuntimeError("checkpoint inheritance attestation is invalid")
+    inherited_count = inheritance["completed_rows"]
+    if (
+        type(inherited_count) is not int
+        or inherited_count < 1
+        or inherited_count > completed_rows
+    ):
+        raise RuntimeError("checkpoint inherited row count is invalid")
+    predecessor_record = inheritance["predecessor_checkpoint"]
+    if not isinstance(predecessor_record, dict) or set(predecessor_record) != {
+        "path",
+        "sha256",
+    }:
+        raise RuntimeError("checkpoint predecessor record is invalid")
+    predecessor_path = Path(predecessor_record["path"]).resolve()
+    if not predecessor_path.is_file() or predecessor_path.is_symlink():
+        raise RuntimeError("checkpoint predecessor is not a regular file")
+    predecessor_bytes = predecessor_path.read_bytes()
+    if hashlib.sha256(predecessor_bytes).hexdigest() != predecessor_record["sha256"]:
+        raise RuntimeError("checkpoint predecessor SHA-256 mismatch")
+    predecessor = json.loads(predecessor_bytes)
+    predecessor_identity = predecessor.get("identity")
+    if (
+        predecessor.get("schema") != _FULL_DOMAIN_SCHEMA
+        or predecessor.get("status") not in ("in_progress", "complete")
+        or predecessor.get("measurement") != checkpoint.get("measurement")
+        or predecessor.get("progress", {}).get("completed_rows") != inherited_count
+        or not isinstance(predecessor_identity, dict)
+        or _canonical_json_sha256(predecessor_identity)
+        != inheritance["predecessor_identity_sha256"]
+        or predecessor_identity.get("baseline") != identity.get("baseline")
+        or predecessor_identity.get("shape_inventory_sha256")
+        != identity.get("shape_inventory_sha256")
+    ):
+        raise RuntimeError("checkpoint predecessor identity or protocol is invalid")
+    predecessor_identities = _checkpoint_receipt_identity_sha256_by_row(
+        predecessor_path,
+        predecessor,
+        seen_paths=seen,
+    )
+    if len(predecessor_identities) != inherited_count:
+        raise RuntimeError("checkpoint predecessor receipt inventory is invalid")
+    identities[:inherited_count] = predecessor_identities
+    return identities
 
 
 def _load_full_domain_inheritance(
@@ -1196,10 +1282,19 @@ def _load_full_domain_inheritance(
     }
 
     predecessor_rows_root = Path(inheritance["predecessor_rows_root"]).resolve()
+    predecessor_identity_sha256_by_row = (
+        _checkpoint_receipt_identity_sha256_by_row(
+            predecessor_checkpoint_path,
+            predecessor_checkpoint,
+        )
+    )
+    if len(predecessor_identity_sha256_by_row) != completed_rows:
+        raise RuntimeError("predecessor checkpoint receipt identity count is invalid")
     predecessor_rows, predecessor_receipts = _load_full_domain_rows(
         predecessor_rows_root,
         predecessor_identity_sha256,
         repeat_iters,
+        inherited_identity_sha256_by_row=predecessor_identity_sha256_by_row,
     )
     if len(predecessor_rows) != completed_rows:
         raise RuntimeError("predecessor row receipts do not match completed rows")
@@ -1306,7 +1401,7 @@ def _load_full_domain_inheritance(
         "predecessor_identity_sha256": predecessor_identity_sha256,
         "completed_rows": completed_rows,
         "inherited_route_names": sorted(used_variants),
-    }
+    }, predecessor_identity_sha256_by_row
 
 
 def _summarize_full_domain(rows):
@@ -1399,9 +1494,9 @@ def _run_full_domain_benchmark(args):
     rows_root.mkdir(parents=True, exist_ok=True)
     inheritance = None
     inherited_count = 0
-    inherited_identity_sha256 = None
+    inherited_identity_sha256_by_row = None
     if args.inheritance_json is not None:
-        inheritance = _load_full_domain_inheritance(
+        inheritance, inherited_identity_sha256_by_row = _load_full_domain_inheritance(
             Path(args.inheritance_json).resolve(),
             current_identity=identity,
             current_identity_sha256=identity_sha256,
@@ -1411,13 +1506,11 @@ def _run_full_domain_benchmark(args):
             repeat_iters=args.repeat_iters,
         )
         inherited_count = inheritance["completed_rows"]
-        inherited_identity_sha256 = inheritance["predecessor_identity_sha256"]
     rows, row_receipts = _load_full_domain_rows(
         rows_root,
         identity_sha256,
         args.repeat_iters,
-        inherited_count=inherited_count,
-        inherited_identity_sha256=inherited_identity_sha256,
+        inherited_identity_sha256_by_row=inherited_identity_sha256_by_row,
     )
     if output_path.is_file():
         checkpoint = json.loads(output_path.read_text(encoding="utf-8"))
