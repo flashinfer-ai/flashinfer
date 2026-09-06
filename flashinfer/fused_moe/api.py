@@ -519,11 +519,11 @@ class TrtllmFp4Config:
 
 @dataclass(frozen=True)
 class CakeWarpDecodeConfig:
-    """Explicit Cake NVFP4 warp-decode backend for exact SM103.
+    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
 
-    This backend is intentionally narrow: it accepts only the two calibrated
-    expert geometries documented by :class:`CakeWarpDecodeRunner`, 1--32
-    tokens, unpacked precomputed routing, and the default SwiGLU semantics.
+    This backend is intentionally narrow: it accepts only the
+    activation-qualified expert geometries documented by
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
     It is never part of the default backend list; users opt in with
     ``CakeWarpDecodeConfig(backend="cake")``.
 
@@ -542,7 +542,7 @@ class CakeWarpDecodeConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 103
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
@@ -568,16 +568,23 @@ class CakeWarpDecodeConfig:
                 "Cake warp decode weight preparation requires "
                 f"QuantVariant.NVFP4, got {variant!r}."
             )
-        if activation is not None and activation != SwiGLU():
-            raise ValueError(
-                "Cake warp decode weight preparation supports only default SwiGLU()."
-            )
+        activation = SwiGLU() if activation is None else activation
         geometry = (hidden_size, intermediate_size, num_local_experts)
-        if geometry not in ((2048, 512, 512), (2048, 1536, 60)):
+        supported = (
+            (SwiGLU(), (2048, 512, 512)),
+            (SwiGLU(), (2048, 1536, 60)),
+            (SiLU(), (6144, 1536, 192)),
+        )
+        if not any(
+            activation == supported_activation and geometry == supported_geometry
+            for supported_activation, supported_geometry in supported
+        ):
             raise ValueError(
-                "Cake warp decode supports only (hidden_size, intermediate_size, "
-                "num_local_experts) = (2048, 512, 512) or (2048, 1536, 60); "
-                f"got {geometry}."
+                "Cake warp decode weight preparation supports only default "
+                "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
+                "= (2048, 512, 512) or (2048, 1536, 60), and SiLU() with "
+                "(6144, 1536, 192); got "
+                f"activation={activation!r}, geometry={geometry}."
             )
         return TrtllmFp4Config.prepare_weights(
             w1_bf16,
@@ -586,7 +593,7 @@ class CakeWarpDecodeConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation=SwiGLU(),
+            activation=activation,
             device=device,
             permute_cache=permute_cache,
         )
