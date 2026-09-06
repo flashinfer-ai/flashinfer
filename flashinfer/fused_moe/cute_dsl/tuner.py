@@ -739,9 +739,27 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
 
             if _is_rubin_tactic(tactic):
-                # The Rubin (SM107) kernels only implement the gated (SwiGLU)
-                # activation path; skip Rubin tactics for non-gated activations.
-                if not gated:
+                # SM107 currently supports standard SwiGLU and non-gated
+                # ReLU^2. Other gated formulas remain unsupported on SM107.
+                if self.activation_type not in (
+                    ActivationType.Swiglu,
+                    ActivationType.Relu2,
+                ):
+                    return False
+                if self.activation_type == ActivationType.Swiglu and (
+                    (
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
+                    )
+                    != (
+                        DEFAULT_SWIGLU_ALPHA,
+                        DEFAULT_SWIGLU_BETA,
+                        DEFAULT_SWIGLU_LIMIT,
+                    )
+                    or self.situ_beta is not None
+                    or self.situ_linear_beta is not None
+                ):
                     return False
 
                 # The SM107 kernels need cutlass.utils.rubin_helpers, which only
@@ -778,7 +796,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     mma_tiler=gemm1_mma_tiler,
                     cluster_shape_mn=gemm1_cluster_shape_mn,
                     m=permuted_m,
-                    n=2 * intermediate_size,
+                    n=gemm1_n,
                     k=hidden_size,
                     l=num_local_experts,
                     a_major="k",

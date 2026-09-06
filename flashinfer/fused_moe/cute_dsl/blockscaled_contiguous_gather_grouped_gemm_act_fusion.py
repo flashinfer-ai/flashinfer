@@ -322,23 +322,29 @@ def _get_compiled_gather_kernel(
 
     if cache_key not in _gather_kernel_cache:
         if is_rubin:
-            # The Rubin (SM107) kernel currently only implements the gated
-            # (SwiGLU) activation path with the default SwiGLU constants.
-            if normalized_activation_type != ActivationType.Swiglu:
+            # SM107 currently supports standard SwiGLU and non-gated ReLU^2.
+            if normalized_activation_type not in (
+                ActivationType.Swiglu,
+                ActivationType.Relu2,
+            ):
                 raise NotImplementedError(
                     f"activation_type {normalized_activation_type!r} is not supported by "
                     "the Rubin (SM107) gather grouped GEMM kernel yet "
-                    "(SwiGLU only)."
+                    "(supported: SwiGLU and ReLU2)."
                 )
-            if (swiglu_alpha, swiglu_beta, swiglu_limit) != (
-                DEFAULT_SWIGLU_ALPHA,
-                DEFAULT_SWIGLU_BETA,
-                DEFAULT_SWIGLU_LIMIT,
+            if normalized_activation_type == ActivationType.Swiglu and (
+                (swiglu_alpha, swiglu_beta, swiglu_limit)
+                != (
+                    DEFAULT_SWIGLU_ALPHA,
+                    DEFAULT_SWIGLU_BETA,
+                    DEFAULT_SWIGLU_LIMIT,
+                )
+                or situ_beta is not None
+                or situ_linear_beta is not None
             ):
                 raise NotImplementedError(
-                    "Custom swiglu_alpha/swiglu_beta/swiglu_limit are not "
-                    "supported by the Rubin (SM107) gather grouped GEMM "
-                    "kernel yet."
+                    "Parameterized SwiGLU and SiTU are not supported by the "
+                    "Rubin (SM107) gather grouped GEMM kernel yet."
                 )
             if use_a_per_token_scale:
                 raise NotImplementedError(
@@ -356,6 +362,7 @@ def _get_compiled_gather_kernel(
                 topk=topk,
                 raster_along_m=raster_along_m,
                 enable_pdl=enable_pdl,
+                gated=gated,
             )
         else:
             # Create kernel instance
