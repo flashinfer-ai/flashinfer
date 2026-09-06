@@ -1226,6 +1226,11 @@ def _load_full_domain_inheritance(
         name = item["variant_name"]
         current_variant = current_variants.get(name)
         predecessor_variant = predecessor_variants.get(name)
+        predecessor_slot_offset_bits = (
+            predecessor_variant.get("slot_offset_bits", 32)
+            if predecessor_variant is not None
+            else None
+        )
         if (
             not isinstance(name, str)
             or current_variant is None
@@ -1236,7 +1241,9 @@ def _load_full_domain_inheritance(
             != item["current_source_sha256"]
             or item["current_source_sha256"]
             != current_variant.get("source_sha256")
-            or current_variant.get("slot_offset_bits") != 32
+            or predecessor_slot_offset_bits not in (32, 64)
+            or current_variant.get("slot_offset_bits")
+            != predecessor_slot_offset_bits
         ):
             raise RuntimeError(f"body equivalence failed for {name!r}")
         equivalent_variants.add(name)
@@ -1517,8 +1524,11 @@ def _run_full_domain_benchmark(args):
             f"({len(rows)}/{len(_FULL_DOMAIN_SHAPES)})",
             flush=True,
         )
-        if shape_index % 32 == 31:
-            gc.collect()
+        # CUDA Graph timing can leave cyclic Python objects holding graph-owned
+        # allocations until collection.  Release them after sealing each row so
+        # the largest tail shapes do not inherit every earlier row's live graph.
+        gc.collect()
+        torch.cuda.empty_cache()
         if args.max_new_rows is not None and new_rows >= args.max_new_rows:
             break
         if (
