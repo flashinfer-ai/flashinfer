@@ -1,0 +1,2462 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "head_dim": 128,
+    "convolution_width": 4,
+    "activation_dtype": "bfloat16",
+    "state_dtypes": [
+      "bfloat16",
+      "float32"
+    ],
+    "lower_bound": "runtime_negative_or_null",
+    "norm_eps": "runtime_nonnegative",
+    "supported_heads": [
+      12,
+      24,
+      32,
+      48,
+      96
+    ],
+    "kernel_abis": {
+      "standard": [
+        [
+          "buffer",
+          "x",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "weight",
+          "float32"
+        ],
+        [
+          "buffer",
+          "conv_state",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "raw_gate",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "raw_beta",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "A_log",
+          "float32"
+        ],
+        [
+          "buffer",
+          "dt_bias",
+          "float32"
+        ],
+        [
+          "buffer",
+          "state_indices",
+          "int32"
+        ],
+        [
+          "buffer",
+          "state",
+          "state_dtype"
+        ],
+        [
+          "buffer",
+          "output_gate",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "norm_weight",
+          "float32"
+        ],
+        [
+          "buffer",
+          "output",
+          "bfloat16"
+        ],
+        [
+          "parameter",
+          "x_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "conv_slot_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "beta_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "state_slot_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "output_gate_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "H",
+          "int32"
+        ],
+        [
+          "parameter",
+          "use_lower_bound",
+          "int32"
+        ],
+        [
+          "parameter",
+          "lower_bound_log2",
+          "float32_scalar"
+        ],
+        [
+          "parameter",
+          "norm_eps",
+          "float32_scalar"
+        ]
+      ],
+      "repeated_safe": [
+        [
+          "buffer",
+          "x",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "weight",
+          "float32"
+        ],
+        [
+          "buffer",
+          "conv_state",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "raw_gate",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "raw_beta",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "A_log",
+          "float32"
+        ],
+        [
+          "buffer",
+          "dt_bias",
+          "float32"
+        ],
+        [
+          "buffer",
+          "state_indices",
+          "int32"
+        ],
+        [
+          "buffer",
+          "state",
+          "state_dtype"
+        ],
+        [
+          "buffer",
+          "output_gate",
+          "bfloat16"
+        ],
+        [
+          "buffer",
+          "norm_weight",
+          "float32"
+        ],
+        [
+          "buffer",
+          "output",
+          "bfloat16"
+        ],
+        [
+          "parameter",
+          "x_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "conv_slot_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "beta_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "state_slot_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "output_gate_row_stride",
+          "int32"
+        ],
+        [
+          "parameter",
+          "H",
+          "int32"
+        ],
+        [
+          "parameter",
+          "rows",
+          "int32"
+        ],
+        [
+          "parameter",
+          "use_lower_bound",
+          "int32"
+        ],
+        [
+          "parameter",
+          "lower_bound_log2",
+          "float32_scalar"
+        ],
+        [
+          "parameter",
+          "norm_eps",
+          "float32_scalar"
+        ]
+      ]
+    }
+  },
+  "status": "complete",
+  "variants": [
+    {
+      "name": "repeated_safe_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_repeated_safe_f32.cu",
+      "source_sha256": "a0a3225a03d0af4ac88268e155a8dac927cc30743e22c3e3e42d070bdfb7e97d",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "repeated_safe",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "repeated_safe_bf16",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_repeated_safe_bf16.cu",
+      "source_sha256": "069c136ee9523aa6e43270b39a406ac97284cdd22ef543c78f94b20adc2f5f25",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "repeated_safe",
+      "state_dtype": "bfloat16",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": null,
+          "slot_classes": [
+            "repeated_positive"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "wide512_positive_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_wide512_positive_f32.cu",
+      "source_sha256": "969183016ec7a5e6fa6ebf11976277dc7e4fccae9919cd3b46eca059e1d41803",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 512,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 1,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "wide512_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_wide512_f32.cu",
+      "source_sha256": "c733d6171dc5071c036de5d74ecc42043b0444268e6d0c2c264ef37ec38cd8c4",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 512,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 1,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "wide512_bf16",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_wide512_bf16.cu",
+      "source_sha256": "d58876b2e0ba9ac50ce13fe664536ebb20650339921ba383334f4e40f1d418b2",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "bfloat16",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 512,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 1,
+          "maximum_rows": 1,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "compact_async_pr_eval_h96_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_compact_async_pr_eval_h96_f32.cu",
+      "source_sha256": "80bf5b3d85ea067a5a1f8b0c866bb5b3c6cafbeed9cb5a31e4c567dad25467fd",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 36480
+      },
+      "eligibility": [
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 36881,
+            "conv_slot_stride": 3256320,
+            "beta_row_stride": 97,
+            "state_slot_stride": 1628160,
+            "output_gate_row_stride": 12295
+          }
+        }
+      ]
+    },
+    {
+      "name": "compact_async_positive_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_compact_async_positive_f32.cu",
+      "source_sha256": "ea6c87d5c780e6015c5a1e53a27f84ade1c5437ca68645e8776504758e82a3c1",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 36480
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": 37,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 18,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 13,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "compact_async_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_compact_async_f32.cu",
+      "source_sha256": "ac12ff1303353123706b64cce14f624930309bec0c67383be0f7a6e85b105fed",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 36480
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": 37,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 18,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 13,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "compact_async_bf16",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_compact_async_bf16.cu",
+      "source_sha256": "50dd9639ef39e45558b0025409a4affe92c4430f728d9f24c2f4ee76ab17cfae",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "bfloat16",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 36480
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": 37,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 18,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 13,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 4,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_h96_pr_strides_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_h96_pr_strides_f32.cu",
+      "source_sha256": "aca6f26a5c45ac004b42d8ea4f63c2017e53e7b0972bd80bed6767b2515c9de9",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": 36881,
+            "conv_slot_stride": 3256320,
+            "beta_row_stride": 97,
+            "state_slot_stride": 1628160,
+            "output_gate_row_stride": 12295
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_h96_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_h96_f32.cu",
+      "source_sha256": "5fd44d07e3775ec705fd2384a24505ca03d2fce9b18b44302fbe72f77e555326",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_pr_eval_h12_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_pr_eval_h12_f32.cu",
+      "source_sha256": "9795655724cd583447274f3bca67900c5483e4e591677c17b1b5287b5dd3f53d",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 99,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 4625,
+            "conv_slot_stride": 407040,
+            "beta_row_stride": 13,
+            "state_slot_stride": 203520,
+            "output_gate_row_stride": 1543
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_pr_eval_h24_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_pr_eval_h24_f32.cu",
+      "source_sha256": "1755132c758517ad0b2a7f0966a81ed0613cbff7e8db36f025f36cedb356e9a7",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 50,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 9233,
+            "conv_slot_stride": 814080,
+            "beta_row_stride": 25,
+            "state_slot_stride": 407040,
+            "output_gate_row_stride": 3079
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_pr_eval_h32_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_pr_eval_h32_f32.cu",
+      "source_sha256": "d7f689640f0589d67af0bbead8e67edd84ebcbf218817ce7c6a30226f124ba8a",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 32,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 12305,
+            "conv_slot_stride": 1085440,
+            "beta_row_stride": 33,
+            "state_slot_stride": 542720,
+            "output_gate_row_stride": 4103
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_pr_eval_h48_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_pr_eval_h48_f32.cu",
+      "source_sha256": "40836e73ab6a9f3269f79f35c0a162bf95fac79c49a25f00d12c613ab9d8a22d",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 18449,
+            "conv_slot_stride": 1628160,
+            "beta_row_stride": 49,
+            "state_slot_stride": 814080,
+            "output_gate_row_stride": 6151
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_positive_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_positive_f32.cu",
+      "source_sha256": "d8da430842956fd5cb2bc0a21668d6af20663cc11ca92e957937739b7e169859",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 99,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 50,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 32,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_f32.cu",
+      "source_sha256": "b768d6941e6fb16efee2f965bb978095c577440c93427954993ae3339498bfbf",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 28288
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 99,
+          "maximum_rows": null,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 50,
+          "maximum_rows": null,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 32,
+          "maximum_rows": null,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": null,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": null,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "high_work_bf16",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_high_work_bf16.cu",
+      "source_sha256": "d59e1b95bb2b41c222cfa494861e7eebf06849856ae07decb30af4fd6afc1ed1",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "bfloat16",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 20096
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 99,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 50,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 32,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 25,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": null,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "pr_eval_h32_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_pr_eval_h32_f32.cu",
+      "source_sha256": "29170f24f3ded9d1ae9d29053880c1f8c3cdd6d01003a408477ef8eb8c15a949",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 12305,
+            "conv_slot_stride": 1085440,
+            "beta_row_stride": 33,
+            "state_slot_stride": 542720,
+            "output_gate_row_stride": 4103
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 14,
+          "maximum_rows": 31,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": [
+            -5.0
+          ],
+          "norm_eps_values": [
+            1e-05
+          ],
+          "strides": {
+            "x_row_stride": 12305,
+            "conv_slot_stride": 1085440,
+            "beta_row_stride": 33,
+            "state_slot_stride": 542720,
+            "output_gate_row_stride": 4103
+          }
+        }
+      ]
+    },
+    {
+      "name": "direct_positive_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_direct_positive_f32.cu",
+      "source_sha256": "a9a8cd33fd3e41c35a986c57c941ea29086ab20a48bc87c8a3621039c9f3ae05",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 38,
+          "maximum_rows": 98,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 14,
+          "maximum_rows": 31,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 2,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "direct_f32",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_direct_f32.cu",
+      "source_sha256": "c14c478c09d6c51968766ae92de356520e2383cbf99a5ce503e69c64c2df04b3",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "float32",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 38,
+          "maximum_rows": 98,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 19,
+          "maximum_rows": 49,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 14,
+          "maximum_rows": 31,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 2,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 19,
+          "maximum_rows": 49,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "direct_bf16",
+      "target": "sm100a",
+      "body": "fused_kda_decode_generated_direct_bf16.cu",
+      "source_sha256": "75e55f8b35a7d4c64a624d8755607f5e5944efc2df01c6315322247291dd803b",
+      "kernel_symbol": "kernel_kernel",
+      "abi_kind": "standard",
+      "state_dtype": "bfloat16",
+      "extra_cuda_cflags": [
+        "--use_fast_math"
+      ],
+      "launch": {
+        "threads": 256,
+        "dynamic_smem_bytes": 3712
+      },
+      "eligibility": [
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 13,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            12
+          ],
+          "minimum_rows": 38,
+          "maximum_rows": 98,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 7,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            24
+          ],
+          "minimum_rows": 19,
+          "maximum_rows": 49,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 9,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            32
+          ],
+          "minimum_rows": 14,
+          "maximum_rows": 31,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 4,
+          "maximum_rows": 6,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            48
+          ],
+          "minimum_rows": 10,
+          "maximum_rows": 24,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 2,
+          "maximum_rows": 3,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        },
+        {
+          "heads": [
+            96
+          ],
+          "minimum_rows": 5,
+          "maximum_rows": 12,
+          "slot_classes": [
+            "positive_unique",
+            "unique_or_null"
+          ],
+          "lower_bound_values": "any",
+          "norm_eps_values": "any",
+          "strides": {
+            "x_row_stride": null,
+            "conv_slot_stride": null,
+            "beta_row_stride": null,
+            "state_slot_stride": null,
+            "output_gate_row_stride": null
+          }
+        }
+      ]
+    }
+  ],
+  "remaining_generated_inputs": []
+}

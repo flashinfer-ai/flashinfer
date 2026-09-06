@@ -54,6 +54,7 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
+        files: ^(?!csrc/kda/fused_kda_decode_generated_.*\.cu$).*
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break parity with their producer manifests.
         exclude: |
