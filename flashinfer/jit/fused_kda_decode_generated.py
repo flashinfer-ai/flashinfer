@@ -813,9 +813,7 @@ def select_fused_kda_decode_generated_variant(
         64
         if (
             (num_slots - 1) * conv_slot_stride + 3 * qkv_size - 1 > 2**31 - 1
-            or (num_slots - 1) * state_slot_stride
-            + num_heads * 128 * 128
-            - 1
+            or (num_slots - 1) * state_slot_stride + num_heads * 128 * 128 - 1
             > 2**31 - 1
         )
         else 32
