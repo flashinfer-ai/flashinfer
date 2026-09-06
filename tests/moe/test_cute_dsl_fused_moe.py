@@ -2176,8 +2176,12 @@ class TestCuteDslMoEWrapper:
     )
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
     def test_wrapper_cuda_graph(
         self,
+        activation_type: ActivationType,
         num_tokens: int,
         num_experts: int,
         quant_mode: str,
@@ -2185,7 +2189,7 @@ class TestCuteDslMoEWrapper:
         use_fused_finalize: bool,
     ):
         """Test wrapper API with CUDA graph capture and replay."""
-        if is_sm107():
+        if is_sm107() and activation_type == ActivationType.Swiglu:
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
                 "SwiGLU constants (swiglu_alpha/beta/limit)"
@@ -2194,6 +2198,7 @@ class TestCuteDslMoEWrapper:
 
         hidden_size, intermediate_size = 256, 512
         top_k = 2
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -2202,6 +2207,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=gated,
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
@@ -2216,7 +2222,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=num_tokens,
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -2291,7 +2297,7 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -3060,6 +3066,9 @@ class TestAllValidTactics:
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    @pytest.mark.parametrize(
         "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
         [
             (128, 256, 512, 256, 2),
@@ -3068,6 +3077,7 @@ class TestAllValidTactics:
     )
     def test_all_tactics_accuracy(
         self,
+        activation_type: ActivationType,
         num_tokens: int,
         hidden_size: int,
         intermediate_size: int,
@@ -3078,6 +3088,7 @@ class TestAllValidTactics:
         from flashinfer import CuteDslMoEWrapper
 
         num_local_experts = num_experts
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -3086,6 +3097,7 @@ class TestAllValidTactics:
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         ref_output = compute_reference_moe_fp4(
@@ -3102,6 +3114,7 @@ class TestAllValidTactics:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            activation_type=activation_type,
         )
 
         # Create wrapper without CUDA graph so we can freely try different tile_sizes
@@ -3111,6 +3124,7 @@ class TestAllValidTactics:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            activation_type=activation_type,
         )
 
         # Get the filtered list of valid tactics for this problem size
