@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
 
-from flashinfer.comm import all_gather_matmul
+from flashinfer.comm import all_gather_matmul, prepare_all_gather_matmul
 from flashinfer.utils import get_compute_capability
 
 
@@ -34,6 +34,45 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     gathered = torch.empty(world_size * rows, 8192, dtype=dtype, device=device)
     dist.all_gather_into_tensor(gathered, inp, group=group)
     expected = gathered @ weight
+
+    if (
+        world_size == 8
+        and dtype == torch.bfloat16
+        and get_compute_capability(device) == (10, 3)
+    ):
+        packed_weight = torch.randn(8192, 1280, dtype=dtype, device=device)
+        active_inp = symm_mem.empty(rows, 8192, dtype=dtype, device=device).normal_()
+        packed_gathered = torch.empty(
+            world_size * rows, 8192, dtype=dtype, device=device
+        )
+        dist.all_gather_into_tensor(packed_gathered, active_inp, group=group)
+        packed_expected = packed_gathered @ packed_weight
+        packed_launcher = prepare_all_gather_matmul(
+            inp, packed_weight, group, backend="cake"
+        )
+        packed_stream = torch.cuda.Stream(device=device)
+        packed_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(packed_stream):
+            packed_first = packed_launcher(active_inp)
+            packed_first_snapshot = packed_first.clone()
+            packed_second = packed_launcher(active_inp)
+        torch.cuda.current_stream(device).wait_stream(packed_stream)
+        assert packed_first.data_ptr() != packed_second.data_ptr()
+        torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
+        torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(packed_second, packed_expected, atol=1e-2, rtol=1e-2)
+        del (
+            active_inp,
+            packed_expected,
+            packed_first,
+            packed_first_snapshot,
+            packed_gathered,
+            packed_launcher,
+            packed_second,
+            packed_stream,
+            packed_weight,
+        )
+
     first = all_gather_matmul(inp, weight, group, backend="cake")
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
     first_snapshot = first.clone()
@@ -168,8 +207,8 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
 
 
 @pytest.mark.skipif(
-    torch.cuda.device_count() not in (2, 4),
-    reason="Cake all-gather matmul e2e requires exactly two or four visible GPUs",
+    torch.cuda.device_count() not in (2, 4, 8),
+    reason="Cake all-gather matmul e2e requires exactly two, four, or eight visible GPUs",
 )
 @pytest.mark.skipif(
     torch.cuda.device_count() == 0

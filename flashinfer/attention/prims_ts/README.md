@@ -22,16 +22,39 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
-For `BlockSparsePagedTSWrapper`, `plan` freezes the logical fixed-Q geometry
-and copies the paged-KV row offsets and optional per-request K/V lengths into
-plan-owned storage. When lengths are provided, the scalar K/V length is the
-static maximum; each page-table row may contain spare entries beyond its live
-length. `run` consumes live physical page IDs and per-KV-head sparse routes,
-and every selected BSR block must start before that request's frozen live K
-length. A violating sorted row fails closed. Eager
-launches retain all launch tensors on the run stream; CUDA Graph users must
-keep the wrapper and Q/cache/output/runtime-metadata tensors alive and
-unmodified until replay completes.
+For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
+geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
+request metadata. Every `run` reads live paged-KV row offsets, physical page
+IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
+bits from device tensors. The physical-page ID tensor is capacity: its live
+prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
+The caller owns every live value contract: dense K/V lengths must be in
+`[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
+`paged_kv_indptr` must start at zero and contain bounded, monotone rows with at
+least `ceil(seq_lens_kv[b] / page_size)` entries; every physical page ID in
+the live prefix ending at `paged_kv_indptr[-1]` must lie in `[0, P)`. Every BSR
+row must have bounded offsets, strictly increasing unique block IDs, and at
+most the planned `max_blocks_per_row` entries. Contiguous IDs must lie below
+`ceil(seq_len_kv / kv_block_size)`; paged IDs must start below the owning
+request's live K/V length.
+
+Reusable wrappers validate tensor structure but read values directly without
+host synchronization. Invalid values therefore have undefined behavior and
+may access out of bounds. Set `CUTE_DSL_ENABLE_ASSERTIONS=1` before the process
+first compiles these kernels to diagnose violations encountered while preparing
+selected routes; such assertions report asynchronously and leave the CUDA
+context unusable. The one-shot APIs instead synchronize once to validate all
+live values, including the complete physical-page-ID prefix, before creating
+their temporary plans and cannot run during CUDA Graph capture.
+
+The one-shot `block_sparse_attention_with_paged_kv_cache` API takes
+`max_seq_len_kv` as the static capacity and requires `seq_lens_kv` with the
+live per-request logical lengths. Paged PrimTS does not support packed or
+mixed/variable Q lengths.
+Eager launches retain all launch tensors on the run stream; CUDA Graph users
+must keep the wrapper and Q/cache/output/runtime-metadata tensors alive and
+unmodified until replay completes. Values may change between completed replays
+while tensor addresses, shapes, dtypes, and strides remain stable.
 
 Qualified Q64/coarse-KV profiles retain KV256 routes for page sizes 64 and
 128. Optional `kv_valid_bits` is a `torch.uint32` per-request bitset with shape

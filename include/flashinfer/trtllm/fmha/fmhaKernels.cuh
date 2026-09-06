@@ -794,10 +794,11 @@ class TllmGenFmhaKernel {
                                        SelectKernelParams& selectKernelParams) const {
     // numHeadsQ <= 32 : SwapsMmaAbForGeneration
     //   Non-power-of-two head counts use one padded Q8/Q16/Q32 tile. Power-of-two head counts use
-    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 or numHeadsQPerKv at batch>=2.
-    //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
-    //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
-    //     full tileSizeQ wins by 2-11% at batch>=2.
+    //   tileSizeQ = numHeadsQPerKv/2 for short queries at batch=1, otherwise numHeadsQPerKv.
+    //   Threshold: maxSeqLenQ <= 16 and batchSize * maxNumCtasPerSeqKv <= MP/8
+    //   (crossover at batch=1->2 on B200).
+    //   Short-query benchmarks (seqLenKv=8192, topK=2048): half tileSizeQ wins by 2-6% at
+    //     batch=1; full tileSizeQ wins by 2-11% at batch>=2.
     // numHeadsQ > 32 : KeepsMmaAbForGeneration, tileSizeQ = 64
     //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
     //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
@@ -814,8 +815,10 @@ class TllmGenFmhaKernel {
       // mMultiCtasKvMode defaults to GmemReduction from the constructor. computeCtaAndClusterConfig
       // may upgrade it to CgaSmemReduction; that update is preserved naturally across
       // re-selections. The base tileSizeQ is numHeadsQPerKv (one CTA covers all Q heads per token).
-      // At batch=1 the GPU is under-utilized, so we halve tileSizeQ to create 2x more
-      // head-splitting CTAs. Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8.
+      // At batch=1 short queries under-utilize the GPU, so halve tileSizeQ to create 2x more
+      // head-splitting CTAs. Long-query prefill already has Q-axis parallelism; halving the tile
+      // duplicates the KV loads for each token.
+      // Threshold: maxSeqLenQ <= 16 and batchSize * maxNumCtasPerSeqKv <= MP/8.
       //   effectiveSeqLenKv = min(seqLen, topK) = 2048 -> maxNumCtasPerSeqKv = 16.
       //   Condition: batchSize * 16 <= MP/8 -> batchSize <= 1 (crossover at batch=1->2).
       // Only halve when half tileSizeQ >= 8 (no valid SwapsMmaAb kernel below tileSizeQ=8).
@@ -824,8 +827,10 @@ class TllmGenFmhaKernel {
       int const effectiveSeqLenKv = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
       int const maxNumCtasPerSeqKv =
           flashinfer::ceil_div(effectiveSeqLenKv, selectKernelParams.mTileSizeKv);
-      bool const useHalfTileSizeQ = halfTileSizeQ >= 8 && params.mBatchSize * maxNumCtasPerSeqKv <=
-                                                              params.mMultiProcessorCount / 8;
+      bool const useHalfTileSizeQ =
+          halfTileSizeQ >= 8 &&
+          params.mBatchSize * maxNumCtasPerSeqKv <= params.mMultiProcessorCount / 8 &&
+          params.mMaxSeqLenQ <= 16;
       tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
     } else {
       // numHeadsQ > 32: use KeepsMmaAbForGeneration.

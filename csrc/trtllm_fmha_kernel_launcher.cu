@@ -37,6 +37,65 @@ using tvm::ffi::Variant;
 
 namespace flashinfer {
 
+namespace {
+
+constexpr int32_t kDsv4SparseMlaSlidingWindowTopK = 128;
+
+__global__ void RemapDsv4SparseMlaIndicesKernel(int32_t const* input, int32_t* output,
+                                                int64_t num_indices, int32_t sparse_mla_top_k,
+                                                int32_t primary_page_size,
+                                                int64_t primary_page_coordinate_stride,
+                                                int32_t sliding_page_size,
+                                                int64_t sliding_page_coordinate_stride) {
+  for (int64_t offset = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       offset < num_indices; offset += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int32_t const index = input[offset];
+    if (index < 0) {
+      output[offset] = index;
+      continue;
+    }
+
+    bool const use_sliding_pool = offset % sparse_mla_top_k < kDsv4SparseMlaSlidingWindowTopK;
+    int32_t const page_size = use_sliding_pool ? sliding_page_size : primary_page_size;
+    int64_t const page_coordinate_stride =
+        use_sliding_pool ? sliding_page_coordinate_stride : primary_page_coordinate_stride;
+    int64_t const page = index / page_size;
+    int64_t const token = index % page_size;
+    output[offset] = static_cast<int32_t>(page * page_coordinate_stride + token);
+  }
+}
+
+struct Dsv4SparseMlaPoolLayout {
+  int32_t page_size;
+  int64_t page_coordinate_stride;
+  bool needs_index_remap;
+};
+
+Dsv4SparseMlaPoolLayout GetDsv4SparseMlaPoolLayout(char const* pool_name, int64_t num_pages,
+                                                   int64_t page_size, int64_t page_stride,
+                                                   int64_t token_stride, int64_t head_dim) {
+  TVM_FFI_ICHECK(num_pages > 0) << pool_name << " must contain at least one page";
+  TVM_FFI_ICHECK(page_size > 0 && page_size <= INT_MAX)
+      << pool_name << " page size must be in [1, INT_MAX]";
+  TVM_FFI_ICHECK(page_stride > 0) << pool_name << " page stride must be positive";
+  TVM_FFI_ICHECK_EQ(token_stride, head_dim)
+      << pool_name << " token stride must equal the head dimension";
+  TVM_FFI_ICHECK((page_stride % token_stride) == 0)
+      << pool_name << " page stride must be divisible by the token stride";
+
+  int64_t const page_coordinate_stride = page_stride / token_stride;
+  int64_t const max_coordinate = INT_MAX - 1;
+  if (num_pages > 1) {
+    TVM_FFI_ICHECK(page_coordinate_stride <= (max_coordinate - page_size + 1) / (num_pages - 1))
+        << pool_name << " encoded page coordinate exceeds int32 range";
+  }
+
+  return {static_cast<int32_t>(page_size), page_coordinate_stride,
+          page_coordinate_stride != page_size};
+}
+
+}  // namespace
+
 enum class TllmPagedAttentionMode {
   Context,
   ForGen,
@@ -909,8 +968,9 @@ void trtllm_ragged_attention(
 void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView out, TensorView query, TensorView primary_kv_cache,
     TensorView sliding_window_kv_cache, TensorView workspace_buffer,
-    TensorView multi_ctas_kv_counter_buffer, TensorView sparse_indices, TensorView seq_lens,
-    TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
+    TensorView multi_ctas_kv_counter_buffer, TensorView sparse_indices,
+    TensorView remapped_sparse_indices, bool sparse_indices_are_storage_offsets,
+    TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q) {
@@ -925,6 +985,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       << "sliding_window_kv_cache must have HND shape [pages, heads, page_size, D]";
   TVM_FFI_ICHECK_EQ(sparse_indices.ndim(), 2)
       << "sparse_indices must have flattened shape [sumQ, topK]";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.ndim(), 2)
+      << "remapped_sparse_indices must have flattened shape [sumQ, topK]";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1);
   TVM_FFI_ICHECK_EQ(sparse_mla_top_k_lens.ndim(), 1)
       << "sparse_mla_top_k_lens must have flattened shape [sumQ]";
@@ -948,6 +1010,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       << "sliding_window_kv_cache must have one KV head";
   TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(sparse_indices.size(0), sum_seq_q);
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.size(0), sum_seq_q);
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.size(1), sparse_indices.size(1));
   TVM_FFI_ICHECK_EQ(sparse_mla_top_k_lens.size(0), sum_seq_q);
   if (is_varlen_q) {
     TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().ndim(), 1);
@@ -973,16 +1037,73 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   TVM_FFI_ICHECK_EQ(head_dim_o, 512);
 
   int const sparse_mla_top_k = sparse_indices.size(-1);
+  TVM_FFI_ICHECK(sparse_mla_top_k >= kDsv4SparseMlaSlidingWindowTopK)
+      << "sparse topK must include 128 sliding-window entries";
   TVM_FFI_ICHECK((sparse_mla_top_k % 4) == 0) << "sparse topK must be a multiple of 4";
-  int const physical_page_size = primary_kv_cache.size(-2);
+  TVM_FFI_ICHECK_EQ(sparse_indices.dtype(), dl_int32) << "sparse_indices must be int32";
+  TVM_FFI_ICHECK(sparse_indices.IsContiguous()) << "sparse_indices must be contiguous";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.dtype(), dl_int32)
+      << "remapped_sparse_indices must be int32";
+  TVM_FFI_ICHECK(remapped_sparse_indices.IsContiguous())
+      << "remapped_sparse_indices must be contiguous";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.device().device_type, query.device().device_type)
+      << "remapped_sparse_indices must be on the same device as query";
+  TVM_FFI_ICHECK_EQ(remapped_sparse_indices.device().device_id, query.device().device_id)
+      << "remapped_sparse_indices must be on the same device as query";
+  TVM_FFI_ICHECK_EQ(primary_kv_cache.stride(-1), 1)
+      << "primary_kv_cache head dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(sliding_window_kv_cache.stride(-1), 1)
+      << "sliding_window_kv_cache head dimension must be contiguous";
+  TVM_FFI_ICHECK(reinterpret_cast<std::uintptr_t>(primary_kv_cache.data_ptr()) % 16 == 0)
+      << "primary_kv_cache must be 16-byte aligned for TMA";
+  TVM_FFI_ICHECK(reinterpret_cast<std::uintptr_t>(sliding_window_kv_cache.data_ptr()) % 16 == 0)
+      << "sliding_window_kv_cache must be 16-byte aligned for TMA";
+
   int const sparse_page_size = 1;
   int const stride_idx_factor = is_4bit(kv_data_type) ? 2 : 1;
+  TVM_FFI_ICHECK(primary_kv_cache.stride(0) <=
+                 std::numeric_limits<int64_t>::max() / stride_idx_factor);
+  TVM_FFI_ICHECK(primary_kv_cache.stride(-2) <=
+                 std::numeric_limits<int64_t>::max() / stride_idx_factor);
+  TVM_FFI_ICHECK(sliding_window_kv_cache.stride(0) <=
+                 std::numeric_limits<int64_t>::max() / stride_idx_factor);
+  TVM_FFI_ICHECK(sliding_window_kv_cache.stride(-2) <=
+                 std::numeric_limits<int64_t>::max() / stride_idx_factor);
+  auto const primary_layout = GetDsv4SparseMlaPoolLayout(
+      "primary_kv_cache", primary_kv_cache.size(0), primary_kv_cache.size(-2),
+      primary_kv_cache.stride(0) * stride_idx_factor,
+      primary_kv_cache.stride(-2) * stride_idx_factor, head_dim_k);
+  auto const sliding_layout = GetDsv4SparseMlaPoolLayout(
+      "sliding_window_kv_cache", sliding_window_kv_cache.size(0), sliding_window_kv_cache.size(-2),
+      sliding_window_kv_cache.stride(0) * stride_idx_factor,
+      sliding_window_kv_cache.stride(-2) * stride_idx_factor, head_dim_sw);
+
   int const kv_stride_keys_values = primary_kv_cache.stride(-2) * stride_idx_factor;
   int const kv_stride_heads = primary_kv_cache.stride(-3) * stride_idx_factor;
   int const sparse_kv_stride_batch = kv_stride_keys_values;
   int const q_stride_tokens = query.stride(0);
   int const q_stride_heads = query.stride(1);
-  int const sparse_num_pages_in_mem_pool = primary_kv_cache.size(0) * physical_page_size;
+  int const sparse_num_pages_in_mem_pool = primary_kv_cache.size(0) * primary_kv_cache.size(-2);
+
+  int* sparse_indices_ptr = static_cast<int*>(sparse_indices.data_ptr());
+  bool const needs_index_remap =
+      !sparse_indices_are_storage_offsets &&
+      (primary_layout.needs_index_remap || sliding_layout.needs_index_remap);
+  auto const stream = get_stream(query.device());
+  if (needs_index_remap && sparse_indices.numel() > 0) {
+    int64_t const num_sparse_indices = sparse_indices.numel();
+    sparse_indices_ptr = static_cast<int*>(remapped_sparse_indices.data_ptr());
+
+    constexpr int32_t threads = 256;
+    int32_t const blocks = static_cast<int32_t>(
+        std::min<int64_t>(ceil_div(num_sparse_indices, static_cast<int64_t>(threads)), 65535));
+    RemapDsv4SparseMlaIndicesKernel<<<blocks, threads, 0, stream>>>(
+        static_cast<int32_t const*>(sparse_indices.data_ptr()), sparse_indices_ptr,
+        num_sparse_indices, sparse_mla_top_k, primary_layout.page_size,
+        primary_layout.page_coordinate_stride, sliding_layout.page_size,
+        sliding_layout.page_coordinate_stride);
+    FLASHINFER_CUDA_CHECK(cudaGetLastError());
+  }
 
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
@@ -1011,13 +1132,12 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  auto const stream = get_stream(query.device());
   trtllm_paged_attention_launcher(
       out.data_ptr(), /*out_scale_factor=*/nullptr, query.data_ptr(), primary_kv_cache.data_ptr(),
       primary_kv_cache.data_ptr(), workspace_buffer.data_ptr(),
       multi_ctas_kv_counter_buffer.data_ptr(),
       multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer),
-      static_cast<int*>(sparse_indices.data_ptr()), /*k_block_scales_ptr=*/nullptr,
+      sparse_indices_ptr, /*k_block_scales_ptr=*/nullptr,
       /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
       /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, /*lse=*/nullptr, q_data_type, kv_data_type,
       o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,

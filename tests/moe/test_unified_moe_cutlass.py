@@ -1148,6 +1148,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
             events.append("pack_inputs")
             return []
 
+        def launch_kwargs_for(self, inputs):
+            return {}
+
         def forward(self, inputs, tactic=-1):
             events.append("forward")
             return torch.empty(0)
