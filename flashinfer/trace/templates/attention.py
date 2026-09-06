@@ -2897,6 +2897,10 @@ def _trtllm_paged_attention_reference(
     bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
     bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
     cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
+    window_left = int(kwargs.get("window_left", -1))
+    window_right = int(kwargs.get("window_right", -1))
+    variable_window_token_starts = kwargs.get("variable_window_token_starts")
+    variable_window_token_ends = kwargs.get("variable_window_token_ends")
     batch_size = block_tables.shape[0]
     output = torch.zeros_like(query, dtype=torch.float32)
     for b in range(batch_size):
@@ -2927,13 +2931,30 @@ def _trtllm_paged_attention_reference(
                 torch.matmul(q_b[:, h], k_flat[:, kv_h].to(torch.float32).T)
                 * bmm1_scale
             )
-            if causal:
-                qi = q_end - q_start
-                delta = kv_len - qi
-                mask = torch.full_like(logits, float("-inf"))
-                for i in range(qi):
-                    mask[i, : i + 1 + max(0, delta)] = 0.0
-                logits = logits + mask
+            qi = q_end - q_start
+            q_positions = torch.arange(qi, device=query.device) + max(0, kv_len - qi)
+            k_positions = torch.arange(kv_len, device=query.device)
+            if variable_window_token_starts is not None:
+                visible = (
+                    k_positions[None, :]
+                    >= variable_window_token_starts[q_start:q_end, None]
+                ) & (
+                    k_positions[None, :]
+                    <= variable_window_token_ends[q_start:q_end, None]
+                )
+            else:
+                visible = torch.ones_like(logits, dtype=torch.bool)
+                if causal:
+                    visible &= k_positions[None, :] <= q_positions[:, None]
+                if window_left >= 0:
+                    visible &= k_positions[None, :] >= (
+                        q_positions[:, None] - window_left
+                    )
+                if window_right >= 0 and not causal:
+                    visible &= k_positions[None, :] <= (
+                        q_positions[:, None] + window_right
+                    )
+            logits = logits.masked_fill(~visible, -float("inf"))
             attn = torch.softmax(logits, dim=-1)
             output[q_start:q_end, h] = (
                 torch.matmul(attn, v_flat[:, kv_h].to(torch.float32)) * bmm2_scale
@@ -2973,15 +2994,18 @@ def _trtllm_batch_context_reference(
     cum_seq_lens_kv,
     **kwargs,
 ):
+    reference_kwargs = dict(kwargs)
+    causal = bool(reference_kwargs.pop("causal", True))
     return _trtllm_paged_attention_reference(
         query,
         kv_cache,
         block_tables,
         seq_lens,
-        causal=True,
+        causal=causal,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         cum_seq_lens_q=cum_seq_lens_q,
+        **reference_kwargs,
     )
 
 
@@ -3553,6 +3577,24 @@ trtllm_batch_context_trace = TraceTemplate(
             ["batch_size_plus_1_kv"],
             dtype="int32",
             description="Cumulative KV sequence lengths, shape batch_size + 1.",
+        ),
+        "window_left": Scalar(
+            "int32", optional=True, description="Left sliding-window reach."
+        ),
+        "window_right": Scalar(
+            "int32", optional=True, description="Right sliding-window reach."
+        ),
+        "variable_window_token_starts": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description="Inclusive K/V start for each packed query token.",
+        ),
+        "variable_window_token_ends": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description="Inclusive K/V end for each packed query token.",
         ),
     },
     outputs={
