@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 
 from flashinfer.autotuner import AutoTuner
 
@@ -283,35 +284,43 @@ def test_exception_path_does_not_deadlock_the_reduce(tmp_path):
     store_file = str(tmp_path / "gloo_rendezvous")
     world_size = 2
     procs = []
-    for rank in range(world_size):
-        env = dict(os.environ)
-        env.update(
-            RANK=str(rank), WORLD_SIZE=str(world_size), GLOO_STORE_FILE=store_file
-        )
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, "-c", _GLOO_WORKER_SRC],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+    deadline = time.monotonic() + 180
+    try:
+        for rank in range(world_size):
+            env = dict(os.environ)
+            env.update(
+                RANK=str(rank), WORLD_SIZE=str(world_size), GLOO_STORE_FILE=store_file
             )
-        )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _GLOO_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
 
-    outputs = {}
-    for rank, p in enumerate(procs):
-        try:
-            out, _ = p.communicate(timeout=180)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
-            raise AssertionError(
-                f"rank {rank} did not finish (possible reduce deadlock):\n{out}"
-            ) from None
-        outputs[rank] = out
-        assert p.returncode == 0, (
-            f"rank {rank} worker failed (exit {p.returncode}):\n{out}"
-        )
+        outputs = {}
+        for rank, p in enumerate(procs):
+            try:
+                out, _ = p.communicate(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out, _ = p.communicate()
+                raise AssertionError(
+                    f"rank {rank} did not finish (possible reduce deadlock):\n{out}"
+                ) from None
+            outputs[rank] = out
+            assert p.returncode == 0, (
+                f"rank {rank} worker failed (exit {p.returncode}):\n{out}"
+            )
+    finally:
+        for process in procs:
+            if process.poll() is None:
+                process.kill()
+        for process in procs:
+            process.communicate()
 
     # Both ranks reaching "OK reduced=inf" proves the failing rank did not skip
     # the reduce (else the peer would have hung and hit the timeout above).
@@ -383,33 +392,43 @@ def test_preparation_memory_error_falls_back_on_every_rank(tmp_path):
     """A rank-local preparation OOM produces one group-wide fallback."""
     store_file = str(tmp_path / "preparation_oom_rendezvous")
     procs = []
-    for rank in range(2):
-        env = dict(os.environ)
-        env.update(RANK=str(rank), WORLD_SIZE="2", GLOO_STORE_FILE=store_file)
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, "-c", _PREPARATION_OOM_WORKER_SRC],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+    deadline = time.monotonic() + 180
+    try:
+        for rank in range(2):
+            env = dict(os.environ)
+            env.update(RANK=str(rank), WORLD_SIZE="2", GLOO_STORE_FILE=store_file)
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _PREPARATION_OOM_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
             )
-        )
 
-    outputs = {}
-    for rank, process in enumerate(procs):
-        try:
-            output, _ = process.communicate(timeout=180)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            output, _ = process.communicate()
-            raise AssertionError(
-                f"rank {rank} timed out during preparation OOM synchronization:\n{output}"
-            ) from None
-        outputs[rank] = output
-        assert process.returncode == 0, (
-            f"rank {rank} worker failed (exit {process.returncode}):\n{output}"
-        )
+        outputs = {}
+        for rank, process in enumerate(procs):
+            try:
+                output, _ = process.communicate(
+                    timeout=max(0, deadline - time.monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                raise AssertionError(
+                    f"rank {rank} timed out during preparation OOM synchronization:\n{output}"
+                ) from None
+            outputs[rank] = output
+            assert process.returncode == 0, (
+                f"rank {rank} worker failed (exit {process.returncode}):\n{output}"
+            )
+    finally:
+        for process in procs:
+            if process.poll() is None:
+                process.kill()
+        for process in procs:
+            process.communicate()
 
     for rank in range(2):
         assert f"rank {rank}: fallback" in outputs[rank], (
