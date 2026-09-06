@@ -890,6 +890,9 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
         int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+        if (lane == 0) {
+            tmem_addr_storage[1] = tmem_addr_storage[0];
+        }
     }
 
     asm volatile("barrier.cluster.arrive.release.aligned;");
@@ -909,7 +912,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
     #define throttle_full_addr (mbar_base + 240)
     #define throttle_empty_addr (mbar_base + 264)
     #define drain_full_addr (mbar_base + 288)
-    const int taddr = tmem_addr_storage[0];
+    const int taddr = tmem_addr_storage[1];
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
@@ -1297,7 +1300,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             if (warp == 0) {
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                int _tmem_dealloc_addr = tmem_addr_storage[1];
                 asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
             }
         }
@@ -2145,6 +2148,9 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+        if (lane == 0) {
+            tmem_addr_storage[1] = tmem_addr_storage[0];
+        }
     }
 
     asm volatile("barrier.cluster.arrive.release.aligned;");
@@ -2164,7 +2170,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     #define throttle_full_addr (mbar_base + 240)
     #define throttle_empty_addr (mbar_base + 264)
     #define drain_full_addr (mbar_base + 288)
-    const int taddr = tmem_addr_storage[0];
+    const int taddr = tmem_addr_storage[1];
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
@@ -2580,7 +2586,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
             if (warp == 0) {
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                int _tmem_dealloc_addr = tmem_addr_storage[1];
                 asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(128));
             }
         }
