@@ -369,8 +369,15 @@ def gen_dcp_lse_reduce_module() -> JitSpec:
         flag.replace("compute_90a,code=sm_90a", "compute_90,code=sm_90")
         for flag in nvcc_flags
     ]
-    extra_includes = [pathlib.Path(path) for path in include_paths(device_type="cuda")]
-    extra_ldflags = [f"-L{path}" for path in library_paths(device_type="cuda")]
+    try:
+        cuda_include_paths = include_paths(device_type="cuda")
+        cuda_library_paths = library_paths(device_type="cuda")
+    except TypeError:
+        # PyTorch < 2.6 uses the legacy ``cuda`` boolean argument.
+        cuda_include_paths = include_paths(cuda=True)
+        cuda_library_paths = library_paths(cuda=True)
+    extra_includes = [pathlib.Path(path) for path in cuda_include_paths]
+    extra_ldflags = [f"-L{path}" for path in cuda_library_paths]
     nccl_ldflag = "-lnccl"
 
     nccl_home = os.environ.get("NCCL_HOME")

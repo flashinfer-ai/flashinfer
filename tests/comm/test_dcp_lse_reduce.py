@@ -143,10 +143,10 @@ def test_single_rank_reference_is_identity(dtype, is_lse_base_on_e):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_lse_base_on_e", [True, False])
 def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
-    torch.manual_seed(0)
     group = dist.group.WORLD
     cp_rank = dist.get_rank(group)
     cp_size = dist.get_world_size(group)
+    torch.manual_seed(cp_rank)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
@@ -196,6 +196,19 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
 
     assert actual.shape == (batch, local_heads, head_dim)
+
+    # The workspace uses two shared slots and must stay on one ordered stream.
+    other_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(other_stream):
+        with pytest.raises(RuntimeError, match="one ordered CUDA stream"):
+            decode_cp_a2a_lse_reduce(
+                partial_o,
+                partial_lse,
+                ws,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
 
     # Capture one invocation on every rank, then replay enough times to exercise
     # both slots and slot reuse inside a graph.

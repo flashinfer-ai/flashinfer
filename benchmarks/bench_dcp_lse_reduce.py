@@ -169,20 +169,20 @@ def _benchmark_case(
         launches_per_sample=launches_per_sample,
     )
 
-    graph_50 = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph_50):
+    graph_multi = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_multi):
         for _ in range(graph_launches_per_replay):
-            graph_50_output = decode_cp_a2a_lse_reduce(
+            graph_multi_output = decode_cp_a2a_lse_reduce(
                 partial_o,
                 partial_lse,
                 workspace,
                 cp_rank=rank,
                 cp_size=world_size,
             )
-    graph_50_us = [
+    graph_multi_us = [
         value / graph_launches_per_replay
         for value in _measure(
-            graph_50.replay,
+            graph_multi.replay,
             warmup=10,
             samples=samples,
             launches_per_sample=1,
@@ -201,10 +201,10 @@ def _benchmark_case(
     torch.testing.assert_close(
         eager_call(), nccl_baseline_call(), rtol=1e-2, atol=1e-3
     )
-    graph_50.replay()
+    graph_multi.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(
-        graph_50_output, nccl_baseline_call(), rtol=1e-2, atol=1e-3
+        graph_multi_output, nccl_baseline_call(), rtol=1e-2, atol=1e-3
     )
 
     result = {
@@ -219,7 +219,10 @@ def _benchmark_case(
             nccl_baseline_us, world_size
         ),
         "graph_max_rank_median_us": _max_rank_median(graph_us, world_size),
-        "graph_50_max_rank_median_us": _max_rank_median(graph_50_us, world_size),
+        "graph_launches_per_replay": graph_launches_per_replay,
+        "graph_multi_launch_max_rank_median_us": _max_rank_median(
+            graph_multi_us, world_size
+        ),
     }
     if rank == 0:
         print("DCP_LSE_BENCH " + json.dumps(result, sort_keys=True), flush=True)
@@ -233,6 +236,8 @@ def main() -> None:
     parser.add_argument("--launches-per-sample", type=int, default=50)
     parser.add_argument("--graph-launches-per-replay", type=int, default=50)
     args = parser.parse_args()
+    if args.graph_launches_per_replay <= 0:
+        parser.error("--graph-launches-per-replay must be greater than zero")
 
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)

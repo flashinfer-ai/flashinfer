@@ -22,7 +22,9 @@ does not call ``libnccl_longseq`` and does not use the Helix/MNNVL A2A kernel.
 """
 
 import functools
-from typing import Any, Dict, Optional, Tuple
+import weakref
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed._symmetric_memory as symm_mem
@@ -31,10 +33,54 @@ from ..api_logging import flashinfer_api
 from ..jit.comm import gen_dcp_lse_reduce_module
 from ..trace.templates.comm import decode_cp_a2a_lse_reduce_trace
 
+
+@dataclass
+class _WorkspaceState:
+    """Python-owned state associated with one symmetric-memory workspace."""
+
+    handle: Any
+    group_name: str
+    device: torch.device
+    stream_id: Optional[int] = None
+
+
 # Keep the rendezvous handle alive and remember the group name needed by the
 # C++ rendezvous lookup. The public hot-path signature remains the issue-4575
 # signature: callers pass only the workspace tensor, rank, and size.
-_workspace_keepalive: Dict[int, Tuple[Any, str]] = {}
+_workspace_keepalive: Dict[int, _WorkspaceState] = {}
+
+
+def _release_workspace(data_ptr: int, state: _WorkspaceState) -> None:
+    """Release workspace state after its queued CUDA work has completed."""
+    if _workspace_keepalive.get(data_ptr) is not state:
+        return
+    try:
+        torch.cuda.synchronize(state.device)
+    except (AttributeError, RuntimeError):
+        # Finalizers may run while CUDA is shutting down. Removing the matching
+        # entry still avoids retaining a stale rendezvous handle indefinitely.
+        pass
+    finally:
+        if _workspace_keepalive.get(data_ptr) is state:
+            del _workspace_keepalive[data_ptr]
+
+
+def _get_workspace_state(workspace: torch.Tensor) -> _WorkspaceState:
+    state = _workspace_keepalive.get(workspace.data_ptr())
+    if state is None:
+        raise ValueError(
+            "workspace was not created by decode_cp_a2a_lse_reduce_create_workspace"
+        )
+
+    stream_id = int(torch.cuda.current_stream(workspace.device).cuda_stream)
+    if state.stream_id is None:
+        state.stream_id = stream_id
+    elif state.stream_id != stream_id:
+        raise RuntimeError(
+            "a DCP LSE reduce workspace may only be used from one ordered CUDA "
+            "stream; allocate a separate workspace for each concurrent stream"
+        )
+    return state
 
 
 def _dcp_lse_reduce_payload_offset(cp_size: int) -> int:
@@ -86,7 +132,9 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     All ranks in ``group`` must call this function collectively. The group must
     fit in one NCCL load/store-accessible (LSA) NVLink domain; multi-node groups
     spanning LSA domains are not supported. Allocate one workspace per group
-    and reuse it for every invocation and CUDA graph replay.
+    and reuse it for every invocation and CUDA graph replay. A workspace may
+    only be used from one ordered CUDA stream; allocate a workspace per
+    concurrent stream.
 
     Parameters
     ----------
@@ -100,8 +148,8 @@ def decode_cp_a2a_lse_reduce_create_workspace(
         Elements per head.
     dtype : torch.dtype
         Storage type of ``partial_o`` / ``output`` (fp16 or bf16).
-    group :
-        ``torch.distributed`` process group (or group name) for the CP team.
+    group : torch.distributed.ProcessGroup or str
+        Process group (or group name) for the CP team.
 
     Returns
     -------
@@ -131,7 +179,10 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     # enter the first fused kernel and publish a remote readiness value.
     torch.cuda.current_stream().synchronize()
     handle = symm_mem.rendezvous(workspace, group)
-    _workspace_keepalive[workspace.data_ptr()] = (handle, group_name)
+    state = _WorkspaceState(handle=handle, group_name=group_name, device=device)
+    data_ptr = workspace.data_ptr()
+    _workspace_keepalive[data_ptr] = state
+    weakref.finalize(workspace, _release_workspace, data_ptr, state)
     return workspace
 
 
@@ -165,7 +216,8 @@ def decode_cp_a2a_lse_reduce(
         ``partial_o``.
     workspace : torch.Tensor
         Rendezvoused NCCL symmetric-memory tensor from
-        :func:`decode_cp_a2a_lse_reduce_create_workspace`.
+        :func:`decode_cp_a2a_lse_reduce_create_workspace`. Reuse it only from
+        one ordered CUDA stream.
     cp_rank : int
         This rank's index in the CP group.
     cp_size : int
@@ -182,12 +234,7 @@ def decode_cp_a2a_lse_reduce(
         ``[..., head_dim]`` in the same dtype as ``partial_o``.
     """
     del enable_pdl
-    workspace_meta = _workspace_keepalive.get(workspace.data_ptr())
-    if workspace_meta is None:
-        raise ValueError(
-            "workspace was not created by decode_cp_a2a_lse_reduce_create_workspace"
-        )
-    _, group_name = workspace_meta
+    group_name = _get_workspace_state(workspace).group_name
     get_dcp_lse_reduce_module()
     return torch.ops.flashinfer.decode_cp_a2a_lse_reduce(
         partial_o,
