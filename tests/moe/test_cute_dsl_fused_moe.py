@@ -1613,6 +1613,12 @@ class TestCuteDslFusedMoeFunctional:
     ):
         from flashinfer.autotuner import AutoTuner
 
+        if is_sm107():
+            pytest.skip(
+                "This test forces a Blackwell cluster-N=2 finalize tactic; "
+                "SM107 finalize tactics pin cluster-N to 1"
+            )
+
         if quant_mode == "w4a4":
             # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
             # configuration. hidden=384 also gives the second CTA a partial tile.
