@@ -76,7 +76,9 @@ def _nccl_a2a_lse_reduce(
     lse_max = torch.where(torch.isneginf(lse_max), torch.zeros_like(lse_max), lse_max)
     weights = torch.exp2(peer_lse - lse_max)
     denom = weights.sum(dim=-1, keepdim=True)
-    output = (peer_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(1e-20)
+    output = (peer_o.float() * weights.unsqueeze(-1)).sum(dim=-2) / denom.clamp_min(
+        1e-20
+    )
     output = torch.where(denom == 0, torch.zeros_like(output), output)
     return output.to(partial_o.dtype)
 
@@ -198,9 +200,7 @@ def _benchmark_case(
     )
 
     # Verify the communication permutation and merge outside the timed loops.
-    torch.testing.assert_close(
-        eager_call(), nccl_baseline_call(), rtol=1e-2, atol=1e-3
-    )
+    torch.testing.assert_close(eager_call(), nccl_baseline_call(), rtol=1e-2, atol=1e-3)
     graph_multi.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(

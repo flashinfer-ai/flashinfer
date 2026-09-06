@@ -376,7 +376,9 @@ def gen_dcp_lse_reduce_module() -> JitSpec:
         # PyTorch < 2.6 uses the legacy ``cuda`` boolean argument.
         cuda_include_paths = include_paths(cuda=True)
         cuda_library_paths = library_paths(cuda=True)
-    extra_includes = [pathlib.Path(path) for path in cuda_include_paths]
+    extra_includes: list[str | pathlib.Path] = [
+        pathlib.Path(path) for path in cuda_include_paths
+    ]
     extra_ldflags = [f"-L{path}" for path in cuda_library_paths]
     nccl_ldflag = "-lnccl"
 

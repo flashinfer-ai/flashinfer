@@ -199,16 +199,17 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
 
     # The workspace uses two shared slots and must stay on one ordered stream.
     other_stream = torch.cuda.Stream(device=device)
-    with torch.cuda.stream(other_stream):
-        with pytest.raises(RuntimeError, match="one ordered CUDA stream"):
-            decode_cp_a2a_lse_reduce(
-                partial_o,
-                partial_lse,
-                ws,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                is_lse_base_on_e=is_lse_base_on_e,
-            )
+    with torch.cuda.stream(other_stream), pytest.raises(
+        RuntimeError, match="one ordered CUDA stream"
+    ):
+        decode_cp_a2a_lse_reduce(
+            partial_o,
+            partial_lse,
+            ws,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
 
     # Capture one invocation on every rank, then replay enough times to exercise
     # both slots and slot reuse inside a graph.
