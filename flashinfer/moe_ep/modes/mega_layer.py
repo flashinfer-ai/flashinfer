@@ -119,6 +119,11 @@ class MoEEpMegaLayer(nn.Module):
         return self._workspace
 
     @property
+    def supports_output_view(self) -> bool:
+        """Whether ``forward(return_workspace_view=True)`` is supported."""
+        return self._kernel.supports_output_view
+
+    @property
     def output_buffer(self) -> torch.Tensor:
         """Stable zero-copy output owned by the pooled mega workspace."""
         return self._kernel.workspace_output(self._ensure_workspace())
@@ -193,14 +198,9 @@ class MoEEpMegaLayer(nn.Module):
     ) -> None:
         """Validate and stage one iteration without launching the mega kernel.
 
-        Keeping staging separate lets frameworks capture its fixed-shape GPU
-        work while replaying a backend-owned compute graph eagerly. This is
-        useful when nesting that graph would discard backend-specific launch
-        scheduling such as Green Context partitioning.
-
-        ``compile_tokens_per_rank`` is a collective hint: when provided, every
-        EP rank must pass the same padded row count. It selects a graph/kernel
-        specialization without changing the workspace capacity.
+        ``compile_tokens_per_rank`` selects a collective graph/kernel bucket
+        without changing the workspace capacity. Every EP rank must pass the
+        same bucket for an invocation.
         """
         if (
             compile_tokens_per_rank is not None
@@ -293,20 +293,34 @@ class MoEEpMegaLayer(nn.Module):
             output=output,
         )
 
-    def forward(self, t: "MoEEpTensors") -> torch.Tensor:
+    def forward(
+        self,
+        t: "MoEEpTensors",
+        *,
+        return_workspace_view: bool = False,
+    ) -> torch.Tensor:
+        """Run MegaMoE and return an owned tensor or an opt-in workspace view."""
+        if return_workspace_view and t.output is not None:
+            raise MoEEpConfigError(
+                "return_workspace_view=True cannot be combined with t.output"
+            )
+        if return_workspace_view and not self.supports_output_view:
+            raise MoEEpConfigError(
+                "return_workspace_view=True is not supported by this MegaMoE backend"
+            )
+
+        output = t.output
+        if output is None and not return_workspace_view:
+            # Allocate before staging; allocator work between stage and compute
+            # can synchronize the device mid-round.
+            output = torch.empty(
+                t.num_tokens,
+                self._fleet_params.token_hidden_size,
+                dtype=torch.bfloat16,
+                device=t.hidden_states.device,
+            )
         self.stage_inputs(t)
-        result = self.compute_staged(output=t.output)
-        caller_output = t.output
-        if caller_output is not None:
-            return result
-        y = torch.empty(
-            t.num_tokens,
-            self._fleet_params.token_hidden_size,
-            dtype=torch.bfloat16,
-            device=t.hidden_states.device,
-        )
-        y.copy_(result)
-        return y
+        return self.compute_staged(output=output)
 
     def destroy(self) -> None:
         if self._workspace is not None:

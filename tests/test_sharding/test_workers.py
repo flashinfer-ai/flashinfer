@@ -77,6 +77,7 @@ raise SystemExit(3)
     result = execute_batch(
         BatchExecutionRequest(
             repo_root=Path(__file__).resolve().parents[2],
+            pytest_root=Path(__file__).resolve().parents[2],
             junit_dir=tmp_path / "junit",
             unit=unit,
             batch=batch,
@@ -151,6 +152,7 @@ def _fake_batch_request(tmp_path: Path) -> BatchExecutionRequest:
     )
     return BatchExecutionRequest(
         repo_root=Path(__file__).resolve().parents[2],
+        pytest_root=Path(__file__).resolve().parents[2],
         junit_dir=tmp_path / "junit",
         unit=unit,
         batch=batch,

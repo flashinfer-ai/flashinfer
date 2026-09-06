@@ -80,8 +80,11 @@ def gen_moe_utils_module() -> JitSpec:
     # MoE JitSpec already opts in; this one was missed. Because these flags are
     # passed as ``extra_cuda_cflags`` they override the correctly-mapped global
     # flags, so omitting it here is not merely redundant -- it breaks the build.
+    # SM90 is included for the Hopper CuTe-DSL MoE path: every kernel in this
+    # module only requires __CUDA_ARCH__ >= 900 (PDL guards), and moe_sort's
+    # routing kernels are documented as SM90+ (grid-sync).
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10], map_sm107_to_100f=True
+        supported_major_versions=[9, 10], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -99,7 +102,13 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],

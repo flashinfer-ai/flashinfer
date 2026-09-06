@@ -17,6 +17,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "The vsa_sm100_blk128 backend requires the `quack-kernels` package.\n"
-        "Install it from PyPI:\n"
-        "    pip install quack-kernels==0.6.4"
+        "Install it from PyPI (--no-deps: quack-kernels pins an older "
+        "nvidia-cutlass-dsl than flashinfer requires):\n"
+        "    pip install --no-deps quack-kernels==0.6.4"
     ) from e

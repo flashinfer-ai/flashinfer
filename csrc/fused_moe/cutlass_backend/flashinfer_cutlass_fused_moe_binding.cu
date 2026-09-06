@@ -81,6 +81,17 @@ class DtypeUtils {
   DtypeUtils() = default;
 };
 
+// Validates one of the optional per-expert activation scale tensors (swiglu_alpha, situ_beta, ...)
+// and returns its data pointer, or nullptr when the caller did not supply it.
+inline float const* checkedPerExpertScale(Optional<TensorView> const& scale,
+                                          int num_experts_on_rank, char const* name) {
+  if (!scale.has_value()) return nullptr;
+  CHECK_INPUT_AND_TYPE(scale.value(), dl_float32);
+  TVM_FFI_ICHECK_EQ(scale.value().size(0), num_experts_on_rank)
+      << name << " must have num_experts_on_rank elements.";
+  return static_cast<float const*>(scale.value().data_ptr());
+}
+
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
   template <
@@ -302,6 +313,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
               Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
               Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+              Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
               bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
               int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
               bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
@@ -397,21 +409,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int const num_experts_on_rank = fc2_expert_weights.size(0);
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-    if (swiglu_alpha.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_alpha.value().size(0), num_experts_on_rank)
-          << "swiglu_alpha must have num_experts_on_rank elements.";
-    }
-    if (swiglu_beta.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
-          << "swiglu_beta must have num_experts_on_rank elements.";
-    }
-    if (swiglu_limit.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_limit.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
-          << "swiglu_limit must have num_experts_on_rank elements.";
-    }
     // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
     // (e.g. SwigluStep) keep their own kernel.
     if (base_activation_type == ActivationType::Swiglu &&
@@ -420,12 +417,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
     auto activation_params = ActivationParams(
         base_activation_type,
-        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().data_ptr()
-                                                                : nullptr),
-        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().data_ptr()
-                                                               : nullptr),
-        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().data_ptr()
-                                                                : nullptr));
+        checkedPerExpertScale(swiglu_alpha, num_experts_on_rank, "swiglu_alpha"),
+        checkedPerExpertScale(swiglu_beta, num_experts_on_rank, "swiglu_beta"),
+        checkedPerExpertScale(swiglu_limit, num_experts_on_rank, "swiglu_limit"),
+        checkedPerExpertScale(situ_beta, num_experts_on_rank, "situ_beta"),
+        checkedPerExpertScale(situ_linear_beta, num_experts_on_rank, "situ_linear_beta"));
 
     setRunnerProfiles(profile_ids);
 
@@ -486,7 +482,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          Optional<TensorView> fc2_expert_biases,
                          Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
                          Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
-                         Optional<TensorView> swiglu_limit, bool swizzled_input_sf,
+                         Optional<TensorView> swiglu_limit, Optional<TensorView> situ_beta,
+                         Optional<TensorView> situ_linear_beta, bool swizzled_input_sf,
                          TensorView num_active_experts_per_node, TensorView experts_to_token_score,
                          TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
                          int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
@@ -567,21 +564,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int const num_experts_on_rank = fc2_expert_weights.size(0);
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-    if (swiglu_alpha.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_alpha.value().size(0), num_experts_on_rank)
-          << "swiglu_alpha must have num_experts_on_rank elements.";
-    }
-    if (swiglu_beta.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
-          << "swiglu_beta must have num_experts_on_rank elements.";
-    }
-    if (swiglu_limit.has_value()) {
-      CHECK_INPUT_AND_TYPE(swiglu_limit.value(), dl_float32);
-      TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
-          << "swiglu_limit must have num_experts_on_rank elements.";
-    }
     // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
     // (e.g. SwigluStep) keep their own kernel.
     if (base_activation_type == ActivationType::Swiglu &&
@@ -590,12 +572,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
     auto activation_params = ActivationParams(
         base_activation_type,
-        reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().data_ptr()
-                                                                : nullptr),
-        reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().data_ptr()
-                                                               : nullptr),
-        reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().data_ptr()
-                                                                : nullptr));
+        checkedPerExpertScale(swiglu_alpha, num_experts_on_rank, "swiglu_alpha"),
+        checkedPerExpertScale(swiglu_beta, num_experts_on_rank, "swiglu_beta"),
+        checkedPerExpertScale(swiglu_limit, num_experts_on_rank, "swiglu_limit"),
+        checkedPerExpertScale(situ_beta, num_experts_on_rank, "situ_beta"),
+        checkedPerExpertScale(situ_linear_beta, num_experts_on_rank, "situ_linear_beta"));
 
     setRunnerProfiles(profile_ids);
 
@@ -811,16 +792,17 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+                 Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
                  bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
                  int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                   swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
-                   ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
-                   profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type),
-                   workspace_buffer);
+                   swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta,
+                   swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank, cluster_size,
+                   cluster_rank, enable_alltoall, min_latency_mode, profile_ids, enable_pdl,
+                   static_cast<ActivationType>(base_activation_type), workspace_buffer);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -830,20 +812,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+                 Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
                  bool swizzled_input_sf, TensorView num_active_experts_per_node,
                  TensorView experts_to_token_score, TensorView active_expert_global_ids,
                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
-            runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
-                              fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-                              fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
-                              swiglu_limit, swizzled_input_sf, num_active_experts_per_node,
-                              experts_to_token_score, active_expert_global_ids, tp_size, tp_rank,
-                              ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
-                              min_latency_mode, profile_ids, enable_pdl,
-                              static_cast<ActivationType>(base_activation_type), workspace_buffer);
+            runMoeMinLantency(
+                output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
+                fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
+                swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta,
+                swizzled_input_sf, num_active_experts_per_node, experts_to_token_score,
+                active_expert_global_ids, tp_size, tp_rank, ep_size, ep_rank, cluster_size,
+                cluster_rank, enable_alltoall, min_latency_mode, profile_ids, enable_pdl,
+                static_cast<ActivationType>(base_activation_type), workspace_buffer);
           });
     } else if (name == "get_workspace_size") {
       return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,

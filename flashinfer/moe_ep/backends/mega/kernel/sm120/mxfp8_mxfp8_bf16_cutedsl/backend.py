@@ -141,6 +141,19 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
+        knobs = k.knobs
+        if knobs is None or "mma_tiler_mnk" not in knobs:
+            # The drop's shim-default tiler N=128 produces silently wrong
+            # output cells at EVERY world size on dense data (verified
+            # 2026-08-06 at ws1, 2026-08-07 at ws2 and ws4 on RTX PRO 6000 /
+            # RTX 6000D): rel-L2 vs the bf16 dense reference degrades from
+            # the ~6.35% MXFP8 band to 8-28% once tokens fill past an N=64
+            # tile, with run-to-run magnitude variation (race-like). The
+            # drop's own ws4 "bit-exact" check used 1%-sparse test data,
+            # which cannot see it. N=64 stays in band everywhere (~23%
+            # slower at large batch). See VENDOR.md; an explicit
+            # mma_tiler_mnk knob overrides this pin.
+            knobs = {**(knobs or {}), "mma_tiler_mnk": (64, 64, 128)}
         return get_symm_buffer_for_sm120_mxfp8_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
@@ -154,7 +167,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_mode=k.token_back_mode,
-            knobs=k.knobs,
+            knobs=knobs,
         )
 
     def validate_forward(

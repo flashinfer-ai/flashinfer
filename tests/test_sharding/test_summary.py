@@ -219,7 +219,7 @@ def test_source_summary_aggregates_local_resources_and_failed_diagnostics(
         )
     )
     assert "[diagnostic truncated at 8 bytes]" in terminal
-    assert "results:" in terminal
+    assert "log:" in terminal
     assert "  - tests/test_sample.py::test_case_1" in terminal
 
 

@@ -64,17 +64,19 @@ def _resolve_local_device(bootstrap: BootstrapConfig) -> int:
 
     ``bootstrap.device`` wins when set (host frameworks pass the device they
     already bound); otherwise fall back to the LOCAL_RANK env var and then
-    ``bootstrap.rank`` (torchrun convention), folded onto the physical GPUs
-    (``local_rank % device_count``, drop-bootstrap parity): the sm_12x
-    rank-sharing multirank flow runs N ranks per GPU, and the modulo is the
-    identity whenever there are enough GPUs, so the normal one-rank-per-GPU
-    mapping is unchanged.
+    ``bootstrap.rank`` (torchrun convention). Only under the sm_12x
+    rank-sharing flow (``MEGA_SINGLE_GPU_GLOO=1``, N ranks per GPU) is the
+    rank folded onto the physical GPUs (``local_rank % device_count``,
+    drop-bootstrap parity); the default one-rank-per-GPU mapping stays raw.
     """
     if bootstrap.device is not None:
         return bootstrap.device
-    import torch
 
     local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+    if not _single_gpu_gloo():
+        return local_rank
+    import torch
+
     count = torch.cuda.device_count()
     return local_rank % count if count else 0
 
@@ -284,16 +286,26 @@ def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
     return frozenset()
 
 
-def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
-    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+def cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL mega kernels."""
     if _mega_no_dist():
         return frozenset()
     return frozenset({TORCH_DIST, NVSHMEM})
 
 
+def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
 def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
     """Runtime needs for the CuTeDSL MXFP8 mega kernel."""
-    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+    return cutedsl_runtime_requirements(bootstrap)
+
+
+def bf16_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL BF16 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
 
 
 def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
@@ -321,6 +333,7 @@ __all__ = [
     "bootstrap_moe_ep_runtime",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
+    "bf16_cutedsl_runtime_requirements",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",

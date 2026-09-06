@@ -31,6 +31,7 @@ class BatchExecution:
 @dataclass(frozen=True)
 class BatchExecutionRequest:
     repo_root: Path
+    pytest_root: Path
     junit_dir: Path
     unit: Unit
     batch: Batch
@@ -207,13 +208,12 @@ def _forward_pytest_output(
             log.flush()
         nodeid = str(event.get("nodeid", ""))
         if event.get("event") == "start":
-            function, should_print = progress.start(
+            _, should_print = progress.start(
                 nodeid, float(event.get("started_at", time.time()))
             )
             if should_print:
                 state.emit(
-                    f"PYTEST START worker={worker_index} batch={batch_id} "
-                    f"function={function} node={nodeid}"
+                    f"PYTEST START worker={worker_index} batch={batch_id} node={nodeid}"
                 )
         elif event.get("event") == "finish":
             outcome = str(event.get("outcome", "unknown"))
@@ -339,6 +339,7 @@ def _pytest_command(
         sys.executable,
         "-m",
         "pytest",
+        f"--rootdir={request.pytest_root}",
         "--continue-on-collection-errors",
         "-p",
         "scripts.test_sharding.pytest_plugin",
@@ -383,7 +384,7 @@ def _run_pytest(
         log.flush()
         process = subprocess.Popen(
             command,
-            cwd=request.repo_root,
+            cwd=request.pytest_root,
             env=_pytest_environment(request),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -26,7 +26,13 @@
 #define uint64_t flashkda_generated_uint64_t
 #define int32_t flashkda_generated_int32_t
 #define int16_t flashkda_generated_int16_t
+#define FlashKDATensorMap flashkda_generated_FlashKDATensorMap
+#define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
+#define CUtensorMap flashkda_generated_CUtensorMap
 #include "flashkda_bf16_fused_m64.cu"
+#undef CUtensorMap
+#undef FlashKDATensorMapPack
+#undef FlashKDATensorMap
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -38,7 +44,7 @@ namespace flashinfer {
 namespace flash_kda {
 
 static_assert(THREADS == 1024);
-static_assert(SMEM_TOTAL == 219136);
+static_assert(SMEM_TOTAL == 221696);
 
 void RunM64(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
             TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
@@ -74,20 +80,26 @@ void RunM64(TensorView q, TensorView k, TensorView v, TensorView g, TensorView b
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(THREADS, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<64>(q, k, v, g, beta_tma, out, descriptor_storage,
-                                                prepare_descriptors, stream);
+  const TmaPointers tma = EncodeTmaPointers<64, 32>(q, k, v, g, beta_tma, out, descriptor_storage,
+                                                    prepare_descriptors, stream);
 
   kernel_flashkda_bf16_fused_m64<<<grid, block, kSmemBytes, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), tma.q,
-      reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
-      reinterpret_cast<__nv_bfloat16*>(v.data_ptr()), tma.v,
-      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), tma.g,
-      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), tma.beta,
+      reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q),
+      reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.k),
+      reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.v),
+      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.g),
+      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.beta),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tma.out,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.out),
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound));

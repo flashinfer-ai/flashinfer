@@ -316,7 +316,10 @@ misses) — both are the right behavior as long as internal drops carry the
   2048 tokens, fb4 + reuse_dispatch_warps at >=2048 (-14.5% at 2048:
   1010.6 vs 1181.6 us kernel-mode; supersedes the 07-14 "dispatch-warp is
   ~5% slower for MXFP8" reading, which conflated it with fb8).
-- Backend configs (`Nvfp4/Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig.knobs`): explicit dict
+  BF16 has ONE profile: `dtype="bf16"` returns the single validated fixed
+  MMA/cluster geometry regardless of token count (candidate validity via
+  `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.
+- Backend configs (`Nvfp4/Mxfp8/Bf16 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the

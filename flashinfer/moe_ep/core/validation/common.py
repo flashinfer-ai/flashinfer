@@ -217,6 +217,36 @@ def validate_arch_for_backend(backend: str) -> None:
             )
 
 
+# nccl_ep instantiates its low-latency kernels only for these hidden sizes
+# (contrib/nccl_ep/device/macros.cuh, SWITCH_HIDDEN). Anything else reaches
+# EP_HOST_ASSERT(false and "Unsupported hidden") in device/low_latency.cu, which
+# aborts the process from C++ with no Python traceback -- under a test harness
+# that surfaces only as the worker dying on a signal.
+_NCCL_EP_LL_HIDDEN_SIZES = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
+    """Reject hidden sizes the LL kernels were never instantiated for.
+
+    LL only; HT is not hidden-size specialized. Raises rather than letting the
+    device-side host assert abort the process.
+    """
+    if backend != "nccl_ep" or params.algorithm is not EpAlgorithm.LOW_LATENCY:
+        return
+    hidden = params.token_hidden_size
+    if hidden in _NCCL_EP_LL_HIDDEN_SIZES:
+        return
+    supported = ", ".join(str(h) for h in _NCCL_EP_LL_HIDDEN_SIZES)
+    raise MoEEpConfigError(
+        f"nccl_ep low-latency does not support token_hidden_size={hidden}. "
+        f"Its kernels are instantiated only for: {supported} "
+        "(contrib/nccl_ep/device/macros.cuh SWITCH_HIDDEN); any other value "
+        "aborts the process in device/low_latency.cu. Round the layer's hidden "
+        "size up to one of the supported values, or use "
+        "EpAlgorithm.HIGH_THROUGHPUT, which is not hidden-size specialized."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 

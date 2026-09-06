@@ -1528,6 +1528,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         state_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: Type[cutlass.Numeric] = cutlass.Int32,
         use_state_indices: bool = False,
+        state_indices_dtype: Type[cutlass.Numeric] | None = None,
+        initial_state_inner_strides: tuple[int, ...] | None = None,
+        output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
@@ -1536,6 +1539,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.state_dtype = state_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.use_state_indices = use_state_indices
+        self.state_indices_dtype = state_indices_dtype
+        self.initial_state_inner_strides = initial_state_inner_strides
+        self.output_state_inner_strides = output_state_inner_strides
         self.store_initial_state = store_initial_state
         self.acc_dtype = cutlass.Float32
         self.mma_dtype = cutlass.TFloat32
@@ -1566,6 +1572,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             "state_dtype",
             "cu_seqlens_dtype",
             "use_state_indices",
+            "state_indices_dtype",
+            "initial_state_inner_strides",
+            "output_state_inner_strides",
             "store_initial_state",
             "m_stage",
             "n_stage",

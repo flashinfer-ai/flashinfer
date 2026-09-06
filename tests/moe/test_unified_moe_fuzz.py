@@ -19,9 +19,9 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. the since-fixed trtllm EP
-offset>0 all-zero bug, gh #3547): the case is still *run* so the suite stays green on a tracked bug
-yet flags loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
+A shared ledger (``tests/test_helpers/fuzz_ledger.py``) manages tracked
+wrong-answer and crash-class findings. It is currently empty because gh #3547
+and #3957 are fixed and covered by regressions.
 
 Verification model (single mode, uniform -- every config that runs gets the same checks):
   1. **no crash / no NaN-Inf** where the reference is finite.
@@ -81,15 +81,14 @@ CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
 dispatch to capable TRTLLM runners. MxInt4 covers packed and BF16-FromLogits
 routing.
 
-OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
-SKIPPED unless that env var is set -- waived in CI pending root-cause of a
-whole-process device-side-assert abort that would block B200 CI. Run it explicitly:
-  FLASHINFER_UMOE_FUZZ=1 CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> \
-    pytest tests/moe/test_unified_moe_fuzz.py
+ENABLED BY DEFAULT: this suite runs like any other test. Unsupported configurations skip at the
+no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver.
+Run it explicitly:
+  CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> pytest tests/moe/test_unified_moe_fuzz.py
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
 "Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
 test id in its own process instead (see var/03-ssh-docker-workflow.md).
-Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0),
+Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 160), FLASHINFER_UMOE_FUZZ_SEED (default 0),
      FLASHINFER_UMOE_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
      perfect-repro hook printed on every test).
 
@@ -102,9 +101,10 @@ CI log alone tells you whether the output is all-zero / all-NaN / Inf without ha
 
 ------------------------------------------------------------------------------------------------
 EXTENDING (cheap, by design):
-  * New backend -> nothing to do: it is auto-discovered from ``_BACKEND_RUNNERS`` the moment its
-    runner registers and ``supported(sm)`` is true. If it ships with a tracked bug, add one
-    ``_KNOWN_FAILURES`` entry (the case still RUNS; an xpass then flags the fix).
+  * New backend -> add its config class to the matching dtype handler's ``candidate_configs``;
+    the live ``_BACKEND_RUNNERS`` registry then supplies the runner and architecture gate. If it
+    ships with a tracked bug, add one ledger ``Finding`` (a non-quarantine case still RUNS; an
+    xpass then hard-fails until the entry is removed).
   * New dtype -> add ONE ``DTypeHandler`` to ``_DTYPE`` (snap / make_act_pack / reference / poison
     / tolerances). Everything else (config gen, all 7 checks, the cache test) is dtype-generic.
 
@@ -154,9 +154,10 @@ OUT OF SCOPE for this single-GPU correctness harness (must live elsewhere, do NO
 POINTERS for future agents (point me at this file and I know the rest):
   * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
     project auto-memory ``flashinfer_quality_fuzzers.md``.
-  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- tracked in the
-    ``_KNOWN_FAILURES`` ledger below until fixed) and
-    gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
+  * Bugs THIS fuzzer found + filed:
+    - fixed gh #3547 (trtllm EP offset>0 all-zero).
+    - fixed gh #3957 (cumulative corruption).
+    - open gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
   * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
   * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
     (branch ``yanxu/unified-moe-api-fuzzer``).
@@ -164,9 +165,10 @@ POINTERS for future agents (point me at this file and I know the rest):
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import os
 import random
-import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -175,6 +177,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
+from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fused_moe import (
     MoEActivationPack,
@@ -183,12 +186,35 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.api import (
-    ActivationConfig,
+    # Typed activation values
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU,
+    ReLU2,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs and backend options
     BackendOptions,
+    B12xNvfp4Config,
+    B12xW4A16Config,
+    CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
+    CutlassW4A8Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
+    MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
@@ -199,62 +225,82 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import _TrtllmRunnerBase
+from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
+from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
-NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
+from tests.test_helpers.fuzz_ledger import FuzzLedger
+
+NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "160"))
+# Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl") to run a
+# backend-scoped sequence -- used to bisect cross-call state corruption by backend (gh #3957).
+_BACKEND_FILTER = {
+    b for b in os.environ.get("FLASHINFER_UMOE_FUZZ_BACKENDS", "").split(",") if b
+}
+# Debug knob: skip the autotune(True) production-path step entirely -- used to isolate whether
+# cross-call corruption accumulates in the profiling path (cudagraph captures) or the plain
+# forward/tactic path (gh #3957).
+_NO_AUTOTUNE = os.environ.get("FLASHINFER_UMOE_FUZZ_NO_AUTOTUNE", "0") not in ("", "0")
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 # Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs. A curated
 # seed maps to its hand-written Cfg; any other seed is regenerated via the deterministic _gen(seed),
 # so a single seed reproduces exactly one config. The repro command printed on every test uses this.
 _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 
-# --- CI-safety gate: OPT-IN ----------------------------------------------------------------
-# Waived in CI pending root-cause of a whole-process abort. Running the SM100 fuzzer
-# in a single `pytest` process can hit `CUDA error: device-side assert triggered` ->
-# `Fatal Python error: Aborted`, which would BLOCK B200 CI (an abort fails the whole job, not one
-# test). Notes from triage (2026-06-09): per-config isolation (one process each) passes 68/86
-# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the since-fixed
-# gh #3547 EP case returned tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces
-# only in the accumulated single-process run that CI uses. `pytest --forked` can't isolate it
-# either (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the
-# abort is root-caused, this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
-# to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
-# never launches a kernel and cannot abort the job.
+# --- CI gate: ON by default (FLASHINFER_UMOE_FUZZ=0 is the emergency waiver) ----------------
+# History: this suite was opt-in (FLASHINFER_UMOE_FUZZ=1) while (a) gh #3547 was open and (b) the
+# accumulated single-process run could hit `CUDA error: device-side assert triggered` ->
+# `Fatal Python error: Aborted` (2026-06-09 triage). Both are now understood (2026-07-14, full
+# default run on a B200-class SM100): #3547 is fixed (its EP-offset configs pass), and the abort
+# is root-caused mechanically -- an async device-side assert from one config poisons the CUDA
+# context and the pending c10 error escapes a destructor at interpreter shutdown
+# (std::terminate). It is not a separate Heisenbug: any assert-class *finding* ends this fuzzer's
+# pytest process after the failure is reported. The shard_group marker keeps the accumulated
+# sequence together in one pytest invocation, preserving the regression while the sharding runner
+# can still isolate failures in other groups. The historical gh #3957 finding
+# (a silent OOB write with a moving victim) was fixed by gh #4186; keeping this accumulated
+# sequence enabled is its regression coverage.
+# Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
+# value) still enables and is now a no-op.
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("FLASHINFER_UMOE_FUZZ"),
-    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "
-    "root-cause of the whole-process device-side-assert abort",
+    os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
+    reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
 )
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an
 # upstream note), because a deterministic->non-deterministic regression is exactly a bug to catch.
 _DETERMINISTIC = {
+    "cutlass_bf16": True,
+    "cutlass_w4a16": True,
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
-    "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
+    "cute_dsl": False,  # atomic scatter-add finalize -> non-bit-exact by design
     "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
     "trtllm_fp8_block": True,
     "trtllm_fp8_per_tensor": True,
 }
+# The seven #4610 CUTLASS runners and both b12x runners are intentionally
+# absent until repeated-run bitwise calibration is completed on SM90 and
+# SM120/SM121 respectively.
 
-# Known-bug ledger: (backend_key, predicate(cfg)) -> reason. A matching (backend, config) is run but
-# its correctness failure is TOLERATED (xfail) -- this keeps the suite green on a filed-and-tracked
-# bug while still EXERCISING it, so the day the bug is fixed the case starts passing and we get a loud
-# "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
-_KNOWN_FAILURES = [
-    # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
-    # Empty since the gh #3547 EP-offset double-subtraction fix.
-]
-
-
-def _known_failure(backend_key, cfg):
-    for bk, predicate, reason in _KNOWN_FAILURES:
-        if bk == backend_key and predicate(cfg):
-            return reason
-    return None
+# Known-bug ledger (shared mechanism: tests/test_helpers/fuzz_ledger.py). Two severities:
+# quarantine=False entries are RUN with a tolerated wrong answer (xpass flags the fix);
+# quarantine=True entries are xfailed up front and never launch (crash / device-state class --
+# one such config poisons the CUDA context for every later test in the process).
+LEDGER = FuzzLedger(
+    "unified-moe",
+    findings=(
+        # Finding(match=..., reason="...; gh #NNNN", quarantine=..., backend=...)
+        # Wrong-answer entries: empty since the gh #3547 EP-offset double-subtraction fix.
+        # The historical gh #3957 cross-call corruption had a moving victim and could not be
+        # quarantined by config predicate. It was fixed by gh #4186, so no ledger entry remains;
+        # this accumulated sequence is the regression test.
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +347,11 @@ class DTypeHandler:
     out_dtype: torch.dtype  # output buffer dtype (used to locate it in the inputs list)
     atol_frac: float  # numeric tolerance vs reference = atol_frac * ‖ref‖∞
     rtol: float
+    # Contract overlays use backend-native activation/preparation recipes and
+    # therefore need a reference derived after the prepared view exists.
+    post_prepare_reference: Callable | None = None
+    prepare_weights: Callable | None = None
+    weight_snap: Callable | None = None
 
 
 def _poison_bf16_out(buf, gen):
@@ -378,14 +429,15 @@ def _bf16_snap(t: torch.Tensor) -> torch.Tensor:
 
 
 def _bf16_act_pack(x, selected_experts, final_scales):
-    # Raw bf16 activations; the bf16 runner reads hidden_states_q directly and
-    # ignores hidden_states_scale.
+    # Raw bf16 activations. Use BF16-grid routing weights represented as FP32
+    # so TRTLLM's packed-id path and CUTLASS's separate-weight path share one
+    # exact semantic input.
     return MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=None,
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        topk_weights=final_scales.to(torch.bfloat16).float(),
     )
 
 
@@ -409,8 +461,59 @@ def _mxint4_act_pack_logits(x, routing_logits, routing_bias):
     )
 
 
+def _apply_typed_activation(fc1, activation, intermediate_size):
+    """Apply one typed activation to canonical GEMM1 output."""
+    if isinstance(activation, ReLU2):
+        return F.relu(fc1) ** 2
+    if isinstance(activation, Identity):
+        return fc1
+    if isinstance(activation, GELU):
+        return F.gelu(fc1, approximate="none")
+    if isinstance(activation, ReLU):
+        return F.relu(fc1)
+    if isinstance(activation, SiLU):
+        return F.silu(fc1)
+
+    up, gate = fc1[:, :intermediate_size], fc1[:, intermediate_size:]
+    if isinstance(activation, SwiGLU):
+        gate = gate.clamp(max=activation.limit)
+        up = up.clamp(min=-activation.limit, max=activation.limit)
+        return gate * torch.sigmoid(activation.alpha * gate) * (up + activation.beta)
+    if isinstance(activation, GeGLU):
+        return F.gelu(gate, approximate="none") * up
+    if isinstance(activation, GeGLUTanh):
+        return F.gelu(gate, approximate="tanh") * up
+    if isinstance(activation, SwiGLUStep):
+        return F.silu(gate).clamp(max=activation.limit) * up.clamp(
+            min=-activation.limit, max=activation.limit
+        )
+    if isinstance(activation, SiTU):
+        if activation.clamp_limit is not None:
+            up = up.clamp(min=-activation.clamp_limit, max=activation.clamp_limit)
+            gate = gate.clamp(max=activation.clamp_limit)
+        linear = (
+            up
+            if activation.linear_scale is None
+            else activation.linear_scale * torch.tanh(up / activation.linear_scale)
+        )
+        return (
+            linear
+            * activation.gate_scale
+            * torch.tanh(gate / activation.gate_scale)
+            * torch.sigmoid(gate)
+        )
+    raise AssertionError(f"unsupported fuzz activation {activation!r}")
+
+
 def _bf16_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    activation=None,
 ):
     """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
     but no fp4 requant -- the only intermediate quantization is the bf16 rounding
@@ -418,6 +521,7 @@ def _bf16_reference(
     to match the packed-id truncation in pack_inputs, so the tolerance measures
     kernel error, not oracle mismatch."""
     final_scales = final_scales.to(torch.bfloat16).float()
+    activation = activation or SwiGLU()
     x32, half = x.float(), intermediate_size
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -425,8 +529,8 @@ def _bf16_reference(
         if not mask.any():
             continue
         tok, nth = torch.where(mask)
-        gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
-        inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
+        fc1 = x32[tok] @ w1[local_e].float().t()
+        inter = _apply_typed_activation(fc1, activation, half)
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
         out[tok] += final_scales[tok, nth, None] * expert_out
@@ -453,24 +557,20 @@ def _mxfp8_quant_matrix(x):
 
 
 def _mxfp4_quant_dequant_matrix(x):
-    """Quantize/dequantize one logical MXFP4 matrix with linear UE8M0 scales."""
-    one = torch.tensor([1.0], device=x.device)
-    q, sf = fp4_quantize(
-        x.to(torch.bfloat16),
-        global_scale=one,
-        sf_vec_size=32,
-        sf_use_ue8m0=True,
-        is_sf_swizzled_layout=False,
+    """Torch MXFP4 round-trip that is valid on both Hopper and Blackwell."""
+    q, sf = _quantize_mxfp4_linear(x.to(torch.bfloat16).contiguous())
+    low = q & 0xF
+    high = q >> 4
+    codes = torch.stack((low, high), dim=-1).reshape(x.shape).to(torch.long)
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=x.device,
+        dtype=torch.float32,
     )
-    deq = e2m1_and_ufp8sf_scale_to_float(
-        q.cpu(),
-        sf.cpu().view(torch.uint8).reshape(-1),
-        (1.0 / one).cpu(),
-        32,
-        0,
-        False,
-    )
-    return deq.reshape(x.shape).to(x.device)
+    values = magnitudes[codes & 0x7]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scales = torch.exp2(sf.to(torch.int16).to(torch.float32) - 127)
+    return values * scales.repeat_interleave(32, dim=-1)
 
 
 def _mxfp4_snap(t: torch.Tensor, *, bf16_activation: bool) -> torch.Tensor:
@@ -491,7 +591,10 @@ def _mxfp4_act_pack(x, selected_experts, final_scales, *, variant: QuantVariant)
         hidden_states_scale=sf,
         routing_input_mode=RoutingInputMode.PackedPrecomputed,
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        # TRTLLM's packed-id ABI rounds routing weights through BF16, whereas
+        # CUTLASS consumes FP32. Supplying BF16-grid values in FP32 gives both
+        # backends one exact routing-weight contract.
+        topk_weights=final_scales.to(torch.bfloat16).float(),
     )
 
 
@@ -749,6 +852,251 @@ def _mxint4_reference(
     return out
 
 
+def _contract_bf16_act_pack(x, selected_experts, final_scales):
+    """Packed CUTLASS/b12x contract: BF16 x and FP32 routing weights."""
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales.float(),
+    )
+
+
+def _contract_fp8_act_pack(config_cls):
+    def make(x, selected_experts, final_scales):
+        q, scale = config_cls.prepare_activations(x)
+        return MoEActivationPack(
+            hidden_states_q=q,
+            hidden_states_scale=scale,
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            topk_ids=selected_experts,
+            topk_weights=final_scales.float(),
+        )
+
+    return make
+
+
+def _semantic_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, activation
+):
+    """Semantic CUTLASS/b12x reference in canonical [up, gate] row order.
+
+    Keep routing weights in FP32: these runners consume separate precomputed
+    tensors, unlike TRTLLM's packed-ID path, which truncates weights to BF16.
+    Quant-specific callers supply dequantized activation and weight operands.
+    This idealized semantic oracle also leaves GEMM intermediates in FP32;
+    ``_bf16_reference`` adds its backend-specific BF16 storage round-trips.
+    """
+    x32 = x.float()
+    out = torch.zeros_like(x32)
+    for expert in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == expert)
+        if token.numel() == 0:
+            continue
+        fc1 = x32[token] @ w1[expert].float().t()
+        inter = _apply_typed_activation(fc1, activation, intermediate_size)
+        expert_out = inter @ w2[expert].float().t()
+        out[token] += final_scales[token, slot, None].float() * expert_out
+    return out
+
+
+def _dequant_cutlass_nvfp4(packed, scale):
+    rows, packed_cols = packed.shape
+    return e2m1_and_ufp8sf_scale_to_float(
+        packed.cpu(),
+        scale.cpu().reshape(-1),
+        torch.ones(1, dtype=torch.float32),
+        16,
+        1,
+        True,
+    ).view(rows, packed_cols * 2)
+
+
+def _dequant_cutlass_nvfp4_experts(packed, scales, device):
+    return torch.stack(
+        [_dequant_cutlass_nvfp4(packed[i], scales[i]) for i in range(packed.shape[0])]
+    ).to(device=device, dtype=torch.bfloat16)
+
+
+def _dequant_int4_grouped(packed, scale, group_size=128):
+    even = packed.to(torch.int16) & 0xF
+    odd = packed.to(torch.int16) >> 4
+    even = torch.where(even >= 8, even - 16, even)
+    odd = torch.where(odd >= 8, odd - 16, odd)
+    unpacked = torch.stack((even, odd), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    return unpacked.float() * scale.float().repeat_interleave(group_size, dim=-1)
+
+
+def _dequant_linear_mxfp4(packed, scales):
+    low, high = packed & 0xF, packed >> 4
+    codes = torch.stack((low, high), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    values = magnitudes[codes.long() & 0x7]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scale = torch.exp2(scales.to(torch.int16).float() - 127)
+    return values * scale.repeat_interleave(32, dim=-1)
+
+
+def _mxfp8_quant_dequant_experts(weight):
+    from flashinfer import mxfp8_dequantize_host
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    dequantized = []
+    for expert in range(weight.shape[0]):
+        packed, scale = mxfp8_quantize(
+            weight[expert], is_sf_swizzled_layout=True, alignment=32
+        )
+        dequantized.append(
+            mxfp8_dequantize_host(
+                packed.cpu().view(torch.uint8),
+                scale.cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+        )
+    return torch.stack(dequantized).to(weight.device)
+
+
+def _cutlass_post_reference(backend_key):
+    def reference(
+        x, w1, w2, selected_experts, final_scales, intermediate_size, view, activation
+    ):
+        x_ref, w1_ref, w2_ref = x, w1, w2
+        if backend_key == "cutlass_nvfp4":
+            one = torch.ones(1, device=x.device)
+            x_q, x_sf = fp4_quantize(
+                x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=True
+            )
+            x_ref = _dequant_cutlass_nvfp4(x_q, x_sf).to(x.device)
+            w1_ref = _dequant_cutlass_nvfp4_experts(
+                view["fc1_expert_weights"], view["fc1_weight_block_scale"], x.device
+            )
+            w2_ref = _dequant_cutlass_nvfp4_experts(
+                view["fc2_expert_weights"], view["fc2_weight_block_scale"], x.device
+            )
+        elif backend_key == "cutlass_fp8_per_tensor":
+            x_ref = view["_activation_q"].float() * view["_activation_scale"]
+            w1_ref = (
+                view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
+            )
+            w2_ref = (
+                view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
+            )
+        elif backend_key == "cutlass_fp8_block":
+            w1_ref = view["fc1_expert_weights"].float() * view[
+                "fc1_block_scale"
+            ].repeat_interleave(128, -2).repeat_interleave(128, -1)
+            w2_ref = view["fc2_expert_weights"].float() * view[
+                "fc2_block_scale"
+            ].repeat_interleave(128, -2).repeat_interleave(128, -1)
+        elif backend_key == "cutlass_mxfp8_mxfp4":
+            from flashinfer import mxfp4_dequantize, mxfp8_dequantize_host
+
+            x_ref = mxfp8_dequantize_host(
+                view["_activation_q"].cpu().view(torch.uint8),
+                view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                True,
+            ).to(x.device)
+            w1_ref = torch.stack(
+                [
+                    mxfp4_dequantize(
+                        view["fc1_expert_weights"][i].cpu(),
+                        view["fc1_expert_scales"][i]
+                        .cpu()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                    )
+                    for i in range(w1.shape[0])
+                ]
+            ).to(x.device)
+            w2_ref = torch.stack(
+                [
+                    mxfp4_dequantize(
+                        view["fc2_expert_weights"][i].cpu(),
+                        view["fc2_expert_scales"][i]
+                        .cpu()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                    )
+                    for i in range(w2.shape[0])
+                ]
+            ).to(x.device)
+        elif backend_key == "cutlass_mxfp8":
+            from flashinfer import mxfp8_dequantize_host
+
+            x_ref = mxfp8_dequantize_host(
+                view["_activation_q"].cpu().view(torch.uint8),
+                view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                True,
+            ).to(x.device)
+            # Re-quantize independently from the canonical weights instead of
+            # consuming the prepared scale view. This catches a broken
+            # _pack_mxfp8_weight_scales transformation in the production path.
+            w1_ref = _mxfp8_quant_dequant_experts(w1)
+            w2_ref = _mxfp8_quant_dequant_experts(w2)
+        elif backend_key == "cutlass_w4a8":
+            from flashinfer.fused_moe.prepare import _quantize_int4_grouped
+
+            q1, s1 = _quantize_int4_grouped(w1)
+            q2, s2 = _quantize_int4_grouped(w2)
+            w1_ref, w2_ref = (
+                _dequant_int4_grouped(q1, s1),
+                _dequant_int4_grouped(q2, s2),
+            )
+        elif backend_key == "cutlass_humming":
+            q1, s1 = _quantize_mxfp4_linear(w1.reshape(-1, w1.shape[-1]))
+            q2, s2 = _quantize_mxfp4_linear(w2.reshape(-1, w2.shape[-1]))
+            w1_ref = _dequant_linear_mxfp4(q1, s1).view_as(w1)
+            w2_ref = _dequant_linear_mxfp4(q2, s2).view_as(w2)
+        return _semantic_reference(
+            x_ref,
+            w1_ref,
+            w2_ref,
+            selected_experts,
+            final_scales,
+            intermediate_size,
+            activation,
+        )
+
+    return reference
+
+
+def _b12x_post_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, view, activation
+):
+    # The b12x conformance tests intentionally use canonical BF16 weights as
+    # the authority for both NVFP4 and checkpoint-style W4A16.
+    return _semantic_reference(
+        x, w1, w2, selected_experts, final_scales, intermediate_size, activation
+    )
+
+
+def _prepare_b12x_w4a16(BackendCfg, w1, w2, **kwargs):
+    from flashinfer.fused_moe.prepare import _quantize_b12x_expert_weights
+
+    q1, sf1 = _quantize_b12x_expert_weights(w1)
+    q2, sf2 = _quantize_b12x_expert_weights(w2)
+    ones = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+    return BackendCfg.prepare_weights(
+        q1,
+        sf1,
+        ones,
+        q2,
+        sf2,
+        ones.clone(),
+        activation=kwargs["activation"],
+        source_format="modelopt",
+    )
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -764,7 +1112,7 @@ _DTYPE = {
     ),
     QuantVariant.BF16: DTypeHandler(
         variant=QuantVariant.BF16,
-        candidate_configs=(TrtllmBf16Config,),
+        candidate_configs=(TrtllmBf16Config, CutlassBf16Config),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
         make_act_pack_logits=_bf16_act_pack_logits,
@@ -838,7 +1186,7 @@ _DTYPE = {
     ),
     QuantVariant.W4A16: DTypeHandler(
         variant=QuantVariant.W4A16,
-        candidate_configs=(TrtllmFp4Config,),
+        candidate_configs=(TrtllmFp4Config, CutlassW4A16Config),
         snap=lambda t: _mxfp4_snap(t, bf16_activation=True),
         make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
             x, ids, weights, variant=QuantVariant.W4A16
@@ -861,14 +1209,135 @@ _DTYPE = {
         reference=_mxint4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        # Curated FromLogits observes max|diff| / ||ref||inf ~= 0.0335.
-        atol_frac=0.04,
+        # A 160-seed GB200 (SM100) sweep exercised 17 MxInt4 cases; seed 18
+        # requires atol_frac ~= 0.062 after the relative-tolerance contribution.
+        # Keep a small SM100-calibrated margin; SM103/SM107 remain uncalibrated.
+        atol_frac=0.065,
         rtol=0.3,
     ),
 }
 
-# Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
-_HANDLER_BY_ID = {variant.name.lower(): handler for variant, handler in _DTYPE.items()}
+
+def _contract_handler(
+    config_cls,
+    variant,
+    *,
+    activation_pack,
+    reference,
+    snap=_block_fp8_snap,
+    weight_snap=None,
+    prepare_weights=None,
+    atol_frac=0.2,
+    rtol=0.2,
+):
+    return DTypeHandler(
+        variant=variant,
+        candidate_configs=(config_cls,),
+        snap=snap,
+        make_act_pack=activation_pack,
+        make_act_pack_logits=None,
+        reference=lambda *_: None,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=atol_frac,
+        rtol=rtol,
+        post_prepare_reference=reference,
+        prepare_weights=prepare_weights,
+        weight_snap=weight_snap,
+    )
+
+
+# Synthetic ids keep activation-pack contracts isolated from TRTLLM handlers.
+# In particular, one Cfg creates exactly one activation pack, so backends with
+# BF16, per-tensor FP8, and MXFP8 inputs cannot safely share a handler.
+_CONTRACT_HANDLERS = {
+    "cutlass_nvfp4": _contract_handler(
+        CutlassNvfp4Config,
+        QuantVariant.NVFP4,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_nvfp4"),
+        snap=_snap_to_nvfp4,
+        atol_frac=0.15,
+        rtol=0.1,
+    ),
+    "cutlass_fp8_per_tensor": _contract_handler(
+        CutlassFp8PerTensorConfig,
+        QuantVariant.FP8PerTensor,
+        activation_pack=_contract_fp8_act_pack(CutlassFp8PerTensorConfig),
+        reference=_cutlass_post_reference("cutlass_fp8_per_tensor"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_fp8_block": _contract_handler(
+        CutlassFp8BlockConfig,
+        QuantVariant.DeepSeekFp8,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_fp8_block"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_mxfp8_mxfp4": _contract_handler(
+        CutlassMxfp8Mxfp4Config,
+        QuantVariant.MXFP4,
+        activation_pack=_contract_fp8_act_pack(CutlassMxfp8Mxfp4Config),
+        reference=_cutlass_post_reference("cutlass_mxfp8_mxfp4"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_mxfp8": _contract_handler(
+        CutlassMxfp8Config,
+        QuantVariant.MxFp8,
+        activation_pack=_contract_fp8_act_pack(CutlassMxfp8Config),
+        reference=_cutlass_post_reference("cutlass_mxfp8"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_w4a8": _contract_handler(
+        CutlassW4A8Config,
+        QuantVariant.W4A8,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_w4a8"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_humming": _contract_handler(
+        CutlassHummingConfig,
+        QuantVariant.Humming,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_humming"),
+    ),
+    "b12x_nvfp4": _contract_handler(
+        B12xNvfp4Config,
+        QuantVariant.NVFP4,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_b12x_post_reference,
+        snap=_snap_to_nvfp4,
+        atol_frac=0.15,
+        rtol=0.1,
+    ),
+    "b12x_w4a16": _contract_handler(
+        B12xW4A16Config,
+        QuantVariant.W4A16,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_b12x_post_reference,
+        weight_snap=_snap_to_nvfp4,
+        prepare_weights=_prepare_b12x_w4a16,
+        # TODO: weight_snap removes the weight quantization error, so the
+        # remaining tolerance covers kernel accumulation plus the
+        # intermediate/epilogue rounding this FP32 oracle does not model.
+        # Tighten once SM120/121 CI can calibrate it.
+        atol_frac=0.05,
+        rtol=0.3,
+    ),
+}
+_B12X_BACKEND_KEYS = frozenset(("b12x_nvfp4", "b12x_w4a16"))
+_FP8_BLOCK_BACKEND_KEY = "cutlass_fp8_block"
+
+# Cfg.variant string <-> handler lookup (random-generation ids stay unchanged).
+_HANDLER_BY_ID = {
+    **{variant.name.lower(): handler for variant, handler in _DTYPE.items()},
+    **_CONTRACT_HANDLERS,
+}
 _FROMLOGITS_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -883,6 +1352,21 @@ _PREROUTED_VARIANT_IDS = tuple(
 
 def _handler_for(cfg):
     return _HANDLER_BY_ID[cfg.variant]
+
+
+def _activation_for(cfg):
+    return {
+        "swiglu": SwiGLU(),
+        "geglu": GeGLU(),
+        "situ": SiTU(),
+        "relu2": ReLU2(),
+        "geglutanh": GeGLUTanh(),
+        "swiglustep": SwiGLUStep(),
+        "identity": Identity(),
+        "gelu": GELU(),
+        "relu": ReLU(),
+        "silu": SiLU(),
+    }[cfg.activation]
 
 
 # ---------------------------------------------------------------------------
@@ -933,10 +1417,21 @@ _ROUTING_METHODS = [
     RoutingMethodType.TopK,
     RoutingMethodType.Sigmoid,
     RoutingMethodType.SigmoidRenorm,
+    RoutingMethodType.TopKSigmoid,  # top_k(raw) -> sigmoid
     RoutingMethodType.DeepSeekV3,  # sigmoid+bias -> group-topk -> top_k (#2575 lives here)
     RoutingMethodType.MiniMax2,  # sigmoid+bias -> top_k -> scaled sum-norm
     RoutingMethodType.Llama4,  # top1 -> sigmoid (top_k forced to 1)
 ]
+# Compiled in-kernel routing tiers are method-specific. Pre-routed modes bypass
+# these limits, but FromLogits must not generate a shape that the selected
+# routing policy cannot dispatch.
+_FROMLOGITS_MAX_EXPERTS = {
+    RoutingMethodType.Default: 256,
+    RoutingMethodType.TopK: 256,
+    RoutingMethodType.Sigmoid: 256,
+    RoutingMethodType.SigmoidRenorm: 256,
+    RoutingMethodType.Llama4: 128,
+}
 # Routing logits dtype axis: fp32 router logits are the #2796 class; bf16 is the common case.
 _LOGITS_DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
@@ -952,6 +1447,21 @@ _UNPACKED_BACKENDS = {
     cfg_cls
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if RoutingInputMode.UnpackedPrecomputed in runner_cls.supported_routing_modes
+}
+# Backend config classes whose runner can compute an EP shard (a local expert subset with
+# a nonzero offset), likewise derived from the runners' capability declaration. CUTLASS and
+# b12x kernels compute the full routed set only, so an EP config restricts to these.
+_EP_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if runner_cls.supports_expert_parallelism
+}
+# Backend config classes whose runners support do_finalize=False and return the
+# three-tensor unfinalized output contract.
+_UNFINALIZED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if issubclass(runner_cls, _TrtllmRunnerBase)
 }
 _UNPACKED_VARIANT_IDS = tuple(
     variant.name.lower()
@@ -1000,6 +1510,9 @@ class Cfg:
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+    do_finalize: bool = True
+    activation: str = "swiglu"
+    expected_backend: str = ""  # curated execution assertion; empty for random cases
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1037,8 +1550,10 @@ class Cfg:
             if self.num_fused_shared_experts
             else ""
         )
+        finalize = "" if self.do_finalize else "unfinalized_"
         return (
-            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{self.activation}_{sh}{mode}{finalize}"
+            f"{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1059,8 +1574,16 @@ def _gen(seed):
     # GPU footprint). Routing mode is chosen BEFORE this loop on purpose: non-EP-forced
     # configs (FromLogits / DeepSeekV3) hold the FULL expert set, so budgeting a sharded
     # `local` and flipping to non-EP afterwards would admit up to shards x the budget.
+    eligible_experts = _EXPERTS
+    if fromlogits and method in _FROMLOGITS_MAX_EXPERTS:
+        max_experts = _FROMLOGITS_MAX_EXPERTS[method]
+        eligible_experts = [ne for ne in _EXPERTS if ne <= max_experts]
     for _ in range(64):
-        ne, h, i = rng.choice(_EXPERTS), rng.choice(_HIDDEN), rng.choice(_INTERMED)
+        ne, h, i = (
+            rng.choice(eligible_experts),
+            rng.choice(_HIDDEN),
+            rng.choice(_INTERMED),
+        )
         # ~30%: expert-parallel shard -- split the global experts and pick a shard (offset>0). This
         # is how large MoE actually runs (no rank holds all experts) and exercises the offset path.
         local, offset = ne, 0
@@ -1071,6 +1594,11 @@ def _gen(seed):
                 offset = local * rng.randrange(shards)
         if _weight_elems(local, h, i) <= _WEIGHT_ELEM_BUDGET:
             break
+    else:
+        raise RuntimeError(
+            f"seed {seed} could not generate a unified-MoE fuzz shape within "
+            f"the {_WEIGHT_ELEM_BUDGET}-element weight budget after 64 attempts"
+        )
 
     # Method-specific top_k + group params.
     n_group = topk_group = 0
@@ -1137,6 +1665,16 @@ def _gen(seed):
         ):
             num_fused_shared_experts = rng.randint(1, max_shared)
 
+    activation = "swiglu"
+    if variant == "bf16":
+        # FromLogits and EP require TRTLLM, whose BF16 cubins expose SwiGLU
+        # and ReLU2. CUTLASS-only activations are valid only for non-EP
+        # pre-routed cases.
+        activation = rng.choice(
+            ("swiglu", "relu2")
+            if fromlogits or offset != 0 or local != ne
+            else ("swiglu", "relu2", "geglutanh", "swiglustep", "situ")
+        )
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
@@ -1156,6 +1694,7 @@ def _gen(seed):
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
+        activation=activation,
         num_fused_shared_experts=num_fused_shared_experts,
     )
 
@@ -1265,6 +1804,45 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # BF16 FromLogits bias/group routing
+    # Deterministic typed-activation coverage. Keep CUTLASS-only activations
+    # pre-routed so they have an executable candidate.
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_014, activation="relu2"),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_015,
+        activation="geglutanh",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_022,
+        activation="swiglustep",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_023,
+        activation="situ",
+        expected_backend="cutlass_bf16",
+    ),
     Cfg(
         16,
         7168,
@@ -1387,7 +1965,7 @@ _CURATED = [
         4,
         "mxfp4",
         "uniform",
-        900_032,
+        900_042,
         routing_input_mode="unpacked",
     ),
     Cfg(
@@ -1398,7 +1976,7 @@ _CURATED = [
         4,
         "w4a16",
         "imbalanced",
-        900_036,
+        900_043,
         routing_input_mode="unpacked",
         unpacked_weights_dtype="fp32",
     ),
@@ -1477,16 +2055,224 @@ _CURATED = [
             num_fused_shared_experts=num_shared,
         )
         for variant, num_shared, seed in (
-            ("nvfp4", 1, 900_042),
-            ("mxfp4", 2, 900_043),
+            ("nvfp4", 1, 900_045),
+            ("mxfp4", 2, 900_046),
             ("w4a16", 1, 900_044),
         )
     ],
+    # Issue #3926: every unified TRTLLM operator that exposes unfinalized
+    # intermediates must return BF16 expert weights for either logits dtype.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.Default,
+            routing_input_mode="fromlogits",
+            logits_dtype=logits_dtype,
+            do_finalize=False,
+        )
+        for variant, seed_base in (
+            ("bf16", 900_050),
+            ("fp8pertensor", 900_052),
+            ("deepseekfp8", 900_054),
+            ("mxint4", 900_056),
+            ("nvfp4", 900_058),
+            ("mxfp8", 900_060),
+        )
+        for logits_dtype, seed in (
+            ("bf16", seed_base),
+            ("fp32", seed_base + 1),
+        )
+    ],
+    # PackedPrecomputed + unfinalized coverage. Packed ids encode BF16 routing
+    # weights, but FP4 borrows topk_weights instead of allocating its own buffer.
+    # The value assertion below guards the returned weights across all TRTLLM
+    # variants and catches an invalid FP4 buffer.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.RenormalizeNaive,
+            routing_input_mode="prerouted",
+            do_finalize=False,
+        )
+        for variant, seed in (
+            ("bf16", 900_070),
+            ("fp8pertensor", 900_071),
+            ("deepseekfp8", 900_072),
+            ("mxint4", 900_073),
+            ("nvfp4", 900_074),
+            ("mxfp8", 900_075),
+        )
+    ],
+    # Contract-isolated CUTLASS and b12x coverage. These are deliberately
+    # curated-only: random generation and its historical seed stream remain
+    # unchanged. Every case is PackedPrecomputed, finalized, non-EP, and has a
+    # singleton backend candidate through its synthetic handler id.
+    *[
+        Cfg(
+            16,
+            128,
+            256,
+            4,
+            2,
+            variant,
+            "uniform",
+            seed,
+            activation=activation,
+            expected_backend=backend,
+        )
+        for variant, backend, activation, seed in (
+            ("cutlass_nvfp4", "cutlass_nvfp4", "swiglu", 900_080),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "geglutanh", 900_081),
+            (
+                "cutlass_fp8_per_tensor",
+                "cutlass_fp8_per_tensor",
+                "swiglu",
+                900_082,
+            ),
+            (
+                "cutlass_fp8_per_tensor",
+                "cutlass_fp8_per_tensor",
+                "geglutanh",
+                900_083,
+            ),
+            ("cutlass_fp8_block", "cutlass_fp8_block", "swiglu", 900_084),
+            ("cutlass_fp8_block", "cutlass_fp8_block", "geglutanh", 900_085),
+            (
+                "cutlass_mxfp8_mxfp4",
+                "cutlass_mxfp8_mxfp4",
+                "swiglu",
+                900_086,
+            ),
+            (
+                "cutlass_mxfp8_mxfp4",
+                "cutlass_mxfp8_mxfp4",
+                "geglutanh",
+                900_087,
+            ),
+            ("cutlass_mxfp8", "cutlass_mxfp8", "swiglu", 900_088),
+            ("cutlass_mxfp8", "cutlass_mxfp8", "geglutanh", 900_089),
+            ("cutlass_w4a8", "cutlass_w4a8", "swiglu", 900_090),
+            ("cutlass_w4a8", "cutlass_w4a8", "geglutanh", 900_091),
+            ("cutlass_humming", "cutlass_humming", "swiglu", 900_092),
+            ("cutlass_humming", "cutlass_humming", "geglutanh", 900_093),
+            ("b12x_nvfp4", "b12x_nvfp4", "swiglu", 900_094),
+            ("b12x_nvfp4", "b12x_nvfp4", "geglutanh", 900_095),
+            ("b12x_w4a16", "b12x_w4a16", "swiglu", 900_096),
+            ("b12x_w4a16", "b12x_w4a16", "relu2", 900_097),
+            # Non-gated geometry (gemm1_rows == I, no up/gate split). CUTLASS
+            # NVFP4 declares all four, so these reach the shared
+            # _apply_typed_activation branches that the gated cases cannot.
+            ("cutlass_nvfp4", "cutlass_nvfp4", "identity", 900_098),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "gelu", 900_099),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "relu", 900_100),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "silu", 900_101),
+        )
+    ],
 ]
+_CURATED_BY_SEED = {}
+for _cfg in _CURATED:
+    if _cfg.seed in _CURATED_BY_SEED:
+        raise ValueError(
+            "duplicate curated unified-MoE fuzz seed "
+            f"{_cfg.seed}: {_CURATED_BY_SEED[_cfg.seed].label} and {_cfg.label}"
+        )
+    _CURATED_BY_SEED[_cfg.seed] = _cfg
+
+
+def test_random_seed_stream_is_unchanged():
+    """Lock the raw ``_gen(i)`` stream independently of curated overlays."""
+    payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == "cff06d91b524c74c66863e4078e24303b431eeffbedc94b3237390bccd837e70"
+    )
+
+
+def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
+    expected = {
+        "cutlass_nvfp4": "cutlass_nvfp4",
+        "cutlass_fp8_per_tensor": "cutlass_fp8_per_tensor",
+        "cutlass_fp8_block": "cutlass_fp8_block",
+        "cutlass_mxfp8_mxfp4": "cutlass_mxfp8_mxfp4",
+        "cutlass_mxfp8": "cutlass_mxfp8",
+        "cutlass_w4a8": "cutlass_w4a8",
+        "cutlass_humming": "cutlass_humming",
+        "b12x_nvfp4": "b12x_nvfp4",
+        "b12x_w4a16": "b12x_w4a16",
+    }
+    for handler_id, backend_key in expected.items():
+        handler = _HANDLER_BY_ID[handler_id]
+        assert len(handler.candidate_configs) == 1
+        config_type = handler.candidate_configs[0]
+        assert _BACKEND_RUNNERS[config_type].backend_key == backend_key
+        assert backend_key not in _DETERMINISTIC
+
+
+def test_b12x_w4a16_uses_nvfp4_weight_snap():
+    # Its reference treats the canonical BF16 weights as the authority, so they
+    # must already sit on the grid _quantize_b12x_expert_weights will use.
+    assert _HANDLER_BY_ID["b12x_w4a16"].weight_snap is _snap_to_nvfp4
+
+
+def test_contract_curated_seeds_match_declared_capabilities():
+    contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
+    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_102))
+    for cfg in contract_cases:
+        handler = _handler_for(cfg)
+        config_type = handler.candidate_configs[0]
+        runner_type = _BACKEND_RUNNERS[config_type]
+        assert handler.variant in runner_type.supported_quant_variants
+        by_quant = runner_type.supported_activation_classes_by_quant
+        activations = (
+            by_quant[handler.variant]
+            if by_quant
+            else runner_type.supported_activation_classes
+        )
+        assert type(_activation_for(cfg)) in activations
+        assert cfg.routing_input_mode == "prerouted"
+        assert cfg.do_finalize and not cfg.is_ep
+        assert cfg.num_fused_shared_experts == 0
+        assert runner_type.backend_key == cfg.expected_backend
+
+
+def test_semantic_reference_applies_situ_clamp():
+    activation = SiTU(gate_scale=4.0, linear_scale=25.0, clamp_limit=1.0)
+    x = torch.tensor([[2.0]])
+    w1 = torch.tensor([[[3.0], [4.0]]])
+    w2 = torch.ones(1, 1, 1)
+    selected = torch.zeros(1, 1, dtype=torch.int32)
+    routing_weights = torch.ones(1, 1)
+
+    actual = _semantic_reference(x, w1, w2, selected, routing_weights, 1, activation)
+    up = torch.tensor(1.0)
+    gate = torch.tensor(1.0)
+    expected = (
+        activation.linear_scale
+        * torch.tanh(up / activation.linear_scale)
+        * activation.gate_scale
+        * torch.tanh(gate / activation.gate_scale)
+        * torch.sigmoid(gate)
+    )
+    torch.testing.assert_close(actual, expected.reshape(1, 1))
+
+
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
-    _curated_by_seed = {c.seed: c for c in _CURATED}
     _CONFIGS = [
-        _curated_by_seed.get(s) or _gen(s)
+        _CURATED_BY_SEED.get(s) or _gen(s)
         for s in (int(t) for t in _ONLY_SEEDS.split(",") if t.strip())
     ]
 else:
@@ -1522,6 +2308,9 @@ def _route(
         w, sel = torch.topk(lf, top_k, dim=-1)
     elif method == M.Sigmoid:  # sigmoid -> top_k (no renorm)
         w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
+    elif method == M.TopKSigmoid:  # top_k(raw) -> sigmoid over selected
+        raw, sel = torch.topk(lf, top_k, dim=-1)
+        w = torch.sigmoid(raw)
     elif (
         method == M.SigmoidRenorm
     ):  # sigmoid -> top_k -> renorm (divide by sum of selected)
@@ -1541,15 +2330,17 @@ def _route(
                 dim=-1
             )  # top-2 sum per group
             _, gidx = torch.topk(group_scores, k=topk_group, dim=-1)
-            gmask = torch.zeros_like(group_scores).scatter_(-1, gidx, 1.0)
+            gmask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
+                -1, gidx, True
+            )
             smask = (
                 gmask.unsqueeze(-1)
                 .expand(*sel_scores.shape[:-1], n_group, E // n_group)
                 .reshape(sel_scores.shape)
             )
-            sel_scores = (
-                sel_scores * smask
-            )  # zero out experts outside the selected groups
+            # A routing bias can make scores negative. Zero-masking would let an
+            # unselected expert outrank a valid negative score in the selected group.
+            sel_scores = sel_scores.masked_fill(~smask, float("-inf"))
         _, sel = torch.topk(sel_scores, top_k, dim=-1)
         w = torch.gather(scores, -1, sel)  # UNBIASED sigmoid weights
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1560,6 +2351,29 @@ def _route(
             f"routing method {method!r} not supported by the fuzzer oracle"
         )
     return sel.to(torch.int64), w.float()
+
+
+def test_deepseek_v3_route_excludes_unselected_groups_with_negative_scores():
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+    # Group 0 wins by its top-2 sum, but its fourth selection score is negative.
+    # Experts in group 1 must remain ineligible rather than becoming zero-score
+    # candidates that can displace that valid negative-score expert.
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    selected, _ = _route(
+        logits,
+        RoutingMethodType.DeepSeekV3,
+        top_k=4,
+        bias=bias,
+        n_group=2,
+        topk_group=1,
+        routed_scaling=1.0,
+    )
+
+    assert set(selected[0].tolist()) == {0, 1, 2, 3}
 
 
 def _master(cfg, handler):
@@ -1575,15 +2389,19 @@ def _master(cfg, handler):
     g = torch.Generator(device="cuda").manual_seed(cfg.seed)
     E_local, H, I, T = cfg.n_local, cfg.hidden, cfg.intermediate, cfg.num_tokens
 
-    def sparse(*shape):
+    def sparse(*shape, snap=handler.snap):
         dense = torch.randn(*shape, device="cuda", generator=g)
         keep = torch.rand(shape, device="cuda", generator=g) >= 0.75  # ~75% zeros
-        return handler.snap(dense * keep)
+        return snap(dense * keep)
 
     # Expert-major tensors carry the SHARED rows too (routed first, shared
     # appended); E_local stays routed-only, matching the API contract.
     rows = cfg.n_weight_rows
-    x, w1, w2 = sparse(T, H), sparse(rows, 2 * I, H), sparse(rows, H, I)
+    gemm1_rows = 2 * I if _activation_for(cfg).is_gated else I
+    x = sparse(T, H)
+    weight_snap = handler.weight_snap or handler.snap
+    w1 = sparse(rows, gemm1_rows, H, snap=weight_snap)
+    w2 = sparse(rows, H, I, snap=weight_snap)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -1646,13 +2464,146 @@ _SKIP_SUBSTR = (
     "only support",
 )
 _CRASH_SUBSTR = ("cuda error", "illegal memory", "misaligned", "device-side assert")
+# Broad skip terms also appear in real activation-plumbing errors, so these
+# concrete identifiers force such errors to fail. Do not add activation names:
+# "does not support SiTU" is a legitimate capability skip.
+_NEVER_SKIP_SUBSTR = (
+    "activation parameters",
+    "gemm1_alpha",
+    "gemm1_beta",
+    "gemm1_clamp_limit",
+)
 
 
 def _is_unsupported(e):
     msg = str(e).lower()
     if any(c in msg for c in _CRASH_SUBSTR):
         return False  # a crash is always a finding, never "unsupported"
-    return isinstance(e, NotImplementedError) or any(s in msg for s in _SKIP_SUBSTR)
+    # A runner raises NotImplementedError only for declared capability gaps, so
+    # honor it before the substring heuristics can second-guess the message.
+    if isinstance(e, NotImplementedError):
+        return True
+    if any(s in msg for s in _NEVER_SKIP_SUBSTR):
+        return False
+    return any(s in msg for s in _SKIP_SUBSTR)
+
+
+# Fragments, not full messages: the classifier must also match what a runner
+# raises on its own, whose prefix need not match the preflight wording. Keeping
+# the fragment primitive makes it a substring of the preflight reason by
+# construction, so the two cannot drift apart.
+_ENV_NEEDS_CUDA13 = "requires CUDA 13 or later"
+_ENV_NEEDS_CUTE_DSL = "requires the CuTe DSL package"
+_ENV_NEEDS_CUDA128 = "FP8 block scaling requires CUDA 12.8 or newer"
+_CONTRACT_ENVIRONMENT_ERRORS = tuple(
+    fragment.lower()
+    for fragment in (_ENV_NEEDS_CUDA13, _ENV_NEEDS_CUTE_DSL, _ENV_NEEDS_CUDA128)
+)
+
+
+def _is_contract_environment_unavailable(e: Exception) -> bool:
+    # Deliberately fail closed: only known environment diagnostics may skip.
+    # A reworded or new rejection should fail CI until it is classified rather
+    # than silently masking a backend capability regression.
+    msg = str(e).lower()
+    return any(reason in msg for reason in _CONTRACT_ENVIRONMENT_ERRORS)
+
+
+@functools.cache
+def _cuda_toolkit_version() -> tuple[int, int]:
+    version = get_cuda_version()
+    return version.major, version.minor
+
+
+def _contract_preflight_skip_reason(
+    cfg: Cfg,
+    *,
+    cuda_version: tuple[int, int] | None = None,
+    cute_dsl_available: bool | None = None,
+) -> str | None:
+    if cfg.variant in _B12X_BACKEND_KEYS:
+        if cuda_version is None:
+            cuda_version = _cuda_toolkit_version()
+        if cuda_version < (13, 0):
+            return f"b12x unified MoE {_ENV_NEEDS_CUDA13}"
+        if cute_dsl_available is None:
+            cute_dsl_available = is_cute_dsl_available()
+        if not cute_dsl_available:
+            return f"b12x unified MoE {_ENV_NEEDS_CUTE_DSL}"
+    elif cfg.variant == _FP8_BLOCK_BACKEND_KEY:
+        if cuda_version is None:
+            cuda_version = _cuda_toolkit_version()
+        if cuda_version < (12, 8):
+            return _ENV_NEEDS_CUDA128
+    return None
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    (
+        # A declared capability gap is a skip, even when the message names an
+        # activation -- matching on activation names would misreport this.
+        (NotImplementedError("backend does not support SiTU"), True),
+        (NotImplementedError("TrtllmBf16RoutedRunner does not support GeGLU"), True),
+        # Activation plumbing phrased as a shape error is the regression this
+        # fuzzer exists to catch, despite "must be" being a skip term.
+        (ValueError("gemm1_alpha must have shape (8,)"), False),
+        (
+            ValueError("runner: prepared weights are missing activation parameters"),
+            False,
+        ),
+        # Ordinary shape-capability rejections still skip.
+        (ValueError("hidden_size must be divisible by 128"), True),
+        # A crash is never "unsupported", however it is phrased.
+        (RuntimeError("CUDA error: illegal memory access"), False),
+    ),
+)
+def test_is_unsupported_classification(exc, expected):
+    assert _is_unsupported(exc) is expected
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    (
+        (ValueError("b12x unified MoE requires CUDA 13 or later."), True),
+        (RuntimeError("b12x unified MoE requires the CuTe DSL package."), True),
+        (NotImplementedError("backend does not support SiTU"), False),
+        (ValueError("hidden_size must be divisible by 128"), False),
+    ),
+)
+def test_contract_environment_classification(exc, expected):
+    assert _is_contract_environment_unavailable(exc) is expected
+
+
+def test_b12x_contract_preflight_requires_cuda_13():
+    b12x = _CURATED_BY_SEED[900_094]
+    cutlass = _CURATED_BY_SEED[900_080]
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(12, 9), cute_dsl_available=True
+        )
+        is not None
+    )
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(13, 0), cute_dsl_available=True
+        )
+        is None
+    )
+    assert _contract_preflight_skip_reason(cutlass, cuda_version=(12, 7)) is None
+
+
+def test_contract_preflight_checks_backend_environment():
+    b12x = _CURATED_BY_SEED[900_094]
+    fp8_block = _CURATED_BY_SEED[900_084]
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(13, 0), cute_dsl_available=False
+        )
+        is not None
+    )
+    assert _contract_preflight_skip_reason(fp8_block, cuda_version=(12, 7)) is not None
+    assert _contract_preflight_skip_reason(fp8_block, cuda_version=(12, 8)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1728,10 +2679,14 @@ def _fail(cfg: Cfg, tag: str, why: str, out=None, ref=None):
     pytest.fail("\n".join(parts))
 
 
+@pytest.mark.shard_group("unified-moe-accumulated")
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
+    # Crash-class quarantine gate: MUST precede any kernel launch (a quarantined config would
+    # poison the CUDA context for every later test in this process).
+    LEDGER.xfail_if_quarantined(cfg)
     # Full per-config determinism so any failure reproduces from the seed alone. Shapes
     # (random.Random(seed)) and input tensors (a per-config torch.Generator) are already seeded;
     # this pins the global RNG (the device probe), and the output buffer is initialized from the
@@ -1752,6 +2707,8 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
+    if reason := _contract_preflight_skip_reason(cfg):
+        pytest.skip(reason)
     if handler.variant is QuantVariant.W4A16 and sm == 103:
         pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
     if handler.variant is QuantVariant.MxInt4 and (
@@ -1774,7 +2731,66 @@ def test_unified_moe_fuzz(cfg):
         # Backends that accept separate tensors through their own ABI are not
         # implementations of RoutingInputMode.UnpackedPrecomputed.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
+    if not cfg.do_finalize:
+        # Only TRTLLM returns unfinalized intermediates; like the EP filter
+        # below, this keeps an unsupported arch on the precise skip path.
+        wired_backends = [B for B in wired_backends if B in _UNFINALIZED_BACKENDS]
+    if cfg.is_ep:
+        # An EP shard needs the runner to map global ids onto a local expert subset;
+        # backends without that capability (CUTLASS, b12x) would fail MoELayer's
+        # check_support, and with no other candidate the case must SKIP, not FAIL.
+        wired_backends = [B for B in wired_backends if B in _EP_BACKENDS]
+    if _BACKEND_FILTER:
+        wired_backends = [
+            B
+            for B in wired_backends
+            if _BACKEND_RUNNERS[B].backend_key in _BACKEND_FILTER
+        ]
+    expected_backend_available = bool(
+        cfg.expected_backend
+        and any(
+            _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend and B.supported(sm)
+            for B in handler.candidate_configs
+            if B in _BACKEND_RUNNERS
+        )
+    )
+    # The debug allowlist deliberately narrows execution to one backend, so it
+    # must retire the curated assertion rather than trip it: otherwise bisecting
+    # with FLASHINFER_UMOE_FUZZ_BACKENDS fails every curated case by design.
+    if _BACKEND_FILTER and cfg.expected_backend not in _BACKEND_FILTER:
+        expected_backend_available = False
+    if expected_backend_available and not any(
+        _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend for B in wired_backends
+    ):
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} was filtered "
+            "before execution"
+        )
+    # A backend-scoped crash quarantine must take effect before backend-native
+    # weight preparation or MoELayer construction: both can load modules and
+    # launch CUDA preparation kernels. Keep the findings so the overall case
+    # still reports XFAIL after all healthy backends have run.
+    quarantined_backends = []
+    healthy_backends = []
+    for BackendCfg in wired_backends:
+        backend_key = _BACKEND_RUNNERS[BackendCfg].backend_key
+        quarantine = LEDGER.skip_backend(cfg, backend_key)
+        if quarantine:
+            quarantined_backends.append((quarantine, backend_key))
+            # A quarantined backend is intentionally never launched, so the
+            # curated "expected backend must execute" assertion cannot hold.
+            # Leaving it armed would report a ledger-tracked crash as a plain
+            # test failure instead of the XFAIL the ledger asks for.
+            if backend_key == cfg.expected_backend:
+                expected_backend_available = False
+        else:
+            healthy_backends.append(BackendCfg)
+    wired_backends = healthy_backends
     if not wired_backends:
+        LEDGER.report_expected_failures(
+            quarantined_backends,
+            context=f"all candidate backends quarantined for {cfg.label}",
+        )
         mode = (
             "in-kernel-routing "
             if cfg.is_fromlogits
@@ -1795,7 +2811,7 @@ def test_unified_moe_fuzz(cfg):
         if cfg.is_unpacked
         else final_scales
     )
-    ref = handler.reference(
+    reference_args = (
         x,
         w1,
         w2,
@@ -1804,8 +2820,12 @@ def test_unified_moe_fuzz(cfg):
         cfg.intermediate,
         cfg.expert_offset,
     )
-    atol = handler.atol_frac * ref.abs().max().item() + 1e-3
-    rtol = handler.rtol
+    ref = None
+    if handler.post_prepare_reference is None:
+        if handler.variant is QuantVariant.BF16:
+            ref = handler.reference(*reference_args, activation=_activation_for(cfg))
+        else:
+            ref = handler.reference(*reference_args)
 
     # One activation pack + one weight pack with each backend's native view, all built from the
     # SAME bf16 inputs (this rank's LOCAL shard) via the API's uniform prepare_weights. In-kernel
@@ -1825,12 +2845,14 @@ def test_unified_moe_fuzz(cfg):
                 routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
             )
     weight_pack = MoEWeightPack()
+    prepared_views = {}
     for BackendCfg in wired_backends:
         prepare_kwargs = dict(
             num_local_experts=cfg.n_weight_rows,
             hidden_size=cfg.hidden,
             intermediate_size=cfg.intermediate,
             device=dev,
+            activation=_activation_for(cfg),
         )
         # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
@@ -1841,14 +2863,37 @@ def test_unified_moe_fuzz(cfg):
                 hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),
             )
-        weight_pack.prepare_for(
-            _BACKEND_RUNNERS[BackendCfg].backend_key,
-            BackendCfg.prepare_weights(
-                w1,
-                w2,
-                **prepare_kwargs,
-            ),
+        view = (
+            handler.prepare_weights(BackendCfg, w1, w2, **prepare_kwargs)
+            if handler.prepare_weights is not None
+            else BackendCfg.prepare_weights(w1, w2, **prepare_kwargs)
         )
+        backend_key = _BACKEND_RUNNERS[BackendCfg].backend_key
+        prepared_views[backend_key] = view
+        weight_pack.prepare_for(backend_key, view)
+
+    if handler.post_prepare_reference is not None:
+        assert len(prepared_views) == 1
+        view = next(iter(prepared_views.values()))
+        # Keep activation quantization artifacts beside the prepared view only
+        # for the independent reference; they are not added to MoEWeightPack.
+        reference_view = dict(view)
+        reference_view["_activation_q"] = act_pack.hidden_states_q
+        reference_view["_activation_scale"] = act_pack.hidden_states_scale
+        ref = handler.post_prepare_reference(
+            x,
+            w1,
+            w2,
+            selected_experts,
+            final_scales,
+            cfg.intermediate,
+            reference_view,
+            _activation_for(cfg),
+        )
+    assert ref is not None
+    ref_abs_max = ref.abs().max().item()
+    atol = handler.atol_frac * ref_abs_max + 1e-3
+    rtol = handler.rtol
 
     config = MoEConfig(
         routing=RoutingConfig(
@@ -1866,19 +2911,85 @@ def test_unified_moe_fuzz(cfg):
             local_expert_offset=cfg.expert_offset,
             num_fused_shared_experts=cfg.num_fused_shared_experts,
         ),
-        activation=ActivationConfig(),
+        activation=_activation_for(cfg),
         backend=BackendOptions(
             candidates=tuple(BackendCfg() for BackendCfg in wired_backends)
         ),
-        execution=ExecutionConfig(tune_max_num_tokens=max(cfg.num_tokens, 8192)),
+        execution=ExecutionConfig(
+            tune_max_num_tokens=(
+                cfg.num_tokens
+                if os.environ.get("FLASHINFER_UMOE_FUZZ_TUNE_REAL_SHAPE")
+                else max(cfg.num_tokens, 8192)
+            )
+        ),
+        finalize=MoEFinalizeConfig(do_finalize=cfg.do_finalize),
     )
 
     try:
         layer = MoELayer(config)
     except Exception as e:
         if _is_unsupported(e):
+            if (
+                cfg.variant in _CONTRACT_HANDLERS
+                and _is_contract_environment_unavailable(e)
+            ):
+                pytest.skip(
+                    f"contract backend {cfg.expected_backend!r} unavailable: {e}"
+                )
+            if expected_backend_available:
+                pytest.fail(
+                    f"{cfg.label}: expected backend {cfg.expected_backend!r} "
+                    f"failed MoELayer construction: {e}"
+                )
             pytest.skip(f"MoELayer rejected {cfg.label}: {e}")
         raise
+
+    if not cfg.do_finalize:
+        result = layer(act_pack, weight_pack)
+        assert isinstance(result, list) and len(result) == 3, (
+            "do_finalize=False must return "
+            "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx], got "
+            f"{type(result).__name__} of length "
+            f"{len(result) if isinstance(result, list) else 'n/a'}"
+        )
+        gemm2_output, expert_weights, expanded_idx_to_permuted_idx = result
+        assert gemm2_output.shape[-1] == cfg.hidden
+        assert expert_weights.dtype == torch.bfloat16, (
+            "do_finalize=False expert_weights must be bfloat16, got "
+            f"{expert_weights.dtype} for routing_logits dtype {cfg.logits_dtype}"
+        )
+        assert tuple(expert_weights.shape) == (cfg.num_tokens, cfg.top_k)
+        assert expanded_idx_to_permuted_idx.numel() == cfg.num_tokens * cfg.top_k
+        torch.testing.assert_close(
+            expert_weights.float(),
+            final_scales.to(torch.bfloat16).float(),
+            rtol=2e-2,
+            atol=2e-3,
+        )
+
+        permutation = expanded_idx_to_permuted_idx.to(torch.long)
+        assert (permutation >= 0).all()
+        assert permutation.unique().numel() == permutation.numel()
+        assert permutation.max().item() < gemm2_output.shape[0]
+
+        recombined = (
+            gemm2_output[permutation]
+            .view(cfg.num_tokens, cfg.top_k, cfg.hidden)
+            .float()
+            .mul(expert_weights.float().unsqueeze(-1))
+            .sum(dim=1)
+        )
+        abs_diff = (recombined - ref).abs()
+        over_tol = abs_diff > (atol + rtol * ref.abs())
+        if over_tol.any():
+            _fail(
+                cfg,
+                "unfinalized host recombination",
+                f"{int(over_tol.sum())}/{recombined.numel()} elems exceed tol",
+                recombined,
+                ref,
+            )
+        return
 
     out_shape = (cfg.num_tokens, cfg.hidden)
 
@@ -1908,7 +3019,11 @@ def test_unified_moe_fuzz(cfg):
             and tuple(t.shape) == out_shape
             and t.data_ptr() not in act_ptrs
         ]
-        assert bufs, "could not locate the output buffer in pack_inputs"
+        # b12x's wrapper allocates and returns its output internally, so
+        # pack_inputs intentionally has no caller-visible output to initialize.
+        # Its clean run still receives the numeric and non-finite checks below.
+        if runner.backend_key not in _B12X_BACKEND_KEYS:
+            assert bufs, "could not locate the output buffer in pack_inputs"
         for b in bufs:
             handler.poison(b, poison_gen) if poison else b.zero_()
         out = runner.forward(inputs, tactic=-1)
@@ -1917,6 +3032,14 @@ def test_unified_moe_fuzz(cfg):
         return out
 
     def assert_correct(out, tag):
+        if ref_abs_max > 0 and out.abs().max().item() == 0:
+            _fail(
+                cfg,
+                tag,
+                "all-zero output for a nonzero reference",
+                out,
+                ref,
+            )
         # (1) no NaN/Inf where the reference is finite.
         n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
         if n_bad != 0:
@@ -1945,6 +3068,8 @@ def test_unified_moe_fuzz(cfg):
     def check_backend(runner, out, tag):
         # (1)+(2) no-NaN + numeric vs the authoritative reference, on a clean run.
         assert_correct(out, tag)
+        if os.environ.get("FLASHINFER_UMOE_FUZZ_LEAN"):
+            return  # debug: minimal per-config work for sanitizer runs (gh #3957)
         # (3) determinism per the backend's contract: deterministic backends must reproduce
         # bitwise; non-deterministic ones (atomic-scatter finalize) are exempt.
         if _DETERMINISTIC.get(runner.backend_key, False):
@@ -1961,13 +3086,18 @@ def test_unified_moe_fuzz(cfg):
         # (4) output-buffer poison: the kernel owns its (uninitialized `new_empty`) output, so the
         # result must NOT depend on it being clean. torch's allocator usually hands back zeros and
         # hides this; poisoning forces it -- the torch->JAX hazard (GH-6158764 padding leak).
-        assert_correct(run(runner, poison=True), f"{tag} [poisoned-output]")
+        # b12x cannot participate because its wrapper does not expose that
+        # internally allocated output through pack_inputs.
+        if runner.backend_key not in _B12X_BACKEND_KEYS:
+            assert_correct(run(runner, poison=True), f"{tag} [poisoned-output]")
         # (5) autotune-tactic sweep: EVERY valid tactic must be correct, not just the default --
         # the autotuner-picks-a-bad-tactic class (#3168/#3227) on the real MoELayer dispatch.
         inputs = runner.pack_inputs(act_pack, weight_pack)
         try:
             tactics = runner.get_valid_tactics(inputs, None)
         except Exception:
+            if cfg.variant in _CONTRACT_HANDLERS:
+                raise
             tactics = []  # backend needs a profile object -> skip the sweep (default tactic stands)
         for tactic in tactics:
             o = runner.forward(inputs, tactic=tactic)
@@ -1976,6 +3106,8 @@ def test_unified_moe_fuzz(cfg):
             assert_correct(o, f"{tag} [tactic={tactic}]")
 
     n_ran = 0
+    ran_backends = set()
+    expected_failures = []
     for runner in layer.runners:
         try:
             out = run(runner)
@@ -1985,30 +3117,41 @@ def test_unified_moe_fuzz(cfg):
             raise
         tag = f"{runner.backend_key} {cfg.label}"
         n_ran += 1
+        ran_backends.add(runner.backend_key)
 
-        known = _known_failure(runner.backend_key, cfg)
+        known = LEDGER.find(cfg, backend=runner.backend_key)
         if known:  # tracked bug -> run it, tolerate a wrong answer, but flag if it starts passing
             try:
                 check_backend(runner, out, tag)
             except (AssertionError, pytest.fail.Exception):
+                expected_failures.append((known, tag))
                 continue
-            warnings.warn(
-                f"{tag}: KNOWN-FAILURE unexpectedly PASSED -- fixed? remove from "
-                f"_KNOWN_FAILURES ({known})",
-                stacklevel=2,
-            )
+            LEDGER.flag_xpass(known, tag)
         else:
             check_backend(runner, out, tag)
 
     if n_ran == 0:
+        LEDGER.report_expected_failures(
+            quarantined_backends,
+            context=f"all candidate backends quarantined for {cfg.label}",
+        )
         pytest.skip(f"no runner ran {cfg.label} on SM{sm}")
+    if expected_backend_available and cfg.expected_backend not in ran_backends:
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} did not execute"
+        )
 
     # (6) autotune-ON: drive the REAL production path -- MoELayer._select_winner profiles every
     # tactic of every runner (the #3168 profiling-IMA class) then selects + caches a winner; the
     # autotuned output must match the authoritative reference. Gated to a subset (profiling is slow)
     # and skipped if a candidate has a known failure (the tuner could pick the broken backend).
-    autotune_due = cfg.seed % 4 == 0 and not any(
-        _known_failure(_BACKEND_RUNNERS[B].backend_key, cfg) for B in wired_backends
+    autotune_due = (
+        not _NO_AUTOTUNE
+        and cfg.seed % 4 == 0
+        and not any(
+            LEDGER.find(cfg, backend=_BACKEND_RUNNERS[B].backend_key)
+            for B in wired_backends
+        )
     )
     if autotune_due:
         with autotune(True):
@@ -2025,6 +3168,10 @@ def test_unified_moe_fuzz(cfg):
     torch.cuda.synchronize()
     assert torch.isfinite(probe).all(), (
         f"{cfg.label}: CUDA context corrupted after MoE run"
+    )
+    LEDGER.report_expected_failures(
+        [*expected_failures, *quarantined_backends],
+        context=f"tracked backend failures for {cfg.label}",
     )
 
 
@@ -2120,7 +3267,7 @@ def test_autotune_cache_coherence(base, variant):
             routing=RoutingConfig(num_experts=E, top_k=top_k),
             quant=QuantConfig(variant=variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
-            activation=ActivationConfig(),
+            activation=SwiGLU(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),
             execution=ExecutionConfig(tune_max_num_tokens=max(_CACHE_TOKEN_SEQ)),
         )

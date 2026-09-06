@@ -22,7 +22,7 @@ path dispatches eligible decode calls here (toggle with
 for tests and benchmarks of the packed-input entry point.
 
 Same numerical contract and tensor layouts as the exported Cake backend in
-``flashinfer.kda_kernels.packed_kda_decode``: packed bf16 QKV rows, raw gate
+``flashinfer.kda_kernels.cake_packed_kda_decode``: packed bf16 QKV rows, raw gate
 and beta logits, ``scale = 1/sqrt(128)``, L2 epsilon ``1e-6``,
 ``lower_bound = -5``, bf16 state pool updated in place, and ``-1`` state
 indices producing zero output without touching the pool.
