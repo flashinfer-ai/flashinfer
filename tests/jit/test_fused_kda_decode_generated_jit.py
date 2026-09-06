@@ -159,9 +159,7 @@ def test_checked_in_manifest_uses_profiled_positive_direct_routes(
         lower_bound=-5.0,
         norm_eps=1e-5,
         x_row_stride=3 * num_heads * 128 + 17,
-        conv_slot_stride=(
-            3 * num_heads * 128 * 3 + num_heads * 128 * 128 * 2
-        ),
+        conv_slot_stride=(3 * num_heads * 128 * 3 + num_heads * 128 * 128 * 2),
         beta_row_stride=num_heads + 1,
         state_slot_stride=num_heads * 128 * 128,
         output_gate_row_stride=num_heads * 128 + 7,
