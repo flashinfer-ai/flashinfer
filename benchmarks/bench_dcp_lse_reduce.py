@@ -90,6 +90,7 @@ def _benchmark_case(
     dtype: torch.dtype,
     samples: int,
     launches_per_sample: int,
+    graph_launches_per_replay: int,
 ) -> None:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -168,6 +169,26 @@ def _benchmark_case(
         launches_per_sample=launches_per_sample,
     )
 
+    graph_50 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_50):
+        for _ in range(graph_launches_per_replay):
+            graph_50_output = decode_cp_a2a_lse_reduce(
+                partial_o,
+                partial_lse,
+                workspace,
+                cp_rank=rank,
+                cp_size=world_size,
+            )
+    graph_50_us = [
+        value / graph_launches_per_replay
+        for value in _measure(
+            graph_50.replay,
+            warmup=10,
+            samples=samples,
+            launches_per_sample=1,
+        )
+    ]
+
     dist.barrier()
     nccl_baseline_us = _measure(
         nccl_baseline_call,
@@ -179,6 +200,11 @@ def _benchmark_case(
     # Verify the communication permutation and merge outside the timed loops.
     torch.testing.assert_close(
         eager_call(), nccl_baseline_call(), rtol=1e-2, atol=1e-3
+    )
+    graph_50.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        graph_50_output, nccl_baseline_call(), rtol=1e-2, atol=1e-3
     )
 
     result = {
@@ -193,6 +219,7 @@ def _benchmark_case(
             nccl_baseline_us, world_size
         ),
         "graph_max_rank_median_us": _max_rank_median(graph_us, world_size),
+        "graph_50_max_rank_median_us": _max_rank_median(graph_50_us, world_size),
     }
     if rank == 0:
         print("DCP_LSE_BENCH " + json.dumps(result, sort_keys=True), flush=True)
@@ -204,6 +231,7 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--launches-per-sample", type=int, default=50)
+    parser.add_argument("--graph-launches-per-replay", type=int, default=50)
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -230,6 +258,7 @@ def main() -> None:
                 dtype=torch.bfloat16,
                 samples=args.samples,
                 launches_per_sample=args.launches_per_sample,
+                graph_launches_per_replay=args.graph_launches_per_replay,
             )
     finally:
         dist.destroy_process_group()
