@@ -262,6 +262,8 @@ PageAttention for MLA
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
+    supported_sparse_mla_sm120_configs
+    SparseMLASm120DecodeConfig
 
 .. note::
 

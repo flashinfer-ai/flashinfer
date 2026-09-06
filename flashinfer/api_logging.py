@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple, Optional, cast
@@ -2542,6 +2543,187 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
             return result
 
         return _attach_fi_trace(wrapper, f, trace_template=trace)
+
+    if func is None:
+        return decorator
+    return decorator(func)
+
+
+# ---------------------------------------------------------------------------
+# Experimental API and backend gating
+#
+# See flashinfer/experimental/README.md for the full policy governing
+# experimental APIs and backends.
+#
+# Opting in is explicit and needs no environment variable: calling a function
+# marked @flashinfer_experimental_api, or naming an experimental backend
+# (backend="<name>") in a stable API. The environment variable below gates
+# only *automatic* selection -- backend="auto" (heuristics and autotuning) may
+# pick an experimental backend only when it is set.
+# ---------------------------------------------------------------------------
+
+_EXPERIMENTAL_AUTO_ENV_VAR = "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS"
+
+# (api_name, backend) pairs that have already emitted an ExperimentalWarning.
+_WARNED_EXPERIMENTAL_BACKENDS: set = set()
+
+
+class ExperimentalWarning(UserWarning):
+    """Warning emitted on first use of experimental FlashInfer functionality.
+
+    Emitted once per experimental API (``@flashinfer_experimental_api``) and
+    once per (stable API, experimental backend) pair. Experimental APIs and
+    backends provide no compatibility or long-term support guarantees and may
+    change or be removed without deprecation.
+    """
+
+
+def experimental_auto_backends_allowed() -> bool:
+    """Return whether ``backend="auto"`` may select experimental backends.
+
+    True when ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. This is the
+    only thing the variable controls: explicitly calling an experimental API,
+    or explicitly naming an experimental backend, never requires it.
+
+    The environment variable is read on every call so the gate can be
+    toggled at runtime (e.g. in tests). The check is a single dict lookup
+    and is not a hot-path concern.
+    """
+    return os.environ.get(_EXPERIMENTAL_AUTO_ENV_VAR, "0") == "1"
+
+
+def _experimental_auto_backends_message(feature: str) -> str:
+    return (
+        f"automatic backend selection for '{feature}' considers only stable "
+        f'backends. Set {_EXPERIMENTAL_AUTO_ENV_VAR}=1 to let backend="auto" '
+        f"(dispatch and autotuning) include experimental backends, or select the "
+        f"experimental backend explicitly with backend=. Experimental backends "
+        f"provide no compatibility guarantees and may change or be removed "
+        f"without deprecation."
+    )
+
+
+def require_experimental_auto_backends(feature: str) -> None:
+    """Raise ``RuntimeError`` unless automatic selection may use experimental backends.
+
+    For stable APIs that route ``backend="auto"`` by hand (without
+    ``@backend_requirement``, which applies this gate itself): call this in the
+    automatic-routing branch before handing off to an experimental backend.
+    Do **not** call it on the explicit ``backend="<experimental>"`` branch --
+    explicit selection is already the user's opt-in.
+
+    >>> if backend == "auto" and candidate == "experimental_xyz":
+    ...     require_experimental_auto_backends("mm_xyz -> experimental_xyz")
+    ...     from flashinfer.experimental import xyz  # deferred import
+    ...     return xyz.run(...)
+
+    Parameters
+    ----------
+    feature : str
+        Human-readable description used in the error message.
+    """
+    if not experimental_auto_backends_allowed():
+        raise RuntimeError(_experimental_auto_backends_message(feature))
+
+
+def warn_experimental_backend_once(
+    api_name: str, backend: str, *, automatic: bool = False
+) -> None:
+    """Emit :class:`ExperimentalWarning` once per ``(api_name, backend)`` pair.
+
+    Used by ``@backend_requirement`` when a stable API selects a backend marked
+    with ``@experimental_backend``, whether explicitly (``automatic=False``) or
+    through ``backend="auto"`` with the opt-in set (``automatic=True``).
+    """
+    key = (api_name, backend)
+    if key in _WARNED_EXPERIMENTAL_BACKENDS:
+        return
+    _WARNED_EXPERIMENTAL_BACKENDS.add(key)
+    how = "may be selected automatically for" if automatic else "selected for"
+    warnings.warn(
+        f"experimental backend '{backend}' {how} '{api_name}': it provides no "
+        f"compatibility guarantees and may change or be removed without "
+        f"deprecation.",
+        ExperimentalWarning,
+        stacklevel=3,
+    )
+
+
+def flashinfer_experimental_api(
+    func: Callable = None,
+    *,
+    trace=None,
+    feature: Optional[str] = None,
+) -> Callable:
+    """Decorator marking a public FlashInfer API as experimental.
+
+    Composes with :func:`flashinfer_api` (the wrapped function keeps API
+    logging, tensor dumping, and ``fi_trace`` support) and additionally:
+
+    - emits an :class:`ExperimentalWarning` once per decorated function, on
+      first use;
+    - sets ``is_experimental = True`` on the returned function so tooling can
+      mechanically identify experimental APIs;
+    - prepends an experimental-status warning to the docstring (picked up by
+      Sphinx).
+
+    Calling an experimental API is itself the opt-in; no environment variable
+    is required. ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS`` only affects
+    ``backend="auto"`` selection inside stable APIs (see
+    ``flashinfer.utils.experimental_backend``).
+
+    Experimental APIs live in core (not under ``flashinfer.experimental``)
+    but must keep backend-specific logic under ``flashinfer.experimental``;
+    see ``flashinfer/experimental/README.md`` for the placement rules.
+
+    Parameters
+    ----------
+    trace : Optional[TraceTemplate]
+        Forwarded to :func:`flashinfer_api`. Optional for experimental APIs.
+    feature : Optional[str]
+        Human-readable feature name used in the warning and docstring banner.
+        Defaults to the function's qualified name.
+
+    Examples
+    --------
+    >>> @flashinfer_experimental_api
+    ... def my_new_op(x, y):
+    ...     ...
+    """
+
+    def decorator(f: Callable) -> Callable:
+        # Mark the original too: flashinfer_api registers `f` (not the wrapper)
+        # in _TRACE_REGISTRY, and the stable trace tests filter on this flag.
+        f.is_experimental = True  # type: ignore[attr-defined]
+        logged = flashinfer_api(f, trace=trace)
+        feature_name = feature if feature is not None else f.__qualname__
+        warned = False
+
+        @functools.wraps(logged)
+        def wrapper(*args, **kwargs):
+            nonlocal warned
+            if not warned:
+                warned = True
+                warn_msg = (
+                    f"'{feature_name}' is an experimental FlashInfer API: it "
+                    f"provides no compatibility guarantees and may change or be "
+                    f"removed without deprecation."
+                )
+                warnings.warn(warn_msg, ExperimentalWarning, stacklevel=2)
+            return logged(*args, **kwargs)
+
+        wrapper.is_experimental = True  # type: ignore[attr-defined]
+        wrapper.experimental_feature = feature_name  # type: ignore[attr-defined]
+        banner = (
+            ".. warning::\n"
+            f"    ``{feature_name}`` is experimental: it provides no "
+            f"compatibility guarantees and may change or be removed without "
+            f"deprecation."
+        )
+        wrapper.__doc__ = (
+            banner if logged.__doc__ is None else banner + "\n\n" + logged.__doc__
+        )
+        return wrapper
 
     if func is None:
         return decorator

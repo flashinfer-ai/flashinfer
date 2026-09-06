@@ -122,8 +122,14 @@ def collect_registered_trace_templates() -> list[TraceRegistryEntry]:
 
     from flashinfer.api_logging import _TRACE_REGISTRY
 
+    # Experimental APIs live in core modules, so filter them by the flag that
+    # @flashinfer_experimental_api sets on the registered function; they are
+    # exercised by the experimental lane, not the stable trace tests.
     entries = [
-        entry for entry in _TRACE_REGISTRY if entry[0].__module__ in available_modules
+        entry
+        for entry in _TRACE_REGISTRY
+        if entry[0].__module__ in available_modules
+        and not getattr(entry[0], "is_experimental", False)
     ]
     keys = [trace_registry_entry_key(entry) for entry in entries]
     if len(keys) != len(set(keys)):
