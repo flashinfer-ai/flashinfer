@@ -75,6 +75,7 @@ def _manifest(
                 "kernel_symbol": kernel_symbol,
                 "abi_kind": abi_kind,
                 "state_dtype": state_dtype,
+                "slot_offset_bits": 32,
                 "extra_cuda_cflags": ["--use_fast_math", "--maxrregcount=128"],
                 "launch": {
                     "threads": 256,
@@ -127,8 +128,8 @@ def test_checked_in_manifest_enables_all_generated_routes():
         manifest_path=csrc_dir / generated._MANIFEST_FILENAME,
         csrc_dir=csrc_dir,
     )
-    assert len(variants) == 22
-    assert len({variant.name for variant in variants}) == 22
+    assert len(variants) == 44
+    assert len({variant.name for variant in variants}) == 44
     assert {variant.target for variant in variants} == {"sm100a"}
     assert generated.fused_kda_decode_generated_is_available()
 
@@ -154,6 +155,7 @@ def test_checked_in_manifest_uses_profiled_positive_direct_routes(
         target="sm100a",
         num_heads=num_heads,
         num_rows=num_rows,
+        num_slots=num_rows + 1,
         state_dtype="float32",
         slot_class="positive_unique",
         lower_bound=-5.0,
@@ -211,6 +213,10 @@ def test_complete_manifest_verifies_source_identity_abi_and_launch(tmp_path):
                 extra_cuda_cflags=["-DUNVERIFIED=1"]
             ),
             "not an allowed generated-kernel flag",
+        ),
+        (
+            lambda payload: payload["variants"][0].update(slot_offset_bits=True),
+            "slot_offset_bits must be 32 or 64",
         ),
     ],
 )
@@ -300,6 +306,10 @@ def test_manifest_selector_matches_exact_rules_and_falls_back_for_gaps(tmp_path)
             "output_gate_row_stride": None,
         },
     )
+    wide_variant = json.loads(json.dumps(payload["variants"][0]))
+    wide_variant["name"] = "single_cta_wide_slot_offsets"
+    wide_variant["slot_offset_bits"] = 64
+    payload["variants"].insert(0, wide_variant)
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     variants = generated.load_fused_kda_decode_generated_variants(
         manifest_path=manifest_path,
@@ -309,6 +319,7 @@ def test_manifest_selector_matches_exact_rules_and_falls_back_for_gaps(tmp_path)
         "target": "sm100a",
         "num_heads": 32,
         "num_rows": 32,
+        "num_slots": 33,
         "state_dtype": "float32",
         "slot_class": "positive_unique",
         "lower_bound": -5.0,
@@ -321,7 +332,13 @@ def test_manifest_selector_matches_exact_rules_and_falls_back_for_gaps(tmp_path)
         "variants": variants,
     }
 
-    assert generated.select_fused_kda_decode_generated_variant(**facts) is variants[0]
+    assert generated.select_fused_kda_decode_generated_variant(**facts) is variants[1]
+    assert (
+        generated.select_fused_kda_decode_generated_variant(
+            **{**facts, "num_slots": 4097}
+        )
+        is variants[0]
+    )
     assert (
         generated.select_fused_kda_decode_generated_variant(**{**facts, "num_rows": 65})
         is None

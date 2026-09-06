@@ -766,6 +766,7 @@ def _select_generated_variant(
             target="sm100a",
             num_heads=num_heads,
             num_rows=num_rows,
+            num_slots=int(conv_state.shape[0]),
             state_dtype=state_dtype,
             slot_class=slot_class,
             lower_bound=None if lower_bound is None else float(lower_bound),

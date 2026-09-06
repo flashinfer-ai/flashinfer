@@ -129,6 +129,7 @@ _VARIANT_KEYS = frozenset(
         "kernel_symbol",
         "abi_kind",
         "state_dtype",
+        "slot_offset_bits",
         "extra_cuda_cflags",
         "launch",
         "eligibility",
@@ -197,6 +198,7 @@ class FusedKDADecodeGeneratedVariant:
     kernel_symbol: str
     abi_kind: str
     state_dtype: str
+    slot_offset_bits: int
     extra_cuda_cflags: tuple[str, ...]
     threads: int
     dynamic_smem_bytes: int
@@ -621,6 +623,7 @@ def load_fused_kda_decode_generated_variants(
         source_sha256 = item["source_sha256"]
         abi_kind = item["abi_kind"]
         state_dtype = item["state_dtype"]
+        slot_offset_bits = item["slot_offset_bits"]
         _require(
             isinstance(name, str) and _SLUG.fullmatch(name) is not None, f"{label}.name"
         )
@@ -642,6 +645,10 @@ def load_fused_kda_decode_generated_variants(
         _require(
             state_dtype in ("bfloat16", "float32"),
             f"{label}.state_dtype must be bfloat16 or float32",
+        )
+        _require(
+            type(slot_offset_bits) is int and slot_offset_bits in (32, 64),
+            f"{label}.slot_offset_bits must be 32 or 64",
         )
         assert isinstance(name, str)
         assert isinstance(target, str)
@@ -700,6 +707,7 @@ def load_fused_kda_decode_generated_variants(
                 kernel_symbol=kernel_symbol,
                 abi_kind=abi_kind,
                 state_dtype=state_dtype,
+                slot_offset_bits=slot_offset_bits,
                 extra_cuda_cflags=_validate_extra_cuda_cflags(
                     item["extra_cuda_cflags"], f"{label}.extra_cuda_cflags"
                 ),
@@ -748,6 +756,7 @@ def select_fused_kda_decode_generated_variant(
     target: FusedKDADecodeGeneratedTarget,
     num_heads: int,
     num_rows: int,
+    num_slots: int,
     state_dtype: str,
     slot_class: FusedKDADecodeGeneratedSlotClass,
     lower_bound: float | None,
@@ -772,6 +781,7 @@ def select_fused_kda_decode_generated_variant(
         f"num_heads must be one of {_CONTRACT['supported_heads']}",
     )
     _require(num_rows > 0, "num_rows must be positive")
+    _require(num_slots > 0, "num_slots must be positive")
     _require(state_dtype in _CONTRACT["state_dtypes"], "unsupported state dtype")
     _require(slot_class in _SLOT_CLASSES, "unsupported slot class")
     if lower_bound is not None:
@@ -798,13 +808,29 @@ def select_fused_kda_decode_generated_variant(
     )
     if num_rows > 2**31 - 1 or any(value > 2**31 - 1 for value in strides.values()):
         return None
+    qkv_size = 3 * num_heads * 128
+    required_slot_offset_bits = (
+        64
+        if (
+            (num_slots - 1) * conv_slot_stride + 3 * qkv_size - 1 > 2**31 - 1
+            or (num_slots - 1) * state_slot_stride
+            + num_heads * 128 * 128
+            - 1
+            > 2**31 - 1
+        )
+        else 32
+    )
     available = (
         load_fused_kda_decode_generated_variants()
         if variants is None
         else tuple(variants)
     )
     for variant in available:
-        if variant.target != target or variant.state_dtype != state_dtype:
+        if (
+            variant.target != target
+            or variant.state_dtype != state_dtype
+            or variant.slot_offset_bits != required_slot_offset_bits
+        ):
             continue
         for rule in variant.eligibility:
             if _eligibility_matches(

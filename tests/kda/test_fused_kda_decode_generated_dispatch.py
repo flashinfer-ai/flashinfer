@@ -200,6 +200,7 @@ def test_generated_selector_receives_exact_runtime_facts(monkeypatch):
             "target": "sm100a",
             "num_heads": 12,
             "num_rows": 4,
+            "num_slots": 5,
             "state_dtype": "float32",
             "slot_class": "positive_unique",
             "lower_bound": -5.0,
