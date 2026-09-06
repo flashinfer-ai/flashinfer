@@ -1,7 +1,10 @@
 """FA3 Hopper VariableWindow tests for batch prefill (ragged and paged).
 
 Per-token inclusive KV start/end bounds, compiled as a sibling of sliding
-window. Skip unless SM90A; force backend=fa3. Do not import PrimTS tests.
+window. Starts/ends must be nondecreasing within each request (trtllm-gen
+VariableWindow): the kernel uses first/last Q-tile rows for load union and
+skips per-row masking on interior KV tiles. Skip unless SM90A; force
+backend=fa3. Do not import PrimTS tests.
 """
 
 from typing import List, Optional, Sequence, Tuple
@@ -272,22 +275,41 @@ def test_paged_variable_window(page_size):
     torch.testing.assert_close(o.float(), o_ref.float(), rtol=2e-2, atol=2e-2)
 
 
-def test_non_monotonic_starts_inside_q_tile():
+@pytest.mark.parametrize("seq_len", [128, 512, 2048])
+def test_full_causal_vw_matches_causal(seq_len):
+    """Global causal baked into VW must match FA3 prod causal (interior mask skip)."""
     _require_sm90()
-    torch.manual_seed(5)
-    seq_len, hq, hkv, d = 128, 8, 2, 128
+    torch.manual_seed(0)
+    hq, hkv, d = 32, 8, 128
     qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
     kv_indptr = qo_indptr.clone()
     q = torch.randn(seq_len, hq, d, dtype=torch.half, device="cuda")
     k = torch.randn(seq_len, hkv, d, dtype=torch.half, device="cuda")
     v = torch.randn(seq_len, hkv, d, dtype=torch.half, device="cuda")
-    # Most rows start at 64; one later row in the same Q tile jumps to 0 so
-    # tile skip cannot use the first row's start. Clamp ends so start <= end
-    # (rows 0-63 would otherwise be empty windows and softmax to NaN).
-    starts = torch.full((seq_len,), 64, dtype=torch.int32, device="cuda")
-    starts[80] = 0
-    ends = torch.arange(seq_len, dtype=torch.int32, device="cuda")
-    ends = torch.maximum(ends, starts)
+    starts, ends = causal_swa_bounds(seq_len, seq_len, seq_len, q.device)
+
+    causal = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(_ws(), "NHD", backend="fa3")
+    causal.plan(qo_indptr, kv_indptr, hq, hkv, d, causal=True, window_left=-1)
+    o_causal = causal.run(q, k, v)
+
+    o_vw = _run_ragged_vw(q, k, v, qo_indptr, kv_indptr, starts, ends, hq, hkv, d)
+    torch.testing.assert_close(o_vw, o_causal, rtol=1e-3, atol=1e-3)
+
+
+def test_look_ahead_past_causal_still_matches_ref():
+    """Image-style end > q (still nondecreasing) must not use a causal right clip."""
+    _require_sm90()
+    torch.manual_seed(7)
+    seq_len, hq, hkv, d = 256, 16, 8, 128
+    q_idx = torch.arange(seq_len, device="cuda")
+    starts = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    ends = q_idx.clone().to(torch.int32)
+    ends[64:192] = 191
+    qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    kv_indptr = qo_indptr.clone()
+    q = torch.randn(seq_len, hq, d, dtype=torch.half, device="cuda")
+    k = torch.randn(seq_len, hkv, d, dtype=torch.half, device="cuda")
+    v = torch.randn(seq_len, hkv, d, dtype=torch.half, device="cuda")
     o = _run_ragged_vw(q, k, v, qo_indptr, kv_indptr, starts, ends, hq, hkv, d)
     o_ref = variable_window_attention_ref(q, k, v, starts, ends)
     torch.testing.assert_close(o.float(), o_ref.float(), rtol=2e-2, atol=2e-2)

@@ -420,11 +420,12 @@ struct SparseCollectiveMainloop {
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
-      // load first v tile (tile 0)
+      // Load V for the earliest remaining KV tile. After the loop above,
+      // kv_tile_idx == swa_begin_kv_tile_idx (not necessarily 0).
       {
-        prefetch_kv_offset(0, false);
+        prefetch_kv_offset(kv_tile_idx, false);
         pipeline_v.producer_acquire(smem_pipe_write_v);
-        load_kv_with_gather(tVsV, tVcV, V_ptr_base, 0, smem_pipe_write_v.index(), false);
+        load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), false);
         pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_v;
       }

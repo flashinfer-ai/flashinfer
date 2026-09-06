@@ -47,35 +47,50 @@ CUTLASS_DEVICE int get_swa_end_kv_tile_idx(int window_left, int q_tile_idx, cons
 }
 
 struct VariableWindowKvTileBounds {
-  int begin;  // inclusive first KV tile to load
-  int end;    // inclusive last KV tile to load
+  int begin;         // inclusive first KV tile to load (union)
+  int end;           // inclusive last KV tile to load (union)
+  int unmask_begin;  // first KV tile fully inside every row's window
+  int unmask_end;    // last KV tile fully inside every row's window
 };
 
 DEFINE_HAS_MEMBER(maybe_variable_window_token_starts)
 DEFINE_HAS_MEMBER(maybe_variable_window_token_ends)
 
-// Min start / max end over valid Q rows in this CTA tile. packed_qo_offset is
-// qo_indptr[batch] into the packed [nnz_qo] start/end arrays.
+// trtllm-gen VariableWindow (MR 938): starts/ends are nondecreasing in Q, so a
+// Q CTA only needs the first and last packed rows.
+//   load union:        [start[firstRow], end[lastRow]]
+//   mask-skip inter.:  [start[lastRow], end[firstRow]]
+// A KV tile fully inside the intersection needs no per-row score mask — the
+// same interior fast path as causal / SlidingWindow.
 template <int CTA_Q, int CTA_KV>
 CUTLASS_DEVICE VariableWindowKvTileBounds
 get_variable_window_kv_tile_bounds(int32_t const* starts, int32_t const* ends, int packed_qo_offset,
                                    int q_tile_idx, int qo_len, int kv_len) {
   int q_start = q_tile_idx * CTA_Q;
-  int q_end = std::min(q_start + CTA_Q, qo_len);
-  int min_start = kv_len;
-  int max_end = -1;
-#pragma unroll 1
-  for (int q = q_start; q < q_end; ++q) {
-    min_start = std::min(min_start, __ldg(starts + packed_qo_offset + q));
-    max_end = std::max(max_end, __ldg(ends + packed_qo_offset + q));
-  }
+  int q_last = std::min(q_start + CTA_Q, qo_len) - 1;
+  int32_t union_start = __ldg(starts + packed_qo_offset + q_start);
+  int32_t union_end = __ldg(ends + packed_qo_offset + q_last);
+  int32_t inter_start = __ldg(starts + packed_qo_offset + q_last);
+  int32_t inter_end = __ldg(ends + packed_qo_offset + q_start);
+
   int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
-  int first = std::max(min_start / CTA_KV - 1, 0);
-  int last = std::min(num_kv_tiles - 1, std::max(max_end, 0) / CTA_KV);
+  int first = std::max(union_start, 0) / CTA_KV;
+  int last = std::min(num_kv_tiles - 1, std::max(union_end, 0) / CTA_KV);
   if (last < first) {
     last = first;
   }
-  return {first, last};
+
+  // tileOffset >= inter_start && nextTileOffset <= inter_end + 1 (exclusive end)
+  int unmask_begin = inter_start <= 0 ? 0 : (inter_start + CTA_KV - 1) / CTA_KV;
+  int unmask_end = (std::max(inter_end, -1) + 1) / CTA_KV - 1;
+  unmask_begin = std::max(unmask_begin, first);
+  unmask_end = std::min(unmask_end, last);
+  if (unmask_end < unmask_begin) {
+    // No fully-visible tile: mask every loaded tile (inner unmasked loop empty).
+    unmask_begin = last + 1;
+    unmask_end = last;
+  }
+  return {first, last, unmask_begin, unmask_end};
 }
 
 template <int CTA_Q, int CTA_KV, bool LEFT_SLIDING_WINDOW, bool LEFT_VARIABLE_WINDOW,
@@ -124,9 +139,11 @@ CUTLASS_DEVICE void apply_window_kv_tile_skip_consumer(Params const& mainloop_pa
           mainloop_params.additional_params.maybe_variable_window_token_starts,
           mainloop_params.additional_params.maybe_variable_window_token_ends, packed_qo_offset,
           q_tile_idx, qo_len, kv_len);
-      // Drain is unused: middle loop consumes (first, last], init consumes last.
+      // Init + n_masking_steps consume the right-edge tiles (load_end .. unmask_end+1).
+      // Inner loop is unpredicated on (unmask_end .. unmask_begin]. Extra loop
+      // masks the left-edge tiles (unmask_begin-1 .. begin], same as SWA.
       swa_begin_kv_tile_idx = bounds.begin;
-      swa_end_kv_tile_idx = bounds.begin - 1;
+      swa_end_kv_tile_idx = bounds.unmask_begin - 1;
       num_kv_tiles = bounds.end + 1;
     }
   }

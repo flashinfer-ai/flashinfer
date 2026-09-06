@@ -432,11 +432,12 @@ struct FP8SparseCollectiveMainloop {
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
-      // load first v tile (tile 0)
+      // Load V for the earliest remaining KV tile. After the loop above,
+      // kv_tile_idx == swa_begin_kv_tile_idx (not necessarily 0).
       {
-        prefetch_kv_offset(0, v_stride_n, v_page_stride, false);
+        prefetch_kv_offset(kv_tile_idx, v_stride_n, v_page_stride, false);
         pipeline_v.producer_acquire(smem_pipe_write);
-        load_kv_with_prefetch(v_base_ptr, tVsV, 0, smem_pipe_write.index(), false);
+        load_kv_with_prefetch(v_base_ptr, tVsV, kv_tile_idx, smem_pipe_write.index(), false);
         pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
         // Transpose V

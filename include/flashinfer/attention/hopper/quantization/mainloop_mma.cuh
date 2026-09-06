@@ -137,7 +137,21 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       make_tensor(convert_type<DTypeKV>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
   permute_regs_A_to_C(tOrP);
 
-  constexpr int n_masking_steps = CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0;
+  int n_masking_steps;
+  if constexpr (LEFT_VARIABLE_WINDOW) {
+    n_masking_steps = 0;
+    using AdditionalParamsT = decltype(mainloop_params.additional_params);
+    if constexpr (has_maybe_variable_window_token_starts_v<AdditionalParamsT> &&
+                  has_maybe_variable_window_token_ends_v<AdditionalParamsT>) {
+      auto vw_bounds = get_variable_window_kv_tile_bounds<CTA_Q, CTA_KV>(
+          mainloop_params.additional_params.maybe_variable_window_token_starts,
+          mainloop_params.additional_params.maybe_variable_window_token_ends, packed_qo_offset,
+          q_tile_idx, qo_len, kv_len);
+      n_masking_steps = std::max(0, vw_bounds.end - vw_bounds.unmask_end - 1);
+    }
+  } else {
+    n_masking_steps = CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0;
+  }
   // masking loops
 #pragma unroll
   for (int masking_step = 0; masking_step < n_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
@@ -164,8 +178,10 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
                                         kv_idx, qo_head_idx, kv_head_idx);
-      if (kv_idx >= col_limit_right(qo_idx)) {
-        tSrS(i) = AttentionUpdater::fill_value;
+      if constexpr (CAUSAL) {
+        if (kv_idx >= col_limit_right(qo_idx)) {
+          tSrS(i) = AttentionUpdater::fill_value;
+        }
       }
       if constexpr (LEFT_SLIDING_WINDOW) {
         if (kv_idx < col_limit_left(qo_idx)) {
@@ -211,7 +227,6 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
                                         kv_idx, qo_head_idx, kv_head_idx);
-      apply_variable_window_mask(tSrS(i), qo_idx, kv_idx);
     }
 
     attention_updater.update</*init=*/false>(tSrS);

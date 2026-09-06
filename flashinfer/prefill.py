@@ -129,6 +129,12 @@ def _validate_variable_window_bounds(
     Returns the caller tensors by reference (same contract as ``prefix_len_ptr``).
     They must stay alive and unchanged from ``plan()`` through ``run()``.
     Checks are host metadata only (no copy, no device sync on the arrays).
+
+    Starts and ends must be nondecreasing within each request (same contract as
+    trtllm-gen VariableWindow). The kernel uses the first/last Q rows of each
+    CTA for KV-tile loads (union) and skips per-row masking on tiles inside the
+    intersection, so a later row with a *smaller* start than an earlier row in
+    the same tile is unsupported.
     """
     has_starts = variable_window_token_starts is not None
     has_ends = variable_window_token_ends is not None
@@ -2467,7 +2473,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
             multi-item scoring. Bake causal / SWA into the arrays. Held by reference
             like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
-            and unchanged until then.
+            and unchanged until then. Within each request, ``starts`` and ``ends``
+            must be nondecreasing so the kernel can skip masking on fully-interior
+            KV tiles (trtllm-gen VariableWindow / causal fast path).
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
@@ -3866,7 +3874,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
             multi-item scoring. Bake causal / SWA into the arrays. Held by reference
             like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
-            and unchanged until then.
+            and unchanged until then. Within each request, ``starts`` and ``ends``
+            must be nondecreasing so the kernel can skip masking on fully-interior
+            KV tiles (trtllm-gen VariableWindow / causal fast path).
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
