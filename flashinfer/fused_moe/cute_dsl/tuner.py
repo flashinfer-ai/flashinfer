@@ -78,7 +78,7 @@ def _seeded_activation(shapes, dtype, device):
 
 
 def get_blackwell_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Get valid Blackwell tactics for GEMM1 (Gather + SwiGLU Fusion).
+    """Get valid Blackwell tactics for GEMM1 (gather + activation fusion).
 
     Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
     """
@@ -179,7 +179,7 @@ VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
 # Format: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
 # where mma_tiler = (M, N, K) and mma_inst_shape = (M', N, K')
 def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Get valid Rubin tactics for GEMM1 (Gather + SwiGLU Fusion).
+    """Get valid Rubin tactics for GEMM1 (gather + activation fusion).
 
     Format: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
     """
@@ -757,7 +757,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     return False
 
                 from .rubin import (
-                    Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
+                    Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel,
                     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
                 )
 
@@ -768,7 +768,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     gemm2_tactic
                 )
 
-                gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
+                gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel.can_implement(
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,
                     sf_dtype=sf_dtype,

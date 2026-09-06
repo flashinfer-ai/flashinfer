@@ -135,7 +135,7 @@ to permuted_m; padded tiles are filtered by the scheduler.
 """
 
 
-class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
+class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
     """Rubin (SM107) FC1: contiguous grouped blockscaled GEMM with token
     gather on A/SFA and SwiGLU activation fusion in the epilogue.
 
@@ -4434,7 +4434,7 @@ def run(
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    if not Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
+    if not Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel.can_implement(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         sf_dtype=sf_dtype,
@@ -4506,7 +4506,7 @@ def run(
         permuted_m,
     )
 
-    gemm = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel(
+    gemm = Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel(
         sf_vec_size,
         mma_inst_shape,
         mma_tiler,

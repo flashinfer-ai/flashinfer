@@ -80,7 +80,7 @@ from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
 
 
 @functools.cache
-def _sm107_swiglu_kernel_cls():
+def _sm107_act_kernel_cls():
     """Import the SM107 kernel lazily.
 
     It requires CuTe DSL >= 4.8 (``cutlass.utils.rubin_helpers``); importing at
@@ -93,11 +93,11 @@ def _sm107_swiglu_kernel_cls():
             "cutlass.utils.rubin_helpers; the installed CuTe DSL does not "
             "have it."
         )
-    from .rubin.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
-        Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
+    from .rubin.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel,
     )
 
-    return Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel
+    return Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
 
 
 def create_gather_gemm_tensors(
@@ -347,7 +347,7 @@ def _get_compiled_gather_kernel(
                     "kernel yet: its wrapper has no a_per_token_scale_ptr "
                     "parameter."
                 )
-            gemm = _sm107_swiglu_kernel_cls()(
+            gemm = _sm107_act_kernel_cls()(
                 sf_vec_size=sf_vec_size,
                 mma_inst_shape=mma_inst_shape,
                 mma_tiler=mma_tiler,
@@ -661,7 +661,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     c_dtype_cutlass = get_cutlass_dtype(c_dtype)
 
     if is_rubin:
-        can_impl = _sm107_swiglu_kernel_cls().can_implement(
+        can_impl = _sm107_act_kernel_cls().can_implement(
             a_dtype=a_dtype_cutlass,
             b_dtype=b_dtype_cutlass,
             sf_dtype=sf_dtype_cutlass,
