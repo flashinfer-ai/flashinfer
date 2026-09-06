@@ -199,8 +199,9 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
 
     # The workspace uses two shared slots and must stay on one ordered stream.
     other_stream = torch.cuda.Stream(device=device)
-    with torch.cuda.stream(other_stream), pytest.raises(
-        RuntimeError, match="one ordered CUDA stream"
+    with (
+        torch.cuda.stream(other_stream),
+        pytest.raises(RuntimeError, match="one ordered CUDA stream"),
     ):
         decode_cp_a2a_lse_reduce(
             partial_o,
