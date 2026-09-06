@@ -522,7 +522,9 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     assert launcher_source.count("params.elements_per_token % 8 == 0") == 2
     assert launcher_source.count("dim3 const topk6_grid(") == 1
     assert "constexpr int kBf16TopK6Threads = 32;" in launcher_source
-    assert "ceilDiv(params.elements_per_token, kBf16TopK6Threads * 8)" in launcher_source
+    assert (
+        "ceilDiv(params.elements_per_token, kBf16TopK6Threads * 8)" in launcher_source
+    )
     assert (
         "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, "
         "kBf16TopK6Threads, 0," in launcher_source
