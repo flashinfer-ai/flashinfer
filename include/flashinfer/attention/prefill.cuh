@@ -2873,7 +2873,23 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // skip out-of-window kv tile by add non-zero kv_start_idx offset
     const uint32_t kv_start_idx = sub_if_greater_or_zero(
         kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    if constexpr (MASK_MODE == MaskMode::kNone || MASK_MODE == MaskMode::kCustom) {
+      // The scheduler (PrefillSplitQOKVIndptr) and num_kv_chunks below size a
+      // request's split-KV chunks for a span of window_left + CTA_TILE_Q keys,
+      // which bounds a causal tile but not a non-causal one: without the
+      // causal cut a tile attends every key in [kv_start_idx, kv_len), up to
+      // qo_len + window_left keys. Spread that span evenly over the chunks
+      // the scheduler allocated so the trailing keys are not dropped (#4972).
+      // window_left=-1 (window_left == kv_len, kv_start_idx == 0) keeps the
+      // original chunk boundaries.
+      if (partition_kv) {
+        // Must match num_kv_chunks below.
+        const uint32_t num_kv_chunks =
+            ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+        max_chunk_size = max(max_chunk_size, ceil_div(kv_len - kv_start_idx, num_kv_chunks));
+      }
+    }
     const uint32_t chunk_start =
         partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
     const uint32_t chunk_end =
@@ -3658,7 +3674,23 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     const uint32_t kv_start_idx = sub_if_greater_or_zero(
         kv_len + (qo_tile_idx * CTA_TILE_Q) / group_size, qo_len + window_left);
-    const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len - kv_start_idx;
+    if constexpr (MASK_MODE == MaskMode::kNone || MASK_MODE == MaskMode::kCustom) {
+      // The scheduler (PrefillSplitQOKVIndptr) and num_kv_chunks below size a
+      // request's split-KV chunks for a span of window_left + CTA_TILE_Q keys,
+      // which bounds a causal tile but not a non-causal one: without the
+      // causal cut a tile attends every key in [kv_start_idx, kv_len), up to
+      // qo_len + window_left keys. Spread that span evenly over the chunks
+      // the scheduler allocated so the trailing keys are not dropped (#4972).
+      // window_left=-1 (window_left == kv_len, kv_start_idx == 0) keeps the
+      // original chunk boundaries.
+      if (partition_kv) {
+        // Must match num_kv_chunks below.
+        const uint32_t num_kv_chunks =
+            ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+        max_chunk_size = max(max_chunk_size, ceil_div(kv_len - kv_start_idx, num_kv_chunks));
+      }
+    }
     const uint32_t chunk_start =
         partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
     const uint32_t chunk_end =
