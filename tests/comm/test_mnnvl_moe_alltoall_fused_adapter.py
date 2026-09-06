@@ -521,10 +521,11 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         )
     assert launcher_source.count("params.elements_per_token % 8 == 0") == 2
     assert launcher_source.count("dim3 const topk6_grid(") == 1
-    assert "ceilDiv(params.elements_per_token, kCombineThreads * 8)" in launcher_source
+    assert "constexpr int kBf16TopK6Threads = 32;" in launcher_source
+    assert "ceilDiv(params.elements_per_token, kBf16TopK6Threads * 8)" in launcher_source
     assert (
         "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, "
-        "kCombineThreads, 0," in launcher_source
+        "kBf16TopK6Threads, 0," in launcher_source
     )
     assert launcher_source.count("bool const fuse_topk6_publication =") == 2
     assert (
@@ -599,7 +600,7 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
             not in topk6_source
         )
         assert "if (bid == 0 && blockIdx.y == 0)" in topk6_source
-        assert "int column_chunk = blockIdx.y * 2048;" in topk6_source
+        assert "int column_chunk = blockIdx.y * 256;" in topk6_source
         assert "int column = column_chunk + tid * 8;" in topk6_source
         dispatch_source = normalized_generated_source.split(
             "void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(",

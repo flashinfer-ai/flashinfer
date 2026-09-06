@@ -89,6 +89,7 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 constexpr int kDispatchThreads = 256;
 constexpr int kDispatchSharedBytes = 256;
 constexpr int kCombineThreads = 256;
+constexpr int kBf16TopK6Threads = 32;
 constexpr int kPublicationThreads = 64;
 constexpr int kQuantThreads = 32;
 constexpr int kSanitizeThreads = 256;
@@ -363,10 +364,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   if (useBf16TopK6Combine(params)) {
     dim3 const topk6_grid(
         static_cast<unsigned int>(grid),
-        static_cast<unsigned int>(ceilDiv(params.elements_per_token, kCombineThreads * 8)), 1);
+        static_cast<unsigned int>(ceilDiv(params.elements_per_token, kBf16TopK6Threads * 8)), 1);
     launchWithPdlWhenEnabled(
         "mnnvl_moe_alltoall_combine_bf16_topk6", params.enable_pdl,
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, kCombineThreads, 0,
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, kBf16TopK6Threads, 0,
         params.stream, params.workspace, static_cast<uint8_t*>(accumulation),
         params.workspace_stride_bytes, flag_offset, completion_offset,
         byteOffset(params.topk_target_ranks, rank_workspace),
