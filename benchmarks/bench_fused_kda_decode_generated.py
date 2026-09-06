@@ -138,9 +138,12 @@ def _make_inputs(num_heads, num_rows, seed=42):
         dtype=torch.float32,
         device=device,
     )
-    state.copy_(
-        0.01 * randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), torch.float32)
+    state_values = randn(
+        (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), torch.float32
     )
+    state_values.mul_(0.01)
+    state.copy_(state_values)
+    del state_values
     beta_storage = randn((1, num_rows, num_heads + 1), torch.bfloat16)
     output_gate_storage = randn((num_rows, hidden_size + 7), torch.bfloat16)
     return {
