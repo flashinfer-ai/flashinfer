@@ -889,6 +889,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
     if (warp == 0) {
         int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
         if (lane == 0) {
             tmem_addr_storage[1] = tmem_addr_storage[0];
@@ -2147,6 +2148,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     if (warp == 0) {
         int _tmem_hold = smem + 296;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
         if (lane == 0) {
             tmem_addr_storage[1] = tmem_addr_storage[0];
