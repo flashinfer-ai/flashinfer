@@ -2959,9 +2959,7 @@ class AutoTuner:
                         or tuning_config.value_aware_input_indices
                     )
                     input_tensor_batches = (
-                        self._prepare_input_tensors_with_batches(
-                            inputs, tuning_config
-                        )
+                        self._prepare_input_tensors_with_batches(inputs, tuning_config)
                         if uses_profile_arena or not tuning_config.use_cold_l2_cache
                         else [inputs]
                     )
