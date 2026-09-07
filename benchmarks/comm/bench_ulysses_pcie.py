@@ -95,7 +95,7 @@ def main():
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument(
         "--dtype",
-        choices=("float16", "bfloat16", "float32", "int8"),
+        choices=("float16", "bfloat16", "float32", "int8", "float8_e4m3fn"),
         default="bfloat16",
     )
     parser.add_argument("--warmup", type=int, default=100)
@@ -115,6 +115,11 @@ def main():
     torch.manual_seed(1024 + rank)
 
     def operand(shape):
+        # FP8 reports is_floating_point but has no normal_ kernel, so it is
+        # filled through a wider float and cast. The transport moves opaque
+        # bytes either way; the values only have to be well-defined.
+        if dtype.itemsize == 1 and dtype.is_floating_point:
+            return torch.randn(shape, dtype=torch.bfloat16, device=device).to(dtype)
         if dtype.is_floating_point:
             return torch.randn(shape, dtype=dtype, device=device)
         return torch.randint(-128, 128, shape, dtype=dtype, device=device)
