@@ -331,12 +331,12 @@ def _require_tensor(name: str, tensor: torch.Tensor) -> None:
         raise TypeError(f"{name} must be a torch.Tensor")
 
 
-def _require_sm120(tensor: torch.Tensor) -> None:
+def _require_sm89_or_sm120(tensor: torch.Tensor) -> None:
     capability = torch.cuda.get_device_capability(tensor.device)
-    if capability != (12, 0):
+    if capability not in {(8, 9), (12, 0)}:
         raise RuntimeError(
             "low-precision Ulysses V2-G operations require CUDA capability "
-            f"(12, 0), but device {tensor.device} reports {capability}"
+            f"(8, 9) or (12, 0), but device {tensor.device} reports {capability}"
         )
 
 
@@ -411,7 +411,7 @@ def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int,
             f"{name} must keep 16-byte alignment of every head_dim row; "
             f"got data_ptr % 16 = {tensor.data_ptr() % 16}, strides {tensor.stride()}"
         )
-    _require_sm120(tensor)
+    _require_sm89_or_sm120(tensor)
     return batch, local_sequence, num_heads, head_dim
 
 
@@ -1404,7 +1404,7 @@ def unpack_for_sage(
         )
     if not recv_u8.is_contiguous():
         raise ValueError("recv_u8 must be contiguous")
-    _require_sm120(recv_u8)
+    _require_sm89_or_sm120(recv_u8)
 
     logical_sequence = int(spec["logical_sequence"])
     padded_sequence = int(spec["padded_sequence"])
@@ -2538,7 +2538,7 @@ def quant_v_fp8_with_scale(
     if not math.isfinite(scale_max) or scale_max != V_SCALE_MAX:
         raise ValueError(f"quant_v_fp8_with_scale requires scale_max={V_SCALE_MAX}")
 
-    _require_sm120(v)
+    _require_sm89_or_sm120(v)
     output = torch.empty_like(
         v, dtype=torch.uint8, memory_format=torch.contiguous_format
     )
