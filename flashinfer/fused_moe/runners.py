@@ -4901,30 +4901,29 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             dtype=torch.bfloat16,
         )
         routing_input_mode = act.routing_input_mode
-        if (
-            self._num_fused_shared_experts > 0
-            and routing_input_mode is not RoutingInputMode.FromLogits
-        ):
-            raise NotImplementedError(
-                "TrtllmFp8BlockRunner requires FromLogits routing when "
-                "num_fused_shared_experts > 0. A pre-routed caller can fuse "
-                "the shared experts itself by appending the slots to "
-                "topk_ids/topk_weights and declaring num_experts + "
-                f"{self._num_fused_shared_experts} experts with top_k + "
-                f"{self._num_fused_shared_experts}."
-            )
         if routing_input_mode == RoutingInputMode.FromLogits:
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, "TrtllmFp8BlockRunner"
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            # routing_input_mode selects FromLogits explicitly; the empty
-            # placeholders only satisfy the launcher ABI, which still requires
-            # the topk_ids / expert_weights slots.
+            # Native keys packed-vs-logits on has_precomputed(ids) (2D with
+            # size(0)>0), not on routing_input_mode. Empty 1D placeholders keep
+            # that false so the launcher uses routing_logits.
             topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
             expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            # The flat pre-routed API has no shared-expert argument. Callers can
+            # append shared slots themselves and declare the fused totals.
+            if self._num_fused_shared_experts > 0:
+                raise NotImplementedError(
+                    "TrtllmFp8BlockRunner requires FromLogits routing when "
+                    "num_fused_shared_experts > 0. A pre-routed caller can fuse "
+                    "the shared experts itself by appending the slots to "
+                    "topk_ids/topk_weights and declaring num_experts + "
+                    f"{self._num_fused_shared_experts} experts with top_k + "
+                    f"{self._num_fused_shared_experts}."
+                )
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"
             )
@@ -4935,6 +4934,15 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
         elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            if self._num_fused_shared_experts > 0:
+                raise NotImplementedError(
+                    "TrtllmFp8BlockRunner requires FromLogits routing when "
+                    "num_fused_shared_experts > 0. A pre-routed caller can fuse "
+                    "the shared experts itself by appending the slots to "
+                    "topk_ids/topk_weights and declaring num_experts + "
+                    f"{self._num_fused_shared_experts} experts with top_k + "
+                    f"{self._num_fused_shared_experts}."
+                )
             _validate_prerouted_inputs(
                 act,
                 num_tokens,
