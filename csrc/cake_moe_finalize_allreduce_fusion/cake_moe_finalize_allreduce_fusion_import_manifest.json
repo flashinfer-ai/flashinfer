@@ -3,7 +3,6 @@
   "build_contract": {
     "architecture_source": "modules[].arch",
     "binary_payloads": false,
-    "source_license_header_sha256": "68f4fab36f2576f11adad6fe6571d922c63f7d8d64a6f0a5aff5b6ea95b090e2",
     "target_infrastructure": {
       "binding_runtime": "flashinfer_tvm_ffi_utils",
       "headers_owned_by_target": true,
