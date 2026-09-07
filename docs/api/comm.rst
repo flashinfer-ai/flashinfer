@@ -272,7 +272,11 @@ constructor, strictly before any IPC allocation or JIT compilation:
                all-P2P, all-RDMA at any multi-rank world size, or the
                eight-rank 4+4 NUMA P2P/mlx5 hybrid. Every route requires
                full-group CUDA P2P access for the epoch signal barrier.
-               ``auto`` never selects this backend.
+               This backend is experimental: ``auto`` considers it only
+               where NVLink is unavailable and
+               ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set on
+               every rank. Naming it explicitly never needs that variable.
+               Either way it warns once.
 ``"nccl"``     force ``dist.all_to_all_single`` + permute; skips the
                topology/NVML probe and all IPC/JIT (the constructor still
                resolves/guards the CUDA device and performs CUDA-backed

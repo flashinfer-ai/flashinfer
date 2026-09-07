@@ -648,7 +648,7 @@ for benchmarking and bring-up.
 
 ##### Ulysses PCIe / RDMA Transport (experimental)
 
-Read only for an explicit `UlyssesCommunicator(backend="pcie")`; every rank must set them identically (rank-ordered lists take one comma-separated value per rank).
+Read when `UlyssesCommunicator` uses the PCIe backend -- named explicitly, or selected by `backend="auto"` where NVLink is unavailable and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set. Every rank must set these identically (rank-ordered lists take one comma-separated value per rank).
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
