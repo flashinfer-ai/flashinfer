@@ -225,10 +225,12 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
     extra_indices_ptr = static_cast<const int32_t*>(extra_idx.data_ptr());
     if (extra_topk_length.has_value()) {
       const auto& length = extra_topk_length.value();
-      CHECK_INPUT_AND_TYPE(length, dl_int32);
+      CHECK_CUDA(length);
+      CHECK_INPUT_TYPE(length, dl_int32);
       CHECK_DEVICE(q, length);
       TVM_FFI_ICHECK_EQ(length.ndim(), 1);
       TVM_FFI_ICHECK_EQ(length.size(0), num_tokens);
+      TVM_FFI_ICHECK(length.IsContiguous()) << "extra_topk_length must be contiguous";
       extra_topk_length_ptr = static_cast<const int*>(length.data_ptr());
     }
   }
@@ -247,17 +249,21 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
 
   if (topk_length.has_value()) {
     const auto& length = topk_length.value();
-    CHECK_INPUT_AND_TYPE(length, dl_int32);
+    CHECK_CUDA(length);
+    CHECK_INPUT_TYPE(length, dl_int32);
     CHECK_DEVICE(q, length);
     TVM_FFI_ICHECK_EQ(length.ndim(), 1);
     TVM_FFI_ICHECK_EQ(length.size(0), num_tokens);
+    TVM_FFI_ICHECK(length.IsContiguous()) << "topk_length must be contiguous";
   }
   if (attn_sink.has_value()) {
     const auto& sink = attn_sink.value();
-    CHECK_INPUT_AND_TYPE(sink, dl_float32);
+    CHECK_CUDA(sink);
+    CHECK_INPUT_TYPE(sink, dl_float32);
     CHECK_DEVICE(q, sink);
     TVM_FFI_ICHECK_EQ(sink.ndim(), 1);
     TVM_FFI_ICHECK_EQ(sink.size(0), num_heads);
+    TVM_FFI_ICHECK(sink.IsContiguous()) << "attn_sink must be contiguous";
   }
 
   if (num_tokens == 0) return;

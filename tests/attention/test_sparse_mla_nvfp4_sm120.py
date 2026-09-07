@@ -23,7 +23,10 @@ from flashinfer.mla import (
     nvfp4_quantize_append_sparse_mla_cache,
     nvfp4_quantize_pack_sparse_mla_cache,
 )
-from flashinfer.mla._core import _nvfp4_sparse_mla_workspace
+from flashinfer.mla._core import (
+    _nvfp4_sparse_mla_workspace,
+    _workspace_tensor_view,
+)
 from flashinfer.mla._sparse_mla_nvfp4_sm120 import (
     _nvfp4_sparse_mla_decode,
     _nvfp4_sparse_mla_prefill,
@@ -370,17 +373,30 @@ def test_nvfp4_sparse_mla_append_rejects_misaligned_vector_accesses(
         nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
 
 
-def test_nvfp4_sparse_mla_append_rejects_duplicate_valid_slots(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("num_tokens", [4, 257])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_nvfp4_sparse_mla_append_duplicate_slots_use_first_row(
+    num_tokens: int, slot_dtype: torch.dtype
 ) -> None:
     _require_sm120()
-    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
-    latent_kv = torch.empty(2, 512, dtype=torch.bfloat16, device="cuda")
-    slots = torch.zeros(2, dtype=torch.int32, device="cuda")
-    cache = torch.empty(1, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+    torch.manual_seed(20260907 + num_tokens)
+    latent_kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.full((num_tokens,), -1, dtype=slot_dtype, device="cuda")
+    slots[0] = 0
+    slots[-1] = 0
+    cache = torch.full((1, 2, _BYTES_PER_TOKEN), 0xA5, dtype=torch.uint8, device="cuda")
 
-    with pytest.raises(ValueError, match="must be unique"):
-        nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+    nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+    expected = nvfp4_quantize_pack_sparse_mla_cache(latent_kv[:1].view(1, 1, 512))
+    actual_data, actual_scales = _split_cache(cache)
+    expected_data, expected_scales = _split_cache(expected)
+
+    torch.testing.assert_close(actual_data[0, 0], expected_data[0, 0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_scales[0, 0], expected_scales[0, 0], rtol=0, atol=0
+    )
+    assert torch.all(actual_data[0, 1] == 0xA5)
+    assert torch.all(actual_scales[0, 1] == 0xA5)
 
 
 def test_nvfp4_sparse_mla_pack_rejects_wrong_dtype():
@@ -541,6 +557,78 @@ def test_nvfp4_sparse_mla_decode_workspace_has_no_global_vt() -> None:
     assert mid_lse.shape == (num_tokens, num_heads, num_splits)
     assert scratch_lse.shape == (num_tokens, num_heads)
     assert mid_out.data_ptr() == workspace.data_ptr()
+
+
+def test_workspace_tensor_view_aligns_sliced_storage_without_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_sm120()
+    storage = torch.empty(4096 + 16, dtype=torch.uint8, device="cuda")
+    workspace = storage[1:]
+    assert workspace.is_contiguous()
+    assert workspace.data_ptr() % 16 == 1
+    previous_default = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        with monkeypatch.context() as context:
+
+            def reject_tensor_allocation(*args, **kwargs):
+                raise AssertionError(
+                    "workspace partitioning must not allocate a tensor"
+                )
+
+            context.setattr(torch, "empty", reject_tensor_allocation)
+            view, byte_end = _workspace_tensor_view(
+                workspace,
+                byte_offset=0,
+                shape=(2, 8, 64),
+                dtype=torch.bfloat16,
+            )
+    finally:
+        torch.set_default_device(previous_default)
+
+    assert view is not None
+    assert view.data_ptr() % 16 == 0
+    assert byte_end <= workspace.numel()
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    "optional_name,optional_dtype,logical_size",
+    [
+        ("topk_length", torch.int32, 2),
+        ("extra_topk_length", torch.int32, 2),
+        ("attn_sink", torch.float32, 16),
+    ],
+)
+def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
+    phase: str,
+    optional_name: str,
+    optional_dtype: torch.dtype,
+    logical_size: int,
+) -> None:
+    _require_sm120()
+    num_tokens, num_heads, topk = 2, 16, 128
+    q = torch.zeros(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty(2, 64, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+    indices = torch.zeros(num_tokens, topk, dtype=torch.int32, device="cuda")
+    strided = torch.zeros(logical_size * 2, dtype=optional_dtype, device="cuda")[::2]
+    kwargs = {optional_name: strided}
+    if optional_name == "extra_topk_length":
+        kwargs.update(
+            extra_kv_cache=torch.empty(
+                1, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda"
+            ),
+            extra_indices=torch.zeros(
+                num_tokens, topk, dtype=torch.int32, device="cuda"
+            ),
+        )
+    attention = (
+        _nvfp4_sparse_mla_decode if phase == "decode" else _nvfp4_sparse_mla_prefill
+    )
+
+    with pytest.raises(RuntimeError, match=rf"{optional_name} must be contiguous"):
+        attention(q, cache, indices, 1.0 / math.sqrt(512), **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -987,7 +1075,9 @@ def test_nvfp4_sparse_mla_public_api_decode_dual_cache() -> None:
         virtual_indices,
         512**-0.5,
     )
-    workspace = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+    workspace_storage = torch.empty((1 << 20) + 1, dtype=torch.uint8, device="cuda")
+    workspace = workspace_storage[1:]
+    assert workspace.data_ptr() % 16 == 1
     output = torch.empty_like(q)
     returned = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
         query=q,

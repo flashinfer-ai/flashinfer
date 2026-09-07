@@ -230,20 +230,6 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
     return int(num_pages), int(page_size), layout
 
 
-def _validate_unique_slots(slot_mapping: torch.Tensor, capacity: int) -> None:
-    """Reject write races when defensive MLA input checks are enabled."""
-    from ._core import _validate_dsv4_sync_checks
-
-    if slot_mapping.numel() < 2 or not _validate_dsv4_sync_checks(slot_mapping.device):
-        return
-    ordered = torch.sort(slot_mapping).values
-    duplicate_valid = (
-        (ordered[1:] == ordered[:-1]) & (ordered[1:] >= 0) & (ordered[1:] < capacity)
-    )
-    if duplicate_valid.any().item():
-        raise ValueError("valid slot_mapping entries must be unique")
-
-
 @supported_compute_capability([120, 121])
 @flashinfer_api
 def nvfp4_quantize_pack_sparse_mla_cache(
@@ -326,9 +312,8 @@ def nvfp4_quantize_append_sparse_mla_cache(
     slot_mapping : torch.Tensor
         Contiguous 1D CUDA int32 or int64 tensor. ``slot_mapping[i]`` is
         ``page_id * page_size + entry_id``. Negative and out-of-range slots
-        are padding and are ignored. Valid slots must be unique; set
-        ``FLASHINFER_VALIDATE_INPUTS=1`` to check that invariant eagerly
-        outside CUDA Graph capture.
+        are padding and are ignored. If a valid slot occurs more than once,
+        the lowest-index input row is written deterministically.
     cache : torch.Tensor
         Destination opaque uint8 paged cache. The 3D shorthand
         ``[num_pages, page_size, 384]`` and public 4D HND/NHD layouts are
@@ -354,7 +339,6 @@ def nvfp4_quantize_append_sparse_mla_cache(
     _check_latent_kv(latent_kv, expected_rows=slot_mapping.numel())
     if num_pages * page_size == 0 and slot_mapping.numel() != 0:
         raise ValueError("cannot append to an empty cache")
-    _validate_unique_slots(slot_mapping, num_pages * page_size)
 
     get_sparse_mla_nvfp4_sm120_module().sparse_mla_sm120_nvfp4_quantize_append(
         latent_kv, slot_mapping, cache

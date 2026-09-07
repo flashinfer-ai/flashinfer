@@ -43,12 +43,15 @@ constexpr int kDataBytesPerToken = Cache::DATA_BYTES_PER_TOKEN;
 constexpr int kScaleBytesPerToken = Cache::SCALE_BYTES_PER_TOKEN;
 constexpr int kBytesPerToken = Cache::BYTES_PER_TOKEN;
 constexpr int kThreadsPerToken = 32;
+constexpr int kOwnerByteOffset = kNumScaleGroups;
+constexpr int kDuplicateScanMaxTokens = 256;
 
 static_assert(kNumScaleGroups == 28);
 static_assert(Cache::SCALE_GROUP_SIZE == SF_VEC_SIZE);
 static_assert(kPackedNopeBytes == 224);
 static_assert(kDataBytesPerToken == 352);
 static_assert(kBytesPerToken == 384);
+static_assert(kOwnerByteOffset + sizeof(uint32_t) == kScaleBytesPerToken);
 
 template <typename T>
 __device__ __forceinline__ void quantize_token(const T* input, uint8_t* data_output,
@@ -90,24 +93,121 @@ __global__ void QuantizePackKernel(const T* input, uint8_t* cache, int num_pages
   quantize_token(token_input, data_output, scale_output);
 }
 
+__device__ __forceinline__ uint8_t* append_data_output(uint8_t* cache, size_t slot, int page_size,
+                                                       size_t page_stride_bytes) {
+  const size_t page_idx = slot / page_size;
+  const size_t entry_idx = slot % page_size;
+  return cache + page_idx * page_stride_bytes + entry_idx * kDataBytesPerToken;
+}
+
+__device__ __forceinline__ uint8_t* append_scale_output(uint8_t* cache, size_t slot, int page_size,
+                                                        size_t page_stride_bytes) {
+  const size_t page_idx = slot / page_size;
+  const size_t entry_idx = slot % page_size;
+  uint8_t* page = cache + page_idx * page_stride_bytes;
+  return page + static_cast<size_t>(page_size) * kDataBytesPerToken +
+         entry_idx * kScaleBytesPerToken;
+}
+
 template <typename T, typename IdType>
-__global__ void QuantizeAppendKernel(const T* input, const IdType* slot_mapping, int num_tokens,
-                                     uint8_t* cache, int num_pages, int page_size,
-                                     size_t page_stride_bytes) {
+__global__ void QuantizeAppendFirstKernel(const T* input, const IdType* slot_mapping,
+                                          int num_tokens, uint8_t* cache, int num_pages,
+                                          int page_size, size_t page_stride_bytes) {
   const int token_idx = blockIdx.x;
   if (token_idx >= num_tokens) return;
 
   const IdType slot = slot_mapping[token_idx];
   if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(num_pages) * page_size) return;
 
-  const size_t page_idx = static_cast<size_t>(slot) / page_size;
-  const size_t entry_idx = static_cast<size_t>(slot) % page_size;
+  // For the latency-sensitive decode-sized path, each warp checks whether an
+  // earlier input row owns the same slot. Only the first occurrence writes,
+  // so duplicate mappings cannot tear a cache record across CUDA blocks.
+  bool has_earlier_duplicate = false;
+  for (int prior = threadIdx.x; prior < token_idx; prior += kThreadsPerToken) {
+    has_earlier_duplicate |= slot_mapping[prior] == slot;
+  }
+  if (__any_sync(0xffffffffu, has_earlier_duplicate)) return;
+
   const T* token_input = input + static_cast<size_t>(token_idx) * kDLatent;
-  uint8_t* page = cache + page_idx * page_stride_bytes;
-  uint8_t* data_output = page + entry_idx * kDataBytesPerToken;
+  uint8_t* data_output =
+      append_data_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
   uint8_t* scale_output =
-      page + static_cast<size_t>(page_size) * kDataBytesPerToken + entry_idx * kScaleBytesPerToken;
+      append_scale_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
   quantize_token(token_input, data_output, scale_output);
+}
+
+template <typename IdType>
+__global__ void ResetAppendOwnersKernel(const IdType* slot_mapping, int num_tokens, uint8_t* cache,
+                                        int num_pages, int page_size, size_t page_stride_bytes) {
+  const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token_idx >= num_tokens) return;
+  const IdType slot = slot_mapping[token_idx];
+  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(num_pages) * page_size) return;
+  uint8_t* scale_output =
+      append_scale_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
+  atomicExch(reinterpret_cast<unsigned int*>(scale_output + kOwnerByteOffset), 0xffffffffu);
+}
+
+template <typename IdType>
+__global__ void ClaimAppendOwnersKernel(const IdType* slot_mapping, int num_tokens, uint8_t* cache,
+                                        int num_pages, int page_size, size_t page_stride_bytes) {
+  const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token_idx >= num_tokens) return;
+  const IdType slot = slot_mapping[token_idx];
+  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(num_pages) * page_size) return;
+  uint8_t* scale_output =
+      append_scale_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
+  atomicMin(reinterpret_cast<unsigned int*>(scale_output + kOwnerByteOffset),
+            static_cast<unsigned int>(token_idx));
+}
+
+template <typename T, typename IdType>
+__global__ void QuantizeAppendWinnerKernel(const T* input, const IdType* slot_mapping,
+                                           int num_tokens, uint8_t* cache, int num_pages,
+                                           int page_size, size_t page_stride_bytes) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) return;
+  const IdType slot = slot_mapping[token_idx];
+  if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(num_pages) * page_size) return;
+
+  uint8_t* scale_output =
+      append_scale_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
+  const unsigned int owner =
+      *reinterpret_cast<const unsigned int*>(scale_output + kOwnerByteOffset);
+  if (owner != static_cast<unsigned int>(token_idx)) return;
+
+  const T* token_input = input + static_cast<size_t>(token_idx) * kDLatent;
+  uint8_t* data_output =
+      append_data_output(cache, static_cast<size_t>(slot), page_size, page_stride_bytes);
+  // quantize_token restores the four-byte owner scratch to the cache ABI's
+  // required zero padding after the winning row has been selected.
+  quantize_token(token_input, data_output, scale_output);
+}
+
+template <typename T, typename IdType>
+void launch_quantize_append(const T* input, const IdType* slot_mapping, int num_tokens,
+                            uint8_t* cache, int num_pages, int page_size, size_t page_stride_bytes,
+                            cudaStream_t stream) {
+  const dim3 token_grid(num_tokens);
+  const dim3 token_block(kThreadsPerToken);
+  if (num_tokens <= kDuplicateScanMaxTokens) {
+    QuantizeAppendFirstKernel<T, IdType><<<token_grid, token_block, 0, stream>>>(
+        input, slot_mapping, num_tokens, cache, num_pages, page_size, page_stride_bytes);
+    return;
+  }
+
+  // Avoid quadratic duplicate scans for large prompt appends. The cache ABI
+  // reserves four zero-padding bytes after its 28 scales; use those bytes as
+  // an owner scratch across ordered kernels, then restore them to zero.
+  constexpr int kOwnerThreads = 256;
+  const dim3 owner_grid((num_tokens + kOwnerThreads - 1) / kOwnerThreads);
+  const dim3 owner_block(kOwnerThreads);
+  ResetAppendOwnersKernel<IdType><<<owner_grid, owner_block, 0, stream>>>(
+      slot_mapping, num_tokens, cache, num_pages, page_size, page_stride_bytes);
+  ClaimAppendOwnersKernel<IdType><<<owner_grid, owner_block, 0, stream>>>(
+      slot_mapping, num_tokens, cache, num_pages, page_size, page_stride_bytes);
+  QuantizeAppendWinnerKernel<T, IdType><<<token_grid, token_block, 0, stream>>>(
+      input, slot_mapping, num_tokens, cache, num_pages, page_size, page_stride_bytes);
 }
 
 namespace {
@@ -177,22 +277,18 @@ void SparseMlaSm120NVFP4QuantizeAppend(TensorView latent_kv, TensorView slot_map
 
   ffi::CUDADeviceGuard device_guard(latent_kv.device().device_id);
   cudaStream_t stream = get_stream(latent_kv.device());
-  const dim3 grid(num_tokens);
-  const dim3 block(kThreadsPerToken);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(latent_kv.dtype(), c_type, [&] {
     if (slot_mapping.dtype() == dl_int32) {
-      QuantizeAppendKernel<c_type, int32_t>
-          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
-                                       static_cast<const int32_t*>(slot_mapping.data_ptr()),
-                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
-                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
+      launch_quantize_append(static_cast<const c_type*>(latent_kv.data_ptr()),
+                             static_cast<const int32_t*>(slot_mapping.data_ptr()), num_tokens,
+                             static_cast<uint8_t*>(cache.data_ptr()), shape.num_pages,
+                             shape.page_size, shape.page_stride_bytes, stream);
     } else {
-      QuantizeAppendKernel<c_type, int64_t>
-          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
-                                       static_cast<const int64_t*>(slot_mapping.data_ptr()),
-                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
-                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
+      launch_quantize_append(static_cast<const c_type*>(latent_kv.data_ptr()),
+                             static_cast<const int64_t*>(slot_mapping.data_ptr()), num_tokens,
+                             static_cast<uint8_t*>(cache.data_ptr()), shape.num_pages,
+                             shape.page_size, shape.page_stride_bytes, stream);
     }
     return true;
   });

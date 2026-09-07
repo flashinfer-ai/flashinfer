@@ -285,10 +285,13 @@ def _workspace_tensor_view(
 ) -> Tuple[Optional[torch.Tensor], int]:
     if not workspace_buffer.is_contiguous():
         return None, byte_offset
-    # Element size is device independent. Avoid a CUDA allocation while
-    # partitioning caller-owned storage so this path stays graph-capture safe.
-    elem_size = torch.empty((), dtype=dtype).element_size()
-    byte_offset = ((byte_offset + elem_size - 1) // elem_size) * elem_size
+    # Keep every scratch view 16-byte aligned for vectorized kernel accesses.
+    # dtype.itemsize avoids creating a tensor on the process-wide default
+    # device while partitioning caller-owned storage during graph capture.
+    elem_size = dtype.itemsize
+    alignment = math.lcm(16, elem_size)
+    address = workspace_buffer.data_ptr() + byte_offset
+    byte_offset += (-address) % alignment
     numel = math.prod(shape)
     byte_end = byte_offset + numel * elem_size
     workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
