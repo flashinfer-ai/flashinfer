@@ -25,10 +25,10 @@ from .core import (
 
 
 @functools.cache
-def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
-    """SM120 MXFP8 / FP8 cute groupwise GEMM module.
+def gen_gemm_sm120_module_cute() -> JitSpec:
+    """SM12x MXFP8 / FP8 cute groupwise GEMM module.
 
-    Bundles the cute SM120 MXFP8 and FP8 float-scale groupwise runners with their
+    Bundles the cute SM12x MXFP8 and FP8 float-scale groupwise runners with their
     public MoE entries (``moe_gemm_mxfp8_nt_groupwise`` / ``moe_gemm_fp8_nt_groupwise``)
     in a single ``.so``. All source is in-tree under ``csrc/cute_sm12x_gemm/
     {cute_sm12x_{mxfp8,fp8}_runner.{h,cu}, cute_sm12x_{mxfp8,fp8}_op{,_jit_binding}.cu,
@@ -55,3 +55,6 @@ def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
         extra_cuda_cflags=[*nvcc_flags, "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
+
+
+__all__ = ["gen_gemm_sm120_module_cute"]
