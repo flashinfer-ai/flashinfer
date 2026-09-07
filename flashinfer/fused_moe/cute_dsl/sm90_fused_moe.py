@@ -91,6 +91,7 @@ def _moe_core_impl(
     intermediate_buffer: Optional[torch.Tensor] = None,
     tile_size: Optional[int] = None,
     gemm1_tile_n: Optional[int] = None,
+    gemm1_swizzle: Optional[int] = None,
     gemm2_tile_n: Optional[int] = None,
     gemm2_tile_k: Optional[int] = None,
     gemm2_cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -237,11 +238,6 @@ def _moe_core_impl(
             moe_output_memset_inplace(moe_output)
             memset_event.record(aux_stream)
 
-    # Keep GEMM1 unclustered. L2 can service concurrent same-expert B reads,
-    # while clustered execution constrains CTA scheduling and requires both
-    # members of each pair to traverse the pipeline.
-    gemm1_cluster = (1, 1)
-
     intermediate = sm90_contiguous_gather_grouped_gemm_act_fusion(
         x,
         w1_weight,
@@ -253,7 +249,8 @@ def _moe_core_impl(
         topk=top_k,
         permuted_m=permuted_m,
         tile_shape_mn=(tile_size, gemm1_tile_n),
-        cluster_shape_mn=gemm1_cluster,
+        cluster_shape_mn=(1, 1),
+        swizzle_size=gemm1_swizzle if gemm1_swizzle is not None else 1,
         enable_pdl=enable_pdl,
     )
 
@@ -320,6 +317,7 @@ def cute_dsl_fused_moe_bf16(
     intermediate_buffer: Optional[torch.Tensor] = None,
     tile_size: Optional[int] = None,
     gemm1_tile_n: Optional[int] = None,
+    gemm1_swizzle: Optional[int] = None,
     gemm2_tile_n: Optional[int] = None,
     gemm2_tile_k: Optional[int] = None,
     gemm2_cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -403,6 +401,10 @@ def cute_dsl_fused_moe_bf16(
             (per-rank ``I < 192``) switch to 128 already at 16 rows per
             expert.
         gemm1_tile_n: N tile for GEMM1 (None auto-selects; keyword-only).
+        gemm1_swizzle: GEMM1 persistent-walk swizzle, a positive int —
+            groups the tile walk into blocks of this many M-tiles so each
+            expert's B streams once per block (None/1 = plain N-fast walk;
+            autotuning selects 8/16 where the grouping wins. Keyword-only).
         gemm2_tile_n: N tile for GEMM2 (None auto-selects; keyword-only).
         gemm2_tile_k: K tile for GEMM2, 64 or 32 (None auto-selects via
             :func:`_default_gemm2_tile_k`: 32 when 64 does not divide the
@@ -430,6 +432,7 @@ def cute_dsl_fused_moe_bf16(
     if (
         tile_size is not None
         or gemm1_tile_n is not None
+        or gemm1_swizzle is not None
         or gemm2_tile_n is not None
         or gemm2_tile_k is not None
         or gemm2_cluster_shape_mn is not None
@@ -450,6 +453,7 @@ def cute_dsl_fused_moe_bf16(
             intermediate_buffer=intermediate_buffer,
             tile_size=tile_size,
             gemm1_tile_n=gemm1_tile_n,
+            gemm1_swizzle=gemm1_swizzle,
             gemm2_tile_n=gemm2_tile_n,
             gemm2_tile_k=gemm2_tile_k,
             gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
@@ -529,6 +533,7 @@ class CuteDslBf16MoEWrapper:
         enable_pdl: bool = True,
         use_fused_finalize: bool = True,
         gemm1_tile_n: Optional[int] = None,
+        gemm1_swizzle: Optional[int] = None,
         gemm2_tile_n: Optional[int] = None,
     ):
         """Configure the SM90 fused-MoE wrapper.
@@ -554,6 +559,8 @@ class CuteDslBf16MoEWrapper:
                 scatter-reduce into GEMM2; False selects the
                 bitwise-reproducible two-stage finalize.
             gemm1_tile_n: Optional GEMM1 N-tile override.
+            gemm1_swizzle: Optional GEMM1 walk-swizzle override (see
+                :func:`cute_dsl_fused_moe_bf16`).
             gemm2_tile_n: Optional GEMM2 N-tile override.
         """
         self.num_experts = num_experts
@@ -568,6 +575,7 @@ class CuteDslBf16MoEWrapper:
         self.output_dtype = output_dtype
         self.tile_size = tile_size
         self.gemm1_tile_n = gemm1_tile_n
+        self.gemm1_swizzle = gemm1_swizzle
         self.gemm2_tile_n = gemm2_tile_n
         self.enable_pdl = enable_pdl
 
@@ -586,12 +594,13 @@ class CuteDslBf16MoEWrapper:
         ``tactic`` overrides the instance tile config for this call."""
         if tactic is None:
             tactic_override = _Sm90MoeTacticOverride(
-                self.tile_size,
-                self.gemm1_tile_n,
-                self.gemm2_tile_n,
-                None,
-                None,
-                None,
+                tile_size=self.tile_size,
+                gemm1_tile_n=self.gemm1_tile_n,
+                gemm1_swizzle=self.gemm1_swizzle,
+                gemm2_tile_n=self.gemm2_tile_n,
+                gemm2_tile_k=None,
+                gemm2_cluster_shape_mn=None,
+                gemm2_raster_along_m=None,
             )
         else:
             tactic_override = _decode_sm90_moe_tactic(tactic)
@@ -613,6 +622,7 @@ class CuteDslBf16MoEWrapper:
             intermediate_buffer=intermediate_buffer,
             tile_size=tactic_override.tile_size,
             gemm1_tile_n=tactic_override.gemm1_tile_n,
+            gemm1_swizzle=tactic_override.gemm1_swizzle,
             gemm2_tile_n=tactic_override.gemm2_tile_n,
             gemm2_tile_k=tactic_override.gemm2_tile_k,
             gemm2_cluster_shape_mn=tactic_override.gemm2_cluster_shape_mn,
@@ -621,10 +631,15 @@ class CuteDslBf16MoEWrapper:
             enable_pdl=self.enable_pdl,
         )
 
-    def get_valid_tactics(self) -> List[Sm90MoeTactic]:
-        """All tunable tactics for this wrapper's geometry."""
+    def get_valid_tactics(self, num_tokens: int) -> List[Sm90MoeTactic]:
+        """All tunable tactics for this wrapper's geometry at ``num_tokens``
+        (the space is bucket-dependent: swizzle candidates that cannot win
+        at this token count are rejected)."""
         return _enumerate_sm90_moe_tactics(
             2 * self.intermediate_size,
             self.hidden_size,
             self.intermediate_size,
+            num_tokens=num_tokens,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
         )
