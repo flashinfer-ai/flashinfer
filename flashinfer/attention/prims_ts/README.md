@@ -61,6 +61,22 @@ Qualified Q64/coarse-KV profiles retain KV256 routes for page sizes 64 and
 `[B, ceil(max_seq_len_kv / 32)]` over logical KV tokens; it is shared by all KV
 heads and independent of the physical page mapping.
 
+For contiguous block-sparse attention, both `BlockSparseTSWrapper.plan` and
+the `block_sparse_attention` one-shot API can opt into
+`sparse_format="bitmask"` and/or `use_proxy_routes=True`. BSR and packed
+exact-block bitmaps are alternative frontends; both are prepared into the same
+route stream before attention. The bitmask one-shot uses the full structural
+KV-block count as its temporary plan capacity, while reusable plans accept a
+tighter caller-provided bound. Proxy routes are supported across the existing
+contiguous block-sparse profiles and preserve the profile's Q tile, KV route,
+and KeepsAB/SWAPAB geometry. Proxy routes currently require
+`mask_type="dense"`; paged K/V proxy execution remains unsupported. Route rows
+are owned by `(batch, KV head, Q block)`, so all Q heads in one GQA/MQA group
+share sparsity. A proxy run supplies one K arithmetic mean and one V sum per
+semantic KV block. The final partial block uses only its structural tokens.
+Optional `kv_valid_bits` filters exact K/V tokens only and does not change
+proxy summaries or their represented mass.
+
 ## Validation
 
 Run the numerical, graph, scheduler/resource, alias-safety, and public-surface
