@@ -2351,7 +2351,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 and self.dtype_weights == DtypeTrtllmGen.MxInt4
             ):
                 result = moe_op.trtllm_mxint4_block_scale_moe(
-                    kwargs["routing_input_mode"],
                     routing_logits,
                     kwargs["routing_bias"],
                     topk_ids,
@@ -4357,7 +4356,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         mutates_args=("routing_replay_out",),
     )
     def trtllm_mxint4_block_scale_moe_op(
-        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
@@ -4395,28 +4393,17 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
 
-        routing_input_mode = RoutingInputMode(routing_input_mode)
-        if routing_input_mode is RoutingInputMode.FromLogits:
-            assert routing_logits is not None, (
-                "FromLogits routing requires routing_logits"
-            )
+        if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
             expert_weights = torch.empty(
                 0, dtype=torch.bfloat16, device=hidden_states.device
             )
         else:
-            assert routing_logits is None, (
-                "precomputed routing does not accept routing_logits"
-            )
-            # Without routing logits, we either have topk_ids/expert_weights,
+            # When routing_logits is provided, we either have topk_ids/expert_weights,
             # packed into a single tensor as topk_id
             # or have them individually as topk_ids and expert_weights respectively
             topk_ids = topk_ids
-            if routing_input_mode is RoutingInputMode.UnpackedPrecomputed:
-                assert expert_weights is not None and expert_weights.numel() > 0, (
-                    "UnpackedPrecomputed routing requires expert_weights"
-                )
             expert_weights = (
                 expert_weights
                 if expert_weights is not None
@@ -4461,11 +4448,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
-            routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
 
+        routing_input_mode = (
+            RoutingInputMode.FromLogits
+            if routing_logits is not None
+            else RoutingInputMode.PackedPrecomputed
+        )
         runner_kwargs = {
             "routing_input_mode": routing_input_mode,
             "num_experts": num_experts,
@@ -4497,9 +4488,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
 
         def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
-            """Launch the MXINT4 operation with one complete tactic."""
+            """Launch the unchanged MXINT4 operation with one complete tactic."""
+            # Preserve the exact MXINT4 ordinary FFI ABI for every fixed-tactic path.
             intermediate_output = moe_op.trtllm_mxint4_block_scale_moe(
-                routing_input_mode,
                 routing_logits,
                 routing_bias,
                 topk_ids,
@@ -4588,7 +4579,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
     @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")
     def _fake_trtllm_mxint4_block_scale_moe(
-        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
@@ -4618,8 +4608,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
     ):
-        # Acknowledge metadata-only arguments without reading device data in fake mode.
-        _ = routing_input_mode, routing_replay_out
+        # Acknowledge the declared mutation-only argument without reading device data in fake mode.
+        _ = routing_replay_out
         return _fake_trtllm_moe_output(
             hidden_states,
             hidden_size=hidden_states.shape[1],
@@ -7248,7 +7238,6 @@ def trtllm_mxint4_block_scale_moe(
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
-        RoutingInputMode.FromLogits,
         routing_logits,
         routing_bias,
         None,  # topk_ids
@@ -7403,7 +7392,6 @@ def trtllm_mxint4_block_scale_routed_moe(
         =============  ==================  =========================================================================
     """
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
-        RoutingInputMode.PackedPrecomputed,
         None,  # routing_logits
         None,  # routing_bias
         topk_ids,

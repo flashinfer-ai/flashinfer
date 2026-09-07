@@ -66,8 +66,9 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
-  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): capable TRTLLM runners receive
-    separate int32 ids + BF16 or FP32 weights without packed-id construction.
+  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4, BF16,
+    and block-FP8 receive separate int32 ids + BF16 or FP32 weights without packed-id
+    construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
@@ -77,8 +78,9 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
     single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
 Coverage today: NVFP4, BF16, block/per-tensor FP8, MXFP4/W4A16, and MxInt4.
-CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
-dispatch to capable TRTLLM runners.
+CuteDSL NVFP4 is pre-routed-only; FromLogits restricts to capable TRTLLM
+runners. UnpackedPrecomputed is wired for TRTLLM FP4, BF16, and block-FP8.
+MxInt4 covers packed and BF16-FromLogits routing.
 
 ENABLED BY DEFAULT: this suite runs like any other test. Unsupported configurations skip at the
 no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver.
@@ -2197,7 +2199,7 @@ def test_random_seed_stream_is_unchanged():
     payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
     assert (
         hashlib.sha256(payload).hexdigest()
-        == "504c8a83ccb3622911238b95b340b5d7901413a48f31dd2c47e8e575a209a629"
+        == "14cf80f6bc0bf77170acc447d4b80603dafdea02eef4fe07f567cdab7b0d6242"
     )
 
 
@@ -2726,8 +2728,8 @@ def test_unified_moe_fuzz(cfg):
         # so it cannot serve a logits-only pack and would compare apples to oranges).
         wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
     elif cfg.is_unpacked:
-        # Keep only runners that implement exact TRTLLM Mode 3 with separate
-        # caller-owned IDs and weights.
+        # Keep only runners that implement UnpackedPrecomputed (TRTLLM FP4, BF16,
+        # and block-FP8). MxInt4 stays packed/FromLogits to match the flat API.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not cfg.do_finalize:
         # Only TRTLLM returns unfinalized intermediates; like the EP filter

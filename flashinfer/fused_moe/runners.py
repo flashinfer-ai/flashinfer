@@ -5548,16 +5548,11 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 
 
 class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
-    """MxInt4 adapter over the canonical TRTLLM MoE runner.
-
-    Routing can be computed from logits or supplied as packed or unpacked
-    precomputed expert IDs and weights.
-    """
+    """MxInt4 adapter over the canonical TRTLLM MoE runner."""
 
     backend_key = "trtllm_mxint4_routed"
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
-        RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.MxInt4,)
@@ -5679,9 +5674,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            # routing_input_mode selects FromLogits explicitly; the empty
-            # placeholders only satisfy the launcher ABI, which still requires
-            # the topk_ids / expert_weights slots.
+            # MxInt4 infers routing mode from these placeholders rather than
+            # receiving RoutingInputMode explicitly. Non-empty tensors select
+            # precomputed routing and would suppress routing_logits.
             topk_ids = hidden_states.new_empty((0,), dtype=torch.int32)
             expert_weights = hidden_states.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
@@ -5691,24 +5686,13 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            expert_weights = act.topk_weights.new_empty((0,), dtype=torch.bfloat16)
-        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
-            _validate_prerouted_inputs(
-                act,
-                num_tokens,
-                routing.top_k,
-                type(self).__name__,
-                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
-                require_contiguous=True,
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
-            routing_logits = None
-            routing_bias = None
-            topk_ids = act.topk_ids
-            expert_weights = act.topk_weights
         else:
             raise NotImplementedError(
-                f"{type(self).__name__} supports only FromLogits, "
-                "PackedPrecomputed, and UnpackedPrecomputed routing."
+                f"{type(self).__name__} supports only FromLogits and "
+                "PackedPrecomputed routing."
             )
 
         required = (
@@ -5792,7 +5776,6 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         )
 
         static_kwargs = dict(
-            routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
