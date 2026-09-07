@@ -27,7 +27,9 @@ from flashinfer.trace_apply.apply import (
     build_extractor_maps,
     extract_axes,
     _derive_output_dests,
+    _dispatcher_for,
     _registry_by_fi_api,
+    _select_template,
     _stateful_namespace_builder,
 )
 from flashinfer.trace_apply.config import Definition
@@ -245,6 +247,150 @@ def test_mla_trace_apply_accepts_historical_and_moved_wrapper_keys():
     assert moved in reg
     assert adapter_for(historical) is not None
     assert adapter_for(moved) is not None
+
+
+def test_mla_dispatch_requires_compatible_decode_plan():
+    mla = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
+    original, templates = _registry_by_fi_api()[mla]
+    assert [template.name_prefix for template in templates] == ["mla_paged_decode"]
+    dispatcher = _dispatcher_for(original)
+    assert dispatcher is not None
+
+    class _Wrapper:
+        pass
+
+    wrapper = _Wrapper()
+    wrapper._causal = False
+    wrapper._all_query_lengths_one = True
+    wrapper._planned_total_q = 4
+    q_nope = torch.empty(4, 2, 8)
+    q_pe = torch.empty(4, 2, 3)
+    namespace = {
+        "self": wrapper,
+        "query": (q_nope, q_pe),
+    }
+    decode = _select_template(
+        templates,
+        dispatcher,
+        namespace,
+    )
+    assert decode.name_prefix == "mla_paged_decode"
+    assert namespace["q_nope"] is q_nope
+    assert namespace["q_pe"] is q_pe
+
+    wrapper._causal = True
+    assert (
+        _select_template(
+            templates,
+            dispatcher,
+            {"self": wrapper, "q_nope": torch.empty(4, 2, 8)},
+        )
+        is None
+    )
+
+    wrapper._causal = False
+    wrapper._all_query_lengths_one = False
+    assert (
+        _select_template(
+            templates,
+            dispatcher,
+            {"self": wrapper, "q_nope": torch.empty(4, 2, 8)},
+        )
+        is None
+    )
+
+    wrapper._all_query_lengths_one = True
+    assert (
+        _select_template(
+            templates,
+            dispatcher,
+            {"self": wrapper, "q_nope": torch.empty(7, 2, 8)},
+        )
+        is None
+    )
+
+    wrapper._all_query_lengths_one = None
+    assert (
+        _select_template(
+            templates,
+            dispatcher,
+            {"self": wrapper, "q_nope": torch.empty(4, 2, 8)},
+        )
+        is None
+    )
+
+    direct = _select_template(
+        templates,
+        dispatcher,
+        {"q_nope": torch.empty(4, 2, 8)},
+    )
+    assert direct.name_prefix == "mla_paged_decode"
+
+
+@pytest.mark.parametrize(
+    ("query_indptr", "expected"),
+    [
+        ([0, 1, 2, 3], (True, 3)),
+        ([0, 0, 2], (False, 2)),
+        ([0, 1, 3], (False, 3)),
+        ([0], (False, 0)),
+        ([4, 5, 6], (False, 6)),
+        ([], (False, None)),
+    ],
+)
+def test_mla_query_plan_characteristics(query_indptr, expected):
+    from flashinfer.mla._batch_mla._wrapper import _query_plan_characteristics
+
+    indptr = torch.tensor(query_indptr, dtype=torch.int32)
+    assert _query_plan_characteristics(indptr) == expected
+
+
+def test_mla_decode_solution_falls_back_for_prefill(monkeypatch):
+    """A solution for the shared run() API must only replace decode calls."""
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def cpu_original(self, q_nope, q_pe, ckv_cache, kpe_cache, **kwargs):
+        return torch.full_like(q_nope, -1.0)
+
+    monkeypatch.setattr(BatchMLAPagedAttentionWrapper, "run", cpu_original)
+
+    def decode_solution(**kwargs):
+        return torch.full_like(kwargs["q_nope"], SENTINEL)
+
+    ta.enable_apply({"mla_paged_decode_h2_ckv4_kpe2_ps1": decode_solution})
+
+    class _Wrapper:
+        pass
+
+    wrapper = _Wrapper()
+    wrapper._kv_indptr_buf = torch.tensor([0, 2, 4], dtype=torch.int32)
+    wrapper._kv_indices_buf = torch.arange(4, dtype=torch.int32)
+    wrapper._sm_scale = 0.125
+    ckv = torch.empty(8, 1, 4)
+    kpe = torch.empty(8, 1, 2)
+
+    wrapper._causal = False
+    wrapper._all_query_lengths_one = True
+    wrapper._planned_total_q = 2
+    decode = BatchMLAPagedAttentionWrapper.run(
+        wrapper, torch.empty(2, 2, 4), torch.empty(2, 2, 2), ckv, kpe
+    )
+    assert torch.all(decode == SENTINEL)
+
+    wrapper._causal = True
+    wrapper._all_query_lengths_one = False
+    wrapper._planned_total_q = 7
+    prefill = BatchMLAPagedAttentionWrapper.run(
+        wrapper, torch.empty(7, 2, 4), torch.empty(7, 2, 2), ckv, kpe
+    )
+    assert torch.all(prefill == -1.0)
+
+    stats = ta.stats()["flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"]
+    assert stats["hit"] == 1
+    assert stats["fallback_no_template"] == 1
+    ta.disable_apply()
 
 
 def test_output_adapt_value_returning_returns_value():
