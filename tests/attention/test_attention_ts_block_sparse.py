@@ -637,9 +637,14 @@ def _make_patterns(case: _Case) -> _Patterns:
                     rows.append((*range(1, 9), *range(22, 30)))
                     continue
                 if case.pattern == "proxy_tail":
-                    rows.append(
-                        (0, 32) if row_idx % 2 == 1 and num_kv_blocks > 32 else (1, 3)
-                    )
+                    if row_idx % 2 == 1 and num_kv_blocks > 32:
+                        rows.append((0, 32))
+                    elif num_kv_blocks > 3:
+                        rows.append((1, 3))
+                    else:
+                        # Three-block rows (128-token KV blocks over 269
+                        # tokens) keep the ragged final block in the set.
+                        rows.append((1, num_kv_blocks - 1))
                     continue
                 selected = {0, num_kv_blocks - 1}
                 if num_kv_blocks > 2:
