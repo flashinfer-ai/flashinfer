@@ -26,6 +26,7 @@ def reference_paged_prefill(
     window_left: int = -1,
     kv_layout: str = "HND",
     kv_page_indices: Optional[torch.Tensor] = None,  # flat CSR page ids
+    lse_base: str = "2",  # "2" (FlashInfer contract) or "e"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if kv_layout == "NHD":
         k_cache = k_cache.permute(0, 2, 1, 3)
@@ -86,7 +87,9 @@ def reference_paged_prefill(
             allowed &= kpos >= (lkv - lq) + qpos - window_left
         if causal or window_left >= 0:
             scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
-        lse_i = torch.logsumexp(scores, dim=-1) / math.log(2)  # (Hq, lq), base-2
+        lse_i = torch.logsumexp(scores, dim=-1)  # (Hq, lq), natural log
+        if lse_base == "2":
+            lse_i = lse_i / math.log(2)
         p = torch.softmax(scores, dim=-1)
         o_i = torch.einsum("hqk,hkd->qhd", p, v_i)  # (lq, Hq, Dvo)
         out[s:e] = o_i

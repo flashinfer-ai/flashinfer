@@ -54,7 +54,7 @@ meta = dict(
     head_dim_qk=D,
     q_dtype=torch.bfloat16,
     causal=True,
-    return_lse=True,
+    lse_mode="base2",
 )
 
 # ---- 1. init-time resolution (no tensors, no wrapper) --------------------

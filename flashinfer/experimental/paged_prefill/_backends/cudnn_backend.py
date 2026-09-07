@@ -34,7 +34,7 @@ class _CudnnBackend:
         # plan (qo_indptr and batch size are fixed here) — precompute them so
         # run() stays a single indexed lookup on the hot path.
         native_lse = batch_ids = pos = None
-        if meta.return_lse:
+        if meta.need_lse:
             dev = meta.qo_indptr.device
             token = torch.arange(meta.total_q_tokens, device=dev, dtype=torch.int64)
             bounds = meta.qo_indptr[1:].to(torch.int64)
@@ -51,7 +51,7 @@ class _CudnnBackend:
         self._meta, self._derived = meta, derived
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None):
+    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
         from ....cudnn import cudnn_batch_prefill_with_kv_cache
 
         meta, derived = self._meta, self._derived
@@ -65,7 +65,7 @@ class _CudnnBackend:
             q,
             k_cache,
             v_cache,
-            meta.sm_scale,
+            sm_scale,
             self._workspace,
             max_token_per_sequence=meta.max_q_len,
             max_sequence_kv=meta.max_kv_len,
@@ -73,17 +73,18 @@ class _CudnnBackend:
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
             block_tables=meta.block_tables,
             causal=meta.causal,
-            return_lse=meta.return_lse,
+            return_lse=meta.need_lse,
+            # native stats are natural-log: basee costs nothing, base2 one fold
+            lse_base="e" if meta.lse_mode == "basee" else "2",
             batch_offsets_q=meta.qo_indptr,
             batch_offsets_units="tokens",
             out=out,
             lse=self._native_lse,
         )
-        if not meta.return_lse:
+        if not meta.need_lse:
             return out_t, None
         # padded (b, max_q, h) -> packed (tokens, h), using the plan-time
-        # precomputed gather indices (zero sync). cuDNN returns base-2 LSE
-        # since #4663, so no log-base fold here.
+        # precomputed gather indices (zero sync). The base was selected above.
         packed = lse_t[self._batch_ids, self._pos, :]
         if lse is not None:
             lse.copy_(packed)

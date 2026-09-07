@@ -27,6 +27,7 @@ from ._contracts import (
     PlanMetadata,
     Resolution,
     _expect,
+    _expect_lse_mode,
     _expect_window_left,
     resolve_config_key,
 )
@@ -91,8 +92,7 @@ class PagedPrefillController:
         kv_layout: str = "HND",
         causal: bool = True,
         window_left: int = -1,
-        sm_scale: Optional[float] = None,
-        return_lse: bool = False,
+        lse_mode: str = "none",
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_seq_lens_cpu: Optional[torch.Tensor] = None,
         backend: Union[str, Resolution] = "auto",
@@ -110,6 +110,8 @@ class PagedPrefillController:
         )
         kv_input_form = "block_tables" if block_tables is not None else "page_indices"
         _expect_window_left(window_left)
+        _expect_lse_mode(lse_mode)
+        need_lse = lse_mode != "none"
 
         validate_structure(
             self.device,
@@ -155,7 +157,7 @@ class PagedPrefillController:
                 page_size,
                 kv_layout,
                 causal,
-                return_lse,
+                need_lse,
                 window_left,
                 kv_input_form,
             )
@@ -177,7 +179,7 @@ class PagedPrefillController:
                 page_size=page_size,
                 kv_layout=kv_layout,
                 causal=causal,
-                need_lse=return_lse,
+                need_lse=need_lse,
                 window_left=window_left,
                 kv_input_form=kv_input_form,
                 backend=backend,
@@ -216,8 +218,7 @@ class PagedPrefillController:
             causal=causal,
             window_left=window_left,
             kv_layout=kv_layout,
-            sm_scale=sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk),
-            return_lse=return_lse,
+            lse_mode=lse_mode,
             batch_size=kv_seq_lens.shape[0],
             qo_indptr_cpu=qo_indptr_cpu,
             kv_seq_lens_cpu=kv_seq_lens_cpu,
@@ -249,6 +250,7 @@ class PagedPrefillController:
         *,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         _expect(self._planned, "run() called before plan() — call plan() first")
         m = self._meta
@@ -330,9 +332,9 @@ class PagedPrefillController:
             )
         if lse is not None:
             _expect(
-                m.return_lse,
-                "lse= buffer passed but the plan has return_lse=False — "
-                "plan(return_lse=True) or drop the lse= argument",
+                m.need_lse,
+                "lse= buffer passed but the plan has lse_mode='none' — "
+                "plan(lse_mode='base2' or 'basee') or drop the lse= argument",
             )
             _expect(
                 tuple(lse.shape) == (q.shape[0], m.num_qo_heads)
@@ -340,10 +342,18 @@ class PagedPrefillController:
                 and lse.is_contiguous()
                 and lse.device == q.device,
                 "lse must be contiguous fp32 (total_q_tokens, num_qo_heads) "
-                f"on {q.device} — the LSE contract is base-2 packed fp32 for "
-                "every backend",
+                f"on {q.device} — the LSE contract is packed fp32 in the planned "
+                "base for every backend",
             )
-        return self._active.run(q, k_cache, v_cache, out=out, lse=lse)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(m.head_dim_qk)
+        _expect(
+            isinstance(sm_scale, float) and math.isfinite(sm_scale) and sm_scale > 0,
+            f"sm_scale must be a positive finite host float, got {sm_scale!r}",
+        )
+        return self._active.run(
+            q, k_cache, v_cache, out=out, lse=lse, sm_scale=sm_scale
+        )
 
     def explain(self) -> str:
         _expect(self._planned, "explain() called before plan() — call plan() first")

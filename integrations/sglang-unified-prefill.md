@@ -69,7 +69,7 @@ already, so this is a copy-forward of an existing host array, not a sync.
 +    q_dtype=self.q_data_type,
 +    kv_layout="NHD",
 +    causal=True,
-+    return_lse=True,
++    lse_mode="base2",
 +    qo_indptr_cpu=qo_indptr_cpu,               # NEW plumbing: host lens
 +    kv_seq_lens_cpu=paged_kernel_lens_cpu,     # forwarded from the scheduler
 +    backend=self._prefill_resolution,

@@ -34,10 +34,14 @@ Design rules enforced (each traces to a documented failure mode):
     passing the returned ``Resolution`` to ``plan(backend=...)`` pins the
     candidate set — plan() verifies the config matches and may only choose
     within it.
-5.  One output contract.  LSE is always base-2 (multiply by ``ln(2)`` to get
-    natural log), shape ``(total_q_tokens, num_qo_heads)``, fp32 — backends
-    normalize native formats (cuDNN returns padded ``(b, max_q, h)`` stats;
-    the gather lives in its backend, not in callers).
+5.  One output contract.  LSE base is declared at plan time (``lse_mode`` =
+    ``"none"`` / ``"base2"`` / ``"basee"``, the Batch MLA vocabulary), shape
+    ``(total_q_tokens, num_qo_heads)``, fp32 — backends deliver the declared
+    base natively where free (cuDNN: natural log) and with one fold otherwise;
+    padded native stats are gathered inside the backend, not by callers.
+6.  Layer constants are run-time.  ``sm_scale`` is a ``run()`` argument, so one
+    plan serves layers with different scales; ``window_left`` stays plan-time
+    because it selects a compiled kernel variant on the FA backends.
 
 Prototype simplifications (documented, not hidden):
 - dtypes: fp16/bf16 only.  fp8/nvfp4 are capability axes, out of scope here.
@@ -166,7 +170,7 @@ class UnifiedPagedPrefill:
         attn.plan(qo_indptr=..., kv_seq_lens=..., block_tables=...,
                   page_size=16, max_q_len=..., max_kv_len=...,
                   num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
-                  q_dtype=torch.bfloat16, causal=True, return_lse=True,
+                  q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
                   backend=res)          # pinned candidate set (or a string)
         out, lse = attn.run(q, (k_cache, v_cache))
     """
@@ -205,8 +209,7 @@ class UnifiedPagedPrefill:
         kv_layout: str = "HND",
         causal: bool = True,
         window_left: int = -1,
-        sm_scale: Optional[float] = None,
-        return_lse: bool = False,
+        lse_mode: str = "none",
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_seq_lens_cpu: Optional[torch.Tensor] = None,
         backend: Union[str, "Resolution"] = "auto",
@@ -227,6 +230,9 @@ class UnifiedPagedPrefill:
         - ``page_size, max_q_len, max_kv_len``: host ints, REQUIRED
         - ``window_left``: sliding-window size (-1 = unlimited); backends
           without window support are capability-excluded
+        - ``lse_mode``: ``"none"`` (no LSE), ``"base2"`` or ``"basee"`` — the
+          base of the LSE ``run()`` returns, delivered natively where the
+          backend can and with one fold otherwise
         - ``qo_indptr_cpu`` / ``kv_seq_lens_cpu``: optional host mirrors —
           with them plan() is zero-sync (validation and fa2/fa3 scheduling
           read the mirrors the engine already owns); without them plan()
@@ -257,8 +263,7 @@ class UnifiedPagedPrefill:
             kv_layout=kv_layout,
             causal=causal,
             window_left=window_left,
-            sm_scale=sm_scale,
-            return_lse=return_lse,
+            lse_mode=lse_mode,
             qo_indptr_cpu=qo_indptr_cpu,
             kv_seq_lens_cpu=kv_seq_lens_cpu,
             backend=backend,
@@ -273,6 +278,7 @@ class UnifiedPagedPrefill:
         *,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the planned batch.
 
@@ -284,13 +290,15 @@ class UnifiedPagedPrefill:
         - ``out``: optional preallocated output, contiguous
           ``(total_q_tokens, num_qo_heads, head_dim_vo)``, dtype == q dtype.
         - ``lse``: optional preallocated LSE buffer, contiguous fp32
-          ``(total_q_tokens, num_qo_heads)``; requires ``return_lse=True``.
+          ``(total_q_tokens, num_qo_heads)``; requires ``lse_mode != "none"``.
+        - ``sm_scale``: softmax scale for this call (default
+          ``1/sqrt(head_dim_qk)``); a per-layer value, so one plan serves
+          layers with different scales.
 
-        Returns ``(out, lse)``; ``lse`` is **base-2** (multiply by ``ln(2)``
-        for natural log), packed ``(total_q_tokens, num_qo_heads)``, fp32 —
-        identical for every backend.
+        Returns ``(out, lse)``; ``lse`` is packed ``(total_q_tokens,
+        num_qo_heads)`` fp32 in the planned base — identical for every backend.
         """
-        return self._impl.run(q, kv_cache, out=out, lse=lse)
+        return self._impl.run(q, kv_cache, out=out, lse=lse, sm_scale=sm_scale)
 
     def explain(self) -> str:
         """Chosen backend plus the per-backend exclusion reasons."""

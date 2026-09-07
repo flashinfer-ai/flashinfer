@@ -13,7 +13,7 @@ from typing import Optional
 
 import torch
 
-from .._contracts import PlanMetadata
+from .._contracts import LN2, PlanMetadata
 from .._planning import Derived
 
 
@@ -33,7 +33,7 @@ class _TrtllmGenBackend:
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         self._meta, self._derived = meta, derived
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None):
+    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
         from ....prefill import trtllm_batch_context_with_kv_cache
 
         meta, derived = self._meta, self._derived
@@ -47,7 +47,7 @@ class _TrtllmGenBackend:
             meta.kv_seq_lens,
             meta.max_q_len,
             meta.max_kv_len,
-            meta.sm_scale,  # bmm1: sm_scale (q/k descales fold here when quantized)
+            sm_scale,  # bmm1: sm_scale (q/k descales fold here when quantized)
             1.0,  # bmm2
             meta.batch_size,
             meta.qo_indptr,
@@ -57,10 +57,12 @@ class _TrtllmGenBackend:
             causal=meta.causal,
             out=out,
             lse=lse,
-            return_lse=meta.return_lse,
+            return_lse=meta.need_lse,
         )
-        if meta.return_lse:
+        if meta.need_lse:
             out_t, lse_t = result
+            if meta.lse_mode == "basee":
+                lse_t.mul_(LN2)  # trtllm-gen emits base-2; one fold
             return out_t, lse_t
         return result, None
 

@@ -7,6 +7,7 @@ fix what a plan means (``PlanMetadata``), what a resolution promised
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -14,10 +15,21 @@ import torch
 
 from ._backends._capabilities import MIN_DENSE_PAGE_SIZE
 
+LSE_MODES = ("none", "base2", "basee")
+LN2 = math.log(2.0)
+
 
 def _expect(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
+
+
+def _expect_lse_mode(lse_mode: str) -> None:
+    _expect(
+        lse_mode in LSE_MODES,
+        f"lse_mode must be one of {LSE_MODES} (MLA vocabulary: none / base-2 / "
+        f"natural log), got {lse_mode!r}",
+    )
 
 
 def _expect_window_left(window_left: int) -> None:
@@ -131,8 +143,7 @@ class PlanMetadata:
     causal: bool
     window_left: int
     kv_layout: str
-    sm_scale: float
-    return_lse: bool
+    lse_mode: str  # "none" | "base2" | "basee"
     batch_size: int
     qo_indptr_cpu: torch.Tensor
     kv_seq_lens_cpu: torch.Tensor
@@ -141,8 +152,14 @@ class PlanMetadata:
     def total_q_tokens(self) -> int:
         return int(self.qo_indptr_cpu[-1])
 
+    @property
+    def need_lse(self) -> bool:
+        return self.lse_mode != "none"
+
 
 __all__ = [
+    "LN2",
+    "LSE_MODES",
     "PlanMetadata",
     "Resolution",
     "resolve_config_key",

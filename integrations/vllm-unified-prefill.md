@@ -58,8 +58,7 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 +    kv_layout=get_kv_cache_layout(),
 +    causal=causal,
 +    window_left=self.window_left,
-+    sm_scale=self.sm_scale,
-+    return_lse=False,
++    lse_mode="none",  # sm_scale is passed per layer at run()
 +    qo_indptr_cpu=qo_indptr_prefill_cpu,     # mirrors vLLM already owns
 +    kv_seq_lens_cpu=seq_lens_cpu[prefill_start:],
 +    backend=self._prefill_resolution,

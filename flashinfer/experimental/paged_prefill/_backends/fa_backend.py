@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from .._contracts import PlanMetadata
+from .._contracts import LN2, PlanMetadata
 from .._planning import Derived
 
 
@@ -22,7 +22,7 @@ class _FaBackend:
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace, kv_layout, backend=backend
         )
-        self._return_lse = False
+        self._lse_mode = "none"
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         qo_host = meta.qo_indptr_cpu.to(torch.int32)
@@ -48,17 +48,27 @@ class _FaBackend:
             head_dim_vo=meta.head_dim_vo,
             causal=meta.causal,
             window_left=meta.window_left,
-            sm_scale=meta.sm_scale,
             q_data_type=meta.q_dtype,
             kv_data_type=meta.kv_dtype,
         )
-        self._return_lse = meta.return_lse
+        self._lse_mode = meta.lse_mode
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None):
+    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
+        # The generated-FA wrapper reads sm_scale from plan-time state and its
+        # run() has no override, while the kernel takes it as a launch arg.
+        # Setting it here keeps sm_scale a per-run (per-layer) value; this
+        # poke goes away when the backend calls the FA module directly.
+        self._wrapper._sm_scale = sm_scale
+        need_lse = self._lse_mode != "none"
         r = self._wrapper.run(
-            q, (k_cache, v_cache), out=out, lse=lse, return_lse=self._return_lse
+            q, (k_cache, v_cache), out=out, lse=lse, return_lse=need_lse
         )
-        return r if self._return_lse else (r, None)
+        if not need_lse:
+            return r, None
+        out_t, lse_t = r
+        if self._lse_mode == "basee":
+            lse_t.mul_(LN2)  # FA kernels emit base-2 (exp2 softmax); one fold
+        return out_t, lse_t
 
 
 __all__ = ["_FaBackend"]

@@ -119,7 +119,7 @@ def run_unified(
     backend,
     *,
     causal=True,
-    return_lse=True,
+    lse_mode="base2",
     with_mirrors=True,
     sm_scale=None,
     window_left=-1,
@@ -144,10 +144,9 @@ def run_unified(
         kv_layout=p.get("kv_layout", "HND"),
         causal=causal,
         window_left=window_left,
-        return_lse=return_lse,
+        lse_mode=lse_mode,
         qo_indptr_cpu=p["qo_indptr_cpu"] if with_mirrors else None,
         kv_seq_lens_cpu=p["kv_seq_lens_cpu"] if with_mirrors else None,
-        sm_scale=sm_scale,
         backend=backend,
     )
     out, lse = attn.run(
@@ -155,6 +154,7 @@ def run_unified(
         (p["k_cache"], p["v_cache"]),
         out=p.get("_out_override"),
         lse=p.get("_lse_override"),
+        sm_scale=sm_scale,
     )
     return attn, out, lse
 
@@ -368,11 +368,43 @@ def test_unified_prefill_noncausal(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_unified_prefill_lse_basee(backend):
+    """lse_mode="basee" returns natural-log LSE from every backend (cuDNN
+    natively, FA/trtllm-gen via one fold), matching the reference."""
+    p = make_problem(
+        seed=23,
+        batch_size=4,
+        max_q=32,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    _resolve_or_skip(p, backend)
+    _, out, lse = run_unified(p, backend, lse_mode="basee")
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_cache"],
+        p["v_cache"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"],
+        p["page_size"],
+        True,
+        lse_base="e",
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_unified_prefill_sm_scale_replan(backend):
-    """Two plans with identical shapes but different sm_scale must each be
-    correct.  Regression for the cuDNN graph-cache stale-scale replay (the
-    cache key omitted attn_scale; found by this prototype's fuzzer, fixed in
-    flashinfer/cudnn/prefill.py)."""
+    """One plan, two run() calls with different sm_scale must each be correct
+    (sm_scale is a per-layer run-time value).  Also the regression for the
+    cuDNN graph-cache stale-scale replay (the cache key omitted attn_scale;
+    found by this prototype's fuzzer, fixed in flashinfer/cudnn/prefill.py)."""
     p = make_problem(
         seed=19,
         batch_size=4,
@@ -430,7 +462,7 @@ def test_resolution_pinning():
         head_dim_qk=p["head_dim_qk"],
         q_dtype=p["dtype"],
         causal=True,
-        return_lse=True,
+        lse_mode="base2",
         qo_indptr_cpu=p["qo_indptr_cpu"],
         kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
         backend=res,
@@ -450,7 +482,7 @@ def test_resolution_pinning():
             head_dim_qk=p["head_dim_qk"],
             q_dtype=p["dtype"],
             causal=True,
-            return_lse=True,
+            lse_mode="base2",
             backend=res,
         )
 

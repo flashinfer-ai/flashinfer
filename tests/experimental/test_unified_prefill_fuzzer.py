@@ -75,6 +75,7 @@ def _sample_config(rng: random.Random):
         kv_layout=rng.choice(["HND", "HND", "NHD"]),
         window_left=rng.choice([-1, -1, -1, 16]),
         input_form=input_form,
+        lse_mode=rng.choice(["base2", "base2", "basee"]),
     )
 
 
@@ -321,10 +322,12 @@ MUTATIONS = [
 KNOWN_GAP_MUTATIONS = {"block_tables_negative"}
 
 
-def _run_and_check(p, backend, causal, repro, window_left=-1):
+def _run_and_check(p, backend, causal, repro, window_left=-1, lse_mode="base2"):
     """Run one call and enforce reject-or-correct against the TRUE oracle."""
     try:
-        _, out, lse = run_unified(p, backend, causal=causal, window_left=window_left)
+        _, out, lse = run_unified(
+            p, backend, causal=causal, window_left=window_left, lse_mode=lse_mode
+        )
     except CLEAN as e:
         assert str(e), f"empty error message is not a clean rejection [{repro}]"
         return "rejected", str(e)
@@ -340,6 +343,7 @@ def _run_and_check(p, backend, causal, repro, window_left=-1):
         window_left=window_left,
         kv_layout=p.get("kv_layout", "HND"),
         kv_page_indices=p.get("kv_page_indices"),
+        lse_base="e" if lse_mode == "basee" else "2",
     )
     torch.testing.assert_close(
         out.float(),
@@ -370,7 +374,12 @@ def test_fuzz_valid_configs(backend):
             continue
         repro = f"backend={backend} seed={seed} cfg={cfg}"
         outcome, _ = _run_and_check(
-            p, backend, cfg["causal"], repro, window_left=cfg["window_left"]
+            p,
+            backend,
+            cfg["causal"],
+            repro,
+            window_left=cfg["window_left"],
+            lse_mode=cfg.get("lse_mode", "base2"),
         )
         assert outcome == "correct", (
             f"valid config was rejected — capability matrix admits a config "
