@@ -243,7 +243,7 @@ void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 16;
     dim3 grid(touched, q.size(2), q.size(0));
-    dim3 block(GROUP * (HEAD_DIM / 8));
+    dim3 block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel("GroupedAmaxKernel(Q)", enable_pdl,
                   lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, false, c_type>, grid, block, stream,
                   static_cast<const c_type*>(q.data_ptr()), static_cast<const c_type*>(nullptr),
@@ -285,7 +285,7 @@ void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView ama
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 128;
     dim3 grid(touched, k.size(2), k.size(0));
-    dim3 block(GROUP * (HEAD_DIM / 8));
+    dim3 block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel(
         "GroupedAmaxKernel(K)", enable_pdl, lowp::GroupedAmaxKernel<HEAD_DIM, GROUP, true, c_type>,
         grid, block, stream, static_cast<const c_type*>(k.data_ptr()),
@@ -334,7 +334,7 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 16;
     dim3 grid(touched, num_heads, batch_size);
-    dim3 block(GROUP * (HEAD_DIM / 8));
+    dim3 block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel("QuantInt8GroupScalePackKernel(Q)", enable_pdl,
                   lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block,
                   stream, static_cast<const c_type*>(q.data_ptr()),
@@ -404,7 +404,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 128;
     dim3 k_grid(touched, num_heads, batch_size);
-    dim3 k_block(GROUP * (HEAD_DIM / 8));
+    dim3 k_block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel("QuantInt8GroupScalePackKernel(K)", enable_pdl,
                   lowp::QuantInt8GroupScalePackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid,
                   k_block, stream, static_cast<const c_type*>(k.data_ptr()),
@@ -469,7 +469,7 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 16;
     dim3 grid(touched, num_heads, batch_size);
-    dim3 block(GROUP * (HEAD_DIM / 8));
+    dim3 block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel(
         "QuantInt8FusedAmaxPackKernel(Q)", enable_pdl,
         lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, false, c_type>, grid, block, stream,
@@ -547,7 +547,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 128;
     dim3 k_grid(touched, num_heads, batch_size);
-    dim3 k_block(GROUP * (HEAD_DIM / 8));
+    dim3 k_block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel("QuantInt8FusedAmaxPackKernel(K)", enable_pdl,
                   lowp::QuantInt8FusedAmaxPackKernel<HEAD_DIM, GROUP, true, c_type>, k_grid,
                   k_block, stream, static_cast<const c_type*>(k.data_ptr()),

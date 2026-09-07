@@ -445,6 +445,36 @@ __global__ void KSumVAmaxCombineKernel(const float* __restrict__ k_partial,
   detail::pdl_launch_dependents();
 }
 
+// A CTA in the grouped quantization kernels maps one thread-row of
+// `head_dim / 8` threads per token of a quantization group, so covering a
+// GROUP-token group in one tile costs `GROUP * head_dim / 8` threads.  For the
+// SM90 K grid (GROUP == 128, head_dim == 128) that is 2048 -- past the
+// 1024-thread CTA limit, which makes the launch fail with
+// cudaErrorInvalidValue.  Wide groups are therefore walked in
+// `grouped_iters` sequential token tiles of `grouped_tokens_per_iter` tokens.
+// Every group width whose single tile already fits (GROUP <= 64 at
+// head_dim == 128) keeps iters == 1 and the exact single-tile instruction
+// sequence it had before, so the SM120 byte anchors are untouched; the amax is
+// a max reduction and therefore independent of the tiling either way.
+constexpr uint32_t kMaxThreadsPerBlock = 1024;
+
+template <uint32_t head_dim, uint32_t GROUP>
+__host__ __device__ constexpr uint32_t grouped_tokens_per_iter() {
+  constexpr uint32_t threads_per_token = head_dim / 8;
+  return GROUP * threads_per_token <= kMaxThreadsPerBlock ? GROUP
+                                                          : kMaxThreadsPerBlock / threads_per_token;
+}
+
+template <uint32_t head_dim, uint32_t GROUP>
+__host__ __device__ constexpr uint32_t grouped_block_threads() {
+  return grouped_tokens_per_iter<head_dim, GROUP>() * (head_dim / 8);
+}
+
+template <uint32_t head_dim, uint32_t GROUP>
+__host__ __device__ constexpr uint32_t grouped_iters() {
+  return GROUP / grouped_tokens_per_iter<head_dim, GROUP>();
+}
+
 // Per-touched-group partial amax on this rank's shard, on the GLOBAL grid.
 // Reproduces the pinned QuantInt8Kernel amax semantics exactly: fp32 convert,
 // optional fp32 subtract of the dtype-T mean, per-thread 1e-7 floor, blockmax.
@@ -465,17 +495,24 @@ __global__ void GroupedAmaxKernel(const T* __restrict__ input, const T* __restri
   const uint32_t head_id = blockIdx.y;
   const uint32_t batch_id = blockIdx.z;
   const uint32_t thread_id = threadIdx.x;
-  const uint32_t token_in_group = thread_id / threads_per_token;
+  constexpr uint32_t tokens_per_iter = grouped_tokens_per_iter<head_dim, GROUP>();
+  constexpr uint32_t iters = grouped_iters<head_dim, GROUP>();
+  const uint32_t token_in_tile = thread_id / threads_per_token;
   const uint32_t d_base = thread_id % threads_per_token * pack_size;
   const uint32_t group_id = group_first + slot;
-  const uint32_t global_token = group_id * GROUP + token_in_group;
-  const bool valid = global_token >= global_offset && global_token < global_offset + local_sequence;
 
   T x_val[pack_size];
   float x_val_float[pack_size];
   float amax_val = 0.0000001f;
   detail::pdl_wait();
-  if (valid) {
+#pragma unroll
+  for (uint32_t it = 0; it < iters; ++it) {
+    const uint32_t global_token = group_id * GROUP + it * tokens_per_iter + token_in_tile;
+    const bool valid =
+        global_token >= global_offset && global_token < global_offset + local_sequence;
+    if (!valid) {
+      continue;
+    }
     const uint32_t local_token = global_token - global_offset;
     const uint64_t input_offset = static_cast<uint64_t>(batch_id) * stride_batch +
                                   static_cast<uint64_t>(local_token) * stride_token +
@@ -537,11 +574,11 @@ __global__ void QuantInt8GroupScalePackKernel(
   const uint32_t head_id = blockIdx.y;
   const uint32_t batch_id = blockIdx.z;
   const uint32_t thread_id = threadIdx.x;
-  const uint32_t token_in_group = thread_id / threads_per_token;
+  constexpr uint32_t tokens_per_iter = grouped_tokens_per_iter<head_dim, GROUP>();
+  constexpr uint32_t iters = grouped_iters<head_dim, GROUP>();
+  const uint32_t token_in_tile = thread_id / threads_per_token;
   const uint32_t d_base = thread_id % threads_per_token * pack_size;
   const uint32_t group_id = group_first + slot;
-  const uint32_t global_token = group_id * GROUP + token_in_group;
-  const bool valid = global_token >= global_offset && global_token < global_offset + local_sequence;
   const uint32_t destination = head_id / local_heads;
   const uint32_t local_head = head_id % local_heads;
 
@@ -556,48 +593,60 @@ __global__ void QuantInt8GroupScalePackKernel(
                  slot] = amax_val / 127.0f;
   }
 
-  if (!valid) {
+  const float reciprocal_scale = 127.0f / amax_val;
+  bool any_valid = false;
+#pragma unroll
+  for (uint32_t it = 0; it < iters; ++it) {
+    const uint32_t global_token = group_id * GROUP + it * tokens_per_iter + token_in_tile;
+    const bool valid =
+        global_token >= global_offset && global_token < global_offset + local_sequence;
+    if (!valid) {
+      continue;
+    }
+    any_valid = true;
+    const uint32_t local_token = global_token - global_offset;
+    const uint64_t input_offset = static_cast<uint64_t>(batch_id) * stride_batch +
+                                  static_cast<uint64_t>(local_token) * stride_token +
+                                  static_cast<uint64_t>(head_id) * stride_head + d_base;
+    T x_val[pack_size];
+    float x_val_float[pack_size];
+    *reinterpret_cast<float4*>(&x_val[0]) = *reinterpret_cast<const float4*>(input + input_offset);
+    if constexpr (sub_mean) {
+      T mean_val[pack_size];
+      const uint64_t mean_offset =
+          (static_cast<uint64_t>(batch_id) * num_heads + head_id) * head_dim + d_base;
+      *reinterpret_cast<float4*>(&mean_val[0]) =
+          *reinterpret_cast<const float4*>(mean + mean_offset);
+#pragma unroll
+      for (uint32_t j = 0; j < pack_size; ++j) {
+        x_val_float[j] = detail::convert_to_float(x_val[j]) - detail::convert_to_float(mean_val[j]);
+      }
+    } else {
+#pragma unroll
+      for (uint32_t j = 0; j < pack_size; ++j) {
+        x_val_float[j] = detail::convert_to_float(x_val[j]);
+      }
+    }
+
+    char4 quantized[2];
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      quantized[j] = make_char4(detail::float_to_int8_rn(x_val_float[j * 4 + 0] * reciprocal_scale),
+                                detail::float_to_int8_rn(x_val_float[j * 4 + 1] * reciprocal_scale),
+                                detail::float_to_int8_rn(x_val_float[j * 4 + 2] * reciprocal_scale),
+                                detail::float_to_int8_rn(x_val_float[j * 4 + 3] * reciprocal_scale));
+    }
+    const uint64_t packed_offset =
+        static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
+        ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads + local_head) *
+            head_dim +
+        d_base;
+    *reinterpret_cast<float2*>(output + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
+  }
+
+  if (!any_valid) {
     return;
   }
-
-  const uint32_t local_token = global_token - global_offset;
-  const uint64_t input_offset = static_cast<uint64_t>(batch_id) * stride_batch +
-                                static_cast<uint64_t>(local_token) * stride_token +
-                                static_cast<uint64_t>(head_id) * stride_head + d_base;
-  T x_val[pack_size];
-  float x_val_float[pack_size];
-  *reinterpret_cast<float4*>(&x_val[0]) = *reinterpret_cast<const float4*>(input + input_offset);
-  if constexpr (sub_mean) {
-    T mean_val[pack_size];
-    const uint64_t mean_offset =
-        (static_cast<uint64_t>(batch_id) * num_heads + head_id) * head_dim + d_base;
-    *reinterpret_cast<float4*>(&mean_val[0]) = *reinterpret_cast<const float4*>(mean + mean_offset);
-#pragma unroll
-    for (uint32_t j = 0; j < pack_size; ++j) {
-      x_val_float[j] = detail::convert_to_float(x_val[j]) - detail::convert_to_float(mean_val[j]);
-    }
-  } else {
-#pragma unroll
-    for (uint32_t j = 0; j < pack_size; ++j) {
-      x_val_float[j] = detail::convert_to_float(x_val[j]);
-    }
-  }
-
-  const float reciprocal_scale = 127.0f / amax_val;
-  char4 quantized[2];
-#pragma unroll
-  for (uint32_t j = 0; j < 2; ++j) {
-    quantized[j] = make_char4(detail::float_to_int8_rn(x_val_float[j * 4 + 0] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 1] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 2] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 3] * reciprocal_scale));
-  }
-  const uint64_t packed_offset =
-      static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
-      ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads + local_head) *
-          head_dim +
-      d_base;
-  *reinterpret_cast<float2*>(output + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
   detail::pdl_launch_dependents();
 }
 
@@ -638,19 +687,29 @@ __global__ void QuantInt8FusedAmaxPackKernel(
   const uint32_t head_id = blockIdx.y;
   const uint32_t batch_id = blockIdx.z;
   const uint32_t thread_id = threadIdx.x;
-  const uint32_t token_in_group = thread_id / threads_per_token;
+  constexpr uint32_t tokens_per_iter = grouped_tokens_per_iter<head_dim, GROUP>();
+  constexpr uint32_t iters = grouped_iters<head_dim, GROUP>();
+  const uint32_t token_in_tile = thread_id / threads_per_token;
   const uint32_t d_base = thread_id % threads_per_token * pack_size;
   const uint32_t group_id = group_first + slot;
-  const uint32_t global_token = group_id * GROUP + token_in_group;
-  const bool valid = global_token >= global_offset && global_token < global_offset + local_sequence;
   const uint32_t destination = head_id / local_heads;
   const uint32_t local_head = head_id % local_heads;
 
+  // The whole group is loaded ONCE into registers (one x_val_float row per
+  // token tile this thread owns) and quantized from those registers after the
+  // amax broadcast -- the single-read property the fused path exists for.
   T x_val[pack_size];
-  float x_val_float[pack_size];
+  float x_val_float[iters][pack_size];
+  bool valid_it[iters];
   float amax_val = 0.0000001f;
   detail::pdl_wait();
-  if (valid) {
+#pragma unroll
+  for (uint32_t it = 0; it < iters; ++it) {
+    const uint32_t global_token = group_id * GROUP + it * tokens_per_iter + token_in_tile;
+    valid_it[it] = global_token >= global_offset && global_token < global_offset + local_sequence;
+    if (!valid_it[it]) {
+      continue;
+    }
     const uint32_t local_token = global_token - global_offset;
     const uint64_t input_offset = static_cast<uint64_t>(batch_id) * stride_batch +
                                   static_cast<uint64_t>(local_token) * stride_token +
@@ -664,12 +723,13 @@ __global__ void QuantInt8FusedAmaxPackKernel(
           *reinterpret_cast<const float4*>(mean + mean_offset);
 #pragma unroll
       for (uint32_t j = 0; j < pack_size; ++j) {
-        x_val_float[j] = detail::convert_to_float(x_val[j]) - detail::convert_to_float(mean_val[j]);
+        x_val_float[it][j] =
+            detail::convert_to_float(x_val[j]) - detail::convert_to_float(mean_val[j]);
       }
     } else {
 #pragma unroll
       for (uint32_t j = 0; j < pack_size; ++j) {
-        x_val_float[j] = detail::convert_to_float(x_val[j]);
+        x_val_float[it][j] = detail::convert_to_float(x_val[j]);
       }
     }
     // Tail repair: padded rows of the single mixed group contribute nothing
@@ -680,7 +740,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
       if constexpr (sub_mean) {
 #pragma unroll
         for (uint32_t j = 0; j < pack_size; ++j) {
-          amax_val = fmaxf(amax_val, fabsf(x_val_float[j]));
+          amax_val = fmaxf(amax_val, fabsf(x_val_float[it][j]));
         }
       } else {
         amax_val = fmaxf(amax_val, detail::packed_abs_max8<T>(x_val));
@@ -699,26 +759,36 @@ __global__ void QuantInt8FusedAmaxPackKernel(
   }
   __syncthreads();
 
-  if (!valid) {
-    return;
+  const float reciprocal_scale = 127.0f / shared_group_amax;
+  bool any_valid = false;
+#pragma unroll
+  for (uint32_t it = 0; it < iters; ++it) {
+    if (!valid_it[it]) {
+      continue;
+    }
+    any_valid = true;
+    char4 quantized[2];
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      quantized[j] =
+          make_char4(detail::float_to_int8_rn(x_val_float[it][j * 4 + 0] * reciprocal_scale),
+                     detail::float_to_int8_rn(x_val_float[it][j * 4 + 1] * reciprocal_scale),
+                     detail::float_to_int8_rn(x_val_float[it][j * 4 + 2] * reciprocal_scale),
+                     detail::float_to_int8_rn(x_val_float[it][j * 4 + 3] * reciprocal_scale));
+    }
+    const uint32_t local_token =
+        group_id * GROUP + it * tokens_per_iter + token_in_tile - global_offset;
+    const uint64_t packed_offset =
+        static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
+        ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads + local_head) *
+            head_dim +
+        d_base;
+    *reinterpret_cast<float2*>(output + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
   }
 
-  const float reciprocal_scale = 127.0f / shared_group_amax;
-  char4 quantized[2];
-#pragma unroll
-  for (uint32_t j = 0; j < 2; ++j) {
-    quantized[j] = make_char4(detail::float_to_int8_rn(x_val_float[j * 4 + 0] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 1] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 2] * reciprocal_scale),
-                              detail::float_to_int8_rn(x_val_float[j * 4 + 3] * reciprocal_scale));
+  if (!any_valid) {
+    return;
   }
-  const uint32_t local_token = global_token - global_offset;
-  const uint64_t packed_offset =
-      static_cast<uint64_t>(destination) * chunk_bytes + section_offset +
-      ((static_cast<uint64_t>(local_token) * batch_size + batch_id) * local_heads + local_head) *
-          head_dim +
-      d_base;
-  *reinterpret_cast<float2*>(output + packed_offset) = *reinterpret_cast<float2*>(&quantized[0]);
   detail::pdl_launch_dependents();
 }
 
