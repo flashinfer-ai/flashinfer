@@ -336,9 +336,10 @@ clean up and raise (or fall back) instead of deadlocking, and a failed
 ``close`` may be retried. All ranks must request the same ``backend`` and
 agree on ``max_bytes`` and ``dtype``; each rank may bind a different CUDA
 device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
-e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
-fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
-process group), checked at construction. Operands must be contiguous 4-D
+e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
+(NVLink's ``exchange_chunks`` runs ``all_to_all_single`` too) require
+``group`` to support CUDA all-to-all (an NCCL process group), checked at
+construction before any resource is armed. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
 only) on the construction device, every dim positive, and ``nbytes`` at most
 ``max_bytes``; the element count of any one operand must additionally stay
