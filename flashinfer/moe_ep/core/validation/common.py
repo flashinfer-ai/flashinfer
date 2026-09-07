@@ -140,21 +140,27 @@ def validate_split_forward_inputs(
 
 
 def _installed_nccl_version() -> "tuple[int, int, int] | None":
-    """Best-effort probe of the NCCL version the EP backend will load.
+    """Best-effort probe of the NCCL version the EP backend will actually load.
 
-    Prefers the nvidia-nccl-cu13 pip wheel's metadata (cuda-pathfinder loads
-    that wheel's libnccl first when present); falls back to ncclGetVersion on
-    the dynamic linker's default search path (covers NGC-style images with a
-    system NCCL and no pip wheel). Returns None when undeterminable — callers
-    must not block in that case.
+    Asks the *loaded* library first (``ncclGetVersion`` through the dynamic
+    linker), and only falls back to the nvidia-nccl-cu13 wheel's metadata when
+    no libnccl can be opened. Returns None when undeterminable — callers must
+    not block in that case.
+
+    Order matters, and this used to be the other way round. Installing the
+    wheel does NOT guarantee it is the copy that loads: NGC-style images ship a
+    system libnccl (e.g. /usr/lib/<triple>/libnccl.so.2.30.4) that the linker
+    finds first, and torch pulls it in before flashinfer is even imported, so
+    the later RTLD_GLOBAL preload in the nccl_ep backend cannot displace it.
+    Trusting the metadata there reports a version that is merely *installed*,
+    passes the Blackwell floor below, and then libnccl_ep — which since
+    nccl-extensions 0.1.0 is built against 2.30.7 and refuses anything older —
+    prints "NCCL library is too old" and aborts the process with
+    ncclInvalidUsage before any Python exception can be raised. Probing the
+    loaded library turns that into the actionable error below. Put the wheel's
+    lib dir ahead of the system one on LD_LIBRARY_PATH to fix the environment
+    (docker/install/build_flashinfer_ep_pytorch.sh does this).
     """
-    try:
-        from importlib.metadata import version
-
-        parts = version("nvidia-nccl-cu13").split(".")[:3]
-        return tuple(int(p) for p in parts)  # type: ignore[return-value]
-    except Exception:
-        pass
     try:
         import ctypes
 
@@ -165,6 +171,13 @@ def _installed_nccl_version() -> "tuple[int, int, int] | None":
             # (e.g. 2.30.7 -> 23007).
             code = out.value
             return (code // 10000, (code // 100) % 100, code % 100)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+
+        parts = version("nvidia-nccl-cu13").split(".")[:3]
+        return tuple(int(p) for p in parts)  # type: ignore[return-value]
     except Exception:
         pass
     return None

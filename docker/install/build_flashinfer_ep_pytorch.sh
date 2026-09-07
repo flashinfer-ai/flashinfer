@@ -63,7 +63,41 @@ PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
 PIP_CONSTRAINT="" pip install --no-cache-dir \
     "cuda-core==${CUDA_CORE_VERSION}" \
     "cuda-bindings==${CUDA_BINDINGS_VERSION}"
+
+# Put the wheel's libnccl AHEAD of any system copy. Installing the 2.30.7 wheel
+# is not enough: NGC images ship /usr/lib/<triple>/libnccl.so.2.30.4, the linker
+# finds it first, and torch loads it before flashinfer is imported. Since
+# nccl-extensions 0.1.0, libnccl_ep is built against 2.30.7 and hard-refuses an
+# older runtime ("NCCL library is too old" -> ncclInvalidUsage, process abort),
+# so the older system copy silently breaks every NCCL-EP collective. nccl-ep
+# 0.1.0 tolerated 2.30.4, which is why this only began to matter with the move
+# off nccl4py. Persist it too, so later `srun`/exec shells in a saved container
+# inherit it.
+NCCL_WHEEL_LIB="$(python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib'))")"
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
+cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
+export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:\${LD_LIBRARY_PATH:-}
+EOF
+chmod +x /etc/profile.d/flashinfer-nccl.sh
+echo "== libnccl search path pinned to ${NCCL_WHEEL_LIB} =="
+
 python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep (nccl-extensions) + nccl.core (nccl4py) import OK')"
+
+# Assert the libnccl that actually LOADS meets libnccl_ep's build-time floor.
+# Cheap here, and far clearer than a mid-collective abort on a compute node.
+python - <<'PYEOF'
+import ctypes
+lib = ctypes.CDLL("libnccl.so.2")
+out = ctypes.c_int()
+assert lib.ncclGetVersion(ctypes.byref(out)) == 0, "ncclGetVersion failed"
+code = out.value
+got = (code // 10000, (code // 100) % 100, code % 100)
+print("loaded libnccl version:", ".".join(map(str, got)))
+assert got >= (2, 30, 7), (
+    f"loaded libnccl {got} < 2.30.7 required by nccl-extensions' libnccl_ep; "
+    "a system libnccl is shadowing the wheel (check LD_LIBRARY_PATH)"
+)
+PYEOF
 
 echo "== install DeepGEMM + NVSHMEM / CUTLASS DSL deps =="
 PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
