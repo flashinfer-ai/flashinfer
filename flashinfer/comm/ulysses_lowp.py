@@ -3,7 +3,7 @@ Copyright (c) 2026 by FlashInfer team.
 Copyright (c) 2026 NVIDIA Corporation.
 
 Low-precision (INT8 Q/K + FP8 V) Ulysses all-to-all payload operations on the
-V2-G global quantization grid (payload ABI v3, stats protocol 3 / ALIGN-128).
+V2-G global quantization grid (stats protocols: ALIGNED / BOUNDARY_MERGE).
 
 V2-G preserves SageAttention2's GLOBAL 32/64-token Q/K quantization grids
 across rank boundaries.  Under ALIGN-128 every local shard is a whole number
@@ -307,10 +307,6 @@ def get_ulysses_lowp_module():
     ) -> None:
         module.ulysses_lowp_quant_v_fp8_with_scale(input, scale, output, enable_pdl)
 
-    @register_custom_op("flashinfer::ulysses_lowp_abi_version", mutates_args=[])
-    def ulysses_lowp_abi_version() -> int:
-        return module.ulysses_lowp_abi_version()
-
     return SimpleNamespace(
         ulysses_lowp_k_sum_v_amax=ulysses_lowp_k_sum_v_amax,
         ulysses_lowp_q_grouped_amax=ulysses_lowp_q_grouped_amax,
@@ -322,7 +318,6 @@ def get_ulysses_lowp_module():
         ulysses_lowp_unpack_for_sage=ulysses_lowp_unpack_for_sage,
         ulysses_lowp_unpack_for_sage_unaligned=ulysses_lowp_unpack_for_sage_unaligned,
         ulysses_lowp_quant_v_fp8_with_scale=ulysses_lowp_quant_v_fp8_with_scale,
-        ulysses_lowp_abi_version=ulysses_lowp_abi_version,
     )
 
 
