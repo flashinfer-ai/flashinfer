@@ -2189,12 +2189,14 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
 def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     persistent: bool,
 ) -> None:
-    """KV256 and 16-bit Q128/KV128 split their scores into streamed fragments.
+    """KV256 splits its scores into streamed fragments; dense Q128 does not.
 
     Streamed profiles share one rolled fragment loop whose geometry follows
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
-    unordered. FP8 Q128 publishes a complete packed row and never streams.
+    unordered. Dense 16-bit Q128/KV128 keeps the complete P row because its
+    route loop is not load-bound; only block-sparse Q128 streams. FP8 Q128
+    publishes a complete packed row and never streams.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -2206,10 +2208,8 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
-    assert q128.streams_tmem_p_fragments
-    assert q128.softmax_score_fragment_regs == 32
-    assert q128.num_softmax_score_fragments == 4
-    assert not q128.uses_ordered_softmax_barrier
+    assert not q128.streams_tmem_p_fragments
+    assert q128.num_softmax_score_fragments == 1
 
     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
     assert q128_fp8.uses_two_inst_tmem_p

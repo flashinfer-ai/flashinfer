@@ -1081,14 +1081,12 @@ class FmhaDecodeConfig:
         """Return the maximum score fragment kept live in registers.
 
         Streamed profiles own 128 score values per lane but process them as
-        four native 32-register LDTM atoms: Q64/KV256 and the 16-bit
-        Q128/KV128 two-instance TMEM-P profiles share that geometry. Other
-        profiles retain their complete score fragment, so this property is
-        intentionally distinct from ``num_s_regs_per_thread`` (the total
-        logical ownership). FP8 Q128 keeps the complete row because its P
-        publication packs four values per column in one x16/x32 store.
+        four native 32-register LDTM atoms. Other profiles retain their
+        complete score fragment, so this property is intentionally distinct
+        from ``num_s_regs_per_thread`` (the total logical ownership). The
+        selection of streamed profiles lives in ``streams_tmem_p_fragments``.
         """
-        if self.uses_two_inst_tmem_p and not self.use_fp8_qkv:
+        if self.streams_tmem_p_fragments:
             return 32
         return self.num_s_regs_per_thread
 
@@ -1642,10 +1640,11 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        FP8 Q128/KV128 publishes a complete packed-P row per pipeline token.
-        Q64/KV256 and 16-bit Q128/KV128 use the same S-to-P aliasing contract
-        but stream four independently ready K32 fragments. Q64/KV128 keeps the
-        base kernel's faster SMEM-P cadence.
+        FP8 Q128/KV128 and dense 16-bit Q128/KV128 publish a complete
+        packed-P row per pipeline token. Q64/KV256 and block-sparse 16-bit
+        Q128/KV128 use the same S-to-P aliasing contract but stream four
+        independently ready K32 fragments (see ``streams_tmem_p_fragments``).
+        Q64/KV128 keeps the base kernel's faster SMEM-P cadence.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -1670,9 +1669,23 @@ class FmhaDecodeConfig:
         Streamed profiles produce their K32 fragments from one rolled runtime
         loop: the max pass writes masked scores back to TMEM, so the P pass
         reloads each fragment without mask logic and the exponentiation body
-        exists once in the instruction stream.
+        exists once in the instruction stream. Each published fragment lets
+        the MMA warp start its PV k-slice before the row is complete, at the
+        cost of one barrier round per fragment.
+
+        Streaming is limited to the 16-bit two-instance profiles whose route
+        loop waits on the K/V loads, where the earlier PV start hides load
+        latency: Q64/KV256 and block-sparse Q128/KV128. Dense Q128/KV128
+        keeps the complete row because its route loop is not load-bound, so
+        the per-fragment barriers are not compensated. FP8 Q128 keeps the
+        complete row because its P publication packs four values per column
+        into one store.
         """
-        return self.uses_two_inst_tmem_p and self.num_softmax_score_fragments > 1
+        return (
+            self.uses_two_inst_tmem_p
+            and not self.use_fp8_qkv
+            and (self.tile_size_kv == 256 or self.use_block_sparse)
+        )
 
     @property
     def defers_softmax_anchor_updates(self) -> bool:

@@ -717,17 +717,28 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4), alignment=16
                 )
         if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-            # FP8 Q128/KV128 publishes the complete packed row with one x32
-            # STTM; 16-bit two-instance profiles stream K32 fragments instead.
-            assert cfg.use_fp8_qkv and cfg.num_packed_p_regs == 32
-            _keeps_tcgen05_st(
-                cfg,
-                prims.make_tmem_ptr(p_tmem_stage_base, Int32),
-                packed_p.data_ptr().load(count=cfg.num_packed_p_regs, alignment=4),
-                # Separate the paired Softmax destinations by one packed row
-                # (the half-row split for x16/x32 TMEM layouts).
-                offset=cfg.num_packed_p_regs,
-            )
+            # FP8 publishes the complete row with one x32 STTM. Dense 16-bit
+            # Q128/KV128 uses x16 slices to limit Softmax register pressure.
+            # Block-sparse two-instance profiles stream K32 fragments instead.
+            assert cfg.num_packed_p_regs in (32, 64)
+            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
+            assert cfg.num_packed_p_regs % regs_per_store == 0
+            for store_idx in cutlass.range_constexpr(
+                cfg.num_packed_p_regs // regs_per_store
+            ):
+                packed_offset = store_idx * regs_per_store
+                _keeps_tcgen05_st(
+                    cfg,
+                    prims.make_tmem_ptr(
+                        p_tmem_stage_base + Int32(packed_offset), Int32
+                    ),
+                    (packed_p.data_ptr() + packed_offset).load(
+                        count=regs_per_store, alignment=4
+                    ),
+                    # Separate the paired Softmax destinations by one packed
+                    # row (the half-row split for x16/x32 TMEM layouts).
+                    offset=cfg.num_packed_p_regs,
+                )
             if cutlass.const_expr(cfg.ordered_softmax_early_release):
                 # Hand the baton over as soon as this group's TMEM store has
                 # issued: the partner's exp2/pack/TMEM store touch only its own
