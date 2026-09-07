@@ -3665,3 +3665,100 @@ def test_glm53_compact_rows_match_padded_rows(layout, num_tokens, num_heads, imp
     run(padded, a, la)
     torch.testing.assert_close(b, a, rtol=0, atol=0)
     torch.testing.assert_close(lb, la, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", [528, 656])
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,impl",
+    [
+        (1, 8, None),
+        (4, 8, None),
+        (1, 32, None),
+        (1, 64, None),
+        (65, 8, "mg"),
+        (65, 32, "mg"),
+        (65, 64, "swapab"),
+        (65, 128, "swapab"),
+    ],
+)
+@pytest.mark.parametrize("pattern", ["partial", "holes", "bounded", "empty"])
+def test_glm53_masked_cache_rows_ignore_poisoned_slot_zero(
+    layout, num_tokens, num_heads, impl, pattern
+):
+    from flashinfer.mla import SparseMLASm120Wrapper
+
+    kv = torch.full((1, 64, 1, 512), 0.5, device="cuda", dtype=torch.bfloat16)
+    packed = quantize_kv_glm53_nope(kv)[..., :layout].contiguous()
+    q = torch.zeros((num_tokens, num_heads, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.full((num_tokens, 2176), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.ones(num_tokens, device="cuda", dtype=torch.int32)
+    if pattern == "empty":
+        lengths.zero_()
+    else:
+        indices[:, 0] = 1
+        if pattern == "holes":
+            indices[:, 2048:2051] = torch.tensor(
+                [2, 3, 4], device="cuda", dtype=torch.int32
+            )
+            lengths.fill_(2051)
+        elif pattern == "bounded":
+            # Even non-negative candidates beyond topk_length must be ignored.
+            indices[:, 1:] = 0
+    wrapper = SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        d_v=512,
+        kv_scale_format="arbitrary_fp32",
+        device="cuda",
+    )
+    clean, poisoned = torch.empty_like(q), torch.empty_like(q)
+    clean_lse = torch.empty((num_tokens, num_heads), device="cuda", dtype=torch.float32)
+    poisoned_lse = torch.empty_like(clean_lse)
+    wrapper.run(
+        q,
+        packed,
+        indices,
+        clean,
+        512**-0.5,
+        topk_length=lengths,
+        prefill_impl=impl,
+        out_lse=clean_lse,
+    )
+    expected = torch.full_like(clean, 0.0 if pattern == "empty" else 0.5)
+    torch.testing.assert_close(clean, expected, atol=1e-3, rtol=1e-3)
+    # E4M3 0x7f is NaN. Cache slot zero is never a valid candidate here.
+    packed.reshape(-1, layout)[0, :512] = 0x7F
+    wrapper.run(
+        q,
+        packed,
+        indices,
+        poisoned,
+        512**-0.5,
+        topk_length=lengths,
+        prefill_impl=impl,
+        out_lse=poisoned_lse,
+    )
+    assert torch.isfinite(poisoned).all()
+    torch.testing.assert_close(poisoned, clean, atol=0, rtol=0)
+    torch.testing.assert_close(poisoned_lse, clean_lse, atol=0, rtol=0)
+
+    if pattern == "holes":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.run(
+                q,
+                packed,
+                indices,
+                poisoned,
+                512**-0.5,
+                topk_length=lengths,
+                prefill_impl=impl,
+                out_lse=poisoned_lse,
+            )
+        # Preserve addresses while changing valid payloads between replays.
+        packed.copy_(quantize_kv_glm53_nope(kv * 0.5)[..., :layout])
+        packed.reshape(-1, layout)[0, :512] = 0x7F
+        graph.replay()
+        torch.testing.assert_close(
+            poisoned, torch.full_like(poisoned, 0.25), atol=1e-3, rtol=1e-3
+        )

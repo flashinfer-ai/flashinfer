@@ -31,6 +31,7 @@
 #include "../arch/barrier.cuh"
 #include "../arch/cp_async.cuh"
 #include "../model/kv_cache_traits.cuh"
+#include "glm53_padding.cuh"
 
 // KV cache IO: gather BI entries from global KV pool to smem.
 //
@@ -81,11 +82,12 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, TILE_BI * COPY_BYTES);
   if (io_tid >= TILE_BI) return;
 
-  idx = (idx >= 0) ? idx : 0;
+  const bool valid = idx >= 0;
+  idx = valid ? idx : 0;
 
   const uint8_t* src;
   if constexpr (MT == ModelType::GLM53_NOPE) {
-    src = kv_ptr + (size_t)idx * (stride_kv_block / PAGE_BLOCK_SIZE);
+    src = valid ? kv_ptr + (size_t)idx * (stride_kv_block / PAGE_BLOCK_SIZE) : glm53_padding_kv;
   } else if constexpr (KV::SCALE_IN_KV_SMEM) {
     src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
   } else {

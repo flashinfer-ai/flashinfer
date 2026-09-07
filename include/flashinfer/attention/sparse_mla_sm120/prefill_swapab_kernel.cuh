@@ -66,6 +66,9 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
 
   const size_t row_stride = MT == ModelType::GLM53_NOPE ? stride_kv_row : STRIDE;
   const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * row_stride;
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    if (idx < 0) src = glm53_padding_kv;
+  }
   cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
@@ -135,6 +138,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // `pf` (tile ti+1) warms L2 after the gather issue: this pipeline is one
     // tile deep, so the prefetch must not delay the gather the math waits on.
     auto ld_idx = [&](int t) -> int {
+      if constexpr (MT == ModelType::GLM53_NOPE) {
+        if (t * BI + io_tid >= topk_len) return -1;
+      }
       return (t < actual_ni && io_tid < BI) ? __ldg(idx_base + t * BI + io_tid) : -1;
     };
     int staged = ld_idx(0);

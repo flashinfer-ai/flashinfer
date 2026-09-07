@@ -11,6 +11,7 @@
 #include "arch/mma_sm120.cuh"
 #include "common/d2_load_b.cuh"
 #include "common/fp8_quant.cuh"
+#include "common/glm53_padding.cuh"
 #include "common/online_softmax.cuh"
 #include "common/scale_mma.cuh"
 #include "model/kv_cache_traits.cuh"
@@ -268,6 +269,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       const int local_idx_g = idx - block_idx_g * pbs;
       const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
                                  (size_t)local_idx_g * (size_t)stride_kv_row;
+      if constexpr (MT == ModelType::GLM53_NOPE) {
+        if (idx_raw < 0) data_base = glm53_padding_kv;
+      }
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));

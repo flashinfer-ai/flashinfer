@@ -575,6 +575,9 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     // This thread's candidate index for tile t, staged a tile ahead of use so
     // the index LDG latency is hidden behind the previous tile's gather.
     auto load_idx = [&](int t) -> int {
+      if constexpr (MT == ModelType::GLM53_NOPE) {
+        if (t * Cfg::BI + io_tid >= topk_len) return -1;
+      }
       return (t < actual_ni && io_tid < Cfg::BI) ? __ldg(idx_base + t * Cfg::BI + io_tid) : -1;
     };
     // Scales first (plain stores, no mbar signal), then bulk gather
@@ -1260,6 +1263,9 @@ __device__ __forceinline__ void prefill_mg_impl(
     // split needs no branch on the tile-length mode.
     auto load_idx = [&](int t) -> int {
       if (t >= loop_bound || io_tid >= BI) return -1;
+      if constexpr (MT == ModelType::GLM53_NOPE) {
+        if (t * BI + io_tid >= topk_len) return -1;
+      }
       if constexpr (DUAL_CACHE) {
         const bool is_main = t < main_ni;
         const int32_t* p = is_main ? (idx_base + t * BI) : (idx_base_extra + (t - main_ni) * BI);
