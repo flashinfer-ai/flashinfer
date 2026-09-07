@@ -59,15 +59,16 @@ from ._block_sparse.runtime import (
     _ContiguousKVStorage,
     _PagedKVStorage,
     launch_block_sparse as _launch_block_sparse,
+    prepare_block_sparse_run_unchecked as _prepare_block_sparse_run_unchecked,
     record_block_sparse_run_args as _record_block_sparse_run_args,
     validate_block_sparse_metadata as _validate_block_sparse_metadata,
     validate_block_sparse_run as _validate_block_sparse_run,
-    validate_paged_kv_metadata as _validate_paged_kv_metadata,
 )
 from .decode import (
     PagedKVCache,
     _normalize_paged_kv_cache,
     _resolve_cuda_device,
+    _validate_block_table_metadata,
 )
 
 
@@ -253,6 +254,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_valid_bits: torch.Tensor | None = None,
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
+        validate: bool = True,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -263,6 +265,13 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         supplied; otherwise it is a newly allocated compact BSHD tensor.
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
+
+        ``validate=True`` performs structural, plan-geometry, and alias
+        validation without reading tensor values; it is the safe public
+        default. ``validate=False`` treats every run argument as a trusted
+        binding and performs no explicit wrapper validation. K/V view
+        selection, scale forwarding, and optional output allocation are
+        unavoidable in both modes.
 
         A BSR plan consumes compact Int32 ``block_indptr`` with shape
         ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32
@@ -317,6 +326,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
             planned output dtype.
+        validate : bool
+            Whether to validate tensor structure, plan geometry, and aliasing
+            before launching. Defaults to ``True``.
 
         Returns
         -------
@@ -325,7 +337,14 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         """
 
         state = self._require_run_state()
-        run_args = _validate_block_sparse_run(
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
+        prepare_run = (
+            _validate_block_sparse_run
+            if validate
+            else _prepare_block_sparse_run_unchecked
+        )
+        run_args = prepare_run(
             q,
             _ContiguousKVStorage(k=k, v=v),
             state=state,
@@ -593,8 +612,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         self,
         q: torch.Tensor,
         paged_kv_cache: PagedKVCache,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
+        block_tables: torch.Tensor,
         seq_lens_kv: torch.Tensor,
         block_indptr: torch.Tensor,
         block_indices: torch.Tensor,
@@ -602,6 +620,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         kv_valid_bits: torch.Tensor | None = None,
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
+        validate: bool = True,
     ) -> torch.Tensor:
         """Launch with live lengths, page tables, and sparse routes.
 
@@ -610,15 +629,20 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         tuple whose members are ``[P, Hkv, page, D]`` with compact inner HND
         strides and arbitrary non-overlapping outer page strides.
 
-        ``paged_kv_indptr`` is compact Int32 ``[B + 1]``;
-        ``paged_kv_indices`` is compact Int32 with capacity at least its live
-        final offset; and ``seq_lens_kv`` is compact Int32 ``[B]``. All values
-        are read on device. The caller must keep every dense length in
-        ``[1, max_seq_len_kv]`` and every causal length in
-        ``[Sq, max_seq_len_kv]``. ``paged_kv_indptr`` must start at zero and
-        contain bounded, monotone rows with at least
-        ``ceil(seq_lens_kv[b] / page_size)`` entries. Every page ID in its live
-        prefix must lie in ``[0, P)``. Each BSR row must contain strictly
+        ``validate=True`` performs structural, plan-geometry, and alias
+        validation without reading tensor values; it is the safe public
+        default. ``validate=False`` treats every run argument as a trusted
+        binding and performs no explicit wrapper validation. K/V view
+        selection, scale forwarding, and optional output allocation are
+        unavoidable in both modes.
+
+        ``block_tables`` is Int32 ``[B, C]``, contiguous within each row but
+        permitted to use a padded outer row stride; ``seq_lens_kv`` is compact
+        Int32 ``[B]``. All values are read on device. The caller must keep
+        every dense length in ``[1, max_seq_len_kv]`` and every causal length
+        in ``[Sq, max_seq_len_kv]``. Every page-table row must contain at least
+        ``ceil(seq_lens_kv[b] / page_size)`` live entries. Every page ID in its
+        live prefix must lie in ``[0, P)``. Each BSR row must contain strictly
         increasing, unique block IDs whose final block starts before that
         request's live K/V length, and its width must not exceed the planned
         ``max_blocks_per_row``. Reusable runs trust all of these device-side
@@ -645,10 +669,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a
             ``(K, V)`` tuple whose tensors are
             ``[P, Hkv, page_size, D]``.
-        paged_kv_indptr : torch.Tensor
-            Contiguous Int32 live request offsets with shape ``[B + 1]``.
-        paged_kv_indices : torch.Tensor
-            Contiguous Int32 physical-page ID capacity.
+        block_tables : torch.Tensor
+            Live Int32 physical page IDs with shape ``[B, C]``. Entries are
+            contiguous within each row; padded, non-overlapping row strides are
+            supported and inactive tail entries are ignored.
         seq_lens_kv : torch.Tensor
             Contiguous Int32 live logical K/V lengths with shape ``[B]``.
             Values must satisfy the dense or causal bounds above.
@@ -667,6 +691,9 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
             planned output dtype.
+        validate : bool
+            Whether to validate tensor structure, plan geometry, and aliasing
+            before launching. Defaults to ``True``.
 
         Returns
         -------
@@ -675,13 +702,19 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         """
 
         state = self._require_run_state()
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
         run_stream = torch.cuda.current_stream(state.device)
-        run_args = _validate_block_sparse_run(
+        prepare_run = (
+            _validate_block_sparse_run
+            if validate
+            else _prepare_block_sparse_run_unchecked
+        )
+        run_args = prepare_run(
             q,
             _PagedKVStorage(
                 paged_kv_cache=paged_kv_cache,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
+                block_tables=block_tables,
                 seq_lens_kv=seq_lens_kv,
             ),
             state=state,
@@ -698,15 +731,14 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
 def block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
     q_block_size: int,
     kv_block_size: int,
     *,
     max_seq_len_kv: int,
-    seq_lens_kv: torch.Tensor,
     kv_valid_bits: torch.Tensor | None = None,
     mask_type: Literal["dense", "causal"] = "dense",
     sm_scale: float | None = None,
@@ -714,12 +746,11 @@ def block_sparse_attention_with_paged_kv_cache(
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
-    This convenience entry point synchronously validates live page and sparse
-    metadata, including the complete live physical-page-ID prefix, creates a
-    capacity-only temporary plan, then forwards the inspected tensors through
-    the trusted live run API. It cannot run during CUDA Graph capture; plan a
-    wrapper outside capture and capture only
-    :meth:`BlockSparsePagedTSWrapper.run` instead.
+    This convenience entry point synchronously validates the live page tables,
+    K/V lengths, and sparse metadata, creates a capacity-only temporary plan,
+    then forwards the inspected tensors through the trusted live run API. It
+    cannot run during CUDA Graph capture; plan a wrapper outside capture and
+    capture only :meth:`BlockSparsePagedTSWrapper.run` instead.
 
     Parameters
     ----------
@@ -728,11 +759,13 @@ def block_sparse_attention_with_paged_kv_cache(
     paged_kv_cache : PagedKVCache
         Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a ``(K, V)``
         tuple whose tensors are ``[P, Hkv, page_size, D]``.
-    paged_kv_indptr : torch.Tensor
-        Contiguous Int32 request offsets into ``paged_kv_indices``, with shape
-        ``[B + 1]``.
-    paged_kv_indices : torch.Tensor
-        Contiguous Int32 physical page IDs referenced by ``paged_kv_indptr``.
+    block_tables : torch.Tensor
+        Int32 physical page IDs ``[B, C]``, contiguous within each row and free
+        to use a padded outer row stride. ``C * page_size`` must cover
+        ``max_seq_len_kv``; only the first ``ceil(seq_lens_kv[b] / page_size)``
+        entries of each row are read.
+    seq_lens_kv : torch.Tensor
+        Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
     block_indptr : torch.Tensor
         Contiguous Int32 BSR row offsets with shape
         ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
@@ -747,8 +780,6 @@ def block_sparse_attention_with_paged_kv_cache(
         be 8, 16, 32, or a positive multiple of 64.
     max_seq_len_kv : int
         Static maximum logical K/V length used for planning.
-    seq_lens_kv : torch.Tensor
-        Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 logical-token validity bitmap
         ``[B, ceil(max_seq_len_kv / 32)]``.
@@ -774,13 +805,16 @@ def block_sparse_attention_with_paged_kv_cache(
 
     batch_size, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
     metadata_device, _ = _resolve_cuda_device(q.device)
-    _validate_paged_kv_metadata(
-        paged_kv_indptr,
-        paged_kv_indices,
-        seq_lens_kv,
-        device=metadata_device,
-        batch_size=batch_size,
+    table_device, table_batch_size, table_capacity = _validate_block_table_metadata(
+        block_tables, seq_lens_kv
     )
+    if table_device != q.device:
+        raise ValueError(f"paged-KV metadata must be on {q.device}, got {table_device}")
+    if table_batch_size != batch_size:
+        raise ValueError(
+            "seq_lens_kv must have one entry per request: "
+            f"expected {batch_size}, got {table_batch_size}"
+        )
 
     (
         k_cache,
@@ -815,6 +849,12 @@ def block_sparse_attention_with_paged_kv_cache(
         kv_dtype=k_cache.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
+    if table_capacity * page_size < static.seq_len_kv:
+        raise ValueError(
+            "block_tables must cover the planned K/V capacity: expected at "
+            f"least {(static.seq_len_kv + page_size - 1) // page_size} columns, "
+            f"got {table_capacity}"
+        )
     _validate_block_sparse_metadata(
         sparse_format="bsr",
         block_indptr=block_indptr,
@@ -833,8 +873,7 @@ def block_sparse_attention_with_paged_kv_cache(
     max_blocks_per_row = _inspect_paged_block_sparse_metadata(
         block_indptr,
         block_indices,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens_kv,
         static=static,
         num_physical_kv_pages=num_physical_kv_pages,
@@ -864,8 +903,7 @@ def block_sparse_attention_with_paged_kv_cache(
     return wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens_kv,
         block_indptr,
         block_indices,

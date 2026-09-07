@@ -42,22 +42,22 @@ obligation.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
-request metadata. Every `run` reads live paged-KV row offsets, physical page
-IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
-bits from device tensors. The physical-page ID tensor is capacity: its live
-prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
-The caller owns every live value contract: dense K/V lengths must be in
-`[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
-`paged_kv_indptr` must start at zero and contain bounded, monotone rows with at
-least `ceil(seq_lens_kv[b] / page_size)` entries; every physical page ID in
-the live prefix ending at `paged_kv_indptr[-1]` must lie in `[0, P)`. Every BSR
-row must have bounded offsets, strictly increasing unique block IDs, and at
-most the planned `max_blocks_per_row` entries. Contiguous IDs must lie below
+request metadata. Every `run` reads live page tables, per-request K/V lengths,
+per-KV-head sparse routes, and optional token bits from device tensors.
+`block_tables` is Int32 `[B, C]`, contiguous within each row and free to use a
+padded outer row stride; `C * page_size` must cover `max_seq_len_kv`, and only
+the first `ceil(seq_lens_kv[b] / page_size)` entries of each row are read. The
+caller owns every live value contract: dense K/V lengths must be in
+`[1, max_seq_len_kv]`, causal lengths must be in `[Sq, max_seq_len_kv]`, and
+every live physical page ID must lie in `[0, P)`. Every BSR row must have
+bounded offsets, strictly increasing unique block IDs, and at most the planned
+`max_blocks_per_row` entries. Contiguous IDs must lie below
 `ceil(seq_len_kv / kv_block_size)`; paged IDs must start below the owning
 request's live K/V length.
 
-Reusable wrappers validate tensor structure but read values directly without
-host synchronization. Invalid values therefore have undefined behavior and
+Reusable wrappers validate tensor structure and aliasing by default and read
+values directly without host synchronization; `validate=False` skips the
+structural checks as well. Invalid values therefore have undefined behavior and
 may access out of bounds. Set `CUTE_DSL_ENABLE_ASSERTIONS=1` before the process
 first compiles these kernels to diagnose violations encountered while preparing
 selected routes; such assertions report asynchronously and leave the CUDA

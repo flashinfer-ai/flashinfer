@@ -1156,8 +1156,7 @@ def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
     v_cache = torch.empty_like(k_cache)
     common_kwargs = {
         "q": q,
-        "paged_kv_indptr": torch.empty((3,), dtype=torch.int32),
-        "paged_kv_indices": torch.empty((8,), dtype=torch.int32),
+        "block_tables": torch.empty((2, 4), dtype=torch.int32),
         "seq_lens_kv": torch.empty((2,), dtype=torch.int32),
         "block_indptr": torch.empty((2, 4, 2), dtype=torch.int32),
         "block_indices": torch.empty((16,), dtype=torch.int32),
@@ -1197,8 +1196,7 @@ def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
         ):
             assert defn["inputs"][name]["optional"] is True
         for name in (
-            "paged_kv_indptr",
-            "paged_kv_indices",
+            "block_tables",
             "seq_lens_kv",
             "block_indptr",
             "block_indices",
@@ -1228,9 +1226,7 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
         "kv_block_size",
         "page_size",
     )
-    assert {"paged_kv_indptr", "paged_kv_indices", "seq_lens_kv"}.isdisjoint(
-        plan_parameters
-    )
+    assert {"block_tables", "seq_lens_kv"}.isdisjoint(plan_parameters)
     for name in (
         "device",
         "max_blocks_per_row",
@@ -1242,8 +1238,7 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
         block_sparse_module.BlockSparsePagedTSWrapper.run
     ).parameters
     for name in (
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         "seq_lens_kv",
         "block_indptr",
         "block_indices",
@@ -1255,8 +1250,10 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     ).parameters
     assert "max_seq_len_kv" in one_shot_parameters
     assert "seq_len_kv" not in one_shot_parameters
+    assert {"paged_kv_indptr", "paged_kv_indices"}.isdisjoint(one_shot_parameters)
     assert one_shot_parameters["max_seq_len_kv"].default is inspect.Parameter.empty
-    assert one_shot_parameters["seq_lens_kv"].default is inspect.Parameter.empty
+    for name in ("block_tables", "seq_lens_kv"):
+        assert one_shot_parameters[name].default is inspect.Parameter.empty
 
     state_fields = {
         field.name for field in fields(block_sparse_plan._BlockSparsePlanState)
@@ -1271,6 +1268,21 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     assert "page_size" in state_fields
     assert "validated_seq_lens_kv" not in {
         field.name for field in fields(block_sparse_runtime._PagedKVLaunchPayload)
+    }
+    assert {
+        "block_tables",
+        "block_table_row_stride",
+    }.issubset(
+        field.name for field in fields(block_sparse_runtime._PagedKVLaunchPayload)
+    )
+    assert {
+        "paged_kv_indptr",
+        "paged_kv_indices",
+    }.isdisjoint(
+        field.name for field in fields(block_sparse_runtime._PagedKVLaunchPayload)
+    )
+    assert "block_table_row_stride" not in {
+        field.name for field in fields(block_sparse_config._BlockSparseCompileKey)
     }
 
 
@@ -1297,8 +1309,7 @@ def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
         paged_kv_cache = torch.empty(
             (1, 2, 1, 64, 128), device="cuda", dtype=torch.float16
         )
-        paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-        paged_kv_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+        block_tables = torch.tensor([[0]], device="cuda", dtype=torch.int32)
         seq_lens_kv = torch.tensor([0], device="cuda", dtype=torch.int32)
         block_indptr = torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32)
         block_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
@@ -1321,8 +1332,7 @@ def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
         wrapper.run(
             q,
             paged_kv_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens_kv,
             block_indptr,
             block_indices,
@@ -2915,8 +2925,8 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
     }
     live_seq_lens_kv = object()
     paged_kv = _PagedKVLaunchPayload(
-        paged_kv_indptr=object(),
-        paged_kv_indices=object(),
+        block_tables=object(),
+        block_table_row_stride=29,
         seq_lens_kv=live_seq_lens_kv,
         num_physical_kv_pages=17,
         k_page_stride=19,
@@ -2941,13 +2951,13 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             run_args.block_indptr,
             run_args.block_indices,
             run_args.kv_valid_bits,
-            paged_kv.paged_kv_indptr,
-            paged_kv.paged_kv_indices,
+            paged_kv.block_tables,
             live_seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             3,
             17,
+            29,
             19,
             23,
             1.25,
@@ -3546,8 +3556,7 @@ def test_static_fallback_reselects_sparse_load_policy(
 @dataclass(frozen=True)
 class _PagedOneShotCase:
     lengths: tuple[int, ...] = (64,)
-    page_ptr: tuple[int, ...] = (0, 1)
-    pages: tuple[int, ...] = (0,)
+    tables: tuple[tuple[int, ...], ...] = ((0, -1),)
     mask: str = "dense"
     bsr: tuple[int, ...] = (0,)
     bsr_ptr: object | None = None
@@ -3569,14 +3578,13 @@ class _PagedOneShotCase:
                 device="cuda",
                 dtype=torch.float16,
             ),
-            "paged_kv_indptr": torch.tensor(self.page_ptr, **cuda_i32),
-            "paged_kv_indices": torch.tensor(self.pages, **cuda_i32),
+            "block_tables": torch.tensor(self.tables, **cuda_i32),
+            "seq_lens_kv": torch.tensor(self.lengths, **cuda_i32),
             "block_indptr": torch.tensor(bsr_ptr, **cuda_i32),
             "block_indices": torch.tensor(self.bsr, **cuda_i32),
             "q_block_size": 64,
             "kv_block_size": 64,
             "max_seq_len_kv": 128,
-            "seq_lens_kv": torch.tensor(self.lengths, **cuda_i32),
             "kv_valid_bits": torch.empty((batch, 4), device="cuda", dtype=torch.uint32),
             "mask_type": self.mask,
         }
@@ -3615,28 +3623,16 @@ def _fail_if_planned(
     ("case", "message"),
     (
         (_PagedOneShotCase((0,)), r"seq_lens_kv.*\[1, 128\]"),
-        (_PagedOneShotCase((129,), (0, 2), (0, 1)), r"seq_lens_kv.*\[1, 128\]"),
+        (_PagedOneShotCase((129,), ((0, 1),)), r"seq_lens_kv.*\[1, 128\]"),
         (_PagedOneShotCase((63,), mask="causal"), r"seq_lens_kv.*\[64, 128\]"),
         (
-            _PagedOneShotCase(page_ptr=(1, 2), pages=(0, 1)),
-            r"paged_kv_indptr.*start at zero",
+            _PagedOneShotCase(tables=((0,),)),
+            r"block_tables must cover the planned K/V capacity",
         ),
+        (_PagedOneShotCase(tables=((2, 0),)), r"block_tables.*physical page ID"),
+        (_PagedOneShotCase((128,), ((0, 2),)), r"block_tables.*physical page ID"),
         (
-            _PagedOneShotCase((64, 64), (0, 2, 1), (0, 1), bsr=(0, 0)),
-            r"paged_kv_indptr.*bounded and monotone",
-        ),
-        (
-            _PagedOneShotCase(page_ptr=(0, 2)),
-            r"paged_kv_indptr.*bounded and monotone",
-        ),
-        (_PagedOneShotCase((65,)), r"paged_kv_indptr.*enough pages.*seq_lens_kv"),
-        (_PagedOneShotCase(pages=(2,)), r"paged_kv_indices.*physical page ID"),
-        (
-            _PagedOneShotCase(page_ptr=(0, 2), pages=(0, 2)),
-            r"paged_kv_indices.*physical page ID",
-        ),
-        (
-            _PagedOneShotCase((128, 64), (0, 2, 3), (0, 1, 0), bsr=(1, 1)),
+            _PagedOneShotCase((128, 64), ((0, 1), (0, -1)), bsr=(1, 1)),
             r"block_indptr/block_indices.*live seq_lens_kv",
         ),
     ),
@@ -3662,12 +3658,11 @@ def test_paged_one_shot_rejects_invalid_live_metadata_before_plan(
     "case",
     (
         _PagedOneShotCase((1,)),
-        _PagedOneShotCase((128,), (0, 2), (1, 1)),
-        _PagedOneShotCase(pages=(0, 2), mask="causal"),
+        _PagedOneShotCase((128,), ((1, 1),)),
+        _PagedOneShotCase(tables=((0, 2),), mask="causal"),
         _PagedOneShotCase(
             (64, 128),
-            (0, 1, 3),
-            (0, 0, 1),
+            ((0, 0), (0, 1)),
             bsr=(0, 1),
             bsr_ptr=(((0, 1),), ((1, 2),)),
         ),
@@ -3706,71 +3701,171 @@ def test_paged_one_shot_accepts_valid_live_metadata_capacity(
     assert calls == [("plan", 1), ("run", None)]
 
 
+def _paged_one_shot_metadata_abi_cases() -> list[object]:
+    cuda_i32 = {"device": "cuda", "dtype": torch.int32}
+
+    def block_tables(**kwargs: object) -> torch.Tensor:
+        return torch.tensor([[0, -1]], **cuda_i32).to(**kwargs)
+
+    return [
+        pytest.param(
+            "block_tables",
+            lambda: block_tables().flatten(),
+            ValueError,
+            r"block_tables must have shape \[B, C\]",
+            id="block_tables-rank",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: block_tables(dtype=torch.int64),
+            TypeError,
+            "block_tables must have dtype torch.int32",
+            id="block_tables-dtype",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: block_tables(device="cpu"),
+            ValueError,
+            "block_tables must be a CUDA tensor",
+            id="block_tables-device",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: torch.tensor([[0, -1, -1, -1]], **cuda_i32)[:, ::2],
+            ValueError,
+            "block_tables must be contiguous within each row",
+            id="block_tables-row-compactness",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: torch.as_strided(torch.tensor([0, -1], **cuda_i32), (1, 2), (1, 1)),
+            ValueError,
+            "block_tables rows must not overlap",
+            id="block_tables-row-overlap",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: _MetadataTensorAbiOverride.wrap(block_tables(), "alignment"),
+            ValueError,
+            "block_tables data pointer must be 4-byte aligned",
+            id="block_tables-alignment",
+        ),
+        pytest.param(
+            "block_tables",
+            lambda: torch.tensor([[0, -1], [0, -1]], **cuda_i32),
+            ValueError,
+            "block_tables must have one row per request",
+            id="block_tables-rows",
+        ),
+        pytest.param(
+            "seq_lens_kv",
+            lambda: torch.tensor([[64]], **cuda_i32),
+            ValueError,
+            "seq_lens must be one-dimensional",
+            id="seq_lens_kv-rank",
+        ),
+        pytest.param(
+            "seq_lens_kv",
+            lambda: torch.tensor([64], device="cuda", dtype=torch.int64),
+            TypeError,
+            "seq_lens must have dtype torch.int32",
+            id="seq_lens_kv-dtype",
+        ),
+        pytest.param(
+            "seq_lens_kv",
+            lambda: torch.tensor([64], dtype=torch.int32),
+            ValueError,
+            "seq_lens must be a CUDA tensor",
+            id="seq_lens_kv-device",
+        ),
+        pytest.param(
+            "seq_lens_kv",
+            lambda: torch.tensor([64, 64], **cuda_i32),
+            ValueError,
+            "block_tables must have one row per request",
+            id="seq_lens_kv-shape",
+        ),
+    ]
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    ("field", "violation"),
-    [
-        pytest.param(field, violation, id=f"{field}-{violation}")
-        for field in ("paged_kv_indptr", "paged_kv_indices", "seq_lens_kv")
-        for violation in (
-            "rank",
-            "dtype",
-            "device",
-            "compactness",
-            "alignment",
-            "int32_extent",
-        )
-    ]
-    + [
-        pytest.param(field, "shape", id=f"{field}-shape")
-        for field in ("paged_kv_indptr", "seq_lens_kv")
-    ],
+    ("field", "make_tensor", "error_type", "message"),
+    _paged_one_shot_metadata_abi_cases(),
 )
 def test_paged_one_shot_rejects_invalid_metadata_abi_before_plan(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
-    violation: str,
+    make_tensor: Callable[[], torch.Tensor],
+    error_type: type[Exception],
+    message: str,
 ) -> None:
-    error_type = {
-        "dtype": TypeError,
-        "int32_extent": OverflowError,
-    }.get(violation, ValueError)
-    messages = {
-        "rank": f"{field} must be rank 1",
-        "dtype": f"{field} must have dtype torch.int32",
-        "device": f"{field} must be on planned device cuda",
-        "compactness": f"{field} must have compact rank-1 strides",
-        "alignment": f"{field} data pointer must be 4-byte aligned",
-        "int32_extent": rf"{field}\.numel\(\).*signed int32",
-        "shape": rf"{field} must have shape "
-        + (r"\(2,\)" if field == "paged_kv_indptr" else r"\(1,\)"),
-    }
     _fail_if_planned(
         monkeypatch,
         block_sparse_module.BlockSparsePagedTSWrapper,
     )
     arguments = _PagedOneShotCase().arguments()
-    tensor = arguments[field]
-    assert isinstance(tensor, torch.Tensor)
-    if violation == "rank":
-        arguments[field] = tensor.unsqueeze(0)
-    elif violation == "dtype":
-        arguments[field] = tensor.to(torch.int64)
-    elif violation == "device":
-        arguments[field] = tensor.cpu()
-    elif violation == "compactness":
-        arguments[field] = torch.empty(
-            tensor.numel() * 2, dtype=tensor.dtype, device=tensor.device
-        )[::2]
-    elif violation in ("alignment", "int32_extent"):
-        arguments[field] = _MetadataTensorAbiOverride.wrap(tensor, violation)
-    elif field == "paged_kv_indptr":
-        arguments[field] = torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda")
-    else:
-        arguments[field] = torch.tensor([64, 64], dtype=torch.int32, device="cuda")
-    with pytest.raises(error_type, match=messages[violation]):
+    arguments[field] = make_tensor()
+    with pytest.raises(error_type, match=message):
         block_sparse_module.block_sparse_attention_with_paged_kv_cache(**arguments)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+def test_paged_one_shot_rejects_batch_mismatch_before_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fail_if_planned(
+        monkeypatch,
+        block_sparse_module.BlockSparsePagedTSWrapper,
+    )
+    arguments = _PagedOneShotCase((64, 64), ((0, -1), (0, -1))).arguments()
+    arguments["q"] = arguments["q"][:1]
+    with pytest.raises(ValueError, match="seq_lens_kv must have one entry per request"):
+        block_sparse_module.block_sparse_attention_with_paged_kv_cache(**arguments)
+
+
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_wrapper_run_validate_false_skips_explicit_checks(
+    monkeypatch: pytest.MonkeyPatch, paged: bool
+) -> None:
+    """The trusted run path canonicalizes and launches without validators."""
+
+    wrapper_type = (
+        block_sparse_module.BlockSparsePagedTSWrapper
+        if paged
+        else block_sparse_module.BlockSparseTSWrapper
+    )
+    wrapper = wrapper_type()
+    wrapper._plan_state = SimpleNamespace(device=torch.device("cpu"))
+    run_args = object()
+    output = object()
+
+    def fail_validation(*_args, **_kwargs):
+        raise AssertionError("explicit validation must be skipped")
+
+    monkeypatch.setattr(
+        block_sparse_module, "_validate_block_sparse_run", fail_validation
+    )
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_prepare_block_sparse_run_unchecked",
+        lambda *_args, **_kwargs: run_args,
+    )
+    monkeypatch.setattr(
+        wrapper_type,
+        "_launch_validated_run",
+        lambda _self, _state, actual_run_args, _stream: (
+            output if actual_run_args is run_args else fail_validation()
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    tensors = [object() for _ in range(6 if paged else 5)]
+
+    assert wrapper.run(*tensors, validate=False) is output
+    with pytest.raises(TypeError, match="validate must be a bool"):
+        wrapper.run(*tensors, validate="no")
 
 
 def test_paged_inspection_launches_share_one_summary(
@@ -3820,7 +3915,7 @@ def test_paged_inspection_launches_share_one_summary(
 
     metadata = tuple(
         torch.tensor(value, dtype=torch.int32)
-        for value in ([[[0, 1]]], [0], [0, 1], [0], [64])
+        for value in ([[[0, 1]]], [0], [[0, -1]], [64])
     )
     result = inspect_paged(
         *metadata,
@@ -3863,8 +3958,8 @@ def test_paged_metadata_compile_adapter_launch_order_contract() -> None:
     )
     block_indptr = object()
     block_indices = object()
-    paged_kv_indptr = object()
-    paged_kv_indices = object()
+    block_tables = object()
+    block_table_row_stride = object()
     seq_lens_kv = object()
     num_physical_kv_pages = object()
     summary = object()
@@ -3874,8 +3969,8 @@ def test_paged_metadata_compile_adapter_launch_order_contract() -> None:
         adapter,
         block_indptr,
         block_indices,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
+        block_table_row_stride,
         seq_lens_kv,
         num_physical_kv_pages,
         summary,
@@ -3886,8 +3981,8 @@ def test_paged_metadata_compile_adapter_launch_order_contract() -> None:
     _, request_args = call_sequence[0]
     _, bsr_args = call_sequence[1]
     assert request_args == (
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
+        block_table_row_stride,
         seq_lens_kv,
         num_physical_kv_pages,
         summary,
@@ -3918,7 +4013,7 @@ def test_metadata_inspection_scan_positions_use_int64() -> None:
         ),
         (
             block_sparse_inspect._InspectPagedKvMetadata.kernel,
-            ("request_page_count", "page_offset", "page_position"),
+            ("row_begin", "page_offset", "page_position"),
         ),
     )
     for target, names in contracts:
@@ -4820,7 +4915,28 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
-def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
+@pytest.mark.parametrize(
+    ("live_seq_len_kv", "physical_page_ids", "patterns"),
+    (
+        pytest.param(
+            96,
+            (0, 2),
+            ((((0,),), ((1,),)),),
+            id="live96-two-pages",
+        ),
+        pytest.param(
+            64,
+            (0,),
+            ((((0,),), ((0,),)),),
+            id="live64-plan128-padded",
+        ),
+    ),
+)
+def test_public_paged_one_shot_q64_kv256_gqa_matches_reference(
+    live_seq_len_kv: int,
+    physical_page_ids: tuple[int, ...],
+    patterns: _Patterns,
+) -> None:
     torch.manual_seed(20260818)
     case = _Case(
         "paged_one_shot_q64_kv256_gqa",
@@ -4839,17 +4955,13 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         expected_kv_tile=256,
     )
     page_size = 64
-    live_seq_len_kv = 96
-    paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
-    paged_kv_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
-    block_indptr, block_indices = _make_bsr(
-        (
-            (
-                ((0,),),
-                ((1,),),
-            ),
-        )
+    block_tables = torch.full(
+        (1, case.seq_len_kv // page_size), -1, device="cuda", dtype=torch.int32
     )
+    block_tables[0, : len(physical_page_ids)] = torch.tensor(
+        physical_page_ids, device="cuda", dtype=torch.int32
+    )
+    block_indptr, block_indices = _make_bsr(patterns)
     q = (
         torch.randn(
             (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4869,31 +4981,20 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
     v_pages = torch.randn_like(k_pages)
     paged_kv_cache = torch.stack((k_pages, v_pages), dim=1)
     logical_k = torch.cat(
-        [
-            paged_kv_cache[page_id, 0].transpose(0, 1)
-            for page_id in paged_kv_indices.tolist()
-        ],
+        [paged_kv_cache[page_id, 0].transpose(0, 1) for page_id in physical_page_ids],
         dim=0,
     ).unsqueeze(0)
     logical_v = torch.cat(
-        [
-            paged_kv_cache[page_id, 1].transpose(0, 1)
-            for page_id in paged_kv_indices.tolist()
-        ],
+        [paged_kv_cache[page_id, 1].transpose(0, 1) for page_id in physical_page_ids],
         dim=0,
     ).unsqueeze(0)
     sm_scale = _HEAD_DIM**-0.5
     expected = _reference(
-        case,
+        replace(case, seq_len_kv=len(physical_page_ids) * page_size),
         q,
         logical_k,
         logical_v,
-        (
-            (
-                ((0,),),
-                ((1,),),
-            ),
-        ),
+        patterns,
         (frozenset(range(live_seq_len_kv)),),
         sm_scale,
     )
@@ -4901,14 +5002,13 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
     actual = prims_ts.block_sparse_attention_with_paged_kv_cache(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
+        torch.tensor([live_seq_len_kv], dtype=torch.int32, device=q.device),
         block_indptr,
         block_indices,
         case.q_block_size,
         case.kv_block_size,
         max_seq_len_kv=case.seq_len_kv,
-        seq_lens_kv=torch.tensor([live_seq_len_kv], dtype=torch.int32, device=q.device),
         sm_scale=sm_scale,
     )
     torch.cuda.synchronize()
@@ -4967,7 +5067,6 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     assert all(route == tuple(sorted(route)) for route in patterns[0][0])
     block_indptr, block_indices = _make_bsr(patterns)
 
-    paged_kv_indptr = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
     paged_kv_indices = torch.tensor(
         [8, 1, 6, 3, 9, 0, 7, 2],
         device="cuda",
@@ -5041,8 +5140,7 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     actual = wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        paged_kv_indices.view(case.batch_size, -1),
         seq_lens_kv,
         block_indptr,
         block_indices,
@@ -5051,14 +5149,26 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
+    trusted = wrapper.run(
+        q,
+        paged_kv_cache,
+        paged_kv_indices.view(case.batch_size, -1),
+        seq_lens_kv,
+        block_indptr,
+        block_indices,
+        sm_scale=sm_scale,
+        validate=False,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(trusted, actual, rtol=0.0, atol=0.0)
+
     graph_out = torch.empty_like(q)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = wrapper.run(
             q,
             paged_kv_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
+            paged_kv_indices.view(case.batch_size, -1),
             seq_lens_kv,
             block_indptr,
             block_indices,
@@ -5200,8 +5310,11 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 
     block_indptr = indptr_a.clone()
     block_indices = indices_a.clone()
-    paged_kv_indices = page_ids_a.clone()
-    paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    block_table_storage = torch.full(
+        (case.batch_size, 3), -1, device="cuda", dtype=torch.int32
+    )
+    block_tables = block_table_storage[:, :2]
+    block_tables.copy_(page_ids_a.view(case.batch_size, 2))
     seq_lens_kv = torch.full(
         (case.batch_size,),
         case.seq_len_kv,
@@ -5234,8 +5347,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     eager = wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens_kv,
         block_indptr,
         block_indices,
@@ -5250,8 +5362,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
         captured = wrapper.run(
             q,
             paged_kv_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens_kv,
             block_indptr,
             block_indices,
@@ -5273,7 +5384,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     # Copies and the next replay share the current stream, preserving ordering.
     block_indptr.copy_(indptr_b)
     block_indices.copy_(indices_b)
-    paged_kv_indices.copy_(page_ids_b)
+    block_tables.copy_(page_ids_b.view(case.batch_size, 2))
     replay()
     assert torch.isfinite(graph_out).all()
     torch.testing.assert_close(graph_out, expected_b, rtol=1e-2, atol=1e-2)
@@ -5311,8 +5422,6 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     sm_scale = _HEAD_DIM**-0.5
     seq_lens_a = torch.tensor([48, 128], device="cuda", dtype=torch.int32)
     seq_lens_b = torch.tensor([96, 64], device="cuda", dtype=torch.int32)
-    paged_kv_indptr_a = torch.tensor([0, 1, 4], device="cuda", dtype=torch.int32)
-    paged_kv_indptr_b = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
     patterns_a = (
         (
             ((0,),),
@@ -5517,16 +5626,18 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
 
     block_indptr = indptr_a.clone()
     block_indices = indices_a.clone()
-    paged_kv_indices = page_ids_a.clone()
-    paged_kv_indptr = paged_kv_indptr_a.clone()
+    block_table_storage = torch.full(
+        (case.batch_size, 3), -1, device="cuda", dtype=torch.int32
+    )
+    block_tables = block_table_storage[:, :2]
+    block_tables.copy_(torch.stack((page_ids_a[:2], page_ids_a[1:3])))
     seq_lens_kv = seq_lens_a.clone()
     kv_valid_bits = kv_valid_bits_a.clone()
 
     eager = wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_tables,
         seq_lens_kv,
         block_indptr,
         block_indices,
@@ -5542,8 +5653,7 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         captured = wrapper.run(
             q,
             paged_kv_cache,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             seq_lens_kv,
             block_indptr,
             block_indices,
@@ -5564,8 +5674,9 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
 
     block_indptr.copy_(indptr_b)
     block_indices.copy_(indices_b)
-    paged_kv_indptr.copy_(paged_kv_indptr_b)
-    paged_kv_indices.copy_(page_ids_b)
+    block_tables.copy_(
+        torch.stack((page_ids_b[:2], torch.stack((page_ids_b[2], page_ids_b[2]))))
+    )
     seq_lens_kv.copy_(seq_lens_b)
     kv_valid_bits.copy_(kv_valid_bits_b)
     replay()

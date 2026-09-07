@@ -41,6 +41,8 @@ generic checks are insufficient.  See the docstring in
 import ast
 from collections import Counter
 import inspect
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -644,6 +646,9 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
             assert (proxy_constraint in template.constraints) == suffix.endswith(
                 "proxy"
             )
+        for name in ("q_block_size", "kv_block_size"):
+            assert not one_shot_template.inputs[name].optional
+            assert wrapper_template.inputs[name].optional
 
     prims_ts_block_sparse_trace = one_shot_traces["prims_ts_block_sparse"]
     constraints = set(prims_ts_block_sparse_trace.constraints)
@@ -664,8 +669,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     combined_trace = paged_templates["prims_ts_paged_block_sparse_combined"]
     common_inputs = {
         "q",
-        "paged_kv_indptr",
-        "paged_kv_indices",
+        "block_tables",
         "max_seq_len_kv",
         "seq_lens_kv",
         "block_indptr",
@@ -685,10 +689,12 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         }.isdisjoint(template.inputs)
         assert "paged KV" in template.description
         assert "max_seq_len_kv" in template.axes
+        assert "max_pages_per_seq" in template.axes
         assert "seq_len_kv" not in template.axes
         assert template.inputs["max_seq_len_kv"].param is None
-        assert not template.inputs["seq_lens_kv"].optional
-        assert "paged_kv_indptr[-1].item() <= num_page_indices" in template.constraints
+        for name in ("max_seq_len_kv", "seq_lens_kv", "q_block_size", "kv_block_size"):
+            assert not template.inputs[name].optional
+        assert "max_pages_per_seq * page_size >= max_seq_len_kv" in template.constraints
         assert (
             "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)"
             in template.constraints
@@ -743,6 +749,79 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
             assert template.inputs[name].optional
     for template in wrapper_paged_templates.values():
         assert template.inputs["max_seq_len_kv"].optional
+        assert template.tags == [
+            "backend:prims-ts",
+            "sparse:block",
+            "sparse-format:bsr",
+            "routes:exact",
+            "status:experimental",
+            "kv-cache:paged",
+        ]
+
+
+@pytest.mark.parametrize(
+    "golden_name, dispatch_name, name_prefix, fi_api",
+    [
+        (
+            "prims_ts_block_sparse_h8_kv8_d128_qb64_kb64",
+            "prims_ts_block_sparse_trace_dispatch",
+            "prims_ts_block_sparse",
+            "block_sparse_attention",
+        ),
+        (
+            "prims_ts_block_sparse_wrapper_h8_kv8_d128",
+            "prims_ts_block_sparse_wrapper_trace_dispatch",
+            "prims_ts_block_sparse_wrapper",
+            "BlockSparseTSWrapper.run",
+        ),
+        (
+            "prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64",
+            "prims_ts_paged_block_sparse_trace_dispatch",
+            "prims_ts_paged_block_sparse_tuple",
+            "block_sparse_attention_with_paged_kv_cache",
+        ),
+        (
+            "prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64",
+            "prims_ts_paged_block_sparse_trace_dispatch",
+            "prims_ts_paged_block_sparse_combined",
+            "block_sparse_attention_with_paged_kv_cache",
+        ),
+        (
+            "prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64",
+            "prims_ts_paged_block_sparse_wrapper_trace_dispatch",
+            "prims_ts_paged_block_sparse_wrapper_tuple",
+            "BlockSparsePagedTSWrapper.run",
+        ),
+        (
+            "prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64",
+            "prims_ts_paged_block_sparse_wrapper_trace_dispatch",
+            "prims_ts_paged_block_sparse_wrapper_combined",
+            "BlockSparsePagedTSWrapper.run",
+        ),
+    ],
+)
+def test_prims_ts_block_sparse_goldens_match_templates(
+    golden_name, dispatch_name, name_prefix, fi_api
+):
+    from flashinfer.trace.templates import attention
+
+    dispatch = getattr(attention, dispatch_name)
+    template = next(t for t in dispatch.templates if t.name_prefix == name_prefix)
+    golden = json.loads(
+        (Path(__file__).parent / "fi_trace_out" / f"{golden_name}.json").read_text()
+    )
+
+    assert golden["description"] == template.description
+    assert golden["tags"] == [
+        f"fi_api:flashinfer.attention.prims_ts.block_sparse.{fi_api}",
+        *template.tags,
+    ]
+    assert list(golden["axes"]) == list(template.axes)
+    assert golden["constraints"] == list(template.constraints)
+    assert list(golden["inputs"]) == list(template.inputs)
+    for name, descriptor in template.inputs.items():
+        assert bool(golden["inputs"][name].get("optional")) == descriptor.optional
+        assert golden["inputs"][name].get("description", "") == descriptor.description
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
