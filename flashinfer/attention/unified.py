@@ -31,8 +31,8 @@ Design rules enforced here (each traces to a documented failure mode):
     within it.
 5.  One output contract.  LSE is always base-2 (multiply by ``ln(2)`` to get
     natural log), shape ``(total_q_tokens, num_qo_heads)``, fp32 — adapters
-    normalize native formats (cuDNN returns natural-log padded ``(b, max_q,
-    h)`` stats; the fold lives in its adapter, not in callers).
+    normalize native formats (cuDNN returns padded ``(b, max_q, h)`` stats;
+    the gather lives in its adapter, not in callers).
 
 Capability honesty rule: ``CAPABILITIES`` declares ONLY what the conformance
 matrix and fuzzer actually exercise on hardware.  Production entries are
@@ -84,8 +84,6 @@ __all__ = [
     "UnifiedPagedPrefill",
 ]
 
-_LOG2E = math.log2(math.e)
-
 
 # --------------------------------------------------------------------------
 # Capability layer
@@ -118,7 +116,7 @@ class BackendCapability:
     needs_dense: bool = False
     # native LSE format, normalized by the adapter:
     #   "base2_tokens_h"  — already the contract
-    #   "ln_padded_bsh"   — natural-log (b, max_q, h); adapter gathers + folds
+    #   "base2_padded_bsh" — base-2 padded (b, max_q, h); adapter gathers
     lse_native: str = "base2_tokens_h"
 
     def check(
@@ -239,7 +237,7 @@ CAPABILITIES: Dict[str, BackendCapability] = {
         supports_window=False,  # no sliding window in the cuDNN SDPA graph path
         requires_contiguous_q=True,  # token-unit offsets assume packed THD
         needs_dense=True,
-        lse_native="ln_padded_bsh",
+        lse_native="base2_padded_bsh",
     ),
     "trtllm-gen": BackendCapability(
         name="trtllm-gen",
@@ -1136,9 +1134,8 @@ class _CudnnAdapter:
     """cuDNN via cudnn_batch_prefill_with_kv_cache (post-#3921 tokens mode).
 
     Dialect: token-unit indptr as batch offsets (units="tokens"), per-request
-    lens as (b,1,1,1).  Native LSE is natural-log padded (b, max_q, h); this
-    adapter gathers it to packed (tokens, h) and folds to base-2 — the LSE
-    outlier (fragmentation survey A4) dies here, invisibly to callers.
+    lens as (b,1,1,1).  Native LSE is base-2 padded (b, max_q, h) (natural-log
+    before #4663); this adapter gathers it to packed (tokens, h).
     """
 
     def __init__(self, device, kv_layout, workspace):
@@ -1195,9 +1192,10 @@ class _CudnnAdapter:
         )
         if not m["return_lse"]:
             return out_t, None
-        # padded (b, max_q, h) natural-log -> packed (tokens, h) base-2,
-        # using the plan-time precomputed gather indices (zero sync).
-        packed = lse_t[self._batch_ids, self._pos, :] * _LOG2E
+        # padded (b, max_q, h) -> packed (tokens, h), using the plan-time
+        # precomputed gather indices (zero sync). cuDNN returns base-2 LSE
+        # since #4663, so no log-base fold here.
+        packed = lse_t[self._batch_ids, self._pos, :]
         if lse is not None:
             lse.copy_(packed)
             packed = lse
