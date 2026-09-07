@@ -22,6 +22,7 @@ import contextlib
 import ctypes
 import functools
 import re
+import sys
 import warnings
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -1394,6 +1395,28 @@ class UlyssesCommunicator:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    def __del__(self) -> None:
+        # Warn only: teardown is collective and cannot run from a finalizer
+        # (unlike workspace_base.AllReduceFusionWorkspace, which destroys
+        # here). Unarmed communicators (pure NCCL, world size 1) hold nothing
+        # peer-shared and stay silent. getattr defaults cover objects whose
+        # __init__ never ran.
+        if sys.is_finalizing():
+            return
+        state = getattr(self, "_state", _CLOSED)
+        armed = getattr(self, "_nvlink_armed", False) or getattr(
+            self, "_pcie_armed", False
+        )
+        if state != _CLOSED and armed:
+            warnings.warn(
+                f"UlyssesCommunicator ({getattr(self, 'backend', '?')}, {state}) was "
+                "garbage-collected without close(); its peer-shared resources leak "
+                "until process exit. Call close() on every rank or use the context "
+                "manager.",
+                ResourceWarning,
+                stacklevel=2,
+            )
 
     @flashinfer_api
     def create_workspace(self, *, max_elems: Optional[int] = None) -> UlyssesWorkspace:
