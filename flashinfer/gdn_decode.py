@@ -1123,6 +1123,7 @@ def gated_delta_rule_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
+    num_householder: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
@@ -1201,6 +1202,8 @@ def gated_delta_rule_mtp(
         to ``initial_state_indices`` (read and write target the same
         slot).  Negative entries skip the writeback for that batch
         (the read still runs).
+    num_householder: int
+        Support GDP. `num_householder = 1` reduces to regular GDN.
 
     Returns
     -------
@@ -1226,9 +1229,16 @@ def gated_delta_rule_mtp(
         )
         disable_state_update = True
 
-    # Validate input shapes
-    B, T, H, K = q.shape
+    # Validate input shapes. With num_householder > 1 (gated DeltaProduct) the
+    # k/v/b axis is num_householder times longer than the real token axis; the
+    # kernel steps that expanded axis and synthesizes q/a for the micro-steps.
+    B, T_real, H, K = q.shape
+    T = k.shape[1]
     _, _, HV, V = v.shape
+    assert T_real * num_householder == T, (
+        f"k has {T} tokens; expected T_real={T_real} * "
+        f"num_householder={num_householder}"
+    )
     pool_size = initial_state.shape[0]
 
     # Dynamic TILE_V and vec_size selection based on batch size and sequence length
@@ -1283,7 +1293,7 @@ def gated_delta_rule_mtp(
     target_dtype = output.dtype if output_provided else q.dtype
 
     if output is None:
-        output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
+        output = torch.zeros((B, T_real, HV, V), dtype=torch.bfloat16, device=q.device)
 
     # Build h0_source for the kernel.
     # - Contiguous 4D pool: `.reshape()` returns a free 3D view, kernel takes
@@ -1351,8 +1361,8 @@ def gated_delta_rule_mtp(
             "ssm_state_indices requires state writes; disable_state_update must be False"
         )
         assert T >= 2, f"ssm_state_indices requires T >= 2 (got T={T})"
-        assert ssm_state_indices.shape == (B, T), (
-            f"ssm_state_indices must have shape [B={B}, T={T}], "
+        assert ssm_state_indices.shape == (B, T_real), (
+            f"ssm_state_indices must have shape [B={B}, T={T_real}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
         assert ssm_state_indices.dtype == torch.int32, (
@@ -1392,6 +1402,7 @@ def gated_delta_rule_mtp(
         ssm_state_indices=ssm_state_indices,
         output_state_indices=output_state_indices,
         use_pool_indexing=pool_use_pool_indexing,
+        n_h=num_householder,
     )
 
     # No post-kernel scatter step: the contiguity assert above guarantees

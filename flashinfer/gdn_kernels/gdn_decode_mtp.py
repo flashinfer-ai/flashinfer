@@ -306,6 +306,10 @@ def gdn_verify_kernel_mtp(
     # the shared-memory footprint independent of sequence length, preserving
     # occupancy at long T. CHUNK == T disables chunking.
     CHUNK: cutlass.Constexpr[int],
+    # Householders per real token. q and a carry one row per REAL token and are
+    # synthesized here for the other micro-steps; k/v/b carry all n_h. n_h == 1
+    # is plain GDN and every predicate below is trivially true.
+    n_h: cutlass.Constexpr[int],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -439,18 +443,29 @@ def gdn_verify_kernel_mtp(
                 # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
                 for j_c in cutlass.range_constexpr(CHUNK):
                     i_t = c0 + j_c
-                    q_tile = cute.local_tile(
-                        q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
-                    )
+
                     k_tile = cute.local_tile(
                         k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
                     )
-                    cute.autovec_copy(q_tile, r_q_bf16)
                     cute.autovec_copy(k_tile, r_k_bf16)
-
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = cutlass.Float32(r_q_bf16[i])
                         r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+                    # Only the last micro-step of a token reads a query; the rest
+                    # contribute no output, so their q is zero.
+                    is_last_micro: cutlass.Constexpr[bool] = i_t % n_h == n_h - 1
+                    if cutlass.const_expr(is_last_micro):
+                        q_tile = cute.local_tile(
+                            q,
+                            (1, 1, 1, vec_size),
+                            (i_n, i_t // n_h, i_h, lane_in_group),
+                        )
+                        cute.autovec_copy(q_tile, r_q_bf16)
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = cutlass.Float32(r_q_bf16[i])
+                    else:
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = cutlass.Float32(0.0)
 
                     if cutlass.const_expr(use_qk_l2norm):
                         sum_q = 0.0
@@ -486,7 +501,12 @@ def gdn_verify_kernel_mtp(
                         sQ[(j_c, k_start + i)] = r_q[i]
                         sK[(j_c, k_start + i)] = r_k[i]
 
-                    r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+                    # The gate applies once per real token;
+                    # later micro-steps decay by exp(0) == 1.
+                    is_first_micro: cutlass.Constexpr[bool] = i_t % n_h == 0
+                    r_a = cutlass.Float32(
+                        a[i_n, i_t // n_h, i_hv] if is_first_micro else 0.0
+                    )
                     r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
                     x = r_a + r_dt_bias
@@ -510,7 +530,11 @@ def gdn_verify_kernel_mtp(
                     r_beta = cutlass.Float32(1.0) / (
                         cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
                     )
-                    r_g = cute.exp(r_g_value, fastmath=True)
+                    r_g = (
+                        cute.exp(r_g_value, fastmath=True)
+                        if cutlass.const_expr(is_first_micro)
+                        else cutlass.Float32(1.0)
+                    )
 
                     # All threads in warp 0 write same warp-uniform values
                     sG[j_c] = r_g
@@ -815,8 +839,12 @@ def gdn_verify_kernel_mtp(
                             # to pool[ssm_state_indices[i_n, i_t]] (a different slot
                             # per iteration). h0_source is [pool_size * HV, V, K] so
                             # the slot-flat index is pool_slot * HV + i_hv.
-                            if cutlass.const_expr(per_token_pool_scatter):
-                                pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
                                 if pool_slot_t >= 0:
                                     # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                     # (65,536 bytes). Element multiply overflows Int32 at
@@ -948,14 +976,32 @@ def gdn_verify_kernel_mtp(
                                     sOutput[(j_c, vl0 + 6)] = cutlass.BFloat16(o6)
                                     sOutput[(j_c, vl0 + 7)] = cutlass.BFloat16(o7)
                                 else:
-                                    o[(i_n, i_t, i_hv, v0)] = cutlass.BFloat16(o0)
-                                    o[(i_n, i_t, i_hv, v1)] = cutlass.BFloat16(o1)
-                                    o[(i_n, i_t, i_hv, v2)] = cutlass.BFloat16(o2)
-                                    o[(i_n, i_t, i_hv, v3)] = cutlass.BFloat16(o3)
-                                    o[(i_n, i_t, i_hv, v4)] = cutlass.BFloat16(o4)
-                                    o[(i_n, i_t, i_hv, v5)] = cutlass.BFloat16(o5)
-                                    o[(i_n, i_t, i_hv, v6)] = cutlass.BFloat16(o6)
-                                    o[(i_n, i_t, i_hv, v7)] = cutlass.BFloat16(o7)
+                                    # non-final micro-steps produce no output row
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v0)] = (
+                                            cutlass.BFloat16(o0)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v1)] = (
+                                            cutlass.BFloat16(o1)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v2)] = (
+                                            cutlass.BFloat16(o2)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v3)] = (
+                                            cutlass.BFloat16(o3)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v4)] = (
+                                            cutlass.BFloat16(o4)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v5)] = (
+                                            cutlass.BFloat16(o5)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v6)] = (
+                                            cutlass.BFloat16(o6)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v7)] = (
+                                            cutlass.BFloat16(o7)
+                                        )
 
                         # Write final state back for all 8 rows. Negative write
                         # indices (output_state_indices == -1) skip the writeback.
@@ -1333,18 +1379,20 @@ def gdn_verify_kernel_mtp(
                                     sOutput[(j_c, vla + 2)] = cutlass.BFloat16(sum_hq_c)
                                     sOutput[(j_c, vla + 3)] = cutlass.BFloat16(sum_hq_d)
                                 else:
-                                    o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                        sum_hq_a
-                                    )
-                                    o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                        sum_hq_b
-                                    )
-                                    o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(
-                                        sum_hq_c
-                                    )
-                                    o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(
-                                        sum_hq_d
-                                    )
+                                    # non-final micro-steps produce no output row
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                            cutlass.BFloat16(sum_hq_a)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                            cutlass.BFloat16(sum_hq_b)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
+                                            cutlass.BFloat16(sum_hq_c)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
+                                            cutlass.BFloat16(sum_hq_d)
+                                        )
 
                             # Cache intermediate state LAST in timestep (fire-and-forget stores
                             # overlap with next timestep's compute)
@@ -1384,8 +1432,12 @@ def gdn_verify_kernel_mtp(
                                 )
 
                             # FLA-style per-token pool scatter (parallel to cache).
-                            if cutlass.const_expr(per_token_pool_scatter):
-                                pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
                                 if pool_slot_t >= 0:
                                     # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                     # (65,536 bytes). Element multiply overflows Int32 at
@@ -1569,8 +1621,12 @@ def gdn_verify_kernel_mtp(
                                 )
 
                             # FLA-style per-token pool scatter (parallel to cache).
-                            if cutlass.const_expr(per_token_pool_scatter):
-                                pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
                                 if pool_slot_t >= 0:
                                     # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                     # (65,536 bytes). Element multiply overflows Int32 at
@@ -1622,12 +1678,14 @@ def gdn_verify_kernel_mtp(
                                         sum_hq_b
                                     )
                                 else:
-                                    o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                        sum_hq_a
-                                    )
-                                    o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                        sum_hq_b
-                                    )
+                                    # non-final micro-steps produce no output row
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                            cutlass.BFloat16(sum_hq_a)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                            cutlass.BFloat16(sum_hq_b)
+                                        )
 
                         # Write final state back for BOTH rows (if not disabled).
                         # Negative write indices skip the writeback.
@@ -1658,13 +1716,15 @@ def gdn_verify_kernel_mtp(
                 cute.arch.barrier()  # sOutput complete; also WAR on sQ/sK before refill
                 v_tile_base = i_v * tile_v
                 for t_idx in cutlass.range_constexpr(CHUNK):
-                    # 128 threads, tile_v values to write per timestep
-                    if tidx < tile_v:
-                        v_global = v_tile_base + tidx
-                        if v_global < V:
-                            o[(i_n, c0 + t_idx, i_hv, v_global)] = sOutput[
-                                (t_idx, tidx)
-                            ]
+                    # one output row per REAL token, taken from its last micro-step
+                    if cutlass.const_expr((c0 + t_idx) % n_h == n_h - 1):
+                        # 128 threads, tile_v values to write per timestep
+                        if tidx < tile_v:
+                            v_global = v_tile_base + tidx
+                            if v_global < V:
+                                o[(i_n, (c0 + t_idx) // n_h, i_hv, v_global)] = sOutput[
+                                    (t_idx, tidx)
+                                ]
 
 
 @cute.jit
@@ -1705,6 +1765,7 @@ def run_gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     CHUNK: cutlass.Constexpr[int],
+    n_h: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -1770,6 +1831,7 @@ def run_gdn_verify_kernel_mtp(
         use_packed_fma,
         per_token_pool_scatter,
         CHUNK,
+        n_h,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1823,6 +1885,9 @@ def gdn_verify_kernel_mtp_inline(
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    # Householders per real token. q and a carry one row per REAL token and
+    # are synthesized here for the other micro-steps; k/v/b carry all n_h.
+    n_h: cutlass.Constexpr[int],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -1951,7 +2016,7 @@ def gdn_verify_kernel_mtp_inline(
             cute.make_layout((T,), stride=(1,)), cutlass.Float32
         )
         for i_t in cutlass.range_constexpr(T):
-            r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
+            r_a_val = cutlass.Float32(a[i_n, i_t // n_h, i_hv])
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
             beta_x_val = softplus_beta * x_val
@@ -1966,7 +2031,11 @@ def gdn_verify_kernel_mtp_inline(
             )
             sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x_val
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
-            r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
+            r_g_arr[i_t] = (
+                cute.exp(r_g_value, fastmath=True)
+                if cutlass.const_expr(i_t % n_h == 0)
+                else cutlass.Float32(1.0)
+            )
             r_beta_arr[i_t] = cutlass.Float32(1.0) / (
                 cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
             )
@@ -2008,7 +2077,9 @@ def gdn_verify_kernel_mtp_inline(
                     cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
                     cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
 
-                    # Prologue: load q[0], k[0]
+                    # Prologue: load q[0], k[0]. Only the last micro-step of
+                    # a real token carries a query; earlier ones use zero.
+                    q_keep = 1.0 if 0 % n_h == n_h - 1 else 0.0
                     q_tile = cute.local_tile(
                         q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane_in_group)
                     )
@@ -2018,7 +2089,7 @@ def gdn_verify_kernel_mtp_inline(
                     cute.autovec_copy(q_tile, r_q_bf16)
                     cute.autovec_copy(k_tile, r_k_bf16)
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = cutlass.Float32(r_q_bf16[i])
+                        r_q[i] = cutlass.Float32(r_q_bf16[i]) * q_keep
                         r_k[i] = cutlass.Float32(r_k_bf16[i])
                     if cutlass.const_expr(not use_qk_l2norm):
                         for i in cutlass.range_constexpr(vec_size):
@@ -2154,8 +2225,12 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=4).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -2255,26 +2330,29 @@ def gdn_verify_kernel_mtp_inline(
                                 sOutput[(i_t, vla + 2)] = cutlass.BFloat16(sum_hq_c)
                                 sOutput[(i_t, vla + 3)] = cutlass.BFloat16(sum_hq_d)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(
-                                    sum_hq_c
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(
-                                    sum_hq_d
-                                )
+                                # non-final micro-steps produce no output row
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
+                                        cutlass.BFloat16(sum_hq_c)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
+                                        cutlass.BFloat16(sum_hq_d)
+                                    )
 
                         # Prefetch q/k/g/β for next timestep
                         if cutlass.const_expr(i_t + 1 < T):
                             q_tile = cute.local_tile(
                                 q,
                                 (1, 1, 1, vec_size),
-                                (i_n, i_t + 1, i_h, lane_in_group),
+                                (i_n, (i_t + 1) // n_h, i_h, lane_in_group),
                             )
+                            q_keep = 1.0 if (i_t + 1) % n_h == n_h - 1 else 0.0
                             k_tile = cute.local_tile(
                                 k,
                                 (1, 1, 1, vec_size),
@@ -2283,7 +2361,7 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(q_tile, r_q_bf16)
                             cute.autovec_copy(k_tile, r_k_bf16)
                             for i in cutlass.range_constexpr(vec_size):
-                                r_q[i] = cutlass.Float32(r_q_bf16[i])
+                                r_q[i] = cutlass.Float32(r_q_bf16[i]) * q_keep
                                 r_k[i] = cutlass.Float32(r_k_bf16[i])
                             if cutlass.const_expr(not use_qk_l2norm):
                                 for i in cutlass.range_constexpr(vec_size):
@@ -2360,15 +2438,18 @@ def gdn_verify_kernel_mtp_inline(
                     # Batch load ALL q/k + compute ALL L2 norms
                     for i_t in cutlass.range_constexpr(T):
                         q_tile = cute.local_tile(
-                            q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                            q,
+                            (1, 1, 1, vec_size),
+                            (i_n, i_t // n_h, i_h, lane_in_group),
                         )
+                        q_keep = 1.0 if i_t % n_h == n_h - 1 else 0.0
                         k_tile = cute.local_tile(
                             k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
                         )
                         cute.autovec_copy(q_tile, r_q_bf16)
                         cute.autovec_copy(k_tile, r_k_bf16)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_q_all[i_t, i] = cutlass.Float32(r_q_bf16[i])
+                            r_q_all[i_t, i] = cutlass.Float32(r_q_bf16[i]) * q_keep
                             r_k_all[i_t, i] = cutlass.Float32(r_k_bf16[i])
 
                         if cutlass.const_expr(use_qk_l2norm):
@@ -2477,8 +2558,12 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=2).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -2521,12 +2606,14 @@ def gdn_verify_kernel_mtp_inline(
                                 sOutput[(i_t, vla2)] = cutlass.BFloat16(sum_hq_a)
                                 sOutput[(i_t, vla2 + 1)] = cutlass.BFloat16(sum_hq_b)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
+                                # non-final micro-steps produce no output row
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
 
                     # Write final state back. Negative write indices skip the writeback.
                     if cutlass.const_expr(
@@ -2552,10 +2639,11 @@ def gdn_verify_kernel_mtp_inline(
             v_tile_base = i_v * tile_v
             for t_idx in cutlass.range_constexpr(T):
                 # 128 threads, tile_v values to write per timestep
-                if tidx < tile_v:
+                # non-final micro-steps produce no output row
+                if cutlass.const_expr(t_idx % n_h == n_h - 1) and tidx < tile_v:
                     v_global = v_tile_base + tidx
                     if v_global < V:
-                        o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+                        o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[(t_idx, tidx)]
 
 
 @cute.jit
@@ -2594,6 +2682,9 @@ def run_gdn_verify_kernel_mtp_inline(
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    # Householders per real token. q and a carry one row per REAL token and
+    # are synthesized here for the other micro-steps; k/v/b carry all n_h.
+    n_h: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -2652,6 +2743,7 @@ def run_gdn_verify_kernel_mtp_inline(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        n_h,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2734,6 +2826,7 @@ def _get_compiled_mtp_kernel(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     chunk_rows: int = 0,
+    n_h: int = 1,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2760,6 +2853,7 @@ def _get_compiled_mtp_kernel_inline(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    n_h: int = 1,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2794,6 +2888,7 @@ def run_mtp_decode(
     ssm_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
     use_pool_indexing: bool = False,
+    n_h: int = 1,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2879,6 +2974,7 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
+            n_h,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -2903,6 +2999,7 @@ def run_mtp_decode(
             use_packed_fma,
             per_token_pool_scatter,
             chunk_rows,
+            n_h,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -3040,6 +3137,7 @@ def run_mtp_decode(
                     use_smem_v=use_smem_v,
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
+                    n_h=n_h,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
@@ -3087,6 +3185,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     CHUNK=chunk_rows,
+                    n_h=n_h,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),

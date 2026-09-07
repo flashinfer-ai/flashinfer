@@ -708,3 +708,86 @@ def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
         f"CHUNK={chunk} changed the final state vs CHUNK={TN}; "
         "r_h must be seeded once and written back on the last chunk only"
     )
+
+
+# --------------------------------------------------------------------------
+# 9. q and a are read at the real token index; nothing is expanded.
+#
+# The kernel synthesizes the micro-steps it does not have rows for, so the
+# wrapper hands it q/a untouched. These two tests pin the contract from both
+# sides: no scratch is allocated, and a k/q token-count mismatch is rejected
+# rather than read out of bounds.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
+)
+def test_decode_allocates_no_expansion_scratch(num_householder):
+    """A GDP call must not allocate anything that scales with n_h.
+
+    The expanded q/a/output buffers were 362 MiB at the target model's shape.
+    Peak-allocation delta is the only observable that catches their return: the
+    results are identical either way.
+    """
+    n_h, B, T, HQ, HV, K, V = num_householder, 3, 4, 16, 32, 128, 128
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
+        B, T, n_h, HQ, HV, K, V, dtype, device, seed=23
+    )
+    out = torch.empty(B, T, HV, V, dtype=dtype, device=device)
+
+    def call():
+        gated_delta_product_mtp(
+            q,
+            k,
+            v,
+            pool,
+            idx,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale=K**-0.5,
+            output=out,
+            ssm_state_indices=ssm,
+            disable_state_update=False,
+        )
+        torch.cuda.synchronize()
+
+    call()  # JIT compile and warm the caching allocator first
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    call()
+    grew = torch.cuda.max_memory_allocated() - before
+
+    # One expanded q alone would be B*T*n_h*HQ*K*2 bytes.
+    one_expanded_q = B * T * n_h * HQ * K * 2
+    assert grew < one_expanded_q, (
+        f"call allocated {grew} B; a single expanded q is {one_expanded_q} B, "
+        "so the expansion is back"
+    )
+
+
+def test_decode_rejects_token_count_mismatch():
+    """k carries n_h rows per real token; q carries one. Enforce the ratio."""
+    from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+    B, T, n_h, HQ, HV, K, V = 2, 2, 3, 16, 32, 128, 128
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, _ = _gen_decode_inputs(
+        B, T, n_h, HQ, HV, K, V, dtype, device, seed=29
+    )
+    with pytest.raises(AssertionError, match="num_householder"):
+        gated_delta_rule_mtp(
+            q,
+            k.flatten(1, 2),
+            v.flatten(1, 2),
+            pool,
+            idx,
+            A_log,
+            a,
+            dt_bias,
+            b.flatten(1, 2),
+            scale=K**-0.5,
+            disable_state_update=False,
+            num_householder=n_h + 1,
+        )
