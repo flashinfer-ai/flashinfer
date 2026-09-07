@@ -19,9 +19,16 @@ struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 template <int N>
 struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
 
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byte aligned");
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
@@ -509,11 +516,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111(__nv_bfloat16* __restrict__ al
         __syncthreads();
         float rstd = rms_scalar[0];
         float norm_value[8];
-        {
-            #pragma unroll
-            for (int j_10 = 0; j_10 < 8; j_10++) {
-                norm_value[j_10] = _vec_load_5[j_10] * rstd * (_vec_load_6[j_10] + weight_bias);
-            }
+        #pragma unroll
+        for (int j_10 = 0; j_10 < 8; j_10++) {
+            norm_value[j_10] = _vec_load_5[j_10] * rstd * (_vec_load_6[j_10] + weight_bias);
         }
         uint32_t norm_value_bf16[4];
         #pragma unroll
