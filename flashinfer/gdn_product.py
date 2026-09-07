@@ -308,7 +308,6 @@ def gated_delta_product_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,  # [B, T, HV, V]
     ssm_state_indices: Optional[torch.Tensor] = None,  # [B, T] per-token scatter
-    scratch_state_indices: Optional[torch.Tensor] = None,  # [B] throwaway slots
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,  # [B]
@@ -325,19 +324,10 @@ def gated_delta_product_mtp(
     With speculative decoding on top, ``T`` is already ``num_spec + 1``, so the
     expanded axis is ``n_h * (num_spec + 1)``.
 
-    Two things differ from the prefill wrapper, both because the decode kernel
-    is less of a blank slate:
-
-    1. **The gate is fused.** Prefill takes ``g`` directly; here the kernel
-       derives alpha from ``A_log``/``a``/``dt_bias``. Neutralising the gate on
-       micro-steps ``1..n_h-1`` therefore happens through ``a``, using
-       :data:`GATE_NEUTRAL_A_SENTINEL` -- not by writing 1.0 anywhere.
-    2. **The per-token state scatter is unguarded.** ``gated_delta_rule_mtp``
-       writes ``h_{t+1}`` to ``initial_state[ssm_state_indices[i, t]]`` for
-       every ``t``, with no "skip this one" sentinel (unlike FLA, whose kernel
-       guards on a non-positive slot id). Intermediate micro-steps must
-       therefore be pointed at a **throwaway pool row** -- one shared row for
-       the whole batch is enough; see ``scratch_state_indices``.
+    **The gate is fused**, unlike the prefill kernel. Prefill takes ``g``
+    directly; here the kernel derives alpha from ``A_log``/``a``/``dt_bias``.
+    Neutralising the gate on micro-steps ``1..n_h-1`` therefore happens through
+    ``a``, using :data:`GATE_NEUTRAL_A_SENTINEL` -- not by writing 1.0 anywhere.
 
     Parameters
     ----------
@@ -346,26 +336,9 @@ def gated_delta_product_mtp(
         one gate per REAL token.
     ssm_state_indices : torch.Tensor, optional
         ``[B, T]`` int32, one pool slot per REAL token, as for GDN MTP. The
-        wrapper expands this to ``[B, T*n_h]``, routing micro-steps
-        ``1..n_h-1`` to the scratch rows and only the last micro-step of each
-        token to the caller's slot.
-    scratch_state_indices : torch.Tensor, optional
-        ``[B]`` or ``[1]`` int32. Pool rows that absorb the intermediate
-        micro-steps' state writes and are never read. Required when
-        ``ssm_state_indices`` is given and ``n_h > 1``.
-
-        The only constraint is that these rows are **disjoint from every live
-        slot** (anything in ``initial_state_indices`` / ``ssm_state_indices`` /
-        ``output_state_indices``). They need *not* be distinct from one another:
-        a single shared row for the whole batch is correct, because the kernel
-        reads the pool exactly once -- before the recurrence, through
-        ``initial_state_indices`` -- and the per-token scatter is write-only
-        thereafter. Concurrent stores to an address nobody reads are benign.
-
-        Prefer one shared row. A per-row scratch costs ``B`` state slots
-        (``HV * V * K * 4`` bytes each -- ~2 MiB at HV=32, K=V=128, so ~512 MiB
-        at B=256) to buy only better write locality, for traffic that is pure
-        waste either way. Phase 2's scatter guard removes these writes entirely.
+        wrapper expands this to ``[B, T*n_h]``, giving micro-steps ``1..n_h-1``
+        a negative slot -- which the kernel's scatter skips -- and routing only
+        the last micro-step of each token to the caller's slot.
     expanded_* : torch.Tensor, optional
         Scratch for the expansion; required for CUDA graph capture. See
         :func:`chunk_gated_delta_product` for why.
@@ -481,10 +454,6 @@ def gated_delta_product_mtp(
         raise ValueError("expanded_output shape must be [B, T*n_h, num_o_heads,  D]")
 
     if ssm_state_indices is not None:
-        if scratch_state_indices is None:
-            raise ValueError(
-                "scratch_state_indices are required if ssm_state_indices is given"
-            )
         if expanded_ssm_state_indices is None:
             expanded_ssm_state_indices = torch.empty(
                 ssm_state_indices.size(0),
@@ -502,7 +471,8 @@ def gated_delta_product_mtp(
                 f"expanded_ssm_state_indices dtype must be {ssm_state_indices.dtype}"
             )
 
-        expanded_ssm_state_indices[:] = scratch_state_indices[:, None]
+        # negative slot indices signal to skip writing
+        expanded_ssm_state_indices[:] = -1
         expanded_ssm_state_indices[:, num_householder - 1 :: num_householder] = (
             ssm_state_indices
         )

@@ -15,14 +15,9 @@ limitations under the License.
 
 Phase 1, step 3: Gated DeltaProduct decode (MTP).
 
-Decode diverges from prefill in two ways that need their own tests, not just a
-port of the prefill suite:
-
-  * the gate is computed INSIDE the kernel from A_log/a/dt_bias, so the
-    neutral value for the non-first micro-steps is a sentinel in `a`, not a 1.0
-    in `g`. `test_gate_sentinel_is_exactly_neutral` pins that.
-  * the per-token state scatter is unguarded, so intermediate micro-steps write
-    to throwaway pool rows. `test_scratch_slots_are_inert` pins that.
+Unlike prefill, the gate is computed INSIDE the kernel from A_log/a/dt_bias, so the
+neutral value for the non-first micro-steps is a sentinel in `a`, not a 1.0
+in `g`. `test_gate_sentinel_is_exactly_neutral` pins that.
 
 Layout note: decode is DENSE [B, T, ...], not varlen. The reference is still
 `delta_product`, reached by flattening to [B*T, ...] with seq_lens = [T]*B.
@@ -85,7 +80,6 @@ class DecodeInputs(NamedTuple):
     pool: torch.Tensor  # [pool_size, HV, V, K]
     initial_state_indices: torch.Tensor  # [B]
     ssm_state_indices: torch.Tensor  # [B, T] one snapshot slot per REAL token
-    scratch_state_indices: torch.Tensor  # [B]
 
 
 def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device, seed):
@@ -96,7 +90,6 @@ def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device,
         row 0                       unused (0 is a sentinel elsewhere in flashinfer)
         [1, 1+B)                    initial states, one per batch row
         [1+B, 1+B+B*T)              per-REAL-token snapshots, ssm_state_indices
-        [1+B+B*T, 1+B+B*T+B)        scratch, absorbs the intermediate micro-steps
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -126,8 +119,7 @@ def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device,
         pool = torch.randn(1 + B + B * T + B, HV, V, K, dtype=torch.float32) * 0.01
         initial = torch.arange(1, 1 + B, dtype=torch.int32)
         ssm = torch.arange(1 + B, 1 + B + B * T, dtype=torch.int32).reshape(B, T)
-        scratch = torch.arange(1 + B + B * T, 1 + B + B * T + B, dtype=torch.int32)
-    return DecodeInputs(q, k, v, A_log, a, dt_bias, b, pool, initial, ssm, scratch)
+    return DecodeInputs(q, k, v, A_log, a, dt_bias, b, pool, initial, ssm)
 
 
 def _reference(q, k, v, A_log, a, dt_bias, b, pool, idx, scale=1.0, use_l2_norm=True):
@@ -195,7 +187,7 @@ def test_decode_nh1_matches_gdn_mtp(T):
 
     B, n_h, HQ, HV, K, V = 2, 1, 16, 32, 128, 128
     device, dtype = torch.device("cuda"), torch.bfloat16
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, HQ, HV, K, V, dtype, device, seed=0
     )
     pool_ref = pool.clone()
@@ -259,7 +251,7 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
     n_h = num_householder
     device, dtype = torch.device("cuda"), torch.bfloat16
 
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device, seed=1
     )
     ref_o, ref_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
@@ -277,8 +269,7 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
         scale=1.0,
         # no ssm_state_indices: this is the PLAIN continuous-batching path.
         # State moves via initial_state_indices (read) and output_state_indices
-        # (write, defaulting to the read slot); no per-token scatter, hence no
-        # scratch. Snapshots are test 7's job.
+        # (write, defaulting to the read slot).
         disable_state_update=False,
     )
     torch.cuda.synchronize()
@@ -293,93 +284,24 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
 
 
 # --------------------------------------------------------------------------
-# 4. Scratch rows are written but never read back into the answer.
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
-)
-def test_scratch_slots_are_inert(num_householder):
-    """Poisoning the scratch rows beforehand must not change the result.
-
-    This is the check on the workaround for gdn_decode_mtp.py's unguarded
-    per-token scatter: the intermediate micro-steps DO write, we just need
-    their landing site to be irrelevant.
-    """
-    _skip_if_unsupported()
-    B, T, n_h, HQ, HV, K, V = 3, 2, num_householder, 16, 32, 128, 128
-    device, dtype = torch.device("cuda"), torch.bfloat16
-
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
-        B, T, n_h, HQ, HV, K, V, dtype, device, seed=2
-    )
-    clean_o, _ = gated_delta_product_mtp(
-        q,
-        k,
-        v,
-        pool.clone(),
-        idx,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        scale=1.0,
-        ssm_state_indices=ssm,
-        scratch_state_indices=scratch,
-        disable_state_update=False,
-    )
-
-    poisoned = pool.clone()
-    poisoned[scratch.long()] = 1e30
-    poisoned_o, poisoned_pool = gated_delta_product_mtp(
-        q,
-        k,
-        v,
-        poisoned,
-        idx,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        scale=1.0,
-        ssm_state_indices=ssm,
-        scratch_state_indices=scratch,
-        disable_state_update=False,
-    )
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(clean_o, poisoned_o, atol=0, rtol=0)
-    assert torch.isfinite(poisoned_pool[idx.long()]).all(), (
-        "poison leaked from a scratch row into a live slot -- scratch and live "
-        "slots are not disjoint, or an intermediate micro-step wrote a live row"
-    )
-
-
-# --------------------------------------------------------------------------
-# 5. Batch rows must not contaminate one another.
+# 4. Batch rows must not contaminate one another.
 #
-# NOT a scratch-race test: sharing one scratch row across the batch is legal.
 # The kernel reads the pool once, before the recurrence, via
 # initial_state_indices; the per-token scatter is write-only after that, so
-# concurrent stores to a row nobody reads are benign. This checks the broader
-# invariant -- a row's result must not depend on who it was batched with --
-# and pins that BOTH scratch layouts satisfy it.
+# concurrent stores to a row nobody reads are benign.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
 )
-@pytest.mark.parametrize("shared_scratch", [True, False], ids=["shared", "per_row"])
-def test_batch_rows_are_independent(num_householder, shared_scratch):
+def test_batch_rows_are_independent(num_householder):
     """Running a row alone must match running it in a batch."""
     _skip_if_unsupported()
     B, T, n_h, HQ, HV, K, V = 4, 2, num_householder, 16, 32, 128, 128
     device, dtype = torch.device("cuda"), torch.bfloat16
 
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, HQ, HV, K, V, dtype, device, seed=3
     )
-    if shared_scratch:
-        # every row funnels its intermediates into ONE throwaway pool row
-        scratch = scratch[:1].expand(B).contiguous()
 
     batched_o, _ = gated_delta_product_mtp(
         q,
@@ -393,7 +315,6 @@ def test_batch_rows_are_independent(num_householder, shared_scratch):
         b,
         scale=1.0,
         ssm_state_indices=ssm,
-        scratch_state_indices=scratch,
         disable_state_update=False,
     )
     torch.cuda.synchronize()
@@ -416,7 +337,6 @@ def test_batch_rows_are_independent(num_householder, shared_scratch):
             b[sl],
             scale=1.0,
             ssm_state_indices=ssm[sl].clone(),
-            scratch_state_indices=scratch[sl].clone(),
             disable_state_update=False,
         )
         torch.cuda.synchronize()
@@ -430,7 +350,7 @@ def test_batch_rows_are_independent(num_householder, shared_scratch):
 
 
 # --------------------------------------------------------------------------
-# 6. The reference BRIDGE itself, against flashinfer's own decode reference.
+# 5. The reference BRIDGE itself, against flashinfer's own decode reference.
 #
 # _reference reaches delta_product through a dense->varlen reshape, a gate
 # computation and a state transpose. Any of those can be wrong independently of
@@ -451,7 +371,7 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
     T, n_h, K, V = 1, 1, 128, 128  # decode_delta_rule is single-step, n_h-free
     device = torch.device("cuda")
 
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, num_q_heads, num_v_heads, K, V, torch.float32, device, seed=0
     )
     mine_o, mine_state = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
@@ -474,14 +394,13 @@ def test_reference_bridge_matches_decode_delta_rule(B, num_heads):
 
 
 # --------------------------------------------------------------------------
-# 7. Per-token state snapshots -- the property speculative decoding needs.
+# 6. Per-token state snapshots -- the property speculative decoding needs.
 #
 # ssm_state_indices[i, t] must end up holding the state AS OF real token t, so
 # that a rejected draft can roll the sequence back to any accepted prefix. This
 # is the only test that pins the scatter remap: it fails if the LAST micro-step
 # of each token is not the one routed to the caller's slot (e.g. an off-by-one
-# leaving the state after householder 0 there instead), and it fails if the
-# intermediates land on live rows rather than scratch.
+# leaving the state after householder 0 there instead).
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "num_householder", [1, 2, 3], ids=lambda nh: f"num_householder={nh}"
@@ -492,7 +411,7 @@ def test_per_token_state_snapshots(num_householder, T):
     B, n_h, HQ, HV, K, V = 3, num_householder, 16, 32, 128, 128
     device, dtype = torch.device("cuda"), torch.bfloat16
 
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm, scratch = _gen_decode_inputs(
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
         B, T, n_h, HQ, HV, K, V, dtype, device, seed=5
     )
 
@@ -524,7 +443,6 @@ def test_per_token_state_snapshots(num_householder, T):
         b,
         scale=1.0,
         ssm_state_indices=ssm,
-        scratch_state_indices=scratch,
         disable_state_update=False,
     )
     torch.cuda.synchronize()
@@ -542,3 +460,113 @@ def test_per_token_state_snapshots(num_householder, T):
                 f"[0::n_h] instead of [n_h-1::n_h].\n{m}"
             ),
         )
+
+
+# --------------------------------------------------------------------------
+# 8. A negative ssm_state_indices entry must SKIP the snapshot write.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
+)
+@pytest.mark.parametrize(
+    "batch_size,dispatch",
+    [(4, "inline"), (8, "warp")],
+    ids=["inline_kernel", "warp_kernel"],
+)
+def test_negative_ssm_state_index_skips_write(batch_size, dispatch, num_householder):
+    """The per-token scatter must treat a negative slot as "do not write".
+
+    This is what makes the wrapper's expansion cheap: micro-steps 1..n_h-1 get
+    -1 and cost no state traffic, instead of being funnelled into throwaway pool
+    rows. At n_h=3 that removes two thirds of the writes, which measured ~2.1x
+    end-to-end on this kernel -- state writes dominate it.
+
+    Three properties, and no other test in this file covers any of them,
+    because they all assert on rows that ARE written:
+
+      * rows a sentinel would have hit stay untouched -- the guard fires and is
+        not compiled out. Writing ``if cutlass.const_expr(pool_slot_t >= 0)``
+        instead of a plain ``if`` would resolve at trace time, emit the store
+        unconditionally, and still pass every other test here.
+      * rows named by a real slot are still written -- the guard suppresses the
+        write, not the computation.
+      * nothing lands before the pool. ``fla_idx = Int64(pool_slot_t) * HV +
+        i_hv`` is ``-HV + i_hv`` at slot -1, i.e. an address BELOW the pool
+        base: silent out-of-bounds corruption, not a wasted store. The pool is
+        therefore a view into a larger tensor so such a write lands in a canary
+        region we own.
+
+    Both dispatch arms run because ``use_inline_kernel = (B * HV) <= 128``
+    selects between two kernels with five scatter sites between them; guarding
+    only one set would leave the other corrupting memory.
+    """
+    _skip_if_unsupported()
+    from flashinfer.gdn_decode import gated_delta_rule_mtp
+
+    n_h = num_householder
+    B, T, HQ, HV, K = batch_size, 2, 16, 32, 128
+    TN = T * n_h
+    assert ((B * HV) <= 128) == (dispatch == "inline"), "dispatch arm mismatch"
+    device, dtype = torch.device("cuda"), torch.bfloat16
+
+    torch.manual_seed(11)
+    with device:
+        q = torch.randn(B, TN, HQ, K, dtype=dtype) * 0.1
+        k = torch.randn(B, TN, HQ, K, dtype=dtype) * 0.1
+        v = torch.randn(B, TN, HV, K, dtype=dtype) * 0.1
+        a = torch.randn(B, TN, HV, dtype=dtype) * 0.1
+        b = torch.randn(B, TN, HV, dtype=dtype) * 0.1
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        # backing = [canary | pool]; `pool` is an offset view, so a write at a
+        # negative slot lands in the canary instead of outside our allocation.
+        canary_rows = 2
+        backing = torch.zeros(
+            canary_rows + 1 + B + B * TN, HV, K, K, dtype=torch.float32
+        )
+        pool = backing[canary_rows:]
+        initial_idx = torch.arange(1, 1 + B, dtype=torch.int32)
+        # every micro-step gets a distinct row, then all but the last of each
+        # token is replaced by the sentinel -- exactly the wrapper's expansion
+        idx_all = torch.arange(1 + B, 1 + B + B * TN, dtype=torch.int32).reshape(B, TN)
+        keep = torch.zeros(TN, dtype=torch.bool)
+        keep[n_h - 1 :: n_h] = True
+        idx_sentinel = idx_all.clone()
+        idx_sentinel[:, ~keep] = -1
+
+    gated_delta_rule_mtp(
+        q,
+        k,
+        v,
+        pool,
+        initial_idx,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        scale=K**-0.5,
+        ssm_state_indices=idx_sentinel,
+        disable_state_update=False,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        backing[:canary_rows], torch.zeros_like(backing[:canary_rows])
+    ), (
+        f"{int((backing[:canary_rows] != 0).sum())} elements were written BEFORE the "
+        "pool base -- a negative slot reached the store as fla_idx = -HV + i_hv. "
+        "The scatter needs `if pool_slot_t >= 0` at all five sites."
+    )
+    skipped = idx_all[:, ~keep].flatten().long()
+    written = pool[skipped].reshape(len(skipped), -1).any(dim=1).sum()
+    assert written == 0, (
+        f"{int(written)}/{len(skipped)} sentinel micro-steps were written anyway. "
+        "A `const_expr` guard resolves at trace time and stores unconditionally; "
+        "the guard must be a plain runtime `if`."
+    )
+    kept = idx_all[:, keep].flatten().long()
+    unwritten = (pool[kept].reshape(len(kept), -1) == 0).all(dim=1).sum()
+    assert unwritten == 0, (
+        f"{int(unwritten)}/{len(kept)} real-token snapshots are missing; the guard "
+        "is suppressing the computation, not just the redundant write"
+    )
