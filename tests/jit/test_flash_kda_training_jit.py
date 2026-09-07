@@ -18,12 +18,15 @@ def _kernel_symbols(source: str) -> set[str]:
     return set(re.findall(r"kernel_flashkda_[A-Za-z0-9_]+", source))
 
 
-def test_flash_kda_generated_direct_serving_uses_cxx20(monkeypatch):
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_flash_kda_generated_direct_serving_uses_cxx20(monkeypatch, target):
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     variant_id = next(
         variant_id
         for variant_id, module in flash_kda.get_flash_kda_generated_registry().items()
-        if module.abi_family == "direct_m128" and module.abi_variant == "serving"
+        if module.target == target
+        and module.abi_family == "direct_m128"
+        and module.abi_variant == "serving"
     )
 
     flash_kda.gen_flash_kda_generated_module.cache_clear()
