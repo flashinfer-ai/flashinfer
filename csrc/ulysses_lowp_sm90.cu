@@ -629,8 +629,10 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   const int64_t scale_rows = scale_sequence == 0 ? logical_sequence : scale_sequence;
   TVM_FFI_ICHECK(scale_rows > 0 && scale_rows <= logical_sequence)
       << "scale_sequence must lie in (0, local_sequence * world_size]";
-  const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
-  const int64_t k_scale_alloc = (scale_rows + 63) / 64;
+  // SM90 WGMMA tile: CTA_Q=64 / 4 warp-groups → ceil(seq/64)*4 Q slots;
+  // CTA_K=128 → ceil(seq/128) K slots. (SM120 uses the inverse: /128*4 and /64.)
+  const int64_t q_scale_alloc = (scale_rows + 63) / 64 * 4;
+  const int64_t k_scale_alloc = (scale_rows + 127) / 128;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
@@ -717,8 +719,10 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   const int64_t scale_rows = scale_sequence == 0 ? logical_sequence : scale_sequence;
   TVM_FFI_ICHECK(scale_rows > 0 && scale_rows <= logical_sequence)
       << "scale_sequence must lie in (0, local_sequence * world_size]";
-  const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
-  const int64_t k_scale_alloc = (scale_rows + 63) / 64;
+  // SM90 WGMMA tile: CTA_Q=64 / 4 warp-groups → ceil(seq/64)*4 Q slots;
+  // CTA_K=128 → ceil(seq/128) K slots. (SM120 uses the inverse: /128*4 and /64.)
+  const int64_t q_scale_alloc = (scale_rows + 63) / 64 * 4;
+  const int64_t k_scale_alloc = (scale_rows + 127) / 128;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";

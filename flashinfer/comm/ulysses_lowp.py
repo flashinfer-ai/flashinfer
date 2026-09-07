@@ -2408,12 +2408,40 @@ class UlyssesLowpSageLayoutSM90:
     @staticmethod
     def _k_grouped_amax(k, k_mean_global, rank, world_size, used_sequence, enable_pdl, mod):
         batch, local_sequence, num_heads, head_dim = k.shape
+        global_sequence = local_sequence * world_size
         amax = torch.zeros(
             (batch, num_heads, slots(local_sequence, K_GROUP_SM90)),
             dtype=torch.float32, device=k.device,
         )
-        used = int(used_sequence) if used_sequence is not None else 0
         mod.ulysses_lowp_k_grouped_amax(k, k_mean_global, amax, rank, world_size, enable_pdl)
+        # Tail repair: the CUDA kernel has no notion of used_sequence, so when
+        # zero-padding rows are present and used_sequence is not a multiple of
+        # K_GROUP_SM90=128, the partial live group's amax is polluted by
+        # |0 - k_mean| from the padding rows.  Recompute that one group's slot
+        # over the live rows only, mirroring the SM120 k_grouped_amax() logic
+        # but with K_GROUP_SM90=128.
+        if (
+            used_sequence is not None
+            and int(used_sequence) < global_sequence
+            and int(used_sequence) % K_GROUP_SM90
+        ):
+            used = int(used_sequence)
+            tail_group = (used - 1) // K_GROUP_SM90
+            g_first = (rank * local_sequence) // K_GROUP_SM90
+            g_last = (rank * local_sequence + local_sequence - 1) // K_GROUP_SM90
+            if g_first <= tail_group <= g_last:
+                lo = max(tail_group * K_GROUP_SM90, rank * local_sequence)
+                hi = min(used, (rank + 1) * local_sequence)
+                lo_local = lo - rank * local_sequence
+                hi_local = hi - rank * local_sequence
+                if hi_local > lo_local:
+                    kc = k[:, lo_local:hi_local].float() - k_mean_global.float().unsqueeze(1)
+                    live = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+                else:
+                    live = torch.full(
+                        (batch, num_heads), 1e-7, dtype=torch.float32, device=k.device
+                    )
+                amax[..., tail_group - g_first] = live
         return amax
 
     def _derive_k_boundary_amax(self, grouped_amax, gathered_minmax, k_mean_global,
