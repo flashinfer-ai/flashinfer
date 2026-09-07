@@ -373,7 +373,8 @@ def _resolve_pdl(enable_pdl: Optional[bool], tensor: torch.Tensor) -> bool:
     return bool(enable_pdl)
 
 
-def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int, int]:
+def _validate_nhd_shape(name: str, tensor: torch.Tensor) -> Tuple[int, int, int, int]:
+    """Validate [B, L, H, D] shape, dtype, and alignment — no SM version check."""
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if not tensor.is_cuda:
@@ -411,8 +412,14 @@ def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int,
             f"{name} must keep 16-byte alignment of every head_dim row; "
             f"got data_ptr % 16 = {tensor.data_ptr() % 16}, strides {tensor.stride()}"
         )
-    _require_sm89_or_sm120(tensor)
     return batch, local_sequence, num_heads, head_dim
+
+
+def _validate_nhd_input(name: str, tensor: torch.Tensor) -> Tuple[int, int, int, int]:
+    """Validate [B, L, H, D] shape/dtype/alignment and require SM89 or SM120."""
+    result = _validate_nhd_shape(name, tensor)
+    _require_sm89_or_sm120(tensor)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2086,9 +2093,9 @@ class UlyssesLowpSageLayoutSM90:
         enable_pdl: Optional[bool] = None,
     ) -> "Tuple[torch.Tensor, StatsContext]":
         """Local stats for the AllGather, using SM90 kernels."""
-        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
-        _validate_nhd_input("k", k)
-        _validate_nhd_input("v", v)
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_shape("q", q)
+        _validate_nhd_shape("k", k)
+        _validate_nhd_shape("v", v)
         world_size = _world_size(world_size)
         rank = _rank(rank, world_size)
         protocol = stats_protocol_for(local_sequence, world_size)
@@ -2140,7 +2147,7 @@ class UlyssesLowpSageLayoutSM90:
         enable_pdl: Optional[bool] = None,
     ) -> "V2GStats":
         """Finalize stats from AllGather, using SM90 kernels."""
-        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_shape("k", k)
         world_size = ctx.world_size
         _pdl = _resolve_pdl(enable_pdl, k)
         mod = get_ulysses_lowp_sm90_module()
@@ -2221,7 +2228,7 @@ class UlyssesLowpSageLayoutSM90:
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         """Quantize-and-pack using SM90 kernels (Q_GROUP=16, K_GROUP=128)."""
-        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_shape("q", q)
         world_size = stats.world_size
         rank = stats.rank
         _pdl = _resolve_pdl(enable_pdl, q)
