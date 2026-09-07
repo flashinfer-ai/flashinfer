@@ -42,7 +42,7 @@ def _is_cute_dsl_kda_runtime_available() -> bool:
     is guarded because a broken DSL install can fail on load.
     """
     try:
-        from .cute_dsl.utils import is_cute_dsl_experimental_available
+        from .cute_dsl.availability import is_cute_dsl_experimental_available
     except (ImportError, RuntimeError):
         return False
     return is_cute_dsl_experimental_available()
