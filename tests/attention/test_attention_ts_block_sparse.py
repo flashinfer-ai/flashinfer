@@ -1272,6 +1272,8 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     assert "validated_seq_lens_kv" not in {
         field.name for field in fields(block_sparse_runtime._PagedKVLaunchPayload)
     }
+
+
 @pytest.mark.skipif(
     os.environ.get("FLASHINFER_TEST_DEVICE_ASSERT") != "1",
     reason="fatal device assertions require explicit isolated-test opt-in",

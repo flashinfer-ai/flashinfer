@@ -1375,8 +1375,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor]
             A 1D tensor indicating the K/V sequence length of each prompt with
             shape ``[batch_size]``. Most backends require uint32; ``prims-ts``
-            accepts uint32, int32, or int64 and stages the values in int32
-            device storage.
+            accepts uint32, int32, or int64 and copies the values into
+            plan-owned int32 device storage. These values remain fixed for the
+            current plan; call :meth:`plan` again before using different
+            lengths. A manually captured ``prims-ts`` CUDA graph is bound to
+            one completed plan revision and must be recaptured after
+            re-planning.
         block_tables: Optional[torch.Tensor]
             A 2D block table with shape
             ``[batch_size, max_num_blocks_per_seq]``. For ``prims-ts`` this is
@@ -1607,8 +1611,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = seq_lens.cpu()
         if self._backend == "prims-ts":
             # Host-only specialization and validation use int64 because PyTorch
-            # CPU reductions do not support the documented uint32 dtype. Live
-            # metadata is still staged in the kernel's int32 device buffer.
+            # CPU reductions do not support the documented uint32 dtype. The
+            # planned values are staged in the kernel's int32 device buffer.
             if kv_lens_arr_host.ndim != 1 or len(kv_lens_arr_host) != batch_size:
                 raise ValueError(
                     "prims-ts seq_lens must be a 1D tensor with exactly "
@@ -1774,8 +1778,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"got {q_data_type} and {kv_data_type}"
                 )
             self._max_kv_len = int(kv_lens_arr_host.max().item())
-            # Keep the caller's exact logical lengths as live device metadata;
-            # the low-level plan consumes only their host specialization evidence.
+            # Stage the caller's exact logical lengths in plan-owned device
+            # storage after the low-level plan succeeds. Subsequent run() calls
+            # reuse these values until the next successful plan().
             assert self._kv_lens_buffer is not None
             required_size = len(kv_lens_arr_host)
             next_kv_lens_buffer = self._kv_lens_buffer
@@ -2436,8 +2441,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0 if v_scale is None else float(v_scale),
                 out=out,
-                # Validation reads live metadata on the host. During manual
-                # fixed-plan capture, trust the wrapper-owned stable bindings.
+                # Validation reads planned metadata values on the host. During
+                # manual fixed-plan capture, trust the stable plan-owned bindings.
                 validate=not torch.cuda.is_current_stream_capturing(),
             )
             return out

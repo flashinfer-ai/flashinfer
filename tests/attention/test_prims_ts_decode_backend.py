@@ -303,7 +303,7 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
     wrapper._kv_lens_buffer[:2].fill_(7)
-    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
+    previous_seq_lens = wrapper._kv_lens_buffer[:2].clone()
     seq_lens = torch.tensor(
         [32, _DECODE_MAX_KV_LEN + 1], dtype=torch.uint32, device="cuda"
     )
@@ -316,17 +316,17 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
         )
 
     delegate.plan.assert_not_called()
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
+    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], previous_seq_lens)
 
 
 @requires_cuda
-def test_failed_low_level_replan_preserves_live_seq_lens():
+def test_failed_low_level_replan_preserves_previous_seq_lens():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     delegate.plan.side_effect = RuntimeError("compile failed")
     wrapper._prims_ts_wrapper = delegate
     wrapper._kv_lens_buffer[:2].fill_(7)
-    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
+    previous_seq_lens = wrapper._kv_lens_buffer[:2].clone()
 
     with pytest.raises(RuntimeError, match="compile failed"):
         wrapper.plan(
@@ -335,7 +335,7 @@ def test_failed_low_level_replan_preserves_live_seq_lens():
             seq_lens=torch.tensor([32, 40], dtype=torch.uint32, device="cuda"),
         )
 
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
+    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], previous_seq_lens)
 
 
 def test_plan_trace_captures_explicit_causal_mode():
