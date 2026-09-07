@@ -532,20 +532,23 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
   const int64_t touched = lowp::grid::group_last(rank, local_sequence, 128) - group_first + 1;
   check_shape_2d(output, "output", world_size, spec.chunk_bytes);
 
-  // The ONE group mixing live and padded rows (matches the split path's
-  // Python repair: only when the padding boundary is not group-aligned).
-  uint32_t exclude_group = 0xFFFFFFFFu;
-  uint32_t used_u32 = 0;
-  if (used_sequence > 0 && used_sequence < global_sequence && (used_sequence % 64) != 0) {
-    exclude_group = static_cast<uint32_t>((used_sequence - 1) / 64);
-    used_u32 = static_cast<uint32_t>(used_sequence);
-  }
-
   ffi::CUDADeviceGuard device_guard(k.device().device_id);
   const cudaStream_t stream = get_stream(k.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t GROUP = 128;
+    // The ONE group mixing live and padded rows (matches the split path's
+    // Python repair: only when the padding boundary is not group-aligned).
+    // Derived from the GROUP the kernel is actually instantiated on: the
+    // header contract is (used-1)/GROUP, and the kernel forms the group id it
+    // compares against on that same grid, so a literal divisor here silently
+    // names the wrong group the moment the two differ.
+    uint32_t exclude_group = 0xFFFFFFFFu;
+    uint32_t used_u32 = 0;
+    if (used_sequence > 0 && used_sequence < global_sequence && (used_sequence % GROUP) != 0) {
+      exclude_group = static_cast<uint32_t>((used_sequence - 1) / GROUP);
+      used_u32 = static_cast<uint32_t>(used_sequence);
+    }
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(lowp::grouped_block_threads<HEAD_DIM, GROUP>());
     launch_kernel("QuantInt8FusedAmaxPackKernel(K)", enable_pdl,
