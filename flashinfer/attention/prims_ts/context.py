@@ -63,8 +63,6 @@ _SUPPORTED_DTYPES = (
     torch.float8_e4m3fn,
 )
 _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-# tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
-# (SM107), not B200 (SM100).
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
@@ -375,6 +373,8 @@ def _default_uses_ldtm_stat(device_index: int) -> bool:
     """Enable LDTM.STAT on SM103/SM107 when nvidia-cutlass-dsl >= 4.8.0."""
     if not _dsl_supports_ldtm_stat():
         return False
+    # tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
+    # (SM107), not B200 (SM100).
     return torch.cuda.get_device_capability(device_index) in ((10, 3), (10, 7))
 
 
