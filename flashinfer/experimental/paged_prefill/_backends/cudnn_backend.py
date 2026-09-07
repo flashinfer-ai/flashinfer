@@ -19,7 +19,9 @@ class _CudnnBackend:
     name = "cudnn"
 
     def __init__(self, device, kv_layout, workspace):
-        assert kv_layout == "HND"  # capability-gated upstream
+        # The cuDNN graph is built from k/v_cache.stride(), so NHD storage is
+        # presented as a zero-copy permuted view with HND logical dim order.
+        self._permute_kv = kv_layout == "NHD"
         self._workspace = workspace.view(torch.int8)
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
@@ -56,6 +58,9 @@ class _CudnnBackend:
         assert meta is not None and derived is not None
         assert meta.block_tables is not None  # needs_dense contract
         b = meta.batch_size
+        if self._permute_kv:
+            k_cache = k_cache.permute(0, 2, 1, 3)
+            v_cache = v_cache.permute(0, 2, 1, 3)
         out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
             q,
             k_cache,

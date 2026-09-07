@@ -142,7 +142,9 @@ CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
         q_dtypes=_F16,
         head_dims=frozenset({(128, 128), (192, 128)}),
         page_sizes=None,
-        kv_layouts=frozenset({"HND"}),
+        kv_layouts=frozenset(
+            {"HND", "NHD"}
+        ),  # NHD = permuted view, stride-driven graph
         supports_lse=True,
         supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
         supports_window=False,  # no sliding window in the cuDNN SDPA graph path
