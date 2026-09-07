@@ -1022,29 +1022,63 @@ class DecodeGenTask(Task):
 def _resolve_and_store_sparse_route(
     sparse_kv_metadata: MemoryResource | None,
     section: FmhaStage,
-) -> tuple[Any, Any, Any, Any] | None:
-    """Resolve one prepared route and retain it for the matching K/V pair."""
+    prefetch: tuple[Any, Any] | None = None,
+    *,
+    pipeline: bool = True,
+) -> tuple[tuple[Any, Any, Any, Any] | None, tuple[Any, Any] | None]:
+    """Resolve one prepared route and retain it for the matching K/V pair.
+
+    Returns ``(route, prefetch)``. With ``pipeline`` the record load is issued
+    one resolution ahead: HEAD loads its own record immediately, and every
+    resolution issues the load for the next one (LOOP iteration 0 from HEAD,
+    iteration i + 1 from iteration i) before the caller's K TMA burst, so the
+    global-memory latency overlaps that issue instead of stalling the load
+    warp. Callers pass the returned ``prefetch`` back into the next resolution
+    of the same instance, the way ``_staged_kv_load`` threads its cached page
+    IDs. Without ``pipeline`` the record is loaded where it is resolved and no
+    state is returned; the split-ring load variants use this because the
+    pipelined form measured slower for them. Dense profiles pass ``None`` and
+    get ``(None, None)``.
+    """
 
     if sparse_kv_metadata is None:
-        return None
+        return None, None
+    if not pipeline:
+        prefetch = sparse_kv_metadata.prefetch_route(
+            target="head" if section == FmhaStage.Head else "current_loop"
+        )
+    elif section == FmhaStage.Head:
+        prefetch = sparse_kv_metadata.prefetch_route(target="head")
+    assert prefetch is not None
+    prefetched_record_word, prefetched_record_offset = prefetch
     (
         resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
-    ) = sparse_kv_metadata.resolve_route(section=section)
+    ) = sparse_kv_metadata.resolve_route(
+        section=section,
+        prefetched_record_word_slot=prefetched_record_word,
+        prefetched_record_offset_slot=prefetched_record_offset,
+    )
     sparse_kv_metadata.store_route(
         resolved_record_word=resolved_record_word,
         resolved_origin1=resolved_origin1,
         resolved_atom_validity=resolved_atom_validity,
         route_record_word_offset=route_record_word_offset,
     )
-    return (
+    next_prefetch = None
+    if pipeline:
+        next_prefetch = sparse_kv_metadata.prefetch_route(
+            target="first_loop" if section == FmhaStage.Head else "next_loop"
+        )
+    route = (
         resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
     )
+    return route, next_prefetch
 
 
 def _publish_sparse_softmax_route(
@@ -1150,14 +1184,19 @@ def create_load_task(
         # Dense profiles have no route metadata: the resolve and publish
         # helpers are no-ops for ``None`` resources, so one cadence serves
         # both dense and block-sparse loads.
-        route0 = _resolve_and_store_sparse_route(sparse_kv_metadata0, FmhaStage.Head)
+        route0, prefetch0 = _resolve_and_store_sparse_route(
+            sparse_kv_metadata0, FmhaStage.Head
+        )
         _kv_load("load_k0", FmhaStage.Head)
-        route1 = _resolve_and_store_sparse_route(sparse_kv_metadata1, FmhaStage.Head)
+        route1, prefetch1 = _resolve_and_store_sparse_route(
+            sparse_kv_metadata1, FmhaStage.Head
+        )
         _kv_load("load_k1", FmhaStage.Head)
         # Issue both K tiles before either metadata FIFO can backpressure
         # the load warp, matching the split-resource sparse cadence.
         _publish_sparse_softmax_route(sparse_softmax_metadata0, route0)
         _publish_sparse_softmax_route(sparse_softmax_metadata1, route1)
+        prefetch_by_label = {"load_k0": prefetch0, "load_k1": prefetch1}
 
         # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set.
         # When P aliases the consumed S columns, MMA must consume each V/P pair
@@ -1180,7 +1219,9 @@ def create_load_task(
                 kv_metadata, softmax_metadata = route_metadata_by_label.get(
                     label, (None, None)
                 )
-                route = _resolve_and_store_sparse_route(kv_metadata, FmhaStage.Loop)
+                route, prefetch_by_label[label] = _resolve_and_store_sparse_route(
+                    kv_metadata, FmhaStage.Loop, prefetch_by_label.get(label)
+                )
                 _kv_load(label, FmhaStage.Loop)
                 if route is not None:
                     loop_routes.append((softmax_metadata, route))
@@ -1632,7 +1673,9 @@ def create_load_task_split_kv(
         ) in active_instances:
             if smem_k is None:
                 continue
-            route = _resolve_and_store_sparse_route(sparse_kv_metadata, FmhaStage.Head)
+            route, _ = _resolve_and_store_sparse_route(
+                sparse_kv_metadata, FmhaStage.Head, pipeline=False
+            )
             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
             head_routes.append((sparse_softmax_metadata, route))
         # In the combined task, preserve both K issues ahead of Softmax
@@ -1660,8 +1703,8 @@ def create_load_task_split_kv(
                     smem_page_offsets_v_local,
                     FmhaStage.Loop,
                 )
-                route = _resolve_and_store_sparse_route(
-                    sparse_kv_metadata, FmhaStage.Loop
+                route, _ = _resolve_and_store_sparse_route(
+                    sparse_kv_metadata, FmhaStage.Loop, pipeline=False
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
                 loop_routes.append((sparse_softmax_metadata, route))

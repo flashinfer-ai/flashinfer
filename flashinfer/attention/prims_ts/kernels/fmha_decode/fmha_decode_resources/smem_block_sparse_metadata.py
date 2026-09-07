@@ -249,6 +249,18 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             Int32(-1),
             "Metadata-relative record offset, or -1 for a dummy route.",
         ),
+        (
+            "prefetched_record_word_slot",
+            Int32,
+            Int32(0),
+            "Lane-owned record word loaded one resolution ahead.",
+        ),
+        (
+            "prefetched_record_offset_slot",
+            Int32,
+            Int32(-1),
+            "Record offset of the prefetched route, or -1 for a dummy route.",
+        ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
     inst_id: Constexpr[int] = 0
@@ -268,6 +280,12 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         TaskLocalVariable.uninitialized()
     )
     route_record_word_offset_slot: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    prefetched_record_word_slot: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    prefetched_record_offset_slot: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
 
@@ -360,6 +378,78 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             )
         return physical_page_id
 
+    @cute.jit
+    def _route_record_word_offset(
+        self, stage_info: StageInfo, route_idx: Int32
+    ) -> Int32:
+        """Return the record offset of one route index, or -1 past the row."""
+
+        task_cache = _decode_gen_task_cache(stage_info)
+        row_route_begin = _sparse_task_cache_route_begin(task_cache)
+        route_count = _sparse_task_cache_route_count(task_cache)
+        route_record_word_offset = Int32(-1)
+        if route_idx < route_count:
+            route_record_word_offset = (row_route_begin + route_idx) * Int32(
+                self.route_layout.route_metadata_stride_words
+            )
+        return cute.arch.make_warp_uniform(route_record_word_offset)
+
+    @consumer_work(
+        returns=(
+            prefetched_record_word_slot,
+            prefetched_record_offset_slot,
+        )
+    )
+    @cute.jit
+    def prefetch_route(
+        self, stage_info: StageInfo, *, target: Constexpr[str]
+    ) -> tuple[Int32, Int32]:
+        """Issue the record load for a route that ``resolve_route`` uses later.
+
+        ``target`` selects the route relative to the calling section:
+        ``"head"`` is this instance's HEAD route, ``"first_loop"`` the route of
+        LOOP iteration 0 (called from HEAD), ``"current_loop"`` the route of
+        the calling LOOP iteration (no pipelining), and ``"next_loop"`` the
+        route of the following LOOP iteration. Only the lane-distributed load is issued
+        here; the warp broadcasts happen in ``resolve_route`` so the global
+        memory latency overlaps the TMA issue of the current route instead of
+        stalling the load warp. Layouts without one-warp transport keep their
+        loads in ``resolve_route`` and get placeholder values here.
+        """
+
+        assert self.route_metadata is not None
+        num_insts = Int32(self.cfg.num_insts_kv)
+        if cutlass.const_expr(target == "head"):
+            route_idx = Int32(self.inst_id)
+        elif cutlass.const_expr(target == "first_loop"):
+            route_idx = num_insts + Int32(self.inst_id)
+        elif cutlass.const_expr(target == "current_loop"):
+            route_idx = (stage_info.loop_offset + Int32(1)) * num_insts + Int32(
+                self.inst_id
+            )
+        else:
+            route_idx = (stage_info.loop_offset + Int32(2)) * num_insts + Int32(
+                self.inst_id
+            )
+        route_record_word_offset = self._route_record_word_offset(stage_info, route_idx)
+        record_word = Int32(0)
+        if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
+            assert self.route_layout.token_words_word_offset is not None
+            meaningful_words = (
+                self.route_layout.token_words_word_offset
+                + self.route_layout.token_words_per_route
+            )
+            lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
+            if lane_idx < Int32(self.route_layout.logical_origins_per_route):
+                record_word = Int32(-1)
+            if route_record_word_offset >= Int32(0) and lane_idx < Int32(
+                meaningful_words
+            ):
+                record_word = Int32(
+                    self.route_metadata[route_record_word_offset + lane_idx]
+                )
+        return record_word, route_record_word_offset
+
     @consumer_work(
         returns=(
             resolved_record_word_slot,
@@ -370,14 +460,23 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     )
     @cute.jit
     def resolve_route(
-        self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]
+        self,
+        stage_info: StageInfo,
+        *,
+        section: Constexpr[FmhaStage],
+        prefetched_record_word_slot: Int32,
+        prefetched_record_offset_slot: Int32,
     ) -> tuple[Int32, Int32, Int32, Int32]:
-        """Load this resource instance's real or dummy prepared KV route."""
+        """Resolve this instance's real or dummy prepared KV route.
+
+        One-warp-transport layouts consume the words that ``prefetch_route``
+        loaded earlier; other layouts load their record here. The routed
+        inputs carry the task-local slot names so that every ``prefetch_route``
+        call, including the one at the end of the previous LOOP iteration,
+        updates the value read here.
+        """
 
         assert self.route_metadata is not None
-        task_cache = _decode_gen_task_cache(stage_info)
-        row_route_begin = _sparse_task_cache_route_begin(task_cache)
-        route_count = _sparse_task_cache_route_count(task_cache)
         # HEAD publishes one route per instruction. LOOP starts after those
         # two publications, hence the one-based loop offset below. Keeping the
         # constexpr branch local lets the task scheduler specialize each work
@@ -389,12 +488,12 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                 self.cfg.num_insts_kv
             ) + Int32(self.inst_id)
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        route_record_word_offset = Int32(-1)
-        if route_idx < route_count:
-            route_record_word_offset = (row_route_begin + route_idx) * Int32(
-                self.route_layout.route_metadata_stride_words
+        if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
+            route_record_word_offset = prefetched_record_offset_slot
+        else:
+            route_record_word_offset = self._route_record_word_offset(
+                stage_info, route_idx
             )
-        route_record_word_offset = cute.arch.make_warp_uniform(route_record_word_offset)
 
         num_logical_origins = self.route_layout.logical_origins_per_route
         uses_two_fragment_route = num_logical_origins == 2
@@ -407,18 +506,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         route_record_is_valid = route_record_word_offset >= Int32(0)
 
         if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
-            assert self.route_layout.token_words_word_offset is not None
-            meaningful_words = (
-                self.route_layout.token_words_word_offset
-                + self.route_layout.token_words_per_route
-            )
-            resolved_record_word = Int32(0)
-            if lane_idx < Int32(num_logical_origins):
-                resolved_record_word = Int32(-1)
-            if route_record_is_valid and lane_idx < Int32(meaningful_words):
-                resolved_record_word = Int32(
-                    self.route_metadata[route_record_word_offset + lane_idx]
-                )
+            resolved_record_word = prefetched_record_word_slot
             atom_valid_mask = _warp_broadcast_i32(
                 resolved_record_word,
                 self.route_layout.atom_valid_mask_word_offset,
