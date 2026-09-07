@@ -2320,6 +2320,7 @@ def _validate_mla_dcp_args(
     cp_world: int,
     cp_rank: int,
     causal_seqlens_kv_global: Optional[torch.Tensor],
+    cp_interleave_granularity: int,
 ) -> str:
     """Validate the public DCP contract and return the effective backend."""
     if not isinstance(enable_dcp, bool):
@@ -2328,6 +2329,15 @@ def _validate_mla_dcp_args(
         raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
     if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
         raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+    if (
+        not isinstance(cp_interleave_granularity, int)
+        or isinstance(cp_interleave_granularity, bool)
+        or cp_interleave_granularity <= 0
+    ):
+        raise ValueError(
+            "cp_interleave_granularity must be a positive integer, got "
+            f"{cp_interleave_granularity!r}"
+        )
 
     if not enable_dcp:
         nondefault = []
@@ -2337,6 +2347,8 @@ def _validate_mla_dcp_args(
             nondefault.append(f"cp_rank={cp_rank}")
         if causal_seqlens_kv_global is not None:
             nondefault.append("causal_seqlens_kv_global")
+        if cp_interleave_granularity != 1:
+            nondefault.append(f"cp_interleave_granularity={cp_interleave_granularity}")
         if nondefault:
             raise ValueError(
                 "DCP arguments require enable_dcp=True; got " + ", ".join(nondefault)
@@ -2433,6 +2445,7 @@ def _cute_dsl_incompatibility_reason(
     max_q_len: Optional[int] = None,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    cp_interleave_granularity: int = 1,
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
@@ -2515,6 +2528,7 @@ def _cute_dsl_incompatibility_reason(
                 "cum_seq_lens_q": cum_seq_lens_q,
                 "max_q_len": max_q_len,
                 "enable_dcp": enable_dcp,
+                "cp_interleave_granularity": cp_interleave_granularity,
             },
         )
     except (TypeError, ValueError, ImportError) as e:
@@ -2543,7 +2557,11 @@ def _cute_dsl_incompatibility_reason(
             is_var_split_kv=False,
         )
         if resolved_impl == "monolithic":
-            check_kwargs.update(enable_dcp=enable_dcp, cp_world=cp_world)
+            check_kwargs.update(
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
+                cp_interleave_granularity=cp_interleave_granularity,
+            )
             check_monolithic_can_implement(**check_kwargs)
         else:
             check_modular_can_implement(**check_kwargs)
@@ -2562,6 +2580,7 @@ def _mla_decode_tuning_config(
     enable_dcp: bool = False,
     cp_world: int = 1,
     cp_rank: int = 0,
+    cp_interleave_granularity: int = 1,
 ) -> TuningConfig:
     """One TuningConfig and stable initializer set per key.
 
@@ -2578,8 +2597,9 @@ def _mla_decode_tuning_config(
     ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
     profiling because MLA decode reads kv_cache and never writes it, so aliased
     page reads give correct timing measurements. ``seq_lens`` is filled with
-    ``profile_seq_len``; the synthetic DCP global bound preserves that exact
-    rank-local length.
+    ``profile_seq_len``; the synthetic DCP global bound maps the first excluded
+    local key back to global coordinates and therefore preserves that exact
+    rank-local length for any block-interleaving granularity.
     """
 
     def init_block_tables(shapes, dtype, device):
@@ -2599,7 +2619,11 @@ def _mla_decode_tuning_config(
 
     def init_causal_seqlens_kv_global(shapes, dtype, device):
         tensor = torch.empty(shapes, dtype=dtype, device=device)
-        tensor.fill_(profile_seq_len * cp_world + cp_rank)
+        local_block, block_offset = divmod(profile_seq_len, cp_interleave_granularity)
+        first_excluded_global = (
+            local_block * cp_world + cp_rank
+        ) * cp_interleave_granularity + block_offset
+        tensor.fill_(first_excluded_global)
         return tensor
 
     # At most one optional fifth batch-swept tensor: native qk_rope_head_dim=0
@@ -2652,6 +2676,7 @@ def _build_mla_decode_tuning_config(
     enable_dcp: bool = False,
     cp_world: int = 1,
     cp_rank: int = 0,
+    cp_interleave_granularity: int = 1,
 ) -> TuningConfig:
     """Reduce call args to the memoization key of ``_mla_decode_tuning_config``.
 
@@ -2690,6 +2715,7 @@ def _build_mla_decode_tuning_config(
         enable_dcp,
         cp_world,
         cp_rank,
+        cp_interleave_granularity,
     )
 
 
@@ -2926,6 +2952,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         enable_dcp: bool = False,
         cp_world: int = 1,
         cp_rank: int = 0,
+        cp_interleave_granularity: int = 1,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
@@ -2953,6 +2980,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.enable_dcp = enable_dcp
         self.cp_world = cp_world
         self.cp_rank = cp_rank
+        self.cp_interleave_granularity = cp_interleave_granularity
         self._profile_lse: Optional[torch.Tensor] = None
         self._workspace_sizer, self._resolved_cute_dsl_impl = (
             _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)
@@ -3027,6 +3055,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             self.cute_dsl_impl,
             getattr(self, "enable_dcp", False),
             getattr(self, "cp_world", 1),
+            getattr(self, "cp_interleave_granularity", 1),
         )
 
     def forward(
@@ -3084,6 +3113,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             cp_world=self.cp_world,
             cp_rank=self.cp_rank,
             causal_seqlens_kv_global=causal_seqlens_kv_global,
+            cp_interleave_granularity=self.cp_interleave_granularity,
         )
 
 
@@ -3120,6 +3150,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_world: int = 1,
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    cp_interleave_granularity: int = 1,
     use_fp16_softmax: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
@@ -3312,19 +3343,23 @@ def trtllm_batch_decode_with_kv_cache_mla(
         padding. Zero-length rows are unsupported; padded query rows should
         contain one valid dummy index and use length 1.
     enable_dcp : bool = False
-        Statically enable cyclic decode context parallelism in the monolithic
-        CuTeDSL MLA kernel. DCP returns a rank-local output/LSE state, so
-        ``return_lse=True`` is required and the caller must merge rank states.
-        Both fixed-Q input and compact variable-Q input described by
-        ``cum_seq_lens_q`` are supported.
+        Statically enable block-cyclic decode context parallelism in the
+        monolithic CuTeDSL MLA kernel. DCP returns a rank-local output/LSE
+        state, so ``return_lse=True`` is required and the caller must merge
+        rank states. Both fixed-Q input and compact variable-Q input described
+        by ``cum_seq_lens_q`` are supported.
     cp_world : int = 1
-        Compile-time context-parallel world size. Rank ``r`` stores global KV
-        positions whose token index modulo ``cp_world`` equals ``r``.
+        Compile-time context-parallel world size.
     cp_rank : int = 0
         Runtime-uniform context-parallel rank.
     causal_seqlens_kv_global : Optional[torch.Tensor] = None
         Contiguous CUDA int32 tensor ``[batch_size]`` containing the global
         exclusive causal bound for the newest query token. Required with DCP.
+    cp_interleave_granularity : int = 1
+        Compile-time number of consecutive global tokens assigned to one rank.
+        With granularity ``G``, local key ``k`` on rank ``r`` maps to
+        ``((k // G) * cp_world + r) * G + (k % G)``. Assignment is anchored at
+        global token zero. The default ``1`` preserves token-level interleaving.
 
     Note
     ----
@@ -3416,6 +3451,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cp_world=cp_world,
         cp_rank=cp_rank,
         causal_seqlens_kv_global=causal_seqlens_kv_global,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
 
     check_trtllm_gen_sm107_only_feature(
@@ -3850,6 +3886,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cute_dsl_impl=cute_dsl_impl,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
@@ -3938,6 +3975,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 enable_dcp=enable_dcp,
                 cp_world=cp_world,
                 cp_rank=cp_rank,
+                cp_interleave_granularity=cp_interleave_granularity,
             )
         )
 
@@ -3958,6 +3996,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         enable_dcp=enable_dcp,
         cp_world=cp_world,
         cp_rank=cp_rank,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
     inputs = [query, block_tables, seq_lens, out]
     if sparse_mla_top_k_lens is not None:

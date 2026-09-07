@@ -160,15 +160,27 @@ def _check_can_implement(
     is_var_split_kv: bool,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    cp_interleave_granularity: int = 1,
 ) -> None:
     """Check if the kernel supports the given configuration (cached)."""
     if not isinstance(enable_dcp, bool):
         raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
     if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
         raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
-    if not enable_dcp and cp_world != 1:
+    if (
+        not isinstance(cp_interleave_granularity, int)
+        or isinstance(cp_interleave_granularity, bool)
+        or cp_interleave_granularity <= 0
+    ):
         raise ValueError(
-            f"cp_world={cp_world} requires enable_dcp=True; disabled DCP uses cp_world=1"
+            "cp_interleave_granularity must be a positive integer, got "
+            f"{cp_interleave_granularity!r}"
+        )
+    if not enable_dcp and (cp_world != 1 or cp_interleave_granularity != 1):
+        raise ValueError(
+            "non-default DCP layout arguments require enable_dcp=True; got "
+            f"cp_world={cp_world}, "
+            f"cp_interleave_granularity={cp_interleave_granularity}"
         )
 
     mma_qk_tiler_mn = (128, 128)
@@ -227,6 +239,7 @@ def _get_compiled_mla_kernel(
     enable_pdl: bool = False,
     enable_dcp: bool = False,
     cp_world: int = 1,
+    cp_interleave_granularity: int = 1,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -274,6 +287,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -472,6 +486,7 @@ def cute_dsl_mla_decode(
     cp_world: int = 1,
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    cp_interleave_granularity: int = 1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -549,18 +564,23 @@ def cute_dsl_mla_decode(
         at least the largest request query length; the compiled kernel is
         specialized to this capacity.
     enable_dcp : bool
-        Enable static cyclic decode context-parallel masking. DCP returns a
-        rank-local attention state and therefore requires ``return_lse=True``.
+        Enable static block-cyclic decode context-parallel masking. DCP returns
+        a rank-local attention state and therefore requires ``return_lse=True``.
         Compact variable-Q input is supported when ``cum_seq_lens_q`` and
         ``max_q_len`` are provided.
     cp_world : int
-        Compile-time context-parallel world size. The local cache owns global
-        token positions ``cp_world * local_k + cp_rank``.
+        Compile-time context-parallel world size.
     cp_rank : int
         Runtime-uniform context-parallel rank.
     causal_seqlens_kv_global : Optional[torch.Tensor]
         Contiguous CUDA int32 tensor ``[B]`` containing the global exclusive
         causal bound for the newest query token. Required when DCP is enabled.
+    cp_interleave_granularity : int
+        Compile-time number of consecutive global tokens assigned to a rank
+        before ownership advances to the next rank. A local key ``k`` maps to
+        ``((k // G) * cp_world + cp_rank) * G + (k % G)``, where
+        ``G=cp_interleave_granularity``. The default ``1`` preserves token-level
+        interleaving.
     Returns
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
@@ -604,6 +624,15 @@ def cute_dsl_mla_decode(
         raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
     if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
         raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+    if (
+        not isinstance(cp_interleave_granularity, int)
+        or isinstance(cp_interleave_granularity, bool)
+        or cp_interleave_granularity <= 0
+    ):
+        raise ValueError(
+            "cp_interleave_granularity must be a positive integer, got "
+            f"{cp_interleave_granularity!r}"
+        )
 
     if enable_dcp:
         if not 0 <= cp_rank < cp_world:
@@ -652,6 +681,8 @@ def cute_dsl_mla_decode(
             nondefault.append(f"cp_rank={cp_rank}")
         if causal_seqlens_kv_global is not None:
             nondefault.append("causal_seqlens_kv_global")
+        if cp_interleave_granularity != 1:
+            nondefault.append(f"cp_interleave_granularity={cp_interleave_granularity}")
         if nondefault:
             raise ValueError(
                 "DCP arguments require enable_dcp=True; got " + ", ".join(nondefault)
@@ -815,6 +846,7 @@ def cute_dsl_mla_decode(
         is_var_split_kv=is_var_split_kv,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
 
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -841,6 +873,7 @@ def cute_dsl_mla_decode(
         enable_pdl=enable_pdl,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
 
     # Call the kernel

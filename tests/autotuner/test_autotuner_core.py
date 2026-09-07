@@ -2007,7 +2007,9 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
 
 
 def _call_build_mla_decode_tuning_config(
-    enable_dcp: bool = False, has_sparse_mla_top_k_lens: bool = False
+    enable_dcp: bool = False,
+    has_sparse_mla_top_k_lens: bool = False,
+    cp_interleave_granularity: int = 1,
 ):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
@@ -2029,6 +2031,7 @@ def _call_build_mla_decode_tuning_config(
         enable_dcp=enable_dcp,
         cp_world=4,
         cp_rank=1,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
 
 
@@ -2036,20 +2039,23 @@ def _call_build_mla_decode_tuning_config(
     (
         "enable_dcp",
         "has_sparse_mla_top_k_lens",
+        "cp_interleave_granularity",
         "expected_input_idx",
         "expected_initializer_indices",
         "expected_fifth_value",
     ),
     [
-        (False, False, (0, 1, 2, 3), {1, 2}, None),
-        (True, False, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
-        (False, True, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
+        (False, False, 1, (0, 1, 2, 3), {1, 2}, None),
+        (True, False, 1, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
+        (True, False, 3, (0, 1, 2, 3, 4), {1, 2, 4}, 4096),
+        (False, True, 1, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
     ],
-    ids=("default", "dcp", "sparse-top-k"),
+    ids=("default", "dcp-token", "dcp-block3", "sparse-top-k"),
 )
 def test_mla_decode_tuning_config_is_memoized(
     enable_dcp,
     has_sparse_mla_top_k_lens,
+    cp_interleave_granularity,
     expected_input_idx,
     expected_initializer_indices,
     expected_fifth_value,
@@ -2063,10 +2069,14 @@ def test_mla_decode_tuning_config_is_memoized(
     _mla_decode_tuning_config.cache_clear()
     try:
         config_a = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
+            enable_dcp,
+            has_sparse_mla_top_k_lens,
+            cp_interleave_granularity,
         )
         config_b = _call_build_mla_decode_tuning_config(
-            enable_dcp, has_sparse_mla_top_k_lens
+            enable_dcp,
+            has_sparse_mla_top_k_lens,
+            cp_interleave_granularity,
         )
 
         assert config_a is config_b, (
@@ -2083,6 +2093,28 @@ def test_mla_decode_tuning_config_is_memoized(
                 fifth_tensor,
                 torch.full((8,), expected_fifth_value, dtype=torch.int32),
             )
+    finally:
+        _mla_decode_tuning_config.cache_clear()
+
+
+def test_mla_decode_tuning_config_keys_dcp_interleave_granularity():
+    """Different block-cyclic layouts must not share captured DCP metadata."""
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        token_config = _call_build_mla_decode_tuning_config(
+            enable_dcp=True, cp_interleave_granularity=1
+        )
+        block_config = _call_build_mla_decode_tuning_config(
+            enable_dcp=True, cp_interleave_granularity=3
+        )
+        assert token_config is not block_config
+
+        token_init = dict(token_config.tensor_initializers)[4]
+        block_init = dict(block_config.tensor_initializers)[4]
+        token_bound = token_init((1,), torch.int32, torch.device("cpu"))
+        block_bound = block_init((1,), torch.int32, torch.device("cpu"))
+        torch.testing.assert_close(token_bound, torch.tensor([4097], dtype=torch.int32))
+        torch.testing.assert_close(block_bound, torch.tensor([4096], dtype=torch.int32))
     finally:
         _mla_decode_tuning_config.cache_clear()
 
