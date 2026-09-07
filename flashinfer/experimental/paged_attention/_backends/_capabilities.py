@@ -47,6 +47,9 @@ class PagedAttentionCapabilities:
     supports_noncausal: bool
     supports_window: bool
     requires_contiguous_q: bool
+    # KV-cache dtypes; fp8 entries mean "fp8 KV with a fp16/bf16 q" (per-tensor
+    # k_scale/v_scale at run()). fp8 q is a separate, undeclared axis.
+    kv_dtypes: frozenset = frozenset({torch.float16, torch.bfloat16})
     # True if the backend consumes the dense block table (derivation from the
     # flat-indices input form is forbidden below page_size 8 — table blowup)
     needs_dense: bool = False
@@ -60,6 +63,7 @@ class PagedAttentionCapabilities:
         *,
         cc_major: int,
         q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
         head_dim_qk: int,
         head_dim_vo: int,
         page_size: int,
@@ -74,6 +78,12 @@ class PagedAttentionCapabilities:
             return f"unsupported compute capability sm_{cc_major}x"
         if q_dtype not in self.q_dtypes:
             return f"unsupported q dtype {q_dtype}"
+        if kv_dtype not in self.kv_dtypes:
+            return f"unsupported kv dtype {kv_dtype}"
+        if kv_dtype != q_dtype and not (
+            _is_fp8(kv_dtype) and q_dtype in (torch.float16, torch.bfloat16)
+        ):
+            return f"unsupported q/kv dtype pair ({q_dtype}, {kv_dtype})"
         if (head_dim_qk, head_dim_vo) not in self.head_dims:
             return f"unsupported head dims ({head_dim_qk}, {head_dim_vo})"
         if self.page_sizes is not None and page_size not in self.page_sizes:
@@ -100,6 +110,12 @@ class PagedAttentionCapabilities:
 
 
 _F16 = frozenset({torch.float16, torch.bfloat16})
+_FP8 = frozenset({torch.float8_e4m3fn})
+
+
+def _is_fp8(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
 
 # Per the capability-honesty rule: these sets mirror exactly what
 # tests/experimental/test_paged_attention_{prototype,fuzzer}.py exercise.
@@ -113,6 +129,7 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
         head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
+        kv_dtypes=_F16 | _FP8,  # fp8 KV + f16 q, per-tensor scales (in-kernel dequant)
         page_sizes=None,
         kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,

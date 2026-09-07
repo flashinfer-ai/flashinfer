@@ -122,6 +122,7 @@ class PagedAttentionController:
                 head_dim_qk,
                 head_dim_vo,
                 q_dtype,
+                kv_dtype,
                 metadata.page_size,
                 kv_layout,
                 causal,
@@ -144,6 +145,7 @@ class PagedAttentionController:
                 head_dim_qk=head_dim_qk,
                 head_dim_vo=head_dim_vo,
                 q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
                 page_size=metadata.page_size,
                 kv_layout=kv_layout,
                 causal=causal,
@@ -213,6 +215,8 @@ class PagedAttentionController:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         _expect(self._planned, "run() called before plan() — call plan() first")
         m = self._meta
@@ -313,8 +317,29 @@ class PagedAttentionController:
             isinstance(sm_scale, float) and math.isfinite(sm_scale) and sm_scale > 0,
             f"sm_scale must be a positive finite host float, got {sm_scale!r}",
         )
+        kv_is_fp8 = m.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        for nm, sc in (("k_scale", k_scale), ("v_scale", v_scale)):
+            if sc is None:
+                continue
+            _expect(
+                kv_is_fp8,
+                f"{nm} given but the plan's kv_dtype is {m.kv_dtype}; per-tensor "
+                "KV scales apply to fp8 KV caches only",
+            )
+            _expect(
+                isinstance(sc, float) and math.isfinite(sc) and sc > 0,
+                f"{nm} must be a positive finite host float (dequant = fp8 * scale), "
+                f"got {sc!r}",
+            )
         return self._active.run(
-            q, k_cache, v_cache, out=out, lse=lse, sm_scale=sm_scale
+            q,
+            k_cache,
+            v_cache,
+            out=out,
+            lse=lse,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def explain(self) -> str:

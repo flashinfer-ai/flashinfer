@@ -45,8 +45,14 @@ def make_problem(
     uniform_q1=False,
     kv_layout="HND",
     input_form="block_tables",
+    kv_dtype=None,
 ):
-    """Random valid paged-prefill problem with scattered (non-identity) page ids."""
+    """Random valid paged-prefill problem with scattered (non-identity) page ids.
+
+    ``kv_dtype=torch.float8_e4m3fn`` quantizes K/V per-tensor (scale = amax/448)
+    and keeps the dequantized values as ``k_ref``/``v_ref`` for the oracle, so
+    the kernel is judged on its math, not on the quantization error.
+    """
     head_dim_vo = head_dim_vo or head_dim_qk
     g = torch.Generator().manual_seed(seed)
     if uniform_q1:
@@ -84,6 +90,14 @@ def make_problem(
         v_shape = (pool_pages, page_size, num_kv_heads, head_dim_vo)
     k_cache = torch.randn(*k_shape, dtype=dtype, device=device)
     v_cache = torch.randn(*v_shape, dtype=dtype, device=device)
+    k_ref, v_ref, k_scale, v_scale = k_cache, v_cache, None, None
+    if kv_dtype is not None and kv_dtype != dtype:
+        k_scale = float(k_cache.abs().amax().item()) / 448.0
+        v_scale = float(v_cache.abs().amax().item()) / 448.0
+        k_cache = (k_cache.float() / k_scale).to(kv_dtype)
+        v_cache = (v_cache.float() / v_scale).to(kv_dtype)
+        k_ref = k_cache.float() * k_scale
+        v_ref = v_cache.float() * v_scale
 
     # flat CSR page-id list: request-ordered concatenation of each row's
     # live prefix (same info as the dense table)
@@ -95,6 +109,11 @@ def make_problem(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
+        k_ref=k_ref,
+        v_ref=v_ref,
+        kv_dtype=kv_dtype if kv_dtype is not None else dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
         qo_indptr=qo_indptr_cpu.to(device),
         qo_indptr_cpu=qo_indptr_cpu,
         kv_seq_lens=kv_lens.to(device),
@@ -163,6 +182,7 @@ def run_unified(
         head_dim_qk=p["head_dim_qk"],
         head_dim_vo=p["head_dim_vo"],
         q_dtype=p["dtype"],
+        kv_dtype=p.get("kv_dtype"),
         kv_layout=p.get("kv_layout", "HND"),
         causal=causal,
         window_left=window_left,
@@ -175,6 +195,8 @@ def run_unified(
         out=p.get("_out_override"),
         lse=p.get("_lse_override"),
         sm_scale=sm_scale,
+        k_scale=p.get("k_scale"),
+        v_scale=p.get("v_scale"),
     )
     return attn, out, lse
 
@@ -188,6 +210,7 @@ def _resolve_or_skip(p, backend, *, causal=True, need_lse=True, window_left=-1):
             head_dim_qk=p["head_dim_qk"],
             head_dim_vo=p["head_dim_vo"],
             q_dtype=p["dtype"],
+            kv_dtype=p.get("kv_dtype"),
             page_size=p["page_size"],
             kv_layout=p.get("kv_layout", "HND"),
             causal=causal,
@@ -209,8 +232,8 @@ def check(p, backend, *, causal=True, window_left=-1):
     _, out, lse = run_unified(p, backend, causal=causal, window_left=window_left)
     ref_out, ref_lse = reference_paged_prefill(
         p["q"],
-        p["k_cache"],
-        p["v_cache"],
+        p["k_ref"],
+        p["v_ref"],
         p["qo_indptr_cpu"],
         p["kv_seq_lens_cpu"],
         p["block_tables"] if p.get("input_form") != "page_indices" else None,
@@ -388,6 +411,26 @@ def test_paged_attention_noncausal(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_paged_attention_fp8_kv(backend):
+    """fp8 (e4m3) KV cache with bf16 q and per-tensor k_scale/v_scale at run();
+    the oracle sees the dequantized values, so this checks the kernel's
+    in-kernel dequant + scale plumbing, not the quantization error."""
+    p = make_problem(
+        seed=31,
+        batch_size=4,
+        max_q=32,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+    check(p, backend)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_paged_attention_lse_basee(backend):
     """lse_mode="basee" returns natural-log LSE from every backend (cuDNN
     natively, FA/trtllm-gen via one fold), matching the reference."""
@@ -406,8 +449,8 @@ def test_paged_attention_lse_basee(backend):
     _, out, lse = run_unified(p, backend, lse_mode="basee")
     ref_out, ref_lse = reference_paged_prefill(
         p["q"],
-        p["k_cache"],
-        p["v_cache"],
+        p["k_ref"],
+        p["v_ref"],
         p["qo_indptr_cpu"],
         p["kv_seq_lens_cpu"],
         p["block_tables"],
@@ -442,8 +485,8 @@ def test_paged_attention_sm_scale_replan(backend):
         _, out, lse = run_unified(p, backend, sm_scale=sm_scale)
         ref_out, ref_lse = reference_paged_prefill(
             p["q"],
-            p["k_cache"],
-            p["v_cache"],
+            p["k_ref"],
+            p["v_ref"],
             p["qo_indptr_cpu"],
             p["kv_seq_lens_cpu"],
             p["block_tables"],

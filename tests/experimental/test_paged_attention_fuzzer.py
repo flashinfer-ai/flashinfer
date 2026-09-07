@@ -76,6 +76,7 @@ def _sample_config(rng: random.Random):
         window_left=rng.choice([-1, -1, -1, 16]),
         input_form=input_form,
         lse_mode=rng.choice(["base2", "base2", "basee"]),
+        kv_dtype=rng.choice([None, None, torch.float8_e4m3fn]),
     )
 
 
@@ -92,6 +93,7 @@ def _build(seed, cfg):
         dtype=cfg["dtype"],
         kv_layout=cfg["kv_layout"],
         input_form=cfg["input_form"],
+        kv_dtype=cfg.get("kv_dtype"),
     )
 
 
@@ -103,6 +105,7 @@ def _backend_runnable(p, backend, causal, window_left=-1):
             num_kv_heads=p["num_kv_heads"],
             head_dim_qk=p["head_dim_qk"],
             q_dtype=p["dtype"],
+            kv_dtype=p.get("kv_dtype"),
             page_size=p["page_size"],
             kv_layout=p.get("kv_layout", "HND"),
             causal=causal,
@@ -333,8 +336,8 @@ def _run_and_check(p, backend, causal, repro, window_left=-1, lse_mode="base2"):
         return "rejected", str(e)
     ref_out, ref_lse = reference_paged_prefill(
         p["q"].contiguous(),
-        p["k_cache"],
-        p["v_cache"],
+        p["k_ref"],
+        p["v_ref"],
         p["qo_indptr_cpu"],
         p["kv_seq_lens_cpu"],
         p["block_tables"] if p.get("input_form") != "page_indices" else None,

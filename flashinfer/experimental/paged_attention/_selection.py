@@ -75,6 +75,7 @@ def resolve_paged_attention(
     head_dim_qk: int,
     head_dim_vo: Optional[int] = None,
     q_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
     page_size: int,
     kv_layout: str = "HND",
     causal: bool = True,
@@ -89,6 +90,8 @@ def resolve_paged_attention(
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
+    if kv_dtype is None:
+        kv_dtype = q_dtype
     if cc_major is None:
         dev = device if device is not None else torch.device("cuda")
         cc_major = torch.cuda.get_device_properties(dev).major
@@ -128,6 +131,7 @@ def resolve_paged_attention(
         reason = cap.rejection_reason(
             cc_major=cc_major,
             q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             page_size=page_size,
@@ -157,6 +161,7 @@ def resolve_paged_attention(
             head_dim_qk,
             head_dim_vo,
             q_dtype,
+            kv_dtype,
             page_size,
             kv_layout,
             causal,

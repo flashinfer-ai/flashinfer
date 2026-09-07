@@ -28,6 +28,22 @@ class _CudnnBackend:
         self._native_lse: Optional[torch.Tensor] = None
         self._batch_ids: Optional[torch.Tensor] = None
         self._pos: Optional[torch.Tensor] = None
+        self._device = device
+        # cuDNN takes fp8 dequant scales as (1,1,1,1) GPU tensors; scales are
+        # per-layer constants, so cache one tensor per distinct value (no H2D
+        # on the hot path after the first call).
+        self._scale_tensors: dict = {}
+
+    def _scale_tensor(self, value):
+        if value is None:
+            return None
+        t = self._scale_tensors.get(value)
+        if t is None:
+            t = torch.tensor([value], dtype=torch.float32, device=self._device).view(
+                1, 1, 1, 1
+            )
+            self._scale_tensors[value] = t
+        return t
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # The LSE-gather indices and the native stats buffer are static per
@@ -51,7 +67,18 @@ class _CudnnBackend:
         self._meta, self._derived = meta, derived
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
+    def run(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        *,
+        out=None,
+        lse=None,
+        sm_scale: float,
+        k_scale=None,
+        v_scale=None,
+    ):
         from ....cudnn import cudnn_batch_prefill_with_kv_cache
 
         meta, derived = self._meta, self._derived
@@ -73,6 +100,8 @@ class _CudnnBackend:
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
             block_tables=meta.block_tables,
             causal=meta.causal,
+            k_scale=self._scale_tensor(k_scale),
+            v_scale=self._scale_tensor(v_scale),
             return_lse=meta.need_lse,
             # native stats are natural-log: basee costs nothing, base2 one fold
             lse_base="e" if meta.lse_mode == "basee" else "2",

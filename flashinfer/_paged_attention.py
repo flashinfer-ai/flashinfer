@@ -122,6 +122,7 @@ def resolve_paged_attention(
     head_dim_qk: int,
     head_dim_vo: Optional[int] = None,
     q_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
     page_size: int,
     kv_layout: str = "HND",
     causal: bool = True,
@@ -149,6 +150,7 @@ def resolve_paged_attention(
         head_dim_qk=head_dim_qk,
         head_dim_vo=head_dim_vo,
         q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
         page_size=page_size,
         kv_layout=kv_layout,
         causal=causal,
@@ -262,6 +264,8 @@ class PagedAttention:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the planned batch.
 
@@ -277,11 +281,22 @@ class PagedAttention:
         - ``sm_scale``: softmax scale for this call (default
           ``1/sqrt(head_dim_qk)``); a per-layer value, so one plan serves
           layers with different scales.
+        - ``k_scale`` / ``v_scale``: per-tensor dequantization scales for an
+          fp8 KV cache (``dequant = fp8_value * scale``), host floats so the
+          call stays sync-free; only valid when the plan's ``kv_dtype`` is fp8.
 
         Returns ``(out, lse)``; ``lse`` is packed ``(total_q_tokens,
         num_qo_heads)`` fp32 in the planned base — identical for every backend.
         """
-        return self._impl.run(q, kv_cache, out=out, lse=lse, sm_scale=sm_scale)
+        return self._impl.run(
+            q,
+            kv_cache,
+            out=out,
+            lse=lse,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
 
     def explain(self) -> str:
         """Chosen backend plus the per-backend exclusion reasons."""

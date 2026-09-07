@@ -33,7 +33,18 @@ class _TrtllmGenBackend:
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         self._meta, self._derived = meta, derived
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
+    def run(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        *,
+        out=None,
+        lse=None,
+        sm_scale: float,
+        k_scale=None,
+        v_scale=None,
+    ):
         from ....prefill import trtllm_batch_context_with_kv_cache
 
         meta, derived = self._meta, self._derived
@@ -47,8 +58,9 @@ class _TrtllmGenBackend:
             meta.kv_seq_lens,
             meta.max_q_len,
             meta.max_kv_len,
-            sm_scale,  # bmm1: sm_scale (q/k descales fold here when quantized)
-            1.0,  # bmm2
+            sm_scale
+            * (k_scale if k_scale is not None else 1.0),  # bmm1 (k descale folds in)
+            v_scale if v_scale is not None else 1.0,  # bmm2 (v descale)
             meta.batch_size,
             meta.qo_indptr,
             derived.cum_kv_seq_lens,

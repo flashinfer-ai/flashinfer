@@ -53,7 +53,18 @@ class _FaBackend:
         )
         self._lse_mode = meta.lse_mode
 
-    def run(self, q, k_cache, v_cache, *, out=None, lse=None, sm_scale: float):
+    def run(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        *,
+        out=None,
+        lse=None,
+        sm_scale: float,
+        k_scale=None,
+        v_scale=None,
+    ):
         # The generated-FA wrapper reads sm_scale from plan-time state and its
         # run() has no override, while the kernel takes it as a launch arg.
         # Setting it here keeps sm_scale a per-run (per-layer) value; this
@@ -61,7 +72,13 @@ class _FaBackend:
         self._wrapper._sm_scale = sm_scale
         need_lse = self._lse_mode != "none"
         r = self._wrapper.run(
-            q, (k_cache, v_cache), out=out, lse=lse, return_lse=need_lse
+            q,
+            (k_cache, v_cache),
+            k_scale=k_scale,  # fp8 KV: folded into the softmax scale by the wrapper
+            v_scale=v_scale,  # fp8 KV: applied to the output by the kernel path
+            out=out,
+            lse=lse,
+            return_lse=need_lse,
         )
         if not need_lse:
             return r, None

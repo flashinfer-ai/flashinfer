@@ -174,7 +174,8 @@ attention over the existing fa2/fa3, cuDNN, and trtllm-gen kernels. One
 optional CPU mirrors for a zero-sync plan); :func:`resolve_paged_attention`
 answers at engine init which backends can run a configuration and why the
 others cannot; ``plan()`` declares the LSE base (``lse_mode``) and ``run()``
-takes the per-layer ``sm_scale``. Calling any of these is the opt-in (an
+takes the per-layer ``sm_scale`` and, for an fp8 KV cache, the per-tensor
+``k_scale`` / ``v_scale``. Calling any of these is the opt-in (an
 ``ExperimentalWarning`` is emitted once); see the tracking issue
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
