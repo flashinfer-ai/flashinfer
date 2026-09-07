@@ -20,10 +20,15 @@ import re
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
+from ..api_logging import (
+    experimental_auto_backends_allowed,
+    warn_experimental_backend_once,
+)
 
 # world sizes for which the fused-transpose NVLink kernel is instantiated;
 # lives here (the policy layer) so the dependency direction stays
@@ -438,10 +443,157 @@ def _rdma_route_error(
     return None
 
 
+def _plan_pcie(
+    by_rank: List[UlyssesRankTopology],
+    world_size: int,
+    unavailable: Callable[[str], Any],
+) -> Any:
+    """Plan the PCIe transport for this mesh, or report it unusable.
+
+    ``unavailable(reason)`` is what an unusable mesh means to the caller:
+    an explicit ``backend='pcie'`` raises through it, while automatic
+    selection passes a callable returning ``None`` so it can move on to the
+    next candidate.
+    """
+    numa_nodes = tuple(t.numa_node for t in by_rank)
+    nic_names = tuple(t.nic_name for t in by_rank)
+    gid_indices = tuple(t.gid_index for t in by_rank)
+    routes = {t.route for t in by_rank}
+    if len(routes) > 1:
+        return unavailable(
+            "ranks disagree on FLASHINFER_ULYSSES_PCIE_ROUTE: "
+            f"{sorted(routes)}; every rank must set it identically"
+        )
+    route = routes.pop()
+    if route not in ("auto", "p2p", "rdma", "hybrid"):
+        return unavailable(
+            f"invalid FLASHINFER_ULYSSES_PCIE_ROUTE {route!r}: "
+            "use auto, p2p, rdma or hybrid"
+        )
+
+    all_p2p_error = None
+    for src in by_rank:
+        for dst in by_rank:
+            if src.rank == dst.rank:
+                continue
+            if not src.peer_p2p.get(dst.device_uuid, False):
+                all_p2p_error = (
+                    f"no CUDA P2P access from rank {src.rank} "
+                    f"({src.device_uuid}) to rank {dst.rank} ({dst.device_uuid})"
+                )
+                break
+        if all_p2p_error is not None:
+            break
+
+    def p2p_plan(reason: str) -> UlyssesBackendDecision:
+        return UlyssesBackendDecision(
+            "pcie",
+            reason,
+            UlyssesPciePlan(
+                numa_nodes=numa_nodes,
+                nic_names=nic_names,
+                transport="p2p",
+                requested_route=route,
+            ),
+        )
+
+    if world_size == 1:
+        # One rank is an identity path; no route carries any payload.
+        return p2p_plan("single-node 1-rank CUDA P2P route planned")
+
+    if route == "rdma" or (
+        route == "auto" and world_size in PCIE_AUTO_RDMA_WORLD_SIZES
+    ):
+        rdma_error = _rdma_route_error(
+            by_rank, gid_indices, all_p2p_error, require_numa_split=False
+        )
+        forced = " (FLASHINFER_ULYSSES_PCIE_ROUTE=rdma)" if route == "rdma" else ""
+        if rdma_error is None:
+            return UlyssesBackendDecision(
+                "pcie",
+                f"single-node {world_size}-rank all-RDMA route planned: "
+                f"per-rank mlx5 RoCE to every peer{forced}",
+                UlyssesPciePlan(
+                    numa_nodes=numa_nodes,
+                    nic_names=nic_names,
+                    transport="rdma",
+                    gid_indices=gid_indices,
+                    requested_route=route,
+                ),
+            )
+        if all_p2p_error is None:
+            return p2p_plan(
+                f"single-node {world_size}-rank CUDA P2P route planned; "
+                f"all-RDMA unavailable: {rdma_error}"
+            )
+        return unavailable(
+            "neither all-RDMA nor all-P2P transport is available: "
+            f"{rdma_error}; {all_p2p_error}"
+        )
+
+    if route == "hybrid":
+        hybrid_error = _rdma_route_error(
+            by_rank, gid_indices, all_p2p_error, require_numa_split=True
+        )
+        if hybrid_error is None:
+            return UlyssesBackendDecision(
+                "pcie",
+                "single-node 4+4 NUMA hybrid route planned: same-NUMA CUDA "
+                "P2P plus cross-NUMA mlx5 RoCE "
+                "(FLASHINFER_ULYSSES_PCIE_ROUTE=hybrid)",
+                UlyssesPciePlan(
+                    numa_nodes=numa_nodes,
+                    nic_names=nic_names,
+                    transport="hybrid",
+                    gid_indices=gid_indices,
+                    requested_route=route,
+                ),
+            )
+        if all_p2p_error is None:
+            return p2p_plan(
+                f"single-node {world_size}-rank CUDA P2P route planned; "
+                f"hybrid unavailable: {hybrid_error}"
+            )
+        return unavailable(
+            f"neither hybrid nor all-P2P transport is available: "
+            f"{hybrid_error}; {all_p2p_error}"
+        )
+
+    if all_p2p_error is not None:
+        return unavailable(all_p2p_error)
+    forced = " (FLASHINFER_ULYSSES_PCIE_ROUTE=p2p)" if route == "p2p" else ""
+    return p2p_plan(f"single-node {world_size}-rank CUDA P2P route planned{forced}")
+
+
+def _nvlink_error(by_rank: List[UlyssesRankTopology]) -> Optional[str]:
+    """First reason the mesh is not an all-pairs NVLink fabric, else None."""
+    for src in by_rank:
+        for dst in by_rank:
+            if src.rank == dst.rank:
+                continue
+            if not src.peer_p2p.get(dst.device_uuid, False):
+                return (
+                    f"no P2P access from rank {src.rank} ({src.device_uuid}) to "
+                    f"rank {dst.rank} ({dst.device_uuid})"
+                )
+            if dst.device_uuid in src.pair_errors:
+                return (
+                    f"NVLink probe failed between rank {src.rank} and rank "
+                    f"{dst.rank}: {src.pair_errors[dst.device_uuid]}"
+                )
+            if not src.peer_nvlink.get(dst.device_uuid, False):
+                return (
+                    f"no NVLink between rank {src.rank} ({src.device_uuid}) and "
+                    f"rank {dst.rank} ({dst.device_uuid})"
+                )
+    return None
+
+
 def decide_ulysses_backend(
     requested: str,
     topologies: List[UlyssesRankTopology],
     supported_world_sizes: Sequence[int] = SUPPORTED_WORLD_SIZES,
+    allow_experimental_auto: bool = False,
 ) -> UlyssesBackendDecision:
     """Pure decision function: gathered per-rank probes -> (backend, reason).
 
@@ -460,6 +612,12 @@ def decide_ulysses_backend(
         Per-rank topology probe results gathered from the process group.
     supported_world_sizes : Sequence[int], optional
         World sizes for which the fused NVLink kernel is instantiated.
+    allow_experimental_auto : bool, optional
+        Whether ``"auto"`` may select the experimental PCIe backend. Passed
+        in rather than read from the environment here so this stays a pure
+        function of its arguments: the caller resolves
+        ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS`` once and gathers it
+        across ranks, so the group cannot split on a per-rank setting.
 
     Returns
     -------
@@ -521,140 +679,38 @@ def decide_ulysses_backend(
         uuid_to_rank[t.device_uuid] = t.rank
 
     if requested == "pcie":
-        numa_nodes = tuple(t.numa_node for t in by_rank)
-        nic_names = tuple(t.nic_name for t in by_rank)
-        gid_indices = tuple(t.gid_index for t in by_rank)
-        routes = {t.route for t in by_rank}
-        if len(routes) > 1:
+        return _plan_pcie(by_rank, world_size, fallback)
+
+    nvlink_error = _nvlink_error(by_rank)
+    if nvlink_error is None:
+        return UlyssesBackendDecision(
+            "nvlink",
+            f"all-pairs NVLink P2P verified across {world_size} ranks on "
+            f"{next(iter(hostnames))}",
+        )
+
+    # Without NVLink, PCIe is the next candidate before NCCL -- but it is
+    # experimental, so automatic selection needs the opt-in. An explicit
+    # backend="pcie" returned above and never consults it.
+    #
+    # The gate is not enforced with require_experimental_auto_backends() the
+    # way flashinfer/experimental/README.md sketches for hand-rolled routing,
+    # because that raises and "auto" here must never raise -- NCCL is always a
+    # working fallback, so there is no candidate-exhausted case to report. The
+    # opt-in is instead named in the fallback reason, so a machine that could
+    # have used PCIe says so rather than silently degrading.
+    if requested == "auto" and world_size in PCIE_SUPPORTED_WORLD_SIZES:
+        plan = _plan_pcie(by_rank, world_size, lambda _reason: None)
+        if plan is not None:
+            if allow_experimental_auto:
+                return plan
             return fallback(
-                "ranks disagree on FLASHINFER_ULYSSES_PCIE_ROUTE: "
-                f"{sorted(routes)}; every rank must set it identically"
-            )
-        route = routes.pop()
-        if route not in ("auto", "p2p", "rdma", "hybrid"):
-            return fallback(
-                f"invalid FLASHINFER_ULYSSES_PCIE_ROUTE {route!r}: "
-                "use auto, p2p, rdma or hybrid"
+                f"{nvlink_error}; the experimental PCIe backend does fit this "
+                "topology -- set FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1 "
+                "to let auto select it, or pass backend='pcie'"
             )
 
-        all_p2p_error = None
-        for src in by_rank:
-            for dst in by_rank:
-                if src.rank == dst.rank:
-                    continue
-                if not src.peer_p2p.get(dst.device_uuid, False):
-                    all_p2p_error = (
-                        f"no CUDA P2P access from rank {src.rank} "
-                        f"({src.device_uuid}) to rank {dst.rank} ({dst.device_uuid})"
-                    )
-                    break
-            if all_p2p_error is not None:
-                break
-
-        def p2p_plan(reason: str) -> UlyssesBackendDecision:
-            return UlyssesBackendDecision(
-                "pcie",
-                reason,
-                UlyssesPciePlan(
-                    numa_nodes=numa_nodes,
-                    nic_names=nic_names,
-                    transport="p2p",
-                    requested_route=route,
-                ),
-            )
-
-        if world_size == 1:
-            # One rank is an identity path; no route carries any payload.
-            return p2p_plan("single-node 1-rank CUDA P2P route planned")
-
-        if route == "rdma" or (
-            route == "auto" and world_size in PCIE_AUTO_RDMA_WORLD_SIZES
-        ):
-            rdma_error = _rdma_route_error(
-                by_rank, gid_indices, all_p2p_error, require_numa_split=False
-            )
-            forced = " (FLASHINFER_ULYSSES_PCIE_ROUTE=rdma)" if route == "rdma" else ""
-            if rdma_error is None:
-                return UlyssesBackendDecision(
-                    "pcie",
-                    f"single-node {world_size}-rank all-RDMA route planned: "
-                    f"per-rank mlx5 RoCE to every peer{forced}",
-                    UlyssesPciePlan(
-                        numa_nodes=numa_nodes,
-                        nic_names=nic_names,
-                        transport="rdma",
-                        gid_indices=gid_indices,
-                        requested_route=route,
-                    ),
-                )
-            if all_p2p_error is None:
-                return p2p_plan(
-                    f"single-node {world_size}-rank CUDA P2P route planned; "
-                    f"all-RDMA unavailable: {rdma_error}"
-                )
-            return fallback(
-                "neither all-RDMA nor all-P2P transport is available: "
-                f"{rdma_error}; {all_p2p_error}"
-            )
-
-        if route == "hybrid":
-            hybrid_error = _rdma_route_error(
-                by_rank, gid_indices, all_p2p_error, require_numa_split=True
-            )
-            if hybrid_error is None:
-                return UlyssesBackendDecision(
-                    "pcie",
-                    "single-node 4+4 NUMA hybrid route planned: same-NUMA CUDA "
-                    "P2P plus cross-NUMA mlx5 RoCE "
-                    "(FLASHINFER_ULYSSES_PCIE_ROUTE=hybrid)",
-                    UlyssesPciePlan(
-                        numa_nodes=numa_nodes,
-                        nic_names=nic_names,
-                        transport="hybrid",
-                        gid_indices=gid_indices,
-                        requested_route=route,
-                    ),
-                )
-            if all_p2p_error is None:
-                return p2p_plan(
-                    f"single-node {world_size}-rank CUDA P2P route planned; "
-                    f"hybrid unavailable: {hybrid_error}"
-                )
-            return fallback(
-                f"neither hybrid nor all-P2P transport is available: "
-                f"{hybrid_error}; {all_p2p_error}"
-            )
-
-        if all_p2p_error is not None:
-            return fallback(all_p2p_error)
-        forced = " (FLASHINFER_ULYSSES_PCIE_ROUTE=p2p)" if route == "p2p" else ""
-        return p2p_plan(f"single-node {world_size}-rank CUDA P2P route planned{forced}")
-
-    for src in by_rank:
-        for dst in by_rank:
-            if src.rank == dst.rank:
-                continue
-            if not src.peer_p2p.get(dst.device_uuid, False):
-                return fallback(
-                    f"no P2P access from rank {src.rank} ({src.device_uuid}) to "
-                    f"rank {dst.rank} ({dst.device_uuid})"
-                )
-            if dst.device_uuid in src.pair_errors:
-                return fallback(
-                    f"NVLink probe failed between rank {src.rank} and rank "
-                    f"{dst.rank}: {src.pair_errors[dst.device_uuid]}"
-                )
-            if not src.peer_nvlink.get(dst.device_uuid, False):
-                return fallback(
-                    f"no NVLink between rank {src.rank} ({src.device_uuid}) and "
-                    f"rank {dst.rank} ({dst.device_uuid})"
-                )
-
-    return UlyssesBackendDecision(
-        "nvlink",
-        f"all-pairs NVLink P2P verified across {world_size} ranks on "
-        f"{next(iter(hostnames))}",
-    )
+    return fallback(nvlink_error)
 
 
 def resolve_ulysses_backend(
@@ -741,7 +797,14 @@ def resolve_ulysses_backend(
         request_payload = backend
     else:
         request_payload = f"<invalid type: {type(backend).__name__}>"
-    requests: List[Optional[str]] = _guarded_gather(request_payload)
+    # The experimental opt-in rides this gather instead of being read inside
+    # the decision: decide_ulysses_backend is a pure function of its arguments,
+    # and a group where only some ranks exported the variable has to fail
+    # together rather than split between PCIe and NCCL.
+    allow_experimental = experimental_auto_backends_allowed()
+    gathered: List[Any] = _guarded_gather((request_payload, allow_experimental))
+    requests: List[Optional[str]] = [item[0] for item in gathered]
+    allows = [item[1] for item in gathered]
 
     invalid = {r: req for r, req in enumerate(requests) if req not in ULYSSES_BACKENDS}
     if invalid:
@@ -755,6 +818,11 @@ def resolve_ulysses_backend(
             f"inconsistent backend requests across ranks: {requests}; all ranks "
             "must pass the same backend"
         )
+    if len(set(allows)) > 1:
+        raise ValueError(
+            "inconsistent FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS across "
+            f"ranks: {allows}; all ranks must set it identically"
+        )
     requested = requests[0]
     if requested == "nccl":
         return UlyssesBackendDecision("nccl", "backend='nccl' requested")
@@ -763,8 +831,15 @@ def resolve_ulysses_backend(
     # probe_ulysses_rank_topology never raises by contract, but a buggy or
     # monkeypatched probe must not break the collective sequence either.
     try:
+        # Auto has to probe the PCIe side too once it may select that backend:
+        # without the NIC and NUMA fields the route planner can only reach the
+        # all-P2P route, which at eight ranks is slower than the NCCL it would
+        # be replacing. The probe stays off when the opt-in is unset, so the
+        # default path reads no extra sysfs.
         local = probe_ulysses_rank_topology(
-            device, rank, probe_pcie=requested == "pcie"
+            device,
+            rank,
+            probe_pcie=requested == "pcie" or (requested == "auto" and allows[0]),
         )
     except Exception as e:  # noqa: BLE001
         local = UlyssesRankTopology(rank=rank, probe_error=f"{type(e).__name__}: {e}")
@@ -777,7 +852,9 @@ def resolve_ulysses_backend(
     # UlyssesPciePlan alongside the two strings.
     outcome: Tuple[Any, ...]
     try:
-        decision = decide_ulysses_backend(requested, topologies)
+        decision = decide_ulysses_backend(
+            requested, topologies, allow_experimental_auto=allows[0]
+        )
         outcome = ("ok", decision.backend, decision.reason, decision.pcie_plan)
     except UlyssesBackendError as e:
         outcome = ("backend_error", str(e))
@@ -816,5 +893,9 @@ def resolve_ulysses_backend(
             f"backend={requested!r} requested but the decision layer selected "
             f"{final.backend!r} ({final.reason}); refusing to silently violate "
             "the forced backend"
+        )
+    if final.backend == "pcie":
+        warn_experimental_backend_once(
+            "UlyssesCommunicator", "pcie", automatic=requested == "auto"
         )
     return final
