@@ -601,6 +601,86 @@ def test_fused_pack_used_sequence_tail_repair_matches_split():
             assert torch.equal(split, fused), f"used={used} r={r}"
 
 
+def _smooth_k_inputs(dtype, world, L, used, seed=20260908):
+    """Inputs in the regime the K tail repair is actually written for.
+
+    The repair keeps the zero-padded rows of the one mixed group out of that
+    group's amax, so it only changes a payload byte when |0 - k_mean| is
+    comparable to the live rows' |k - k_mean|.  Plain ``randn`` puts the live
+    deviation an order of magnitude ABOVE |k_mean| (measured: 26x), so the
+    padded rows never win the max and the repair is a no-op on the bytes --
+    which is why a test built on ``randn`` passes with the repair mis-aimed or
+    deleted outright.  Large per-channel means with small deviations inverts
+    that ratio (measured: padded 13x above live), which is the regime the
+    kernel's tail-repair contract describes.
+    """
+    torch.manual_seed(seed)
+    S = world * L
+    q = torch.randn((1, S, _HEADS, _HEAD_DIM), device="cuda", dtype=dtype)
+    means = torch.randn((1, 1, _HEADS, _HEAD_DIM), device="cuda", dtype=dtype) * 4.0
+    k = means.expand(1, S, _HEADS, _HEAD_DIM).contiguous()
+    k += torch.randn_like(k) * 1e-3
+    v = torch.randn_like(q)
+    for x in (q, k, v):
+        x[:, used:] = 0
+    return q, k, v
+
+
+@requires_sm120
+def test_fused_pack_tail_repair_is_observable_and_matches_split():
+    """Regression for the K tail-repair group index, with a power guard.
+
+    ``test_fused_pack_used_sequence_tail_repair_matches_split`` above compares
+    the same two paths but on ``randn`` inputs, where the repair cannot change
+    a byte -- it passes unchanged against a kernel with the repair deleted.
+    This test asserts up front that the chosen inputs DO make the repair
+    observable, so it cannot silently decay into the same no-op.
+
+    Scope: this exercises the SM120 grid (K_GROUP=64).  The SM90 launcher runs
+    the same kernel at K_GROUP=128 and once open-coded the repair's divisor as
+    a literal 64, naming the wrong group; that line is now derived from GROUP.
+    An SM90 counterpart needs SM90 hardware, which CI does not have.
+    """
+    world, L = 4, 128
+    S = world * L
+    # The padded rows reach |k_mean| = M*used/S and the live rows only
+    # M*(1 - used/S), so the repair is observable in proportion to
+    # used/(S - used).  Values near or below S/2 do not discriminate and the
+    # power guard below rejects them -- keep these well above S/2.
+    for used in (S - 35, S - 130, S - 3, 445, 450):
+        assert used % lowp.K_GROUP != 0, f"used={used} leaves no mixed group"
+        q, k, v = _smooth_k_inputs(torch.bfloat16, world, L, used)
+        k_mean, v_scale = _stats(k, v, world, L)
+
+        # Power guard: without this the comparison below proves nothing.
+        group = (used - 1) // lowp.K_GROUP
+        rows = slice(group * lowp.K_GROUP, (group + 1) * lowp.K_GROUP)
+        deviation = (k[0, rows].float() - k_mean[0].float()).abs()
+        live = deviation[: used - group * lowp.K_GROUP].amax().item()
+        both = deviation.amax().item()
+        assert both > 2.0 * live, (
+            f"used={used}: padded rows reach {both:.3f} vs live rows {live:.3f} -- "
+            "this input regime cannot observe the tail repair, so the assertion "
+            "below would pass on a kernel with the repair removed"
+        )
+
+        for r in range(world):
+            s = slice(r * L, (r + 1) * L)
+            q_r, k_r, v_r = (x[:, s].contiguous() for x in (q, k, v))
+            q_amax = lowp.q_grouped_amax(q_r, rank=r, world_size=world)
+            k_amax = lowp.k_grouped_amax(
+                k_r, k_mean, rank=r, world_size=world, used_sequence=used
+            )
+            split = lowp.quant_qkv_pack(
+                q_r, k_r, v_r, k_mean, q_amax, k_amax, v_scale, rank=r, world_size=world
+            )
+            fused = lowp.quant_qkv_pack_fused(
+                q_r, k_r, v_r, k_mean, v_scale, rank=r, world_size=world,
+                used_sequence=used,
+            )
+            assert torch.equal(split, fused), f"used={used} r={r}"
+
+
 @requires_sm120
 def test_fused_pack_rejects_unaligned():
     q = torch.randn((1, 65, 56, 128), device="cuda", dtype=torch.bfloat16)
