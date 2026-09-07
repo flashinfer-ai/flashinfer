@@ -550,6 +550,7 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
     assert compile_args == [
         {
             "lower_bound": -5.0,
+            "state_dtype": torch.bfloat16,
             "has_state_in": True,
             "has_state_out": True,
             "has_state_ckpt": False,
@@ -567,6 +568,66 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
         "planned_cu_chunks": None,
         "planned_total_chunks": None,
     }
+
+
+def test_cute_dsl_prefill_adapter_compiles_fp32_state_and_checkpoints(monkeypatch):
+    calls = []
+    compile_args = []
+
+    class Compiled:
+        def workspace_size(self, cu_seqlens, heads, **kwargs):
+            return 0
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_get_compiled_cute_dsl_kda",
+        lambda **kwargs: compile_args.append(kwargs) or Compiled(),
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_identity_seq_order",
+        lambda **kwargs: torch.tensor([0], dtype=torch.int32),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
+    )
+
+    inputs = _cpu_route_tensors(token_count=65)
+    state = torch.empty((1, 1, 128, 128), dtype=torch.float32)
+    checkpoints = torch.empty((2, 1, 128, 128), dtype=torch.float32)
+    checkpoint_starts = torch.tensor([0, 2], dtype=torch.int64)
+    result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        scale=None,
+        initial_state=state,
+        output_final_state=True,
+        lower_bound=-5.0,
+        cu_seqlens=None,
+        seq_order=None,
+        output=torch.empty_like(inputs["q"]),
+        prefill_workspace=None,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_every_n_tokens=64,
+    )
+
+    assert compile_args[0]["state_dtype"] == torch.float32
+    assert result[1] is state
+    assert result[2] is checkpoints
+    args, kwargs = calls[0]
+    assert args[8] is state
+    assert args[10] is state
+    assert kwargs["state_ckpt"] is checkpoints
 
 
 def test_cute_dsl_prefill_adapter_narrows_padded_gate_and_beta_without_copy(
@@ -923,6 +984,100 @@ def test_cute_dsl_padded_gate_and_beta_match_compact_inputs(flash_kda_device):
 
     torch.testing.assert_close(padded_output, compact_output, atol=0, rtol=0)
     torch.testing.assert_close(padded_final_state, compact_final_state, atol=0, rtol=0)
+
+
+def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[130],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=4964,
+    )
+    initial_state = inputs["initial_state"].clone()
+
+    control_output, control_final_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_state.clone()}),
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+    expected_checkpoints = [initial_state[0]]
+    for boundary in (64, 128):
+        prefix_inputs = {
+            **inputs,
+            "q": inputs["q"][:, :boundary],
+            "k": inputs["k"][:, :boundary],
+            "v": inputs["v"][:, :boundary],
+            "g": inputs["g"][:, :boundary],
+            "beta": inputs["beta"][:, :boundary],
+            "initial_state": initial_state.clone(),
+            "cu_seqlens": torch.tensor(
+                [0, boundary], dtype=torch.int64, device=flash_kda_device
+            ),
+        }
+        _, prefix_final_state = recurrent_kda(
+            **_strict_prefill_kwargs(prefix_inputs),
+            output_final_state=True,
+            backend="cute-dsl",
+        )
+        expected_checkpoints.append(prefix_final_state[0])
+
+    state_pool = torch.zeros(
+        (3, 12, 128, 128), dtype=torch.float32, device=flash_kda_device
+    )
+    state_pool[1].copy_(initial_state[0])
+    state_indices = torch.tensor([1], dtype=torch.int32, device=flash_kda_device)
+    checkpoints = torch.empty(
+        (3, 12, 128, 128), dtype=torch.float32, device=flash_kda_device
+    )
+    checkpoint_starts = torch.tensor([0, 3], dtype=torch.int64, device=flash_kda_device)
+    output, final_state, actual_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_every_n_tokens=64,
+        backend="cute-dsl",
+    )
+
+    assert final_state is state_pool
+    assert actual_checkpoints is checkpoints
+    torch.testing.assert_close(output, control_output, atol=0, rtol=0)
+    torch.testing.assert_close(state_pool[1], control_final_state[0], atol=0, rtol=0)
+    torch.testing.assert_close(
+        checkpoints,
+        torch.stack(expected_checkpoints),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_cute_dsl_rejects_mixed_state_and_checkpoint_dtypes(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[65],
+        num_heads=1,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=4965,
+    )
+    checkpoints = torch.empty(
+        (2, 1, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+    )
+    checkpoint_starts = torch.tensor([0, 2], dtype=torch.int64, device=flash_kda_device)
+
+    with pytest.raises(ValueError, match="backend='cute-dsl' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=checkpoint_starts,
+            checkpoint_every_n_tokens=64,
+            backend="cute-dsl",
+        )
 
 
 @pytest.mark.parametrize(

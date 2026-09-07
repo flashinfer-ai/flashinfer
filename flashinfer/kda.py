@@ -141,9 +141,9 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must normally be
-            bfloat16; the source-only generated indexed prefill domain requires
-            float32. If ``None``, zero-initialized. Updated in-place. For
+            Initial state of shape ``[N, HV, V, K]``. Eligible prefill
+            backends accept bfloat16 or float32; other modes may be stricter.
+            If ``None``, zero-initialized. Updated in-place. For
             batched spec decode without ``cu_seqlens``, ``N`` is the packed
             checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
             ``ssm_state_indices`` is omitted. For eligible frozen prefill with
@@ -242,12 +242,14 @@ def recurrent_kda(
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
-            Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
-            frozen prefill. Row zero for each sequence is its initial state;
-            later rows are the states before token blocks beginning at
-            ``N, 2N, ...``. ``C`` must be at least
-            ``checkpoint_cu_starts[N_seq]``; this capacity contract is not
-            host-validated. Required when ``checkpoint_every_n_tokens > 0``.
+            Caller-owned checkpoint output ``[C, H, 128, 128]`` for frozen
+            prefill. CuTe DSL accepts BF16 or FP32 and requires it to match
+            ``initial_state`` when present; Cake accepts BF16. Row zero for
+            each sequence is its initial state; later rows are the states
+            before token blocks beginning at ``N, 2N, ...``. ``C`` must be at
+            least ``checkpoint_cu_starts[N_seq]``; this capacity contract is
+            not host-validated. Required when
+            ``checkpoint_every_n_tokens > 0``.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
             The first value must be zero, and each consecutive difference must

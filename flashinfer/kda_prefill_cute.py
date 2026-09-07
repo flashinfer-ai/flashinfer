@@ -219,7 +219,7 @@ def _is_cute_dsl_kda_prefill_eligible(
         if (
             not isinstance(initial_state, torch.Tensor)
             or initial_state.device != q.device
-            or initial_state.dtype != torch.bfloat16
+            or initial_state.dtype not in (torch.bfloat16, torch.float32)
             or initial_state.ndim != 4
             or initial_state.shape[0] <= 0
             or tuple(initial_state.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
@@ -251,7 +251,7 @@ def _is_cute_dsl_kda_prefill_eligible(
         if (
             not isinstance(state_checkpoints, torch.Tensor)
             or state_checkpoints.device != q.device
-            or state_checkpoints.dtype != torch.bfloat16
+            or state_checkpoints.dtype not in (torch.bfloat16, torch.float32)
             or state_checkpoints.ndim != 4
             or tuple(state_checkpoints.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
             or state_checkpoints.shape[0] > torch.iinfo(torch.int32).max
@@ -264,6 +264,8 @@ def _is_cute_dsl_kda_prefill_eligible(
             or not checkpoint_cu_starts.is_contiguous()
         ):
             return False
+        if initial_state is not None and state_checkpoints.dtype != initial_state.dtype:
+            return False
     elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         return False
     # Probed last so that calls rejected above reach Cake exactly as before.
@@ -273,6 +275,7 @@ def _is_cute_dsl_kda_prefill_eligible(
 def _get_compiled_cute_dsl_kda(
     *,
     lower_bound: float,
+    state_dtype: torch.dtype,
     has_state_in: bool,
     has_state_out: bool,
     has_state_ckpt: bool,
@@ -284,9 +287,13 @@ def _get_compiled_cute_dsl_kda(
 
     from .kda_kernels.kda_chunked_bt16 import compile
 
+    cutlass_state_dtype = {
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[state_dtype]
     return compile(
         dtype=cutlass.BFloat16,
-        state_dtype=cutlass.BFloat16,
+        state_dtype=cutlass_state_dtype,
         gate_dtype=cutlass.BFloat16,
         safe_gate=True,
         gate_lower_bound=lower_bound,
@@ -362,6 +369,13 @@ def _run_cute_dsl_kda_prefill(
         raise ValueError(f"scale must be finite, got {scale_value}")
 
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+    state_dtype = (
+        initial_state.dtype
+        if initial_state is not None
+        else (
+            state_checkpoints.dtype if state_checkpoints is not None else torch.bfloat16
+        )
+    )
     if seq_order is None and cu_seqlens is None:
         seq_order = _identity_seq_order(
             device=q.device,
@@ -380,7 +394,7 @@ def _run_cute_dsl_kda_prefill(
             q.shape[2],
             _HEAD_DIM,
             _HEAD_DIM,
-            dtype=torch.bfloat16,
+            dtype=state_dtype,
             device=q.device,
         )
     else:
@@ -396,6 +410,7 @@ def _run_cute_dsl_kda_prefill(
 
     compiled = _get_compiled_cute_dsl_kda(
         lower_bound=float(lower_bound),
+        state_dtype=state_dtype,
         has_state_in=initial_state is not None,
         has_state_out=final_state is not None,
         has_state_ckpt=state_checkpoints is not None,
