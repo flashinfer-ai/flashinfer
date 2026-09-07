@@ -155,12 +155,25 @@ def _benchmark_case(
     )
 
     dist.barrier()
+    # CUDA graph capture uses a distinct stream. Each graph therefore needs a
+    # separately rendezvoused workspace under the one-stream workspace
+    # contract.
+    graph_workspace = decode_cp_a2a_lse_reduce_create_workspace(
+        max_tokens=batch,
+        local_heads=local_heads,
+        cp_size=world_size,
+        head_dim=head_dim,
+        dtype=dtype,
+        group=dist.group.WORLD,
+    )
+    # One-op replay isolates the CUDA graph replay overhead for one decode
+    # layer. Use a dedicated workspace because capture uses a distinct stream.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         _graph_output = decode_cp_a2a_lse_reduce(
             partial_o,
             partial_lse,
-            workspace,
+            graph_workspace,
             cp_rank=rank,
             cp_size=world_size,
         )
@@ -171,13 +184,24 @@ def _benchmark_case(
         launches_per_sample=launches_per_sample,
     )
 
+    # Multi-op replay models one decode step containing many layers. Report
+    # its replay time per fused operation, and use another capture-specific
+    # workspace because this graph has its own stream.
+    graph_multi_workspace = decode_cp_a2a_lse_reduce_create_workspace(
+        max_tokens=batch,
+        local_heads=local_heads,
+        cp_size=world_size,
+        head_dim=head_dim,
+        dtype=dtype,
+        group=dist.group.WORLD,
+    )
     graph_multi = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph_multi):
         for _ in range(graph_launches_per_replay):
             graph_multi_output = decode_cp_a2a_lse_reduce(
                 partial_o,
                 partial_lse,
-                workspace,
+                graph_multi_workspace,
                 cp_rank=rank,
                 cp_size=world_size,
             )
