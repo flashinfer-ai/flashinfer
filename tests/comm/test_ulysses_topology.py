@@ -24,22 +24,7 @@ from flashinfer.comm.ulysses_topology import (
     probe_ulysses_rank_topology,
     resolve_ulysses_backend,
 )
-
-
-def _full_mesh(world_size, hostname="hostA"):
-    uuids = [f"GPU-fake-{i}" for i in range(world_size)]
-    return [
-        UlyssesRankTopology(
-            rank=r,
-            hostname=hostname,
-            device_index=r,
-            device_uuid=uuids[r],
-            pci_bus_id=f"0000:{r:02x}:00.0",
-            peer_p2p={uuids[p]: True for p in range(world_size) if p != r},
-            peer_nvlink={uuids[p]: True for p in range(world_size) if p != r},
-        )
-        for r in range(world_size)
-    ]
+from tests.test_helpers.ulysses import forbid_ipc_and_jit, full_mesh
 
 
 def _pcie_mesh(rank_order=None, world_size=8):
@@ -241,21 +226,21 @@ def test_pcie_probe_rejects_unknown_numa_node(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
 def test_full_mesh_selects_nvlink(world_size):
-    d = decide_ulysses_backend("auto", _full_mesh(world_size))
+    d = decide_ulysses_backend("auto", full_mesh(world_size))
     assert d.backend == "nvlink"
     assert f"{world_size} ranks" in d.reason
 
 
 @pytest.mark.parametrize("world_size", [1, 3, 5, 7, 9, 16])
 def test_unsupported_world_size_falls_back(world_size):
-    d = decide_ulysses_backend("auto", _full_mesh(world_size))
+    d = decide_ulysses_backend("auto", full_mesh(world_size))
     assert d.backend == "nccl"
     assert f"world size {world_size}" in d.reason
 
 
 def test_requested_nccl_short_circuits():
     # Explicit NCCL must not even look at probe results.
-    broken = _full_mesh(4)
+    broken = full_mesh(4)
     broken[0].probe_error = "boom"
     d = decide_ulysses_backend("nccl", broken)
     assert d.backend == "nccl"
@@ -263,7 +248,7 @@ def test_requested_nccl_short_circuits():
 
 
 def test_multi_node_falls_back():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     topos[3].hostname = "hostB"
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
@@ -271,7 +256,7 @@ def test_multi_node_falls_back():
 
 
 def test_probe_error_falls_back():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     topos[2].probe_error = "NVMLError: Driver Not Loaded"
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
@@ -279,7 +264,7 @@ def test_probe_error_falls_back():
 
 
 def test_asymmetric_p2p_falls_back():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     # one missing direction (3 -> 1) breaks the full mesh
     del topos[3].peer_p2p[topos[1].device_uuid]
     d = decide_ulysses_backend("auto", topos)
@@ -288,7 +273,7 @@ def test_asymmetric_p2p_falls_back():
 
 
 def test_missing_nvlink_pair_falls_back():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     # P2P reachable (e.g. over PCIe) but the concrete pair has no NVLink
     topos[0].peer_nvlink[topos[2].device_uuid] = False
     d = decide_ulysses_backend("auto", topos)
@@ -297,7 +282,7 @@ def test_missing_nvlink_pair_falls_back():
 
 
 def test_pair_probe_error_reported_as_diagnostic():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     # NVML broke for this concrete pair: must surface the diagnostic, not
     # masquerade as a verified missing physical link
     topos[0].peer_nvlink[topos[2].device_uuid] = False
@@ -309,7 +294,7 @@ def test_pair_probe_error_reported_as_diagnostic():
 
 
 def test_unknown_identity_falls_back():
-    topos = _full_mesh(2)
+    topos = full_mesh(2)
     topos[1].device_uuid = ""
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
@@ -317,7 +302,7 @@ def test_unknown_identity_falls_back():
 
 
 def test_duplicate_physical_gpu_falls_back():
-    topos = _full_mesh(2)
+    topos = full_mesh(2)
     topos[1].device_uuid = topos[0].device_uuid
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
@@ -325,15 +310,15 @@ def test_duplicate_physical_gpu_falls_back():
 
 
 def test_malformed_ranks_fall_back():
-    topos = _full_mesh(2)
+    topos = full_mesh(2)
     topos[1].rank = 5
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
     assert "malformed" in d.reason
 
 
-def test_forced_nvlink_ok_on_full_mesh():
-    d = decide_ulysses_backend("nvlink", _full_mesh(8))
+def test_forced_nvlink_ok_onfull_mesh():
+    d = decide_ulysses_backend("nvlink", full_mesh(8))
     assert d.backend == "nvlink"
 
 
@@ -347,7 +332,7 @@ def test_forced_nvlink_ok_on_full_mesh():
     ],
 )
 def test_forced_nvlink_raises_with_reason(mutate):
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     mutate(topos)
     with pytest.raises(UlyssesBackendError, match="backend='nvlink' requested but"):
         decide_ulysses_backend("nvlink", topos)
@@ -355,12 +340,12 @@ def test_forced_nvlink_raises_with_reason(mutate):
 
 def test_forced_nvlink_raises_on_unsupported_world_size():
     with pytest.raises(UlyssesBackendError, match="world size 3"):
-        decide_ulysses_backend("nvlink", _full_mesh(3))
+        decide_ulysses_backend("nvlink", full_mesh(3))
 
 
 def test_invalid_backend_value():
     with pytest.raises(ValueError, match="backend must be one of"):
-        decide_ulysses_backend("magic", _full_mesh(2))
+        decide_ulysses_backend("magic", full_mesh(2))
 
 
 def test_explicit_pcie_builds_rank_order_independent_plan():
@@ -376,7 +361,7 @@ def test_explicit_pcie_builds_rank_order_independent_plan():
 
 @pytest.mark.parametrize("world_size", [1, 2])
 def test_explicit_pcie_selects_p2p_for_small_world_sizes(world_size):
-    decision = decide_ulysses_backend("pcie", _full_mesh(world_size))
+    decision = decide_ulysses_backend("pcie", full_mesh(world_size))
     assert decision.backend == "pcie"
     assert decision.pcie_plan is not None
     assert decision.pcie_plan.transport == "p2p"
@@ -388,7 +373,7 @@ def test_explicit_pcie_selects_p2p_for_small_world_sizes(world_size):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_explicit_pcie_small_world_rejects_missing_p2p_pair(world_size):
-    topos = _full_mesh(world_size)
+    topos = full_mesh(world_size)
     topos[-1].peer_p2p[topos[0].device_uuid] = False
     with pytest.raises(UlyssesBackendError, match="no CUDA P2P access"):
         decide_ulysses_backend("pcie", topos)
@@ -396,7 +381,7 @@ def test_explicit_pcie_small_world_rejects_missing_p2p_pair(world_size):
 
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_explicit_pcie_falls_back_to_all_p2p_when_rdma_is_unavailable(world_size):
-    decision = decide_ulysses_backend("pcie", _full_mesh(world_size))
+    decision = decide_ulysses_backend("pcie", full_mesh(world_size))
     assert decision.backend == "pcie"
     assert decision.pcie_plan is not None
     assert decision.pcie_plan.transport == "p2p"
@@ -508,7 +493,7 @@ def test_explicit_pcie_route_hybrid_requires_numa_split():
 
 
 def test_explicit_pcie_route_p2p_selects_all_p2p():
-    topos = _full_mesh(8)
+    topos = full_mesh(8)
     for topo in topos:
         topo.route = "p2p"
     decision = decide_ulysses_backend("pcie", topos)
@@ -520,7 +505,7 @@ def test_explicit_pcie_route_p2p_selects_all_p2p():
 
 def _rdma_mesh(world_size):
     """A same-NUMA mesh with a distinct NIC and GID per rank."""
-    topos = _full_mesh(world_size)
+    topos = full_mesh(world_size)
     for r, topo in enumerate(topos):
         topo.numa_node = 0
         topo.nic_name = f"mlx5_{r}"
@@ -552,7 +537,7 @@ def test_explicit_pcie_route_rdma_world_size_one_stays_identity():
 
 
 def test_explicit_pcie_route_rdma_falls_back_without_nics():
-    topos = _full_mesh(4)
+    topos = full_mesh(4)
     for topo in topos:
         topo.route = "rdma"
     decision = decide_ulysses_backend("pcie", topos)
@@ -604,7 +589,7 @@ def test_explicit_pcie_route_disagreement_raises():
 
 def test_explicit_pcie_rejects_unsupported_world_size():
     with pytest.raises(UlyssesBackendError, match="supports world sizes"):
-        decide_ulysses_backend("pcie", _full_mesh(6))
+        decide_ulysses_backend("pcie", full_mesh(6))
 
 
 def test_auto_does_not_select_experimental_pcie_without_the_opt_in():
@@ -636,7 +621,7 @@ def test_auto_selects_pcie_with_the_opt_in(world_size):
 def test_opt_in_does_not_make_auto_prefer_pcie_over_nvlink():
     """PCIe is a candidate only where NVLink is not; the opt-in does not reorder."""
     decision = decide_ulysses_backend(
-        "auto", _full_mesh(4), allow_experimental_auto=True
+        "auto", full_mesh(4), allow_experimental_auto=True
     )
     assert decision.backend == "nvlink"
 
@@ -717,46 +702,16 @@ def test_forced_pcie_rejects_incomplete_route(mutate, match):
 
 
 # ---- resolve (collective wrapper) -------------------------------------------
-# Single-process gloo group: no GPU or NCCL needed, proves the forced-NVLink
-# failure fires before any IPC allocation or JIT compilation.
-
-
-@pytest.fixture
-def gloo_pg():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=0,
-        world_size=1,
-    )
-    yield dist.group.WORLD
-    dist.destroy_process_group()
-
-
-def _forbid_ipc_and_jit(monkeypatch):
-    import importlib
-
-    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("IPC/JIT entry point must not be touched")
-
-    monkeypatch.setattr(cuda_ipc_mod, "create_shared_buffer", _boom)
-    monkeypatch.setattr(ulysses_mod, "get_ulysses_a2a_module", _boom)
-    # the merged module binds gen_ulysses_a2a_module at import: patch the
-    # local binding, not flashinfer.jit.comm (which would not intercept)
-    monkeypatch.setattr(ulysses_mod, "gen_ulysses_a2a_module", _boom)
+# Single-process gloo group (the gloo_pg fixture in tests/comm/conftest.py): no
+# GPU or NCCL needed, proves the forced-NVLink failure fires before any IPC
+# allocation or JIT compilation.
 
 
 def test_resolve_auto_world_size_1_no_ipc_jit(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank, *, probe_pcie=True: _full_mesh(1)[0],
+        lambda device, rank, *, probe_pcie=True: full_mesh(1)[0],
     )
     d = resolve_ulysses_backend("auto", group=gloo_pg, device=torch.device("cpu"))
     assert d.backend == "nccl"
@@ -764,10 +719,10 @@ def test_resolve_auto_world_size_1_no_ipc_jit(gloo_pg, monkeypatch):
 
 
 def test_resolve_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank, *, probe_pcie=True: _full_mesh(1)[0],
+        lambda device, rank, *, probe_pcie=True: full_mesh(1)[0],
     )
     with pytest.raises(UlyssesBackendError, match="world size 1"):
         resolve_ulysses_backend("nvlink", group=gloo_pg, device=torch.device("cpu"))
@@ -800,12 +755,12 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
     mod = importlib.import_module("flashinfer.comm.ulysses_topology")
 
     def mesh_probe(device, r, *, probe_pcie=True):
-        return _full_mesh(world_size)[r]
+        return full_mesh(world_size)[r]
 
     if patch == "nvlink_pair_missing":
 
         def broken_probe(device, r, *, probe_pcie=True):
-            topos = _full_mesh(world_size)
+            topos = full_mesh(world_size)
             topos[1].peer_nvlink[topos[0].device_uuid] = False
             return topos[r]
 
