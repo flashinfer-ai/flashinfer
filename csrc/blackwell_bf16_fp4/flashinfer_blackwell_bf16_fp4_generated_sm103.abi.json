@@ -21517,7 +21517,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent_317c9377cd",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent_c5ff8f39d2",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21668,7 +21668,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent_e4ebe93671",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent_b5a956b126",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21819,7 +21819,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent_81435cf499",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent_1354d9098f",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21970,7 +21970,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent_3d9d9006d6",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent_20046e482d",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -24000,7 +24000,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072_k3072_6f8138a695",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072_k3072_61d66ff492",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",

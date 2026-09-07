@@ -8,8 +8,8 @@
 #define FLASHINFER_BLACKWELL_BF16_FP4_SOURCE_READY 1
 #define FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION 3
 #define FLASHINFER_BLACKWELL_BF16_FP4_TARGET_SM 103
-#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "d95057ae94748430195dc2aeaa48717a874d96543627df09d3673cb0142ffa54"
-#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "47568bb1a3e6a738c6c33dacdb6ef686c064b84adedb36b5d9c65dcac0530ec1"
+#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "cebf3fe0396099fb2d1624538fd7dc50602d906264c4002270d85cfcebbdc28d"
+#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "430826d793009c01905e1c8a9f27d56ff450fada89ab70b94ea5ffcda516363a"
 #include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -48267,9 +48267,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group = safe_local_kt * 8 + local_scale_k_group;
     int _min_8 = ((global_scale_k_group) < (total_k_groups - 1) ? (global_scale_k_group) : (total_k_groups - 1));
     int safe_scale_k_group = _min_8;
-    bool valid_scale = stage_valid && lane < 8 && global_scale_k_group < total_k_groups;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    bool valid_scale = stage_valid && global_scale_k_group < total_k_groups;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_21 = (K + 128 - 1) / 128;
     bool stage_valid_22 = k_tiles_21 > 1;
@@ -48335,9 +48337,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group_66 = safe_local_kt_23 * 8 + local_scale_k_group_64;
     int _min_17 = ((global_scale_k_group_66) < (total_k_groups_24 - 1) ? (global_scale_k_group_66) : (total_k_groups_24 - 1));
     int safe_scale_k_group_67 = _min_17;
-    bool valid_scale_68 = stage_valid_22 && lane < 8 && global_scale_k_group_66 < total_k_groups_24;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    bool valid_scale_68 = stage_valid_22 && global_scale_k_group_66 < total_k_groups_24;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_69 = (K + 128 - 1) / 128;
     bool stage_valid_70 = k_tiles_69 > 2;
@@ -48403,9 +48407,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group_114 = safe_local_kt_71 * 8 + local_scale_k_group_112;
     int _min_26 = ((global_scale_k_group_114) < (total_k_groups_72 - 1) ? (global_scale_k_group_114) : (total_k_groups_72 - 1));
     int safe_scale_k_group_115 = _min_26;
-    bool valid_scale_116 = stage_valid_70 && lane < 8 && global_scale_k_group_114 < total_k_groups_72;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    bool valid_scale_116 = stage_valid_70 && global_scale_k_group_114 < total_k_groups_72;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     unsigned int a_frag[4];
     unsigned int raw[1];
@@ -49527,9 +49533,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int global_scale_k_group_165 = safe_local_kt_122 * 8 + local_scale_k_group_163;
         int _min_35 = ((global_scale_k_group_165) < (total_k_groups_123 - 1) ? (global_scale_k_group_165) : (total_k_groups_123 - 1));
         int safe_scale_k_group_166 = _min_35;
-        bool valid_scale_167 = stage_valid_121 && lane < 8 && global_scale_k_group_165 < total_k_groups_123;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        bool valid_scale_167 = stage_valid_121 && global_scale_k_group_165 < total_k_groups_123;
+        if (lane < 8) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
     }
     float alpha_value = 1.0f;
@@ -49742,9 +49750,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group = safe_local_kt * 8 + local_scale_k_group;
     int _min_8 = ((global_scale_k_group) < (total_k_groups - 1) ? (global_scale_k_group) : (total_k_groups - 1));
     int safe_scale_k_group = _min_8;
-    bool valid_scale = stage_valid && lane < 8 && global_scale_k_group < total_k_groups;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    bool valid_scale = stage_valid && global_scale_k_group < total_k_groups;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_21 = (K + 128 - 1) / 128;
     bool stage_valid_22 = k_tiles_21 > 1;
@@ -49810,9 +49820,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group_66 = safe_local_kt_23 * 8 + local_scale_k_group_64;
     int _min_17 = ((global_scale_k_group_66) < (total_k_groups_24 - 1) ? (global_scale_k_group_66) : (total_k_groups_24 - 1));
     int safe_scale_k_group_67 = _min_17;
-    bool valid_scale_68 = stage_valid_22 && lane < 8 && global_scale_k_group_66 < total_k_groups_24;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    bool valid_scale_68 = stage_valid_22 && global_scale_k_group_66 < total_k_groups_24;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_69 = (K + 128 - 1) / 128;
     bool stage_valid_70 = k_tiles_69 > 2;
@@ -49878,9 +49890,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group_114 = safe_local_kt_71 * 8 + local_scale_k_group_112;
     int _min_26 = ((global_scale_k_group_114) < (total_k_groups_72 - 1) ? (global_scale_k_group_114) : (total_k_groups_72 - 1));
     int safe_scale_k_group_115 = _min_26;
-    bool valid_scale_116 = stage_valid_70 && lane < 8 && global_scale_k_group_114 < total_k_groups_72;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    bool valid_scale_116 = stage_valid_70 && global_scale_k_group_114 < total_k_groups_72;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     unsigned int a_frag[4];
     unsigned int raw[1];
@@ -51002,9 +51016,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int global_scale_k_group_165 = safe_local_kt_122 * 8 + local_scale_k_group_163;
         int _min_35 = ((global_scale_k_group_165) < (total_k_groups_123 - 1) ? (global_scale_k_group_165) : (total_k_groups_123 - 1));
         int safe_scale_k_group_166 = _min_35;
-        bool valid_scale_167 = stage_valid_121 && lane < 8 && global_scale_k_group_165 < total_k_groups_123;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        bool valid_scale_167 = stage_valid_121 && global_scale_k_group_165 < total_k_groups_123;
+        if (lane < 8) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
     }
     float alpha_value = 1.0f;
@@ -51222,9 +51238,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group = safe_local_kt * 8 + local_scale_k_group;
     int _min_8 = ((global_scale_k_group) < (total_k_groups - 1) ? (global_scale_k_group) : (total_k_groups - 1));
     int safe_scale_k_group = _min_8;
-    bool valid_scale = stage_valid && lane < 8 && global_scale_k_group < total_k_groups;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    bool valid_scale = stage_valid && global_scale_k_group < total_k_groups;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_21 = (K + 128 - 1) / 128;
     bool stage_valid_22 = k_tiles_21 > 1;
@@ -51290,9 +51308,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group_66 = safe_local_kt_23 * 8 + local_scale_k_group_64;
     int _min_17 = ((global_scale_k_group_66) < (total_k_groups_24 - 1) ? (global_scale_k_group_66) : (total_k_groups_24 - 1));
     int safe_scale_k_group_67 = _min_17;
-    bool valid_scale_68 = stage_valid_22 && lane < 8 && global_scale_k_group_66 < total_k_groups_24;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    bool valid_scale_68 = stage_valid_22 && global_scale_k_group_66 < total_k_groups_24;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_69 = (K + 128 - 1) / 128;
     bool stage_valid_70 = k_tiles_69 > 2;
@@ -51358,9 +51378,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     int global_scale_k_group_114 = safe_local_kt_71 * 8 + local_scale_k_group_112;
     int _min_26 = ((global_scale_k_group_114) < (total_k_groups_72 - 1) ? (global_scale_k_group_114) : (total_k_groups_72 - 1));
     int safe_scale_k_group_115 = _min_26;
-    bool valid_scale_116 = stage_valid_70 && lane < 8 && global_scale_k_group_114 < total_k_groups_72;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    bool valid_scale_116 = stage_valid_70 && global_scale_k_group_114 < total_k_groups_72;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     unsigned int a_frag[4];
     unsigned int raw[1];
@@ -52482,9 +52504,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int global_scale_k_group_165 = safe_local_kt_122 * 8 + local_scale_k_group_163;
         int _min_35 = ((global_scale_k_group_165) < (total_k_groups_123 - 1) ? (global_scale_k_group_165) : (total_k_groups_123 - 1));
         int safe_scale_k_group_166 = _min_35;
-        bool valid_scale_167 = stage_valid_121 && lane < 8 && global_scale_k_group_165 < total_k_groups_123;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        bool valid_scale_167 = stage_valid_121 && global_scale_k_group_165 < total_k_groups_123;
+        if (lane < 8) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
     }
     float alpha_value = 1.0f;
@@ -52700,9 +52724,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group = safe_local_kt * 8 + local_scale_k_group;
     int _min_8 = ((global_scale_k_group) < (total_k_groups - 1) ? (global_scale_k_group) : (total_k_groups - 1));
     int safe_scale_k_group = _min_8;
-    bool valid_scale = stage_valid && lane < 8 && global_scale_k_group < total_k_groups;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    bool valid_scale = stage_valid && global_scale_k_group < total_k_groups;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_21 = (K + 128 - 1) / 128;
     bool stage_valid_22 = k_tiles_21 > 1;
@@ -52768,9 +52794,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group_66 = safe_local_kt_23 * 8 + local_scale_k_group_64;
     int _min_17 = ((global_scale_k_group_66) < (total_k_groups_24 - 1) ? (global_scale_k_group_66) : (total_k_groups_24 - 1));
     int safe_scale_k_group_67 = _min_17;
-    bool valid_scale_68 = stage_valid_22 && lane < 8 && global_scale_k_group_66 < total_k_groups_24;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    bool valid_scale_68 = stage_valid_22 && global_scale_k_group_66 < total_k_groups_24;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 9216 + (unsigned int)(scale_chunk_63 * 16)), "l"(B_descale + (safe_scale_k_group_67 * N + off_n + local_scale_n_65)), "r"((valid_scale_68) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     int k_tiles_69 = (K + 128 - 1) / 128;
     bool stage_valid_70 = k_tiles_69 > 2;
@@ -52836,9 +52864,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     int global_scale_k_group_114 = safe_local_kt_71 * 8 + local_scale_k_group_112;
     int _min_26 = ((global_scale_k_group_114) < (total_k_groups_72 - 1) ? (global_scale_k_group_114) : (total_k_groups_72 - 1));
     int safe_scale_k_group_115 = _min_26;
-    bool valid_scale_116 = stage_valid_70 && lane < 8 && global_scale_k_group_114 < total_k_groups_72;
-    asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-        :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    bool valid_scale_116 = stage_valid_70 && global_scale_k_group_114 < total_k_groups_72;
+    if (lane < 8) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+            :: "r"(cute_remaining_small_scale_addr + 18432 + (unsigned int)(scale_chunk_111 * 16)), "l"(B_descale + (safe_scale_k_group_115 * N + off_n + local_scale_n_113)), "r"((valid_scale_116) ? 16 : 0));
+    }
     asm volatile("cp.async.commit_group;");
     unsigned int a_frag[4];
     unsigned int raw[1];
@@ -53960,9 +53990,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int global_scale_k_group_165 = safe_local_kt_122 * 8 + local_scale_k_group_163;
         int _min_35 = ((global_scale_k_group_165) < (total_k_groups_123 - 1) ? (global_scale_k_group_165) : (total_k_groups_123 - 1));
         int safe_scale_k_group_166 = _min_35;
-        bool valid_scale_167 = stage_valid_121 && lane < 8 && global_scale_k_group_165 < total_k_groups_123;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        bool valid_scale_167 = stage_valid_121 && global_scale_k_group_165 < total_k_groups_123;
+        if (lane < 8) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(cute_remaining_small_scale_addr + (unsigned int)(stage * 9216) + (unsigned int)(scale_chunk_162 * 16)), "l"(B_descale + (safe_scale_k_group_166 * N + off_n + local_scale_n_164)), "r"((valid_scale_167) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
     }
     float alpha_value = 1.0f;
@@ -62560,9 +62592,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
         int global_scale_k_group = safe_local_kt * 16 + local_scale_k_group;
         int _min_14 = ((global_scale_k_group) < (total_k_groups - 1) ? (global_scale_k_group) : (total_k_groups - 1));
         int safe_scale_k_group = _min_14;
-        bool valid_scale = stage_valid && lane < 16 && global_scale_k_group < total_k_groups;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(v41_cute_k256_p2_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+        bool valid_scale = stage_valid && global_scale_k_group < total_k_groups;
+        if (lane < 16) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(v41_cute_k256_p2_scale_addr + (unsigned int)(scale_chunk * 16)), "l"(B_descale + (safe_scale_k_group * N + off_n + local_scale_n)), "r"((valid_scale) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
         int k_tiles_59 = (K + 256 - 1) / 256;
         bool stage_valid_60 = k_tiles_59 > 1;
@@ -62680,9 +62714,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
         int global_scale_k_group_142 = safe_local_kt_61 * 16 + local_scale_k_group_140;
         int _min_29 = ((global_scale_k_group_142) < (total_k_groups_62 - 1) ? (global_scale_k_group_142) : (total_k_groups_62 - 1));
         int safe_scale_k_group_143 = _min_29;
-        bool valid_scale_144 = stage_valid_60 && lane < 16 && global_scale_k_group_142 < total_k_groups_62;
-        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-            :: "r"(v41_cute_k256_p2_scale_addr + 17408 + (unsigned int)(scale_chunk_139 * 16)), "l"(B_descale + (safe_scale_k_group_143 * N + off_n + local_scale_n_141)), "r"((valid_scale_144) ? 16 : 0));
+        bool valid_scale_144 = stage_valid_60 && global_scale_k_group_142 < total_k_groups_62;
+        if (lane < 16) {
+            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                :: "r"(v41_cute_k256_p2_scale_addr + 17408 + (unsigned int)(scale_chunk_139 * 16)), "l"(B_descale + (safe_scale_k_group_143 * N + off_n + local_scale_n_141)), "r"((valid_scale_144) ? 16 : 0));
+        }
         asm volatile("cp.async.commit_group;");
         unsigned int a_frag[4];
         unsigned int raw0[1];
@@ -64820,9 +64856,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
             int global_scale_k_group_86 = safe_local_kt_3 * 16 + local_scale_k_group_84;
             int _min_44 = ((global_scale_k_group_86) < (total_k_groups_4 - 1) ? (global_scale_k_group_86) : (total_k_groups_4 - 1));
             int safe_scale_k_group_87 = _min_44;
-            bool valid_scale_88 = stage_valid_2 && lane < 16 && global_scale_k_group_86 < total_k_groups_4;
-            asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
-                :: "r"(v41_cute_k256_p2_scale_addr + (unsigned int)(stage * 17408) + (unsigned int)(scale_chunk_83 * 16)), "l"(B_descale + (safe_scale_k_group_87 * N + off_n + local_scale_n_85)), "r"((valid_scale_88) ? 16 : 0));
+            bool valid_scale_88 = stage_valid_2 && global_scale_k_group_86 < total_k_groups_4;
+            if (lane < 16) {
+                asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
+                    :: "r"(v41_cute_k256_p2_scale_addr + (unsigned int)(stage * 17408) + (unsigned int)(scale_chunk_83 * 16)), "l"(B_descale + (safe_scale_k_group_87 * N + off_n + local_scale_n_85)), "r"((valid_scale_88) ? 16 : 0));
+            }
             asm volatile("cp.async.commit_group;");
         }
         asm volatile("cp.async.wait_group 0;");
