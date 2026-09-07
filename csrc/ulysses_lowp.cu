@@ -322,6 +322,7 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
   const int64_t local_sequence = q.size(1);
   const int64_t num_heads = q.size(2);
   const int64_t head_dim = q.size(3);
+  TVM_FFI_ICHECK_EQ(num_heads % world_size, 0) << "num_heads must be divisible by world_size";
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
@@ -391,6 +392,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
   const int64_t local_sequence = k.size(1);
   const int64_t num_heads = k.size(2);
   const int64_t head_dim = k.size(3);
+  TVM_FFI_ICHECK_EQ(num_heads % world_size, 0) << "num_heads must be divisible by world_size";
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
@@ -456,6 +458,7 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
   const int64_t local_sequence = q.size(1);
   const int64_t num_heads = q.size(2);
   const int64_t head_dim = q.size(3);
+  TVM_FFI_ICHECK_EQ(num_heads % world_size, 0) << "num_heads must be divisible by world_size";
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
       lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
@@ -521,6 +524,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
   const int64_t local_sequence = k.size(1);
   const int64_t num_heads = k.size(2);
   const int64_t head_dim = k.size(3);
+  TVM_FFI_ICHECK_EQ(num_heads % world_size, 0) << "num_heads must be divisible by world_size";
   const int64_t local_heads = num_heads / world_size;
   const int64_t global_sequence = local_sequence * world_size;
   TVM_FFI_ICHECK(used_sequence <= global_sequence)

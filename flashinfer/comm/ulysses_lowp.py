@@ -2018,7 +2018,8 @@ class UlyssesLowpSageLayoutSM90:
             mod = get_ulysses_lowp_sm90_module()
             q_g = int(mod.ulysses_lowp_compiled_q_group())
             k_g = int(mod.ulysses_lowp_compiled_k_group())
-            return q_g == self.Q_GROUP and k_g == self.K_GROUP
+            h_d = int(mod.ulysses_lowp_compiled_head_dim())
+            return q_g == self.Q_GROUP and k_g == self.K_GROUP and h_d == self.HEAD_DIM
         except Exception:  # noqa: BLE001
             return False
 
