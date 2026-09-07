@@ -578,6 +578,28 @@ def test_route_defaults_to_auto(monkeypatch):
     assert probe_ulysses_rank_topology(None, rank=0).route == "auto"
 
 
+def test_nics_env_is_recorded_verbatim(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", "mlx5_1,mlx5_0")
+    assert probe_ulysses_rank_topology(None, rank=0).nics == "mlx5_1,mlx5_0"
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_NICS", raising=False)
+    assert probe_ulysses_rank_topology(None, rank=0).nics == ""
+
+
+def test_explicit_pcie_falls_back_on_nics_disagreement():
+    """A NIC list exported on some ranks only is caught as such, not as a
+    duplicate NIC or silently divergent routing."""
+    topos = _pcie_mesh()
+    for topo in topos:
+        topo.nics = ",".join(f"mlx5_{i}" for i in range(8))
+    topos[3].nics = ""
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "disagree on FLASHINFER_ULYSSES_PCIE_NICS" in decision.reason
+
+
 def test_explicit_pcie_route_disagreement_raises():
     topos = _pcie_mesh()
     topos[0].route = "p2p"
