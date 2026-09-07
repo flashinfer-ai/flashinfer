@@ -675,11 +675,11 @@ def _make_program(
                 if cutlass.const_expr(mode == 1):
                     lo = lo * nw[2 * j]
                     hi = hi * nw[2 * j + 1]
-                qq = cvt_2xf32_to_bf16x2(lo * r, hi * r)
-                ylo, yhi = cvt_bf16x2_to_2xf32(qq)
+                ylo = lo * r
+                yhi = hi * r
                 if cutlass.const_expr(mode == 0):
-                    qq = cvt_2xf32_to_bf16x2(ylo * nw[2 * j], yhi * nw[2 * j + 1])
-                    ylo, yhi = cvt_bf16x2_to_2xf32(qq)
+                    ylo = ylo * nw[2 * j]
+                    yhi = yhi * nw[2 * j + 1]
                 accs[2 * j] = accs[2 * j] + ylo * wk
                 accs[2 * j + 1] = accs[2 * j + 1] + yhi * wk
 

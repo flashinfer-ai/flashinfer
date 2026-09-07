@@ -20,6 +20,13 @@ TOPK = 8
 HIDDEN_SIZE = 4096
 
 
+def _assert_model_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    delta = actual.float() - expected.float()
+    rel_l2 = delta.norm() / expected.float().norm().clamp_min(1e-12)
+    assert rel_l2 < 1e-3
+    assert delta.abs().max() <= 0.03125
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
@@ -34,6 +41,31 @@ def _reference(
     gain_center: float,
     weight_before_norm: bool,
 ) -> torch.Tensor:
+    rows = partial_rows.float()
+    dist.all_reduce(rows)
+    rows = rows.to(torch.bfloat16).float()
+    if weight_before_norm:
+        rows *= norm_weight.float() + gain_center
+    inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + eps)
+    normalized = rows * inv_rms
+    if not weight_before_norm:
+        normalized *= norm_weight.float() + gain_center
+    return (
+        normalized.mul(expert_weights.float().unsqueeze(-1))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+
+def _rounded_reference(
+    partial_rows: torch.Tensor,
+    expert_weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    weight_before_norm: bool,
+) -> torch.Tensor:
+    """The obsolete contract with an expert-local BF16 normalization store."""
     rows = partial_rows.float()
     dist.all_reduce(rows)
     rows = rows.to(torch.bfloat16).float()
@@ -130,13 +162,72 @@ def _worker(local_rank: int, master_port: int) -> None:
                 gain_center=1.0,
                 weight_before_norm=weight_before_norm,
             )
-            torch.testing.assert_close(output, expected, atol=0.03125, rtol=0.015625)
+            _assert_model_close(output, expected)
 
             gathered = [torch.empty_like(output) for _ in range(WORLD_SIZE)]
             dist.all_gather(gathered, output)
             assert all(
                 torch.equal(gathered[0], rank_output) for rank_output in gathered
             )
+
+    # Isolate post-collective arithmetic by making the other three ranks
+    # contribute exact zeros. This must prefer the FP32-until-final contract
+    # over the obsolete expert-local BF16 round.
+    contract_tokens = 17
+    shared = torch.Generator(device=device).manual_seed(7000)
+    rank0_rows = torch.randn(
+        contract_tokens,
+        TOPK,
+        HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=shared,
+    )
+    contract_rows = rank0_rows if local_rank == 0 else torch.zeros_like(rank0_rows)
+    contract_weights = torch.randn(
+        contract_tokens,
+        TOPK,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=shared,
+    )
+    contract_norm = torch.randn(
+        HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=shared,
+    )
+    for weight_before_norm in (False, True):
+        expected = _reference(
+            contract_rows,
+            contract_weights,
+            contract_norm,
+            1e-8,
+            1.0,
+            weight_before_norm,
+        )
+        rounded = _rounded_reference(
+            contract_rows,
+            contract_weights,
+            contract_norm,
+            1e-8,
+            1.0,
+            weight_before_norm,
+        )
+        assert torch.count_nonzero(expected != rounded) > 0
+        output = torch.empty_like(expected)
+        tp_moe_finalize_rmsnorm(
+            contract_rows,
+            contract_weights,
+            contract_norm,
+            output,
+            eps=1e-8,
+            gain_center=1.0,
+            weight_before_norm=weight_before_norm,
+        )
+        fp32_error = (output.float() - expected.float()).abs().mean()
+        rounded_error = (output.float() - rounded.float()).abs().mean()
+        assert fp32_error < rounded_error
 
     graph_rows_generator = torch.Generator(device=device).manual_seed(3000 + local_rank)
     graph_rows = torch.randn(
@@ -189,7 +280,7 @@ def _worker(local_rank: int, master_port: int) -> None:
         graph_rows.normal_(generator=replay_generator)
         expected = _reference(graph_rows, graph_weights, graph_norm, 1e-4, 1.0, True)
         graph.replay()
-        torch.testing.assert_close(graph_output, expected, atol=0.03125, rtol=0.015625)
+        _assert_model_close(graph_output, expected)
     dist.destroy_process_group()
 
 
