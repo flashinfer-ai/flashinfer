@@ -39,6 +39,9 @@ from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
 )
+from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import autotune_v2 as autotune_v2
+from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
@@ -125,6 +128,8 @@ with contextlib.suppress(ImportError):
         CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 

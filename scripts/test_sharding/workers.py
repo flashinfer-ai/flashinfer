@@ -208,13 +208,12 @@ def _forward_pytest_output(
             log.flush()
         nodeid = str(event.get("nodeid", ""))
         if event.get("event") == "start":
-            function, should_print = progress.start(
+            _, should_print = progress.start(
                 nodeid, float(event.get("started_at", time.time()))
             )
             if should_print:
                 state.emit(
-                    f"PYTEST START worker={worker_index} batch={batch_id} "
-                    f"function={function} node={nodeid}"
+                    f"PYTEST START worker={worker_index} batch={batch_id} node={nodeid}"
                 )
         elif event.get("event") == "finish":
             outcome = str(event.get("outcome", "unknown"))

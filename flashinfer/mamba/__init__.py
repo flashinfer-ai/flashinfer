@@ -15,13 +15,17 @@ limitations under the License.
 """
 
 from .cake_selective_state_update import cake_selective_state_update
-from .checkpointing_ssu import checkpointing_ssu
 from .selective_state_update import selective_state_update
+from .checkpointing_ssu import (
+    allocate_checkpointing_ssu_scratch,
+    checkpointing_ssu,
+)
 
 __all__ = [
     "cake_selective_state_update",
     "selective_state_update",
     "checkpointing_ssu",
+    "allocate_checkpointing_ssu_scratch",
 ]
 
 try:

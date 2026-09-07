@@ -181,6 +181,24 @@ jobs:
         with:
           submodules: true
 
+      - name: Build patched sccache (${{ matrix.arch }})
+        if: ${{ matrix.cuda.label == 'cu134' }}
+        env:
+          CUDA_VERSION: ${{ matrix.cuda.version }}
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
+          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/ci-cache"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
+            -e CUDA_VERSION \
+            -e SCCACHE_PATCHED_BINARY_PATH \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash /workspace/scripts/build_patched_sccache.sh
+        timeout-minutes: 30
+
       - name: Build wheel in container
         env:
           ARCH: ${{ matrix.arch }}
@@ -195,6 +213,7 @@ jobs:
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
           PYTORCH_INDEX: ${{ matrix.cuda.pytorch_index }}
           SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
         run: |
           # Extract CUDA major and minor versions
@@ -218,6 +237,7 @@ jobs:
             -e FLASHINFER_CUDA_ARCH_LIST \
             -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
             -e SCCACHE_BUCKET \
+            -e SCCACHE_PATCHED_BINARY_PATH \
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_REGION \

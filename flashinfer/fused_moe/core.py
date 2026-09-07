@@ -252,6 +252,26 @@ class TrtllmDaBodyCaptureStream:
 
 
 @functools.cache
+def _device_support_moe_pdl(device: torch.device) -> bool:
+    """PDL gate for the trtllm-gen fused-MoE pipeline.
+
+    On SM107 (Rubin), PDL in this pipeline intermittently fails with
+    "unspecified launch failure" and occasional hangs. A/B stress runs on Rubin
+    hardware isolated the trigger: with PDL enabled the renormalize-routing
+    tests crash across routing modes (split-topK on/off), dtypes
+    (BF16/MxFP4/MxInt4) and autotune on/off -- 4 crashes in ~21 full-file runs
+    -- while the same loop with PDL fully disabled ran clean.
+
+    Disable PDL here until the launch-dependency chain is audited for Rubin
+    timing. The CUTLASS MoE path is deliberately left alone: it has soaked with
+    PDL enabled on Rubin for 9+ nights without a crash.
+    """
+    if get_compute_capability(device) == (10, 7):
+        return False
+    return device_support_pdl(device)
+
+
+@functools.cache
 def _get_trtllm_da_body_capture_stream(
     device_index: int,
 ) -> TrtllmDaBodyCaptureStream:
@@ -1861,6 +1881,33 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 num_experts if num_experts is not None else num_local_experts
             )
 
+        def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+            # runner_hash is excluded from persisted (v2) file keys because it
+            # is not stable across processes, so every constructor-fixed option
+            # that selects a tactic but is NOT derivable from the profiled
+            # tensor shapes must be named here. Otherwise two runners with
+            # identical tensor profiles but different config (activation, weight
+            # layout, quantization, expert structure, ...) alias to one stored
+            # entry and clobber / mis-serve each other. Mirrors the CUTLASS
+            # MoERunner in get_cutlass_fused_moe_module. Enums -> int keeps the
+            # key JSON-round-trippable for the store's in-memory preload.
+            return (
+                int(self.top_k),
+                int(self.num_local_experts),
+                int(self.num_experts),
+                int(self.num_fused_shared_experts),
+                int(self.dtype_act),
+                int(self.dtype_weights),
+                int(self.fp8_quantization_type),
+                int(self.hidden_size),
+                int(self.intermediate_size),
+                int(self.activation_type),
+                bool(self.use_shuffled_weight),
+                int(self.weight_layout),
+                bool(self.use_packed_weights),
+                bool(self.use_per_token_scaling),
+            )
+
         def _make_tuning_config(
             self,
             moe_inputs: "MoeRunnerInputs",
@@ -2670,6 +2717,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
@@ -2948,6 +2997,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
 
@@ -3186,6 +3237,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
 
@@ -3661,6 +3714,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
@@ -4039,6 +4094,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
@@ -4354,6 +4411,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        if not _device_support_moe_pdl(hidden_states.device):
+            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
