@@ -174,8 +174,10 @@ def validate_arch_for_backend(backend: str) -> None:
     """Check the GPU arch and CUDA version are supported by `backend`."""
     import torch
 
-    # The EP runtime wheels (nccl4py, nvidia-nccl-cu13, nixl-cu13) are
-    # CUDA-13-only, so a torch built for CUDA 12 can't drive either backend —
+    # The EP runtime stack is CUDA-13-only here: nvidia-nccl-cu13 and
+    # nixl-cu13 ship CUDA-13 binaries only. (nccl-extensions itself bundles
+    # both cu12 and cu13 libnccl_ep.so, but the rest of the stack does not.)
+    # So a torch built for CUDA 12 can't drive either backend —
     # fail here with a clear message instead of a cryptic dlopen error later.
     # Parse defensively: custom/nightly torch builds can carry version
     # strings this check shouldn't crash on; skip it when unparseable.
@@ -186,8 +188,8 @@ def validate_arch_for_backend(backend: str) -> None:
         cuda_major = None
     if cuda_major is not None and cuda_major < 13:
         raise MoEEpConfigError(
-            f"{backend} requires CUDA 13: the EP runtime wheels (nccl4py, "
-            f"nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "
+            f"{backend} requires CUDA 13: the EP runtime wheels "
+            f"(nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "
             f"the installed torch was built for CUDA {cuda_ver}. Install a "
             "CUDA-13 torch build to use flashinfer.moe_ep."
         )

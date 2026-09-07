@@ -38,11 +38,14 @@
 #
 # Build args:
 #   CUDA_IMAGE   — base image (default: the 26.05 PyTorch image).
-#   FI_NCCL_VERSION — nvidia-nccl-cu13 pin (default 2.30.7, matching nccl4py
-#                  0.3.1). FI_-prefixed because the base image's ENV
+#   FI_NCCL_VERSION — nvidia-nccl-cu13 pin (default 2.30.7, matching
+#                  nccl-extensions 0.1.0). FI_-prefixed because the base image's ENV
 #                  NCCL_VERSION (Debian version, e.g. 2.28.3-1) would override
 #                  a same-named ARG inside RUN and break the pip pin.
-#   NCCL4PY_SPEC — nccl4py pin (default nccl4py[cu13]==0.3.1).
+#   NCCL_EXT_SPEC — nccl-extensions pin (default nccl-extensions[cu13]==0.1.0);
+#                  ships nccl.ep since it moved out of nccl4py in 0.4.1.
+#   NCCL4PY_SPEC — nccl4py pin (default nccl4py[cu13]==0.5.0); ships
+#                  nccl.core.Communicator in the same `nccl` namespace.
 
 ARG CUDA_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 FROM ${CUDA_IMAGE}
@@ -69,12 +72,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # keeps the base torch intact; nccl.ep also imports cuda.core / cuda.bindings,
 # installed explicitly at ep_bench's exact versions.
 ARG FI_NCCL_VERSION=2.30.7
-ARG NCCL4PY_SPEC=nccl4py[cu13]==0.3.1
+ARG NCCL4PY_SPEC=nccl4py[cu13]==0.5.0
+ARG NCCL_EXT_SPEC=nccl-extensions[cu13]==0.1.0
 ARG CUDA_CORE_VERSION=1.0.1
 ARG CUDA_BINDINGS_VERSION=13.2.0
 RUN PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
         "nvidia-nccl-cu13==${FI_NCCL_VERSION}" \
         "${NCCL4PY_SPEC}" \
+        "${NCCL_EXT_SPEC}" \
     && PIP_CONSTRAINT= pip install --no-cache-dir \
         "cuda-core==${CUDA_CORE_VERSION}" \
         "cuda-bindings==${CUDA_BINDINGS_VERSION}" \
@@ -87,7 +92,7 @@ print('nccl.ep OK; libnccl', v.value); assert v.value>=23007"
 # Build & install FlashInfer with the NCCL-EP backend only.
 # --no-build-isolation uses the base image's python/torch for the build hook
 # (so meson/torch are found); BUILD_NIXL_EP=0 opts out of the (default-on)
-# NIXL-EP submodule build. NCCL-EP needs no build step — the nccl4py wheel is
+# NIXL-EP submodule build. NCCL-EP needs no build step — the nccl-extensions wheel is
 # a base dependency (already pinned above; the >= constraint no-ops).
 ARG BUILD_NCCL_EP=1
 ARG BUILD_NIXL_EP=0
