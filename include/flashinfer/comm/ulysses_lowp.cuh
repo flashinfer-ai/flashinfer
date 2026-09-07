@@ -220,10 +220,10 @@ struct ChunkSpec {
 };
 
 inline ChunkSpec chunk_spec(int64_t batch_size, int64_t local_sequence, int64_t local_heads,
-                            int64_t head_dim) {
+                            int64_t head_dim, uint32_t q_group = 32, uint32_t k_group = 64) {
   ChunkSpec spec;
-  spec.q_slots = slots(local_sequence, 32);
-  spec.k_slots = slots(local_sequence, 64);
+  spec.q_slots = slots(local_sequence, q_group);
+  spec.k_slots = slots(local_sequence, k_group);
   spec.main_bytes = batch_size * local_sequence * local_heads * head_dim;
   spec.q_scale_bytes =
       batch_size * local_heads * spec.q_slots * static_cast<int64_t>(sizeof(float));
@@ -458,7 +458,7 @@ __global__ void GroupedAmaxKernel(const T* __restrict__ input, const T* __restri
                                   const int64_t stride_batch, const int64_t stride_token,
                                   const int64_t stride_head) {
   static_assert(head_dim == 128);
-  static_assert(GROUP == 32 || GROUP == 64);
+  static_assert(GROUP == 16 || GROUP == 32 || GROUP == 64 || GROUP == 128);
   constexpr uint32_t pack_size = 8;
   constexpr uint32_t threads_per_token = head_dim / pack_size;
   const uint32_t slot = blockIdx.x;
@@ -530,7 +530,7 @@ __global__ void QuantInt8GroupScalePackKernel(
     const uint32_t slots_alloc, const uint32_t group_first, const int64_t stride_batch,
     const int64_t stride_token, const int64_t stride_head) {
   static_assert(head_dim == 128);
-  static_assert(GROUP == 32 || GROUP == 64);
+  static_assert(GROUP == 16 || GROUP == 32 || GROUP == 64 || GROUP == 128);
   constexpr uint32_t pack_size = 8;
   constexpr uint32_t threads_per_token = head_dim / pack_size;
   const uint32_t slot = blockIdx.x;
@@ -631,7 +631,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
     const uint32_t group_first, const uint32_t amax_exclude_group, const uint32_t used_sequence,
     const int64_t stride_batch, const int64_t stride_token, const int64_t stride_head) {
   static_assert(head_dim == 128);
-  static_assert(GROUP == 32 || GROUP == 64);
+  static_assert(GROUP == 16 || GROUP == 32 || GROUP == 64 || GROUP == 128);
   constexpr uint32_t pack_size = 8;
   constexpr uint32_t threads_per_token = head_dim / pack_size;
   const uint32_t slot = blockIdx.x;
@@ -730,7 +730,7 @@ __global__ void QuantInt8FusedAmaxPackKernel(
 // straight per-chunk copy -- no cross-chunk gather, no token-validity tail
 // (padded_sequence == logical_sequence), no unused scale slots
 // (scale_alloc == groups_total).
-template <uint32_t head_dim, uint32_t CTA_SIZE>
+template <uint32_t head_dim, uint32_t CTA_SIZE, uint32_t Q_GROUP = 32, uint32_t K_GROUP = 64>
 __global__ void UnpackForSageKernel(const uint8_t* __restrict__ input, uint8_t* __restrict__ q,
                                     uint8_t* __restrict__ k, uint8_t* __restrict__ v,
                                     uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale,
@@ -818,8 +818,8 @@ __global__ void UnpackForSageKernel(const uint8_t* __restrict__ input, uint8_t* 
   const uint64_t q_scale_chunk_bytes =
       static_cast<uint64_t>(batch_size) * local_heads * q_slots_per_source * sizeof(float);
   const uint64_t scale_head = static_cast<uint64_t>(batch_id) * local_heads + local_head;
-  const uint32_t q_groups_per_source = local_sequence / 32;
-  const uint32_t k_groups_per_source = local_sequence / 64;
+  const uint32_t q_groups_per_source = local_sequence / Q_GROUP;
+  const uint32_t k_groups_per_source = local_sequence / K_GROUP;
 
   for (uint32_t g = thread_id; g < q_scale_alloc; g += blockDim.x) {
     const uint32_t owner = g / q_groups_per_source;
@@ -849,7 +849,7 @@ __global__ void UnpackForSageKernel(const uint8_t* __restrict__ input, uint8_t* 
 // the scale rebuild is owner-only with deterministic zeroing of the unused
 // tail slots (scale_alloc may exceed groups_total here).  Bit-exact port of
 // the SageAttention protocol-2 kernel (p2-upstream-prep @8a1d1f6).
-template <uint32_t head_dim, uint32_t CTA_SIZE>
+template <uint32_t head_dim, uint32_t CTA_SIZE, uint32_t Q_GROUP = 32, uint32_t K_GROUP = 64>
 __global__ void UnpackForSageUnalignedKernel(
     const uint8_t* __restrict__ input, uint8_t* __restrict__ q, uint8_t* __restrict__ k,
     uint8_t* __restrict__ v, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale,
@@ -936,14 +936,14 @@ __global__ void UnpackForSageUnalignedKernel(
   const uint64_t q_scale_chunk_bytes =
       static_cast<uint64_t>(batch_size) * local_heads * q_slots_per_source * sizeof(float);
   const uint64_t scale_head = static_cast<uint64_t>(batch_id) * local_heads + local_head;
-  const uint32_t q_groups_total = (logical_sequence + 31) / 32;
-  const uint32_t k_groups_total = (logical_sequence + 63) / 64;
+  const uint32_t q_groups_total = (logical_sequence + Q_GROUP - 1) / Q_GROUP;
+  const uint32_t k_groups_total = (logical_sequence + K_GROUP - 1) / K_GROUP;
 
   for (uint32_t g = thread_id; g < q_scale_alloc; g += blockDim.x) {
     uint32_t value = 0u;
     if (g < q_groups_total) {
-      const uint32_t owner = (g * 32) / local_sequence;
-      const uint32_t owner_first = (owner * local_sequence) / 32;
+      const uint32_t owner = (g * Q_GROUP) / local_sequence;
+      const uint32_t owner_first = (owner * local_sequence) / Q_GROUP;
       const uint32_t owner_slot = g - owner_first;
       const uint32_t* q_scale_input = reinterpret_cast<const uint32_t*>(
           input + static_cast<uint64_t>(owner) * chunk_bytes + q_scale_section);
@@ -954,8 +954,8 @@ __global__ void UnpackForSageUnalignedKernel(
   for (uint32_t g = thread_id; g < k_scale_alloc; g += blockDim.x) {
     uint32_t value = 0u;
     if (g < k_groups_total) {
-      const uint32_t owner = (g * 64) / local_sequence;
-      const uint32_t owner_first = (owner * local_sequence) / 64;
+      const uint32_t owner = (g * K_GROUP) / local_sequence;
+      const uint32_t owner_first = (owner * local_sequence) / K_GROUP;
       const uint32_t owner_slot = g - owner_first;
       const uint32_t* k_scale_input =
           reinterpret_cast<const uint32_t*>(input + static_cast<uint64_t>(owner) * chunk_bytes +

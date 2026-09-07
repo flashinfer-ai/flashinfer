@@ -44,6 +44,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_lowp_module
+from ..jit.comm import gen_ulysses_lowp_sm90_module
 from ..trace.templates.comm import (
     ulysses_lowp_k_grouped_amax_trace,
     ulysses_lowp_k_sum_v_amax_trace,
@@ -116,6 +117,12 @@ def owner(group_id: int, local_sequence: int, group: int) -> int:
 # ---------------------------------------------------------------------------
 # JIT module loading
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def get_ulysses_lowp_sm90_module():
+    """Load (and cache) the SM90 low-precision Ulysses module (Q_GROUP=16, K_GROUP=128)."""
+    return gen_ulysses_lowp_sm90_module().build_and_load()
 
 
 @functools.cache
@@ -426,7 +433,7 @@ def capability(
 
     Supported means the compiled kernel's layout constants (Q_GROUP, K_GROUP,
     HEAD_DIM) match the Python-side values and the device capability is
-    ``(12, 0)`` (SM120).
+    ``(8, 9)`` (SM89) or ``(12, 0)`` (SM120).
     """
 
     device_capability = None
@@ -456,7 +463,7 @@ def capability(
         and compiled_k_group == K_GROUP
         and compiled_head_dim == HEAD_DIM
     )
-    supported = bool(layout_match and device_capability == (12, 0))
+    supported = bool(layout_match and device_capability in {(8, 9), (12, 0)})
     return {
         "compiled_q_group": compiled_q_group,
         "compiled_k_group": compiled_k_group,
@@ -1829,9 +1836,9 @@ class UlyssesLowpSageLayout:
         K_GROUP = 64   # 4 × HMMA M=16 tile
         HEAD_DIM = 128
 
-    A future SM90 WGMMA variant (Q_GROUP=16, K_GROUP=128) would be a separate
-    subclass; the orchestration layer accepts any ``UlyssesLowpSageLayout``
-    instance without modification.
+    Supports SM89 (Ada L40S / RTX 4090) and SM120 (RTX 5090 / Blackwell
+    consumer) — both use the same ``per_warp_int8`` HMMA tile sizes.
+    For SM90 (H100/H200), use :class:`UlyssesLowpSageLayoutSM90`.
     """
 
     Q_GROUP: int = Q_GROUP
@@ -1848,7 +1855,7 @@ class UlyssesLowpSageLayout:
         device: Optional[Union[int, str, torch.device]] = None,
     ) -> bool:
         """Return True when the compiled kernel matches this layout and the
-        device is supported (SM120 for this layout)."""
+        device is SM89 (Ada) or SM120 (Blackwell consumer)."""
         return bool(capability(device=device).get("supported"))
 
     # ── payload geometry ────────────────────────────────────────────────────
@@ -1963,6 +1970,455 @@ class UlyssesLowpSageLayout:
             out=out,
             enable_pdl=enable_pdl,
         )
+
+
+# SM90-specific constants (Hopper H100/H200).
+# SageAttention2's WGMMA-based SM90 kernel uses warp-group-level MMA with
+# CTA_Q=64 tokens (4 warps × 16 tokens/warp) → per-warp Q scale granularity
+# = 16 tokens.  CTA_K=128 tokens; per-block K scale granularity = 128 tokens.
+Q_GROUP_SM90: int = 16
+K_GROUP_SM90: int = 128
+
+
+class UlyssesLowpSageLayoutSM90:
+    """Ulysses low-precision layout for SM90 (Hopper H100/H200).
+
+    Identical interface to :class:`UlyssesLowpSageLayout` but targets
+    SageAttention2's WGMMA-based SM90 attention kernel, which expects a
+    different quantization granularity: Q per-16-token, K per-128-token.
+    """
+
+    Q_GROUP: int = Q_GROUP_SM90
+    K_GROUP: int = K_GROUP_SM90
+    HEAD_DIM: int = HEAD_DIM
+    V_SCALE_MAX: float = V_SCALE_MAX
+    KSUM_CHUNK_TOKENS: int = KSUM_CHUNK_TOKENS
+    SUPPORTED_STATS_PROTOCOLS = SUPPORTED_STATS_PROTOCOLS
+
+    # ── capability ────────────────────────────────────────────────────────────
+
+    def is_supported(self, device=None) -> bool:
+        """Return True when the device is SM90 (H100/H200) and the SM90 kernel
+        compiled constants match Q_GROUP=16, K_GROUP=128."""
+        device_capability = None
+        if torch.cuda.is_available():
+            if isinstance(device, int):
+                cuda_device = torch.device("cuda", device)
+            elif device is None:
+                cuda_device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                cuda_device = torch.device(device)
+            if cuda_device.type == "cuda":
+                if cuda_device.index is None:
+                    cuda_device = torch.device("cuda", torch.cuda.current_device())
+                device_capability = tuple(torch.cuda.get_device_capability(cuda_device))
+        if device_capability != (9, 0):
+            return False
+        try:
+            mod = get_ulysses_lowp_sm90_module()
+            q_g = int(mod.ulysses_lowp_compiled_q_group())
+            k_g = int(mod.ulysses_lowp_compiled_k_group())
+            return q_g == self.Q_GROUP and k_g == self.K_GROUP
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ── payload geometry ──────────────────────────────────────────────────────
+
+    def payload_spec(
+        self,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        num_heads: int,
+        world_size: int,
+    ) -> Dict[str, Union[int, float]]:
+        """Payload layout for SM90 (Q_GROUP=16, K_GROUP=128)."""
+        if num_heads % world_size:
+            raise ValueError("num_heads must be divisible by world_size")
+        local_heads = num_heads // world_size
+        q_slots = slots(local_sequence, self.Q_GROUP)
+        k_slots = slots(local_sequence, self.K_GROUP)
+        main_bytes = batch_size * local_sequence * local_heads * self.HEAD_DIM
+        q_scale_bytes = batch_size * local_heads * q_slots * 4
+        k_scale_bytes = batch_size * local_heads * k_slots * 4
+        q_scale_offset = 3 * main_bytes
+        k_scale_offset = q_scale_offset + q_scale_bytes
+        raw_chunk_bytes = k_scale_offset + k_scale_bytes
+        chunk_bytes = (raw_chunk_bytes + 127) // 128 * 128
+        logical_sequence = world_size * local_sequence
+        return {
+            "local_heads": local_heads,
+            "q_slots_per_source": q_slots,
+            "k_slots_per_source": k_slots,
+            "logical_sequence": logical_sequence,
+            "padded_sequence": (logical_sequence + 63) // 64 * 64,
+            "q_scale_alloc": (logical_sequence + self.Q_GROUP - 1) // self.Q_GROUP,
+            "k_scale_alloc": (logical_sequence + self.K_GROUP - 1) // self.K_GROUP,
+            "main_bytes": main_bytes,
+            "q_offset": 0,
+            "k_offset": main_bytes,
+            "v_offset": 2 * main_bytes,
+            "q_scale_offset": q_scale_offset,
+            "k_scale_offset": k_scale_offset,
+            "raw_chunk_bytes": raw_chunk_bytes,
+            "chunk_bytes": chunk_bytes,
+            "payload_bytes": world_size * chunk_bytes,
+        }
+
+    # ── protocol routing ──────────────────────────────────────────────────────
+
+    def stats_protocol_for(self, local_sequence: int, world_size: int) -> str:
+        return stats_protocol_for(local_sequence, world_size)
+
+    def required_alignment(self, world_size: int, stats_protocol: str) -> int:
+        return required_alignment(world_size, stats_protocol)
+
+    def aligned_length(self, n_tokens: int, world_size: int, stats_protocol: str) -> int:
+        return aligned_length(n_tokens, world_size, stats_protocol)
+
+    # ── stats flow ────────────────────────────────────────────────────────────
+
+    def local_stats(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rank: int,
+        world_size: int,
+        used_sequence: Optional[int] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, StatsContext]":
+        """Local stats for the AllGather, using SM90 kernels."""
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
+        _validate_nhd_input("k", k)
+        _validate_nhd_input("v", v)
+        world_size = _world_size(world_size)
+        rank = _rank(rank, world_size)
+        protocol = stats_protocol_for(local_sequence, world_size)
+        global_sequence = local_sequence * world_size
+
+        _pdl = _resolve_pdl(enable_pdl, k)
+        mod = get_ulysses_lowp_sm90_module()
+        k_sum, v_amax = self._k_sum_v_amax(k, v, _pdl, mod)
+
+        ctx = StatsContext(
+            stats_protocol=protocol,
+            rank=rank,
+            world_size=world_size,
+            used_sequence=int(used_sequence) if used_sequence is not None else None,
+            batch_size=batch,
+            local_sequence=local_sequence,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            input_dtype=q.dtype,
+            stats_numel=k_sum.numel(),
+        )
+        if protocol == ALIGNED:
+            send = torch.cat([k_sum.flatten(), v_amax.flatten()]).contiguous()
+            return send, ctx
+
+        q_amax = self._q_grouped_amax(q, rank, world_size, _pdl, mod)
+        q_desc = boundary_descriptors(
+            q_amax,
+            rank=rank,
+            local_sequence=local_sequence,
+            group=self.Q_GROUP,
+            world_size=world_size,
+        )
+        k_minmax = self._k_boundary_minmax(k, rank, world_size, used_sequence, mod)
+        ctx.q_amax = q_amax
+        ctx.q_desc_shape = tuple(q_desc.shape)
+        ctx.k_minmax_shape = tuple(k_minmax.shape)
+        send = torch.cat(
+            [k_sum.flatten(), v_amax.flatten(), q_desc.flatten(), k_minmax.flatten()]
+        ).contiguous()
+        return send, ctx
+
+    def finalize_stats(
+        self,
+        gathered: torch.Tensor,
+        ctx: "StatsContext",
+        k: torch.Tensor,
+        *,
+        enable_pdl: Optional[bool] = None,
+    ) -> "V2GStats":
+        """Finalize stats from AllGather, using SM90 kernels."""
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("k", k)
+        world_size = ctx.world_size
+        _pdl = _resolve_pdl(enable_pdl, k)
+        mod = get_ulysses_lowp_sm90_module()
+
+        per_rank = ctx.stats_numel * 2
+        if ctx.stats_protocol == BOUNDARY_MERGE:
+            per_rank += int(math.prod(ctx.q_desc_shape)) + int(
+                math.prod(ctx.k_minmax_shape)
+            )
+        used = ctx.used_sequence
+        denominator = used if used is not None else local_sequence * world_size
+        stat_shape = (batch, num_heads, head_dim)
+        g = gathered.reshape(world_size, per_rank)
+        n_stat = ctx.stats_numel
+        k_mean_global = (
+            (g[:, :n_stat].sum(dim=0).view(stat_shape) / denominator)
+            .to(ctx.input_dtype)
+            .contiguous()
+        )
+        v_scale_global = (
+            g[:, n_stat : 2 * n_stat].amax(dim=0).view(stat_shape) / V_SCALE_MAX
+        ).contiguous()
+        if ctx.stats_protocol == ALIGNED:
+            return V2GStats(
+                stats_protocol=ALIGNED,
+                rank=ctx.rank,
+                world_size=world_size,
+                used_sequence=used,
+                k_mean_global=k_mean_global,
+                v_scale_global=v_scale_global,
+            )
+        n_desc = int(math.prod(ctx.q_desc_shape))
+        merge_boundary_amax(
+            ctx.q_amax,
+            g[:, 2 * n_stat : 2 * n_stat + n_desc]
+            .reshape(world_size, *ctx.q_desc_shape)
+            .contiguous(),
+            rank=ctx.rank,
+            local_sequence=local_sequence,
+            group=self.Q_GROUP,
+            world_size=world_size,
+        )
+        k_amax = self._k_grouped_amax(
+            k, k_mean_global, ctx.rank, world_size, used, _pdl, mod
+        )
+        # derive_k_boundary_amax uses K_GROUP for group_first/touched — pass SM90 K_GROUP
+        self._derive_k_boundary_amax(
+            k_amax,
+            g[:, 2 * n_stat + n_desc :]
+            .reshape(world_size, *ctx.k_minmax_shape)
+            .contiguous(),
+            k_mean_global,
+            ctx.rank,
+            local_sequence,
+            world_size,
+        )
+        return V2GStats(
+            stats_protocol=BOUNDARY_MERGE,
+            rank=ctx.rank,
+            world_size=world_size,
+            used_sequence=used,
+            k_mean_global=k_mean_global,
+            v_scale_global=v_scale_global,
+            q_amax_final=ctx.q_amax,
+            k_amax_final=k_amax,
+        )
+
+    # ── pack / unpack ─────────────────────────────────────────────────────────
+
+    def quant_and_pack(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        stats: "V2GStats",
+        *,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Quantize-and-pack using SM90 kernels (Q_GROUP=16, K_GROUP=128)."""
+        batch, local_sequence, num_heads, head_dim = _validate_nhd_input("q", q)
+        world_size = stats.world_size
+        rank = stats.rank
+        _pdl = _resolve_pdl(enable_pdl, q)
+        mod = get_ulysses_lowp_sm90_module()
+
+        spec = self.payload_spec(
+            batch_size=batch,
+            local_sequence=local_sequence,
+            num_heads=num_heads,
+            world_size=world_size,
+        )
+        if out is None:
+            out = torch.empty(
+                (world_size, spec["chunk_bytes"]),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+        out[:, int(spec["q_scale_offset"]):].zero_()
+
+        if stats.stats_protocol == ALIGNED:
+            mod.ulysses_lowp_quant_q_int8_pack_fused(
+                q, out, rank, world_size, _pdl
+            )
+            used_seq = int(stats.used_sequence) if stats.used_sequence else 0
+            mod.ulysses_lowp_quant_kv_int8_fp8_pack_fused(
+                k, v, stats.k_mean_global, stats.v_scale_global, out,
+                rank, world_size, used_seq, _pdl
+            )
+        else:
+            mod.ulysses_lowp_quant_q_int8_pack(
+                q, stats.q_amax_final, out, rank, world_size, _pdl
+            )
+            mod.ulysses_lowp_quant_kv_int8_fp8_pack(
+                k, v, stats.k_mean_global, stats.k_amax_final, stats.v_scale_global,
+                out, rank, world_size, _pdl
+            )
+        return out
+
+    def unpack_for_sage(
+        self,
+        recv_u8: torch.Tensor,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        local_heads: int,
+        world_size: int,
+        aligned: Optional[bool] = True,
+        scale_sequence: Optional[int] = None,
+        out: Optional[
+            "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]"
+        ] = None,
+        enable_pdl: Optional[bool] = None,
+    ) -> "Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Unpack SM90 payload into SageAttention2 SM90 pre-quantized operands.
+
+        Scale widths follow SageAttention2's WGMMA SM90 kernel indexing:
+        ``ceil(seq/64)*4`` Q slots (4 warps per 64-token CTA_Q) and
+        ``ceil(seq/128)`` K slots (1 scale per 128-token CTA_K).
+        """
+        spec = self.payload_spec(
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            num_heads=local_heads * world_size,
+            world_size=world_size,
+        )
+        if aligned is None:
+            aligned = local_sequence % 128 == 0
+        if aligned and local_sequence % 128:
+            raise ValueError(
+                f"aligned path requires local_sequence % 128 == 0, got {local_sequence}"
+            )
+        logical_sequence = int(spec["logical_sequence"])
+        padded_sequence = int(spec["padded_sequence"])
+        if scale_sequence is None:
+            scale_sequence = logical_sequence
+        # SM90 SageAttention2 WGMMA kernel scale slot counts (per head):
+        #   Q: ceil(seq / 64) * 4  (4 warp-groups per 64-token CTA_Q)
+        #   K: ceil(seq / 128)     (1 scale per 128-token CTA_K)
+        q_scale_width = (int(scale_sequence) + 63) // 64 * 4
+        k_scale_width = (int(scale_sequence) + 127) // 128
+        if out is None:
+            q_logical = torch.empty(
+                (batch_size, logical_sequence, local_heads, self.HEAD_DIM),
+                dtype=torch.int8,
+                device=recv_u8.device,
+            )
+            k_logical = torch.empty_like(q_logical)
+            v_packed = torch.empty(
+                (batch_size, self.HEAD_DIM, local_heads, padded_sequence),
+                dtype=torch.float8_e4m3fn,
+                device=recv_u8.device,
+            )
+            q_scale = torch.empty(
+                (batch_size, local_heads, q_scale_width),
+                dtype=torch.float32,
+                device=recv_u8.device,
+            )
+            k_scale = torch.empty(
+                (batch_size, local_heads, k_scale_width),
+                dtype=torch.float32,
+                device=recv_u8.device,
+            )
+        else:
+            if not isinstance(out, tuple) or len(out) != 5:
+                raise TypeError("out must be a five-tensor global-grid Sage tuple")
+            q_logical, k_logical, v_packed, q_scale, k_scale = out
+        mod = get_ulysses_lowp_sm90_module()
+        fn = (
+            mod.ulysses_lowp_unpack_for_sage
+            if aligned
+            else mod.ulysses_lowp_unpack_for_sage_unaligned
+        )
+        fn(
+            recv_u8,
+            q_logical,
+            k_logical,
+            v_packed,
+            q_scale,
+            k_scale,
+            local_sequence,
+            world_size,
+            int(scale_sequence),
+            _resolve_pdl(enable_pdl, recv_u8),
+        )
+        return q_logical, k_logical, v_packed, q_scale, k_scale
+
+    # ── internal SM90 kernel helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _k_sum_v_amax(k, v, enable_pdl, mod):
+        batch, local_sequence, num_heads, head_dim = k.shape
+        chunks = (local_sequence + KSUM_CHUNK_TOKENS - 1) // KSUM_CHUNK_TOKENS
+        k_sum = torch.zeros((batch, num_heads, head_dim), dtype=torch.float32, device=k.device)
+        v_amax = torch.zeros_like(k_sum)
+        k_partial = torch.zeros((batch, num_heads, chunks, head_dim), dtype=torch.float32, device=k.device)
+        v_partial = torch.zeros_like(k_partial)
+        mod.ulysses_lowp_k_sum_v_amax(k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl)
+        return k_sum, v_amax
+
+    @staticmethod
+    def _q_grouped_amax(q, rank, world_size, enable_pdl, mod):
+        batch, local_sequence, num_heads, _ = q.shape
+        amax = torch.zeros(
+            (batch, num_heads, slots(local_sequence, Q_GROUP_SM90)),
+            dtype=torch.float32, device=q.device,
+        )
+        mod.ulysses_lowp_q_grouped_amax(q, amax, rank, world_size, enable_pdl)
+        return amax
+
+    @staticmethod
+    def _k_boundary_minmax(k, rank, world_size, used_sequence, mod):
+        batch, local_sequence, num_heads, head_dim = k.shape
+        out = torch.empty(
+            (batch, num_heads, 2, 2, head_dim), dtype=torch.float32, device=k.device
+        )
+        global_sequence = local_sequence * world_size
+        used = int(used_sequence) if used_sequence is not None else global_sequence
+        mod.ulysses_lowp_k_boundary_minmax(k, out, rank, world_size, used, False)
+        return out
+
+    @staticmethod
+    def _k_grouped_amax(k, k_mean_global, rank, world_size, used_sequence, enable_pdl, mod):
+        batch, local_sequence, num_heads, head_dim = k.shape
+        amax = torch.zeros(
+            (batch, num_heads, slots(local_sequence, K_GROUP_SM90)),
+            dtype=torch.float32, device=k.device,
+        )
+        used = int(used_sequence) if used_sequence is not None else 0
+        mod.ulysses_lowp_k_grouped_amax(k, k_mean_global, amax, rank, world_size, enable_pdl)
+        return amax
+
+    def _derive_k_boundary_amax(self, grouped_amax, gathered_minmax, k_mean_global,
+                                rank, local_sequence, world_size):
+        """Pure-Python derive using SM90 K_GROUP=128."""
+        mean32 = k_mean_global.float()
+        my_first = group_first(rank, local_sequence, self.K_GROUP)
+        touched_count = touched(rank, local_sequence, self.K_GROUP)
+        for boundary_group in {my_first, my_first + touched_count - 1}:
+            merged = None
+            for other in range(world_size):
+                other_first = group_first(other, local_sequence, self.K_GROUP)
+                other_last = group_last(other, local_sequence, self.K_GROUP)
+                if not other_first <= boundary_group <= other_last:
+                    continue
+                slot = 0 if boundary_group == other_first else 1
+                mn = gathered_minmax[other, :, :, slot, 0]
+                mx = gathered_minmax[other, :, :, slot, 1]
+                contrib = (
+                    torch.maximum(mx - mean32, mean32 - mn).amax(dim=-1).clamp_(min=1e-7)
+                )
+                merged = contrib if merged is None else torch.maximum(merged, contrib)
+            grouped_amax[..., boundary_group - my_first] = merged
+        return grouped_amax
 
 
 @flashinfer_api
@@ -2098,6 +2554,11 @@ def quant_v_fp8_with_scale(
 
 __all__ = [
     "UlyssesLowpSageLayout",
+    "UlyssesLowpSageLayoutSM90",
+    "Q_GROUP_SM90",
+    "K_GROUP_SM90",
+    "gen_ulysses_lowp_sm90_module",
+    "get_ulysses_lowp_sm90_module",
     "HEAD_DIM",
     "KSUM_CHUNK_TOKENS",
     "K_GROUP",

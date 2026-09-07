@@ -70,6 +70,7 @@ from .ulysses import ulysses_a2a as ulysses_a2a
 # with the ulysses_lowp_ prefix, following the vllm_meta_size precedent.
 from .ulysses_lowp import StatsContext as StatsContext
 from .ulysses_lowp import UlyssesLowpSageLayout as UlyssesLowpSageLayout
+from .ulysses_lowp import UlyssesLowpSageLayoutSM90 as UlyssesLowpSageLayoutSM90
 from .ulysses_lowp import V2GStats as V2GStats
 from .ulysses_lowp import aligned_length as aligned_length
 from .ulysses_lowp import capability as ulysses_lowp_capability

@@ -14,17 +14,14 @@
  * limitations under the License.
  */
 
-// TVM-FFI host bindings for the low-precision Ulysses A2A stack (stats
-// protocol 3 / ALIGN-128): fused K-sum/V-amax statistics, V2-G global-grid
-// INT8/FP8 quant-and-pack, and the receiver-side unpack. Kernel logic lives
-// in include/flashinfer/comm/ulysses_lowp.cuh.
+// TVM-FFI host bindings for the low-precision Ulysses A2A stack, SM90
+// (Hopper H100/H200) variant: Q_GROUP=16, K_GROUP=128 to match SageAttention2's
+// WGMMA-based SM90 attention kernel (warp-group-level MMA, CTA_Q=64 tiles).
+// Kernel logic lives in include/flashinfer/comm/ulysses_lowp.cuh.
 //
-// V2-G global-grid (payload ABI v3): V2-G keeps ordinary Sage2's global
-// 32/64-token quantization grids across rank boundaries.  Under ALIGN-128
-// (local_sequence % 128 == 0) no quantization group straddles a rank
-// boundary, so every rank's locally computed grouped amax is already the
-// FINAL per-group scale -- no cross-rank scale merge exists.
-
+// All function names are identical to ulysses_lowp.cu; they live in a
+// separately compiled module (ulysses_lowp_sm90) so there is no symbol
+// collision at link time.
 #include <cstdint>
 #include <utility>
 
@@ -235,16 +232,16 @@ void ulysses_lowp_q_grouped_amax(TensorView q, TensorView amax_out, int64_t rank
   CHECK_DEVICE(q, amax_out);
 
   const int64_t local_sequence = q.size(1);
-  const int64_t slots_alloc = lowp::grid::slots(local_sequence, 32);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 32);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 32) - group_first + 1;
+  const int64_t slots_alloc = lowp::grid::slots(local_sequence, 16);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 16);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 16) - group_first + 1;
   check_shape_3d(amax_out, "amax_out", q.size(0), q.size(2), slots_alloc);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 32;
+    constexpr uint32_t GROUP = 16;
     dim3 grid(touched, q.size(2), q.size(0));
     dim3 block(GROUP * (HEAD_DIM / 8));
     launch_kernel("GroupedAmaxKernel(Q)", enable_pdl,
@@ -277,16 +274,16 @@ void ulysses_lowp_k_grouped_amax(TensorView k, TensorView k_mean, TensorView ama
   check_shape_3d(k_mean, "k_mean", k.size(0), k.size(2), k.size(3));
 
   const int64_t local_sequence = k.size(1);
-  const int64_t slots_alloc = lowp::grid::slots(local_sequence, 64);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 64);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 64) - group_first + 1;
+  const int64_t slots_alloc = lowp::grid::slots(local_sequence, 128);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 128);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 128) - group_first + 1;
   check_shape_3d(amax_out, "amax_out", k.size(0), k.size(2), slots_alloc);
 
   ffi::CUDADeviceGuard device_guard(k.device().device_id);
   const cudaStream_t stream = get_stream(k.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 64;
+    constexpr uint32_t GROUP = 128;
     dim3 grid(touched, k.size(2), k.size(0));
     dim3 block(GROUP * (HEAD_DIM / 8));
     launch_kernel(
@@ -324,9 +321,9 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
   const int64_t head_dim = q.size(3);
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 32);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 32) - group_first + 1;
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 16);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 16) - group_first + 1;
   check_shape_3d(q_amax_final, "q_amax_final", batch_size, num_heads, spec.q_slots);
   check_shape_2d(output, "output", world_size, spec.chunk_bytes);
 
@@ -334,7 +331,7 @@ void ulysses_lowp_quant_q_int8_pack(TensorView q, TensorView q_amax_final, Tenso
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 32;
+    constexpr uint32_t GROUP = 16;
     dim3 grid(touched, num_heads, batch_size);
     dim3 block(GROUP * (HEAD_DIM / 8));
     launch_kernel("QuantInt8GroupScalePackKernel(Q)", enable_pdl,
@@ -393,9 +390,9 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
   const int64_t head_dim = k.size(3);
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 64);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 64) - group_first + 1;
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 128);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 128) - group_first + 1;
   check_shape_3d(k_amax_final, "k_amax_final", batch_size, num_heads, spec.k_slots);
   check_shape_2d(output, "output", world_size, spec.chunk_bytes);
 
@@ -403,7 +400,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack(TensorView k, TensorView v, TensorView 
   const cudaStream_t stream = get_stream(k.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 64;
+    constexpr uint32_t GROUP = 128;
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(GROUP * (HEAD_DIM / 8));
     launch_kernel("QuantInt8GroupScalePackKernel(K)", enable_pdl,
@@ -458,16 +455,16 @@ void ulysses_lowp_quant_q_int8_pack_fused(TensorView q, TensorView output, int64
   const int64_t head_dim = q.size(3);
   const int64_t local_heads = num_heads / world_size;
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 32);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 32) - group_first + 1;
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 16);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 16) - group_first + 1;
   check_shape_2d(output, "output", world_size, spec.chunk_bytes);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 32;
+    constexpr uint32_t GROUP = 16;
     dim3 grid(touched, num_heads, batch_size);
     dim3 block(GROUP * (HEAD_DIM / 8));
     launch_kernel(
@@ -526,9 +523,9 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
   TVM_FFI_ICHECK(used_sequence <= global_sequence)
       << "used_sequence must not exceed local_sequence * world_size";
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
-  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 64);
-  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 64) - group_first + 1;
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
+  const int64_t group_first = lowp::grid::group_first(rank, local_sequence, 128);
+  const int64_t touched = lowp::grid::group_last(rank, local_sequence, 128) - group_first + 1;
   check_shape_2d(output, "output", world_size, spec.chunk_bytes);
 
   // The ONE group mixing live and padded rows (matches the split path's
@@ -544,7 +541,7 @@ void ulysses_lowp_quant_kv_int8_fp8_pack_fused(TensorView k, TensorView v, Tenso
   const cudaStream_t stream = get_stream(k.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
     constexpr uint32_t HEAD_DIM = 128;
-    constexpr uint32_t GROUP = 64;
+    constexpr uint32_t GROUP = 128;
     dim3 k_grid(touched, num_heads, batch_size);
     dim3 k_block(GROUP * (HEAD_DIM / 8));
     launch_kernel("QuantInt8FusedAmaxPackKernel(K)", enable_pdl,
@@ -635,7 +632,7 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
   const int64_t k_scale_alloc = (scale_rows + 63) / 64;
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
   check_shape_4d(k, "k", batch_size, logical_sequence, local_heads, head_dim);
   check_shape_4d(v, "v", batch_size, head_dim, local_heads, padded_sequence);
@@ -651,7 +648,7 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   constexpr uint32_t VECTOR_SIZE = 16;
   dim3 grid(padded_sequence / CTA_SIZE, local_heads, batch_size);
   dim3 block(CTA_SIZE * HEAD_DIM / VECTOR_SIZE);
-  launch_kernel("UnpackForSageKernel", enable_pdl, (lowp::UnpackForSageKernel<HEAD_DIM, CTA_SIZE, 32, 64>),
+  launch_kernel("UnpackForSageKernel", enable_pdl, (lowp::UnpackForSageKernel<HEAD_DIM, CTA_SIZE, 16, 128>),
                 grid, block, stream, static_cast<const uint8_t*>(input.data_ptr()),
                 static_cast<uint8_t*>(q.data_ptr()), static_cast<uint8_t*>(k.data_ptr()),
                 static_cast<uint8_t*>(v.data_ptr()), static_cast<uint8_t*>(q_scale.data_ptr()),
@@ -723,7 +720,7 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   const int64_t q_scale_alloc = (scale_rows + 127) / 128 * 4;
   const int64_t k_scale_alloc = (scale_rows + 63) / 64;
   const lowp::grid::ChunkSpec spec =
-      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim);
+      lowp::grid::chunk_spec(batch_size, local_sequence, local_heads, head_dim, 16, 128);
   TVM_FFI_ICHECK_EQ(q.size(1), logical_sequence) << "q logical sequence shape is incorrect";
   check_shape_4d(k, "k", batch_size, logical_sequence, local_heads, head_dim);
   check_shape_4d(v, "v", batch_size, head_dim, local_heads, padded_sequence);
@@ -740,7 +737,7 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   dim3 grid(padded_sequence / CTA_SIZE, local_heads, batch_size);
   dim3 block(CTA_SIZE * HEAD_DIM / VECTOR_SIZE);
   launch_kernel("UnpackForSageUnalignedKernel", enable_pdl,
-                (lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE, 32, 64>), grid, block, stream,
+                (lowp::UnpackForSageUnalignedKernel<HEAD_DIM, CTA_SIZE, 16, 128>), grid, block, stream,
                 static_cast<const uint8_t*>(input.data_ptr()), static_cast<uint8_t*>(q.data_ptr()),
                 static_cast<uint8_t*>(k.data_ptr()), static_cast<uint8_t*>(v.data_ptr()),
                 static_cast<uint8_t*>(q_scale.data_ptr()),
@@ -754,8 +751,8 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
 
 // Layout constants exported so the Python layer can verify the compiled kernel
 // matches its expectations without relying on an opaque version integer.
-int64_t ulysses_lowp_compiled_q_group() { return 32; }
-int64_t ulysses_lowp_compiled_k_group() { return 64; }
+int64_t ulysses_lowp_compiled_q_group() { return 16; }
+int64_t ulysses_lowp_compiled_k_group() { return 128; }
 int64_t ulysses_lowp_compiled_head_dim() { return 128; }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_lowp_k_sum_v_amax, ulysses_lowp_k_sum_v_amax);
