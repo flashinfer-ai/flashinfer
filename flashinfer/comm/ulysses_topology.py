@@ -82,6 +82,10 @@ class UlyssesRankTopology:
     # Raw FLASHINFER_ULYSSES_PCIE_ROUTE value; validated jointly by the
     # decision layer so every rank raises the same error on a bad setting.
     route: str = "auto"
+    # Raw FLASHINFER_ULYSSES_PCIE_NICS value, compared across ranks by the
+    # decision layer: a list exported on some ranks only would otherwise show
+    # up as a duplicate NIC at best, or as silently divergent routing.
+    nics: str = ""
     pcie_error: Optional[str] = None
     probe_error: Optional[str] = None
     # The selected rank-local GID index and the full explicit rank-ordered
@@ -293,6 +297,7 @@ def probe_ulysses_rank_topology(
     """
     topo = UlyssesRankTopology(rank=rank)
     topo.route = os.environ.get("FLASHINFER_ULYSSES_PCIE_ROUTE", "") or "auto"
+    topo.nics = os.environ.get("FLASHINFER_ULYSSES_PCIE_NICS", "")
     try:
         topo.hostname = socket.gethostname()
         if device is None:
@@ -402,6 +407,12 @@ def _rdma_route_error(
         return (
             "an RDMA route still requires full-group CUDA P2P access for its "
             f"epoch signal barrier: {all_p2p_error}"
+        )
+    nics = {t.nics for t in by_rank}
+    if len(nics) > 1:
+        return (
+            f"ranks disagree on FLASHINFER_ULYSSES_PCIE_NICS: {sorted(nics)}; "
+            "every rank must set it identically"
         )
     for t in by_rank:
         if t.pcie_error is not None:
