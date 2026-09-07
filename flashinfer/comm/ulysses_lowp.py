@@ -307,6 +307,15 @@ def get_ulysses_lowp_module():
     ) -> None:
         module.ulysses_lowp_quant_v_fp8_with_scale(input, scale, output, enable_pdl)
 
+    def ulysses_lowp_compiled_q_group() -> int:
+        return int(module.ulysses_lowp_compiled_q_group())
+
+    def ulysses_lowp_compiled_k_group() -> int:
+        return int(module.ulysses_lowp_compiled_k_group())
+
+    def ulysses_lowp_compiled_head_dim() -> int:
+        return int(module.ulysses_lowp_compiled_head_dim())
+
     return SimpleNamespace(
         ulysses_lowp_k_sum_v_amax=ulysses_lowp_k_sum_v_amax,
         ulysses_lowp_q_grouped_amax=ulysses_lowp_q_grouped_amax,
@@ -318,6 +327,9 @@ def get_ulysses_lowp_module():
         ulysses_lowp_unpack_for_sage=ulysses_lowp_unpack_for_sage,
         ulysses_lowp_unpack_for_sage_unaligned=ulysses_lowp_unpack_for_sage_unaligned,
         ulysses_lowp_quant_v_fp8_with_scale=ulysses_lowp_quant_v_fp8_with_scale,
+        ulysses_lowp_compiled_q_group=ulysses_lowp_compiled_q_group,
+        ulysses_lowp_compiled_k_group=ulysses_lowp_compiled_k_group,
+        ulysses_lowp_compiled_head_dim=ulysses_lowp_compiled_head_dim,
     )
 
 
@@ -1512,14 +1524,21 @@ def stats_protocol_for(local_sequence: int, world_size: int) -> str:
     return ALIGNED if local_sequence % 128 == 0 else BOUNDARY_MERGE
 
 
-def required_alignment(world_size: int, stats_protocol: str) -> int:
+_LEGACY_INT_PROTOCOL = {3: ALIGNED, 2: BOUNDARY_MERGE}
+
+
+def required_alignment(world_size: int, stats_protocol) -> int:
     """Recommended multiple for padding the packed GLOBAL sequence.
 
     ``128 * world_size`` for the aligned path (every shard a whole number of
     128-token blocks); ``64`` for the boundary-merge path (keeps whole global
-    K groups, tail padding < 64)."""
+    K groups, tail padding < 64).
+
+    Accepts either the string constants :data:`ALIGNED` / :data:`BOUNDARY_MERGE`
+    or their legacy integer IDs (3 = ALIGNED, 2 = BOUNDARY_MERGE)."""
 
     world_size = _world_size(world_size)
+    stats_protocol = _LEGACY_INT_PROTOCOL.get(stats_protocol, stats_protocol)
     if stats_protocol == ALIGNED:
         return 128 * world_size
     if stats_protocol == BOUNDARY_MERGE:
@@ -1550,7 +1569,11 @@ def _fields_repr(obj: Any) -> str:
         value = getattr(obj, field.name)
         if isinstance(value, torch.Tensor):
             value = f"Tensor{tuple(value.shape)}[{value.dtype}, {value.device}]"
-        parts.append(f"{field.name}={value!r}")
+            parts.append(f"{field.name}={value!r}")
+        elif isinstance(value, str):
+            parts.append(f"{field.name}={value}")
+        else:
+            parts.append(f"{field.name}={value!r}")
     return f"{type(obj).__name__}({', '.join(parts)})"
 
 
