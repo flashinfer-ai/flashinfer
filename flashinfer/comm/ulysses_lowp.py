@@ -2099,8 +2099,6 @@ class UlyssesLowpSageLayoutSM90:
         world_size = _world_size(world_size)
         rank = _rank(rank, world_size)
         protocol = stats_protocol_for(local_sequence, world_size)
-        global_sequence = local_sequence * world_size
-
         _pdl = _resolve_pdl(enable_pdl, k)
         mod = get_ulysses_lowp_sm90_module()
         k_sum, v_amax = self._k_sum_v_amax(k, v, _pdl, mod)
@@ -2129,7 +2127,7 @@ class UlyssesLowpSageLayoutSM90:
             group=self.Q_GROUP,
             world_size=world_size,
         )
-        k_minmax = self._k_boundary_minmax(k, rank, world_size, used_sequence, mod)
+        k_minmax = self._k_boundary_minmax(k, rank, world_size, used_sequence)
         ctx.q_amax = q_amax
         ctx.q_desc_shape = tuple(q_desc.shape)
         ctx.k_minmax_shape = tuple(k_minmax.shape)
@@ -2228,7 +2226,11 @@ class UlyssesLowpSageLayoutSM90:
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         """Quantize-and-pack using SM90 kernels (Q_GROUP=16, K_GROUP=128)."""
+        if not isinstance(stats, V2GStats):
+            raise TypeError("stats must be the V2GStats returned by finalize_stats")
         batch, local_sequence, num_heads, head_dim = _validate_nhd_shape("q", q)
+        _validate_nhd_shape("k", k)
+        _validate_nhd_shape("v", v)
         world_size = stats.world_size
         rank = stats.rank
         _pdl = _resolve_pdl(enable_pdl, q)
@@ -2379,14 +2381,28 @@ class UlyssesLowpSageLayoutSM90:
         return amax
 
     @staticmethod
-    def _k_boundary_minmax(k, rank, world_size, used_sequence, mod):
+    def _k_boundary_minmax(k, rank, world_size, used_sequence):
+        # Pure-Python boundary min/max using K_GROUP_SM90=128, matching the
+        # SM120 k_boundary_minmax() logic but with the wider K group.
         batch, local_sequence, num_heads, head_dim = k.shape
+        global_sequence = local_sequence * world_size
+        used = int(used_sequence) if used_sequence is not None else global_sequence
         out = torch.empty(
             (batch, num_heads, 2, 2, head_dim), dtype=torch.float32, device=k.device
         )
-        global_sequence = local_sequence * world_size
-        used = int(used_sequence) if used_sequence is not None else global_sequence
-        mod.ulysses_lowp_k_boundary_minmax(k, out, rank, world_size, used, False)
+        g_first = group_first(rank, local_sequence, K_GROUP_SM90)
+        g_last = group_last(rank, local_sequence, K_GROUP_SM90)
+        base = rank * local_sequence
+        for slot, group_id in enumerate((g_first, g_last)):
+            lo = max(group_id * K_GROUP_SM90, base)
+            hi = min((group_id + 1) * K_GROUP_SM90, base + local_sequence, used)
+            if hi > lo:
+                rows = k[:, lo - base : hi - base].float()
+                out[:, :, slot, 0] = rows.amin(dim=1)
+                out[:, :, slot, 1] = rows.amax(dim=1)
+            else:
+                out[:, :, slot, 0] = float("inf")
+                out[:, :, slot, 1] = float("-inf")
         return out
 
     @staticmethod
