@@ -126,7 +126,7 @@ def _is_cute_dsl_kda_prefill_eligible(
     batch_size, token_count, num_heads, head_dim = q.shape
     if batch_size <= 0 or token_count <= 1 or num_heads <= 0 or head_dim != _HEAD_DIM:
         return False
-    for tensor in (k, v, g):
+    for tensor in (k, v):
         if (
             not isinstance(tensor, torch.Tensor)
             or tensor.device != q.device
@@ -136,11 +136,25 @@ def _is_cute_dsl_kda_prefill_eligible(
         ):
             return False
     if (
+        not isinstance(g, torch.Tensor)
+        or g.device != q.device
+        or g.dtype != torch.bfloat16
+        or g.ndim != 4
+        or g.shape[0] != batch_size
+        or g.shape[1] < token_count
+        or tuple(g.shape[2:]) != (num_heads, head_dim)
+        or not g[:, :token_count].is_contiguous()
+    ):
+        return False
+    if (
         not isinstance(beta, torch.Tensor)
         or beta.device != q.device
         or beta.dtype != torch.bfloat16
-        or beta.shape != (batch_size, token_count, num_heads)
-        or not beta.is_contiguous()
+        or beta.ndim != 3
+        or beta.shape[0] != batch_size
+        or beta.shape[1] < token_count
+        or beta.shape[2] != num_heads
+        or not beta[:, :token_count].is_contiguous()
         or beta.data_ptr() % 16 != 0
     ):
         return False
@@ -336,6 +350,12 @@ def _run_cute_dsl_kda_prefill(
         beta=beta,
         initial_state=initial_state,
     )
+
+    # SGLang may retain page-aligned padding in its gate and beta buffers.
+    # Narrow to Q's logical token extent with views before building TensorMaps.
+    token_count = q.shape[1]
+    g = g[:, :token_count]
+    beta = beta[:, :token_count]
 
     scale_value = _HEAD_DIM**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value):

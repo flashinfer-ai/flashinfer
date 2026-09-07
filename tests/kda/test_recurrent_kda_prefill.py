@@ -569,6 +569,67 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
     }
 
 
+def test_cute_dsl_prefill_adapter_narrows_padded_gate_and_beta_without_copy(
+    monkeypatch,
+):
+    calls = []
+
+    class Compiled:
+        def workspace_size(self, cu_seqlens, heads, **kwargs):
+            return 0
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_get_compiled_cute_dsl_kda",
+        lambda **kwargs: Compiled(),
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_identity_seq_order",
+        lambda **kwargs: torch.tensor([0], dtype=torch.int32),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
+    )
+
+    inputs = _cpu_route_tensors(token_count=2)
+    padded_g = torch.empty((1, 4, 1, 128), dtype=torch.bfloat16)
+    padded_beta = torch.empty((1, 4, 1), dtype=torch.bfloat16)
+    output = torch.empty_like(inputs["q"])
+    kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=padded_g,
+        beta=padded_beta,
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        lower_bound=-5.0,
+        cu_seqlens=None,
+        seq_order=None,
+        output=output,
+        prefill_workspace=None,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+
+    args, _ = calls[0]
+    kernel_g = args[3]
+    kernel_beta = args[6]
+    assert kernel_g.shape == inputs["q"].shape
+    assert kernel_beta.shape == inputs["beta"].shape
+    assert kernel_g.data_ptr() == padded_g.data_ptr()
+    assert kernel_beta.data_ptr() == padded_beta.data_ptr()
+
+
 @pytest.mark.parametrize("explicit_order", [False, True])
 def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
     monkeypatch, explicit_order
@@ -777,6 +838,91 @@ def _make_inputs(
             torch.tensor(offsets, dtype=torch.int64, device="cuda") if packed else None
         ),
     }
+
+
+@pytest.mark.parametrize(
+    ("valid_tokens", "physical_gate_tokens"),
+    [(26, 28), (68, 80), (502, 512), (1495, 1536)],
+)
+def test_cute_dsl_prefill_accepts_padded_gate_and_beta_token_extents(
+    flash_kda_device,
+    monkeypatch,
+    valid_tokens,
+    physical_gate_tokens,
+):
+    inputs = _make_inputs(
+        seq_lens=[valid_tokens],
+        num_heads=1,
+        packed=True,
+        seed=4896 + valid_tokens,
+    )
+    padded_g = torch.empty(
+        (1, physical_gate_tokens, 1, 128),
+        dtype=inputs["g"].dtype,
+        device=flash_kda_device,
+    )
+    padded_beta = torch.empty(
+        (1, physical_gate_tokens, 1),
+        dtype=inputs["beta"].dtype,
+        device=flash_kda_device,
+    )
+    padded_g[:, :valid_tokens].copy_(inputs["g"])
+    padded_beta[:, :valid_tokens].copy_(inputs["beta"])
+    inputs["g"] = padded_g
+    inputs["beta"] = padded_beta
+
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_runtime_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: sentinel,
+    )
+
+    assert (
+        recurrent_kda(**_strict_prefill_kwargs(inputs), backend="cute-dsl") is sentinel
+    )
+
+
+def test_cute_dsl_padded_gate_and_beta_match_compact_inputs(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[26, 42],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=4896,
+    )
+    compact_state = inputs["initial_state"].clone()
+    compact_output, compact_final_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+
+    padded_inputs = {
+        **inputs,
+        "initial_state": compact_state,
+        "g": torch.empty(
+            (1, 80, 12, 128), dtype=inputs["g"].dtype, device=flash_kda_device
+        ),
+        "beta": torch.empty(
+            (1, 80, 12), dtype=inputs["beta"].dtype, device=flash_kda_device
+        ),
+    }
+    padded_inputs["g"][:, :68].copy_(inputs["g"])
+    padded_inputs["beta"][:, :68].copy_(inputs["beta"])
+    padded_output, padded_final_state = recurrent_kda(
+        **_strict_prefill_kwargs(padded_inputs),
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+
+    torch.testing.assert_close(padded_output, compact_output, atol=0, rtol=0)
+    torch.testing.assert_close(padded_final_state, compact_final_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
