@@ -3581,3 +3581,87 @@ def test_sparse_mla_sm120_envelope_consistency(
     else:
         with pytest.raises(RuntimeError, match="sparse-MLA"):
             call()
+
+
+@pytest.mark.parametrize("layout", ["3d", "nhd", "hnd"])
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,impl",
+    [
+        (1, 32, None),
+        (6, 64, None),
+        (65, 32, None),
+        (65, 8, None),
+        (65, 64, "mg"),
+        (65, 64, "swapab"),
+    ],
+)
+def test_glm53_compact_rows_match_padded_rows(layout, num_tokens, num_heads, impl):
+    """Compaction preserves payload bits, attention, LSE and graph replay."""
+    torch.manual_seed(53)
+    device = torch.device("cuda")
+    pages, page_size, topk = 32, 64, 2176
+    kv = torch.randn(pages, page_size, 1, 512, device=device, dtype=torch.bfloat16) / 10
+    padded = quantize_kv_glm53_nope(kv)
+    compact = padded[..., :528].contiguous()
+    assert compact.numel() * 656 == padded.numel() * 528
+    # Poison the unused padded bytes. Neither layout may use them as values.
+    padded[..., 528:] = 255
+    q = (
+        torch.randn(num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16)
+        / 10
+    )
+    indices = torch.randint(
+        pages * page_size, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, 0] = pages * page_size - 1
+    counts = torch.arange(num_tokens, device=device, dtype=torch.int32) % 3
+    lengths = torch.where(counts == 0, 1, torch.where(counts == 1, 70, topk)).to(
+        torch.int32
+    )
+    indices.masked_fill_(
+        torch.arange(topk, device=device)[None, :] >= lengths[:, None], -1
+    )
+    scratch = (
+        _make_decode_scratch(num_tokens, num_heads, topk, 512, device)
+        if num_tokens <= 64
+        else (None, None)
+    )
+
+    def reshape(cache):
+        if layout == "3d":
+            return cache.squeeze(2)
+        if layout == "hnd":
+            return cache.transpose(1, 2)
+        return cache
+
+    def run(cache, out, lse):
+        sparse_mla_sm120_paged_attention(
+            q,
+            reshape(cache),
+            indices,
+            out,
+            lse,
+            512**-0.5,
+            d_v=512,
+            kv_scale_format="arbitrary_fp32",
+            prefill_impl=impl,
+            topk_length=lengths,
+            mid_out=scratch[0],
+            mid_lse=scratch[1],
+        )
+
+    a, b = torch.empty_like(q), torch.empty_like(q)
+    la = torch.empty((num_tokens, num_heads), device=device, dtype=torch.float32)
+    lb = torch.empty_like(la)
+    run(padded, a, la)
+    run(compact, b, lb)
+    torch.testing.assert_close(b, a, rtol=0, atol=0)
+    torch.testing.assert_close(lb, la, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(compact, b, lb)
+    q.mul_(0.75)
+    graph.replay()
+    run(padded, a, la)
+    torch.testing.assert_close(b, a, rtol=0, atol=0)
+    torch.testing.assert_close(lb, la, rtol=0, atol=0)

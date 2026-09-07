@@ -45,7 +45,10 @@
 enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA };
 
 // Bytes per packed KV cache token row, per model type.
-constexpr int bytes_per_token(ModelType mt) {
+constexpr int bytes_per_token(ModelType mt, int row_width = 0) {
+  // Explicitly shaped NoPE caches may omit the unused 128-byte RoPE pad.
+  // A flat 2D cache retains the historical 656-byte interpretation.
+  if (mt == ModelType::GLM53_NOPE && row_width == 528) return 528;
   switch (mt) {
     case ModelType::DSV3_2:
     case ModelType::GLM_NSA:

@@ -56,14 +56,16 @@ template <ModelType MT>
 __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
                                                            uint64_t* mbar, int io_tid,
-                                                           uint64_t cache_policy) {
+                                                           uint64_t cache_policy,
+                                                           size_t stride_kv_row) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   static_assert(BI <= IO_THREADS, "per-thread index staging assumes one candidate per IO thread");
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * STRIDE);
   if (io_tid >= BI) return;
 
-  const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * STRIDE;
+  const size_t row_stride = MT == ModelType::GLM53_NOPE ? stride_kv_row : STRIDE;
+  const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * row_stride;
   cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
@@ -72,10 +74,12 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
 template <ModelType MT>
 __device__ __forceinline__ void io_bulk_prefetch_l2_swapab(int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
-                                                           int io_tid, uint64_t cache_policy) {
+                                                           int io_tid, uint64_t cache_policy,
+                                                           size_t stride_kv_row) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   if (io_tid >= BI || idx < 0) return;
-  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * STRIDE, STRIDE, cache_policy);
+  const size_t row_stride = MT == ModelType::GLM53_NOPE ? stride_kv_row : STRIDE;
+  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * row_stride, STRIDE, cache_policy);
 }
 
 template <ModelType MT, int NUM_HEADS>
@@ -142,8 +146,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const int next = ld_idx(ti + 2);
       mbarrier_wait_parity(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
-                                     kv_l2_policy);
-      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, kv_l2_policy);
+                                     kv_l2_policy, cold.stride_kv_block / 64);
+      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, kv_l2_policy, cold.stride_kv_block / 64);
       staged = pf;
       pf = next;
       if (buf == 1) wr_phase ^= 1;

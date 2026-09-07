@@ -184,15 +184,15 @@ void SparseMlaSm120PagedAttention(
   const int d_qk = static_cast<int>(q.size(2));
   const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const ModelType mt = resolve_model_type(d_qk, model_type);
-  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  const int bpt = bytes_per_token(mt, kv_cache.ndim() >= 3 ? kv_cache.size(-1) : 0);
+  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bpt, "kv_cache");
   const int page_block_size = kv_layout.page_block_size;
   // Inline-scale models (DSV3_2 / GLM_NSA / GLM53_NOPE) are addressed by the
   // prefill kernels as a flat token array (prefill_kv_entry_base), so a
   // padded block stride would be silently misread; only footer-scale models
   // honor stride_kv_block. Padded strides remain a decode-path capability.
   if (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE) {
-    TVM_FFI_ICHECK_EQ(kv_layout.stride_kv_block,
-                      static_cast<size_t>(page_block_size) * bytes_per_token(mt))
+    TVM_FFI_ICHECK_EQ(kv_layout.stride_kv_block, static_cast<size_t>(page_block_size) * bpt)
         << "prefill for inline-scale KV caches (DSv3.2/GLM) requires densely packed blocks "
            "(stride_kv_block == page_block_size * bytes_per_token); padded block strides are "
            "decode-only";

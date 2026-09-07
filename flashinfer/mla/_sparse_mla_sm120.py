@@ -176,7 +176,10 @@ class SparseMLASm120DecodeConfig:
         Packed cache format described by this entry (``"fp8"`` or
         ``"nvfp4"``).
     bytes_per_token : int
-        Logical packed-cache bytes per token.
+        Default packed-cache bytes per token, including for flat 2-D caches.
+    compact_bytes_per_token : Optional[int]
+        Optional smaller lossless row layout for explicitly shaped 3-D or
+        4-D caches. GLM53_NOPE can omit its 128 unused RoPE padding bytes.
     head_counts : Optional[frozenset[int]]
         Exact instantiated head counts when the kernel has no runtime-head
         fallback. ``None`` means every count in ``[1, max_num_heads]``.
@@ -199,6 +202,7 @@ class SparseMLASm120DecodeConfig:
     head_counts: Optional[frozenset[int]] = None
     topk_is_runtime: bool = True
     extra_page_block_sizes: frozenset[int] = frozenset()
+    compact_bytes_per_token: Optional[int] = None
 
     def supported_num_heads(self) -> tuple[int, ...]:
         """Sorted instantiated head counts, including any runtime-H envelope."""
@@ -336,6 +340,7 @@ def supported_sparse_mla_sm120_configs(
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
             bytes_per_token=_BPT_DSV3_2,
+            compact_bytes_per_token=528,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
             d_qk=1088,
@@ -519,6 +524,12 @@ def _packed_kv_page_block_size(
     name: str,
 ) -> int:
     bytes_per_token = _bytes_per_token_for_model_type(model_type)
+    if (
+        model_type == _MODEL_TYPE_GLM53_NOPE
+        and kv_cache.ndim >= 3
+        and kv_cache.shape[-1] == 528
+    ):
+        bytes_per_token = 528
     if kv_cache.ndim == 2:
         block_bytes = int(kv_cache.shape[1])
         if block_bytes % bytes_per_token != 0:

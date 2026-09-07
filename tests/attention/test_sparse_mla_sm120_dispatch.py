@@ -60,6 +60,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _decode_scratch_views,
     _decode_dispatch_error_message,
     _resolve_model_type,
+    _packed_kv_page_block_size,
 )
 from flashinfer.mla._sparse_mla_sm120_plan import (
     _PREFILL_IMPL_SWAPAB,
@@ -73,6 +74,9 @@ def test_supported_configs_families() -> None:
     """The query API mirrors the decode dispatch envelopes exactly."""
     configs = supported_sparse_mla_sm120_configs()
     assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope", "dots3_swa"}
+    assert configs["glm53_nope"].bytes_per_token == 656
+    assert configs["glm53_nope"].compact_bytes_per_token == 528
+    assert configs["glm_nsa"].compact_bytes_per_token is None
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
     )
@@ -889,3 +893,22 @@ def test_sparse_mla_sm120_wrapper_public_export() -> None:
 
     assert SparseMLASm120Wrapper is _SparseMLAPagedAttentionRunner
     assert "SparseMLASm120Wrapper" in dir(flashinfer.mla)
+
+
+@pytest.mark.parametrize("shape", [(2, 64, 528), (2, 1, 64, 528), (2, 64, 1, 528)])
+def test_glm53_compact_page_shape(shape):
+    cache = torch.empty(shape, dtype=torch.uint8)
+    assert (
+        _packed_kv_page_block_size(cache, model_type=_MODEL_TYPE_GLM53_NOPE, name="kv")
+        == 64
+    )
+    with pytest.raises(ValueError):
+        _packed_kv_page_block_size(cache, model_type=_MODEL_TYPE_GLM_NSA, name="kv")
+
+
+def test_glm53_flat_cache_keeps_legacy_layout():
+    cache = torch.empty((2, 64 * 656), dtype=torch.uint8)
+    assert (
+        _packed_kv_page_block_size(cache, model_type=_MODEL_TYPE_GLM53_NOPE, name="kv")
+        == 64
+    )

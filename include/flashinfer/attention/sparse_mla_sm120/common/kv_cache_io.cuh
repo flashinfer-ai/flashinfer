@@ -84,7 +84,9 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
   idx = (idx >= 0) ? idx : 0;
 
   const uint8_t* src;
-  if constexpr (KV::SCALE_IN_KV_SMEM) {
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    src = kv_ptr + (size_t)idx * (stride_kv_block / PAGE_BLOCK_SIZE);
+  } else if constexpr (KV::SCALE_IN_KV_SMEM) {
     src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
   } else {
     constexpr int pbs = PAGE_BLOCK_SIZE;
@@ -113,7 +115,9 @@ __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __re
   if (io_tid >= TILE_BI || idx < 0) return;
 
   const uint8_t* src;
-  if constexpr (KV::SCALE_IN_KV_SMEM) {
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    src = kv_ptr + (size_t)idx * (stride_kv_block / PAGE_BLOCK_SIZE);
+  } else if constexpr (KV::SCALE_IN_KV_SMEM) {
     src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
   } else {
     constexpr int pbs = PAGE_BLOCK_SIZE;
@@ -123,10 +127,12 @@ __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __re
                             (size_t)(idx % pbs) * KV::SCALE_BYTES_PER_TOKEN;
     prefetch_l2_line(footer);
   }
+  constexpr int PREFETCH_BYTES =
+      MT == ModelType::GLM53_NOPE ? KV::KV_SMEM_COPY_BYTES : IO::IO_STRIDE;
   if constexpr (USE_L2_HINT)
-    cp_async_bulk_prefetch_l2_hint(src, IO::IO_STRIDE, cache_policy);
+    cp_async_bulk_prefetch_l2_hint(src, PREFETCH_BYTES, cache_policy);
   else
-    cp_async_bulk_prefetch_l2(src, IO::IO_STRIDE);
+    cp_async_bulk_prefetch_l2(src, PREFETCH_BYTES);
 }
 
 // `idx` is the same per-thread staged value passed to io_bulk_gather_tile, so

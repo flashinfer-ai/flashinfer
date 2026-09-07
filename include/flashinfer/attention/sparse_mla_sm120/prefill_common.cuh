@@ -197,7 +197,9 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
   // This matches io_bulk_gather_tile. Keying it on V_HAS_ROPE happened to agree
   // for the three DeepSeek-family models and disagrees for DOTS3_SWA, which is
   // footer-scaled with no rope in V.
-  if constexpr (!KV::SCALE_IN_KV_SMEM) {
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    return kv_global + (size_t)idx * (stride_kv_block / PAGE_BLOCK_SIZE);
+  } else if constexpr (!KV::SCALE_IN_KV_SMEM) {
     const int bi = idx / PAGE_BLOCK_SIZE;
     const int li = idx % PAGE_BLOCK_SIZE;
     return kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;

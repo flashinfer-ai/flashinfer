@@ -255,7 +255,9 @@ struct SmemLayoutSwapAB {
   using KV = KVCacheTraits<MT>;
   using CT = ComputeTraitsSwapAB<MT>;
 
-  static constexpr int KV_STRIDE = KV::KV_GMEM_STRIDE;          // 656
+  // NoPE has no RoPE payload to stage, including with a padded global row.
+  static constexpr int KV_STRIDE =
+      MT == ModelType::GLM53_NOPE ? KV::KV_SMEM_COPY_BYTES : KV::KV_GMEM_STRIDE;
   static constexpr int P_TILE_BYTES = CT::HEADS_PER_WARP * BI;  // 512
 
   // nope + inline scales + rope, one linear tile per candidate.
