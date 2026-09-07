@@ -781,38 +781,16 @@ class TmemCastAResource(MemoryResource):
         byte_lane: Constexpr[int],
         scale_lane: Constexpr[int],
     ) -> Int32:
-        # E2M1-to-BF16x2 conversion was introduced in PTX ISA 9.2 (CUDA 13.2).
-        # Decode the E2M1 values with integer operations on older toolchains,
-        # while retaining the safe UE8M0 conversion and packed BF16 multiply.
-        if cutlass.target_version(max_version="13.1"):
-            packed_byte = (packed_word >> Int32(byte_lane * 8)) & Int32(0xFF)
-            scale_byte = (packed_scale_word >> Int32(scale_lane * 8)) & Int32(0xFF)
-            value = self._decode_cast_pair(packed_byte)
-            scale_pair = scale_byte | (scale_byte << Int32(8))
-            scale = self._cvt_ue8m0x2_to_bf16x2(scale_pair)
-            return self._mul_bf16x2(value, scale)
-
-        extract = (
-            "mov.b32 {byte, _, _, _}, {$r0}; ",
-            "mov.b32 {_, byte, _, _}, {$r0}; ",
-            "mov.b32 {_, _, byte, _}, {$r0}; ",
-            "mov.b32 {_, _, _, byte}, {$r0}; ",
-        )[byte_lane]
-        scale_permute = (
-            "prmt.b32 scale_pair, {$r1}, 0, 0x7700; ",
-            "prmt.b32 scale_pair, {$r1}, 0, 0x7711; ",
-            "prmt.b32 scale_pair, {$r1}, 0, 0x7722; ",
-            "prmt.b32 scale_pair, {$r1}, 0, 0x7733; ",
-        )[scale_lane]
-        return prims.inline_ptx_hl(
-            "{ .reg .b8 byte; .reg .b16 scale; .reg .b32 scale_pair; "
-            + extract
-            + scale_permute
-            + "mov.b32 {scale, _}, scale_pair; "
-            + "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 {$w0}, byte, scale; }",
-            write_only_types=[Int32],
-            read_only_args=[packed_word, packed_scale_word],
-        )
+        # The fused PTX form is bit-exact with this expansion in isolation on
+        # CUDA 13.2, but its lowering inside the CastA tile16/cluster2 kernel
+        # produces incorrect results. Keep the explicit sequence on every
+        # toolchain until that context-sensitive compiler issue is resolved.
+        packed_byte = (packed_word >> Int32(byte_lane * 8)) & Int32(0xFF)
+        scale_byte = (packed_scale_word >> Int32(scale_lane * 8)) & Int32(0xFF)
+        value = self._decode_cast_pair(packed_byte)
+        scale_pair = scale_byte | (scale_byte << Int32(8))
+        scale = self._cvt_ue8m0x2_to_bf16x2(scale_pair)
+        return self._mul_bf16x2(value, scale)
 
     @cute.jit
     def _cvt_ue8m0x2_to_bf16x2(self, packed_scale: Int32) -> Int32:
