@@ -454,6 +454,49 @@ def test_public_prefill_auto_routes_supported_checkpoints_to_cute_dsl(monkeypatc
     assert calls[0]["checkpoint_every_n_tokens"] == 32
 
 
+def test_public_prefill_forwards_checkpoint_state_indices_only_to_cute_dsl(
+    monkeypatch,
+):
+    calls = []
+    sentinel = (object(), object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: calls.append(kwargs) or sentinel,
+    )
+
+    checkpoints = torch.empty((4, 1, 128, 128), dtype=torch.bfloat16)
+    starts = torch.tensor([0, 2], dtype=torch.int64)
+    indices = torch.tensor([3, 1], dtype=torch.int32)
+    assert (
+        recurrent_kda(
+            **_cpu_route_tensors(token_count=64),
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=starts,
+            checkpoint_state_indices=indices,
+            checkpoint_every_n_tokens=32,
+            backend="cute-dsl",
+        )
+        is sentinel
+    )
+    assert calls[0]["checkpoint_state_indices"] is indices
+
+    with pytest.raises(ValueError, match="checkpoint_state_indices.*CuTe DSL"):
+        recurrent_kda(
+            **_cpu_route_tensors(token_count=64),
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=starts,
+            checkpoint_state_indices=indices,
+            checkpoint_every_n_tokens=32,
+            backend="cake",
+        )
+
+
 def test_public_prefill_cake_backend_is_strict(monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api,
@@ -555,6 +598,7 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
             "has_state_out": True,
             "has_state_ckpt": False,
             "has_state_indices": True,
+            "has_checkpoint_state_indices": False,
         }
     ]
     args, kwargs = calls[0]
@@ -628,6 +672,75 @@ def test_cute_dsl_prefill_adapter_compiles_fp32_state_and_checkpoints(monkeypatc
     assert args[8] is state
     assert args[10] is state
     assert kwargs["state_ckpt"] is checkpoints
+
+
+def test_cute_dsl_prefill_adapter_indexes_checkpoint_pool_and_auto_allocates(
+    monkeypatch,
+):
+    calls = []
+
+    class Compiled:
+        def workspace_size(self, cu_seqlens, heads, **kwargs):
+            return 0
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_get_compiled_cute_dsl_kda",
+        lambda **kwargs: Compiled(),
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_identity_seq_order",
+        lambda **kwargs: torch.tensor([0], dtype=torch.int32),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
+    )
+
+    inputs = _cpu_route_tensors(token_count=64)
+    adapter_inputs = {
+        key: inputs[key]
+        for key in ("q", "k", "v", "g", "beta", "A_log", "dt_bias", "lower_bound")
+    }
+    starts = torch.tensor([0, 2], dtype=torch.int64)
+    indices = torch.tensor([3, 1], dtype=torch.int32)
+    pool = torch.empty((4, 1, 128, 128), dtype=torch.bfloat16)
+    result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        **adapter_inputs,
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        seq_order=None,
+        output=torch.empty_like(inputs["q"]),
+        prefill_workspace=None,
+        state_checkpoints=pool,
+        checkpoint_cu_starts=starts,
+        checkpoint_every_n_tokens=32,
+        checkpoint_state_indices=indices,
+    )
+    assert result[2] is pool
+    assert calls[-1][1]["checkpoint_state_indices"] is indices
+
+    result = kda_prefill_cute_api._run_cute_dsl_kda_prefill(
+        **adapter_inputs,
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        seq_order=None,
+        output=torch.empty_like(inputs["q"]),
+        prefill_workspace=None,
+        state_checkpoints=None,
+        checkpoint_cu_starts=starts,
+        checkpoint_every_n_tokens=32,
+    )
+    assert result[2].shape == (2, 1, 128, 128)
+    assert calls[-1][1]["state_ckpt"] is result[2]
 
 
 def test_cute_dsl_prefill_adapter_narrows_padded_gate_and_beta_without_copy(
@@ -1053,6 +1166,172 @@ def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
         torch.stack(expected_checkpoints),
         atol=0,
         rtol=0,
+    )
+
+
+def test_cute_dsl_checkpoint_state_indices_write_pool_and_aligned_final_boundary(
+    flash_kda_device,
+):
+    seq_lens = [130, 128]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=4896,
+    )
+    initial_states = inputs["initial_state"].clone()
+    expected = []
+    sequence_start = 0
+    for sequence, seq_len in enumerate(seq_lens):
+        for boundary in (64, 128):
+            assert boundary <= seq_len
+            token_slice = slice(sequence_start, sequence_start + boundary)
+            prefix_inputs = {
+                **inputs,
+                "q": inputs["q"][:, token_slice].contiguous(),
+                "k": inputs["k"][:, token_slice].contiguous(),
+                "v": inputs["v"][:, token_slice].contiguous(),
+                "g": inputs["g"][:, token_slice].contiguous(),
+                "beta": inputs["beta"][:, token_slice].contiguous(),
+                "initial_state": initial_states[sequence : sequence + 1].clone(),
+                "cu_seqlens": torch.tensor(
+                    [0, boundary], dtype=torch.int64, device=flash_kda_device
+                ),
+            }
+            _, prefix_state = recurrent_kda(
+                **_strict_prefill_kwargs(prefix_inputs),
+                output_final_state=True,
+                backend="cute-dsl",
+            )
+            expected.append(prefix_state[0].clone())
+        sequence_start += seq_len
+
+    state_pool = torch.zeros(
+        (4, 12, 128, 128), dtype=torch.float32, device=flash_kda_device
+    )
+    state_indices = torch.tensor([3, 0], dtype=torch.int32, device=flash_kda_device)
+    state_pool[state_indices.long()] = initial_states
+    checkpoint_pool = torch.full(
+        (7, 12, 128, 128),
+        torch.nan,
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    checkpoint_indices = torch.tensor(
+        [5, 1, 4, 2], dtype=torch.int32, device=flash_kda_device
+    )
+    checkpoint_starts = torch.tensor(
+        [0, 2, 4], dtype=torch.int64, device=flash_kda_device
+    )
+    _, _, returned_pool = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=checkpoint_pool,
+        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_state_indices=checkpoint_indices,
+        checkpoint_every_n_tokens=64,
+        backend="cute-dsl",
+    )
+
+    assert returned_pool is checkpoint_pool
+    torch.testing.assert_close(
+        checkpoint_pool[checkpoint_indices.long()],
+        torch.stack(expected),
+        atol=0,
+        rtol=0,
+    )
+    assert torch.isnan(checkpoint_pool[[0, 3, 6]]).all()
+
+    packed_starts = torch.tensor([0, 3, 5], dtype=torch.int64, device=flash_kda_device)
+    _, _, allocated_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_states.clone()}),
+        state_checkpoints=None,
+        checkpoint_cu_starts=packed_starts,
+        checkpoint_every_n_tokens=64,
+        backend="cute-dsl",
+    )
+    assert allocated_checkpoints.shape == (5, 12, 128, 128)
+    torch.testing.assert_close(
+        allocated_checkpoints,
+        torch.stack(
+            [
+                initial_states[0],
+                expected[0],
+                expected[1],
+                initial_states[1],
+                expected[2],
+            ]
+        ),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_cute_dsl_checkpoint_state_indices_engine_route_matches_packed_states(
+    flash_kda_device,
+):
+    num_sequences = 7
+    inputs = _make_inputs(
+        seq_lens=[128] * num_sequences,
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=4897,
+    )
+    initial_states = inputs["initial_state"].clone()
+    checkpoint_starts = torch.arange(
+        0,
+        2 * num_sequences + 1,
+        2,
+        dtype=torch.int64,
+        device=flash_kda_device,
+    )
+    legacy_checkpoints = torch.empty(
+        (2 * num_sequences, 12, 128, 128),
+        dtype=torch.float32,
+        device=flash_kda_device,
+    )
+    _, legacy_final_states, _ = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_states.clone()}),
+        output_final_state=True,
+        state_checkpoints=legacy_checkpoints,
+        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_every_n_tokens=64,
+        backend="cute-dsl",
+    )
+    expected = torch.stack(
+        [
+            state
+            for sequence in range(num_sequences)
+            for state in (
+                legacy_checkpoints[2 * sequence + 1],
+                legacy_final_states[sequence],
+            )
+        ]
+    )
+
+    checkpoint_indices = torch.tensor(
+        [13, 0, 12, 1, 11, 2, 10, 3, 9, 4, 8, 5, 7, 6],
+        dtype=torch.int32,
+        device=flash_kda_device,
+    )
+    checkpoint_pool = torch.full_like(legacy_checkpoints, torch.nan)
+    _, _, returned_pool = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": initial_states.clone()}),
+        state_checkpoints=checkpoint_pool,
+        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_state_indices=checkpoint_indices,
+        checkpoint_every_n_tokens=64,
+        backend="cute-dsl",
+    )
+
+    assert returned_pool is checkpoint_pool
+    torch.testing.assert_close(
+        checkpoint_pool[checkpoint_indices.long()], expected, atol=0, rtol=0
     )
 
 

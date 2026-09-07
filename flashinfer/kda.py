@@ -79,6 +79,7 @@ def recurrent_kda(
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
     *,
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
@@ -242,19 +243,25 @@ def recurrent_kda(
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
-            Caller-owned checkpoint output ``[C, H, 128, 128]`` for frozen
-            prefill. CuTe DSL accepts BF16 or FP32 and requires it to match
-            ``initial_state`` when present; Cake accepts BF16. Row zero for
-            each sequence is its initial state; later rows are the states
-            before token blocks beginning at ``N, 2N, ...``. ``C`` must be at
-            least ``checkpoint_cu_starts[N_seq]``; this capacity contract is
-            not host-validated. Required when
-            ``checkpoint_every_n_tokens > 0``.
+            Checkpoint output or pool ``[C, H, 128, 128]`` for prefill. CuTe DSL
+            accepts BF16 or FP32 and requires it to match ``initial_state`` when
+            present; Cake accepts BF16. Without ``checkpoint_state_indices``,
+            row zero for each sequence is its initial state and later rows are
+            states before token blocks beginning at ``N, 2N, ...``. CuTe DSL
+            allocates this packed output during eager execution when omitted;
+            CUDA graph capture requires a caller-owned tensor.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
-            The first value must be zero, and each consecutive difference must
-            equal ``ceil(seq_len / checkpoint_every_n_tokens)`` for that
-            sequence.
+            The first value must be zero. Without ``checkpoint_state_indices``,
+            each difference is ``ceil(seq_len / N)``. With indices, each
+            difference is ``floor(seq_len / N)`` and counts completed periodic
+            boundaries, including an aligned final boundary and excluding the
+            initial state.
+        checkpoint_state_indices (Optional[torch.Tensor]):
+            CuTe DSL-only contiguous CUDA int32 destination rows. Entry ``i``
+            selects the row of the ``state_checkpoints`` pool written for packed
+            completed-boundary entry ``i``. The kernel writes the pool directly;
+            no temporary checkpoint tensor or scatter is used.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
@@ -288,11 +295,13 @@ def recurrent_kda(
         raise ValueError(
             f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
         )
+    if checkpoint_state_indices is not None and backend == "cake":
+        raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
     # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
     sm120_rejection: Optional[str] = None
-    if backend in ("auto", "cute-dsl"):
+    if backend in ("auto", "cute-dsl") and checkpoint_state_indices is None:
         sm120_prefill_kwargs = dict(
             q=q,
             k=k,
@@ -386,6 +395,7 @@ def recurrent_kda(
             or prefill_workspace is not None
             or state_checkpoints is not None
             or checkpoint_cu_starts is not None
+            or checkpoint_state_indices is not None
             or checkpoint_every_n_tokens != 0
         ):
             raise ValueError(
@@ -495,6 +505,7 @@ def recurrent_kda(
             beta_is_logit=beta_is_logit,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
         if backend == "cute-dsl" and not cute_dsl_eligible:
@@ -534,6 +545,7 @@ def recurrent_kda(
                 state_indices=ssm_state_indices,
                 state_checkpoints=state_checkpoints,
                 checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_state_indices=checkpoint_state_indices,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
 
@@ -548,6 +560,7 @@ def recurrent_kda(
             )
         )
         and backend != "cute-dsl"
+        and checkpoint_state_indices is None
         and _kda_prefill._flash_kda_prefill_is_eligible(
             q=q,
             k=k,
@@ -619,6 +632,7 @@ def recurrent_kda(
         checkpoint_every_n_tokens != 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
+        or checkpoint_state_indices is not None
     ):
         raise ValueError(
             "state checkpoints are supported only by eligible frozen "
@@ -829,6 +843,7 @@ class RecurrentKDAPrefillWrapper:
         state_checkpoints: Optional[torch.Tensor] = None,
         checkpoint_cu_starts: Optional[torch.Tensor] = None,
         checkpoint_every_n_tokens: int = 0,
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
         ssm_state_indices: Optional[torch.Tensor] = None,
     ) -> (
         tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -871,6 +886,7 @@ class RecurrentKDAPrefillWrapper:
             prefill_workspace=self._workspace,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             backend="cute-dsl",
         )

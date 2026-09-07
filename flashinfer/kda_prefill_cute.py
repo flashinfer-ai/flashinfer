@@ -87,6 +87,7 @@ def _is_cute_dsl_kda_prefill_eligible(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
 ) -> bool:
     """Return whether the ported BT=16 kernel can serve this call.
 
@@ -249,14 +250,7 @@ def _is_cute_dsl_kda_prefill_eligible(
         return False
     if checkpoint_every_n_tokens:
         if (
-            not isinstance(state_checkpoints, torch.Tensor)
-            or state_checkpoints.device != q.device
-            or state_checkpoints.dtype not in (torch.bfloat16, torch.float32)
-            or state_checkpoints.ndim != 4
-            or tuple(state_checkpoints.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
-            or state_checkpoints.shape[0] > torch.iinfo(torch.int32).max
-            or not state_checkpoints.is_contiguous()
-            or not isinstance(checkpoint_cu_starts, torch.Tensor)
+            not isinstance(checkpoint_cu_starts, torch.Tensor)
             or checkpoint_cu_starts.device != q.device
             or checkpoint_cu_starts.dtype != torch.int64
             or checkpoint_cu_starts.ndim != 1
@@ -264,9 +258,37 @@ def _is_cute_dsl_kda_prefill_eligible(
             or not checkpoint_cu_starts.is_contiguous()
         ):
             return False
-        if initial_state is not None and state_checkpoints.dtype != initial_state.dtype:
+        if state_checkpoints is not None and (
+            not isinstance(state_checkpoints, torch.Tensor)
+            or state_checkpoints.device != q.device
+            or state_checkpoints.dtype not in (torch.bfloat16, torch.float32)
+            or state_checkpoints.ndim != 4
+            or tuple(state_checkpoints.shape[1:]) != (num_heads, _HEAD_DIM, _HEAD_DIM)
+            or state_checkpoints.shape[0] > torch.iinfo(torch.int32).max
+            or not state_checkpoints.is_contiguous()
+        ):
             return False
-    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        if checkpoint_state_indices is not None and (
+            state_checkpoints is None
+            or not isinstance(checkpoint_state_indices, torch.Tensor)
+            or checkpoint_state_indices.device != q.device
+            or checkpoint_state_indices.dtype != torch.int32
+            or checkpoint_state_indices.ndim != 1
+            or not checkpoint_state_indices.is_contiguous()
+            or checkpoint_state_indices.numel() > torch.iinfo(torch.int32).max
+        ):
+            return False
+        if (
+            initial_state is not None
+            and state_checkpoints is not None
+            and state_checkpoints.dtype != initial_state.dtype
+        ):
+            return False
+    elif (
+        state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+        or checkpoint_state_indices is not None
+    ):
         return False
     # Probed last so that calls rejected above reach Cake exactly as before.
     return _is_cute_dsl_kda_runtime_available()
@@ -280,6 +302,7 @@ def _get_compiled_cute_dsl_kda(
     has_state_out: bool,
     has_state_ckpt: bool,
     has_state_indices: bool,
+    has_checkpoint_state_indices: bool,
 ):
     # Keep the large CuTe DSL module lazy so normal Cake and decode imports do
     # not initialize its compilation stack.
@@ -301,6 +324,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_out=has_state_out,
         has_state_ckpt=has_state_ckpt,
         has_state_indices=has_state_indices,
+        has_checkpoint_state_indices=has_checkpoint_state_indices,
         mode=None,
     )
 
@@ -326,6 +350,7 @@ def _run_cute_dsl_kda_prefill(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_indices: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -376,6 +401,22 @@ def _run_cute_dsl_kda_prefill(
             state_checkpoints.dtype if state_checkpoints is not None else torch.bfloat16
         )
     )
+    if checkpoint_every_n_tokens and state_checkpoints is None:
+        if capturing:
+            raise RuntimeError(
+                "CUDA graph capture requires preallocated state_checkpoints for "
+                "backend='cute-dsl'"
+            )
+        assert checkpoint_cu_starts is not None
+        checkpoint_count = int(checkpoint_cu_starts[-1].item())
+        state_checkpoints = torch.empty(
+            checkpoint_count,
+            q.shape[2],
+            _HEAD_DIM,
+            _HEAD_DIM,
+            dtype=state_dtype,
+            device=q.device,
+        )
     if seq_order is None and cu_seqlens is None:
         seq_order = _identity_seq_order(
             device=q.device,
@@ -415,6 +456,7 @@ def _run_cute_dsl_kda_prefill(
         has_state_out=final_state is not None,
         has_state_ckpt=state_checkpoints is not None,
         has_state_indices=state_indices is not None,
+        has_checkpoint_state_indices=checkpoint_state_indices is not None,
     )
     planned_cu_chunks = (
         getattr(prefill_workspace, "_cute_dsl_cu_chunks", None)
@@ -463,6 +505,7 @@ def _run_cute_dsl_kda_prefill(
             checkpoint_kwargs = {
                 "state_ckpt": state_checkpoints,
                 "checkpoint_cu_starts": checkpoint_cu_starts,
+                "checkpoint_state_indices": checkpoint_state_indices,
                 "ckpt_interval": checkpoint_every_n_tokens,
             }
         compiled(
