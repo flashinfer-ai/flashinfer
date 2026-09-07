@@ -2478,10 +2478,12 @@ class TmemCorrResource(DecodeGenResourceBase):
                     packed = scaled_vector.to(cutlass.BFloat16).bitcast(Int32)
                 else:
                     packed = scaled_vector.to(cutlass.Float16).bitcast(Int32)
+                # Split-KV partials are 16-bit, so the column offset follows
+                # the partial element width
                 partial_o_dst = cutlass.inttoptr(
                     self.partial_o_ptr.toint()
                     + partial_row_base
-                    + Int64(output_col * cfg.o_dtype_bytes),
+                    + Int64(output_col * 2),
                     mem_space=1,
                     dtype=Int32,
                 )
