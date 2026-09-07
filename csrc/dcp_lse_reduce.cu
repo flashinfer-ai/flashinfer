@@ -25,6 +25,8 @@ using c10d::symmetric_memory::NCCLSymmetricMemory;
 
 namespace {
 
+constexpr int kRowDistributedMinEntries = 16;
+
 void CheckNccl(ncclResult_t result, const char* operation) {
   TORCH_CHECK(result == ncclSuccess, operation, ": ", ncclGetErrorString(result));
 }
@@ -81,7 +83,11 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
                   size_t lse_region_window_offset, size_t lse_region_local_offset,
                   size_t slot_lse_bytes, at::Tensor& output, int rank, int cp_size, int num_tokens,
                   int max_tokens, int local_heads, int head_dim, cudaStream_t stream) {
-  if (num_tokens * local_heads >= 16) {
+  // Small decode batches keep all rows for one destination in its owning
+  // block, avoiding an extra grid synchronization. Once there are enough
+  // rows to occupy the cooperative grid, distribute (destination, row) pairs
+  // across blocks so multiple blocks can serve the same destination.
+  if (num_tokens * local_heads >= kRowDistributedMinEntries) {
     launch_fused_impl<T, BaseE, true>(partial_o, partial_lse, workspace, window,
                                       signal_window_offset, out_region_window_offset,
                                       out_region_local_offset, slot_out_bytes,
