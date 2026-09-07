@@ -116,7 +116,7 @@ from .jit.blackwell_bgmv_moe import (
     gen_blackwell_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
-from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -778,7 +778,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
-            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
+            jit_specs.append(gen_gemm_sm120_module_cute())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
