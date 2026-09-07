@@ -70,6 +70,16 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
     assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
 
 
+@pytest.mark.parametrize(
+    ("total_tokens", "num_sequences", "expected"),
+    [(256, 4, 19), (17, 2, 2), (8, 16, 8), (0, 4, 0)],
+)
+def test_cute_dsl_max_packed_chunks(total_tokens, num_sequences, expected):
+    assert (
+        kda_prefill_cute_api._max_packed_chunks(total_tokens, num_sequences) == expected
+    )
+
+
 def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
     assert cake_kda_jit_api.CAKE_KDA_VARIANTS == (
         "m128_unbounded_softplus",
@@ -229,40 +239,33 @@ def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
         )
 
 
-def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
+def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device, monkeypatch):
     wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    wrapper.plan(torch.tensor([0, 0, 7, 7, 12], device=cuda_device))
+    offsets = torch.tensor([0, 0, 7, 7, 12], device=cuda_device)
+    original_to = torch.Tensor.to
+
+    def reject_device_to_host(self, *args, **kwargs):
+        if args and torch.device(args[0]).type == "cpu" and self.is_cuda:
+            pytest.fail("wrapper plan must not read CUDA offsets on the host")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", reject_device_to_host)
+    wrapper.plan(offsets)
 
     cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
     seq_order_ptr = wrapper._seq_order_buf.data_ptr()
     cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
     assert wrapper._cu_seqlens_buf.dtype == torch.int64
     assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
-    assert wrapper._seq_order_buf.tolist() == [1, 3, 0, 2]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 0, 1, 1, 2]
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
+    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
 
     wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
     assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
     assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
     assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
-    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
-
-    with pytest.raises(ValueError, match="total token count is fixed"):
-        wrapper.plan(torch.tensor([0, 0, 2, 2, 13], device=cuda_device))
 
     with pytest.raises(ValueError, match="number of sequences is fixed"):
         wrapper.plan(torch.tensor([0, 2, 12], device=cuda_device))
-
-    chunk_wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    chunk_wrapper.plan(torch.tensor([0, 16, 16, 32], device=cuda_device))
-    with pytest.raises(ValueError, match="chunk count is fixed"):
-        chunk_wrapper.plan(torch.tensor([0, 1, 17, 32], device=cuda_device))
-
-    with pytest.raises(ValueError, match="non-decreasing"):
-        RecurrentKDAPrefillWrapper(cuda_device).plan(
-            torch.tensor([0, 2, 1, 12], device=cuda_device)
-        )
 
 
 def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
@@ -287,7 +290,7 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     assert calls[0]["prefill_workspace"] is wrapper._workspace
     assert calls[0]["backend"] == "cute-dsl"
     assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
+    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
 
 
 def _cpu_route_tensors(token_count=2):
@@ -611,6 +614,7 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
         "state_indices": state_indices,
         "planned_cu_chunks": None,
         "planned_total_chunks": None,
+        "generate_planned_metadata": False,
     }
 
 
@@ -864,26 +868,28 @@ def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
         "seq_order",
         "planned_cu_chunks",
         "planned_total_chunks",
+        "generate_planned_metadata",
     }
     assert kwargs["seq_order"] is seq_order
     assert kwargs["state_indices"] is None
     assert kwargs["planned_cu_chunks"] is None
     assert kwargs["planned_total_chunks"] is None
+    assert kwargs["generate_planned_metadata"] is False
 
 
-def test_cute_dsl_lpt_sequence_order_is_content_cached(monkeypatch):
+def test_cute_dsl_device_sequence_order_buffer_is_stream_cached(monkeypatch):
     kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
-    monkeypatch.setattr(kernel_module, "_CU_CONTENTS_MEMO", {})
-    monkeypatch.setattr(kernel_module, "_LPT_SEQUENCE_ORDER_CACHE", {})
-    cu_seqlens = torch.tensor(
-        [0, 1300, 1847, 3895, 4858, 5129, 8192], dtype=torch.int64
+    monkeypatch.setattr(kernel_module, "_DEVICE_SEQUENCE_ORDER_CACHE", {})
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    first = kernel_module._device_sequence_order_buffer(6, torch.device("cpu"), 7)
+    second = kernel_module._device_sequence_order_buffer(6, torch.device("cpu"), 7)
+    other_stream = kernel_module._device_sequence_order_buffer(
+        6, torch.device("cpu"), 8
     )
 
-    first = kernel_module._lpt_sequence_order(cu_seqlens)
-    second = kernel_module._lpt_sequence_order(cu_seqlens.clone())
-
-    assert first.tolist() == [5, 2, 0, 3, 1, 4]
     assert second.data_ptr() == first.data_ptr()
+    assert other_stream.data_ptr() != first.data_ptr()
 
 
 def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
@@ -913,7 +919,7 @@ def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
     inputs = _cpu_route_tensors()
     cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
 
-    with pytest.raises(RuntimeError, match=r"Wrapper\.plan\(\)"):
+    with pytest.raises(RuntimeError, match="device sequence order must be warmed"):
         compiled(
             inputs["q"],
             inputs["k"],
@@ -6671,6 +6677,9 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
         inputs["initial_state"].copy_(initial_state_seed)
         output.zero_()
     capture_stream.synchronize()
+    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
+    if num_heads == 12:
+        assert wrapper._cu_chunks_buf.tolist() == [0, 0, 2, 2, 5]
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
@@ -6691,6 +6700,41 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
     )
     torch.testing.assert_close(
         captured_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+    # Reuse the captured graph with different device-resident offsets.  The
+    # graph's metadata prepass must refresh both scheduling buffers without a
+    # data-dependent host read or a changed launch geometry.
+    replay_seq_lens = [8, 0, 25, 17]
+    replay_offsets = torch.tensor(
+        [0, 8, 8, 33, 50], dtype=torch.int64, device=flash_kda_device
+    )
+    replay_inputs = {**inputs, "cu_seqlens": replay_offsets}
+    expected_replay_output, expected_replay_state = reference(
+        {**replay_inputs, "initial_state": initial_state_seed.clone()}
+    )
+    with torch.cuda.stream(capture_stream):
+        wrapper.plan(replay_offsets)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+        graph.replay()
+    capture_stream.synchronize()
+
+    assert wrapper._seq_order_buf.tolist() == [2, 3, 0, 1]
+    if num_heads == 12:
+        assert wrapper._cu_chunks_buf.tolist() == [0, 1, 1, 3, 5]
+    assert sum(replay_seq_lens) == output.shape[1]
+    torch.testing.assert_close(
+        captured_output.float(),
+        expected_replay_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        captured_state.float(),
+        expected_replay_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 

@@ -4592,6 +4592,56 @@ def tcgen05_store_final_state_tmem(
                 )
 
 
+PACKED_METADATA_THREADS: int = 256
+
+
+@cute.kernel
+def packed_metadata_kernel(
+    cu_seqlens: cute.Tensor,
+    seq_order: cute.Tensor,
+    cu_chunks: cute.Tensor,
+    generate_seq_order: cutlass.Int32,
+    generate_cu_chunks: cutlass.Int32,
+) -> None:
+    """Build packed scheduling metadata from device-resident prefix offsets."""
+
+    tidx, _, _ = cute.arch.thread_idx()
+    n_seq = cutlass.Int32(seq_order.shape[0])
+    if generate_seq_order != cutlass.Int32(0):
+        for index in cutlass.range(tidx, n_seq, PACKED_METADATA_THREADS):
+            seq_order[index] = cutlass.Int32(index)
+        cute.arch.sync_threads()
+
+        # Stable descending-length order.  The issue workload has at most 64
+        # sequences; odd-even transposition keeps the implementation compact
+        # and supports a runtime sequence count without temporary storage.
+        for phase in cutlass.range(n_seq):
+            parity = phase & cutlass.Int32(1)
+            pair_count = (n_seq - parity) // cutlass.Int32(2)
+            for pair in cutlass.range(tidx, pair_count, PACKED_METADATA_THREADS):
+                left = parity + pair * cutlass.Int32(2)
+                right = left + cutlass.Int32(1)
+                left_seq = cutlass.Int32(seq_order[left])
+                right_seq = cutlass.Int32(seq_order[right])
+                left_len = cu_seqlens[left_seq + 1] - cu_seqlens[left_seq]
+                right_len = cu_seqlens[right_seq + 1] - cu_seqlens[right_seq]
+                swap = (right_len > left_len) | (
+                    (right_len == left_len) & (right_seq < left_seq)
+                )
+                if swap:
+                    seq_order[left] = right_seq
+                    seq_order[right] = left_seq
+            cute.arch.sync_threads()
+
+    if (generate_cu_chunks != cutlass.Int32(0)) & (tidx == cutlass.Int32(0)):
+        cu_chunks[0] = cutlass.Int32(0)
+        total_chunks = cutlass.Int32(0)
+        for index in cutlass.range(n_seq):
+            seq_len = cutlass.Int32(cu_seqlens[index + 1] - cu_seqlens[index])
+            total_chunks += (seq_len + cutlass.Int32(BT - 1)) // cutlass.Int32(BT)
+            cu_chunks[index + 1] = total_chunks
+
+
 @cute.kernel
 def kernel(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
@@ -6853,26 +6903,6 @@ def host_prep(
 
 
 _PLAN_CACHE: dict = {}
-_LPT_SEQUENCE_ORDER_CACHE: dict = {}
-
-
-def _lpt_sequence_order(cu_seqlens: torch.Tensor) -> torch.Tensor:
-    """Cached longest-processing-time-first order for packed engine calls."""
-
-    cu_list = _cu_seqlens_contents(cu_seqlens)
-    key = (cu_list, str(cu_seqlens.device))
-    order = _LPT_SEQUENCE_ORDER_CACHE.get(key)
-    if order is None:
-        lengths = [
-            cu_list[index + 1] - cu_list[index] for index in range(len(cu_list) - 1)
-        ]
-        order = torch.tensor(
-            sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True),
-            dtype=torch.int32,
-            device=cu_seqlens.device,
-        )
-        _LPT_SEQUENCE_ORDER_CACHE[key] = order
-    return order
 
 
 def _plan(cu_seqlens: torch.Tensor) -> dict:
@@ -7715,7 +7745,9 @@ def kernel_prep(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tidx % THREADS_PER_WARP
 
-    total_chunks = cutlass.Int32(ws_qk.shape[2])
+    # The workspace extent is a graph-static capacity.  The device-generated
+    # prefix carries the actual count for the current replay.
+    total_chunks = cutlass.Int32(cu_chunks[cu_chunks.shape[0] - 1])
     gchunk_stride = cutlass.Int32(1)
     chunk_lo = bidx * chunks_per_cta
     my_chunks = total_chunks - chunk_lo
@@ -9514,8 +9546,10 @@ def host_unified(
     beta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     seq_order: cute.Tensor,
+    generate_seq_order: cutlass.Int32,
     state_indices: cute.Tensor | None,
     cu_chunks: cute.Tensor,
+    generate_cu_chunks: cutlass.Int32,
     ws_kd: cute.Tensor,
     ws_qd: cute.Tensor,
     ws_w: cute.Tensor,
@@ -9544,6 +9578,21 @@ def host_unified(
     heads = q.shape[2]
     h32 = cutlass.Int32(heads)
     z = cutlass.Int32(0)
+    if (generate_seq_order != z) | (generate_cu_chunks != z):
+        # A separate launch supplies the grid-wide publication boundary needed
+        # before either the persistent engine or decomposed kernels consume the
+        # generated metadata.  The launch is captured as part of a CUDA Graph.
+        packed_metadata_kernel(
+            cu_seqlens,
+            seq_order,
+            cu_chunks,
+            generate_seq_order,
+            generate_cu_chunks,
+        ).launch(
+            grid=(1, 1, 1),
+            block=(PACKED_METADATA_THREADS, 1, 1),
+            stream=stream_a,
+        )
     # Route selection.  MODE is a COMPILE-TIME constexpr:
     #   MODE is None    -> RUNTIME routing (both routes emitted, one .o handles
     #                      all shapes) — the default build.
@@ -9749,8 +9798,10 @@ def _unified_fakes(
             fbeta,
             fcu,
             forder,
+            0,  # generate_seq_order
             fstate_indices,
             fcuc,
+            0,  # generate_cu_chunks
             fkd,
             fqd,
             fw,
@@ -9798,6 +9849,27 @@ _UNIFORM_CU_CACHE: dict = {}
 
 
 _IDENTITY_SEQUENCE_ORDER_CACHE: dict = {}
+_DEVICE_SEQUENCE_ORDER_CACHE: dict = {}
+
+
+def _stream_pointer(stream) -> int:
+    value = getattr(stream, "value", stream)
+    return int(value or 0)
+
+
+def _device_sequence_order_buffer(num_sequences: int, device, stream) -> torch.Tensor:
+    """Reusable per-stream output for device-side packed sequence sorting."""
+
+    key = (str(device), _stream_pointer(stream), int(num_sequences))
+    order = _DEVICE_SEQUENCE_ORDER_CACHE.get(key)
+    if order is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "KDA device sequence order must be warmed before CUDA graph capture"
+            )
+        order = torch.empty(num_sequences, dtype=torch.int32, device=device)
+        _DEVICE_SEQUENCE_ORDER_CACHE[key] = order
+    return order
 
 
 def _identity_sequence_order(num_sequences: int, device) -> torch.Tensor:
@@ -9833,9 +9905,10 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
 
     Runtime ABI: (q, k, v, raw_gate, a_log, dt_bias, beta, cu_seqlens,
     initial_state, out, final_state, workspace, stream_a, scale, ..., seq_order)
-    — for packed engine calls, ``seq_order=None`` builds and caches an eager LPT
-    order; fixed and decomp calls retain the original sequence order. An explicit
-    packed CUDA int32 permutation overrides either default. The remaining
+    — packed engine calls with ``seq_order=None`` generate an LPT order on the
+    device; fixed and decomp calls retain the original sequence order unless a
+    wrapper requests device-generated metadata. An explicit packed CUDA int32
+    permutation overrides the implicit engine order. The remaining
     positional ABI is
     the reference host ABI (stream_a == the reference `stream`, scale in the same
     position) plus the `workspace` operand.  Decomp always runs prep-first on
@@ -9879,6 +9952,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         seq_order=None,
         planned_cu_chunks=None,
         planned_total_chunks=None,
+        generate_planned_metadata=False,
         state_indices=None,
         checkpoint_state_indices=None,
     ):
@@ -9932,6 +10006,7 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 seq_order=seq_order,
                 planned_cu_chunks=planned_cu_chunks,
                 planned_total_chunks=planned_total_chunks,
+                generate_planned_metadata=generate_planned_metadata,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -9989,15 +10064,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         if kind is None:
             kind = _route_for_workspace(n_seq, heads, device, compile_mode or "auto")
             decisions[key] = kind
+        generate_seq_order = bool(generate_planned_metadata)
         if seq_order is None:
             if packed_layout and kind == "engine":
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "packed CuTe DSL engine CUDA Graph capture requires "
-                        "an explicit sequence plan; use "
-                        "RecurrentKDAPrefillWrapper.plan() before capture"
-                    )
-                seq_order = _lpt_sequence_order(cu_seqlens)
+                generate_seq_order = True
+                seq_order = _device_sequence_order_buffer(n_seq, device, stream_a)
             else:
                 seq_order = _identity_sequence_order(n_seq, device)
         elif (
@@ -10017,6 +10088,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         if (planned_cu_chunks is None) != (planned_total_chunks is None):
             raise ValueError(
                 "planned_cu_chunks and planned_total_chunks must be provided together"
+            )
+        if generate_planned_metadata and not has_planned_chunks:
+            raise ValueError(
+                "device-generated chunk metadata requires planned_cu_chunks and "
+                "planned_total_chunks capacity"
             )
         cu_list = None
         if (kind == "decomp" and not has_planned_chunks) or (
@@ -10097,8 +10173,10 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 beta,
                 cu_seqlens,
                 seq_order,
+                int(generate_seq_order),
                 state_indices,
                 cuc,
+                0,  # engine does not consume a chunk prefix
                 kd,
                 qd,
                 wt,
@@ -10168,8 +10246,10 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             beta,
             cu_seqlens,
             seq_order,
+            int(generate_seq_order),
             state_indices,
             plan["cu_chunks"],
+            int(generate_planned_metadata),
             ws["kd"],
             ws["qd"],
             ws["w"],

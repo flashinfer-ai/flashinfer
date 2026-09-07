@@ -33,6 +33,14 @@ from .utils import get_compute_capability
 
 _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _HEAD_DIM = 128
+_CHUNK_SIZE = 16
+
+
+def _max_packed_chunks(total_tokens: int, num_sequences: int) -> int:
+    """Graph-static capacity for sum(ceil(sequence_length / 16))."""
+
+    nonempty_sequences = min(total_tokens, num_sequences)
+    return nonempty_sequences + (total_tokens - nonempty_sequences) // _CHUNK_SIZE
 
 
 def _is_cute_dsl_kda_runtime_available() -> bool:
@@ -463,11 +471,24 @@ def _run_cute_dsl_kda_prefill(
         if prefill_workspace is not None
         else None
     )
+    generate_planned_metadata = bool(
+        getattr(prefill_workspace, "_cute_dsl_generate_planned_metadata", False)
+        if prefill_workspace is not None
+        else False
+    )
     planned_total_chunks = (
         getattr(prefill_workspace, "_cute_dsl_total_chunks", None)
         if prefill_workspace is not None
         else None
     )
+    if generate_planned_metadata:
+        if planned_cu_chunks is None:
+            raise RuntimeError("missing CuTe DSL device chunk-prefix buffer")
+        total_tokens = q.shape[0] * q.shape[1]
+        # Maximum sum(ceil(seq_len / 16)) for non-negative integer lengths
+        # summing to total_tokens. This graph-static capacity avoids reading the
+        # actual per-replay prefix offsets on the host.
+        planned_total_chunks = _max_packed_chunks(total_tokens, num_sequences)
     if (planned_cu_chunks is None) != (planned_total_chunks is None):
         raise RuntimeError("incomplete CuTe DSL chunk plan on prefill workspace")
     if planned_cu_chunks is not None:
@@ -527,6 +548,7 @@ def _run_cute_dsl_kda_prefill(
             seq_order=seq_order,
             planned_cu_chunks=planned_cu_chunks,
             planned_total_chunks=planned_total_chunks,
+            generate_planned_metadata=generate_planned_metadata,
             **checkpoint_kwargs,
         )
 
