@@ -29,16 +29,20 @@ the full audited list lives in integrations/README.md):
 import pytest
 import torch
 
-from flashinfer.attention.unified import UnifiedPagedPrefill, resolve_paged_prefill
+from flashinfer.prefill import (
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
+)
 
-from .unified_prefill_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill
 
 DEVICE = "cuda:0"
 
 
 def _resolve_or_skip(**kw):
     try:
-        return resolve_paged_prefill(**kw)
+        return resolve_paged_attention(**kw)
     except ValueError as e:
         pytest.skip(str(e))
 
@@ -105,26 +109,29 @@ def test_vllm_shaped_prefill_mixed_batch():
         need_lse=True,  # vLLM DCP consumes LSE
     )
 
-    attn = UnifiedPagedPrefill(torch.device(DEVICE))
+    attn = PagedAttention(torch.device(DEVICE))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        # with the mirrors vLLM already owns, plan() must be zero-sync
-        attn.plan(
-            qo_indptr=qo_indptr_prefill,
-            kv_seq_lens=kv_lens_prefill,
-            block_tables=block_tables_prefill,
+        # with the mirrors vLLM already owns, metadata + plan() must be zero-sync
+        md = PagedAttentionMetadata.dense(
+            qo_indptr_prefill,
+            kv_lens_prefill,
+            block_tables_prefill,
             page_size=page_size,
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
+            qo_indptr_cpu=qo_indptr_prefill_cpu,
+            kv_seq_lens_cpu=kv_lens_prefill_cpu,
+        )
+        attn.plan(
+            md,
             num_qo_heads=h_qo,
             num_kv_heads=h_kv,
             head_dim_qk=d,
             q_dtype=torch.bfloat16,
             causal=True,
             lse_mode="base2",
-            qo_indptr_cpu=qo_indptr_prefill_cpu,
-            kv_seq_lens_cpu=kv_lens_prefill_cpu,
             backend=res,
         )
     finally:
@@ -206,17 +213,22 @@ def test_sglang_shaped_prefill_token_csr():
     # sglang pins fa2 today; assert the pinned form is in the candidate set
     assert "fa2" in res.backends
 
-    attn = UnifiedPagedPrefill(torch.device(DEVICE))
+    attn = PagedAttention(torch.device(DEVICE))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        attn.plan(
-            qo_indptr=qo_indptr,
-            kv_seq_lens=kv_lens_dev,
-            kv_page_indices=kv_indices_buf,  # over-allocated, as-is
+        md = PagedAttentionMetadata.csr(
+            qo_indptr,
+            kv_lens_dev,
+            kv_indices_buf,  # over-allocated, as-is
             page_size=1,
             max_q_len=int(q_lens.max()),
             max_kv_len=int(kv_lens.max()),
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_seq_lens_cpu=kv_lens,
+        )
+        attn.plan(
+            md,
             num_qo_heads=h_qo,
             num_kv_heads=h_kv,
             head_dim_qk=d,
@@ -224,8 +236,6 @@ def test_sglang_shaped_prefill_token_csr():
             kv_layout="NHD",
             causal=True,
             lse_mode="base2",
-            qo_indptr_cpu=qo_indptr_cpu,
-            kv_seq_lens_cpu=kv_lens,
             backend=res,
         )
     finally:
@@ -290,22 +300,25 @@ def test_vllm_shaped_sliding_window_uniform():
     )
     assert "cudnn" in res.excluded  # windowed: cudnn capability-excluded
 
-    attn = UnifiedPagedPrefill(torch.device(DEVICE))
-    attn.plan(
-        qo_indptr=qo_indptr_cpu.to(DEVICE),
-        kv_seq_lens=kv_lens_cpu.to(DEVICE),
-        block_tables=bt,
+    attn = PagedAttention(torch.device(DEVICE))
+    md = PagedAttentionMetadata.dense(
+        qo_indptr_cpu.to(DEVICE),
+        kv_lens_cpu.to(DEVICE),
+        bt,
         page_size=page_size,
         max_q_len=int(q_lens_cpu.max()),
         max_kv_len=int(kv_lens_cpu.max()),
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens_cpu=kv_lens_cpu,
+    )
+    attn.plan(
+        md,
         num_qo_heads=h_qo,
         num_kv_heads=h_kv,
         head_dim_qk=d,
         q_dtype=torch.bfloat16,
         causal=True,
         window_left=window,
-        qo_indptr_cpu=qo_indptr_cpu,
-        kv_seq_lens_cpu=kv_lens_cpu,
         backend=res,
     )
     total_q = int(qo_indptr_cpu[-1])

@@ -28,7 +28,7 @@ MIN_DENSE_PAGE_SIZE = 8
 
 
 @dataclass(frozen=True)
-class PagedPrefillCapabilities:
+class PagedAttentionCapabilities:
     """Static description of what one backend can run.
 
     This is the queryable capability matrix from the proposal (§5.1) — the
@@ -102,11 +102,11 @@ class PagedPrefillCapabilities:
 _F16 = frozenset({torch.float16, torch.bfloat16})
 
 # Per the capability-honesty rule: these sets mirror exactly what
-# tests/experimental/test_unified_prefill_{prototype,fuzzer}.py exercise.
+# tests/experimental/test_paged_attention_{prototype,fuzzer}.py exercise.
 # Production sets are wider (fa2 64/256 head dims, trtllm pages up to 1024
 # with GQA per tests/attention/test_trtllm_gen_attention_prefill.py, NHD...).
-CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
-    "fa2": PagedPrefillCapabilities(
+CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
+    "fa2": PagedAttentionCapabilities(
         name="fa2",
         # cc 11 (Thor/sm_110) intentionally undeclared: no hardware in the
         # verification pool (capability-honesty rule)
@@ -120,7 +120,7 @@ CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
         supports_window=True,
         requires_contiguous_q=False,
     ),
-    "fa3": PagedPrefillCapabilities(
+    "fa3": PagedAttentionCapabilities(
         name="fa3",
         cc_majors=frozenset({9}),
         q_dtypes=_F16,
@@ -136,7 +136,7 @@ CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
         supports_window=True,
         requires_contiguous_q=False,
     ),
-    "cudnn": PagedPrefillCapabilities(
+    "cudnn": PagedAttentionCapabilities(
         name="cudnn",
         cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
@@ -152,7 +152,7 @@ CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
         needs_dense=True,
         lse_native="base2_padded_bsh",
     ),
-    "trtllm-gen": PagedPrefillCapabilities(
+    "trtllm-gen": PagedAttentionCapabilities(
         name="trtllm-gen",
         cc_majors=frozenset({10}),
         q_dtypes=_F16,
@@ -170,4 +170,4 @@ CAPABILITIES: Dict[str, PagedPrefillCapabilities] = {
     ),
 }
 
-__all__ = ["CAPABILITIES", "MIN_DENSE_PAGE_SIZE", "PagedPrefillCapabilities"]
+__all__ = ["CAPABILITIES", "MIN_DENSE_PAGE_SIZE", "PagedAttentionCapabilities"]

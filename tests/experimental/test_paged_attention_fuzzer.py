@@ -43,10 +43,10 @@ import random
 import pytest
 import torch
 
-from flashinfer.attention.unified import resolve_paged_prefill
+from flashinfer.prefill import resolve_paged_attention
 
-from .test_unified_prefill_prototype import make_problem, run_unified
-from .unified_prefill_reference import reference_paged_prefill
+from .test_paged_attention_prototype import make_problem, run_unified
+from .paged_attention_reference import reference_paged_prefill
 
 TRIALS = int(os.environ.get("FI_UNIFIED_FUZZ_TRIALS", "30"))
 BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "auto"]
@@ -97,7 +97,7 @@ def _build(seed, cfg):
 
 def _backend_runnable(p, backend, causal, window_left=-1):
     try:
-        resolve_paged_prefill(
+        resolve_paged_attention(
             device=torch.device(p["device"]),
             num_qo_heads=p["num_qo_heads"],
             num_kv_heads=p["num_kv_heads"],

@@ -18,11 +18,11 @@ multimodal / deterministic mode).  Explicitly OUT of the v1 diff:
 ```python
 # FlashInferAttnBackend.__init__ (replacing the fa2 pin at :312 and the
 # paged-prefill wrapper construction at :492-510)
-+from flashinfer.attention.unified import (
-+    UnifiedPagedPrefill, resolve_paged_prefill,
++from flashinfer.prefill import (
++    PagedAttention, PagedAttentionMetadata, resolve_paged_attention,
 +)
 +
-+self._prefill_resolution = resolve_paged_prefill(
++self._prefill_resolution = resolve_paged_attention(
 +    device=self.device,
 +    num_qo_heads=self.num_qo_heads,
 +    num_kv_heads=self.num_kv_heads,
@@ -34,7 +34,7 @@ multimodal / deterministic mode).  Explicitly OUT of the v1 diff:
 +    need_lse=True,                    # merge_state consumes LSE
 +    kv_input_form="page_indices",     # the flat kv_indices sglang builds
 +)
-+self.prefill_attn = UnifiedPagedPrefill(self.device)
++self.prefill_attn = PagedAttention(self.device)
 ```
 
 `backend="fa2"` pinning becomes unnecessary: at page_size=1 the
@@ -56,13 +56,18 @@ already, so this is a copy-forward of an existing host array, not a sync.
 -kv_last_page_len = ...                                           # DELETED
 -wrapper.begin_forward(qo_indptr, kv_indptr, kv_indices,
 -                      self.kv_last_page_len[:bs], ...)
-+self.prefill_attn.plan(
-+    qo_indptr=qo_indptr,                       # same preallocated buffer slice
-+    kv_seq_lens=paged_kernel_lens,             # the masking truth, directly
-+    kv_page_indices=kv_indices,                # over-allocated tail is fine
++md = PagedAttentionMetadata.csr(
++    qo_indptr,                                 # same preallocated buffer slice
++    paged_kernel_lens,                         # the masking truth, directly
++    kv_indices,                                # over-allocated tail is fine
 +    page_size=1,
 +    max_q_len=max_extend_len,                  # host ints sglang carries
 +    max_kv_len=max_kv_len,
++    qo_indptr_cpu=qo_indptr_cpu,               # NEW plumbing: host lens
++    kv_seq_lens_cpu=paged_kernel_lens_cpu,     # forwarded from the scheduler
++)
++self.prefill_attn.plan(
++    md,
 +    num_qo_heads=self.num_qo_heads,
 +    num_kv_heads=self.num_kv_heads,
 +    head_dim_qk=self.head_dim,
@@ -70,8 +75,6 @@ already, so this is a copy-forward of an existing host array, not a sync.
 +    kv_layout="NHD",
 +    causal=True,
 +    lse_mode="base2",
-+    qo_indptr_cpu=qo_indptr_cpu,               # NEW plumbing: host lens
-+    kv_seq_lens_cpu=paged_kernel_lens_cpu,     # forwarded from the scheduler
 +    backend=self._prefill_resolution,
 +)
 ```

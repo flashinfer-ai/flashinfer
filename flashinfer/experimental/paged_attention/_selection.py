@@ -66,7 +66,7 @@ HEURISTIC_ORDER: Dict[int, Tuple[str, ...]] = {
 }
 
 
-def resolve_paged_prefill(
+def resolve_paged_attention(
     *,
     device: Optional[torch.device] = None,
     cc_major: Optional[int] = None,
@@ -167,4 +167,4 @@ def resolve_paged_prefill(
     )
 
 
-__all__ = ["HEURISTIC_ORDER", "PROBES", "resolve_paged_prefill"]
+__all__ = ["HEURISTIC_ORDER", "PROBES", "resolve_paged_attention"]

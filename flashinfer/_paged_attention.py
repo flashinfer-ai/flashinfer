@@ -1,18 +1,19 @@
-"""Unified paged-prefill — EXPERIMENTAL public entry point.
+"""Paged attention (PagedAttention) — EXPERIMENTAL public entry point.
 
 Working prototype of ``PAGED_PREFILL_UNIFICATION_PROPOSAL.md``. This module is
 the thin core entry point required by ``flashinfer/experimental/README.md``:
 public signatures, the experimental marker, and a deferred handoff to
-``flashinfer.experimental.paged_prefill``, which owns contracts, planning,
+``flashinfer.experimental.paged_attention``, which owns contracts, planning,
 selection, and the per-backend modules. Everything dispatches to *existing*
 kernels — there is no new kernel.
 
 Layers (see proposal §"Architecture" and the MLA precedent in
 ``docs/design_docs/batch_mla_backend_architecture.md``):
 
-    entry       this module: resolve_paged_prefill() + UnifiedPagedPrefill
-    controller  experimental.paged_prefill._controller  (plan/run lifecycle)
-    backends    experimental.paged_prefill._backends    (fa2/fa3, cudnn, trtllm-gen)
+    entry       this module (exported from flashinfer.prefill):
+                resolve_paged_attention() + PagedAttention + PagedAttentionMetadata
+    controller  experimental.paged_attention._controller  (plan/run lifecycle)
+    backends    experimental.paged_attention._backends    (fa2/fa3, cudnn, trtllm-gen)
     kernels     the existing wrapper / standalone functions (untouched)
 
 Design rules enforced (each traces to a documented failure mode):
@@ -27,9 +28,9 @@ Design rules enforced (each traces to a documented failure mode):
     (cuDNN issue #3800 is what guessing looks like).
 3.  Reject-or-correct.  Anything this API returns must match the reference
     semantics; anything it cannot address must raise.  The companion fuzzer
-    (``tests/experimental/test_unified_prefill_fuzzer.py``) enforces exactly
+    (``tests/experimental/test_paged_attention_fuzzer.py``) enforces exactly
     this property with randomized valid and corrupted inputs.
-4.  Two-level selection.  ``resolve_paged_prefill()`` is a static, tensor-free
+4.  Two-level selection.  ``resolve_paged_attention()`` is a static, tensor-free
     query usable at engine init (before pool allocation / graph capture);
     passing the returned ``Resolution`` to ``plan(backend=...)`` pins the
     candidate set — plan() verifies the config matches and may only choose
@@ -74,33 +75,34 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ..api_logging import flashinfer_experimental_api
+from .api_logging import flashinfer_experimental_api
 
 if TYPE_CHECKING:  # pragma: no cover — types only; the package is imported lazily
-    from ..experimental.paged_prefill import Resolution
+    from .experimental.paged_attention import PagedAttentionMetadata, Resolution
 
 __all__ = [
-    "resolve_paged_prefill",
-    "UnifiedPagedPrefill",
+    "resolve_paged_attention",
+    "PagedAttention",
 ]
 
-_FEATURE = "unified paged prefill"
+_FEATURE = "PagedAttention"
 
 # Value types users receive from / hand back to this API. Resolved lazily so
 # that importing core never loads the experimental package.
 _LAZY_EXPORTS = {
+    "PagedAttentionMetadata": "PagedAttentionMetadata",
     "Resolution": "Resolution",
-    "PagedPrefillCapabilities": "PagedPrefillCapabilities",
-    "BackendCapability": "PagedPrefillCapabilities",  # pre-rename alias
+    "PagedAttentionCapabilities": "PagedAttentionCapabilities",
+    "BackendCapability": "PagedAttentionCapabilities",  # pre-rename alias
     "CAPABILITIES": "CAPABILITIES",
 }
 
 
 def __getattr__(name: str):
     if name in _LAZY_EXPORTS:
-        from ..experimental import paged_prefill
+        from .experimental import paged_attention
 
-        value = getattr(paged_prefill, _LAZY_EXPORTS[name])
+        value = getattr(paged_attention, _LAZY_EXPORTS[name])
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -111,7 +113,7 @@ def __dir__():
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def resolve_paged_prefill(
+def resolve_paged_attention(
     *,
     device: Optional[torch.device] = None,
     cc_major: Optional[int] = None,
@@ -134,10 +136,10 @@ def resolve_paged_prefill(
     CUDA graph is captured (vLLM decides its cudagraph mode and Q dtype at
     that point).  Returns an ordered candidate set plus a reason for every
     excluded backend; raises ``ValueError`` when nothing can run.  Pass the
-    result to :meth:`UnifiedPagedPrefill.plan` as ``backend=`` to pin the
+    result to :meth:`PagedAttention.plan` as ``backend=`` to pin the
     candidate set.
     """
-    from ..experimental.paged_prefill import resolve_paged_prefill as _resolve
+    from .experimental.paged_attention import resolve_paged_attention as _resolve
 
     return _resolve(
         device=device,
@@ -157,28 +159,32 @@ def resolve_paged_prefill(
     )
 
 
-class UnifiedPagedPrefill:
-    """Unified paged-prefill entry point (experimental).
+class PagedAttention:
+    """Paged attention over the existing fa2/fa3, cuDNN and trtllm-gen kernels
+    behind one contract (experimental).
 
-    Usage (engine-shaped; see ``prototype_demo_unified_prefill.py``)::
+    Usage (engine-shaped; see ``prototype_demo_paged_attention.py``)::
 
-        res = resolve_paged_prefill(cc_major=9, num_qo_heads=8, num_kv_heads=2,
-                                    head_dim_qk=128, q_dtype=torch.bfloat16,
-                                    page_size=16, need_lse=True)
+        res = resolve_paged_attention(cc_major=9, num_qo_heads=8, num_kv_heads=2,
+                                      head_dim_qk=128, q_dtype=torch.bfloat16,
+                                      page_size=16, need_lse=True)
         # ... engine allocates its KV pool in res.kv_layout, sets dtypes ...
-        attn = UnifiedPagedPrefill(device)
-        attn.plan(qo_indptr=..., kv_seq_lens=..., block_tables=...,
-                  page_size=16, max_q_len=..., max_kv_len=...,
-                  num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
-                  q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
-                  backend=res)          # pinned candidate set (or a string)
-        out, lse = attn.run(q, (k_cache, v_cache))
+        attn = PagedAttention(device)
+        for step in engine:
+            md = PagedAttentionMetadata.dense(qo_indptr, kv_seq_lens, block_tables,
+                                              page_size=16, max_q_len=..., max_kv_len=...,
+                                              qo_indptr_cpu=..., kv_seq_lens_cpu=...)
+            attn.plan(md, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+                      q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
+                      backend=res)          # pinned candidate set (or a string)
+            for layer in model:
+                out, lse = attn.run(q, (k_cache, v_cache), sm_scale=layer.scale)
     """
 
     def __init__(self, device: Optional[torch.device] = None):
-        from ..experimental.paged_prefill import PagedPrefillController
+        from .experimental.paged_attention import PagedAttentionController
 
-        self._impl = PagedPrefillController(device)
+        self._impl = PagedAttentionController(device)
 
     @property
     def device(self) -> torch.device:
@@ -192,14 +198,8 @@ class UnifiedPagedPrefill:
     @flashinfer_experimental_api(feature=_FEATURE)
     def plan(
         self,
+        metadata: "PagedAttentionMetadata",
         *,
-        qo_indptr: torch.Tensor,
-        kv_seq_lens: torch.Tensor,
-        block_tables: Optional[torch.Tensor] = None,
-        kv_page_indices: Optional[torch.Tensor] = None,
-        page_size: int,
-        max_q_len: int,
-        max_kv_len: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim_qk: int,
@@ -210,50 +210,35 @@ class UnifiedPagedPrefill:
         causal: bool = True,
         window_left: int = -1,
         lse_mode: str = "none",
-        qo_indptr_cpu: Optional[torch.Tensor] = None,
-        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
         backend: Union[str, "Resolution"] = "auto",
-    ) -> "UnifiedPagedPrefill":
-        """Plan one batch with the canonical paged-prefill metadata.
+    ) -> "PagedAttention":
+        """Plan one batch.
 
-        Canonical metadata (all CUDA int32 on this instance's device):
-
-        - ``qo_indptr``: ``(b+1,)`` token-unit prefix sums of query lengths
-          (``qo_indptr[0] == 0``; build with ``cumsum(..., dtype=torch.int32)``)
-        - ``kv_seq_lens``: ``(b,)`` per-request valid KV lengths >= 1
-          (masking truth; causal requires ``q_len_i <= kv_len_i``)
-        - paging: EXACTLY ONE of ``block_tables`` ``(b, max_pages_per_seq)``
-          dense (page_size >= 8) or ``kv_page_indices`` flat CSR page-id list
-          (any page_size >= 1; page-unit indptr / last-page lengths are
-          derived from ``kv_seq_lens`` — a second copy would be a second
-          truth)
-        - ``page_size, max_q_len, max_kv_len``: host ints, REQUIRED
+        - ``metadata``: a :class:`PagedAttentionMetadata` built once per step
+          with ``.dense(...)`` (vLLM-style block table, page_size >= 8) or
+          ``.csr(...)`` (sglang-style flat page ids, any page_size >= 1).  It
+          carries the device tensors, the required host maxes and the optional
+          CPU mirrors; construction validates once, so plan() is zero-sync and
+          several plans over the same batch derive their metadata once.
+        - ``num_qo_heads / num_kv_heads / head_dim_qk / head_dim_vo / q_dtype /
+          kv_dtype / kv_layout``: the static model configuration.
+        - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request.
         - ``window_left``: sliding-window size (-1 = unlimited); backends
-          without window support are capability-excluded
-        - ``lse_mode``: ``"none"`` (no LSE), ``"base2"`` or ``"basee"`` — the
-          base of the LSE ``run()`` returns, delivered natively where the
-          backend can and with one fold otherwise
-        - ``qo_indptr_cpu`` / ``kv_seq_lens_cpu``: optional host mirrors —
-          with them plan() is zero-sync (validation and fa2/fa3 scheduling
-          read the mirrors the engine already owns); without them plan()
-          performs ONE documented D2H here.  Value-level validation always
-          runs; there is no unvalidated path.
+          without window support are capability-excluded.  Plan-time because
+          it selects a compiled kernel variant on the FA backends.
+        - ``lse_mode``: ``"none"``, ``"base2"`` or ``"basee"`` — the base of
+          the LSE ``run()`` returns, delivered natively where the backend can
+          and with one fold otherwise.
         - ``backend``: a backend name, ``"auto"``, or a ``Resolution`` from
-          :func:`resolve_paged_prefill` — the latter pins the candidate set
+          :func:`resolve_paged_attention` — the latter pins the candidate set
           decided at engine init (plan() verifies the config matches).
 
         Publication is transactional: a failing ``plan()`` leaves the previous
-        plan runnable (see ``experimental/paged_prefill/_controller.py`` for
+        plan runnable (see ``experimental/paged_attention/_controller.py`` for
         the one generated-FA caveat).
         """
         self._impl.plan(
-            qo_indptr=qo_indptr,
-            kv_seq_lens=kv_seq_lens,
-            block_tables=block_tables,
-            kv_page_indices=kv_page_indices,
-            page_size=page_size,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
+            metadata,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim_qk,
@@ -264,8 +249,6 @@ class UnifiedPagedPrefill:
             causal=causal,
             window_left=window_left,
             lse_mode=lse_mode,
-            qo_indptr_cpu=qo_indptr_cpu,
-            kv_seq_lens_cpu=kv_seq_lens_cpu,
             backend=backend,
         )
         return self

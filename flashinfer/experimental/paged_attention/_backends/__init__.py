@@ -11,7 +11,7 @@ from typing import Callable, Dict
 
 import torch
 
-from ._capabilities import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedPrefillCapabilities
+from ._capabilities import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedAttentionCapabilities
 from .cudnn_backend import _CudnnBackend
 from .fa_backend import _FaBackend
 from .trtllm_gen_backend import _TrtllmGenBackend
@@ -34,6 +34,6 @@ def make_backend(
 __all__ = [
     "CAPABILITIES",
     "MIN_DENSE_PAGE_SIZE",
-    "PagedPrefillCapabilities",
+    "PagedAttentionCapabilities",
     "make_backend",
 ]

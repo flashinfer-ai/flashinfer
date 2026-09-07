@@ -9,14 +9,14 @@ with decode and wait for the decode follow-up).
 
 ```python
 # FlashInferMetadataBuilder.__init__ (near the q_data_type decisions, ~:672)
-+from flashinfer.attention.unified import (
-+    UnifiedPagedPrefill, resolve_paged_prefill,
++from flashinfer.prefill import (
++    PagedAttention, PagedAttentionMetadata, resolve_paged_attention,
 +)
 +
 +# NOTE: the Resolution config-key includes window_left and causal, so a
 +# model with sliding window resolves its own variant; engines with mixed
 +# variants hold one Resolution per (window, causal) pair.
-+self._prefill_resolution = resolve_paged_prefill(
++self._prefill_resolution = resolve_paged_attention(
 +    device=self.device,
 +    num_qo_heads=self.num_qo_heads,
 +    num_kv_heads=self.num_kv_heads,
@@ -30,7 +30,7 @@ with decode and wait for the decode follow-up).
 +)
 +# constructed ONCE here (it owns 128 MB workspace; per-build construction
 +# would re-allocate every scheduler step)
-+self._prefill_attn = UnifiedPagedPrefill(self.device)
++self._prefill_attn = PagedAttention(self.device)
 ```
 
 Deletes on the prefill side: the `prefill_use_trtllm` predicate
@@ -44,13 +44,18 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 ```python
 # in build(), prefill branch (replacing TRTLLMPrefill :1175-1207 AND the
 # FIPrefill CSR construction :1208-1269 for the prefill slice)
-+self._prefill_attn.plan(
-+    qo_indptr=qo_indptr[prefill_start:] - qo_indptr[prefill_start],
-+    kv_seq_lens=seq_lens[prefill_start:],
-+    block_tables=block_table_tensor[prefill_start:],
++md = PagedAttentionMetadata.dense(          # once per step; validates once
++    qo_indptr[prefill_start:] - qo_indptr[prefill_start],
++    seq_lens[prefill_start:],
++    block_table_tensor[prefill_start:],
 +    page_size=page_size,
 +    max_q_len=max_q_len,                     # already host ints
 +    max_kv_len=max_seq_len,
++    qo_indptr_cpu=qo_indptr_prefill_cpu,     # mirrors vLLM already owns
++    kv_seq_lens_cpu=seq_lens_cpu[prefill_start:],
++)
++self._prefill_attn.plan(
++    md,
 +    num_qo_heads=self.num_qo_heads,
 +    num_kv_heads=self.num_kv_heads,
 +    head_dim_qk=self.head_dim,
@@ -59,8 +64,6 @@ replaces.  `resolve()` also reports exclusion reasons, replacing the logged
 +    causal=causal,
 +    window_left=self.window_left,
 +    lse_mode="none",  # sm_scale is passed per layer at run()
-+    qo_indptr_cpu=qo_indptr_prefill_cpu,     # mirrors vLLM already owns
-+    kv_seq_lens_cpu=seq_lens_cpu[prefill_start:],
 +    backend=self._prefill_resolution,
 +)
 ```

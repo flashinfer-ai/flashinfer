@@ -15,12 +15,13 @@ import zlib
 import pytest
 import torch
 
-from flashinfer.attention.unified import (
-    UnifiedPagedPrefill,
-    resolve_paged_prefill,
+from flashinfer.prefill import (
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
 )
 
-from .unified_prefill_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill
 
 BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "auto"]
 
@@ -114,6 +115,35 @@ def make_problem(
     )
 
 
+def make_metadata(p, *, with_mirrors=True):
+    """Problem dict -> PagedAttentionMetadata.  ``input_form="both"`` calls the
+    raw constructor with both paging forms so the fuzzer can check that this
+    is rejected structurally."""
+    form = p.get("input_form", "block_tables")
+    common = dict(
+        page_size=p["page_size"],
+        max_q_len=p["max_q_len"],
+        max_kv_len=p["max_kv_len"],
+        qo_indptr_cpu=p["qo_indptr_cpu"] if with_mirrors else None,
+        kv_seq_lens_cpu=p["kv_seq_lens_cpu"] if with_mirrors else None,
+    )
+    if form == "block_tables":
+        return PagedAttentionMetadata.dense(
+            p["qo_indptr"], p["kv_seq_lens"], p["block_tables"], **common
+        )
+    if form == "page_indices":
+        return PagedAttentionMetadata.csr(
+            p["qo_indptr"], p["kv_seq_lens"], p["kv_page_indices"], **common
+        )
+    return PagedAttentionMetadata(
+        qo_indptr=p["qo_indptr"],
+        kv_seq_lens=p["kv_seq_lens"],
+        block_tables=p["block_tables"],
+        kv_page_indices=p["kv_page_indices"],
+        **common,
+    )
+
+
 def run_unified(
     p,
     backend,
@@ -124,18 +154,10 @@ def run_unified(
     sm_scale=None,
     window_left=-1,
 ):
-    attn = UnifiedPagedPrefill(torch.device(p["device"]))
-    form = p.get("input_form", "block_tables")
+    attn = PagedAttention(torch.device(p["device"]))
+    md = make_metadata(p, with_mirrors=with_mirrors)
     attn.plan(
-        qo_indptr=p["qo_indptr"],
-        kv_seq_lens=p["kv_seq_lens"],
-        block_tables=(p["block_tables"] if form in ("block_tables", "both") else None),
-        kv_page_indices=(
-            p["kv_page_indices"] if form in ("page_indices", "both") else None
-        ),
-        page_size=p["page_size"],
-        max_q_len=p["max_q_len"],
-        max_kv_len=p["max_kv_len"],
+        md,
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
         head_dim_qk=p["head_dim_qk"],
@@ -145,8 +167,6 @@ def run_unified(
         causal=causal,
         window_left=window_left,
         lse_mode=lse_mode,
-        qo_indptr_cpu=p["qo_indptr_cpu"] if with_mirrors else None,
-        kv_seq_lens_cpu=p["kv_seq_lens_cpu"] if with_mirrors else None,
         backend=backend,
     )
     out, lse = attn.run(
@@ -161,7 +181,7 @@ def run_unified(
 
 def _resolve_or_skip(p, backend, *, causal=True, need_lse=True, window_left=-1):
     try:
-        return resolve_paged_prefill(
+        return resolve_paged_attention(
             device=torch.device(p["device"]),
             num_qo_heads=p["num_qo_heads"],
             num_kv_heads=p["num_kv_heads"],
@@ -217,7 +237,7 @@ def check(p, backend, *, causal=True, window_left=-1):
         (1, 128, 128, (4, 4), 64),  # single request
     ],
 )
-def test_unified_prefill_conformance(
+def test_paged_attention_conformance(
     backend, batch_size, max_q, max_kv, heads, page_size
 ):
     p = make_problem(
@@ -237,7 +257,7 @@ def test_unified_prefill_conformance(
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_unified_prefill_decode_shape(backend):
+def test_paged_attention_decode_shape(backend):
     """Uniform q_len=1 through the same API — decode is a special case of the
     unified contract, not a different world (proposal / PD-统一 argument)."""
     p = make_problem(
@@ -255,7 +275,7 @@ def test_unified_prefill_decode_shape(backend):
     check(p, backend)
 
 
-def test_unified_prefill_noncausal_fa2():
+def test_paged_attention_noncausal_fa2():
     p = make_problem(
         seed=11,
         batch_size=4,
@@ -270,7 +290,7 @@ def test_unified_prefill_noncausal_fa2():
     check(p, "fa2", causal=False)
 
 
-def test_unified_prefill_no_mirrors_documented_sync():
+def test_paged_attention_no_mirrors_documented_sync():
     """Without host mirrors the facade does one documented D2H and results
     are identical — the sync is a perf note, never a semantics change."""
     p = make_problem(
@@ -292,9 +312,9 @@ def test_unified_prefill_no_mirrors_documented_sync():
 
 
 def test_resolve_is_static_and_explains():
-    """resolve_paged_prefill needs no tensors — callable at engine init —
+    """resolve_paged_attention needs no tensors — callable at engine init —
     and reports per-backend exclusion reasons (the anti-rot 'explain')."""
-    res = resolve_paged_prefill(
+    res = resolve_paged_attention(
         cc_major=9,
         num_qo_heads=8,
         num_kv_heads=2,
@@ -309,7 +329,7 @@ def test_resolve_is_static_and_explains():
     assert "sm_9" in res.excluded["trtllm-gen"]
     # explicit pin of an impossible backend raises with the reason
     with pytest.raises(ValueError, match="compute capability"):
-        resolve_paged_prefill(
+        resolve_paged_attention(
             cc_major=8,
             num_qo_heads=8,
             num_kv_heads=2,
@@ -320,7 +340,7 @@ def test_resolve_is_static_and_explains():
         )
     # GQA violation is a contract error, not a backend error
     with pytest.raises(ValueError, match="divisible"):
-        resolve_paged_prefill(
+        resolve_paged_attention(
             cc_major=9,
             num_qo_heads=7,
             num_kv_heads=2,
@@ -332,7 +352,7 @@ def test_resolve_is_static_and_explains():
 
 @pytest.mark.parametrize("backend", ["cudnn", "fa2"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_unified_prefill_headdim_192_128(backend, dtype):
+def test_paged_attention_headdim_192_128(backend, dtype):
     """(192,128) head dims — capability-honesty: declared rows are tested."""
     if backend == "fa2":
         pytest.skip("fa2 (192,128) not declared in the prototype capability set")
@@ -352,7 +372,7 @@ def test_unified_prefill_headdim_192_128(backend, dtype):
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn"])
-def test_unified_prefill_noncausal(backend):
+def test_paged_attention_noncausal(backend):
     p = make_problem(
         seed=11,
         batch_size=4,
@@ -368,7 +388,7 @@ def test_unified_prefill_noncausal(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_unified_prefill_lse_basee(backend):
+def test_paged_attention_lse_basee(backend):
     """lse_mode="basee" returns natural-log LSE from every backend (cuDNN
     natively, FA/trtllm-gen via one fold), matching the reference."""
     p = make_problem(
@@ -400,7 +420,7 @@ def test_unified_prefill_lse_basee(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_unified_prefill_sm_scale_replan(backend):
+def test_paged_attention_sm_scale_replan(backend):
     """One plan, two run() calls with different sm_scale must each be correct
     (sm_scale is a per-layer run-time value).  Also the regression for the
     cuDNN graph-cache stale-scale replay (the cache key omitted attn_scale;
@@ -449,34 +469,23 @@ def test_resolution_pinning():
         dtype=torch.bfloat16,
     )
     res = _resolve_or_skip(p, "auto")
-    attn = UnifiedPagedPrefill(torch.device(p["device"]))
+    attn = PagedAttention(torch.device(p["device"]))
+    md = make_metadata(p)
     attn.plan(
-        qo_indptr=p["qo_indptr"],
-        kv_seq_lens=p["kv_seq_lens"],
-        block_tables=p["block_tables"],
-        page_size=p["page_size"],
-        max_q_len=p["max_q_len"],
-        max_kv_len=p["max_kv_len"],
+        md,
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
         head_dim_qk=p["head_dim_qk"],
         q_dtype=p["dtype"],
         causal=True,
         lse_mode="base2",
-        qo_indptr_cpu=p["qo_indptr_cpu"],
-        kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
         backend=res,
     )
     assert attn.backend in res.backends
     # drifted config (different heads) must be rejected, not silently re-resolved
     with pytest.raises(ValueError, match="pinned Resolution"):
         attn.plan(
-            qo_indptr=p["qo_indptr"],
-            kv_seq_lens=p["kv_seq_lens"],
-            block_tables=p["block_tables"],
-            page_size=p["page_size"],
-            max_q_len=p["max_q_len"],
-            max_kv_len=p["max_kv_len"],
+            md,
             num_qo_heads=p["num_qo_heads"],
             num_kv_heads=p["num_qo_heads"],  # MHA instead of GQA
             head_dim_qk=p["head_dim_qk"],
@@ -522,7 +531,7 @@ def test_derive_is_sync_free():
     """The derivation layer must not synchronize (proposal P1 acceptance:
     with mirrors, plan() is zero-D2H).  Guards against masked-select /
     repeat_interleave style data-dependent-size ops sneaking back in."""
-    from flashinfer.experimental.paged_prefill import derive as _derive
+    from flashinfer.experimental.paged_attention import derive as _derive
 
     p = make_problem(
         seed=31,
@@ -578,7 +587,7 @@ def test_derive_is_sync_free():
 
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("window_left", [0, 16, 127])
-def test_unified_prefill_sliding_window(backend, window_left):
+def test_paged_attention_sliding_window(backend, window_left):
     """window_left plumbed through every windowed backend; cudnn is
     capability-excluded (skip via resolve)."""
     p = make_problem(
@@ -596,7 +605,7 @@ def test_unified_prefill_sliding_window(backend, window_left):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_unified_prefill_nhd_layout(backend):
+def test_paged_attention_nhd_layout(backend):
     p = make_problem(
         seed=41,
         batch_size=4,
@@ -614,7 +623,7 @@ def test_unified_prefill_nhd_layout(backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("page_size", [1, 16])
-def test_unified_prefill_csr_page_indices(backend, page_size):
+def test_paged_attention_csr_page_indices(backend, page_size):
     """The flat kv_page_indices form (sglang-style); page_size=1 token-CSR is
     in-envelope here, with dense-needing backends capability-excluded."""
     p = make_problem(
@@ -632,7 +641,7 @@ def test_unified_prefill_csr_page_indices(backend, page_size):
     check(p, backend)
 
 
-def test_unified_prefill_csr_dense_equivalence():
+def test_paged_attention_csr_dense_equivalence():
     """Dense and flat-indices forms of the same problem are bitwise identical
     per backend (the derivation is exact, not approximate)."""
     common = dict(
@@ -662,7 +671,7 @@ def test_unified_prefill_csr_dense_equivalence():
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
-def test_unified_prefill_fp16(backend):
+def test_paged_attention_fp16(backend):
     p = make_problem(
         seed=53,
         batch_size=3,
@@ -680,7 +689,7 @@ def test_unified_prefill_fp16(backend):
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("head_dim", [64, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_unified_prefill_wide_head_dims(backend, head_dim, dtype):
+def test_paged_attention_wide_head_dims(backend, head_dim, dtype):
     p = make_problem(
         seed=59,
         batch_size=3,

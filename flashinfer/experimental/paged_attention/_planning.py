@@ -143,15 +143,8 @@ def validate_values(
             f"{int(kv_seq_lens_cpu[bad])}) — zero-length KV rows are "
             "outside the v1 envelope; filter empty requests before plan()"
         )
-    if causal and not bool((d <= kv_seq_lens_cpu).all()):
-        bad = int((d > kv_seq_lens_cpu).nonzero()[0])
-        raise ValueError(
-            f"causal masking requires q_len_i <= kv_len_i for every "
-            f"request; request {bad} has q_len {int(d[bad])} > kv_len "
-            f"{int(kv_seq_lens_cpu[bad])} (fully-masked rows have "
-            "backend-divergent LSE semantics and are outside the v1 "
-            "envelope)"
-        )
+    if causal:
+        validate_causal_envelope(qo_indptr_cpu, kv_seq_lens_cpu)
     _expect(
         int(kv_seq_lens_cpu.max()) <= max_kv_len,
         f"max_kv_len ({max_kv_len}) is smaller than the actual longest "
@@ -175,6 +168,20 @@ def validate_values(
             f"kv_seq_lens require {total_pages} pages at page_size "
             f"{page_size} — the flat page-id list must cover "
             "sum(ceil(kv_len/page_size)) entries in request order",
+        )
+
+
+def validate_causal_envelope(qo_indptr_cpu, kv_seq_lens_cpu) -> None:
+    """Causal masking requires q_len_i <= kv_len_i (host mirrors, zero sync)."""
+    d = qo_indptr_cpu.diff()
+    if not bool((d <= kv_seq_lens_cpu).all()):
+        bad = int((d > kv_seq_lens_cpu).nonzero()[0])
+        raise ValueError(
+            f"causal masking requires q_len_i <= kv_len_i for every "
+            f"request; request {bad} has q_len {int(d[bad])} > kv_len "
+            f"{int(kv_seq_lens_cpu[bad])} (fully-masked rows have "
+            "backend-divergent LSE semantics and are outside the v1 "
+            "envelope)"
         )
 
 
@@ -250,4 +257,10 @@ def derive(
     return Derived(q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices, dense)
 
 
-__all__ = ["Derived", "derive", "validate_structure", "validate_values"]
+__all__ = [
+    "Derived",
+    "derive",
+    "validate_causal_envelope",
+    "validate_structure",
+    "validate_values",
+]

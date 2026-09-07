@@ -1,11 +1,11 @@
 # Engine integration sketches for the unified paged-prefill API
 
 Two reviewable diffs showing what vLLM and sglang delete and gain by moving
-their paged-prefill path to `flashinfer.attention.unified` (draft PR #4015).
+their paged-prefill path to `flashinfer.prefill` (draft PR #4015).
 
 **Verification status — read this first.**  These diffs have NOT been run
 against the live engines.  What IS machine-checked, on real GPUs, is the
-data flow they rely on: `tests/experimental/test_unified_prefill_engine_shapes.py`
+data flow they rely on: `tests/experimental/test_paged_attention_engine_shapes.py`
 replicates each engine's exact metadata pipeline and drives the unified API
 under a zero-sync guard against an independent fp32 oracle.  The diffs were
 then adversarially audited against the pinned engine clones; every claim

@@ -1585,9 +1585,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
     .. note::
 
-        Superseded by the experimental unified paged-prefill API
-        (:mod:`flashinfer.attention.unified`); scheduled for deprecation once that
-        API graduates (tracking issue #5007). This class stays supported and keeps
+        Superseded by the experimental :class:`~flashinfer.prefill.PagedAttention`;
+        scheduled for deprecation once that API graduates (tracking issue #5007). This class stays supported and keeps
         receiving bug fixes; new integrations should start from the unified API.
 
     Check :ref:`our tutorial <kv-layout>` for page table layout.
@@ -6831,3 +6830,26 @@ def trtllm_fmha_v2_prefill(
         return out, lse
     else:
         return out
+
+
+# --- experimental paged-attention entry (see flashinfer/_paged_attention.py) ---
+from ._paged_attention import (  # noqa: E402
+    PagedAttention as PagedAttention,
+    resolve_paged_attention as resolve_paged_attention,
+)
+
+_PAGED_ATTENTION_LAZY = frozenset(
+    {"PagedAttentionMetadata", "Resolution", "PagedAttentionCapabilities"}
+)
+
+
+def __getattr__(name: str):
+    """Lazily expose the paged-attention value types without importing the
+    experimental implementation at module load."""
+    if name in _PAGED_ATTENTION_LAZY:
+        from . import _paged_attention
+
+        value = getattr(_paged_attention, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,6 +1,6 @@
-"""Demo: unified paged-prefill prototype — run me and read the output.
+"""Demo: PagedAttention (experimental) — run me and read the output.
 
-    PYTHONPATH=<this worktree> python prototype_demo_unified_prefill.py
+    PYTHONPATH=<this worktree> python prototype_demo_paged_attention.py
 
 What it shows, in order:
  1. resolve() at "engine init" — static, tensor-free, with exclusion reasons
@@ -13,7 +13,11 @@ What it shows, in order:
 
 import torch
 
-from flashinfer.attention.unified import UnifiedPagedPrefill, resolve_paged_prefill
+from flashinfer.prefill import (
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
+)
 
 torch.manual_seed(0)
 dev = torch.device("cuda:0")
@@ -40,15 +44,17 @@ q = torch.randn(int(q_lens.sum()), H_QO, D, dtype=torch.bfloat16, device=dev)
 k_cache = torch.randn(pool, H_KV, PAGE, D, dtype=torch.bfloat16, device=dev)
 v_cache = torch.randn(pool, H_KV, PAGE, D, dtype=torch.bfloat16, device=dev)
 
-meta = dict(
-    qo_indptr=qo_indptr_cpu.to(dev),
-    qo_indptr_cpu=qo_indptr_cpu,
-    kv_seq_lens=kv_lens.to(dev),
-    kv_seq_lens_cpu=kv_lens,
-    block_tables=block_tables.to(dev),
+md = PagedAttentionMetadata.dense(
+    qo_indptr_cpu.to(dev),
+    kv_lens.to(dev),
+    block_tables.to(dev),
     page_size=PAGE,
     max_q_len=int(q_lens.max()),
     max_kv_len=int(kv_lens.max()),
+    qo_indptr_cpu=qo_indptr_cpu,
+    kv_seq_lens_cpu=kv_lens,
+)
+cfg = dict(
     num_qo_heads=H_QO,
     num_kv_heads=H_KV,
     head_dim_qk=D,
@@ -59,7 +65,7 @@ meta = dict(
 
 # ---- 1. init-time resolution (no tensors, no wrapper) --------------------
 print("=== 1. resolve at engine init ===")
-res = resolve_paged_prefill(
+res = resolve_paged_attention(
     device=dev,
     num_qo_heads=H_QO,
     num_kv_heads=H_KV,
@@ -75,8 +81,8 @@ print(res.explain(), "\n")
 print("=== 2/3. same call, every runnable backend ===")
 results = {}
 for name in res.backends:
-    attn = UnifiedPagedPrefill(dev)
-    attn.plan(**meta, backend=name)
+    attn = PagedAttention(dev)
+    attn.plan(md, **cfg, backend=name)
     out, lse = attn.run(q, (k_cache, v_cache))
     results[name] = (out, lse)
     print(
@@ -96,19 +102,36 @@ q1_lens = torch.ones(B, dtype=torch.int32)
 qo1 = torch.cat(
     [torch.zeros(1, dtype=torch.int32), q1_lens.cumsum(0, dtype=torch.int32)]
 )
-meta_d = dict(meta, qo_indptr=qo1.to(dev), qo_indptr_cpu=qo1, max_q_len=1)
-attn = UnifiedPagedPrefill(dev)
-attn.plan(**meta_d, backend="auto")
+md_d = PagedAttentionMetadata.dense(
+    qo1.to(dev),
+    kv_lens.to(dev),
+    block_tables.to(dev),
+    page_size=PAGE,
+    max_q_len=1,
+    max_kv_len=int(kv_lens.max()),
+    qo_indptr_cpu=qo1,
+    kv_seq_lens_cpu=kv_lens,
+)
+attn = PagedAttention(dev)
+attn.plan(md_d, **cfg, backend="auto")
 out, lse = attn.run(q[:B], (k_cache, v_cache))
 print(f"auto chose: {attn.backend}; out={tuple(out.shape)} lse={tuple(lse.shape)}\n")
 
 # ---- 5. broken input → loud error, not plausible garbage ------------------
 print("=== 5. broken metadata is rejected, loudly ===")
-bad = dict(meta, max_kv_len=64)  # under-claimed: real KV goes to 256
-try:
-    UnifiedPagedPrefill(dev).plan(**bad, backend="auto")
+try:  # under-claimed max: real KV goes to 256 — rejected at metadata construction
+    PagedAttentionMetadata.dense(
+        qo_indptr_cpu.to(dev),
+        kv_lens.to(dev),
+        block_tables.to(dev),
+        page_size=PAGE,
+        max_q_len=int(q_lens.max()),
+        max_kv_len=64,
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens_cpu=kv_lens,
+    )
 except ValueError as e:
     print(f"ValueError: {e}")
 print(
-    "\n(reject-or-correct is machine-checked: tests/experimental/test_unified_prefill_fuzzer.py)"
+    "\n(reject-or-correct is machine-checked: tests/experimental/test_paged_attention_fuzzer.py)"
 )
