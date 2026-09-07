@@ -205,9 +205,10 @@ class UlyssesCommunicator:
       still resolves and guards the CUDA device and performs CUDA-backed
       metadata collectives over ``group``). Supports any world size.
 
-    All ranks must request the same ``backend``. The NCCL path with
-    ``world_size > 1`` requires ``group`` to support CUDA all-to-all (an
-    NCCL process group); this is checked at construction.
+    All ranks must request the same ``backend``. With ``world_size > 1`` the
+    NCCL and NVLink backends require ``group`` to support CUDA all-to-all (an
+    NCCL process group); this is checked at construction before any resource
+    is armed.
     ``world_size == 1`` is a passthrough: both collectives return the input
     tensor unchanged (no copy).
 
@@ -387,6 +388,18 @@ class UlyssesCommunicator:
         )
         self.transport = None
 
+        # The NCCL backend and NVLink's exchange_chunks both run
+        # dist.all_to_all_single on the group, so it must move CUDA tensors.
+        # Checked before anything is armed (a raise here leaks nothing) and
+        # deterministic in the (identical) group object, so group-uniform.
+        if self.backend != "pcie" and self.world_size > 1:
+            supported, observed = self._group_supports_cuda_alltoall()
+            if not supported:
+                raise ValueError(
+                    f"the Ulysses {self.backend.upper()} backend requires a process "
+                    f"group supporting CUDA all-to-all (nccl), got '{observed}'"
+                )
+
         if self.backend == "nvlink":
             err = self._nvlink_init_transaction()
             if err is not None:
@@ -430,16 +443,6 @@ class UlyssesCommunicator:
                 err = self._pcie_init_transaction()
                 if err is not None:
                     raise RuntimeError(f"PCIe backend initialization failed: {err}")
-
-        # NCCL fallback needs a group that can move CUDA tensors; deterministic
-        # in the (identical) group object, so a plain raise is group-uniform.
-        if self.backend == "nccl" and self.world_size > 1:
-            supported, observed = self._group_supports_cuda_alltoall()
-            if not supported:
-                raise ValueError(
-                    "the Ulysses NCCL backend requires a process group "
-                    f"supporting CUDA all-to-all (nccl), got '{observed}'"
-                )
 
         self._state = _OPEN
 

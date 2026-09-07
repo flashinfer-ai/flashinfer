@@ -1266,7 +1266,7 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 # bodies that need a specific process-group backend (None = torch default
 # multi-backend group, used to prove capability detection handles "undefined")
-_PG_BACKEND_OVERRIDES = {"_none_backend_body": None}
+_PG_BACKEND_OVERRIDES = {"_none_backend_body": None, "_gloo_group_body": "gloo"}
 
 
 def _init_pg(rank, world_size, rendezvous, pg_backend="nccl"):
@@ -3117,6 +3117,35 @@ def test_init_cleanup_fault(cleanup_fault, requested):
 )
 def test_lifecycle_nvlink_two_ranks(scenario):
     _run_multi_rank("_lifecycle_nvlink_body", 2, scenario, allow_skip=True)
+
+
+def _gloo_group_body(rank, world_size, group, backend):
+    """A group that cannot move CUDA tensors is rejected at construction,
+    before the NVLink transaction arms IPC/JIT, for NCCL and NVLink alike."""
+    _patch_probe_mesh_module(world_size)
+    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("IPC/JIT entry point must not be touched")
+
+    cuda_ipc_mod.create_shared_buffer = _boom
+    cuda_ipc_mod.cudart.cudaMalloc = _boom
+    ulysses_mod.get_ulysses_a2a_module = _boom
+    ulysses_mod.gen_ulysses_a2a_module = _boom
+    try:
+        UlyssesCommunicator(
+            group, max_bytes=1 << 17, dtype=torch.float16, backend=backend
+        )
+        raise AssertionError("a gloo group must be rejected")
+    except ValueError as e:
+        assert "supporting CUDA all-to-all" in str(e) and "gloo" in str(e), str(e)
+        return ("ok", backend)
+
+
+@pytest.mark.parametrize("backend", ["nvlink", "nccl"])
+def test_gloo_group_rejected_before_ipc(backend):
+    _run_multi_rank("_gloo_group_body", 2, backend)
 
 
 @pytest.mark.parametrize("kind", ["invalid_one_rank", "inconsistent"])
