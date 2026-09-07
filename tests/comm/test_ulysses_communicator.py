@@ -12,7 +12,6 @@ import importlib
 import multiprocessing as std_mp
 import os
 import queue as queue_mod
-import tempfile
 import time
 from types import SimpleNamespace
 
@@ -22,23 +21,12 @@ import torch.distributed as dist
 
 from flashinfer.comm import UlyssesCommunicator, UlyssesWorkspace
 from flashinfer.comm.ulysses import missing_ulysses_pcie_dependencies
-from flashinfer.comm.ulysses_topology import UlyssesBackendError, UlyssesRankTopology
-
-
-def _full_mesh(world_size, hostname="hostA"):
-    uuids = [f"GPU-fake-{i}" for i in range(world_size)]
-    return [
-        UlyssesRankTopology(
-            rank=r,
-            hostname=hostname,
-            device_index=r,
-            device_uuid=uuids[r],
-            pci_bus_id=f"0000:{r:02x}:00.0",
-            peer_p2p={uuids[p]: True for p in range(world_size) if p != r},
-            peer_nvlink={uuids[p]: True for p in range(world_size) if p != r},
-        )
-        for r in range(world_size)
-    ]
+from flashinfer.comm.ulysses_topology import UlyssesBackendError
+from tests.test_helpers.ulysses import (
+    forbid_ipc_and_jit,
+    fresh_rendezvous_path,
+    full_mesh,
+)
 
 
 def _patch_probe_mesh_module(world_size, break_nvlink=False, error_rank=None):
@@ -48,7 +36,7 @@ def _patch_probe_mesh_module(world_size, break_nvlink=False, error_rank=None):
     def fake_probe(device, r, *, probe_pcie=True):
         if error_rank is not None and r == error_rank:
             raise RuntimeError("injected probe failure")
-        topos = _full_mesh(world_size)
+        topos = full_mesh(world_size)
         if break_nvlink:
             topos[1].peer_nvlink[topos[0].device_uuid] = False
         return topos[r]
@@ -79,71 +67,13 @@ def _ref_gather_heads(y_local, world_size, rank, group):
     return torch.cat(blocks, dim=2).contiguous()
 
 
-# ---- rendezvous ---------------------------------------------------------------
-
-
-def _fresh_rendezvous_path():
-    """A unique, unused path for a FileStore rendezvous.
-
-    Not a TCP port: binding and closing a socket to pick one leaves a race,
-    and each test starts eight workers.
-    """
-    handle, path = tempfile.mkstemp(prefix="flashinfer_ulysses_pg_")
-    os.close(handle)
-    # torch's FileStore wants to create the file itself.
-    os.unlink(path)
-    return path
-
-
-@contextlib.contextmanager
-def _rendezvous_path():
-    path = _fresh_rendezvous_path()
-    try:
-        yield path
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-
-
-# ---- single-rank fixtures -----------------------------------------------------
-
-
-@pytest.fixture
-def gloo_pg():
-    with _rendezvous_path() as rendezvous:
-        dist.init_process_group(
-            backend="gloo",
-            init_method=f"file://{rendezvous}",
-            rank=0,
-            world_size=1,
-        )
-        try:
-            yield dist.group.WORLD
-        finally:
-            dist.destroy_process_group()
-
-
-def _forbid_ipc_and_jit(monkeypatch):
-    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
-    vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("IPC/JIT entry point must not be touched")
-
-    monkeypatch.setattr(cuda_ipc_mod, "create_shared_buffer", _boom)
-    monkeypatch.setattr(cuda_ipc_mod.cudart, "cudaMalloc", _boom, raising=False)
-    monkeypatch.setattr(ulysses_mod, "get_ulysses_a2a_module", _boom)
-    monkeypatch.setattr(ulysses_mod, "init_ulysses_a2a", _boom)
-    monkeypatch.setattr(vllm_ar_mod, "meta_size", _boom)
-    # merged module binds gen at import: patch the local binding
-    monkeypatch.setattr(ulysses_mod, "gen_ulysses_a2a_module", _boom)
+# ---- single-rank helpers (the gloo_pg fixture lives in tests/comm/conftest.py) --
 
 
 def _patch_probe_mesh(monkeypatch, world_size):
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank, *, probe_pcie=True: _full_mesh(world_size)[rank],
+        lambda device, rank, *, probe_pcie=True: full_mesh(world_size)[rank],
     )
 
 
@@ -1009,7 +939,7 @@ def test_joint_config_validation_uses_gathered_backends():
 
 @requires_cuda
 def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     comm = UlyssesCommunicator(
         gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl"
     )
@@ -1020,7 +950,7 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     _patch_probe_mesh(monkeypatch, 1)
     comm = UlyssesCommunicator(
         gloo_pg, max_bytes=2048, dtype=torch.float16, backend="auto"
@@ -1032,7 +962,7 @@ def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     _patch_probe_mesh(monkeypatch, 1)
     with pytest.raises(UlyssesBackendError, match="world size 1"):
         UlyssesCommunicator(
@@ -1063,14 +993,14 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
     ],
 )
 def test_ctor_invalid_config(gloo_pg, monkeypatch, kwargs, match):
-    _forbid_ipc_and_jit(monkeypatch)  # invalid config must fail before IPC/JIT too
+    forbid_ipc_and_jit(monkeypatch)  # invalid config must fail before IPC/JIT too
     with pytest.raises(ValueError, match=match):
         UlyssesCommunicator(gloo_pg, backend="nccl", **kwargs)
 
 
 @requires_cuda
 def test_ctor_invalid_backend(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     with pytest.raises(ValueError, match="backend must be one of"):
         UlyssesCommunicator(
             gloo_pg, max_bytes=2048, dtype=torch.float16, backend="magic"
@@ -1079,7 +1009,7 @@ def test_ctor_invalid_backend(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_ctor_bare_cuda_device_normalized(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     comm = UlyssesCommunicator(
         gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl", device="cuda"
     )
@@ -1096,7 +1026,7 @@ def test_ctor_bare_cuda_device_normalized(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_w1_passthrough_no_copy(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     comm = _make_w1(gloo_pg, monkeypatch)
     x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
     assert comm.scatter_heads(x) is x
@@ -1106,7 +1036,7 @@ def test_w1_passthrough_no_copy(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_w1_destination_passing_and_workspace(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     comm = _make_w1(gloo_pg, monkeypatch, max_bytes=4096 * 2)
     x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
     out = torch.empty_like(x)
@@ -2634,7 +2564,7 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
 
     ctx = std_mp.get_context("spawn")
     q = ctx.Queue()
-    rendezvous = _fresh_rendezvous_path()
+    rendezvous = fresh_rendezvous_path()
     procs = [
         ctx.Process(
             target=_worker_main,
@@ -2913,6 +2843,9 @@ def _pcie_exchange_chunks_body(rank, world_size, group, route):
                 f"forced rdma fell back to {comm.transport}; this case is about "
                 "the RDMA descriptor"
             )
+        if route == "p2p":
+            # A forced p2p route never falls back, so a mismatch is a test bug.
+            assert comm.transport == "p2p", comm.transport
         out = comm.allocate_output(packed, "exchange_chunks", dtype=torch.uint8)
         comm.exchange_chunks(packed, out=out, dtype=torch.uint8)
         torch.cuda.synchronize(device)
