@@ -435,7 +435,7 @@ def test_resolution_pinning():
         kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
         backend=res,
     )
-    assert attn._backend in res.backends
+    assert attn.backend in res.backends
     # drifted config (different heads) must be rejected, not silently re-resolved
     with pytest.raises(ValueError, match="pinned Resolution"):
         attn.plan(
@@ -490,7 +490,7 @@ def test_derive_is_sync_free():
     """The derivation layer must not synchronize (proposal P1 acceptance:
     with mirrors, plan() is zero-D2H).  Guards against masked-select /
     repeat_interleave style data-dependent-size ops sneaking back in."""
-    from flashinfer.attention.unified import _derive
+    from flashinfer.experimental.paged_prefill import derive as _derive
 
     p = make_problem(
         seed=31,

@@ -100,7 +100,7 @@ meta_d = dict(meta, qo_indptr=qo1.to(dev), qo_indptr_cpu=qo1, max_q_len=1)
 attn = UnifiedPagedPrefill(dev)
 attn.plan(**meta_d, backend="auto")
 out, lse = attn.run(q[:B], (k_cache, v_cache))
-print(f"auto chose: {attn._backend}; out={tuple(out.shape)} lse={tuple(lse.shape)}\n")
+print(f"auto chose: {attn.backend}; out={tuple(out.shape)} lse={tuple(lse.shape)}\n")
 
 # ---- 5. broken input → loud error, not plausible garbage ------------------
 print("=== 5. broken metadata is rejected, loudly ===")
@@ -110,5 +110,5 @@ try:
 except ValueError as e:
     print(f"ValueError: {e}")
 print(
-    "\n(reject-or-correct is machine-checked: tests/attention/test_unified_prefill_fuzzer.py)"
+    "\n(reject-or-correct is machine-checked: tests/experimental/test_unified_prefill_fuzzer.py)"
 )
