@@ -2645,6 +2645,10 @@ class CutlassHummingRunner(_CutlassRunnerBase):
 _CUTILE_BF16_DEFAULT_GEMM_CONFIGS = {
     89: (128, 32, 4),
     90: (128, 64, 1),
+    # Datacenter Blackwell: seed the autotune default from the SM90 datacenter
+    # profile; the full config set is still searched when autotuning is on.
+    100: (128, 64, 1),
+    103: (128, 64, 1),
     120: (128, 32, 4),
     121: (128, 32, 4),
 }
@@ -3093,7 +3097,9 @@ class CuTileBf16Runner(MoERunner):
     def _candidate_non_gated_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         num_experts = self.config.routing.num_experts
         rows_per_expert = (num_assignments + num_experts - 1) // num_experts
-        prefill_threshold = {89: 256, 90: 32, 120: 128, 121: 128}[self._device_arch]
+        prefill_threshold = {89: 256, 90: 32, 100: 32, 103: 32, 120: 128, 121: 128}[
+            self._device_arch
+        ]
         return (32,) if rows_per_expert < prefill_threshold else (64,)
 
     def _gated_block_size(self, num_assignments: int) -> int:

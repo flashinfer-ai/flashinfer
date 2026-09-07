@@ -404,8 +404,8 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
-_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
-_CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_BF16_ARCHS = (89, 90, 100, 103, 120, 121)
+_CUTILE_NVFP4_ARCHS = (100, 103, 120, 121)
 _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Swiglu,
     ActivationType.SwigluStep,
