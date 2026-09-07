@@ -71,9 +71,9 @@ void launch_fused_impl(const T* partial_o, const float* partial_lse, unsigned ch
       &local_heads,
       &head_dim,
   };
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-      reinterpret_cast<void*>(FusedKernel<T, BaseE, RowDistributed>), dim3(grid_blocks),
-      dim3(kFusedBlockSize), args, smem, stream));
+  C10_CUDA_CHECK(
+      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(FusedKernel<T, BaseE, RowDistributed>),
+                                  dim3(grid_blocks), dim3(kFusedBlockSize), args, smem, stream));
 }
 
 template <typename T, bool BaseE>
@@ -88,19 +88,17 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
   // rows to occupy the cooperative grid, distribute (destination, row) pairs
   // across blocks so multiple blocks can serve the same destination.
   if (num_tokens * local_heads >= kRowDistributedMinEntries) {
-    launch_fused_impl<T, BaseE, true>(partial_o, partial_lse, workspace, window,
-                                      signal_window_offset, out_region_window_offset,
-                                      out_region_local_offset, slot_out_bytes,
-                                      lse_region_window_offset, lse_region_local_offset,
-                                      slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens,
-                                      local_heads, head_dim, stream);
+    launch_fused_impl<T, BaseE, true>(
+        partial_o, partial_lse, workspace, window, signal_window_offset, out_region_window_offset,
+        out_region_local_offset, slot_out_bytes, lse_region_window_offset, lse_region_local_offset,
+        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim,
+        stream);
   } else {
-    launch_fused_impl<T, BaseE, false>(partial_o, partial_lse, workspace, window,
-                                       signal_window_offset, out_region_window_offset,
-                                       out_region_local_offset, slot_out_bytes,
-                                       lse_region_window_offset, lse_region_local_offset,
-                                       slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens,
-                                       local_heads, head_dim, stream);
+    launch_fused_impl<T, BaseE, false>(
+        partial_o, partial_lse, workspace, window, signal_window_offset, out_region_window_offset,
+        out_region_local_offset, slot_out_bytes, lse_region_window_offset, lse_region_local_offset,
+        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim,
+        stream);
   }
 }
 

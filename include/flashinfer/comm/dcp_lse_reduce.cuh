@@ -188,10 +188,10 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
       const size_t src_base = ((static_cast<size_t>(tile) * nranks + dst) * head_dim);
       const size_t dst_row =
           ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
-      T* dst_out = reinterpret_cast<T*>(ncclGetLsaPointer(
-          window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
-      float* dst_lse = reinterpret_cast<float*>(ncclGetLsaPointer(
-          window, slot_lse_window_offset + dst_row * sizeof(float), dst));
+      T* dst_out = reinterpret_cast<T*>(
+          ncclGetLsaPointer(window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
+      float* dst_lse = reinterpret_cast<float*>(
+          ncclGetLsaPointer(window, slot_lse_window_offset + dst_row * sizeof(float), dst));
       constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
       const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
       int4* dst4 = reinterpret_cast<int4*>(dst_out);
@@ -218,8 +218,8 @@ __global__ void FusedKernel(const T* __restrict__ partial_o, const float* __rest
             ((static_cast<size_t>(rank) * max_tokens + token) * local_heads + local_head);
         T* dst_out = reinterpret_cast<T*>(ncclGetLsaPointer(
             window, slot_out_window_offset + dst_row * head_dim * sizeof(T), dst));
-        float* dst_lse = reinterpret_cast<float*>(ncclGetLsaPointer(
-            window, slot_lse_window_offset + dst_row * sizeof(float), dst));
+        float* dst_lse = reinterpret_cast<float*>(
+            ncclGetLsaPointer(window, slot_lse_window_offset + dst_row * sizeof(float), dst));
         constexpr int kVec = static_cast<int>(sizeof(int4) / sizeof(T));
         const int4* src4 = reinterpret_cast<const int4*>(partial_o + src_base);
         int4* dst4 = reinterpret_cast<int4*>(dst_out);
