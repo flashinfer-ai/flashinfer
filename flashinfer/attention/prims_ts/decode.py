@@ -55,10 +55,11 @@ _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
     torch.float8_e4m3fn,
 )
-_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
+_MAX_HEAD_RATIO = 128
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,7 @@ def _decode_policy_from_config(
         ),
         ("tile_size_q", int(config.tile_size_q)),
         ("tile_size_kv", int(config.tile_size_kv)),
+        ("num_insts_kv", int(config.num_insts_kv)),
         ("use_split_kv", bool(config.use_split_kv)),
         ("splits_kv", int(config.splits_kv)),
         ("max_splits_kv", int(config.max_splits_kv)),
@@ -574,9 +576,10 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> None:
             f"{num_qo_heads} and {num_kv_heads}"
         )
     head_ratio = num_qo_heads // num_kv_heads
-    if head_ratio > 32:
+    if head_ratio > _MAX_HEAD_RATIO:
         raise ValueError(
-            f"attention-ts decode requires 1 <= Hq/Hkv <= 32, got {head_ratio}"
+            "attention-ts decode requires "
+            f"1 <= Hq/Hkv <= {_MAX_HEAD_RATIO}, got {head_ratio}"
         )
 
 
@@ -660,9 +663,16 @@ def _validate_runtime_device(device: torch.device) -> int:
         capability = torch.cuda.get_device_capability(device_index)
     if capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise NotImplementedError(
-            "attention-ts decode requires an SM100a/B200 or SM103a/B300 GPU; "
+            "attention-ts decode requires an SM100a/B200, SM103a/B300 or "
+            "SM107a/Rubin GPU; "
             f"device cuda:{device_index} has compute capability {capability}"
         )
+    # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
+    # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
+    if capability == (10, 7):
+        from ...cute_dsl.utils import require_cute_dsl_arch
+
+        require_cute_dsl_arch(device_index)
     return device_index
 
 

@@ -4666,3 +4666,73 @@ trtllm_gen_routing_trace = TraceTemplate(
     tags=["status:verified", "moe", "moe:routing"],
     init=_trtllm_gen_routing_init,
 )
+
+
+# ---------------------------------------------------------------------------
+# SM90 (Hopper) CuTe-DSL unquantized fused MoE
+# ---------------------------------------------------------------------------
+
+cute_dsl_fused_moe_bf16_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_fused_moe_bf16",
+    description=(
+        "SM90 (Hopper) CuTe-DSL unquantized (bf16/fp16) fused MoE: moe_sort "
+        "routing maps + gather-fused grouped GEMM1 with SiLU-gating epilogue "
+        "+ grouped GEMM2 with fused finalize. Pre-routed "
+        "(token_selected_experts + token_final_scales)."
+    ),
+    axes={
+        "num_tokens": Var(description="Total tokens across the batch."),
+        "hidden_size": Const(abbrev="h"),
+        "gemm1_out_size": Var(
+            description="FC1 output rows: 2 * intermediate_size (gated SwiGLU)."
+        ),
+        "intermediate_size": Var(description="MoE intermediate size per rank."),
+        "num_local_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="topk"),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "hidden_size"],
+            description="Input activations (bfloat16 or float16).",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k GLOBAL expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            description=(
+                "FC1 weights, up/gate interleaved at 32 columns (reference "
+                "repack: interleave_up_gate_sm90; frameworks keep their own "
+                "copy, the SM100 convention)."
+            ),
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"],
+            description="FC2 (down-projection) weights.",
+        ),
+        "num_experts": Scalar("int32", description="Total (global) expert count."),
+        "top_k": Scalar("int32", description="Experts per token."),
+        "num_local_experts": Scalar(
+            "int32", optional=True, description="Experts held by this rank (EP)."
+        ),
+        "local_expert_offset": Scalar(
+            "int32", optional=True, description="Global id of the first local expert."
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="x",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
+)
