@@ -51,6 +51,20 @@ pytestmark = [
     ),
 ]
 
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_gpu_kernels(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        return
+    class_name = request.cls.__name__ if request.cls is not None else ""
+    test_name = getattr(request.node, "originalname", request.node.name)
+    if class_name in {"TestFp4Fc1GPU", "TestFp4Fc1SfbTmaRouteCluster2"} or (
+        class_name in {"TestFp4Fc1SfGather", "TestFp4Fc1HT"}
+        and test_name.endswith("_gpu")
+    ):
+        pytest.skip("Prims-TS FP4 FC1 supports SM100 and SM103, not SM107")
+
+
 # FP4 FC1 LowLatency base config (rows 0-23).
 FP4_FC1_LL = dict(
     route_act=1,

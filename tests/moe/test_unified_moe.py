@@ -2104,6 +2104,16 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
     ),
 )
 def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
+    if (
+        get_compute_capability(torch.device("cuda")) == (10, 7)
+        and variant is QuantVariant.NVFP4
+        and (
+            isinstance(activation, (GeGLUTanh, ReLU2))
+            or isinstance(activation, SwiGLU)
+            and activation != SwiGLU()
+        )
+    ):
+        pytest.skip("SM107 CuTe DSL MoE supports only default SwiGLU and SiTU")
     shape = dict(
         hidden_size=1024,
         intermediate_size=512,

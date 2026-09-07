@@ -45,6 +45,11 @@ pytestmark = [
     ),
 ]
 
+_requires_non_sm107_prims_ts = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="Prims-TS BatchedGemm supports SM100 and SM103, not SM107",
+)
+
 
 def _finalize_tmem(cfg):
     """Exercise config construction while leaving TMEM columns derived."""
@@ -692,6 +697,7 @@ class TestMxFp4Bf16Fc1:
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
 
+    @_requires_non_sm107_prims_ts
     def test_tile16_cluster2_swiglu_persistent_correctness(self):
         cfg = {
             **_mxfp4_bf16_base(has_activation_epilogue=True),

@@ -30,6 +30,12 @@ from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import is_sm100a_supported
 
 
+_requires_non_sm107_prims_ts = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="NVFP4 Prims-TS kernels support SM100 and SM103, not SM107",
+)
+
+
 def _find_bs1_ldgsts_persistent_pair():
     tactics = valid_prims_ts_nvfp4_moe_tactics(
         num_tokens=1,
@@ -83,6 +89,7 @@ def test_nvfp4_search_contains_bs1_ldgsts_persistent_pair():
     torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
+@_requires_non_sm107_prims_ts
 @pytest.mark.parametrize(
     (
         "stage",
@@ -161,6 +168,7 @@ def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
     torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
 )
+@_requires_non_sm107_prims_ts
 @pytest.mark.parametrize(
     ("problem_k", "dtype_c_override"),
     (

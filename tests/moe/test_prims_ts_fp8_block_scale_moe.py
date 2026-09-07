@@ -42,6 +42,11 @@ def cache_permute_indices():
     return {}
 
 
+def _skip_prims_ts_on_sm107() -> None:
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
+
+
 @pytest.mark.parametrize(
     ("quant_mode", "case_id"),
     [
@@ -54,6 +59,7 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
     case_id,
     cache_permute_indices,
 ):
+    _skip_prims_ts_on_sm107()
     if case_id == "deepseek":
         num_tokens = 128
         hidden_size = 512
@@ -102,6 +108,7 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
 def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     cache_permute_indices,
 ):
+    _skip_prims_ts_on_sm107()
     run_moe_test(
         num_tokens=128,
         hidden_size=512,
@@ -137,6 +144,7 @@ def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
 
 
 def test_prims_ts_deepseek_fp8_accepts_fp32_logits(cache_permute_indices):
+    _skip_prims_ts_on_sm107()
     run_moe_test(
         num_tokens=32,
         hidden_size=512,
@@ -184,6 +192,8 @@ def test_prims_ts_mxfp8_block_scale_bias(
     moe_gemm_backend,
     cache_permute_indices,
 ):
+    if moe_gemm_backend is MoeGemmBackend.PRIMS_TS:
+        _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 512
     intermediate_size = 512
@@ -242,6 +252,7 @@ def test_prims_ts_mxfp8_block_scale_routed_modes_match_logits(
     cache_permute_indices,
 ):
     """Packed and unpacked MXFP8 Prims-TS routed inputs match the logits path."""
+    _skip_prims_ts_on_sm107()
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")

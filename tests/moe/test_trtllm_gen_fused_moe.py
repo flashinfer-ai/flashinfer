@@ -62,6 +62,11 @@ def cache_permute_indices():
     return {}
 
 
+def _skip_prims_ts_on_sm107() -> None:
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
+
+
 # Test: Sigmoid routing (Sigmoid -> TopK) and TopKSigmoid routing (TopK -> Sigmoid),
 # neither of which renormalizes the top-K weights.
 # Shape fan-out kept minimal (boundary tokens/intermediate only): the quant x
@@ -794,6 +799,7 @@ def test_mxfp4_moe_gemm_bias(
 )
 def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     """Test FP4-family Prims-TS MoE with FC1 and FC2 GEMM bias."""
+    _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 1024
     intermediate_size = 512
@@ -1038,6 +1044,7 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
 
 def test_bf16_prims_ts_identity_activation(cache_permute_indices):
     """Smoke-test non-gated Identity activation through the Prims-TS MoE path."""
+    _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 1024
     intermediate_size = 512
@@ -1538,6 +1545,7 @@ def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
 )
 def test_prims_ts_block_major_k_all_dtypes(moe_impl, cache_permute_indices):
     """Prims-TS accepts BlockMajorK weights for every supported MoE dtype."""
+    _skip_prims_ts_on_sm107()
     hidden_size = 1024
     intermediate_size = 512
     run_moe_test(

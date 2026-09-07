@@ -44,6 +44,15 @@ pytestmark = [
     ),
 ]
 
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_gpu_kernels(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        return
+    if request.cls is not None and request.cls.__name__ != "TestFp4Fc2Validation":
+        pytest.skip("Prims-TS FP4 FC2 supports SM100 and SM103, not SM107")
+
+
 # FP4 FC2 LowLatency base config (rows 31-54).
 # tmem_sfa/sfb_cols = tile_k / mma_k * 4 = num_kblocks * 4
 FP4_FC2_LL = dict(

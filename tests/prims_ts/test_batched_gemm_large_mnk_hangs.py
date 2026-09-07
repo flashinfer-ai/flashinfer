@@ -38,6 +38,10 @@ pytestmark = [
         (torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda"))),
         reason="kernels require Blackwell sm_100+ (skip on sm_120a)",
     ),
+    pytest.mark.skipif(
+        torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+        reason="Prims-TS BatchedGemm supports SM100 and SM103, not SM107",
+    ),
 ]
 
 

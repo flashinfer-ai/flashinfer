@@ -37,6 +37,11 @@ pytestmark = [
     ),
 ]
 
+_requires_non_sm107_prims_ts = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="Prims-TS BatchedGemm supports SM100 and SM103, not SM107",
+)
+
 
 def _reference_check(**kwargs):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
@@ -110,6 +115,7 @@ def test_bf16_swap_uses_block_major_k_weight_a():
     )
 
 
+@_requires_non_sm107_prims_ts
 def test_nvfp4_swap_uses_block_major_k_weight_a():
     _reference_check(
         num_experts=2,
@@ -147,6 +153,7 @@ def test_nvfp4_swap_uses_block_major_k_weight_a():
     )
 
 
+@_requires_non_sm107_prims_ts
 def test_fp8_swap_uses_block_major_k_weight_a():
     _reference_check(
         num_experts=2,
