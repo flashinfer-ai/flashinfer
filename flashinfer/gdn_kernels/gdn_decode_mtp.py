@@ -117,6 +117,26 @@ def get_mtp_config(
             ilp_rows = 8
             use_smem_v = False
 
+    # Cap tile_v by sequence length. A longer token loop makes the resident
+    # [tile_v, K] state cost more relative to the one-off q/k reads each V-slice
+    # CTA repeats, so the largest workable tile shrinks as seq_len grows. The
+    # work_units table above only consults seq_len for the <=448 branch, so
+    # without this every branch keeps its short-sequence tile indefinitely.
+    #
+    # Measured on GB200, HV=32, bf16, per-kernel time:
+    #
+    #   seq_len | best tile_v | uncapped heuristic | gain
+    #   --------|-------------|--------------------|------
+    #        12 |          32 | 64                 | up to 1.42x
+    #        24 |          16 | 64 / 32            | up to 1.34x
+    #
+    # The thresholds sit in the gaps between sampled points (seq_len was
+    # 3/6/12/24); 8 and 16 are the powers of two inside them.
+    if seq_len > 16:
+        tile_v = min(tile_v, 16)
+    elif seq_len > 8:
+        tile_v = min(tile_v, 32)
+
     # Clamp tile_v to v_dim (e.g. v_dim=64 models shouldn't use tile_v=128)
     tile_v = min(tile_v, v_dim)
 
