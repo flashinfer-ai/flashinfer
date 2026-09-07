@@ -946,7 +946,10 @@ def test_attention_ts_context_uses_ldtm_stat_default_is_off():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
     """Context attention enables LDTM.STAT on B300 (SM103) and Rubin (SM107)."""
-    expected = torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+    expected = (
+        context_module._dsl_supports_ldtm_stat()
+        and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+    )
     assert (
         context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
     )
