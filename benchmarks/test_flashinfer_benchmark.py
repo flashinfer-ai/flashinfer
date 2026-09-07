@@ -6,7 +6,10 @@ import numpy as np
 import pytest
 import torch
 from routines import attention as attention_routine
-from routines.flashinfer_benchmark_utils import routine_cc_to_supported_backends
+from routines.flashinfer_benchmark_utils import (
+    full_output_columns,
+    routine_cc_to_supported_backends,
+)
 
 
 PRIMS_TS_ATTENTION_ROUTINES = (
@@ -99,6 +102,134 @@ def _parse_prims_ts_case(routine, extra_args):
             *extra_args,
         ]
     )
+
+
+def _parse_trtllm_ragged_case(extra_args):
+    return flashinfer_benchmark.parse_args(
+        [
+            "--routine",
+            "BatchPrefillWithRaggedKVCacheWrapper",
+            "--backends",
+            "trtllm-native",
+            "--batch_size",
+            "1",
+            "--s_qo",
+            "1",
+            "--s_kv",
+            "16",
+            "--num_qo_heads",
+            "8",
+            "--num_kv_heads",
+            "8",
+            "--head_dim_qk",
+            "128",
+            "--head_dim_vo",
+            "128",
+            "--no_cuda_graph",
+            "--use_cuda_events",
+            *extra_args,
+        ]
+    )
+
+
+def test_trtllm_ragged_timing_columns_are_in_output_schema():
+    for column in ("timing_metric", "row_activity_mode", "calls_per_sample"):
+        assert column in full_output_columns
+
+
+def test_trtllm_ragged_timing_args():
+    args = _parse_trtllm_ragged_case(
+        ["--row_activity_mode", "device_check", "--calls_per_sample", "32"]
+    )
+
+    assert args.row_activity_mode == "device_check"
+    assert args.calls_per_sample == 32
+    assert args.use_cupti is False
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--row_activity_mode", "device_check", "--calls_per_sample", "0"],
+        ["--calls_per_sample", "2"],
+    ],
+)
+def test_trtllm_ragged_timing_rejects_invalid_args(extra_args):
+    with pytest.raises(ValueError):
+        _parse_trtllm_ragged_case(extra_args)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["assumed_active", "device_check", "cpu_mirror"],
+)
+def test_trtllm_ragged_row_activity_and_grouped_timing(monkeypatch, mode):
+    calls = []
+    timing_kwargs = {}
+    real_torch_empty = torch.empty
+
+    monkeypatch.setattr(
+        attention_routine, "get_device", lambda _args: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        attention_routine,
+        "filter_backends_by_compute_capability",
+        lambda backends, *_args: list(backends),
+    )
+    monkeypatch.setattr(attention_routine, "print_perf_metrics", lambda *_args: None)
+
+    def small_workspace_empty(*args, **kwargs):
+        if args == (512 * 1024 * 1024,):
+            return real_torch_empty(1, **kwargs)
+        return real_torch_empty(*args, **kwargs)
+
+    monkeypatch.setattr(attention_routine.torch, "empty", small_workspace_empty)
+
+    def fake_ragged_attention(**kwargs):
+        calls.append(kwargs)
+        return (kwargs["out"],)
+
+    monkeypatch.setattr(
+        attention_routine.flashinfer.prefill,
+        "trtllm_ragged_attention_deepseek",
+        fake_ragged_attention,
+    )
+
+    def fake_bench_gpu_time(*, fn, input_args, **kwargs):
+        timing_kwargs.update(kwargs)
+        fn(*input_args)
+        return np.array([8.0])
+
+    monkeypatch.setattr(attention_routine, "bench_gpu_time", fake_bench_gpu_time)
+    args = _parse_trtllm_ragged_case(
+        [
+            "--row_activity_mode",
+            mode,
+            "--calls_per_sample",
+            "4",
+            "--output_path",
+            "unused.csv",
+        ]
+    )
+
+    results = attention_routine.testBatchPrefillWithRaggedKVCacheWrapper(args)
+
+    assert len(calls) == 4
+    if mode == "assumed_active":
+        assert calls[0]["skip_all_rows_active_check"] is True
+        assert "q_seq_lens_cpu" not in calls[0]
+    elif mode == "device_check":
+        assert "skip_all_rows_active_check" not in calls[0]
+        assert "q_seq_lens_cpu" not in calls[0]
+    else:
+        assert calls[0]["q_seq_lens_cpu"].device.type == "cpu"
+        assert calls[0]["kv_seq_lens_cpu"].device.type == "cpu"
+    assert timing_kwargs["enable_cupti"] is False
+    assert timing_kwargs["use_cuda_graph"] is False
+    assert results[0]["median_time"] == 2.0
+    assert results[0]["timing_metric"] == "cuda_event_eager_per_call_v1"
+    assert results[0]["row_activity_mode"] == mode
+    assert results[0]["calls_per_sample"] == 4
 
 
 def test_prims_ts_backend_alias_is_canonicalized():
