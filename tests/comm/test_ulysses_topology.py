@@ -607,10 +607,95 @@ def test_explicit_pcie_rejects_unsupported_world_size():
         decide_ulysses_backend("pcie", _full_mesh(6))
 
 
-def test_auto_does_not_select_experimental_pcie():
+def test_auto_does_not_select_experimental_pcie_without_the_opt_in():
+    """Default auto is unchanged: PCIe is experimental, so it needs the opt-in.
+
+    The reason still has to name the way in, or a machine whose only fast path
+    is PCIe degrades to NCCL with nothing to go on.
+    """
     decision = decide_ulysses_backend("auto", _pcie_mesh())
     assert decision.backend == "nccl"
     assert "no NVLink" in decision.reason
+    assert "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS" in decision.reason
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_auto_selects_pcie_with_the_opt_in(world_size):
+    """With the opt-in, auto plans exactly what an explicit request would.
+
+    Reaching PCIe through a different route must not reach a different route:
+    the plan is compared against the explicit one rather than spot-checked.
+    """
+    mesh = _pcie_mesh(world_size=world_size)
+    automatic = decide_ulysses_backend("auto", mesh, allow_experimental_auto=True)
+    explicit = decide_ulysses_backend("pcie", mesh)
+    assert automatic.backend == "pcie"
+    assert automatic.pcie_plan == explicit.pcie_plan
+
+
+def test_opt_in_does_not_make_auto_prefer_pcie_over_nvlink():
+    """PCIe is a candidate only where NVLink is not; the opt-in does not reorder."""
+    decision = decide_ulysses_backend(
+        "auto", _full_mesh(4), allow_experimental_auto=True
+    )
+    assert decision.backend == "nvlink"
+
+
+@pytest.mark.parametrize(
+    "gate,expect_pcie_probe", [(False, False), (True, True)]
+)
+def test_auto_probes_the_pcie_side_only_when_it_may_use_it(
+    gloo_pg, monkeypatch, gate, expect_pcie_probe
+):
+    """The opt-in has to reach the probe, not just the decision.
+
+    NIC and NUMA come from the PCIe half of the probe, and the route planner
+    needs them to reach the RDMA route -- without them it can only plan
+    all-P2P, which at eight ranks is slower than the NCCL it would replace. So
+    a gate that reached the decision but not the probe would look like it
+    worked and quietly pick the wrong route. With the gate off nothing extra
+    is read.
+    """
+    seen = {}
+
+    def recording_probe(device, rank, *, probe_pcie=True):
+        seen["probe_pcie"] = probe_pcie
+        return _pcie_mesh()[0]
+
+    monkeypatch.setattr(
+        "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
+        recording_probe,
+    )
+    monkeypatch.setenv(
+        "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1" if gate else "0"
+    )
+    resolve_ulysses_backend("auto", group=gloo_pg, device=torch.device("cpu"))
+    assert seen["probe_pcie"] is expect_pcie_probe
+
+
+def test_resolve_rejects_a_split_experimental_opt_in(gloo_pg, monkeypatch):
+    """A group where only some ranks exported the variable must fail together.
+
+    The opt-in is gathered with the backend request rather than read inside the
+    decision, so a split group raises here instead of half the ranks planning
+    PCIe while the others plan NCCL -- which would hang, not fail.
+    """
+    ulysses_topology = importlib.import_module("flashinfer.comm.ulysses_topology")
+    monkeypatch.setattr(
+        "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
+        lambda device, rank, *, probe_pcie=True: _pcie_mesh()[0],
+    )
+    real_gather = ulysses_topology.dist.all_gather_object
+
+    def split_gather(out, payload, group=None):
+        real_gather(out, payload, group=group)
+        # world_size is 1 under gloo_pg, so forge the disagreeing peer.
+        if isinstance(payload, tuple) and len(payload) == 2:
+            out.append((payload[0], not payload[1]))
+
+    monkeypatch.setattr(ulysses_topology.dist, "all_gather_object", split_gather)
+    with pytest.raises(ValueError, match="ALLOW_EXPERIMENTAL_AUTO_BACKENDS"):
+        resolve_ulysses_backend("auto", group=gloo_pg, device=torch.device("cpu"))
 
 
 @pytest.mark.parametrize(
