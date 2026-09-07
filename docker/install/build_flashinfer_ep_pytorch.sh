@@ -74,12 +74,21 @@ PIP_CONSTRAINT="" pip install --no-cache-dir \
 # off nccl4py. Persist it too, so later `srun`/exec shells in a saved container
 # inherit it.
 NCCL_WHEEL_LIB="$(python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib'))")"
+# ldconfig, not just LD_LIBRARY_PATH: an `export` here dies with this script
+# and never reaches whatever runs the tests, and /etc/profile.d is only read by
+# login shells. Registering the directory in the loader cache makes EVERY
+# process in the image resolve libnccl.so.2 to the wheel's copy with no env
+# plumbing at all. LD_LIBRARY_PATH is still exported for the rest of THIS
+# script, and profile.d is kept as a belt-and-braces for interactive shells.
+echo "${NCCL_WHEEL_LIB}" > /etc/ld.so.conf.d/000-flashinfer-nccl.conf
+ldconfig
 export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
 cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
 export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:\${LD_LIBRARY_PATH:-}
 EOF
 chmod +x /etc/profile.d/flashinfer-nccl.sh
-echo "== libnccl search path pinned to ${NCCL_WHEEL_LIB} =="
+echo "== libnccl pinned to ${NCCL_WHEEL_LIB} =="
+ldconfig -p | grep -E "libnccl\.so\.2" || true
 
 python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep (nccl-extensions) + nccl.core (nccl4py) import OK')"
 
@@ -95,7 +104,23 @@ got = (code // 10000, (code // 100) % 100, code % 100)
 print("loaded libnccl version:", ".".join(map(str, got)))
 assert got >= (2, 30, 7), (
     f"loaded libnccl {got} < 2.30.7 required by nccl-extensions' libnccl_ep; "
-    "a system libnccl is shadowing the wheel (check LD_LIBRARY_PATH)"
+    "a system libnccl is shadowing the wheel (check ldconfig -p / LD_LIBRARY_PATH)"
+)
+PYEOF
+
+# Same check with LD_LIBRARY_PATH cleared: proves the ldconfig pin holds for
+# processes that do not inherit this script's environment (e.g. the test suite).
+env -u LD_LIBRARY_PATH python - <<'PYEOF'
+import ctypes
+lib = ctypes.CDLL("libnccl.so.2")
+out = ctypes.c_int()
+assert lib.ncclGetVersion(ctypes.byref(out)) == 0, "ncclGetVersion failed"
+code = out.value
+got = (code // 10000, (code // 100) % 100, code % 100)
+print("loaded libnccl version (clean env):", ".".join(map(str, got)))
+assert got >= (2, 30, 7), (
+    f"loaded libnccl {got} < 2.30.7 with LD_LIBRARY_PATH unset — the ldconfig "
+    "pin in /etc/ld.so.conf.d/000-flashinfer-nccl.conf did not take effect"
 )
 PYEOF
 

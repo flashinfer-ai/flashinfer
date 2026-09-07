@@ -96,8 +96,14 @@ print('nccl.ep OK; libnccl', v.value); assert v.value>=23007"
 # a base dependency (already pinned above; the >= constraint no-ops).
 # Ensure the 2.30.7 wheel's libnccl wins over the image's system
 # /usr/lib/<triple>/libnccl.so.2.30.4. nccl-extensions' libnccl_ep is built
-# against 2.30.7 and aborts on an older runtime; see the same pin in
-# docker/install/build_flashinfer_ep_pytorch.sh.
+# against 2.30.7 and aborts on an older runtime. Registered with ldconfig so it
+# applies to every process regardless of environment (an ENV alone is lost by
+# anything that scrubs it); ENV kept so interactive `docker run` inherits it
+# too. Mirrors docker/install/build_flashinfer_ep_pytorch.sh.
+RUN echo /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib \
+      > /etc/ld.so.conf.d/000-flashinfer-nccl.conf \
+    && ldconfig \
+    && ldconfig -p | grep -E "libnccl\.so\.2"
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
 
 ARG BUILD_NCCL_EP=1
