@@ -438,12 +438,16 @@ def gated_delta_product_mtp(
             f"expanded_q.dtype and q.dtype must match, got {expanded_q.dtype} != {q.dtype}"
         )
 
+    # Micro-steps 0..n_h-2 of every token must read a ZERO query -- only the
+    # last one produces a kept output row. Cleared unconditionally because a
+    # caller-supplied buffer may be dirty (CUDA-graph scratch is reused);
+    # empty + zero_ is a single pass, same cost as torch.zeros.
+    expanded_q.zero_()
     expanded_q[:, num_householder - 1 :: num_householder] = q
 
     if expanded_a is None:
-        expanded_a = torch.full(
+        expanded_a = torch.empty(
             (a.size(0), a.size(1) * num_householder, *a.shape[2:]),
-            GATE_NEUTRAL_A_SENTINEL,
             dtype=a.dtype,
             device=a.device,
         )
@@ -451,6 +455,11 @@ def gated_delta_product_mtp(
         raise ValueError("expanded_a shape must be [B, T*n_h, num_sab_heads]")
     elif expanded_a.dtype != a.dtype:
         raise ValueError(f"expanded_a dtype must match a dtype ({a.dtype})")
+    # Micro-steps 1..n_h-1 must carry the neutral sentinel so alpha == 1 there.
+    # This one is load-bearing, not hygiene: a dirty buffer gives those steps
+    # random gates, which corrupts the STATE rather than merely the discarded
+    # output rows, and goes NaN at larger n_h.
+    expanded_a.fill_(GATE_NEUTRAL_A_SENTINEL)
     expanded_a[:, ::num_householder] = a
 
     if expanded_output is None:

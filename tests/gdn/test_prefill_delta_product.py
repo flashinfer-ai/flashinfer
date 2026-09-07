@@ -327,6 +327,7 @@ def test_prefill_kernel_matches_reference(
     torch.testing.assert_close(our_o, ref_o.to(q.dtype), atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
+
 def test_expanded_prefill_head_size_64(qkv_factory, seed=0):
     """D=64 also has an explicit expanded baseline for benchmark comparison."""
     _skip_if_unsupported()
