@@ -162,6 +162,33 @@ XQA
     xqa
     xqa_mla
 
+Experimental Unified Paged Prefill
+==================================
+
+``flashinfer.attention.unified`` is the experimental successor to
+:class:`~flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` for paged
+prefill/append attention. It accepts one canonical metadata form (token-unit
+``qo_indptr``, per-request ``kv_seq_lens``, a dense ``block_tables`` or flat
+``kv_page_indices``, required host maxes, optional CPU mirrors for a zero-sync
+plan), resolves the runnable backends at engine init with a reason for every
+exclusion, dispatches to the existing fa2/fa3, cuDNN, and trtllm-gen kernels,
+and returns LSE in one contract for every backend. Calling it is the opt-in
+(an ``ExperimentalWarning`` is emitted once); see the tracking issue
+`#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
+graduation plan.
+
+.. currentmodule:: flashinfer.attention.unified
+
+.. autosummary::
+    :toctree: ../generated
+
+    resolve_paged_prefill
+
+.. autoclass:: UnifiedPagedPrefill
+    :members: plan, run, explain, backend
+
+    .. automethod:: __init__
+
 flashinfer.prefill
 ==================
 
@@ -197,6 +224,16 @@ Batch Prefill/Append Attention
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
     .. automethod:: __init__
+
+.. note::
+
+    :class:`BatchPrefillWithPagedKVCacheWrapper` is **superseded** by the
+    experimental unified paged-prefill API (:mod:`flashinfer.attention.unified`,
+    above) and is scheduled for deprecation once that API graduates (tracking:
+    `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_). It
+    remains fully supported and receives bug fixes; new integrations should
+    start from the unified API, which is the only path on which ``backend="auto"``
+    can select the cuDNN and trtllm-gen kernels.
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
