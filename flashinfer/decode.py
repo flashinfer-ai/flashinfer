@@ -1947,6 +1947,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             window_left,
         )
         if key != self._prims_ts_graph_key:
+            # The functional launch validates its scratch at 32 bytes, stricter
+            # than the 16-byte wrapper check, so fail at plan rather than at
+            # graph capture.
+            _check_workspace_buffer_alignment(
+                self._float_workspace_buffer, "float_workspace_buffer", alignment=32
+            )
             required = get_prims_ts_batch_decode_workspace_size(
                 batch_size,
                 num_qo_heads,

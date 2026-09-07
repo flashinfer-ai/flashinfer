@@ -177,6 +177,26 @@ def test_graph_plan_rejects_small_workspace():
         wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
 
 
+@requires_cuda
+def test_graph_plan_rejects_misaligned_workspace():
+    # 16-byte aligned but not 32-byte aligned; the wrapper-level check passes
+    # and the functional launch would reject it only at graph capture. The
+    # alignment check fires before the arch-gated sizing helper, so any CUDA
+    # device can run this.
+    backing = torch.zeros(64 * 1024 * 1024 + 16, dtype=torch.uint8, device="cuda")
+    workspace = backing[16:]
+    assert workspace.data_ptr() % 32 == 16
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        "HND",
+        backend="prims-ts",
+        use_cuda_graph=True,
+        **_graph_buffers(2, max_pages=64),
+    )
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
+
+
 @requires_prims_ts_gpu
 def test_graph_plan_grows_kv_lens_buffer():
     # One page per request; the batch exceeds the 32768-slot default buffer.
