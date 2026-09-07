@@ -113,6 +113,8 @@ class TrtllmGenBatchedGemmRunner {
  public:
   explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
 
+  [[nodiscard]] batchedGemm::trtllm::gen::SfLayout getSfLayoutB(int32_t configIndex) const;
+
   [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
                                                std::vector<int32_t> const& batchedTokens,
                                                int32_t numTokens, int32_t numBatches,

@@ -141,6 +141,103 @@ def test_prims_ts_backend_is_blackwell_only(routine):
     )
 
 
+def test_dsv4_sparse_mla_backend_is_sm100_or_sm103_only():
+    support = routine_cc_to_supported_backends["trtllm_batch_decode_sparse_mla_dsv4"]
+    assert support["10.0"] == ["trtllm-gen"]
+    assert support["10.3"] == ["trtllm-gen"]
+    assert all(
+        not backends
+        for compute_capability, backends in support.items()
+        if compute_capability not in ("10.0", "10.3")
+    )
+
+
+def test_dsv4_sparse_mla_adapter_contract(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        attention_routine, "get_device", lambda _args: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        attention_routine,
+        "filter_backends_by_compute_capability",
+        lambda backends, *_args: list(backends),
+    )
+    monkeypatch.setattr(attention_routine, "print_perf_metrics", lambda *_args: None)
+    monkeypatch.setattr(attention_routine, "_DSV4_WORKSPACE_BYTES", 1)
+    monkeypatch.setattr(
+        attention_routine.torch,
+        "randn",
+        lambda *shape, **kwargs: torch.ones(*shape, **kwargs),
+    )
+
+    def fake_sparse_mla(**kwargs):
+        calls.append(kwargs)
+        kwargs["out"].fill_(0.05)
+        return kwargs["out"]
+
+    monkeypatch.setattr(
+        attention_routine.flashinfer.mla,
+        "trtllm_batch_decode_sparse_mla_dsv4",
+        fake_sparse_mla,
+    )
+
+    def fake_bench_gpu_time(*, fn, input_args, **_kwargs):
+        fn(*input_args)
+        return np.array([1.0, 1.0])
+
+    monkeypatch.setattr(attention_routine, "bench_gpu_time", fake_bench_gpu_time)
+    args = flashinfer_benchmark.parse_args(
+        [
+            "--routine",
+            "trtllm_batch_decode_sparse_mla_dsv4",
+            "--batch_size",
+            "1",
+            "--s_qo",
+            "2",
+            "--s_kv",
+            "256",
+            "--num_qo_heads",
+            "16",
+            "--num_kv_heads",
+            "1",
+            "--head_dim_qk",
+            "512",
+            "--head_dim_vo",
+            "512",
+            "--compressed_topk",
+            "16",
+            "--q_dtype",
+            "bfloat16",
+            "--kv_dtype",
+            "bfloat16",
+            "--refcheck",
+        ]
+    )
+
+    assert args.backends == ["trtllm-gen"]
+    assert args.page_size == 256
+    assert args.causal is True
+    results = attention_routine.testTrtllmBatchDecodeSparseMlaDsv4(args)
+
+    assert len(calls) == 2
+    call = calls[0]
+    assert call["query"].shape == (2, 16, 512)
+    assert call["swa_kv_cache"].shape == (1, 1, 256, 512)
+    assert call["compressed_kv_cache"].shape == (1, 1, 64, 512)
+    assert call["sparse_indices"].shape == (2, 144)
+    assert call["sparse_topk_lens"].tolist() == [144, 144]
+    assert call["seq_lens"].tolist() == [256]
+    assert call["cum_seq_lens_q"].tolist() == [0, 2]
+    assert call["max_q_len"] == 2
+    assert call["backend"] == "trtllm-gen"
+    assert call["kv_layout"] == "HND"
+    assert call["out"].dtype == torch.bfloat16
+    assert results[0]["median_time"] == 1.0
+    assert results[0]["compressed_kv_len"] == 64
+    assert results[0]["causal"] is True
+
+
 @pytest.mark.parametrize(
     ("backend", "out_dtype", "message"),
     [

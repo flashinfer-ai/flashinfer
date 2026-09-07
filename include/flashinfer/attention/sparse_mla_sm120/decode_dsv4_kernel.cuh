@@ -31,43 +31,95 @@ namespace flashinfer::sparse_mla_sm120 {
 // smem, otherwise non-leader IO writes can be stale. We use
 // bar_sync<3, MATH_THREADS> since only math warps participate.
 
-constexpr int DSV4_N_WARPS = 8;  // math warps
-constexpr int DSV4_IO_WARPS = 1;
-constexpr int DSV4_N_TOTAL_WARPS = DSV4_N_WARPS + DSV4_IO_WARPS;  // 9
-constexpr int DSV4_BLOCK_THREADS = DSV4_N_TOTAL_WARPS * 32;       // 288
-constexpr int DSV4_MATH_THREADS = DSV4_N_WARPS * 32;              // 256
-constexpr int DSV4_IO_THREADS = DSV4_IO_WARPS * 32;               // 32
-constexpr int DSV4_CAND_WINDOW = 64;
-constexpr int DSV4_BI = DSV4_CAND_WINDOW;
-constexpr int DSV4_KV_BUF_COUNT = 2;
-constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;  // 8
-constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;     // 1
+// Decode tile configuration, per model type. Only these four values are chosen;
+// everything else in DecodeTileCfg is derived.
+//
+// The DeepSeek-family models run a 64-candidate tile across 8 math warps.
+// DOTS3_SWA halves both. Its 1040-byte KV smem stride does not fit BI=64: the
+// resulting 173872 B dynamic request is rejected outright by the driver on
+// sm120 (cudaFuncSetAttribute -> invalid argument), against a 101376 B
+// per-block opt-in cap. At BI=32 it needs 97072 B and fits, with ~3.2 KB spare.
+// Math warps must halve with BI, or ENTRIES_PER_WARP drops below 8 and
+// QK_N_TILES floors to 0 — see the asserts in DecodeTileCfg.
+template <ModelType MT>
+struct DecodeTilePrimary {
+  static constexpr int N_WARPS = 8;  // math warps
+  static constexpr int IO_WARPS = 1;
+  static constexpr int CAND_WINDOW = 64;
+  static constexpr int KV_BUF_COUNT = 2;
+  // Sliding-window bound on a token's candidate count, 0 for models whose
+  // candidate list is a genuine top-k with no positional bound.
+  static constexpr int WINDOW = 0;
+};
+
+template <>
+struct DecodeTilePrimary<ModelType::DOTS3_SWA> {
+  static constexpr int N_WARPS = 4;
+  static constexpr int IO_WARPS = 1;
+  static constexpr int CAND_WINDOW = 32;
+  static constexpr int KV_BUF_COUNT = 2;  // keep the copy/compute overlap
+  // the family's sliding-window size. The candidate list is the window, so no
+  // token can have more than this many valid entries however wide TOPK is.
+  static constexpr int WINDOW = 513;
+};
+
+template <ModelType MT>
+struct DecodeTileCfg {
+  using P = DecodeTilePrimary<MT>;
+  static constexpr int N_WARPS = P::N_WARPS;
+  static constexpr int IO_WARPS = P::IO_WARPS;
+  static constexpr int CAND_WINDOW = P::CAND_WINDOW;
+  static constexpr int KV_BUF_COUNT = P::KV_BUF_COUNT;
+
+  static constexpr int N_TOTAL_WARPS = N_WARPS + IO_WARPS;  // DSV4 9,   DOTS3_SWA 5
+  static constexpr int BLOCK_THREADS = N_TOTAL_WARPS * 32;  // DSV4 288, DOTS3_SWA 160
+  static constexpr int MATH_THREADS = N_WARPS * 32;         // DSV4 256, DOTS3_SWA 128
+  static constexpr int IO_THREADS = IO_WARPS * 32;          // 32
+  static constexpr int BI = CAND_WINDOW;                    // DSV4 64,  DOTS3_SWA 32
+  static constexpr int ENTRIES_PER_WARP = BI / N_WARPS;     // 8 for both
+  static constexpr int QK_N_TILES = ENTRIES_PER_WARP / 8;   // 1 for both
+
+  static constexpr int WINDOW = P::WINDOW;
+  static constexpr bool HAS_WINDOW = WINDOW > 0;
+
+  static_assert(BI % N_WARPS == 0, "each math warp must own a whole number of entries");
+  static_assert(ENTRIES_PER_WARP >= 8,
+                "ENTRIES_PER_WARP < 8 floors QK_N_TILES to 0 and silently drops the QK MMA; "
+                "halve N_WARPS along with CAND_WINDOW");
+  static_assert(QK_N_TILES >= 1, "QK tiling degenerate");
+};
 
 template <ModelType MT>
 struct DecodeDsv4Smem {
   using KV = KVCacheTraits<MT>;
-  static_assert(MT == ModelType::DSV4);
+  using Cfg = DecodeTileCfg<MT>;
+  // This layout assumes footer scales (a separate kv_sc buffer) and a KV smem
+  // region holding nope only. Both DSV4 and DOTS3_SWA satisfy that; the inline-
+  // scale models (DSV3_2 / GLM_NSA) bulk-copy their scales inside the KV region
+  // and use decode_dsv3_2_kernel.cuh instead.
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA);
+  static_assert(!KV::SCALE_IN_KV_SMEM, "this smem layout keeps scales in a separate buffer");
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_Q_FP8 = HPB * KV::Q_NOPE_STRIDE;
   static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
-  static constexpr size_t SMEM_KV_FP8_BUF = DSV4_BI * KV::KV_SMEM_STRIDE;
-  static constexpr size_t SMEM_KV_SC_BUF = DSV4_BI * KV::SCALE_BYTES_PER_TOKEN;
-  static constexpr size_t SMEM_KV_ROPE_BUF = DSV4_BI * KV::D_ROPE * sizeof(bf16);
+  static constexpr size_t SMEM_KV_FP8_BUF = Cfg::BI * KV::KV_SMEM_STRIDE;
+  static constexpr size_t SMEM_KV_SC_BUF = Cfg::BI * KV::SCALE_BYTES_PER_TOKEN;
+  static constexpr size_t SMEM_KV_ROPE_BUF = Cfg::BI * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_MBAR_PAIR = 2 * sizeof(uint64_t);
-  static constexpr size_t SMEM_REDUCE = 2 * DSV4_N_WARPS * HPB * sizeof(float);
+  static constexpr size_t SMEM_REDUCE = 2 * Cfg::N_WARPS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_HEAD_SC = N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_BUF = HPB * (DSV4_BI + 16);
+  static constexpr size_t SMEM_W_FP8_BUF = HPB * (Cfg::BI + 16);
 
   static constexpr size_t OFF_Q_ROPE = 0;
   static constexpr size_t OFF_Q_FP8 = OFF_Q_ROPE + SMEM_Q_ROPE;
   static constexpr size_t OFF_Q_SC = OFF_Q_FP8 + SMEM_Q_FP8;
   static constexpr size_t OFF_KV_FP8 = OFF_Q_SC + SMEM_Q_SC;
-  static constexpr size_t OFF_KV_SC = OFF_KV_FP8 + DSV4_KV_BUF_COUNT * SMEM_KV_FP8_BUF;
-  static constexpr size_t OFF_KV_ROPE = OFF_KV_SC + DSV4_KV_BUF_COUNT * SMEM_KV_SC_BUF;
+  static constexpr size_t OFF_KV_SC = OFF_KV_FP8 + Cfg::KV_BUF_COUNT * SMEM_KV_FP8_BUF;
+  static constexpr size_t OFF_KV_ROPE = OFF_KV_SC + Cfg::KV_BUF_COUNT * SMEM_KV_SC_BUF;
   static constexpr size_t OFF_MBAR_FULL_UNALIGNED =
-      OFF_KV_ROPE + DSV4_KV_BUF_COUNT * SMEM_KV_ROPE_BUF;
+      OFF_KV_ROPE + Cfg::KV_BUF_COUNT * SMEM_KV_ROPE_BUF;
   static constexpr size_t OFF_MBAR_FULL = (OFF_MBAR_FULL_UNALIGNED + 15) / 16 * 16;
   static constexpr size_t OFF_MBAR_EMPTY = OFF_MBAR_FULL + SMEM_MBAR_PAIR;
   static constexpr size_t OFF_REDUCE = OFF_MBAR_EMPTY + SMEM_MBAR_PAIR;
@@ -105,7 +157,7 @@ struct DecodeDsv4Smem {
     return reinterpret_cast<float*>(base + OFF_REDUCE);
   }
   __device__ __forceinline__ float* warp_max() const { return reduce(); }
-  __device__ __forceinline__ float* warp_sum() const { return reduce() + DSV4_N_WARPS * HPB; }
+  __device__ __forceinline__ float* warp_sum() const { return reduce() + Cfg::N_WARPS * HPB; }
   __device__ __forceinline__ float* w_head_sc() const {
     return reinterpret_cast<float*>(base + OFF_W_HEAD_SC);
   }
@@ -116,8 +168,8 @@ struct DecodeDsv4Smem {
 
 // No minBlocksPerSM on launch_bounds: kernel is smem-bound at 1 block/SM, and
 // the unconstrained register budget avoids the per-warp spill the hint forces.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
-__global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_kernel(
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
+__global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_decode_dsv4_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (DSV4 footer layout)
     const int32_t* __restrict__ indices,      // [num_tokens, topk] int32
@@ -132,10 +184,15 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
     int extra_topk,                                 // 0 = no extra cache
     int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-    size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
-    float sm_scale, size_t stride_kv_block) {
+    size_t stride_extra_kv_block, int num_tokens, int num_heads, int topk, int num_splits,
+    int chunks_per_block, float sm_scale, size_t stride_kv_block,
+    // Row strides of (extra_)indices; either may exceed the row width when the
+    // caller views a wider persistent buffer (last dim must stay contiguous).
+    size_t stride_indices_token, size_t stride_extra_indices_token) {
   using KV = KVCacheTraits<MT>;
-  static_assert(MT == ModelType::DSV4, "decode-dsv4 currently DSV4-only");
+  using Cfg = DecodeTileCfg<MT>;
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA,
+                "decode-dsv4 serves the footer-scale model types (DSV4, DOTS3_SWA)");
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 512
@@ -148,8 +205,15 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
-  // head slots); NUM_HEADS=8 small-TP shards write back only VALID_HPB rows.
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
+  // one kernel per model type serves any num_heads <= 128. Q/output carry the
+  // true num_heads stride while the mid scratch is HPB-aligned (gridDim.y *
+  // HPB head rows per token), so both halves of the head tile write back
+  // unconditionally and the merge kernel reads only h < num_heads. The
+  // dedicated NUM_HEADS=8 instantiation keeps its true-H scratch, which makes
+  // the second-half writeback a compile-time skip.
+  constexpr bool RUNTIME_H = (NUM_HEADS == 0);
+  constexpr int VALID_HPB = RUNTIME_H ? HPB : ((NUM_HEADS < HPB) ? NUM_HEADS : HPB);
 
   const int t_idx = blockIdx.x;
   const int h_block_idx = blockIdx.y;
@@ -157,8 +221,25 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  // Gmem row strides: Q/output use the true head count; the split-K scratch
+  // is HPB-padded under RUNTIME_H so the (gid + 8) half-rows always exist.
+  const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
+  const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
+  const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
+  // topk is the runtime indices-row width (the buffer bound); topk_length,
+  // when given, is clamped to it.
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
+  // Sliding-window models cap the candidate count at the window regardless of
+  // what the caller passed, so omitting topk_length costs nothing: topk is
+  // only the buffer width and the extra slots can never hold valid
+  // candidates. Applied here rather than validated at the FFI so a caller
+  // passing a too-large length cannot make the kernel over-scan either. The
+  // host side rejects a buffer narrower than the window with a readable
+  // error (SparseMlaSm120DecodeDsv4 in the JIT binding).
+  if constexpr (Cfg::HAS_WINDOW) {
+    topk_len = topk_len > Cfg::WINDOW ? Cfg::WINDOW : topk_len;
+  }
   int extra_topk_len =
       (extra_KV_cache != nullptr)
           ? (extra_topk_length_ptr ? __ldg(extra_topk_length_ptr + t_idx) : extra_topk)
@@ -169,22 +250,22 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   // Chunk range this block owns. Total chunks = main + extra (extra layout
   // is concatenated immediately after main; per-chunk dispatch in IO + math
   // routes to the right source).
-  const int num_orig_chunks = (topk_len + DSV4_CAND_WINDOW - 1) / DSV4_CAND_WINDOW;
-  const int num_extra_chunks = (extra_topk_len + DSV4_CAND_WINDOW - 1) / DSV4_CAND_WINDOW;
+  const int num_orig_chunks = (topk_len + Cfg::CAND_WINDOW - 1) / Cfg::CAND_WINDOW;
+  const int num_extra_chunks = (extra_topk_len + Cfg::CAND_WINDOW - 1) / Cfg::CAND_WINDOW;
   const int num_chunks_total = num_orig_chunks + num_extra_chunks;
   const int chunk_lo = split_idx * chunks_per_block;
   const int chunk_hi = min(chunk_lo + chunks_per_block, num_chunks_total);
 
   const int warp_id = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
-  const bool is_io = (warp_id >= DSV4_N_WARPS);
+  const bool is_io = (warp_id >= Cfg::N_WARPS);
 
   // Early-exit splits: only math threads write LSE; IO warp has nothing to do.
   if (chunk_lo >= num_chunks_total) {
-    if (!is_io && threadIdx.x < VALID_HPB) {
+    if (!is_io && threadIdx.x < valid_h) {
       const int h = h_start + threadIdx.x;
       const size_t lse_off =
-          (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits + split_idx;
+          (size_t)t_idx * mid_heads * num_splits + (size_t)h * num_splits + split_idx;
       mid_lse[lse_off] = -1e30f;
     }
     return;
@@ -192,40 +273,56 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 
   constexpr int V_CHUNK = QUANT_TILE;                          // 64
   constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                 // 7
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV4_N_WARPS;   // 1
-  constexpr int XV_KSTEPS = DSV4_BI / 32;                      // 2
-  constexpr int W_FP8_STRIDE = DSV4_BI + 16;                   // 80
-  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / DSV4_N_WARPS;  // 8
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / Cfg::N_WARPS;   // 1
+  constexpr int XV_KSTEPS = Cfg::BI / 32;                      // 2
+  constexpr int W_FP8_STRIDE = Cfg::BI + 16;                   // 80
+  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / Cfg::N_WARPS;  // 8
   constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;         // 1
-  constexpr int ROPE_K_ITERS = DSV4_BI / 16;                   // 4
+  constexpr int ROPE_K_ITERS = Cfg::BI / 16;                   // 4
+
+  // Whether rope participates in V. DSV4: D_V = D_NOPE + D_ROPE, so the output
+  // row carries a rope segment at [D_NOPE, D_V) fed by a P×V_rope MMA.
+  // DOTS3_SWA: D_V = D_NOPE, no rope segment — the XV-rope stages below are
+  // skipped entirely. This is a correctness guard, not an optimization: the
+  // rope writeback indexes mid_out at D_NOPE + ..., which for D_V == D_NOPE
+  // would run past the end of the row.
+  // Note this is the *output* rope only; the QK rope path is unconditional.
+  constexpr bool V_ROPE = KV::V_HAS_ROPE;
+  static_assert(!V_ROPE || D_V_C == D_NOPE + D_ROPE_C,
+                "V_HAS_ROPE implies the output row is nope followed by rope");
+  static_assert(V_ROPE || D_V_C == D_NOPE, "without V rope the output row is pure nope");
 
   // ── Dynamic smem layout ────────────────────────────────────────
   // Single-buffer Q/scratch + double-buffered KV bufs.
   //   sm_q_rope    HPB * D_ROPE * 2B            =  2 KB
   //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
   //   sm_q_sc      HPB * NUM_SCALES * 4B        = 0.44 KB
-  //   sm_kv_fp8    2 * DSV4_BI * KV_SMEM_STRIDE   = 58 KB
-  //   sm_kv_sc     2 * DSV4_BI * 8                = 1 KB
-  //   sm_kv_rope   2 * DSV4_BI * D_ROPE * 2B      = 16 KB
-  //   sm_reduce    2 * DSV4_N_WARPS * HPB * 4     = 1 KB  (8 warps)
+  //   sm_kv_fp8    2 * Cfg::BI * KV_SMEM_STRIDE   = 58 KB
+  //   sm_kv_sc     2 * Cfg::BI * 8                = 1 KB
+  //   sm_kv_rope   2 * Cfg::BI * D_ROPE * 2B      = 16 KB
+  //   sm_reduce    2 * Cfg::N_WARPS * HPB * 4     = 1 KB  (8 warps)
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4         = 448 B
-  //   sm_w_fp8 ×2  2 * HPB * (DSV4_BI + 16)       = 2.5 KB  (double-buf
+  //   sm_w_fp8 ×2  2 * HPB * (Cfg::BI + 16)       = 2.5 KB  (double-buf
   //                across vc iters to drop the if-vc>0 bar_sync)
   //   Total                                     ~ 88 KB
-  // Plus static sm_p_full HPB * DSV4_BI * 2B (bf16) = 2 KB.
+  // Plus static sm_p_full HPB * Cfg::BI * 2B (bf16) = 2 KB.
   // Grand total ~ 90 KB (under 100 KB SM120 carveout, 1 block/SM).
   extern __shared__ __align__(16) char smem_raw[];
   auto sm = DecodeDsv4Smem<MT>::init(smem_raw);
 
-  __shared__ bf16 sm_p_full[HPB][DSV4_BI];  // 2 KB static
-  const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
+  // Only the XV-rope MMA consumes the bf16 P matrix; the XV-nope path reads the
+  // FP8-quantized sm_w_fp8 instead. So with V_HAS_ROPE=false this buffer and the
+  // stores feeding it are dead — size it away in the source rather than relying
+  // on the optimizer to notice.
+  __shared__ bf16 sm_p_full[HPB][V_ROPE ? Cfg::BI : 1];  // DSV4 2 KB static, DOTS3_SWA 0
+  const int32_t* idx_base = indices + (size_t)t_idx * stride_indices_token;
 
   // mbar_full: leader arrives + expect_tx, bulk completion drives tx.
   // mbar_empty: math signaling thread arrives. mbar.try_wait.parity has no
   // implicit memory fence — consumer must acq-rel via bar_sync after wait.
   if (threadIdx.x == 0) {
 #pragma unroll
-    for (int s = 0; s < DSV4_KV_BUF_COUNT; ++s) {
+    for (int s = 0; s < Cfg::KV_BUF_COUNT; ++s) {
       mbarrier_init(sm.mbar_full(s), 1);
       mbarrier_init(sm.mbar_empty(s), 1);
     }
@@ -236,7 +333,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                   // 448
   constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // 128
   constexpr uint32_t DSV4_BULK_TX_BYTES =
-      (uint32_t)DSV4_BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
+      (uint32_t)Cfg::BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
 
   // IO gather: scalar scales → fence → expect_tx + bulks.
   // Dispatch per-chunk: chunks [0, num_orig_chunks) read from main KV_cache +
@@ -247,10 +344,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const bool is_extra = (gather_chunk_idx >= num_orig_chunks);
     const int chunk_in_section = is_extra ? (gather_chunk_idx - num_orig_chunks) : gather_chunk_idx;
     const int section_len = is_extra ? extra_topk_len : topk_len;
-    const int g_start = chunk_in_section * DSV4_CAND_WINDOW;
-    const int g_end = min(g_start + DSV4_CAND_WINDOW, section_len);
+    const int g_start = chunk_in_section * Cfg::CAND_WINDOW;
+    const int g_end = min(g_start + Cfg::CAND_WINDOW, section_len);
     const int32_t* section_idx_base =
-        is_extra ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+        is_extra ? (extra_indices + (size_t)t_idx * stride_extra_indices_token) : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
     // Page block size of THIS section. Main is compile-time constexpr (typ.
@@ -261,25 +358,38 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     bf16* kv_rope_dst = sm.kv_rope(buf);
     uint8_t* kv_sc_dst = sm.kv_sc(buf);
 
+    // Per-lane entries (BI / IO_THREADS, compile-time): read each candidate's
+    // index exactly once into registers — both the scale gather and the bulk
+    // issues below derive from them. The per-lane index loads issue
+    // back-to-back, as do the scale loads, so each round trip is paid once
+    // per chunk instead of twice serialized.
+    constexpr int EPW = Cfg::BI / Cfg::IO_THREADS;
+    static_assert(Cfg::BI % Cfg::IO_THREADS == 0, "IO lanes must split BI evenly");
+    int idx_raw[EPW];
 #pragma unroll
-    for (int eo = 0; eo < DSV4_BI; eo += DSV4_IO_THREADS) {
-      const int entry_idx = eo + lane;
-      if (entry_idx >= DSV4_BI) break;
-      const int cand_pos = g_start + entry_idx;
-      const bool is_valid_cand = (cand_pos < g_end);
-      const int idx_raw = is_valid_cand ? section_idx_base[cand_pos] : -1;
-      uint64_t scale_word = 0;
-      if (idx_raw >= 0) {
-        const int idx = idx_raw;
+    for (int e = 0; e < EPW; e++) {
+      const int cand_pos = g_start + e * Cfg::IO_THREADS + lane;
+      idx_raw[e] = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
+    }
+
+    uint64_t scale_word[EPW];
+#pragma unroll
+    for (int e = 0; e < EPW; e++) {
+      scale_word[e] = 0;
+      if (idx_raw[e] >= 0) {
+        const int idx = idx_raw[e];
         const int block_idx_g = idx / section_pbs;
         const int local_idx_g = idx - block_idx_g * section_pbs;
         const uint8_t* scale_base = section_kv + (size_t)block_idx_g * section_stride +
                                     (size_t)section_pbs * IO_STRIDE +
                                     (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
-        scale_word = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+        scale_word[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
       }
-      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)entry_idx * SCALE_BYTES_PER_TOKEN) =
-          scale_word;
+    }
+#pragma unroll
+    for (int e = 0; e < EPW; e++) {
+      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
+                                                   SCALE_BYTES_PER_TOKEN) = scale_word[e];
     }
     __threadfence_block();
 
@@ -291,12 +401,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // Bulk completion decrements mbar tx; phase flips when arrival count
     // (1, by leader above) AND tx=0 both met.
 #pragma unroll
-    for (int eo = 0; eo < DSV4_BI; eo += DSV4_IO_THREADS) {
-      const int entry_idx = eo + lane;
-      if (entry_idx >= DSV4_BI) break;
-      const int cand_pos = g_start + entry_idx;
-      const int idx_raw = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
-      const int idx = (idx_raw >= 0) ? idx_raw : 0;
+    for (int e = 0; e < EPW; e++) {
+      const int entry_idx = e * Cfg::IO_THREADS + lane;
+      const int idx = (idx_raw[e] >= 0) ? idx_raw[e] : 0;
       const int block_idx_g = idx / section_pbs;
       const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base =
@@ -318,7 +425,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       mbarrier_wait_parity(sm.mbar_empty(prod_idx), prod_phase);
       issue_gather(chunk_idx, buf);
       ++prod_idx;
-      if (prod_idx == DSV4_KV_BUF_COUNT) {
+      if (prod_idx == Cfg::KV_BUF_COUNT) {
         prod_idx = 0;
         prod_phase ^= 1;
       }
@@ -327,21 +434,22 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   }
 
   // ──────────────────────────────────────────────────────────────
-  // Math warps branch (warp_id < DSV4_N_WARPS = 4)
+  // Math warps branch (warp_id < Cfg::N_WARPS = 4)
   // ──────────────────────────────────────────────────────────────
 
   const int gid = lane >> 2;
   const int tid = lane & 3;
 
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
-  // internally with count=DSV4_MATH_THREADS).
-  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV4_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, sm.reduce(),
-                                            VALID_HPB);
+  // internally with count=Cfg::MATH_THREADS; rows past valid_h are zero-filled).
+  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
+  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
-  float acc_rope[ROPE_N_TILES][4] = {0};
+  // Sized 1 when unused: a zero-length array is ill-formed, and every read is
+  // behind `if constexpr (V_ROPE)`.
+  float acc_rope[V_ROPE ? ROPE_N_TILES : 1][4] = {0};
   float global_max[2] = {-1e30f, -1e30f};
   float global_sum[2] = {0.f, 0.f};
 
@@ -358,24 +466,24 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const bool is_extra_chunk = (chunk_idx >= num_orig_chunks);
     const int chunk_in_section = is_extra_chunk ? (chunk_idx - num_orig_chunks) : chunk_idx;
     const int section_len = is_extra_chunk ? extra_topk_len : topk_len;
-    const int split_cand_start = chunk_in_section * DSV4_CAND_WINDOW;
-    const int split_cand_end = min(split_cand_start + DSV4_CAND_WINDOW, section_len);
+    const int split_cand_start = chunk_in_section * Cfg::CAND_WINDOW;
+    const int split_cand_end = min(split_cand_start + Cfg::CAND_WINDOW, section_len);
 
     // Wait for IO to fill this buf (mbar_full tx + arrival both met).
     mbarrier_wait_parity(sm.mbar_full(cons_idx), cons_phase);
     // CTA-wide acquire after mbar wake. Without this, math reads see only
     // the view released by whichever IO thread triggered the phase flip —
     // other IO lanes' writes (e.g., last-head RoPE bytes) may be stale.
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
 
     uint8_t* sm_kv_fp8 = sm.kv_fp8(buf);
     uint8_t* sm_kv_sc = sm.kv_sc(buf);
     bf16* sm_kv_rope = sm.kv_rope(buf);
 
     // ── Stage 2 QK ────────────────────────────────────────────
-    float qk[DSV4_QK_N_TILES][4] = {0};
+    float qk[Cfg::QK_N_TILES][4] = {0};
     {
-      const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
+      const int warp_first_cand = warp_id * Cfg::ENTRIES_PER_WARP;
 #pragma unroll
       for (int blk = 0; blk < NUM_SCALES; blk++) {
         uint8_t sfa = fp32_to_ue8m0(sm.q_sc()[(gid + (lane & 1) * 8) * NUM_SCALES + blk]);
@@ -385,7 +493,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           uint32_t a0, a1, a2, a3;
           ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_fp8() + ko, Q_NOPE_STRIDE, lane);
 #pragma unroll
-          for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+          for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
             const int cand_row_base = warp_first_cand + nt * 8;
             uint8_t sfb = sm_kv_sc[(cand_row_base + gid) * SCALE_BYTES_PER_TOKEN + blk];
             uint32_t b0, b1;
@@ -405,13 +513,13 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       // K-rope B operand: scalar per-lane reads. mma.m16n8k16 needs each lane's
       // b0/b1 to hold consecutive K-rows of one N-entry, which ldmatrix.x2.trans
       // can't produce from the N-outer smem here (gid = lane>>2, tid = lane&3).
-      const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
+      const int warp_first_cand = warp_id * Cfg::ENTRIES_PER_WARP;
 #pragma unroll
       for (int ks = 0; ks < D_ROPE_C / 16; ks++) {
         uint32_t a0, a1, a2, a3;
         ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_rope() + ks * 16, D_ROPE_C, lane);
 #pragma unroll
-        for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+        for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
           const int cand_row_base = warp_first_cand + nt * 8;
           // Per-lane scalar load: each lane reads from its OWN N-col entry.
           const int entry = cand_row_base + gid;
@@ -432,10 +540,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
     // into smem with idx clamped — masking to -inf kills it in softmax).
     const int32_t* section_idx_base =
-        is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
-    const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
+        is_extra_chunk ? (extra_indices + (size_t)t_idx * stride_extra_indices_token) : idx_base;
+    const int warp_first_cand = warp_id * Cfg::ENTRIES_PER_WARP;
 #pragma unroll
-    for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+    for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       const int c0 = warp_first_cand + nt * 8 + tid * 2;
       const int c1 = c0 + 1;
       const int abs_c0 = c0 + split_cand_start;
@@ -459,7 +567,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // Per-warp local max/sum.
     float local_max[2] = {-1e30f, -1e30f};
 #pragma unroll
-    for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+    for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       local_max[0] = fmaxf(local_max[0], fmaxf(qk[nt][0], qk[nt][1]));
       local_max[1] = fmaxf(local_max[1], fmaxf(qk[nt][2], qk[nt][3]));
     }
@@ -469,9 +577,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       local_max[1] = fmaxf(local_max[1], __shfl_xor_sync(0xffffffff, local_max[1], s));
     }
     float local_sum[2] = {0.f, 0.f};
-    float p[DSV4_QK_N_TILES][4];
+    float p[Cfg::QK_N_TILES][4];
 #pragma unroll
-    for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+    for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       p[nt][0] = exp2f(qk[nt][0] - local_max[0]);
       p[nt][1] = exp2f(qk[nt][1] - local_max[0]);
       p[nt][2] = exp2f(qk[nt][2] - local_max[1]);
@@ -492,25 +600,25 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       sm.warp_sum()[warp_id * HPB + gid] = local_sum[0];
       sm.warp_sum()[warp_id * HPB + gid + 8] = local_sum[1];
     }
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
     if (threadIdx.x < VALID_HPB) {
       const int h = threadIdx.x;
-      float wmax[DSV4_N_WARPS], wsum[DSV4_N_WARPS];
+      float wmax[Cfg::N_WARPS], wsum[Cfg::N_WARPS];
 #pragma unroll
-      for (int w = 0; w < DSV4_N_WARPS; w++) {
+      for (int w = 0; w < Cfg::N_WARPS; w++) {
         wmax[w] = sm.warp_max()[w * HPB + h];
         wsum[w] = sm.warp_sum()[w * HPB + h];
       }
       float bmax = -1e30f;
 #pragma unroll
-      for (int w = 0; w < DSV4_N_WARPS; w++) bmax = fmaxf(bmax, wmax[w]);
+      for (int w = 0; w < Cfg::N_WARPS; w++) bmax = fmaxf(bmax, wmax[w]);
       float bsum = 0.f;
 #pragma unroll
-      for (int w = 0; w < DSV4_N_WARPS; w++) bsum += wsum[w] * exp2f(wmax[w] - bmax);
+      for (int w = 0; w < Cfg::N_WARPS; w++) bsum += wsum[w] * exp2f(wmax[w] - bmax);
       sm.warp_max()[h] = bmax;
       sm.warp_sum()[h] = bsum;
     }
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
 
     const float block_local_max0 = sm.warp_max()[gid];
     const float block_local_max1 = sm.warp_max()[gid + 8];
@@ -552,12 +660,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           acc_nope[vc][nt][3] *= alpha1;
         }
       }
+      if constexpr (V_ROPE) {
 #pragma unroll
-      for (int nt = 0; nt < ROPE_N_TILES; nt++) {
-        acc_rope[nt][0] *= alpha0;
-        acc_rope[nt][1] *= alpha0;
-        acc_rope[nt][2] *= alpha1;
-        acc_rope[nt][3] *= alpha1;
+        for (int nt = 0; nt < ROPE_N_TILES; nt++) {
+          acc_rope[nt][0] *= alpha0;
+          acc_rope[nt][1] *= alpha0;
+          acc_rope[nt][2] *= alpha1;
+          acc_rope[nt][3] *= alpha1;
+        }
       }
       global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * block_rescale0;
       global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * block_rescale1;
@@ -570,36 +680,40 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 
     // Stage 2.75: sm_p_full = p * warp_rescale. Each warp uses its OWN
     // local_max-based rescale to kill all-invalid-warp contributions.
-    float w_pre[DSV4_QK_N_TILES][4];
+    // w_pre is shared: the XV-nope FP8 quantization below reads it too, so it
+    // stays unconditional. Only the bf16 sm_p_full staging is rope-only.
+    float w_pre[Cfg::QK_N_TILES][4];
 #pragma unroll
-    for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+    for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       w_pre[nt][0] = p[nt][0] * warp_rescale0;
       w_pre[nt][1] = p[nt][1] * warp_rescale0;
       w_pre[nt][2] = p[nt][2] * warp_rescale1;
       w_pre[nt][3] = p[nt][3] * warp_rescale1;
     }
-    const int cand_col_base = warp_id * DSV4_ENTRIES_PER_WARP;
+    if constexpr (V_ROPE) {
+      const int cand_col_base = warp_id * Cfg::ENTRIES_PER_WARP;
 #pragma unroll
-    for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
-      const int c0 = nt * 8 + tid * 2;
-      const int c1 = c0 + 1;
-      sm_p_full[gid][cand_col_base + c0] = __float2bfloat16(w_pre[nt][0]);
-      sm_p_full[gid][cand_col_base + c1] = __float2bfloat16(w_pre[nt][1]);
-      sm_p_full[gid + 8][cand_col_base + c0] = __float2bfloat16(w_pre[nt][2]);
-      sm_p_full[gid + 8][cand_col_base + c1] = __float2bfloat16(w_pre[nt][3]);
+      for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
+        const int c0 = nt * 8 + tid * 2;
+        const int c1 = c0 + 1;
+        sm_p_full[gid][cand_col_base + c0] = __float2bfloat16(w_pre[nt][0]);
+        sm_p_full[gid][cand_col_base + c1] = __float2bfloat16(w_pre[nt][1]);
+        sm_p_full[gid + 8][cand_col_base + c0] = __float2bfloat16(w_pre[nt][2]);
+        sm_p_full[gid + 8][cand_col_base + c1] = __float2bfloat16(w_pre[nt][3]);
+      }
     }
     // Zero-init sm_w_head_sc here (different smem buffer than sm_p_full above),
     // so the single bar_sync below covers both write groups.
-    for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += DSV4_MATH_THREADS) {
+    for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS) {
       sm.w_head_sc()[i] = 0.f;
     }
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
 
     // ── Stage 3 NoPE FP8 ──────────────────────────────────────
     {
-      const int warp_first_cand_xv = warp_id * DSV4_ENTRIES_PER_WARP;
+      const int warp_first_cand_xv = warp_id * Cfg::ENTRIES_PER_WARP;
 #pragma unroll
-      for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+      for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
         const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
         const int cand_e1 = cand_e0 + 1;
 #pragma unroll
@@ -613,11 +727,11 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
         }
       }
     }
-    bar_sync_t<3, DSV4_MATH_THREADS>();
-    for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += DSV4_MATH_THREADS) {
+    bar_sync_t<3, Cfg::MATH_THREADS>();
+    for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS) {
       sm.w_head_sc()[i] = fmaxf(sm.w_head_sc()[i], 1e-10f) / FP8_MAX;
     }
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
 
 #pragma unroll
     for (int vc = 0; vc < N_V_CHUNKS; vc++) {
@@ -627,11 +741,11 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
       // Phase 3 quant.
       {
-        const int warp_first_cand_xv = warp_id * DSV4_ENTRIES_PER_WARP;
+        const int warp_first_cand_xv = warp_id * Cfg::ENTRIES_PER_WARP;
         const float si0 = 1.f / sm.w_head_sc()[vc * HPB + gid];
         const float si1 = 1.f / sm.w_head_sc()[vc * HPB + gid + 8];
 #pragma unroll
-        for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
+        for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
           const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
           const int cand_e1 = cand_e0 + 1;
           const float vsc0 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
@@ -646,7 +760,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = f11.__x;
         }
       }
-      bar_sync_t<3, DSV4_MATH_THREADS>();
+      bar_sync_t<3, Cfg::MATH_THREADS>();
       // Phase 4 FP8 MMA. Accumulate into persistent acc_nope[vc][nt][k].
       const float sc0 = sm.w_head_sc()[vc * HPB + gid];
       const float sc1 = sm.w_head_sc()[vc * HPB + gid + 8];
@@ -674,13 +788,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     }
 
     // ── Stage 3 RoPE bf16 ─────────────────────────────────────
-    {
+    // Skipped when V has no rope segment (DOTS3_SWA).
+    if constexpr (V_ROPE) {
       const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
 #pragma unroll
       for (int ks = 0; ks < ROPE_K_ITERS; ks++) {
         uint32_t a0, a1, a2, a3;
         ldmatrix_load_A_bf16(a0, a1, a2, a3, reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
-                             DSV4_BI, lane);
+                             Cfg::BI, lane);
 #pragma unroll
         for (int nt = 0; nt < ROPE_N_TILES; nt++) {
           const int n_col = rope_dim_base + nt * 8;
@@ -712,14 +827,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 
     // sm_p_full + sm_w_fp8 reuse next iter — math-only sync ensures Stage 3
     // is fully drained before consumer_release lets IO overwrite the slot.
-    bar_sync_t<3, DSV4_MATH_THREADS>();
+    bar_sync_t<3, Cfg::MATH_THREADS>();
 
     // Release the slot to IO (single signaling thread arrives mbar_empty).
     if (threadIdx.x == 0) {
       mbarrier_arrive(sm.mbar_empty(cons_idx));
     }
     ++cons_idx;
-    if (cons_idx == DSV4_KV_BUF_COUNT) {
+    if (cons_idx == Cfg::KV_BUF_COUNT) {
       cons_idx = 0;
       cons_phase ^= 1;
     }
@@ -729,7 +844,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+  const size_t mid_o_base = ((size_t)t_idx * mid_heads + h_start) * (size_t)num_splits * D_V_C +
                             (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 so the compiler
@@ -749,16 +864,19 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
-      // gid + 8 slot exists only when the kernel tile holds > 8 heads. For
-      // NUM_HEADS=8 (small-TP configs) the second half is invalid and writing
-      // would overflow mid_out's head dim.
+      // gid + 8 slot exists only when the kernel tile holds > 8 heads. The
+      // dedicated NUM_HEADS=8 instantiation strides mid_out by the true head
+      // count, so the second half would overflow it; the runtime-H
+      // instantiation HPB-aligns the scratch, making the write unconditional.
       if constexpr (VALID_HPB > 8) {
         *reinterpret_cast<__nv_bfloat162*>(
             &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
       }
     }
   }
-  {
+  // Rope segment of the output row, at [D_NOPE, D_V). Absent when D_V == D_NOPE
+  // (DOTS3_SWA) — writing it there would index past the end of the row.
+  if constexpr (V_ROPE) {
     const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < ROPE_N_TILES; nt++) {
@@ -778,7 +896,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   if (warp_id == 0 && tid == 0) {
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
@@ -798,16 +916,25 @@ template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge_kernel(
     const bf16* __restrict__ mid_out, const float* __restrict__ mid_lse, bf16* __restrict__ output,
     float* __restrict__ out_lse,
-    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable. natural-log domain.
-    int num_tokens, int num_splits) {
+    const float* __restrict__ attn_sink,  // [num_heads], nullable. natural-log domain.
+    int num_tokens, int num_splits,
+    // Runtime head counts, used when NUM_HEADS == 0 (the runtime-H
+    // instantiation): num_heads strides output; mid_heads strides the
+    // HPB-aligned split-K scratch (gridDim.y * HPB of the stage-1 launch).
+    int num_heads, int mid_heads,
+    // out_lse row stride in elements; a column slice of a wider buffer is
+    // legal.
+    size_t stride_out_lse) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
   constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / 8;  // 1 for D_V=512, BT=64
+  const int q_heads = (NUM_HEADS == 0) ? num_heads : NUM_HEADS;
+  const int m_heads = (NUM_HEADS == 0) ? mid_heads : NUM_HEADS;
 
   const int t_idx = blockIdx.x;
   const int h = blockIdx.y;
-  if (t_idx >= num_tokens || h >= NUM_HEADS) return;
+  if (t_idx >= num_tokens || h >= q_heads) return;
   const int tid = threadIdx.x;
 
   // Dynamic smem: cache runtime per-split LSE values so long C128A dual-cache
@@ -818,7 +945,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   __shared__ float sm_inv_gsum;
   __shared__ float sm_glse;
 
-  const float* lse_ptr = mid_lse + (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits;
+  const float* lse_ptr = mid_lse + (size_t)t_idx * m_heads * num_splits + (size_t)h * num_splits;
 
   // Stage 0: cooperatively load mid_lse into smem.
   for (int sp = tid; sp < num_splits; sp += BLOCK_THREADS) {
@@ -870,8 +997,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   const float inv_global_sum = sm_inv_gsum;
 
   // Stage 2: vec-load the partial outputs per split and accumulate.
-  const bf16* mid_base = mid_out + ((size_t)t_idx * NUM_HEADS + h) * (size_t)num_splits * D_V_VAL;
-  bf16* out_ptr = output + ((size_t)t_idx * NUM_HEADS + h) * D_V_VAL;
+  const bf16* mid_base = mid_out + ((size_t)t_idx * m_heads + h) * (size_t)num_splits * D_V_VAL;
+  bf16* out_ptr = output + ((size_t)t_idx * q_heads + h) * D_V_VAL;
   const int dim_base = tid * DIMS_PER_THREAD;
 
   float acc[DIMS_PER_THREAD];
@@ -909,7 +1036,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
     *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
-    out_lse[(size_t)t_idx * NUM_HEADS + h] = sm_glse;
+    out_lse[(size_t)t_idx * stride_out_lse + h] = sm_glse;
   }
 }
 

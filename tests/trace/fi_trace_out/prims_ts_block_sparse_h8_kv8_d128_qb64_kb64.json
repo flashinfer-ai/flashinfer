@@ -39,7 +39,7 @@
     },
     "num_block_indices": {
       "type": "var",
-      "description": "Number of selected KV blocks."
+      "description": "Capacity of the runtime KV-block ID tensor."
     },
     "num_kv_valid_words": {
       "type": "var",
@@ -107,7 +107,7 @@
         "num_block_indices"
       ],
       "dtype": "int32",
-      "description": "Selected KV block IDs, consumed by the one-shot call."
+      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are live."
     },
     "kv_valid_bits": {
       "shape": [

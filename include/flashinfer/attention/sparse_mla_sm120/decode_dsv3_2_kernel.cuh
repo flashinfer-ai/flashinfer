@@ -28,6 +28,7 @@ namespace flashinfer::sparse_mla_sm120 {
 //   [512   : 528)  4 × FP32 scale (one per 128-elem tile)
 //   [528   : 656)  BF16 rope, 64 elements × 2B
 // DSv3.2 stores power-of-2 FP32 scales; GLM_NSA stores arbitrary FP32 scales.
+// GLM53_NOPE reuses the 656 B row with [528:656) as reserved padding — never read as rope.
 // The IO warp does a single bulk per token that covers both nope and inline
 // scales in one go (528 B), then a second bulk for rope (128 B). No scalar
 // scale gather phase.
@@ -50,8 +51,9 @@ constexpr int DSV3_2_KV_BUF_COUNT = 2;
 constexpr int DSV3_2_ENTRIES_PER_WARP = DSV3_2_BI / DSV3_2_N_WARPS;  // 8
 constexpr int DSV3_2_QK_N_TILES = DSV3_2_ENTRIES_PER_WARP / 8;       // 1
 
+template <ModelType MT>
 struct DecodeDsv3_2Smem {
-  using KV = KVCacheTraits<ModelType::DSV3_2>;
+  using KV = KVCacheTraits<MT>;
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
@@ -116,7 +118,7 @@ struct DecodeDsv3_2Smem {
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
@@ -124,9 +126,17 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
+    int num_tokens, int num_heads, int topk, int num_splits, int chunks_per_block, float sm_scale,
+    size_t stride_kv_block,
+    // Row stride of indices; may exceed topk when the caller views a wider
+    // persistent buffer (last dim must stay contiguous).
+    size_t stride_indices_token,
+    // Per-token advance in the KV cache. Equals KV::KV_GMEM_STRIDE for a packed
+    // cache, but is larger when the caller pads rows to share one KV cache
+    // group across layer geometries; the payload stays at the row start.
+    int stride_kv_row) {
   using KV = KVCacheTraits<MT>;
-  static_assert(KV::D_QK == 576);
+  static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 576
@@ -140,11 +150,17 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // gmem offset KV_ROPE_GMEM_OFFSET=528 with 128 B/entry.
   constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;  // 528
   constexpr int pbs = PAGE_BLOCK_SIZE;
-  // Heads actually populated per CTA tile. For NUM_HEADS=8 (small TP),
-  // only the first 8 head slots carry valid data; the kernel computes a
-  // full HPB×CAND tile internally (zero-padded Q rows on invalid heads)
-  // but only writes back NUM_HEADS heads.
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  // Heads actually populated per CTA tile. NUM_HEADS == 0 selects the
+  // runtime-head-count instantiation (one kernel per model type, any
+  // num_heads <= 128): Q/output carry the true num_heads stride, the mid
+  // scratch is HPB-aligned (gridDim.y * HPB rows per token) so both tile
+  // halves write back unconditionally, and the merge kernel reads only
+  // h < num_heads. The dedicated NUM_HEADS=8 instantiation keeps true-H
+  // scratch, making the second-half writeback a compile-time skip; the kernel
+  // still computes a full HPB×CAND tile internally (zero-padded Q rows on
+  // invalid heads).
+  constexpr bool RUNTIME_H = (NUM_HEADS == 0);
+  constexpr int VALID_HPB = RUNTIME_H ? HPB : ((NUM_HEADS < HPB) ? NUM_HEADS : HPB);
 
   const int t_idx = blockIdx.x;
   const int h_block_idx = blockIdx.y;
@@ -152,8 +168,15 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  // Gmem row strides: Q/output use the true head count; the split-K scratch
+  // is HPB-padded under RUNTIME_H so the (gid + 8) half-rows always exist.
+  const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
+  const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
+  const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
+  // topk is the runtime indices-row width (the buffer bound); topk_length,
+  // when given, is clamped to it.
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
 
   // Chunk range this block owns.
   const int num_chunks_total = (topk_len + DSV3_2_CAND_WINDOW - 1) / DSV3_2_CAND_WINDOW;
@@ -166,10 +189,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
   // Early-exit splits: only math threads write LSE; IO has nothing to do.
   if (chunk_lo >= num_chunks_total) {
-    if (!is_io && threadIdx.x < VALID_HPB) {
+    if (!is_io && threadIdx.x < valid_h) {
       const int h = h_start + threadIdx.x;
       const size_t lse_off =
-          (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits + split_idx;
+          (size_t)t_idx * mid_heads * num_splits + (size_t)h * num_splits + split_idx;
       mid_lse[lse_off] = -1e30f;
     }
     return;
@@ -200,10 +223,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // D_NOPE 512 + SCALE_BYTES_PER_TOKEN 16), so the QK / XV stages read
   // scales directly out of sm_kv_fp8.
   extern __shared__ __align__(16) char smem_raw[];
-  auto sm = DecodeDsv3_2Smem::init(smem_raw);
+  auto sm = DecodeDsv3_2Smem<MT>::init(smem_raw);
 
   __shared__ bf16 sm_p_full[HPB][DSV3_2_BI];  // 2 KB static
-  const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
+  const int32_t* idx_base = indices + (size_t)t_idx * stride_indices_token;
 
   // ── Per-stage mbarrier init.
   if (threadIdx.x == 0) {
@@ -244,13 +267,16 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       const int block_idx_g = idx / pbs;
       const int local_idx_g = idx - block_idx_g * pbs;
       const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                 (size_t)local_idx_g * KV::KV_GMEM_STRIDE;
+                                 (size_t)local_idx_g * (size_t)stride_kv_row;
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));
-      // Bulk 2: RoPE (128 B) → sm_kv_rope slot.
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
-                        V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      // Bulk 2: RoPE (128 B) → sm_kv_rope slot. NoPE models issue no rope bulk;
+      // the expect-tx accounting shrinks with V2_BULK_ROPE_BYTES automatically.
+      if constexpr (D_ROPE_C > 0) {
+        cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
+                          V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      }
     }
   };
 
@@ -279,10 +305,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const int gid = lane >> 2;
   const int tid = lane & 3;
 
-  // Stage 0: Q quantization.
-  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
-                                              sm.reduce(), VALID_HPB);
+  // Stage 0: Q quantization (rows past valid_h are zero-filled).
+  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
+  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -627,7 +652,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+  const size_t mid_o_base = ((size_t)t_idx * mid_heads + h_start) * (size_t)num_splits * D_V_C +
                             (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 → STG.E.64.
@@ -651,7 +676,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   if (warp_id == 0 && tid == 0) {
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;

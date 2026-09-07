@@ -339,7 +339,7 @@ def bench_cute_dsl(
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
-                    If False, use cute_dsl_fused_moe_nvfp4 functional API.
+                    If False, use cute_dsl_fused_moe functional API.
         do_autotune: If True, run the pre-warm pass under autotune(True) so the
                     autotuner profiles all buckets and populates its cache. The
                     measurement loop runs OUTSIDE the autotune context so that
@@ -499,7 +499,7 @@ def bench_cute_dsl(
             )
     else:
         # Use functional API
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
             x, x_sf, per_token_scale = prepare_activation(x, x_sf)
@@ -513,7 +513,7 @@ def bench_cute_dsl(
                 topk_values=topk_values,
                 topk_indices=topk_indices,
             )
-            return cute_dsl_fused_moe_nvfp4(
+            return cute_dsl_fused_moe(
                 x=x,
                 x_sf=x_sf,
                 token_selected_experts=topk_indices,

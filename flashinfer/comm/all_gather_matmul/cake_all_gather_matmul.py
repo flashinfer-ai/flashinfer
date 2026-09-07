@@ -29,22 +29,31 @@ _BLOCK_M = 128
 _CHUNK_ROWS = 19 * _BLOCK_M
 _K = 8192
 _N = 2048
+_TP8_PACKED_QKV_N = 1280
 _PACKED_QKV_N = 2560
+_PREPARED_PACKED_QKV_N_BY_WORLD_SIZE = {
+    4: _PACKED_QKV_N,
+    8: _TP8_PACKED_QKV_N,
+}
 _TENSOR_MAP_BYTES = 128
 _DESCRIPTOR_COUNT = 3
 _DESCRIPTOR_CACHE_MAX_ENTRIES = 256
-_MAIN_KERNEL_COUNT = 4
-_SUPPORTED_WORLD_SIZES = frozenset((2, 4))
+_MAIN_KERNEL_COUNT = 6
+_SUPPORTED_WORLD_SIZES = frozenset((2, 4, 8))
 _SUPPORTED_DTYPES = frozenset((torch.bfloat16, torch.float16))
 _KERNEL_SYMBOLS = (
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1",
     "kernel_cake_blackwell_all_gather_matmul_float16_ws2",
     "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2",
     "kernel_cake_blackwell_all_gather_matmul_float16_ws4",
     "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4",
+    "kernel_cake_blackwell_all_gather_matmul_float16_ws8",
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8",
 )
 _MANIFEST_KEYS = frozenset(
     {
@@ -61,26 +70,37 @@ _MANIFEST_KEYS = frozenset(
     }
 )
 _SMEM_TOTAL_PATTERN = re.compile(rb"^#define SMEM_TOTAL ([1-9][0-9]*)$", re.MULTILINE)
-_CONSTRAINTS = {
+_COMMON_CONSTRAINTS: dict[str, Any] = {
     "dtypes": ["float16", "bfloat16"],
     "k": 8192,
     "m_multiple": 128,
-    "n": 2048,
-    "world_sizes": [2, 4],
+    "n_by_world_size": {
+        "2": [2048],
+        "4": [2048],
+        "8": [2048],
+    },
+    "world_sizes": [2, 4, 8],
 }
 _ROUTE_COVERAGE = {
     "ws2": {
         "barrier": list(_KERNEL_SYMBOLS[:2]),
         "main": {
-            "bfloat16": _KERNEL_SYMBOLS[5],
-            "float16": _KERNEL_SYMBOLS[4],
+            "bfloat16": _KERNEL_SYMBOLS[7],
+            "float16": _KERNEL_SYMBOLS[6],
         },
     },
     "ws4": {
         "barrier": list(_KERNEL_SYMBOLS[2:4]),
         "main": {
-            "bfloat16": _KERNEL_SYMBOLS[7],
-            "float16": _KERNEL_SYMBOLS[6],
+            "bfloat16": _KERNEL_SYMBOLS[9],
+            "float16": _KERNEL_SYMBOLS[8],
+        },
+    },
+    "ws8": {
+        "barrier": list(_KERNEL_SYMBOLS[4:6]),
+        "main": {
+            "bfloat16": _KERNEL_SYMBOLS[11],
+            "float16": _KERNEL_SYMBOLS[10],
         },
     },
 }
@@ -156,8 +176,9 @@ inline void CheckDescriptorInputs(const TensorView& inp,
   CheckContiguous(weight, "weight");
   CheckSameDevice(scratch, inp, "scratch");
   CheckSameDevice(weight, inp, "weight");
-  TVM_FFI_CHECK(world_size == 2 || world_size == 4, ValueError)
-      << "world_size must be 2 or 4";
+  TVM_FFI_CHECK(world_size == 2 || world_size == 4 || world_size == 8,
+                ValueError)
+      << "world_size must be 2, 4, or 8";
   TVM_FFI_CHECK(rows > 0 && rows % 128 == 0, ValueError)
       << "rows must be a positive multiple of 128";
   TVM_FFI_CHECK(inp.ndim() == 2 && inp.size(0) == rows && inp.size(1) == 8192,
@@ -168,9 +189,10 @@ inline void CheckDescriptorInputs(const TensorView& inp,
                 ValueError)
       << "scratch must have shape [world_size, rows, 8192]";
   TVM_FFI_CHECK(weight.ndim() == 2 && weight.size(0) == 8192 &&
-                    (weight.size(1) == 2048 || weight.size(1) == 2560),
+                    (weight.size(1) == 1280 || weight.size(1) == 2048 ||
+                     weight.size(1) == 2560),
                 ValueError)
-      << "weight must have shape [8192, 2048] or [8192, 2560]";
+      << "weight must have shape [8192, 1280], [8192, 2048], or [8192, 2560]";
   const DLDataType dtype = inp.dtype();
   for (const auto* tensor : {&scratch, &weight}) {
     const DLDataType other = tensor->dtype();
@@ -262,8 +284,9 @@ void PrepareDescriptors(TensorView inp, TensorView scratch, TensorView weight,
 }
 
 inline tvm::ffi::CubinKernel& BarrierKernel(int64_t world_size, int64_t phase) {
-  TVM_FFI_CHECK(world_size == 2 || world_size == 4, ValueError)
-      << "world_size must be 2 or 4";
+  TVM_FFI_CHECK(world_size == 2 || world_size == 4 || world_size == 8,
+                ValueError)
+      << "world_size must be 2, 4, or 8";
   TVM_FFI_CHECK(phase == 0 || phase == 1, ValueError)
       << "phase must be 0 or 1";
   static auto ws2_p0 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
@@ -278,25 +301,41 @@ inline tvm::ffi::CubinKernel& BarrierKernel(int64_t world_size, int64_t phase) {
   static auto ws4_p1 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
       "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1");
+  static auto ws8_p0 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+      CAKE_MODULE_IDENT,
+      "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0");
+  static auto ws8_p1 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+      CAKE_MODULE_IDENT,
+      "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1");
   if (world_size == 2) {
     return phase == 0 ? ws2_p0 : ws2_p1;
   }
-  return phase == 0 ? ws4_p0 : ws4_p1;
+  if (world_size == 4) {
+    return phase == 0 ? ws4_p0 : ws4_p1;
+  }
+  return phase == 0 ? ws8_p0 : ws8_p1;
 }
 
 inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
                                          int64_t n) {
-  TVM_FFI_CHECK(world_size == 2 || world_size == 4, ValueError)
-      << "world_size must be 2 or 4";
+  TVM_FFI_CHECK(world_size == 2 || world_size == 4 || world_size == 8,
+                ValueError)
+      << "world_size must be 2, 4, or 8";
   TVM_FFI_CHECK(dtype_code == 0 || dtype_code == 1, ValueError)
       << "dtype_code must be 0 (bfloat16) or 1 (float16)";
-  TVM_FFI_CHECK(n == 2048 || n == 2560, ValueError)
-      << "n must be 2048 or 2560";
+  TVM_FFI_CHECK(n == 1280 || n == 2048 || n == 2560, ValueError)
+      << "n must be 1280, 2048, or 2560";
   if (n == 2560) {
     TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 4 &&
                       dtype_code == 0,
                   ValueError)
         << "the packed-QKV experiment requires SM103, world_size=4, and bfloat16";
+  }
+  if (n == 1280) {
+    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 8 &&
+                      dtype_code == 0,
+                  ValueError)
+        << "N=1280 requires the SM103, world_size=8, bfloat16 packed-QKV route";
   }
   static auto bf16_ws2 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
@@ -310,20 +349,30 @@ inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
   static auto f16_ws4 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
       "kernel_cake_blackwell_all_gather_matmul_float16_ws4");
+  static auto bf16_ws8 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+      CAKE_MODULE_IDENT,
+      "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8");
+  static auto f16_ws8 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+      CAKE_MODULE_IDENT,
+      "kernel_cake_blackwell_all_gather_matmul_float16_ws8");
   if (world_size == 2) {
     return dtype_code == 0 ? bf16_ws2 : f16_ws2;
   }
-  return dtype_code == 0 ? bf16_ws4 : f16_ws4;
+  if (world_size == 4) {
+    return dtype_code == 0 ? bf16_ws4 : f16_ws4;
+  }
+  return dtype_code == 0 ? bf16_ws8 : f16_ws8;
 }
 
 inline tvm::ffi::CubinKernel& ConfiguredMainKernel(
     int64_t world_size, int64_t dtype_code, int64_t n, int64_t device_id) {
   auto& kernel = MainKernel(world_size, dtype_code, n);
   namespace cuda_api = tvm::ffi::cuda_api;
-  static signed char smem_configured[4][64] = {};
+  static signed char smem_configured[6][64] = {};
   TVM_FFI_CHECK(device_id >= 0 && device_id < 64, RuntimeError)
       << "CUDA device id exceeds the dynamic-smem cache";
-  const int route = (world_size == 4 ? 2 : 0) + (dtype_code == 1 ? 1 : 0);
+  const int topology = world_size == 2 ? 0 : (world_size == 4 ? 1 : 2);
+  const int route = topology * 2 + (dtype_code == 1 ? 1 : 0);
   if (smem_configured[route][device_id] == 0) {
     auto device = cuda_api::GetDeviceHandle(device_id);
     const auto result = cuda_api::SetKernelMaxDynamicSharedMem(
@@ -363,8 +412,8 @@ void RunBarrier(TensorView flag_peers, int64_t world_size, int64_t rank,
 
 void RunMain(TensorView inp, TensorView scratch, TensorView weight,
              TensorView out, TensorView descriptor_storage, TensorView ready,
-             int64_t world_size, int64_t rank, int64_t rows, int64_t dtype_code,
-             int64_t cuda_stream) {
+             int64_t ready_target, int64_t world_size, int64_t rank,
+             int64_t rows, int64_t dtype_code, int64_t cuda_stream) {
   CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
   CheckCudaTensor(descriptor_storage, "descriptor_storage");
   CheckCudaTensor(ready, "ready");
@@ -394,6 +443,8 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
                     ready.size(1) == num_chunks,
                 ValueError)
       << "ready must have shape [world_size, num_chunks]";
+  TVM_FFI_CHECK(ready_target > 0 && ready_target <= UINT32_MAX, ValueError)
+      << "ready_target must be in [1, UINT32_MAX]";
 
   auto* descriptors = static_cast<unsigned char*>(descriptor_storage.data_ptr());
   void* inp_map = descriptors + 0 * kTensorMapBytes;
@@ -402,10 +453,12 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
   void* output_ptr = out.data_ptr();
   void* scratch_ptr = scratch.data_ptr();
   void* ready_ptr = ready.data_ptr();
+  uint32_t ready_value = static_cast<uint32_t>(ready_target);
   int32_t local_rank = static_cast<int32_t>(rank);
   int32_t local_rows = static_cast<int32_t>(rows);
   void* args[] = {&inp_map, &scratch_map, &weight_map, &output_ptr,
-                  &scratch_ptr, &ready_ptr, &local_rank, &local_rows};
+                  &scratch_ptr, &ready_ptr, &ready_value, &local_rank,
+                  &local_rows};
 
   const int64_t n = weight.size(1);
   auto& kernel = ConfiguredMainKernel(world_size, dtype_code, n,
@@ -427,13 +480,21 @@ void RunPreparedPackedQkv(
     TensorView peer_scratch_0, TensorView peer_signal_0,
     TensorView peer_scratch_1, TensorView peer_signal_1,
     TensorView peer_scratch_2, TensorView peer_signal_2,
+    TensorView peer_scratch_3, TensorView peer_signal_3,
+    TensorView peer_scratch_4, TensorView peer_signal_4,
+    TensorView peer_scratch_5, TensorView peer_signal_5,
+    TensorView peer_scratch_6, TensorView peer_signal_6,
     int64_t world_size, int64_t rank, int64_t rows, int64_t phase,
-    int64_t main_cuda_stream, int64_t comm_cuda_stream,
+    int64_t ready_target, int64_t main_cuda_stream, int64_t comm_cuda_stream,
     int64_t bridge_cuda_event, int64_t expected_scratch_ptr,
     int64_t expected_ready_ptr, int64_t expected_peer_scratch_0,
     int64_t expected_peer_signal_0, int64_t expected_peer_scratch_1,
     int64_t expected_peer_signal_1, int64_t expected_peer_scratch_2,
-    int64_t expected_peer_signal_2) {
+    int64_t expected_peer_signal_2, int64_t expected_peer_scratch_3,
+    int64_t expected_peer_signal_3, int64_t expected_peer_scratch_4,
+    int64_t expected_peer_signal_4, int64_t expected_peer_scratch_5,
+    int64_t expected_peer_signal_5, int64_t expected_peer_scratch_6,
+    int64_t expected_peer_signal_6) {
   CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
   CheckCudaTensor(descriptor_storage, "descriptor_storage");
   CheckCudaTensor(ready, "ready");
@@ -464,16 +525,19 @@ void RunPreparedPackedQkv(
                     flag_dtype.lanes == 1,
                 TypeError)
       << "flag_peers must have int64 dtype";
-  TVM_FFI_CHECK(world_size == 4, ValueError)
-      << "prepared packed-QKV launch requires world_size=4";
+  TVM_FFI_CHECK(
+      kPackedQkvExperimentSupported &&
+          ((world_size == 4 && weight.size(1) == 2560) ||
+           (world_size == 8 && weight.size(1) == 1280)),
+      ValueError)
+      << "prepared packed-QKV launch requires SM103 and exact profile "
+         "world_size=4,N=2560 or world_size=8,N=1280";
   TVM_FFI_CHECK(rank >= 0 && rank < world_size, ValueError)
       << "rank is outside the process group";
   TVM_FFI_CHECK(flag_peers.ndim() == 1 &&
                     flag_peers.numel() == world_size,
                 ValueError)
       << "flag_peers must contain one pointer per rank";
-  TVM_FFI_CHECK(weight.size(1) == 2560, ValueError)
-      << "prepared packed-QKV launch requires N=2560";
   const DLDataType dtype = inp.dtype();
   TVM_FFI_CHECK(dtype.code == kDLBfloat && dtype.bits == 16 &&
                     dtype.lanes == 1,
@@ -485,19 +549,27 @@ void RunPreparedPackedQkv(
                     ready.size(1) == num_chunks,
                 ValueError)
       << "ready must have shape [world_size, num_chunks]";
+  TVM_FFI_CHECK(ready_target > 0 && ready_target <= UINT32_MAX, ValueError)
+      << "ready_target must be in [1, UINT32_MAX]";
   TVM_FFI_CHECK(comm_cuda_stream != 0 && bridge_cuda_event != 0,
                 ValueError)
       << "prepared packed-QKV communication CUDA handles must be nonzero";
 
-  const std::array<const TensorView*, 3> peer_scratch = {
-      &peer_scratch_0, &peer_scratch_1, &peer_scratch_2};
-  const std::array<const TensorView*, 3> peer_signal = {
-      &peer_signal_0, &peer_signal_1, &peer_signal_2};
-  const std::array<int64_t, 3> expected_peer_scratch = {
+  const std::array<const TensorView*, 7> peer_scratch = {
+      &peer_scratch_0, &peer_scratch_1, &peer_scratch_2, &peer_scratch_3,
+      &peer_scratch_4, &peer_scratch_5, &peer_scratch_6};
+  const std::array<const TensorView*, 7> peer_signal = {
+      &peer_signal_0, &peer_signal_1, &peer_signal_2, &peer_signal_3,
+      &peer_signal_4, &peer_signal_5, &peer_signal_6};
+  const std::array<int64_t, 7> expected_peer_scratch = {
       expected_peer_scratch_0, expected_peer_scratch_1,
-      expected_peer_scratch_2};
-  const std::array<int64_t, 3> expected_peer_signal = {
-      expected_peer_signal_0, expected_peer_signal_1, expected_peer_signal_2};
+      expected_peer_scratch_2, expected_peer_scratch_3,
+      expected_peer_scratch_4, expected_peer_scratch_5,
+      expected_peer_scratch_6};
+  const std::array<int64_t, 7> expected_peer_signal = {
+      expected_peer_signal_0, expected_peer_signal_1, expected_peer_signal_2,
+      expected_peer_signal_3, expected_peer_signal_4, expected_peer_signal_5,
+      expected_peer_signal_6};
   TVM_FFI_CHECK(expected_scratch_ptr != 0 && expected_ready_ptr != 0 &&
                     reinterpret_cast<uintptr_t>(scratch.data_ptr()) ==
                         static_cast<uintptr_t>(expected_scratch_ptr) &&
@@ -591,21 +663,15 @@ void RunPreparedPackedQkv(
           cuStreamWriteValue32(
               comm_stream,
               peer_signal_base + static_cast<size_t>(chunk) * sizeof(uint32_t),
-              1, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS,
+              static_cast<uint32_t>(ready_target),
+              CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS,
           RuntimeError)
           << "prepared peer signal submission failed";
     }
   }
 
-  RunMain(inp, scratch, weight, out, descriptor_storage, ready, world_size,
-          rank, rows, 0, main_cuda_stream);
-  TVM_FFI_CHECK(
-      cuMemsetD32Async(
-          static_cast<CUdeviceptr>(
-              reinterpret_cast<uintptr_t>(ready.data_ptr())),
-          0, ready.numel(), main_stream) == CUDA_SUCCESS,
-      RuntimeError)
-      << "prepared signal reset submission failed";
+  RunMain(inp, scratch, weight, out, descriptor_storage, ready, ready_target,
+          world_size, rank, rows, 0, main_cuda_stream);
   TVM_FFI_CHECK(cuEventRecord(bridge_event, comm_stream) == CUDA_SUCCESS,
                 RuntimeError)
       << "recording the prepared comm-to-main event failed";
@@ -694,9 +760,28 @@ def _launch_contract(source: bytes) -> dict[str, Any]:
         "main": {
             "block_threads": 192,
             "dynamic_smem_bytes": _resolved_main_smem_bytes(source),
-            "grid_x": "(min(M, 2432) / 128) * 8",
+            "grid_x": "(min(M, 2432) / 128) * (N / 256)",
         },
     }
+
+
+def _constraints_for_arch(arch: str) -> dict[str, Any]:
+    constraints = {
+        "dtypes": list(_COMMON_CONSTRAINTS["dtypes"]),
+        "k": _COMMON_CONSTRAINTS["k"],
+        "m_multiple": _COMMON_CONSTRAINTS["m_multiple"],
+        "n_by_world_size": {
+            key: list(values)
+            for key, values in _COMMON_CONSTRAINTS["n_by_world_size"].items()
+        },
+        "world_sizes": list(_COMMON_CONSTRAINTS["world_sizes"]),
+    }
+    if arch == "sm_103a":
+        constraints["prepared_packed_qkv"] = {
+            "dtypes": ["bfloat16"],
+            "n_by_world_size": {"4": [2560], "8": [1280]},
+        }
+    return constraints
 
 
 def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
@@ -744,9 +829,9 @@ def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
         "arch": arch,
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
-        "kernel_count": 8,
+        "kernel_count": 12,
         "launch": _launch_contract(source_bytes),
-        "constraints": _CONSTRAINTS,
+        "constraints": _constraints_for_arch(arch),
         "kernel_symbols": list(_KERNEL_SYMBOLS),
         "route_coverage": _ROUTE_COVERAGE,
         "source_sha256": source_sha256,
@@ -815,11 +900,14 @@ def _load_program(arch: str):
 class _LaunchState:
     lock: Any = field(default_factory=RLock, repr=False)
     next_phase: int = 0
+    ready_epoch: int = 0
     tail_event: Any = None
     tail_stream: int | None = None
     flags: Any = None
     flag_handle: Any = None
     flag_peers: Any = None
+    initialization_event: Any = None
+    initialization_stream: int | None = None
     poisoned: bool = False
 
 
@@ -893,30 +981,39 @@ def _validate_inputs(
     rows, k = (int(dim) for dim in inp.shape)
     if rows <= 0 or rows % _BLOCK_M:
         raise ValueError("inp.shape[0] must be a positive multiple of 128")
-    if packed_qkv_experiment:
-        if k != _K or tuple(w.shape) != (_K, _PACKED_QKV_N):
-            raise ValueError(
-                "the packed-QKV experiment requires exact K=8192 and N=2560"
-            )
-    elif k != _K or tuple(w.shape) != (_K, _N):
-        raise ValueError("the Cake backend requires exact K=8192 and N=2048")
     world_size = int(dist.get_world_size(group))
     rank = int(dist.get_rank(group))
     if world_size not in _SUPPORTED_WORLD_SIZES:
-        raise ValueError("the Cake backend requires process-group world size 2 or 4")
+        raise ValueError(
+            "the Cake backend requires process-group world size 2, 4, or 8"
+        )
     if not 0 <= rank < world_size:
         raise RuntimeError("process-group rank is outside its world size")
+    if packed_qkv_experiment:
+        expected_n = _PREPARED_PACKED_QKV_N_BY_WORLD_SIZE.get(world_size)
+        if expected_n is None or k != _K or tuple(w.shape) != (_K, expected_n):
+            raise ValueError(
+                "the packed-QKV experiment requires exact K=8192 and profile "
+                "world_size=4,N=2560 or world_size=8,N=1280"
+            )
+    else:
+        allowed_n = {
+            2: frozenset((_N,)),
+            4: frozenset((_N,)),
+            8: frozenset((_N,)),
+        }[world_size]
+        if k != _K or int(w.shape[0]) != _K or int(w.shape[1]) not in allowed_n:
+            raise ValueError(
+                "the Cake backend requires exact K=8192 and an N supported "
+                f"by world_size={world_size}: {sorted(allowed_n)}"
+            )
     if str(symm_mem.get_backend(inp.device)).upper() != "NVSHMEM":
         raise ValueError(
             "the Cake backend requires the NVSHMEM symmetric-memory backend"
         )
     arch = _target_arch(inp.device)
-    if packed_qkv_experiment and (
-        arch != "sm_103a" or inp.dtype != torch.bfloat16 or world_size != 4
-    ):
-        raise ValueError(
-            "the packed-QKV experiment requires SM103, bfloat16, and world size 4"
-        )
+    if packed_qkv_experiment and (arch != "sm_103a" or inp.dtype != torch.bfloat16):
+        raise ValueError("the packed-QKV experiment requires SM103 and bfloat16")
     return device_index, rank, world_size, _group_name(group)
 
 
@@ -927,6 +1024,7 @@ def _ensure_launch_state(
     rank: int,
     world_size: int,
     group_name: str,
+    main_stream: torch.cuda.Stream,
 ) -> None:
     if state.flags is not None:
         return
@@ -942,6 +1040,9 @@ def _ensure_launch_state(
     state.flags = flags
     state.flag_handle = handle
     state.flag_peers = torch.tensor(peer_ptrs, dtype=torch.int64, device=device_index)
+    state.initialization_event = torch.cuda.Event(enable_timing=False)
+    state.initialization_event.record(main_stream)
+    state.initialization_stream = int(main_stream.cuda_stream)
 
 
 def _workspace(
@@ -1108,7 +1209,7 @@ def _validate_prepared_view(
 
 
 @dataclass(frozen=True)
-class _PreparedPackedQkvSm103Tp4Launcher:
+class _PreparedPackedQkvSm103Launcher:
     group: dist.ProcessGroup = field(repr=False)
     group_id: int
     group_name: str
@@ -1119,6 +1220,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     arch: str
     dtype: torch.dtype
     rows: int
+    output_n: int
     module: Any = field(repr=False)
     state: _LaunchState = field(repr=False)
     workspace: _Workspace = field(repr=False)
@@ -1133,6 +1235,8 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
     peer_scratch_ptrs: tuple[int, ...]
     peer_signal_ptrs: tuple[int, ...]
+    native_peer_args: tuple[Any, ...] = field(repr=False)
+    native_expected_peer_args: tuple[int, ...]
     verbose: bool = False
 
     def _validate_hot_input(self, inp: torch.Tensor) -> None:
@@ -1163,6 +1267,12 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 )
             try:
                 main_stream = torch.cuda.current_stream(self.device_index)
+                main_stream_id = int(main_stream.cuda_stream)
+                if (
+                    state.initialization_event is not None
+                    and state.initialization_stream != main_stream_id
+                ):
+                    main_stream.wait_event(state.initialization_event)
                 descriptor_entry = _prepared_descriptor_storage(
                     workspace,
                     self.module,
@@ -1178,7 +1288,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 descriptors = descriptor_entry.descriptors
                 output = torch.empty(
                     self.world_size * self.rows,
-                    _PACKED_QKV_N,
+                    self.output_n,
                     dtype=self.dtype,
                     device=self.device_index,
                 )
@@ -1187,13 +1297,18 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 inp.record_stream(workspace.comm_stream)
                 w.record_stream(main_stream)
                 descriptors.record_stream(main_stream)
-                main_stream_id = int(main_stream.cuda_stream)
                 if descriptor_entry.ready_stream != main_stream_id:
                     main_stream.wait_event(descriptor_entry.ready_event)
                 if state.tail_event is not None and state.tail_stream != main_stream_id:
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
+                if state.ready_epoch >= 2**32 - 1:
+                    raise RuntimeError(
+                        "Cake all-gather matmul ready epoch exhausted uint32 range"
+                    )
+                state.ready_epoch += 1
+                ready_target = state.ready_epoch
                 self.module.run_prepared_packed_qkv(
                     inp,
                     workspace.scratch,
@@ -1202,27 +1317,18 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     descriptors,
                     self.signal_pad,
                     state.flag_peers,
-                    self.peer_routes[0][0],
-                    self.peer_routes[0][1],
-                    self.peer_routes[1][0],
-                    self.peer_routes[1][1],
-                    self.peer_routes[2][0],
-                    self.peer_routes[2][1],
+                    *self.native_peer_args,
                     self.world_size,
                     self.rank,
                     self.rows,
                     phase,
+                    ready_target,
                     main_stream_id,
                     int(workspace.comm_stream.cuda_stream),
                     int(workspace.bridge_event.cuda_event),
                     int(self.scratch_fingerprint[0]),
                     self.signal_pad_ptr,
-                    self.peer_scratch_ptrs[0],
-                    self.peer_signal_ptrs[0],
-                    self.peer_scratch_ptrs[1],
-                    self.peer_signal_ptrs[1],
-                    self.peer_scratch_ptrs[2],
-                    self.peer_signal_ptrs[2],
+                    *self.native_expected_peer_args,
                 )
                 if state.tail_event is None:
                     state.tail_event = torch.cuda.Event(enable_timing=False)
@@ -1233,7 +1339,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     print(
                         "Cake all-gather matmul prepared packed-QKV: "
                         f"arch={self.arch}, world_size={self.world_size}, "
-                        f"M={self.rows}, K={_K}, N={_PACKED_QKV_N}"
+                        f"M={self.rows}, K={_K}, N={self.output_n}"
                     )
                 return output
             except Exception:
@@ -1241,14 +1347,14 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 raise
 
 
-def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
+def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
     inp: torch.Tensor,
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
     verbose: bool = False,
-) -> _PreparedPackedQkvSm103Tp4Launcher:
-    """Bind immutable host state for the private SM103/BF16/TP4 route."""
+) -> _PreparedPackedQkvSm103Launcher:
+    """Bind immutable host state for an exact SM103/BF16 packed-QKV route."""
 
     device_index, rank, world_size, group_name = _validate_inputs(
         inp, w, group, packed_qkv_experiment=True
@@ -1288,6 +1394,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 rank=rank,
                 world_size=world_size,
                 group_name=group_name,
+                main_stream=main_stream,
             )
             if workspace is None:
                 with _CACHE_LOCK:
@@ -1372,6 +1479,26 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
             peer_signal_ptrs = tuple(
                 int(peer_signal.data_ptr()) for _, peer_signal in peer_routes
             )
+            padding = 7 - len(peer_routes)
+            native_peer_routes = tuple(peer_routes) + (peer_routes[-1],) * padding
+            native_peer_scratch_ptrs = (
+                peer_scratch_ptrs + (peer_scratch_ptrs[-1],) * padding
+            )
+            native_peer_signal_ptrs = (
+                peer_signal_ptrs + (peer_signal_ptrs[-1],) * padding
+            )
+            native_peer_args = tuple(
+                tensor for route in native_peer_routes for tensor in route
+            )
+            native_expected_peer_args = tuple(
+                pointer
+                for pair in zip(
+                    native_peer_scratch_ptrs,
+                    native_peer_signal_ptrs,
+                    strict=True,
+                )
+                for pointer in pair
+            )
             _prepared_descriptor_storage(
                 workspace,
                 module,
@@ -1384,7 +1511,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 scratch_fingerprint=scratch_fingerprint,
                 weight_fingerprint=weight_fingerprint,
             )
-            launcher = _PreparedPackedQkvSm103Tp4Launcher(
+            launcher = _PreparedPackedQkvSm103Launcher(
                 group=group,
                 group_id=id(group),
                 group_name=group_name,
@@ -1395,6 +1522,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 arch=arch,
                 dtype=inp.dtype,
                 rows=rows,
+                output_n=int(w.shape[1]),
                 module=module,
                 state=state,
                 workspace=workspace,
@@ -1409,6 +1537,8 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 peer_routes=tuple(peer_routes),
                 peer_scratch_ptrs=peer_scratch_ptrs,
                 peer_signal_ptrs=peer_signal_ptrs,
+                native_peer_args=native_peer_args,
+                native_expected_peer_args=native_expected_peer_args,
                 verbose=verbose,
             )
             return launcher
@@ -1429,10 +1559,10 @@ def _run_cake_validated(
         device_index, rank, world_size, group_name = _validate_inputs(
             inp, w, group, packed_qkv_experiment=True
         )
-        output_n = _PACKED_QKV_N
+        output_n = int(w.shape[1])
     else:
         device_index, rank, world_size, group_name = _validate_inputs(inp, w, group)
-        output_n = _N
+        output_n = int(w.shape[1])
     rows = int(inp.shape[0])
     arch = _target_arch(inp.device)
     module = _load_program(arch)
@@ -1471,6 +1601,7 @@ def _run_cake_validated(
                 rank=rank,
                 world_size=world_size,
                 group_name=group_name,
+                main_stream=main_stream,
             )
             if workspace is None:
                 with _CACHE_LOCK:
@@ -1482,6 +1613,13 @@ def _run_cake_validated(
                         world_size=world_size,
                         rows=rows,
                     )
+
+            main_stream_id = int(main_stream.cuda_stream)
+            if (
+                state.initialization_event is not None
+                and state.initialization_stream != main_stream_id
+            ):
+                main_stream.wait_event(state.initialization_event)
 
             descriptors = _descriptor_storage(
                 workspace,
@@ -1506,11 +1644,16 @@ def _run_cake_validated(
             inp.record_stream(workspace.comm_stream)
             w.record_stream(main_stream)
             descriptors.record_stream(main_stream)
-            main_stream_id = int(main_stream.cuda_stream)
             if state.tail_event is not None and state.tail_stream != main_stream_id:
                 main_stream.wait_event(state.tail_event)
 
             phase = state.next_phase
+            if state.ready_epoch >= 2**32 - 1:
+                raise RuntimeError(
+                    "Cake all-gather matmul ready epoch exhausted uint32 range"
+                )
+            state.ready_epoch += 1
+            ready_target = state.ready_epoch
             module.run_barrier(
                 state.flag_peers, world_size, rank, phase, main_stream_id
             )
@@ -1529,7 +1672,7 @@ def _run_cake_validated(
                         end = min(begin + chunk_size, rows)
                         peer_scratch[begin:end].copy_(inp[begin:end], non_blocking=True)
                         torch.ops.symm_mem.stream_write_value32_(
-                            peer_signal[rank], chunk_idx, 1
+                            peer_signal[rank], chunk_idx, ready_target
                         )
 
             module.run_main(
@@ -1539,13 +1682,13 @@ def _run_cake_validated(
                 output,
                 descriptors,
                 signal_pad,
+                ready_target,
                 world_size,
                 rank,
                 rows,
                 int(inp.dtype == torch.float16),
                 main_stream_id,
             )
-            signal_pad.zero_()
             main_stream.wait_stream(workspace.comm_stream)
             if state.tail_event is None:
                 state.tail_event = torch.cuda.Event(enable_timing=False)

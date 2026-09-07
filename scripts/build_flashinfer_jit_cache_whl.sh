@@ -119,10 +119,8 @@ echo "::endgroup::"
 
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::Install sccache"
   export SCCACHE_BUCKET
   setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
-  echo "::endgroup::"
 fi
 
 # Clean any previous builds

@@ -1009,6 +1009,7 @@ def test_radix_preallocated_outputs(return_values):
         ("radix_cutlass", None),
         ("gvr", True),
         ("gvr", False),
+        ("gvr_2", None),
     ],
 )
 def test_out_values_ignored_when_return_values_false(backend, load_balance):
@@ -1017,9 +1018,11 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
     _compile_radix specialises the kernel on return_output_values: when False the
     compiled signature has None for the values slot.  Passing a real tensor there
     (without the 'out_values if return_output_values else None' guard) causes a
-    type mismatch.  Covers all three backends plus both GVR load-balance paths.
+    type mismatch.  Covers all backends plus both GVR load-balance paths.
     """
-    dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 4
+    # gvr_2 is fp32-only; the other backends keep the original bf16 coverage.
+    dtype = torch.float32 if backend == "gvr_2" else torch.bfloat16
+    top_k, N, batch_size = 512, 8192, 4
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=99)
     # Pre-allocate a values buffer but deliberately do NOT set return_values=True.
     out_v = torch.full((batch_size, top_k), float("nan"), dtype=dtype, device="cuda")
@@ -1028,6 +1031,8 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
     if backend == "gvr":
         kwargs["pre_idx"] = pre_idx
         kwargs["load_balance"] = load_balance
+    elif backend == "gvr_2":
+        kwargs["pre_idx"] = pre_idx
 
     ret_i, ret_v = flashinfer.top_k_varlen(logits, seq_lens, top_k, **kwargs)
     torch.cuda.synchronize()
@@ -1194,23 +1199,127 @@ def test_cuda_graph_gvr(load_balance):
 
 
 def test_backend_heuristic_priority():
-    """Auto-selection priority is gvr > radix (CuTe DSL) > radix_cutlass.
+    """Auto-selection is shape/dtype-aware and tracks the measured winners.
 
-    Hardware-independent: exercises the heuristic directly so a regression in
-    the backend ordering (e.g. from a future rename) is caught even off-GPU.
+    Hardware-independent: exercises the heuristic directly with meta tensors
+    (only .dtype/.shape are read) so a regression in the decision rules is
+    caught even off-GPU. The boundaries are grounded in the B200 sweep
+    documented on the heuristic itself.
     """
     from flashinfer.topk_varlen.topk_varlen import _top_k_varlen_heuristic
 
-    # The heuristic only uses suitable_backends; pass None for the tensor/scalar
-    # args required by the full signature (needed so skip_check=True works).
-    dummy = (None, None, None)
-    assert (
-        _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"], *dummy)[0] == "gvr"
-    )
-    assert _top_k_varlen_heuristic(["radix", "radix_cutlass"], *dummy)[0] == "radix"
-    assert _top_k_varlen_heuristic(["radix_cutlass"], *dummy)[0] == "radix_cutlass"
-    # order is preserved regardless of the suitable-set ordering
-    assert _top_k_varlen_heuristic(["radix_cutlass", "radix", "gvr"], *dummy) == [
+    def order(suitable, dtype, batch, n_cols):
+        logits = torch.empty(batch, n_cols, dtype=dtype, device="meta")
+        seq_lens = torch.empty(batch, dtype=torch.int32, device="meta")
+        return _top_k_varlen_heuristic(suitable, logits, seq_lens, 1024)
+
+    all4 = ["radix_cutlass", "radix", "gvr_2", "gvr"]  # unordered on purpose
+
+    # fp32 + hint: gvr_2 always first; small problems rank radix over gvr.
+    assert order(all4, torch.float32, 1, 8192) == [
+        "gvr_2",
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    # fp32 large batch x long rows: gvr ahead of radix; the fp32 big corner
+    # (N >= 64K and B*N >= 2^23) ranks radix_cutlass over radix.
+    assert order(all4, torch.float32, 256, 131072) == [
+        "gvr_2",
+        "gvr",
+        "radix_cutlass",
+        "radix",
+    ]
+    # B*N = 2^23 but N < 64K: gvr first, radix over radix_cutlass.
+    assert order(all4, torch.float32, 256, 32768) == [
+        "gvr_2",
+        "gvr",
+        "radix",
+        "radix_cutlass",
+    ]
+    # bf16 (gvr_2 never suitable): radix wins everywhere below B*N = 2^23...
+    assert order(["gvr", "radix", "radix_cutlass"], torch.bfloat16, 64, 65536) == [
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    # ...and gvr only above it; radix_cutlass never leads in half precision.
+    assert order(["gvr", "radix", "radix_cutlass"], torch.bfloat16, 256, 131072) == [
+        "gvr",
+        "radix",
+        "radix_cutlass",
+    ]
+    # no-hint fallbacks
+    assert order(["radix", "radix_cutlass"], torch.bfloat16, 256, 131072) == [
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(["radix", "radix_cutlass"], torch.float32, 256, 131072) == [
+        "radix_cutlass",
+        "radix",
+    ]
+    assert order(["radix_cutlass"], torch.float32, 1, 4096) == ["radix_cutlass"]
+
+    # radix_filter admission (auto-vs-oracle study, PR #4811): hint-free fp32
+    # from 32K columns up, except the single-row case at >= 512K, and at every
+    # N once B >= 256 (ahead of the fp32 radix_cutlass corner).
+    hf = ["radix_cutlass", "radix", "radix_filter"]
+    assert order(hf, torch.float32, 16, 32768) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 16, 8192) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.float32, 1, 65536) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 1, 524288) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.float32, 256, 8192) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 256, 131072) == [
+        "radix_filter",
+        "radix_cutlass",
+        "radix",
+    ]
+    # fp32 with a hint but gvr_2 unsuitable: radix_filter ranks ahead of gvr.
+    assert order(hf + ["gvr"], torch.float32, 64, 131072)[:2] == ["radix_filter", "gvr"]
+    # half precision: gvr only for B >= 256 with 32K-512K columns (the old
+    # B*N >= 2^23 rule picked it at B=16 x 2M, a 7x loss to radix); radix_filter
+    # in the mid band for small batches and from 128K up for B >= 64.
+    hh = ["gvr", "radix", "radix_cutlass", "radix_filter"]
+    assert order(hh, torch.bfloat16, 16, 2097152) == ["radix", "gvr", "radix_cutlass"]
+    assert order(hh, torch.bfloat16, 256, 131072) == [
+        "gvr",
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hh, torch.bfloat16, 256, 32768) == ["gvr", "radix", "radix_cutlass"]
+    assert order(hh, torch.bfloat16, 64, 524288) == [
+        "radix_filter",
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float16, 16, 65536) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.bfloat16, 64, 8192) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.bfloat16, 256, 8192) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    # None tensors (skip_check / doc examples): static fallback order.
+    assert _top_k_varlen_heuristic(all4, None, None, None) == [
+        "gvr_2",
         "gvr",
         "radix",
         "radix_cutlass",
@@ -1219,7 +1328,7 @@ def test_backend_heuristic_priority():
 
 @requires_blackwell
 def test_cross_backend_value_consistency():
-    """radix, radix_cutlass, and gvr select the same top-K *value* multiset.
+    """radix, radix_cutlass, gvr, and gvr_2 select the same top-K *value* multiset.
 
     Compares sorted selected values (not indices) so ties don't cause spurious
     failures. fp32 keeps ties rare; any real divergence between backends fails.
@@ -1231,17 +1340,24 @@ def test_cross_backend_value_consistency():
     idx_g, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
     )
+    idx_g2, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
+    )
     torch.cuda.synchronize()
     lf = logits.float()
     for row in range(batch_size):
         vr = lf[row][idx_r[row].long()].sort(descending=True).values
         vc = lf[row][idx_c[row].long()].sort(descending=True).values
         vg = lf[row][idx_g[row].long()].sort(descending=True).values
+        vg2 = lf[row][idx_g2[row].long()].sort(descending=True).values
         assert torch.allclose(vr, vc, rtol=1e-4, atol=1e-4), (
             f"row={row}: radix vs radix_cutlass value multisets differ"
         )
         assert torch.allclose(vr, vg, rtol=1e-4, atol=1e-4), (
             f"row={row}: radix vs gvr value multisets differ"
+        )
+        assert torch.allclose(vr, vg2, rtol=1e-4, atol=1e-4), (
+            f"row={row}: radix vs gvr_2 value multisets differ"
         )
 
 
@@ -1263,16 +1379,161 @@ def test_unknown_backend_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_input_validation():
-    """1-D logits and non-int32 seq_lens are rejected by the up-front asserts."""
+    """1-D logits and non-int32 seq_lens are rejected with ValueErrors (real
+    exceptions with a message, so the checks also hold under ``python -O``)."""
     top_k = 512
     logits = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
     seq_lens = torch.full((4,), 4096, dtype=torch.int32, device="cuda")
     # logits must be 2-D
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="2-D CUDA"):
         flashinfer.top_k_varlen(logits[0], seq_lens[:1], top_k)
     # seq_lens must be int32
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="int32"):
         flashinfer.top_k_varlen(logits, seq_lens.long(), top_k)
+
+
+def _malformed_hints(batch, top_k):
+    dev = "cuda"
+    return {
+        "transposed": torch.zeros(top_k, batch, dtype=torch.int32, device=dev).t(),
+        "wrong_batch": torch.zeros(batch // 2, top_k, dtype=torch.int32, device=dev),
+        "wrong_width": torch.zeros(batch, top_k // 2, dtype=torch.int32, device=dev),
+        "int64": torch.zeros(batch, top_k, dtype=torch.int64, device=dev),
+        "cpu": torch.zeros(batch, top_k, dtype=torch.int32),
+        "misaligned": torch.zeros(batch * top_k + 4, dtype=torch.int32, device=dev)[
+            1 : 1 + batch * top_k
+        ].view(batch, top_k),
+        "three_d": torch.zeros(batch, top_k, 1, dtype=torch.int32, device=dev),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "transposed",
+        "wrong_batch",
+        "wrong_width",
+        "int64",
+        "cpu",
+        "misaligned",
+        "three_d",
+    ],
+)
+def test_malformed_hint_is_discarded_with_warning(kind):
+    """A malformed ``pre_idx`` (wrong shape, dtype, device, layout or
+    alignment) is dropped with a RuntimeWarning and the call runs hint-free
+    and exact, under ``auto`` and under an explicit hint-free backend. The
+    hint-consuming backends refuse the call up front instead of failing
+    inside the kernel (they cannot run without a hint)."""
+    from flashinfer.utils import BackendSupportedError
+
+    batch, n, top_k = 4, 8192, 1024
+    torch.manual_seed(11)
+    logits = torch.randn(batch, n, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((batch,), n, dtype=torch.int32, device="cuda")
+    bad = _malformed_hints(batch, top_k)[kind]
+    ref = torch.sort(torch.topk(logits, top_k, dim=1).values, dim=1).values
+    with pytest.warns(RuntimeWarning, match="pre_idx"):
+        indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=bad)
+    assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
+    assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
+    # explicit hint-free backend (radix on Blackwell+, radix_cutlass elsewhere):
+    # the hint is dropped with the same warning and the result stays exact
+    major, minor = torch.cuda.get_device_capability()
+    cc = major * 10 + minor
+    hint_free = (
+        "radix"
+        if flashinfer.top_k_varlen.is_backend_supported("radix", cc)
+        else "radix_cutlass"
+    )
+    with pytest.warns(RuntimeWarning, match="pre_idx"):
+        indices, _ = flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, pre_idx=bad, backend=hint_free
+        )
+    assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
+    assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
+    # explicit hint-consuming backends: refused by their checker up front
+    # (the @backend_requirement decorator reports a failed explicit-backend
+    # check as ValueError("Problem size is not supported ..."))
+    for backend in ("gvr", "gvr_2"):
+        if flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
+            with pytest.raises(
+                (BackendSupportedError, ValueError), match="not supported"
+            ):
+                flashinfer.top_k_varlen(
+                    logits, seq_lens, top_k, pre_idx=bad, backend=backend
+                )
+            # skip_check=True bypasses the checkers: the body must still refuse
+            # instead of handing the discarded hint (None) to the kernel host
+            with (
+                pytest.warns(RuntimeWarning, match="pre_idx"),
+                pytest.raises(BackendSupportedError, match="well-formed"),
+            ):
+                flashinfer.top_k_varlen(
+                    logits,
+                    seq_lens,
+                    top_k,
+                    pre_idx=bad,
+                    backend=backend,
+                    skip_check=True,
+                )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_output_buffer_contract():
+    """Caller-provided ``out_indices`` / ``out_values`` must be contiguous, on
+    the logits device, of the right dtype and exactly ``[num_rows, top_k]``;
+    anything else is a ValueError. The gvr_2 host used to accept a wider
+    buffer and pack the result into it at stride ``top_k``, so rows 0 and 1
+    of the caller's buffer held two result rows each and the rest stayed
+    untouched."""
+    batch, n, top_k = 4, 8192, 1024
+    logits = torch.randn(batch, n, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((batch,), n, dtype=torch.int32, device="cuda")
+    bad = {
+        "wider": torch.empty(batch, 2 * top_k, dtype=torch.int32, device="cuda"),
+        "taller": torch.empty(2 * batch, top_k, dtype=torch.int32, device="cuda"),
+        "short_flat": torch.empty(batch * top_k - 1, dtype=torch.int32, device="cuda"),
+        # right element count, wrong 2-D shape: would be a silent re-layout
+        "transposed_shape": torch.empty(top_k, batch, dtype=torch.int32, device="cuda"),
+        "misaligned": torch.empty(batch * top_k + 4, dtype=torch.int32, device="cuda")[
+            1 : 1 + batch * top_k
+        ].view(batch, top_k),
+        "int64": torch.empty(batch, top_k, dtype=torch.int64, device="cuda"),
+        "non_contiguous": torch.empty(
+            top_k, batch, dtype=torch.int32, device="cuda"
+        ).t(),
+        "cpu": torch.empty(batch, top_k, dtype=torch.int32),
+    }
+    for buf in bad.values():
+        with pytest.raises(ValueError, match="out_indices"):
+            flashinfer.top_k_varlen(logits, seq_lens, top_k, out_indices=buf)
+    with pytest.raises(ValueError, match="out_values"):
+        flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            return_values=True,
+            out_values=torch.empty(batch, top_k, dtype=torch.bfloat16, device="cuda"),
+        )
+    # a flat buffer with exactly num_rows * top_k elements is viewed in place
+    # (the contract the radix_filter in-place test relies on), for every backend
+    flat_i = torch.full((batch * top_k,), -7, dtype=torch.int32, device="cuda")
+    idx, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, out_indices=flat_i)
+    assert idx.data_ptr() == flat_i.data_ptr() and tuple(idx.shape) == (batch, top_k)
+    assert int((flat_i == -7).sum()) == 0
+    good_i = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    good_v = torch.empty(batch, top_k, dtype=torch.float32, device="cuda")
+    idx, vals = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        return_values=True,
+        out_indices=good_i,
+        out_values=good_v,
+    )
+    assert idx.data_ptr() == good_i.data_ptr() and vals.data_ptr() == good_v.data_ptr()
 
 
 # ---------------------------------------------------------------------------

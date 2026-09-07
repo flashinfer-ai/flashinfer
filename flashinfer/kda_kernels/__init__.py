@@ -53,7 +53,7 @@ except (ImportError, RuntimeError):
 
 try:
     if _torch.cuda.is_available():
-        from ..cute_dsl.utils import is_cute_dsl_arch_supported as _dsl_arch_ok
+        from ..cute_dsl.availability import is_cute_dsl_arch_supported as _dsl_arch_ok
 
         if not _dsl_arch_ok(*_torch.cuda.get_device_capability(0)):
             raise ImportError(

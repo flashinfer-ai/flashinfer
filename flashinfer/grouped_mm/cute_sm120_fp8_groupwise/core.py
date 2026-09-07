@@ -24,7 +24,7 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
-from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from ...jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from ...utils import get_device_sm_count, supported_compute_capability
 
 from .._sm120_moe_autotune import (
@@ -61,7 +61,7 @@ def get_gemm_sm120_module_cute_fp8():
     FP8 shares the single-``.so`` JIT module with the MXFP8 entries; the accessor
     is separate so callers depend only on the FP8 surface.
     """
-    return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
+    return gen_gemm_sm120_module_cute().build_and_load()
 
 
 def _check_scale_granularity_mnk_fp8(

@@ -15,14 +15,14 @@ limitations under the License.
 """
 
 """
-CuteDSL-based Fused MoE API for NVFP4 on Blackwell and Rubin GPUs.
+CuteDSL-based fused MoE API for block-scaled kernels on Blackwell and Rubin.
 
 This module provides high-level APIs for running Mixture of Experts (MoE)
 computations using CuteDSL kernels.
 
 Two APIs are provided:
 
-1. **Functional API** (`cute_dsl_fused_moe_nvfp4`):
+1. **Functional API** (`cute_dsl_fused_moe`):
    Simple function call with auto-tuning support via `autotune()` context.
    Best for: simple use cases, experimenting, auto-tuning.
 
@@ -34,8 +34,8 @@ Two APIs are provided:
 Both APIs share the same mode-specific runners and support auto-tuning.
 
 Example (Functional API):
-    >>> from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
-    >>> output = cute_dsl_fused_moe_nvfp4(x, x_sf, ..., num_experts=8, top_k=2)
+    >>> from flashinfer import cute_dsl_fused_moe
+    >>> output = cute_dsl_fused_moe(x, x_sf, ..., num_experts=8, top_k=2)
 
 Example (Wrapper API with CUDA Graph):
     >>> from flashinfer.cute_dsl import CuteDslMoEWrapper
@@ -52,14 +52,17 @@ Example (Wrapper API with CUDA Graph):
 
 from typing import Any, Dict, Optional, Tuple
 
+import warnings
 import weakref
 
 import torch
 
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import (
-    cute_dsl_fused_moe_nvfp4_trace,
+    cute_dsl_fused_moe_mxfp8_mxfp4_trace,
+    cute_dsl_fused_moe_trace,
     cute_dsl_moe_wrapper_run_trace,
+    cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace,
 )
 from ...tllm_enums import (
     ActivationType,
@@ -83,13 +86,14 @@ from .moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
-    blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
+    blockscaled_contiguous_gather_grouped_gemm_act_fusion,
 )
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
-    blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4,
+    blockscaled_contiguous_grouped_gemm_finalize_fusion,
 )
 from .tuner import (
-    CuteDslFusedMoENvfp4Runner,
+    ALL_W4A8_MOE_TACTICS,
+    CuteDslFusedMoERunner,
     CuteDslFusedMoEW4A16Runner,
     W4A16_MOE_TACTICS,
     _get_arch_tactics,
@@ -113,6 +117,18 @@ def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
     )
 
 
+def _canonicalize_quant_mode(quant_mode: str) -> str:
+    quant_mode = quant_mode.lower()
+    if quant_mode == "nvfp4":
+        warnings.warn(
+            "quant_mode='nvfp4' is deprecated; use quant_mode='w4a4' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return "w4a4"
+    return quant_mode
+
+
 def _get_cuda_graph_resources() -> Dict[str, Any]:
     """Get or create pre-allocated CUDA events and streams.
 
@@ -128,6 +144,41 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
 # =============================================================================
 # Core Implementation (Shared by Functional and Wrapper APIs)
 # =============================================================================
+
+
+def validate_w4a8_inputs(
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+) -> None:
+    """Validate mixed-format contracts not checked by the GEMM entry points."""
+    expected_x_sf = (x.shape[0], x.shape[1] // 32)
+    if tuple(x_sf.shape) != expected_x_sf:
+        raise ValueError(f"x_sf must have shape {expected_x_sf}")
+    if x_sf.dtype is not torch.uint8:
+        raise TypeError(
+            "W4A8 x_sf must have dtype torch.uint8; view e8m0 scales as uint8"
+        )
+    if token_final_scales.dtype is not torch.float32:
+        raise TypeError("W4A8 token_final_scales must have dtype torch.float32")
+    for name, weight, scale in (
+        ("w1_weight_sf", w1_weight, w1_weight_sf),
+        ("w2_weight_sf", w2_weight, w2_weight_sf),
+    ):
+        if scale.dtype is not torch.uint8:
+            raise TypeError(f"W4A8 {name} must have dtype torch.uint8")
+        rows, columns = weight.shape[1], weight.shape[2] * 2
+        m_tiles, k_tiles = (rows + 127) // 128, (columns + 127) // 128
+        shape = (32, 4, m_tiles, 4, k_tiles, weight.shape[0])
+        strides = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
+        if tuple(scale.shape) != shape or tuple(scale.stride()) != strides:
+            raise ValueError(
+                f"{name} must use MMA scale strides {strides}, shape {shape}"
+            )
 
 
 def _moe_core_impl(
@@ -194,15 +245,16 @@ def _moe_core_impl(
     4. Routing-weight reduction in deterministic mode
 
     Args:
-        x: Input tensor, NVFP4 quantized.
-        x_sf: Scale factors for x.
+        x: Packed W4A4 or MXFP8 W4A8 input tensor.
+        x_sf: W4A4 or W4A8 scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
             single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
-        fc2_input_scale: Global scale for GEMM2 input quantization.
+        fc2_input_scale: Global scale for W4A4 GEMM2 input quantization;
+            must be None for W4A8.
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
         w2_alpha: Per-expert global scale for GEMM2.
@@ -243,15 +295,37 @@ def _moe_core_impl(
         Output tensor [num_tokens, hidden_size].
     """
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
-    if x.dtype != torch.uint8:
+    is_mxfp8 = x.dtype == torch.float8_e4m3fn
+    if not is_mxfp8 and x.dtype != torch.uint8:
         raise TypeError(
-            f"quant_mode='w4a4' requires x.dtype=torch.uint8, got {x.dtype}"
+            "CuTe-DSL block-scaled MoE requires packed NVFP4 (torch.uint8) "
+            f"or MXFP8 (torch.float8_e4m3fn) activations, got {x.dtype}"
         )
     if x_sf is None:
-        raise ValueError("x_sf is required when quant_mode='w4a4'")
-    if fc2_input_scale is None:
+        raise ValueError("x_sf is required for block-scaled MoE")
+    if not is_mxfp8 and fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
+    if is_mxfp8 and fc2_input_scale is not None:
+        raise ValueError("fc2_input_scale must be None when quant_mode='w4a8'")
+    if is_mxfp8 and per_token_scale is not None:
+        raise ValueError("per_token_scale is not supported when quant_mode='w4a8'")
+    if is_mxfp8 and output_dtype is not torch.bfloat16:
+        raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
+    if is_mxfp8 and not use_fused_finalize:
+        raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
+    if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
+        raise ValueError("SiTU is not supported when quant_mode='w4a8'")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    if is_mxfp8:
+        validate_w4a8_inputs(
+            x,
+            x_sf,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+        )
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -313,24 +387,19 @@ def _moe_core_impl(
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + activation
-    output_kwargs: Dict[str, Any] = (
-        {
-            "out_scale": None,
-            "global_scale": None,
-            "a_per_token_scale": per_token_scale,
-            "c_dtype": _intermediate_c_dtype(output_dtype),
-        }
+    a_dtype = "float8_e4m3fn" if is_mxfp8 else "float4_e2m1fn"
+    sf_dtype = "float8_e8m0fnu" if is_mxfp8 else "float8_e4m3fn"
+    sf_vec_size = 32 if is_mxfp8 else 16
+    c_dtype = (
+        "float8_e4m3fn"
+        if is_mxfp8
+        else _intermediate_c_dtype(output_dtype)
         if use_per_token_activation
-        else {
-            "out_scale": gemm1_out_scale,
-            "global_scale": fc2_input_scale,
-            "a_per_token_scale": None,
-            "c_dtype": "float4_e2m1fn",
-        }
+        else "float4_e2m1fn"
     )
     intermediate_per_token_scale = None
     intermediate, intermediate_sf = (
-        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             a=x,
             b=w1_weight,
             a_scale=x_sf,
@@ -341,7 +410,19 @@ def _moe_core_impl(
             token_id_mapping=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=kernel_num_non_exiting_tiles,
             out=gemm1_out,
-            **output_kwargs,
+            out_scale=None if use_per_token_activation else gemm1_out_scale,
+            global_scale=(
+                fc2_input_scale
+                if not is_mxfp8 and not use_per_token_activation
+                else None
+            ),
+            a_per_token_scale=per_token_scale,
+            c_dtype=c_dtype,
+            a_dtype=a_dtype,
+            b_dtype="float4_e2m1fn",
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            quantize_output=not use_per_token_activation,
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
@@ -394,7 +475,7 @@ def _moe_core_impl(
         )
 
     # Step 3: GEMM2 with optional atomic finalize
-    blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+    blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a=intermediate,
         b=w2_weight,
         a_scale=intermediate_sf,
@@ -407,10 +488,15 @@ def _moe_core_impl(
         token_final_scales=token_final_scales,
         out=gemm2_output,
         a_per_token_scale=intermediate_per_token_scale,
+        a_dtype=a_dtype,
+        b_dtype="float4_e2m1fn",
+        sf_dtype=sf_dtype,
+        sf_vec_size=sf_vec_size,
+        out_dtype="bfloat16",
         mma_tiler_mn=gemm2_mma_tiler_mn,
-        cluster_shape_mn=gemm2_cluster_shape_mn,
         mma_tiler=gemm2_mma_tiler,
         mma_inst_shape=gemm2_mma_inst_shape,
+        cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
     )
@@ -444,7 +530,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103.
+    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
+    SM100 and SM103.
 
     Attributes:
         num_experts: Total number of experts.
@@ -455,7 +542,7 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        quant_mode: Selected W4A4 or W4A16 compute mode.
+        quant_mode: Selected W4A4, W4A8, or W4A16 compute mode.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -508,7 +595,7 @@ class CuteDslMoEWrapper:
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
     ):
-        r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
+        r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
         Parameters
         ----------
@@ -559,11 +646,12 @@ class CuteDslMoEWrapper:
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         quant_mode : str
-            Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``.
-            Defaults to ``"w4a4"``.
+            Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``.
+            Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
+            ``"w4a4"``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
-        quant_mode = quant_mode.lower()
+        quant_mode = _canonicalize_quant_mode(quant_mode)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.num_experts = num_experts
         self.top_k = top_k
@@ -586,6 +674,20 @@ class CuteDslMoEWrapper:
         self.situ_linear_beta = situ_linear_beta
         self.use_fused_finalize = use_fused_finalize
         self.quant_mode = quant_mode
+        if quant_mode == "w4a8":
+            if output_dtype is not torch.bfloat16:
+                raise ValueError("quant_mode='w4a8' supports only bfloat16 output")
+            if not use_fused_finalize:
+                raise ValueError("quant_mode='w4a8' requires fused finalize")
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError("SiTU is not supported when quant_mode='w4a8'")
+            device_obj = torch.device(device)
+            if (
+                device_obj.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(device_obj) == (10, 7)
+            ):
+                raise ValueError("quant_mode='w4a8' is not supported on SM107")
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -595,10 +697,10 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        self._runner: Optional[CuteDslFusedMoENvfp4Runner] = None
-        self._per_token_runner: Optional[CuteDslFusedMoENvfp4Runner] = None
+        self._runner: Optional[CuteDslFusedMoERunner] = None
+        self._per_token_runner: Optional[CuteDslFusedMoERunner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
-        if quant_mode in ("nvfp4", "w4a4"):
+        if quant_mode in ("w4a4", "w4a8"):
             wrapper_ref = weakref.ref(self)
 
             def _forward_with_tactic_weak(*args, **kwargs):
@@ -612,7 +714,7 @@ class CuteDslMoEWrapper:
             # Create auto-tuner runner. Use a weak trampoline instead of a bound
             # method so the runner cannot keep CUDA graph resources alive after the
             # wrapper drops out of scope.
-            self._runner = CuteDslFusedMoENvfp4Runner(
+            self._runner = CuteDslFusedMoERunner(
                 forward_impl=_forward_with_tactic_weak,
                 num_experts=num_experts,
                 top_k=top_k,
@@ -628,24 +730,27 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=False,
+                quant_mode=quant_mode,
             )
-            self._per_token_runner = CuteDslFusedMoENvfp4Runner(
-                forward_impl=_forward_with_tactic_weak,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=self.num_local_experts,
-                local_expert_offset=local_expert_offset,
-                use_fused_finalize=use_fused_finalize,
-                output_dtype=output_dtype,
-                enable_pdl=enable_pdl,
-                activation_type=activation.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                use_per_token_activation=True,
-            )
+            if quant_mode == "w4a4":
+                self._per_token_runner = CuteDslFusedMoERunner(
+                    forward_impl=_forward_with_tactic_weak,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=self.num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    use_fused_finalize=use_fused_finalize,
+                    output_dtype=output_dtype,
+                    enable_pdl=enable_pdl,
+                    activation_type=activation.value,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    swiglu_limit=swiglu_limit,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    use_per_token_activation=True,
+                    quant_mode=quant_mode,
+                )
 
             if use_cuda_graph:
                 self._aux_stream = torch.cuda.Stream(device=self.device)
@@ -669,7 +774,7 @@ class CuteDslMoEWrapper:
             )
         else:
             raise ValueError(
-                f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+                f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
             )
 
     def _forward_with_tactic(
@@ -770,7 +875,7 @@ class CuteDslMoEWrapper:
         *,
         per_token_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
+        r"""Run the CuTe-DSL fused-MoE forward pass.
 
         CUDA-graph safe when the wrapper was constructed with
         ``use_cuda_graph=True``.  Supports auto-tuning via the ``tactic``
@@ -779,11 +884,11 @@ class CuteDslMoEWrapper:
         Parameters
         ----------
         x : torch.Tensor
-            Packed NVFP4 input for ``quant_mode="w4a4"`` or BF16 input for
-            ``quant_mode="w4a16"``.
+            Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
+            ``quant_mode="w4a8"``, or BF16 input for ``quant_mode="w4a16"``.
         x_sf : Optional[torch.Tensor]
-            Scale factors for ``quant_mode="w4a4"``; must be ``None`` for
-            ``quant_mode="w4a16"``.
+            Scale factors for ``quant_mode="w4a4"`` or ``quant_mode="w4a8"``;
+            must be ``None`` for ``quant_mode="w4a16"``.
         token_selected_experts : torch.Tensor
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
@@ -797,7 +902,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM1.
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for W4A4 GEMM2 input quantization; must be ``None``
-            for W4A16 because GEMM1 output stays in BF16.
+            for W4A8 and W4A16.
         w2_weight : torch.Tensor
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
@@ -817,6 +922,16 @@ class CuteDslMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
 
+        if self.quant_mode == "w4a8" and x.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
+        if self.quant_mode == "w4a8":
+            if per_token_scale is not None:
+                raise ValueError(
+                    "per_token_scale is not supported when quant_mode='w4a8'"
+                )
+        if self.quant_mode == "w4a4" and x.dtype is not torch.uint8:
+            raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
             dtype=self.output_dtype,
@@ -825,9 +940,9 @@ class CuteDslMoEWrapper:
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
-        runner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner | None
+        runner: CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner | None
 
-        if self.quant_mode in ("nvfp4", "w4a4"):
+        if self.quant_mode in ("w4a4", "w4a8"):
             use_per_token_activation = per_token_scale is not None
             runner = (
                 self._per_token_runner if use_per_token_activation else self._runner
@@ -851,7 +966,8 @@ class CuteDslMoEWrapper:
             activation_name = (
                 "Situ" if self.situ_beta is not None else self.activation_type.name
             )
-            op_name = f"CuteDslMoEWrapper::run::{activation_name}"
+            format_name = "w4a8" if self.quant_mode == "w4a8" else "w4a4"
+            op_name = f"CuteDslMoEWrapper::run::{format_name}::{activation_name}"
         elif self.quant_mode == "w4a16":
             if (
                 x_sf is not None
@@ -893,7 +1009,7 @@ class CuteDslMoEWrapper:
             runner.tuning_config,
             inputs,
         )
-        if self.quant_mode in ("nvfp4", "w4a4"):
+        if self.quant_mode in ("w4a4", "w4a8"):
             # Timed tactic runs retain the default async path; only this
             # selected-tactic execution is single-stream while tuning.
             runner_kwargs = {"use_async_memset": not tuner.is_tuning_mode}
@@ -909,6 +1025,8 @@ class CuteDslMoEWrapper:
             # _get_arch_tactics() replaces main's ALL_MOE_TACTICS: the tactic
             # list is now architecture-dependent (Blackwell vs Rubin).
             return _get_arch_tactics()
+        elif self.quant_mode == "w4a8":
+            return list(ALL_W4A8_MOE_TACTICS)
         elif self.quant_mode == "w4a16":
             return list(W4A16_MOE_TACTICS)
         else:
@@ -920,7 +1038,7 @@ class CuteDslMoEWrapper:
 # =============================================================================
 
 
-def _cute_dsl_fused_moe_nvfp4_impl(
+def _cute_dsl_fused_moe_impl(
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
     token_selected_experts: torch.Tensor,
@@ -1002,8 +1120,8 @@ def _cute_dsl_fused_moe_nvfp4_impl(
 
 
 @supported_compute_capability([100, 103, 107])
-@flashinfer_api(trace=cute_dsl_fused_moe_nvfp4_trace)
-def cute_dsl_fused_moe_nvfp4(
+@flashinfer_api(trace=cute_dsl_fused_moe_trace)
+def cute_dsl_fused_moe(
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
     token_selected_experts: torch.Tensor,
@@ -1033,25 +1151,27 @@ def cute_dsl_fused_moe_nvfp4(
     *,
     quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
+    tactic: Optional[Tuple] = None,
 ) -> torch.Tensor:
-    r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
+    r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103.  This is the simple functional
-    API; for CUDA-graph support use :class:`CuteDslMoEWrapper` instead.
+    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
+    SM100 and SM103. This is the simple functional API; for CUDA-graph support
+    use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
 
         with autotune(True):
-            output = cute_dsl_fused_moe_nvfp4(...)
+            output = cute_dsl_fused_moe(...)
 
     Parameters
     ----------
     x : torch.Tensor
-        Packed NVFP4 input for ``quant_mode="w4a4"`` or BF16 input for
-        ``quant_mode="w4a16"``.
+        Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
+        ``quant_mode="w4a8"``, or BF16 input for ``quant_mode="w4a16"``.
     x_sf : Optional[torch.Tensor]
-        Scale factors for ``quant_mode="w4a4"``; must be ``None`` for
-        ``quant_mode="w4a16"``.
+        Scale factors for ``quant_mode="w4a4"`` or ``quant_mode="w4a8"``;
+        must be ``None`` for ``quant_mode="w4a16"``.
     token_selected_experts : torch.Tensor
         Expert assignments of shape ``[num_tokens, top_k]``.
     token_final_scales : torch.Tensor
@@ -1065,7 +1185,7 @@ def cute_dsl_fused_moe_nvfp4(
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
-        W4A16 because GEMM1 output stays in BF16.
+        W4A8 and W4A16.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -1101,8 +1221,8 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
-        Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``. Defaults
-        to ``"w4a4"``.
+        Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``. Defaults to
+        ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for ``"w4a4"``.
     situ_beta : Optional[float]
         When set with ``ActivationType.Swiglu``, use the SiTU gate
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
@@ -1110,6 +1230,8 @@ def cute_dsl_fused_moe_nvfp4(
         Optional SiTU tanh clamp for the up branch.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
+    tactic : Optional[Tuple]
+        Tactic tuple, or ``None`` for auto-selection via the runtime tuner.
 
     Returns
     -------
@@ -1118,8 +1240,16 @@ def cute_dsl_fused_moe_nvfp4(
     """
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    quant_mode = quant_mode.lower()
+    quant_mode = _canonicalize_quant_mode(quant_mode)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+
+    if quant_mode == "w4a8":
+        if x.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
+        if torch.cuda.get_device_capability(x.device) == (10, 7):
+            raise ValueError("quant_mode='w4a8' is not supported on SM107")
+    elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
+        raise TypeError("quant_mode='w4a4' requires packed uint8 input")
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -1135,12 +1265,12 @@ def cute_dsl_fused_moe_nvfp4(
         )
 
     tuner = AutoTuner.get()
-    runner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
+    runner: CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner
 
-    if quant_mode in ("nvfp4", "w4a4"):
+    if quant_mode in ("w4a4", "w4a8"):
         use_per_token_activation = per_token_scale is not None
-        runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+        runner = CuteDslFusedMoERunner(
+            forward_impl=_cute_dsl_fused_moe_impl,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -1155,6 +1285,7 @@ def cute_dsl_fused_moe_nvfp4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_per_token_activation=use_per_token_activation,
+            quant_mode=quant_mode,
         )
 
         inputs = [
@@ -1175,7 +1306,8 @@ def cute_dsl_fused_moe_nvfp4(
         inputs.append(moe_output)
 
         activation_name = "Situ" if situ_beta is not None else activation.name
-        op_name = f"CuteDslFusedMoE::run_moe_nvfp4::{activation_name}"
+        format_name = "w4a8" if quant_mode == "w4a8" else "w4a4"
+        op_name = f"CuteDslFusedMoE::run_moe_{format_name}::{activation_name}"
     elif quant_mode == "w4a16":
         if (
             x_sf is not None
@@ -1217,8 +1349,11 @@ def cute_dsl_fused_moe_nvfp4(
         op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation_name}"
     else:
         raise ValueError(
-            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+            f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
         )
+
+    if tactic is not None:
+        return runner(inputs, tactic=tactic, aux_stream=aux_stream)
 
     _, best_tactic = tuner.choose_one(
         op_name,
@@ -1227,7 +1362,7 @@ def cute_dsl_fused_moe_nvfp4(
         inputs,
         aux_stream=aux_stream,
     )
-    if quant_mode in ("nvfp4", "w4a4"):
+    if quant_mode in ("w4a4", "w4a8"):
         runner_kwargs = {
             "aux_stream": aux_stream,
             "use_async_memset": not tuner.is_tuning_mode,
@@ -1239,7 +1374,273 @@ def cute_dsl_fused_moe_nvfp4(
     return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
 
+@supported_compute_capability([100, 103, 107])
+@flashinfer_api(trace=cute_dsl_fused_moe_trace)
+def cute_dsl_fused_moe_nvfp4(
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    output_dtype: torch.dtype = torch.bfloat16,
+    use_fused_finalize: bool = True,
+    moe_output: Optional[torch.Tensor] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    *,
+    quant_mode: str = "w4a4",
+    per_token_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
+
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :func:`cute_dsl_fused_moe` with ``quant_mode="w4a4"`` instead.
+
+    See :func:`cute_dsl_fused_moe` for the full parameter documentation; this
+    function forwards every argument unchanged.
+    """
+    warnings.warn(
+        "cute_dsl_fused_moe_nvfp4 is deprecated; use cute_dsl_fused_moe with "
+        "quant_mode='w4a4' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cute_dsl_fused_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        fc2_input_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        num_experts,
+        top_k,
+        num_local_experts,
+        local_expert_offset,
+        output_dtype,
+        use_fused_finalize,
+        moe_output,
+        aux_stream,
+        enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
+        quant_mode=quant_mode,
+        per_token_scale=per_token_scale,
+    )
+
+
+@supported_compute_capability([100, 103])
+@flashinfer_api(trace=cute_dsl_fused_moe_mxfp8_mxfp4_trace)
+def cute_dsl_fused_moe_mxfp8_mxfp4(
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    moe_output: Optional[torch.Tensor] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    tactic: Optional[Tuple[Any, ...]] = None,
+    enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+) -> torch.Tensor:
+    """Run fused MoE with MXFP8 activations and packed MXFP4 weights.
+
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :func:`cute_dsl_fused_moe` with ``quant_mode="w4a8"`` instead.
+
+    Unlike the NVFP4 entry point this interface has no ``fc2_input_scale``;
+    it is forwarded as ``None``. See :func:`cute_dsl_fused_moe` for the full
+    parameter documentation.
+    """
+    warnings.warn(
+        "cute_dsl_fused_moe_mxfp8_mxfp4 is deprecated; use cute_dsl_fused_moe "
+        "with quant_mode='w4a8' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cute_dsl_fused_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        None,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        num_experts,
+        top_k,
+        num_local_experts,
+        local_expert_offset,
+        torch.bfloat16,
+        True,
+        moe_output,
+        aux_stream,
+        enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        quant_mode="w4a8",
+        tactic=tactic,
+    )
+
+
+class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
+    """Production wrapper for the MXFP8 x MXFP4 fused-MoE pipeline.
+
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :class:`CuteDslMoEWrapper` with ``quant_mode="w4a8"`` instead.
+
+    Because the stream and event resources are reused, one wrapper instance is
+    not reentrant or safe for concurrent calls. The first ``run`` binds the
+    instance to that call's CUDA stream; create one wrapper per stream.
+    """
+
+    @supported_compute_capability([100, 103])
+    @flashinfer_api
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        max_num_tokens: Optional[int] = None,
+        num_local_experts: Optional[int] = None,
+        local_expert_offset: int = 0,
+        use_cuda_graph: bool = False,
+        device: str = "cuda",
+        enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    ) -> None:
+        """Initialize a reusable mixed-precision fused-MoE runner.
+
+        Warning
+        -------
+        This API will be deprecated in the future, please use
+        :class:`CuteDslMoEWrapper` with ``quant_mode="w4a8"`` instead.
+
+        ``max_num_tokens`` is accepted for backwards compatibility but
+        ignored. See :class:`CuteDslMoEWrapper` for the full parameter
+        documentation.
+        """
+        warnings.warn(
+            "CuteDslMxfp8Mxfp4MoEWrapper is deprecated; use CuteDslMoEWrapper "
+            "with quant_mode='w4a8' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            max_num_tokens=max_num_tokens,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_cuda_graph=use_cuda_graph,
+            device=device,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            quant_mode="w4a8",
+        )
+
+    @flashinfer_api(trace=cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace)
+    def run(
+        self,
+        x: torch.Tensor,
+        x_sf: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        w1_weight: torch.Tensor,
+        w1_weight_sf: torch.Tensor,
+        w1_alpha: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_sf: torch.Tensor,
+        w2_alpha: torch.Tensor,
+        tactic: Optional[Tuple[Any, ...]] = None,
+    ) -> torch.Tensor:
+        """Run the MXFP8 x MXFP4 fused-MoE forward pass.
+
+        Warning
+        -------
+        This API will be deprecated in the future, please use
+        :meth:`CuteDslMoEWrapper.run` with ``quant_mode="w4a8"`` instead.
+
+        This entry point has no ``fc2_input_scale``; it is forwarded as
+        ``None``. See :meth:`CuteDslMoEWrapper.run` for the full parameter
+        documentation.
+        """
+        return super().run(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            None,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            tactic,
+        )
+
+
 __all__ = [
-    "cute_dsl_fused_moe_nvfp4",
+    "cute_dsl_fused_moe",
     "CuteDslMoEWrapper",
+    "cute_dsl_fused_moe_nvfp4",
+    "cute_dsl_fused_moe_mxfp8_mxfp4",
+    "CuteDslMxfp8Mxfp4MoEWrapper",
 ]

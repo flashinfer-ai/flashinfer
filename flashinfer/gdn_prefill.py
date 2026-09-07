@@ -233,7 +233,10 @@ def chunk_gated_delta_rule(
         work tiles, leaving that row's final state nondeterministic. Uniqueness
         is a caller precondition (not checked at launch, to avoid a per-call
         host sync); the caller's slot allocator is expected to guarantee it.
-
+    _cp_chunk_len : int, optional
+        Internal context-parallel chunk-length override used for testing and
+        tuning. ``None`` lets the CP backend select the length automatically;
+        an explicit value must be a multiple of 64.
 
     Returns
     -------

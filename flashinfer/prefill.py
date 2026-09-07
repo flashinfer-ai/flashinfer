@@ -36,6 +36,7 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
 )
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
@@ -1510,29 +1511,72 @@ def _compute_page_mask_indptr(
     return mask_indptr
 
 
-def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
-    """Whether split-KV must be disabled because the KV cache is NVFP4.
+# Architectures on which the NVFP4 split-KV corruption was actually observed. Keep this as narrow
+# as the evidence: every target added here pays the gate on low-batch decode. Measured on SM90 at
+# batch 1, qo_len 1, head_dim 128, page_size 16, bf16: 3.98x at kv_len 8192, 8.14x at kv_len 32768.
+_NVFP4_SPLIT_KV_BROKEN_ARCHS = ((12, 0), (12, 1))
+
+
+def _nvfp4_kv_requires_disabled_split_kv(
+    kv_data_type: torch.dtype, device: torch.device
+) -> bool:
+    """Whether split-KV must be disabled because the KV cache is NVFP4 on an affected arch.
 
     This gate is an *empirical workaround*: with split-KV (flash-decoding)
     enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
     a short query attends a long KV range (``qo_len << kv_len``, i.e. decode
     and prefix-cache extend), while dense full-prefill was unaffected.
-    Disabling split-KV removes the corruption, and decode-throughput
-    measurements showed no cost from the gate.
+    Disabling split-KV removes the corruption.
 
     The root cause has not been confirmed. The FP8 scale-factor blocks
     themselves cannot be the mechanism: NVFP4 scales group 16 consecutive
     *head-dim* elements of a single token, whereas split-KV partitions the
     *token* axis, so a split boundary never slices a scale block. The current
     hypothesis (unconfirmed) is that the small per-split KV chunks interact
-    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path. Until
-    the failure is root-caused and fixed, force split-KV off for NVFP4 KV.
-    FP8 and 16-bit KV caches are unaffected and keep split-KV.
+    badly with the ``NUM_MMA_KV`` tile floor of the 1-byte-KV FA2 path.
+
+    The corruption was only ever reported on SM120/121, alongside the
+    asymmetric VO-split NVFP4 paged prefill path added for those targets, so
+    the gate is scoped to them. Pre-SM100 has no native FP4 conversion, so
+    every such target runs the same generic 1-byte-KV FA2 path; on that path
+    split-KV yields output indistinguishable from the gated result. Review
+    reproduced that on SM90 as well, over symmetric ``head_dim`` 128, the
+    asymmetric 512/256 path and a needle retrieval swept across split
+    boundaries, with the gate-on/gate-off difference staying at output-dtype
+    rounding scale. FP8 and 16-bit KV caches were never gated and keep split-KV
+    everywhere.
     """
-    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
-        return True
-    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
-    return native_fp4 is not None and kv_data_type == native_fp4
+    if not _is_nvfp4_kv_dtype(kv_data_type):
+        return False
+    return get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS
+
+
+def _build_block_tables_from_paged_kv_indices(
+    paged_kv_indptr_host: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert flat paged-KV indices to a shared ``[B, M]`` block table.
+
+    This is the input format consumed by the existing backend and SM120 PRIMS.
+    K and V share every logical-to-physical page mapping.
+    """
+    blocks_per_seq = [
+        int(paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i])
+        for i in range(batch_size)
+    ]
+    max_num_blocks_per_seq = max(blocks_per_seq)
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device=device,
+    )
+    for i, num_blocks_needed in enumerate(blocks_per_seq):
+        start = int(paged_kv_indptr_host[i])
+        end = int(paged_kv_indptr_host[i + 1])
+        block_tables[i, :num_blocks_needed] = paged_kv_indices[start:end]
+    return block_tables
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -1707,11 +1751,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
-            or ``cute-dsl``.
+            ``cute-dsl``/``cute-dsl-prims``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
+            CUTLASS primitives.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1753,7 +1799,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
             )
 
-        if jit_args is not None and backend != "cute-dsl":
+        if (
+            jit_args is not None
+            and backend != "cute-dsl"
+            and backend != "cute-dsl-prims"
+        ):
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
@@ -1844,6 +1894,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._prims_backend = None
+        if backend == "cute-dsl-prims":
+            try:
+                from .attention.cute_dsl.sm120_fmha import (
+                    SM120PrimsBatchPrefillBackend,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "backend='cute-dsl-prims' requires the SM120 CuTe DSL stack "
+                    "providing cutlass.experimental"
+                ) from exc
+            self._prims_backend = SM120PrimsBatchPrefillBackend(self.device)
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2017,6 +2079,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if self._backend == "cute-dsl-prims":
+            return (0, 0)
+
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2189,6 +2254,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            For the ``cudnn`` backend this is interpreted in **element units**
+            (``cumsum(seq_lens_q) * num_qo_heads * head_dim_qk``), not token units.
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
@@ -2534,6 +2601,52 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_last_page_len=self._paged_kv_last_page_len_buf,
                 kv_layout=self._kv_layout,
             )
+        elif self._backend == "cute-dsl-prims":
+            from .attention.cute_dsl.sm120_fmha import (
+                _validate_sm120_prims_plan_options,
+            )
+
+            _validate_sm120_prims_plan_options(
+                kv_layout=self._kv_layout,
+                required_kv_layout="HND",
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                max_item_len_ptr=max_item_len_ptr,
+                max_sequence_kv=max_sequence_kv,
+                fixed_split_size=fixed_split_size,
+            )
+            if block_tables is None:
+                block_tables = _build_block_tables_from_paged_kv_indices(
+                    paged_kv_indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                )
+            self._block_tables = block_tables
+            assert self._prims_backend is not None
+            self._prims_backend.plan_paged(
+                qo_indptr=self._qo_indptr_buf,
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv=self._kv_lens_buffer[:batch_size],
+                seqlens_kv_host=kv_lens_arr_host,
+                block_tables=self._block_tables,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                o_dtype=o_data_type,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -2588,26 +2701,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "Use window_left=-1 for dense bidirectional attention."
                 )
             if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int,
-                    device=self.device,
+                self._block_tables = _build_block_tables_from_paged_kv_indices(
+                    paged_kv_indptr_host,
+                    paged_kv_indices,
+                    batch_size,
+                    self.device,
                 )
-                block_id = paged_kv_indptr_host[0]
-                for i in range(batch_size):
-                    num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
-                    )
-                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
-                        block_id : block_id + num_blocks_needed
-                    ]
-                    block_id += num_blocks_needed
 
         if self._cached_module is not None:
             args = [
@@ -2631,7 +2730,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type
+                    kv_data_type, self.device
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
                     # when qo_len << kv_len (decode / prefix-cache extend); see
@@ -2785,7 +2884,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to return the logsumexp of attention output
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+            Only effective on backends and devices that support PDL.
         window_left : Optional[int]
             Per-call override for the left (inclusive) sliding-window size.  When
             ``None``, the value supplied to :meth:`plan` is used.  Pass ``-1`` to
@@ -2903,6 +3002,53 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
+            )
+        elif self._backend == "cute-dsl-prims":
+            if args:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not accept custom run arguments"
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support attention sinks"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
+                )
+            if skip_softmax_threshold_scale_factor is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    "skip_softmax_threshold_scale_factor"
+                )
+            if window_left is not None and window_left != self._window_left:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support a run-time "
+                    "window_left override"
+                )
+            if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+                raise ValueError(
+                    "backend='cute-dsl-prims' requires HND K/V pools with shape "
+                    "[num_pages, num_kv_heads, page_size, head_dim]"
+                )
+            if out is None:
+                out = torch.empty(
+                    q.shape,
+                    dtype=self._cached_o_data_type,
+                    device=q.device,
+                )
+            assert self._prims_backend is not None
+            return self._prims_backend.run_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                return_lse=return_lse,
+                lse=lse,
+                enable_pdl=enable_pdl,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
         check_trtllm_gen_sm107_only_feature(
@@ -3022,6 +3168,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
+            # qo_indptr is element-unit (tokens * num_qo_heads * head_dim_qk). The O
+            # ragged offset is strided by head_dim_vo, so when head_dim_qk !=
+            # head_dim_vo the Q offset cannot be reused for O -- rescale it (only in
+            # that case, so the common head_dim_qk == head_dim_vo path is unchanged).
+            head_dim_qk = q.shape[-1]
+            head_dim_vo = out.shape[-1]
+            if head_dim_qk == head_dim_vo:
+                o_indptr = self._qo_indptr_buf
+            else:
+                o_indptr = self._qo_indptr_buf // head_dim_qk * head_dim_vo
+
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed
@@ -3039,7 +3196,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
                 batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_o=self._qo_indptr_buf,
+                batch_offsets_o=o_indptr,
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
@@ -3372,11 +3529,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
+            or ``cute-dsl``/``cute-dsl-prims``/``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
+            The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
+            opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3405,7 +3565,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
                 "under MaskMode.CUSTOM."
             )
-        if jit_args is not None and backend != "cute-dsl":
+        if (
+            jit_args is not None
+            and backend != "cute-dsl"
+            and backend != "cute-dsl-prims"
+        ):
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
@@ -3427,11 +3591,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._variant_owns_mask = variant_owns_mask
 
         self._cute_dsl_wrapper = None
+        self._prims_backend = None
         if backend == "cute-dsl":
             from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
 
             self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
+        elif backend == "cute-dsl-prims":
+            try:
+                from .attention.cute_dsl.sm120_fmha import (
+                    SM120PrimsBatchPrefillBackend,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "backend='cute-dsl-prims' requires the SM120 CuTe DSL stack "
+                    "providing cutlass.experimental"
+                ) from exc
+            self._prims_backend = SM120PrimsBatchPrefillBackend(
+                float_workspace_buffer.device
             )
 
         self._kv_layout = kv_layout
@@ -3544,6 +3722,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            For the ``cudnn`` backend the ``qo_indptr`` and ``kv_indptr`` are
+            interpreted in **element units** (``cumsum(seq_lens) * num_heads *
+            head_dim_qk``), not token units. The ``cudnn`` backend also requires
+            ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
         num_qo_heads : int
@@ -3774,7 +3956,43 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_seq_in_batch = int(kv_len_arr.max().item())
         max_qo_len = int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item())
 
-        if self._backend == "cute-dsl":
+        if self._backend == "cute-dsl-prims":
+            from .attention.cute_dsl.sm120_fmha import (
+                _validate_sm120_prims_plan_options,
+            )
+
+            _validate_sm120_prims_plan_options(
+                kv_layout=self._kv_layout,
+                required_kv_layout="NHD",
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                max_item_len_ptr=max_item_len_ptr,
+                max_sequence_kv=max_sequence_kv,
+                fixed_split_size=fixed_split_size,
+            )
+            assert self._prims_backend is not None
+            self._prims_backend.plan_ragged(
+                qo_indptr=self._qo_indptr_buf,
+                kv_indptr=self._kv_indptr_buf,
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                o_dtype=o_data_type,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
+        elif self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
                 raise NotImplementedError(
                     "cute-dsl backend does not support custom_mask"
@@ -3874,6 +4092,55 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     window_left=window_left,
                     variant=variant,
                 )
+        elif self._backend == "cutile":
+            # cuTile ragged prefill: no C++ module to build. Materialize the
+            # per-request length/offset arrays the kernel needs from
+            # qo_indptr/kv_indptr here (plan() may host-sync; run() must not).
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support custom_mask."
+                )
+            if pos_encoding_mode != "NONE":
+                raise NotImplementedError(
+                    "cuTile ragged prefill only supports pos_encoding_mode='NONE'. "
+                    "Apply RoPE to Q/K before calling the kernel."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support logits_soft_cap."
+                )
+            if window_left >= 0:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support sliding window."
+                )
+            # The kernel slices Q and KV with a single shared per-request offset,
+            # so it only supports qo_indptr == kv_indptr (equal-length prefill /
+            # self-attention, no cached prefix). Append/chunked prefill with
+            # kv_len != q_len must use another backend.
+            if not torch.equal(qo_indptr_host, kv_indptr_host):
+                raise NotImplementedError(
+                    "cuTile ragged prefill requires qo_indptr == kv_indptr "
+                    "(equal-length prefill). For append/chunked prefill with "
+                    "kv_len != q_len, use backend='fa2'."
+                )
+            seq_lens_q_host = (qo_indptr_host[1:] - qo_indptr_host[:-1]).to(torch.int32)
+            kv_len_arr_i32 = kv_len_arr.to(torch.int32)
+            self._cutile_num_batch = batch_size
+            self._cutile_seq_lens_q = seq_lens_q_host.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._cutile_seq_lens_kv = kv_len_arr_i32.to(
+                self.device, non_blocking=non_blocking
+            )
+            # Shared exclusive-prefix-sum offset (== qo_indptr[:-1] == kv_indptr[:-1]).
+            self._cutile_seq_offset = self._qo_indptr_buf[:-1].to(torch.int32)
+            self._cutile_max_seq_len = (
+                int(kv_len_arr_i32.max().item()) if batch_size > 0 else 0
+            )
+            # block_tables is accepted but unused by the ragged kernel.
+            self._cutile_block_tables = torch.zeros(
+                batch_size, 1, dtype=torch.int32, device=self.device
+            )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -3968,7 +4235,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
-        elif self._backend not in ("cudnn", "cute-dsl"):
+        elif self._backend not in (
+            "cudnn",
+            "cute-dsl",
+            "cute-dsl-prims",
+            "cutile",
+        ):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3991,7 +4263,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type
+                    kv_data_type, self.device
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
                     # when qo_len << kv_len (decode / prefix-cache extend); see
@@ -4120,7 +4392,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to return the logsumexp of attention output
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+            Only effective on backends and devices that support PDL.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -4221,7 +4493,38 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "fmha_v2":
+        if self._backend == "cute-dsl-prims":
+            assert self._prims_backend is not None
+            if args:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not accept custom run arguments"
+                )
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but "
+                    "backend='cute-dsl-prims' does not support attention sinks"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
+                )
+            if o_scale is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support o_scale"
+                )
+            self._prims_backend.run_ragged(
+                q,
+                k,
+                v,
+                out,
+                lse=lse if return_lse else None,
+                enable_pdl=enable_pdl,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return (out, lse) if return_lse else out
+        elif self._backend == "fmha_v2":
             if return_lse:
                 raise NotImplementedError(
                     "return_lse is not yet supported for backend='fmha_v2'. "
@@ -4360,6 +4663,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cudnn":
+            # cuDNN's ragged prefill graph has no kv_layout input and reads
+            # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
+            # loudly rather than silently addressing the wrong data.
+            if self._kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cuDNN ragged prefill backend requires kv_layout='NHD'"
+                )
             if self._seq_lens_q.dim() == 1:
                 batch_size = self._seq_lens_q.shape[0]
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
@@ -4393,6 +4703,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
 
             return (out, lse) if return_lse else out
+        elif self._backend == "cutile":
+            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support FP8 scale parameters."
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cuTile ragged prefill does not support NVFP4 KV scaling."
+                )
+            from .attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: PLC0415
+                prefill_attention_kv_ragged_cutile,
+            )
+
+            # k/v are ragged [total_kv, num_kv_heads, head_dim]. The kernel folds
+            # the softmax scale into k_scale (qk_scale = k_scale * INV_LOG_2),
+            # matching single_prefill_with_kv_cache's default.
+            out_ragged, lse_ragged = prefill_attention_kv_ragged_cutile(
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                actual_seq_lens_q=self._cutile_seq_lens_q,
+                actual_seq_lens_kv=self._cutile_seq_lens_kv,
+                actual_seq_offset=self._cutile_seq_offset,
+                block_tables=self._cutile_block_tables,
+                k_scale=sm_scale,
+                v_scale=1.0,
+                num_batch=self._cutile_num_batch,
+                max_seq_len=self._cutile_max_seq_len,
+                is_causal=self._causal,
+                outputs=out,
+                out_lse=lse if return_lse else None,
+            )
+            return (out_ragged, lse_ragged) if return_lse else out_ragged
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
         # The JIT module will handle FP8 natively
@@ -4888,6 +5231,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    skip_all_rows_active_check: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -4977,6 +5321,10 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
+    skip_all_rows_active_check : bool
+        Skip empty-row detection when the caller guarantees that every row has
+        positive query and KV lengths. Mutually exclusive with CPU length
+        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5145,7 +5493,13 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if skip_all_rows_active_check:
+            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+                raise ValueError(
+                    "skip_all_rows_active_check cannot be combined with CPU length "
+                    "mirrors"
+                )
+        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"

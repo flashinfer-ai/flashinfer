@@ -36,6 +36,7 @@ from flashinfer.quantization.fp8_quantization import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
+from tests.moe.utils import assert_trtllm_packed_call_contract
 
 
 def _build_per_tensor_fp8_runner(config):
@@ -297,7 +298,9 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
-    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    inputs = runner.pack_inputs(pack, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
+    direct = runner.forward(inputs, tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
 
@@ -506,7 +509,7 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     runner = layer.runners[0]
     inputs = runner.pack_inputs(act_pack, weights)
     routing_replay = torch.empty_like(expected_ids, dtype=torch.int16)
-    runner._static_kwargs["routing_replay_out"] = routing_replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=routing_replay)
     actual = runner.forward(inputs, tactic=-1)
     torch.testing.assert_close(
         torch.sort(routing_replay.to(torch.int32), dim=-1).values,
@@ -917,6 +920,7 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
     runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
 
@@ -1038,7 +1042,7 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
     )
-    runner._static_kwargs["routing_replay_out"] = replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=replay)
     runner.forward(inputs)
     torch.testing.assert_close(
         replay.to(torch.int32).sort(dim=-1).values,

@@ -2298,6 +2298,17 @@ def test_single_prefill_torch_compile_cuda_graph():
     env = os.environ.copy()
     env.setdefault("USER", "ci")
 
+    # Preflight in-process so a module missing from the jit-cache skips via
+    # conftest's MissingJITCacheError handler instead of failing in the
+    # subprocess; also keeps JIT compilation out of the subprocess timeout.
+    S, QH, KH, D = 128, 8, 8, 128
+    flashinfer.single_prefill_with_kv_cache(
+        torch.randn(S, QH, D, device="cuda", dtype=torch.float16),
+        torch.randn(S, KH, D, device="cuda", dtype=torch.float16),
+        torch.randn(S, KH, D, device="cuda", dtype=torch.float16),
+        causal=True,
+    )
+
     # The parent pytest process has already run thousands of prefill cases in this
     # file. Release its cached blocks before the subprocess initializes
     # torch.compile/cudagraph state on memory-constrained A10G runners.

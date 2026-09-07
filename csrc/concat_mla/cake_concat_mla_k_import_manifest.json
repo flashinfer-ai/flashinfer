@@ -1,0 +1,180 @@
+{
+  "artifact_kind": "source_only",
+  "build_contract": {
+    "architecture_source": "modules[].arch",
+    "binary_payloads": false,
+    "target_infrastructure": {
+      "binding_runtime": "flashinfer_tvm_ffi_utils",
+      "headers_owned_by_target": true,
+      "required_headers": [
+        "tvm_ffi_utils.h"
+      ]
+    },
+    "translation_unit_model": "separate_device_and_binding"
+  },
+  "contract": {
+    "backend": "cake",
+    "correctness": "byte_exact_copy_and_broadcast",
+    "dtypes": [
+      "bfloat16",
+      "float16",
+      "float8_e4m3fn",
+      "float8_e5m2"
+    ],
+    "fixed_shape": {
+      "nope_dim": 128,
+      "num_heads": 128,
+      "output_dim": 192,
+      "rope_dim": 64
+    },
+    "input_layouts": [
+      "contiguous",
+      "nope_strided",
+      "both_strided"
+    ],
+    "mutation": "caller_owned_k_in_place",
+    "operator": "concat_mla_k",
+    "output_layouts": [
+      "caller_owned_uninitialized",
+      "caller_owned_leading_strided_uninitialized"
+    ],
+    "public_api": "flashinfer.concat_ops.concat_mla_k",
+    "return_value": null,
+    "signature": "concat_mla_k(k, k_nope, k_rope) -> None",
+    "target": "sm_103a"
+  },
+  "files": [
+    {
+      "bytes": 2946,
+      "kind": "device_source",
+      "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu",
+      "sha256": "146ef3b028c818fd1243256681de9eca3bf69ee245fd32ce6727fabd250ad790"
+    },
+    {
+      "bytes": 7058,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
+      "sha256": "9fc547121309a0c0c364e1084cb51eefccea013900c9b3534ab38db75420c9e5"
+    }
+  ],
+  "library": "flashinfer",
+  "modules": [
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "buffer",
+          "k_nope"
+        ],
+        [
+          "buffer",
+          "k_rope"
+        ],
+        [
+          "parameter",
+          "element_bytes"
+        ],
+        [
+          "parameter",
+          "k_stride_0_bytes"
+        ],
+        [
+          "parameter",
+          "k_stride_1_bytes"
+        ],
+        [
+          "parameter",
+          "k_nope_stride_0_bytes"
+        ],
+        [
+          "parameter",
+          "k_nope_stride_1_bytes"
+        ],
+        [
+          "parameter",
+          "k_rope_stride_0_bytes"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "17c4ced2842a6275d4c90de0c381500304c5208df74f19f5b7f557b1e966eb64",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 2946,
+          "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu",
+          "sha256": "146ef3b028c818fd1243256681de9eca3bf69ee245fd32ce6727fabd250ad790"
+        },
+        {
+          "bytes": 7058,
+          "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
+          "sha256": "9fc547121309a0c0c364e1084cb51eefccea013900c9b3534ab38db75420c9e5"
+        }
+      ],
+      "closure_sha256": "f21bee1de92e6270c04908885c41810c95821de3308a08b96e959cf3ab6eecff",
+      "compile_flags": [
+        "-gencode=arch=compute_103a,code=sm_103a",
+        "-DFLASHINFER_ENABLE_FP8_E8M0",
+        "-DFLASHINFER_ENABLE_FP4_E2M1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_concat_mla_k_vector_copy",
+      "launch": {
+        "block": [
+          512,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 0,
+        "use_pdl": false
+      },
+      "module_ident": "cake_concat_mla_k_vector_copy_sm_103a_main",
+      "name": "cake_concat_mla_k_vector_copy",
+      "role": "main",
+      "route": {
+        "backend": "cake",
+        "nope_dim": 128,
+        "num_heads": 128,
+        "rope_dim": 64,
+        "target": "sm_103a",
+        "threads": 512,
+        "tokens": "runtime_grid_x"
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu"
+      }
+    }
+  ],
+  "name": "cake_concat_mla_k",
+  "producer": "cake",
+  "producer_revision": "932d3e0d3d5b6f044c40cf6321045801d0543a4e",
+  "schema": "cake.library_export.v1"
+}

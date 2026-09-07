@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 
 import numpy as np
 import torch
@@ -281,6 +282,8 @@ def run_attention_test(args):
         return testBatchPrefillWithRaggedKVCacheWrapper(args)
     elif args.routine == "BatchMLAPagedAttentionWrapper":
         return testBatchMLAPagedAttentionWrapper(args)
+    elif args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
+        return testTrtllmBatchDecodeSparseMlaDsv4(args)
     else:
         print(f"[ERROR] Unsupported routine: {args.routine}")
         return []
@@ -302,7 +305,7 @@ def parse_attention_args(line, parser):
         type=str,
         required=False,
         nargs="+",
-        default=["fa2"],
+        default=None,
         choices=[
             "fa2",
             "fa2_tc",
@@ -318,8 +321,9 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
+            "cute-dsl-prims",
         ],
-        help="Kernel backends to test. Default: fa2. prims-ts selects the experimental task-scheduled Blackwell backend for all attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -458,8 +462,55 @@ def parse_attention_args(line, parser):
             "preserving existing behavior and perf baselines."
         ),
     )
+    parser.add_argument(
+        "--swa_topk",
+        type=int,
+        default=128,
+        help="DSV4 sparse MLA only: fixed sliding-window segment width.",
+    )
+    parser.add_argument(
+        "--compressed_topk",
+        type=int,
+        default=1920,
+        help="DSV4 sparse MLA only: maximum selected compressed-cache rows per query.",
+    )
+    parser.add_argument(
+        "--compressed_kv_len",
+        type=int,
+        default=None,
+        help=(
+            "DSV4 sparse MLA only: logical compressed-cache rows per request "
+            "(default: ceil(s_kv / 4))."
+        ),
+    )
+    parser.add_argument(
+        "--compressed_page_size",
+        type=int,
+        default=64,
+        help="DSV4 sparse MLA only: compressed-cache page size.",
+    )
+    parser.add_argument(
+        "--kv_layout",
+        choices=["HND", "NHD"],
+        default="HND",
+        help="DSV4 sparse MLA only: layout of both KV-cache pools.",
+    )
 
     args = parser.parse_args(line)
+
+    if args.backends is None:
+        args.backends = (
+            ["trtllm-gen"]
+            if args.routine == "trtllm_batch_decode_sparse_mla_dsv4"
+            else ["fa2"]
+        )
+
+    if args.routine == "trtllm_batch_decode_sparse_mla_dsv4" and args.page_size == 0:
+        args.page_size = 256
+    if args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
+        # The sparse tables encode causal visibility; there is no non-causal
+        # mode in this DSV4 generation-form API.
+        args.causal = True
 
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
@@ -1721,7 +1772,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = backend_wrappers_prims_ts
             resolved_backends[backend] = backend
             continue
-        if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa3", "auto", "trtllm-gen", "cute-dsl-prims"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
@@ -1825,6 +1876,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 out=out,
+            )
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                kv_cache,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -2558,7 +2617,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in [
+            "cutlass",
+            "fa2",
+            "fa3",
+            "trtllm-gen",
+            "cute-dsl-prims",
+        ]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -2699,6 +2764,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
@@ -3314,6 +3388,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
+    # The shared sampler retains singleton dimensions for other attention
+    # routines, but MLA CSR metadata requires one KV length per request.
+    mla_kv_len_arr = actual_seq_lens_kv.flatten()
     backend_wrappers = {}
     for backend in backends:
         if backend in ["fa2", "fa3", "cutlass"]:
@@ -3323,7 +3400,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
+                kv_len_arr=mla_kv_len_arr,
                 backend=backend,
             )
             if backend != "cutlass":
@@ -3331,7 +3408,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                     qo_indptr=qo_indptr,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
+                    kv_len_arr=mla_kv_len_arr,
                     num_heads=num_qo_heads,
                     head_dim_ckv=head_dim_ckv,
                     head_dim_kpe=head_dim_kpe,
@@ -3413,14 +3490,14 @@ def testBatchMLAPagedAttentionWrapper(args):
         """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # FA2/FA3 use their planned CSR metadata and do not accept the
+            # CUTLASS-only page_table argument. trtllm-native/auto/cute-dsl
+            # branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
                 ckv_cache,
                 kpe_cache,
-                page_table=block_tables,
                 return_lse=False,
             )
         elif backend == "cutlass":
@@ -3778,3 +3855,429 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+_DSV4_HEAD_DIM = 512
+_DSV4_SWA_TOPK = 128
+_DSV4_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _dsv4_cache_to_flat_rows(cache, kv_layout):
+    if kv_layout == "HND":
+        cache = cache.transpose(1, 2)
+    return cache.reshape(-1, cache.shape[-1])
+
+
+def _dsv4_coprime_strides(lengths):
+    """Choose deterministic, non-unit strides for sparse-index permutations."""
+    strides = []
+    for length in lengths.to("cpu").tolist():
+        if length <= 1:
+            strides.append(1)
+            continue
+        candidate = max(1, length // 2 + 1)
+        if candidate >= length:
+            candidate = 1
+        while math.gcd(candidate, length) != 1:
+            candidate += 1
+            if candidate >= length:
+                candidate = 1
+        strides.append(candidate)
+    return torch.tensor(strides, dtype=torch.int64, device=lengths.device)
+
+
+def _dsv4_make_sparse_indices(
+    *,
+    batch_size,
+    s_qo,
+    s_kv,
+    swa_topk,
+    swa_page_size,
+    compressed_topk,
+    compressed_kv_len,
+    compressed_page_size,
+    device,
+):
+    """Build causal SWA rows plus causal compressed-cache selections."""
+    query_positions = torch.arange(s_kv - s_qo, s_kv, dtype=torch.int64, device=device)
+
+    swa_valid_lens = torch.minimum(
+        query_positions + 1,
+        torch.tensor(swa_topk, dtype=torch.int64, device=device),
+    )
+    swa_columns = torch.arange(swa_topk, dtype=torch.int64, device=device)
+    swa_starts = query_positions - swa_valid_lens + 1
+    swa_local = swa_starts[:, None] + swa_columns[None, :]
+    swa_local = torch.where(
+        swa_columns[None, :] < swa_valid_lens[:, None], swa_local, -1
+    )
+
+    # DSV4's compressed pool stores one row per four raw KV tokens. The active
+    # top-k grows causally during a full-prompt prefill and saturates at the
+    # configured maximum.
+    compressed_available = torch.minimum(
+        torch.div(query_positions + 4, 4, rounding_mode="floor"),
+        torch.tensor(compressed_kv_len, dtype=torch.int64, device=device),
+    ).clamp_min(1)
+    compressed_active_lens = torch.minimum(
+        compressed_available,
+        torch.tensor(compressed_topk, dtype=torch.int64, device=device),
+    )
+    compressed_columns = torch.arange(compressed_topk, dtype=torch.int64, device=device)
+    compressed_strides = _dsv4_coprime_strides(compressed_available)
+    compressed_local = (
+        compressed_columns[None, :] * compressed_strides[:, None]
+        + query_positions[:, None] * 29
+    ) % compressed_available[:, None]
+    compressed_local = torch.where(
+        compressed_columns[None, :] < compressed_active_lens[:, None],
+        compressed_local,
+        -1,
+    )
+
+    swa_rows_per_request = math.ceil(s_kv / swa_page_size) * swa_page_size
+    compressed_rows_per_request = (
+        math.ceil(compressed_kv_len / compressed_page_size) * compressed_page_size
+    )
+    swa_bases = (
+        torch.arange(batch_size, dtype=torch.int64, device=device)
+        * swa_rows_per_request
+    )
+    compressed_bases = (
+        torch.arange(batch_size, dtype=torch.int64, device=device)
+        * compressed_rows_per_request
+    )
+    swa_indices = torch.where(
+        swa_local[None, :, :] >= 0,
+        swa_local[None, :, :] + swa_bases[:, None, None],
+        -1,
+    )
+    compressed_indices = torch.where(
+        compressed_local[None, :, :] >= 0,
+        compressed_local[None, :, :] + compressed_bases[:, None, None],
+        -1,
+    )
+    sparse_indices = torch.cat((swa_indices, compressed_indices), dim=-1)
+    sparse_indices = sparse_indices.reshape(
+        batch_size * s_qo, swa_topk + compressed_topk
+    ).to(torch.int32)
+
+    compressed_active_lens = compressed_active_lens.repeat(batch_size)
+    sparse_topk_lens = (compressed_active_lens + swa_topk).to(torch.int32)
+    active_kv_lens = (swa_valid_lens + compressed_active_lens[:s_qo]).repeat(batch_size)
+    return sparse_indices.contiguous(), sparse_topk_lens.contiguous(), active_kv_lens
+
+
+@torch.inference_mode()
+def _validate_dsv4_sparse_mla_samples(
+    *,
+    query,
+    swa_kv_cache,
+    compressed_kv_cache,
+    sparse_indices,
+    sparse_topk_lens,
+    output,
+    swa_topk,
+    bmm1_scale,
+    bmm2_scale,
+    kv_layout,
+    sample_limit=8,
+):
+    """Check sampled query rows against an independent FP32 attention oracle."""
+    if not torch.isfinite(output.float()).all():
+        raise AssertionError("DSV4 sparse MLA output contains nonfinite values")
+
+    total_q = query.shape[0]
+    sample_rows = sorted(
+        {
+            0,
+            total_q - 1,
+            total_q // 4,
+            total_q // 2,
+            (3 * total_q) // 4,
+        }
+    )[:sample_limit]
+    swa_rows = _dsv4_cache_to_flat_rows(swa_kv_cache, kv_layout)
+    compressed_rows = _dsv4_cache_to_flat_rows(compressed_kv_cache, kv_layout)
+    scale_qk = float(bmm1_scale.item()) if torch.is_tensor(bmm1_scale) else bmm1_scale
+    scale_out = float(bmm2_scale.item()) if torch.is_tensor(bmm2_scale) else bmm2_scale
+    max_abs_error = 0.0
+
+    for query_row in sample_rows:
+        active_len = int(sparse_topk_lens[query_row].item())
+        row_indices = sparse_indices[query_row]
+        swa_indices = row_indices[:swa_topk]
+        swa_indices = swa_indices[swa_indices >= 0].to(torch.int64)
+        compressed_len = max(0, active_len - swa_topk)
+        compressed_indices = row_indices[swa_topk : swa_topk + compressed_len].to(
+            torch.int64
+        )
+        selected_kv = torch.cat(
+            (
+                swa_rows.index_select(0, swa_indices),
+                compressed_rows.index_select(0, compressed_indices),
+            ),
+            dim=0,
+        ).float()
+        scores = torch.matmul(query[query_row].float(), selected_kv.T) * scale_qk
+        expected = torch.matmul(torch.softmax(scores, dim=-1), selected_kv) * scale_out
+        actual = output[query_row].float()
+        max_abs_error = max(
+            max_abs_error, float((actual - expected).abs().max().item())
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    return len(sample_rows), max_abs_error
+
+
+def testTrtllmBatchDecodeSparseMlaDsv4(args):
+    """Benchmark the public DSV4 sparse-MLA API on SM100/SM103."""
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmBatchDecodeSparseMlaDsv4")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            "[INFO] To reproduce this test case, run the following command: "
+            f"{args.repro_command}"
+        )
+
+    backends = filter_backends_by_compute_capability(
+        list(args.backends), args.routine, device
+    )
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+    if args.random_actual_seq_len:
+        raise ValueError(
+            "trtllm_batch_decode_sparse_mla_dsv4 does not support "
+            "--random_actual_seq_len"
+        )
+    if args.batch_size <= 0 or args.s_qo <= 0 or args.s_kv <= 0:
+        raise ValueError("batch_size, s_qo, and s_kv must be positive")
+    if args.s_qo > args.s_kv:
+        raise ValueError("DSV4 sparse MLA requires s_qo <= s_kv")
+    if args.num_qo_heads not in (8, 16, 32, 64, 128):
+        raise ValueError("DSV4 sparse MLA num_qo_heads must be one of 8,16,32,64,128")
+    if args.num_kv_heads != 1:
+        raise ValueError("DSV4 sparse MLA requires num_kv_heads=1")
+    if args.head_dim_qk != _DSV4_HEAD_DIM:
+        raise ValueError("DSV4 sparse MLA requires head_dim_qk=512")
+    head_dim_vo = args.head_dim_qk if args.head_dim_vo is None else args.head_dim_vo
+    if head_dim_vo != _DSV4_HEAD_DIM:
+        raise ValueError("DSV4 sparse MLA requires head_dim_vo=512")
+    if args.swa_topk != _DSV4_SWA_TOPK:
+        raise ValueError("DSV4 sparse MLA requires swa_topk=128")
+    if args.page_size <= 0 or args.compressed_page_size <= 0:
+        raise ValueError("page sizes must be positive")
+    compressed_kv_len = (
+        math.ceil(args.s_kv / 4)
+        if args.compressed_kv_len is None
+        else args.compressed_kv_len
+    )
+    if args.compressed_topk <= 0 or compressed_kv_len < args.compressed_topk:
+        raise ValueError("compressed_kv_len must be >= compressed_topk > 0")
+
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if q_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("DSV4 sparse MLA Q supports bfloat16 or fp8_e4m3")
+    if kv_dtype != q_dtype:
+        raise ValueError("DSV4 sparse MLA requires matching Q and KV dtypes")
+    if args.out_dtype not in (None, "bfloat16"):
+        raise ValueError("DSV4 sparse MLA output dtype is bfloat16")
+
+    batch_size = args.batch_size
+    total_q = batch_size * args.s_qo
+    query = (
+        torch.randn(
+            total_q,
+            args.num_qo_heads,
+            _DSV4_HEAD_DIM,
+            dtype=torch.float32,
+            device=device,
+        )
+        .mul_(0.05)
+        .clamp_(-1.0, 1.0)
+        .to(q_dtype)
+    )
+
+    def make_cache(logical_len, page_size):
+        pages_per_request = math.ceil(logical_len / page_size)
+        cache = (
+            torch.randn(
+                batch_size * pages_per_request,
+                page_size,
+                1,
+                _DSV4_HEAD_DIM,
+                dtype=torch.float32,
+                device=device,
+            )
+            .mul_(0.05)
+            .clamp_(-1.0, 1.0)
+            .to(kv_dtype)
+        )
+        if args.kv_layout == "HND":
+            cache = cache.transpose(1, 2).contiguous()
+        return cache
+
+    swa_kv_cache = make_cache(args.s_kv, args.page_size)
+    compressed_kv_cache = make_cache(compressed_kv_len, args.compressed_page_size)
+    sparse_indices, sparse_topk_lens, active_kv_lens = _dsv4_make_sparse_indices(
+        batch_size=batch_size,
+        s_qo=args.s_qo,
+        s_kv=args.s_kv,
+        swa_topk=args.swa_topk,
+        swa_page_size=args.page_size,
+        compressed_topk=args.compressed_topk,
+        compressed_kv_len=compressed_kv_len,
+        compressed_page_size=args.compressed_page_size,
+        device=device,
+    )
+    seq_lens = torch.full((batch_size,), args.s_kv, dtype=torch.int32, device=device)
+    cum_seq_lens_q = torch.arange(
+        0,
+        (batch_size + 1) * args.s_qo,
+        args.s_qo,
+        dtype=torch.int32,
+        device=device,
+    )
+    workspace = torch.empty(_DSV4_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    output = torch.empty(
+        total_q,
+        args.num_qo_heads,
+        _DSV4_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    qk_scale_value = _DSV4_HEAD_DIM**-0.55
+    bmm1_scale = (
+        torch.tensor([qk_scale_value], dtype=torch.float32, device=device)
+        if q_dtype == torch.float8_e4m3fn
+        else qk_scale_value
+    )
+    bmm2_scale = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if q_dtype == torch.float8_e4m3fn
+        else 1.0
+    )
+
+    def run_backend(
+        query_arg,
+        swa_cache_arg,
+        compressed_cache_arg,
+        sparse_indices_arg,
+        sparse_topk_lens_arg,
+        seq_lens_arg,
+        cum_seq_lens_q_arg,
+        output_arg,
+    ):
+        return flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=query_arg,
+            swa_kv_cache=swa_cache_arg,
+            workspace_buffer=workspace,
+            sparse_indices=sparse_indices_arg,
+            compressed_kv_cache=compressed_cache_arg,
+            sparse_topk_lens=sparse_topk_lens_arg,
+            seq_lens=seq_lens_arg,
+            out=output_arg,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            kv_layout=args.kv_layout,
+            cum_seq_lens_q=cum_seq_lens_q_arg,
+            max_q_len=args.s_qo,
+            enable_pdl=args.enable_pdl,
+            backend="trtllm-gen",
+        )
+
+    runtime_args = (
+        query,
+        swa_kv_cache,
+        compressed_kv_cache,
+        sparse_indices,
+        sparse_topk_lens,
+        seq_lens,
+        cum_seq_lens_q,
+        output,
+    )
+    if args.refcheck:
+        run_backend(*runtime_args)
+        try:
+            sample_count, max_abs_error = _validate_dsv4_sparse_mla_samples(
+                query=query,
+                swa_kv_cache=swa_kv_cache,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_indices=sparse_indices,
+                sparse_topk_lens=sparse_topk_lens,
+                output=output,
+                swa_topk=args.swa_topk,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                kv_layout=args.kv_layout,
+            )
+            if args.verbose >= 1:
+                print(
+                    f"[INFO] DSV4 sampled FP32 reference passed: {sample_count} "
+                    f"query rows, max_abs_error={max_abs_error:.6g}"
+                )
+        except AssertionError as error:
+            print(f"[ERROR] DSV4 sampled FP32 reference mismatch: {error}")
+            if not args.allow_output_mismatch:
+                raise
+
+    times = bench_gpu_time(
+        fn=run_backend,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=runtime_args,
+    )
+    median_time = float(np.median(times))
+    std_time = float(np.std(times))
+    active_pairs = int(active_kv_lens.sum().item())
+    flops = 4 * active_pairs * args.num_qo_heads * _DSV4_HEAD_DIM
+    logical_bytes = (
+        query.numel() * query.element_size()
+        + active_pairs * _DSV4_HEAD_DIM * torch.empty((), dtype=kv_dtype).element_size()
+        + output.numel() * output.element_size()
+    )
+    tflops = flops / (median_time * 1e9)
+    tb_per_sec = logical_bytes / (median_time * 1e9)
+    print_perf_metrics("trtllm-gen", median_time, std_time, tflops, tb_per_sec)
+
+    result = defaultdict(str)
+    result.update(
+        {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "backend": "trtllm-gen",
+            "resolved_backend": "trtllm-gen",
+            "page_size": args.page_size,
+            "batch_size": batch_size,
+            "s_qo": args.s_qo,
+            "s_kv": args.s_kv,
+            "num_qo_heads": args.num_qo_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "head_dim_qk": _DSV4_HEAD_DIM,
+            "head_dim_vo": _DSV4_HEAD_DIM,
+            "causal": True,
+            "q_dtype": args.q_dtype,
+            "kv_dtype": args.kv_dtype,
+            "out_dtype": "bfloat16",
+            "avg_actual_seq_len": args.s_kv,
+            "random_actual_seq_len": False,
+            "swa_topk": args.swa_topk,
+            "compressed_topk": args.compressed_topk,
+            "compressed_kv_len": compressed_kv_len,
+            "compressed_page_size": args.compressed_page_size,
+            "kv_layout": args.kv_layout,
+            "case_tag": args.case_tag,
+        }
+    )
+    return [result]

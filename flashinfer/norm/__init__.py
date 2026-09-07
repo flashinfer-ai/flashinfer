@@ -78,7 +78,7 @@ if not _USE_CUDA_NORM:
 def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
     """Whether the installed CuTe DSL can target this compute capability."""
     try:
-        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+        from ..cute_dsl.availability import is_cute_dsl_arch_supported
 
         return is_cute_dsl_arch_supported(major, minor)
     except Exception:

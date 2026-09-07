@@ -32,8 +32,8 @@ include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv
 tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
 
 # ── MOE_EP ──
-flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
-tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
+flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka
+tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
