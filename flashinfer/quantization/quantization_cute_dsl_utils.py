@@ -1957,6 +1957,49 @@ def process_nvfp4_block_bfloat(
 
 
 @cute.jit
+def process_nvfp4_block_bfloat_smooth(
+    row_tensor,
+    pre_quant_scale,
+    elem_base: Int32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Smooth and quantize one BF16 block without materializing ``x * scale``."""
+    from ..cute_dsl.fp4_common import (
+        bfloat2_mul,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+    )
+
+    ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+    scale_ptr0 = get_ptr_as_int64(pre_quant_scale, elem_base)
+    scale_ptr1 = get_ptr_as_int64(pre_quant_scale, elem_base + Int32(8))
+
+    h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+    h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+    s0, s1, s2, s3 = ld_global_v4_u32(scale_ptr0)
+    s4, s5, s6, s7 = ld_global_v4_u32(scale_ptr1)
+
+    return _quantize_nvfp4_from_h2x8_bfloat(
+        bfloat2_mul(h0, s0),
+        bfloat2_mul(h1, s1),
+        bfloat2_mul(h2, s2),
+        bfloat2_mul(h3, s3),
+        bfloat2_mul(h4, s4),
+        bfloat2_mul(h5, s5),
+        bfloat2_mul(h6, s6),
+        bfloat2_mul(h7, s7),
+        global_scale,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        row_amax,
+    )
+
+
+@cute.jit
 def process_nvfp4_silu_block_half(
     row_tensor,
     elem_base: Int32,
@@ -2299,6 +2342,7 @@ __all__ = [
     "bfloat2x8_to_e2m1x16_packed",
     "process_nvfp4_block_half",
     "process_nvfp4_block_bfloat",
+    "process_nvfp4_block_bfloat_smooth",
     "process_nvfp4_silu_block_half",
     "process_nvfp4_silu_block_bfloat",
     # High-level helper functions (NVFP4 - FP8 input)

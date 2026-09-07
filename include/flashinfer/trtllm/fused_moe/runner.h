@@ -310,8 +310,9 @@ struct MoERunnerArgs {
                                    // gemm(hidden_state, routing_weights)
   void* routing_bias = nullptr;    // [num_experts] in bfloat16 for now = mDtypeExpW
   void* hidden_states = nullptr;   // [num_tokens, hidden_size] in fp8 = mDtypeElt
-  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
-  // and [num_tokens, hidden_size/16] in float for e2m1
+  // [hidden_size/128, num_tokens] in float for e4m3 DS recipe,
+  // [num_tokens, hidden_size/16] in float for e2m1, and [num_tokens, 1]
+  // in float for FP8 per-token/per-channel.
   void* hidden_states_scale = nullptr;
 
   // Gemm input:
@@ -357,6 +358,10 @@ struct MoERunnerArgs {
   float* output1_scales_scalar = nullptr;
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
+
+  // Gated GEMM1 scales follow the shuffled, interleaved weight rows.
+  float* gemm1_per_channel_weight_scale = nullptr;  // [local_num_experts, M]
+  float* gemm2_per_channel_weight_scale = nullptr;  // [local_num_experts, hidden_size]
 
   // Output:
   void* output = nullptr;

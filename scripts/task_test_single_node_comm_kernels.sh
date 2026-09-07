@@ -28,6 +28,20 @@ python -c "import nvshmem.core" 2>/dev/null || pip install --no-deps nvshmem4py-
 
 # vllm ar
 pytest -s tests/comm/test_vllm_custom_allreduce.py
+# pcie ipc ar (intra-node PCIe without NVLink)
+# Every case here needs 2, 4 or 8 GPUs. With this script's default
+# CUDA_VISIBLE_DEVICES=0 they all skip and pytest still exits 0, which reads as
+# "passed" in a log. Say so loudly rather than letting a green run mean nothing.
+pcie_ipc_gpus=$(python3 -c 'import torch; print(torch.cuda.device_count())')
+if [ "$pcie_ipc_gpus" -lt 2 ]; then
+  echo "############################################################"
+  echo "# SKIPPING pcie ipc ar: $pcie_ipc_gpus GPU visible, needs >=2 (>=8 for full"
+  echo "# coverage). This is NOT a pass. Set CUDA_VISIBLE_DEVICES=0,1,...,7."
+  echo "############################################################"
+else
+  echo "pcie ipc ar: $pcie_ipc_gpus GPUs visible (8 needed for full coverage)"
+  pytest -s tests/comm/test_pcie_ipc_all_reduce.py
+fi
 # trtllm ar + fusion
 pytest -s tests/comm/test_trtllm_allreduce.py
 pytest -s tests/comm/test_trtllm_allreduce_fusion.py

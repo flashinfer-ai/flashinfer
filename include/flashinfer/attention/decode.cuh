@@ -101,11 +101,13 @@ __device__ __forceinline__ void compute_qk(
   }
 
   if constexpr (variant.use_softmax) {
-    float o_scale = math::ptx_exp2(m_prev - st.m);
+    // Per-row clamp: fully masked tiles (st.m == -inf) yield exp2(-inf) = 0, not NaN.
+    const float m_scaled = max(st.m, -cuda::std::numeric_limits<float>::max());
+    float o_scale = math::ptx_exp2(m_prev - m_scaled);
     st.d *= o_scale;
 #pragma unroll
     for (uint32_t j = 0; j < tile_size; ++j) {
-      s[j] = math::ptx_exp2(s[j] - st.m);
+      s[j] = math::ptx_exp2(s[j] - m_scaled);
       st.d += s[j];
     }
 #pragma unroll
@@ -864,11 +866,13 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     st.m = max(st.m, s[j]);
   }
 
-  float o_scale = math::ptx_exp2(m_prev - st.m);
+  // Per-row clamp: fully masked tiles (st.m == -inf) yield exp2(-inf) = 0, not NaN.
+  const float m_scaled = max(st.m, -cuda::std::numeric_limits<float>::max());
+  float o_scale = math::ptx_exp2(m_prev - m_scaled);
   st.d *= o_scale;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
-    s[j] = math::ptx_exp2(s[j] - st.m);
+    s[j] = math::ptx_exp2(s[j] - m_scaled);
     st.d += s[j];
   }
 #pragma unroll

@@ -39,9 +39,12 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.attention.prims_ts.block_sparse",
     "flashinfer.attention.prims_ts.decode",
     "flashinfer.attention.prims_ts.mla_decode",
+    "flashinfer.attn_scores.attn_scores",
+    "flashinfer.cake_vsa",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
+    "flashinfer.comm.pcie_ipc_ar",
     "flashinfer.concat_ops",
     "flashinfer.cudnn.decode",
     "flashinfer.cudnn.prefill",
@@ -53,13 +56,16 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.core",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
-    "flashinfer.fused_moe.cute_dsl.fused_moe_mxfp8_mxfp4",
+    "flashinfer.fused_moe.cute_dsl.sm90_fused_moe",
     "flashinfer.fused_moe.fused_routing_dsv3",
     "flashinfer.fused_moe.hash_topk",
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
+    "flashinfer.fused_moe.trtllm_gen_routing",
     "flashinfer.gdn_decode",
+    "flashinfer.gdn_kernels.experimental.gdn_fused_decode",
     "flashinfer.gdn_prefill",
+    "flashinfer.gated_act_mxfp8",
     "flashinfer.gemm.gemm_base",
     "flashinfer.gemm.gemm_bf16_fp4",
     "flashinfer.gemm.gemm_svdquant",
@@ -68,11 +74,14 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.kda",
     "flashinfer.kda_decode",
     "flashinfer.mamba.selective_state_update",
+    "flashinfer.mamba.ssd_combined",
     "flashinfer.mhc",
+    "flashinfer.mla._batch_mla._wrapper",
     "flashinfer.mla._core",
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",
     "flashinfer.msa_ops.sparse_prefill",
+    "flashinfer.msa_ops.sparse_topk_select",
     "flashinfer.norm",
     "flashinfer.nvfp4_attention_sm120",
     "flashinfer.page",
@@ -113,8 +122,14 @@ def collect_registered_trace_templates() -> list[TraceRegistryEntry]:
 
     from flashinfer.api_logging import _TRACE_REGISTRY
 
+    # Experimental APIs live in core modules, so filter them by the flag that
+    # @flashinfer_experimental_api sets on the registered function; they are
+    # exercised by the experimental lane, not the stable trace tests.
     entries = [
-        entry for entry in _TRACE_REGISTRY if entry[0].__module__ in available_modules
+        entry
+        for entry in _TRACE_REGISTRY
+        if entry[0].__module__ in available_modules
+        and not getattr(entry[0], "is_experimental", False)
     ]
     keys = [trace_registry_entry_key(entry) for entry in entries]
     if len(keys) != len(set(keys)):

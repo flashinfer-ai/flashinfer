@@ -431,11 +431,14 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                                    int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
                                    float const* SFB) {
   constexpr auto kGT = sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
-  using KT_M32 = sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M64 = sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M128 = sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 2, 1, 128, 128, kGT>;
+  using KT_M32 =
+      sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 4, 1, 128, 128, kGT, false>;
+  using KT_M64 =
+      sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 4, 1, 128, 128, kGT, false>;
+  using KT_M128 =
+      sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 3, 1, 128, 128, kGT, false>;
   using KT_SWAPAB_N8 =
-      sm120_blockscaling::SM120BlockScalingBuilder<128, 8, 128, 2, 128, 1, 128, kGT, true>;
+      sm120_blockscaling::SM120BlockScalingBuilder<128, 8, 128, 4, 128, 1, 128, kGT, true>;
 
   auto ptr_A = reinterpret_cast<typename KT_M128::ElementA const*>(A);
   auto ptr_B = reinterpret_cast<typename KT_M128::ElementB const*>(B);
@@ -473,11 +476,11 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                                          cudaStream_t stream, float const* SFA, float const* SFB,
                                          int tactic_tile_m, int tactic_tile_n) {
   constexpr auto kGT = sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
-  using KT_M32 = sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M64 = sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M128 = sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 2, 1, 128, 128, kGT>;
+  using KT_M32 = sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 4, 1, 128, 128, kGT>;
+  using KT_M64 = sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 4, 1, 128, 128, kGT>;
+  using KT_M128 = sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 3, 1, 128, 128, kGT>;
   using KT_SWAPAB =
-      sm120_blockscaling::SM120BlockScalingBuilder<128, 8, 128, 2, 128, 1, 128, kGT, true>;
+      sm120_blockscaling::SM120BlockScalingBuilder<128, 8, 128, 4, 128, 1, 128, kGT, true>;
 
   auto ptr_A = reinterpret_cast<typename KT_M64::ElementA const*>(A);
   auto ptr_B = reinterpret_cast<typename KT_M64::ElementB const*>(B);
