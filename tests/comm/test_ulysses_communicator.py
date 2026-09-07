@@ -8,11 +8,13 @@
 
 import contextlib
 import datetime
+import gc
 import importlib
 import multiprocessing as std_mp
 import os
 import queue as queue_mod
 import time
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -372,6 +374,31 @@ def test_pcie_p2p_wrapper_failure_poison_is_sticky(monkeypatch):
     assert calls == ["exchange"]
     assert comm._state == ulysses_mod._BROKEN
     assert comm._pcie_python_teardown_safe is False
+
+
+def test_del_warns_when_armed_and_not_closed():
+    gc.collect()  # collect mocks earlier tests left armed, before recording
+    comm = _make_mock_pcie_comm()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del comm
+        gc.collect()
+    leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    assert len(leaks) == 1 and "without close()" in str(leaks[0].message)
+
+
+def test_del_is_silent_when_closed_or_unarmed():
+    gc.collect()  # collect mocks earlier tests left armed, before recording
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    closed = _make_mock_pcie_comm()
+    closed._state = ulysses_mod._CLOSED
+    unarmed = _make_mock_pcie_comm()
+    unarmed._pcie_armed = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        del closed, unarmed
+        gc.collect()
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)]
 
 
 def test_pcie_unsafe_native_work_blocks_every_teardown_stage(monkeypatch):
