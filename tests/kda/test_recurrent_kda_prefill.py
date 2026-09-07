@@ -6738,6 +6738,193 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
     )
 
 
+def test_cute_dsl_cuda_graph_replay_updates_offsets_and_indexed_checkpoints(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[64, 131],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=4898,
+    )
+    initial_states = inputs["initial_state"].clone()
+
+    def eager_control(offsets, state_indices, checkpoint_starts, checkpoint_indices):
+        state_pool = torch.zeros(
+            (4, 12, 128, 128),
+            dtype=initial_states.dtype,
+            device=flash_kda_device,
+        )
+        state_pool[state_indices.long()] = initial_states
+        checkpoint_pool = torch.full(
+            (6, 12, 128, 128),
+            torch.nan,
+            dtype=initial_states.dtype,
+            device=flash_kda_device,
+        )
+        output, returned_state, returned_checkpoints = recurrent_kda(
+            **_strict_prefill_kwargs(
+                {
+                    **inputs,
+                    "cu_seqlens": offsets,
+                    "initial_state": state_pool,
+                }
+            ),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            ssm_state_indices=state_indices,
+            state_checkpoints=checkpoint_pool,
+            checkpoint_cu_starts=checkpoint_starts,
+            checkpoint_state_indices=checkpoint_indices,
+            checkpoint_every_n_tokens=64,
+            backend="cute-dsl",
+        )
+        assert returned_state is state_pool
+        assert returned_checkpoints is checkpoint_pool
+        return (
+            output.clone(),
+            state_pool[state_indices.long()].clone(),
+            checkpoint_pool[checkpoint_indices.long()].clone(),
+        )
+
+    offsets = inputs["cu_seqlens"]
+    state_indices = torch.tensor([0, 2], dtype=torch.int32, device=flash_kda_device)
+    checkpoint_starts = torch.tensor(
+        [0, 1, 3], dtype=torch.int64, device=flash_kda_device
+    )
+    checkpoint_indices = torch.tensor(
+        [5, 1, 4], dtype=torch.int32, device=flash_kda_device
+    )
+    expected = eager_control(
+        offsets, state_indices, checkpoint_starts, checkpoint_indices
+    )
+
+    state_pool = torch.zeros(
+        (4, 12, 128, 128),
+        dtype=initial_states.dtype,
+        device=flash_kda_device,
+    )
+    checkpoint_pool = torch.full(
+        (6, 12, 128, 128),
+        torch.nan,
+        dtype=initial_states.dtype,
+        device=flash_kda_device,
+    )
+    output = torch.empty_like(inputs["q"])
+    wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
+    wrapper.plan(offsets)
+    run_kwargs = {
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        "output": output,
+        "output_final_state": True,
+        "ssm_state_indices": state_indices,
+        "state_checkpoints": checkpoint_pool,
+        "checkpoint_cu_starts": checkpoint_starts,
+        "checkpoint_state_indices": checkpoint_indices,
+        "checkpoint_every_n_tokens": 64,
+    }
+    run_kwargs.pop("cu_seqlens")
+
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    with torch.cuda.stream(capture_stream):
+        state_pool[state_indices.long()] = initial_states
+        wrapper.run(**run_kwargs)
+        state_pool.zero_()
+        state_pool[state_indices.long()] = initial_states
+        checkpoint_pool.fill_(float("nan"))
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state, captured_checkpoints = wrapper.run(
+            **run_kwargs
+        )
+
+    with torch.cuda.stream(capture_stream):
+        state_pool.zero_()
+        state_pool[state_indices.long()] = initial_states
+        checkpoint_pool.fill_(float("nan"))
+        output.fill_(float("nan"))
+        graph.replay()
+    capture_stream.synchronize()
+
+    assert captured_output is output
+    assert captured_state is state_pool
+    assert captured_checkpoints is checkpoint_pool
+    torch.testing.assert_close(
+        output.float(), expected[0].float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_pool[state_indices.long()].float(),
+        expected[1].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        checkpoint_pool[checkpoint_indices.long()].float(),
+        expected[2].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.count_nonzero(state_pool[[1, 3]]) == 0
+    assert torch.isnan(checkpoint_pool[[0, 2, 3]]).all()
+
+    # Keep all captured addresses fixed while changing the sequence split,
+    # initial-state slots, checkpoint prefix, and checkpoint destinations.
+    replay_offsets = torch.tensor(
+        [0, 129, 195], dtype=torch.int64, device=flash_kda_device
+    )
+    replay_state_indices = torch.tensor(
+        [3, 1], dtype=torch.int32, device=flash_kda_device
+    )
+    replay_checkpoint_starts = torch.tensor(
+        [0, 2, 3], dtype=torch.int64, device=flash_kda_device
+    )
+    replay_checkpoint_indices = torch.tensor(
+        [0, 3, 2], dtype=torch.int32, device=flash_kda_device
+    )
+    expected_replay = eager_control(
+        replay_offsets,
+        replay_state_indices,
+        replay_checkpoint_starts,
+        replay_checkpoint_indices,
+    )
+    with torch.cuda.stream(capture_stream):
+        wrapper.plan(replay_offsets)
+        state_indices.copy_(replay_state_indices)
+        checkpoint_starts.copy_(replay_checkpoint_starts)
+        checkpoint_indices.copy_(replay_checkpoint_indices)
+        state_pool.zero_()
+        state_pool[replay_state_indices.long()] = initial_states
+        checkpoint_pool.fill_(float("nan"))
+        output.fill_(float("nan"))
+        graph.replay()
+    capture_stream.synchronize()
+
+    assert wrapper._seq_order_buf.tolist() == [0, 1]
+    assert wrapper._cu_chunks_buf.tolist() == [0, 9, 14]
+    torch.testing.assert_close(
+        output.float(), expected_replay[0].float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_pool[replay_state_indices.long()].float(),
+        expected_replay[1].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        checkpoint_pool[replay_checkpoint_indices.long()].float(),
+        expected_replay[2].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.count_nonzero(state_pool[[0, 2]]) == 0
+    assert torch.isnan(checkpoint_pool[[1, 4, 5]]).all()
+
+
 @pytest.mark.parametrize("num_heads", [6, 12])
 def test_frozen_prefill_non_aligned_heads_graph_refreshes_beta(
     flash_kda_device, num_heads
