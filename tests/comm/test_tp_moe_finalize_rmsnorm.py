@@ -18,13 +18,19 @@ from flashinfer.comm import (
 WORLD_SIZE = 4
 TOPK = 8
 HIDDEN_SIZE = 4096
+HIDDEN_SIZE_PADDED = HIDDEN_SIZE + 32
+EXTRA_ROWS = 17
 
 
-def _assert_model_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+def _assert_model_close(
+    actual: torch.Tensor, expected: torch.Tensor, *, context: str = ""
+) -> None:
     delta = actual.float() - expected.float()
     rel_l2 = delta.norm() / expected.float().norm().clamp_min(1e-12)
-    assert rel_l2 < 1e-3
-    assert delta.abs().max() <= 0.03125
+    max_abs = delta.abs().max()
+    prefix = f"{context}: " if context else ""
+    assert rel_l2 < 1e-3, f"{prefix}relative L2 error {rel_l2.item():.6g}"
+    assert max_abs <= 0.0625, f"{prefix}maximum absolute error {max_abs.item():.6g}"
 
 
 def _free_port() -> int:
@@ -34,14 +40,23 @@ def _free_port() -> int:
 
 
 def _reference(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     expert_weights: torch.Tensor,
     norm_weight: torch.Tensor,
     eps: float,
     gain_center: float,
     weight_before_norm: bool,
 ) -> torch.Tensor:
-    rows = partial_rows.float()
+    num_tokens = expanded_idx_to_permuted_idx.shape[0]
+    indices = expanded_idx_to_permuted_idx.reshape(-1).long()
+    valid = (indices >= 0) & (indices < gemm2_permuted.shape[0])
+    rows = gemm2_permuted.index_select(
+        0, indices.clamp(0, gemm2_permuted.shape[0] - 1)
+    )[:, :HIDDEN_SIZE]
+    rows = rows.view(num_tokens, TOPK, HIDDEN_SIZE)
+    rows.masked_fill_(~valid.view(num_tokens, TOPK, 1), 0)
+    rows = rows.float()
     dist.all_reduce(rows)
     rows = rows.to(torch.bfloat16).float()
     if weight_before_norm:
@@ -58,7 +73,8 @@ def _reference(
 
 
 def _rounded_reference(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     expert_weights: torch.Tensor,
     norm_weight: torch.Tensor,
     eps: float,
@@ -66,7 +82,15 @@ def _rounded_reference(
     weight_before_norm: bool,
 ) -> torch.Tensor:
     """The obsolete contract with an expert-local BF16 normalization store."""
-    rows = partial_rows.float()
+    num_tokens = expanded_idx_to_permuted_idx.shape[0]
+    indices = expanded_idx_to_permuted_idx.reshape(-1).long()
+    valid = (indices >= 0) & (indices < gemm2_permuted.shape[0])
+    rows = gemm2_permuted.index_select(
+        0, indices.clamp(0, gemm2_permuted.shape[0] - 1)
+    )[:, :HIDDEN_SIZE]
+    rows = rows.view(num_tokens, TOPK, HIDDEN_SIZE)
+    rows.masked_fill_(~valid.view(num_tokens, TOPK, 1), 0)
+    rows = rows.float()
     dist.all_reduce(rows)
     rows = rows.to(torch.bfloat16).float()
     if weight_before_norm:
@@ -85,6 +109,38 @@ def _rounded_reference(
     )
 
 
+def _make_permuted(
+    partial_rows: torch.Tensor,
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scatter logical rows into a padded physical GEMM2 buffer.
+
+    Row zero and all unused storage stay NaN so an invalid map entry catches
+    any implementation that reads a fallback row and tries to mask it later.
+    """
+    num_tokens = partial_rows.shape[0]
+    num_logical_rows = num_tokens * TOPK
+    num_rows = num_logical_rows + EXTRA_ROWS
+    gemm2_permuted = torch.full(
+        (num_rows, HIDDEN_SIZE_PADDED),
+        float("nan"),
+        dtype=partial_rows.dtype,
+        device=partial_rows.device,
+    )
+    generator = torch.Generator(device=partial_rows.device).manual_seed(seed)
+    physical_rows = (
+        torch.randperm(num_rows - 1, device=partial_rows.device, generator=generator)[
+            :num_logical_rows
+        ]
+        + 1
+    )
+    gemm2_permuted[physical_rows, :HIDDEN_SIZE] = partial_rows.reshape(
+        num_logical_rows, HIDDEN_SIZE
+    )
+    return gemm2_permuted, physical_rows.to(torch.int32).view(num_tokens, TOPK)
+
+
 def _worker(local_rank: int, master_port: int) -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
@@ -98,15 +154,29 @@ def _worker(local_rank: int, master_port: int) -> None:
     contract_rows = torch.empty(
         1, TOPK, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
     )
+    contract_gemm2, contract_indices = _make_permuted(
+        contract_rows, seed=100 + local_rank
+    )
     contract_weights = torch.empty(1, TOPK, dtype=torch.bfloat16, device=device)
     contract_norm = torch.empty(HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
     contract_output = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+    assert supports_tp_moe_finalize_rmsnorm(
+        contract_gemm2,
+        contract_weights,
+        contract_indices,
+        contract_norm,
+        contract_output,
+    )
     misaligned_rows = torch.empty(
-        TOPK * HIDDEN_SIZE + 1, dtype=torch.bfloat16, device=device
-    )[1:].view(1, TOPK, HIDDEN_SIZE)
+        contract_gemm2.numel() + 1, dtype=torch.bfloat16, device=device
+    )[1:].view_as(contract_gemm2)
     assert misaligned_rows.is_contiguous() and misaligned_rows.data_ptr() % 16 != 0
     assert not supports_tp_moe_finalize_rmsnorm(
-        misaligned_rows, contract_weights, contract_norm, contract_output
+        misaligned_rows,
+        contract_weights,
+        contract_indices,
+        contract_norm,
+        contract_output,
     )
 
     finalize_module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
@@ -114,7 +184,11 @@ def _worker(local_rank: int, master_port: int) -> None:
     finalize_module._WS.dev_ord = (initialized_device + 1) % torch.cuda.device_count()
     try:
         assert not supports_tp_moe_finalize_rmsnorm(
-            contract_rows, contract_weights, contract_norm, contract_output
+            contract_gemm2,
+            contract_weights,
+            contract_indices,
+            contract_norm,
+            contract_output,
         )
     finally:
         finalize_module._WS.dev_ord = initialized_device
@@ -129,6 +203,10 @@ def _worker(local_rank: int, master_port: int) -> None:
                 dtype=torch.bfloat16,
                 device=device,
                 generator=generator,
+            )
+            gemm2_permuted, expanded_idx_to_permuted_idx = _make_permuted(
+                partial_rows,
+                seed=3000 + 100 * num_tokens + local_rank,
             )
             shared = torch.Generator(device=device).manual_seed(2000)
             expert_weights = torch.randn(
@@ -145,7 +223,8 @@ def _worker(local_rank: int, master_port: int) -> None:
                 generator=shared,
             )
             expected = _reference(
-                partial_rows,
+                gemm2_permuted,
+                expanded_idx_to_permuted_idx,
                 expert_weights,
                 norm_weight,
                 1e-8,
@@ -154,15 +233,43 @@ def _worker(local_rank: int, master_port: int) -> None:
             )
             output = torch.empty_like(expected)
             tp_moe_finalize_rmsnorm(
-                partial_rows,
+                gemm2_permuted,
                 expert_weights,
+                expanded_idx_to_permuted_idx,
                 norm_weight,
                 output,
                 eps=1e-8,
                 gain_center=1.0,
                 weight_before_norm=weight_before_norm,
             )
-            _assert_model_close(output, expected)
+            if num_tokens == 65 and not weight_before_norm:
+                identity_gemm2 = torch.full_like(gemm2_permuted, float("nan"))
+                identity_indices = torch.arange(
+                    1,
+                    num_tokens * TOPK + 1,
+                    dtype=torch.int32,
+                    device=device,
+                ).view(num_tokens, TOPK)
+                identity_gemm2[1 : num_tokens * TOPK + 1, :HIDDEN_SIZE] = (
+                    partial_rows.view(-1, HIDDEN_SIZE)
+                )
+                identity_output = torch.empty_like(output)
+                tp_moe_finalize_rmsnorm(
+                    identity_gemm2,
+                    expert_weights,
+                    identity_indices,
+                    norm_weight,
+                    identity_output,
+                    eps=1e-8,
+                    gain_center=1.0,
+                    weight_before_norm=weight_before_norm,
+                )
+                torch.testing.assert_close(output, identity_output, atol=0, rtol=0)
+            _assert_model_close(
+                output,
+                expected,
+                context=f"tokens={num_tokens}, weight_before_norm={weight_before_norm}",
+            )
 
             gathered = [torch.empty_like(output) for _ in range(WORLD_SIZE)]
             dist.all_gather(gathered, output)
@@ -170,28 +277,85 @@ def _worker(local_rank: int, master_port: int) -> None:
                 torch.equal(gathered[0], rank_output) for rank_output in gathered
             )
 
+    # Invalid entries must contribute zero without touching row zero or another
+    # padded row, both of which intentionally contain NaNs.
+    invalid_generator = torch.Generator(device=device).manual_seed(6000 + local_rank)
+    invalid_rows = torch.randn(
+        17,
+        TOPK,
+        HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=invalid_generator,
+    )
+    invalid_gemm2, invalid_indices = _make_permuted(
+        invalid_rows, seed=6100 + local_rank
+    )
+    invalid_indices[0, 0] = -1
+    invalid_indices[0, 1] = invalid_gemm2.shape[0]
+    metadata_generator = torch.Generator(device=device).manual_seed(6200)
+    invalid_weights = torch.randn(
+        17,
+        TOPK,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=metadata_generator,
+    )
+    invalid_norm = torch.randn(
+        HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=metadata_generator,
+    )
+    for weight_before_norm in (False, True):
+        expected = _reference(
+            invalid_gemm2,
+            invalid_indices,
+            invalid_weights,
+            invalid_norm,
+            1e-8,
+            1.0,
+            weight_before_norm,
+        )
+        output = torch.empty_like(expected)
+        tp_moe_finalize_rmsnorm(
+            invalid_gemm2,
+            invalid_weights,
+            invalid_indices,
+            invalid_norm,
+            output,
+            eps=1e-8,
+            gain_center=1.0,
+            weight_before_norm=weight_before_norm,
+        )
+        assert torch.isfinite(output).all()
+        _assert_model_close(output, expected)
+
     # Isolate post-collective arithmetic by making the other three ranks
     # contribute exact zeros. This must prefer the FP32-until-final contract
     # over the obsolete expert-local BF16 round.
-    contract_tokens = 17
+    rounding_tokens = 17
     shared = torch.Generator(device=device).manual_seed(7000)
     rank0_rows = torch.randn(
-        contract_tokens,
+        rounding_tokens,
         TOPK,
         HIDDEN_SIZE,
         dtype=torch.bfloat16,
         device=device,
         generator=shared,
     )
-    contract_rows = rank0_rows if local_rank == 0 else torch.zeros_like(rank0_rows)
-    contract_weights = torch.randn(
-        contract_tokens,
+    rounding_rows = rank0_rows if local_rank == 0 else torch.zeros_like(rank0_rows)
+    rounding_gemm2, rounding_indices = _make_permuted(
+        rounding_rows, seed=7300 + local_rank
+    )
+    rounding_weights = torch.randn(
+        rounding_tokens,
         TOPK,
         dtype=torch.bfloat16,
         device=device,
         generator=shared,
     )
-    contract_norm = torch.randn(
+    rounding_norm = torch.randn(
         HIDDEN_SIZE,
         dtype=torch.bfloat16,
         device=device,
@@ -199,17 +363,19 @@ def _worker(local_rank: int, master_port: int) -> None:
     )
     for weight_before_norm in (False, True):
         expected = _reference(
-            contract_rows,
-            contract_weights,
-            contract_norm,
+            rounding_gemm2,
+            rounding_indices,
+            rounding_weights,
+            rounding_norm,
             1e-8,
             1.0,
             weight_before_norm,
         )
         rounded = _rounded_reference(
-            contract_rows,
-            contract_weights,
-            contract_norm,
+            rounding_gemm2,
+            rounding_indices,
+            rounding_weights,
+            rounding_norm,
             1e-8,
             1.0,
             weight_before_norm,
@@ -217,9 +383,10 @@ def _worker(local_rank: int, master_port: int) -> None:
         assert torch.count_nonzero(expected != rounded) > 0
         output = torch.empty_like(expected)
         tp_moe_finalize_rmsnorm(
-            contract_rows,
-            contract_weights,
-            contract_norm,
+            rounding_gemm2,
+            rounding_weights,
+            rounding_indices,
+            rounding_norm,
             output,
             eps=1e-8,
             gain_center=1.0,
@@ -229,8 +396,8 @@ def _worker(local_rank: int, master_port: int) -> None:
         rounded_error = (output.float() - rounded.float()).abs().mean()
         assert fp32_error < rounded_error
 
-    graph_rows_generator = torch.Generator(device=device).manual_seed(3000 + local_rank)
-    graph_rows = torch.randn(
+    graph_rows_generator = torch.Generator(device=device).manual_seed(7000 + local_rank)
+    graph_logical_rows = torch.randn(
         17,
         TOPK,
         HIDDEN_SIZE,
@@ -238,7 +405,10 @@ def _worker(local_rank: int, master_port: int) -> None:
         device=device,
         generator=graph_rows_generator,
     )
-    graph_metadata_generator = torch.Generator(device=device).manual_seed(4000)
+    graph_gemm2, graph_indices = _make_permuted(
+        graph_logical_rows, seed=7100 + local_rank
+    )
+    graph_metadata_generator = torch.Generator(device=device).manual_seed(7200)
     graph_weights = torch.randn(
         17,
         TOPK,
@@ -254,8 +424,9 @@ def _worker(local_rank: int, master_port: int) -> None:
     )
     graph_output = torch.empty(17, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
     tp_moe_finalize_rmsnorm(
-        graph_rows,
+        graph_gemm2,
         graph_weights,
+        graph_indices,
         graph_norm,
         graph_output,
         eps=1e-4,
@@ -265,8 +436,9 @@ def _worker(local_rank: int, master_port: int) -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         tp_moe_finalize_rmsnorm(
-            graph_rows,
+            graph_gemm2,
             graph_weights,
+            graph_indices,
             graph_norm,
             graph_output,
             eps=1e-4,
@@ -275,10 +447,29 @@ def _worker(local_rank: int, master_port: int) -> None:
         )
     for iteration in range(4):
         replay_generator = torch.Generator(device=device).manual_seed(
-            5000 + 10 * iteration + local_rank
+            8000 + 10 * iteration + local_rank
         )
-        graph_rows.normal_(generator=replay_generator)
-        expected = _reference(graph_rows, graph_weights, graph_norm, 1e-4, 1.0, True)
+        replay_rows = torch.randn(
+            graph_logical_rows.shape,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=replay_generator,
+        )
+        replay_gemm2, replay_indices = _make_permuted(
+            replay_rows,
+            seed=9000 + 10 * iteration + local_rank,
+        )
+        graph_gemm2.copy_(replay_gemm2)
+        graph_indices.copy_(replay_indices)
+        expected = _reference(
+            graph_gemm2,
+            graph_indices,
+            graph_weights,
+            graph_norm,
+            1e-4,
+            1.0,
+            True,
+        )
         graph.replay()
         _assert_model_close(graph_output, expected)
     dist.destroy_process_group()

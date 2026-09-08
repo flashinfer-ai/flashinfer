@@ -574,13 +574,15 @@ def test_tp_moe_finalize_rmsnorm_fi_trace():
 
     if not hasattr(flashinfer.comm, "tp_moe_finalize_rmsnorm"):
         pytest.skip("TP MoE finalize dependencies are unavailable")
-    partial_rows = torch.empty(2, 8, 4096, dtype=torch.bfloat16)
+    gemm2_permuted = torch.empty(19, 4128, dtype=torch.bfloat16)
     expert_weights = torch.empty(2, 8, dtype=torch.bfloat16)
+    expanded_idx_to_permuted_idx = torch.empty(2, 8, dtype=torch.int32)
     norm_weight = torch.empty(4096, dtype=torch.bfloat16)
     output = torch.empty(2, 4096, dtype=torch.bfloat16)
     defn = flashinfer.comm.tp_moe_finalize_rmsnorm.fi_trace(
-        partial_rows=partial_rows,
+        gemm2_permuted=gemm2_permuted,
         expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         norm_weight=norm_weight,
         output=output,
         eps=1e-8,
@@ -594,6 +596,7 @@ def test_tp_moe_finalize_rmsnorm_fi_trace():
     )
     assert defn["axes"]["num_experts"]["value"] == 8
     assert defn["axes"]["hidden_size"]["value"] == 4096
+    assert defn["axes"]["hidden_size_padded"]["value"] == 4128
 
 
 # ---------------------------------------------------------------------------

@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """TP4 MoE finalize and post-expert RMSNorm for generic TP4 on B300.
 
-One candidate-owned kernel, no framework collective.  The cross-rank sum is
-expert-sharded instead of replicated, which is what makes it cheap: the naive
-one-shot all-gather forces every rank to *receive* three full copies of the
-[T,K,H] partial-row tensor (four with a multicast push, because the switch
-loops the sender's own copy back), even though the only thing anybody needs out
-of it is the [T,H] finalized row.  Sharding the experts moves the fabric cost
-onto the small tensor:
+One candidate-owned kernel, no framework collective.  The input is the raw
+permuted GEMM2 buffer plus its expanded-to-permuted row map; resolving that map
+inside the kernel avoids materializing the logical [T,K,H] partial-row tensor.
+The cross-rank sum is expert-sharded instead of replicated, which is what makes
+it cheap: the naive one-shot all-gather forces every rank to *receive* three
+full copies of that logical tensor (four with a multicast push, because the
+switch loops the sender's own copy back), even though the only thing anybody
+needs out of it is the [T,H] finalized row.  Sharding the experts moves the
+fabric cost onto the small tensor:
 
   phase 1 (scatter by expert owner): rank r owns experts [2r, 2r+1].  Every
       rank pushes the six expert rows it does *not* own straight from registers
@@ -438,7 +440,19 @@ def _pick_split(n_tok, nsm):
 # kernel factory
 # --------------------------------------------------------------------------- #
 def _make_program(
-    n_tok, grid_y, split, nthr, mode, eps, gain_center, ws, use_mc, addrs, my_rank
+    n_tok,
+    num_rows,
+    row_stride,
+    grid_y,
+    split,
+    nthr,
+    mode,
+    eps,
+    gain_center,
+    ws,
+    use_mc,
+    addrs,
+    my_rank,
 ):
     inv_h = 1.0 / float(H_DIM)
     n_iter = (n_tok + grid_y - 1) // grid_y
@@ -513,6 +527,7 @@ def _make_program(
     def finalize_tile(
         gIn: cute.Tensor,
         gW: cute.Tensor,
+        gIdx: cute.Tensor,
         gNw: cute.Tensor,
         gOut: cute.Tensor,
         sred: cute.Tensor,
@@ -527,23 +542,35 @@ def _make_program(
     ):
         lane = tidx % 32
         warp = tidx // 32
-        base_in = tok * (K_EXPERTS * H_DIM) + h0
 
         # issue the two small vector loads first; they overlap the fabric wait
         nrm = ld_global_v4(gNw.iterator + h0)
         wgt = ld_global_v4(gW.iterator + tok * K_EXPERTS)
 
+        # Resolve physical GEMM2 rows directly from the expanded-to-permuted
+        # map.  A missing or out-of-range slot contributes literal zero without
+        # touching the fallback row: GEMM workspaces are allowed to contain
+        # unwritten NaN/Inf values, for which multiplying by zero is not safe.
+        # The predicate is uniform across the CTA because every thread handles
+        # the same token and compile-time expert slot.
+        mine = []
+        for k in cutlass.range_constexpr(K_EXPERTS):
+            permuted_idx = cutlass.Int32(gIdx[tok, k])
+            is_valid = permuted_idx >= 0 and permuted_idx < num_rows
+            q0 = cutlass.Int32(0)
+            q1 = cutlass.Int32(0)
+            q2 = cutlass.Int32(0)
+            q3 = cutlass.Int32(0)
+            if is_valid:
+                q0, q1, q2, q3 = ld_global_v4(
+                    gIn.iterator + (permuted_idx * row_stride + h0)
+                )
+            mine.append((scrub_a(q0), scrub_a(q1), scrub_a(q2), scrub_a(q3)))
+
         packed = []
         if cutlass.const_expr(comm):
             gm = gen % NGEN
             pa = _pin(cutlass.BFloat16, a_lam)
-
-            # ---- read our own contribution and scrub the sentinel pattern
-            raw = [
-                ld_global_v4(gIn.iterator + (base_in + k * H_DIM))
-                for k in range(K_EXPERTS)
-            ]
-            mine = [tuple(scrub_a(x) for x in raw[k]) for k in range(K_EXPERTS)]
 
             # ---- phase 1: unicast every non-owned expert row to its owner.
             # One store per expert row; nothing is broadcast, so the rank's
@@ -596,7 +623,7 @@ def _make_program(
             rearm(gen, slot, h0)
         else:
             for k in cutlass.range_constexpr(K_EXPERTS):
-                packed.append(ld_global_v4(gIn.iterator + (base_in + k * H_DIM)))
+                packed.append(mine[k])
 
         nw = []
         for r2 in cutlass.range_constexpr(4):
@@ -739,7 +766,11 @@ def _make_program(
 
     @cute.kernel
     def fused_kernel(
-        gIn: cute.Tensor, gW: cute.Tensor, gNw: cute.Tensor, gOut: cute.Tensor
+        gIn: cute.Tensor,
+        gW: cute.Tensor,
+        gIdx: cute.Tensor,
+        gNw: cute.Tensor,
+        gOut: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         sx, cta, _ = cute.arch.block_idx()
@@ -772,6 +803,7 @@ def _make_program(
                 finalize_tile(
                     gIn,
                     gW,
+                    gIdx,
                     gNw,
                     gOut,
                     sred,
@@ -799,12 +831,13 @@ def _make_program(
     def host(
         gIn: cute.Tensor,
         gW: cute.Tensor,
+        gIdx: cute.Tensor,
         gNw: cute.Tensor,
         gOut: cute.Tensor,
         stream: _drv.CUstream,
     ):
         if cutlass.const_expr(split > 1):
-            fused_kernel(gIn, gW, gNw, gOut).launch(
+            fused_kernel(gIn, gW, gIdx, gNw, gOut).launch(
                 grid=(split, grid_y, 1),
                 block=(nthr, 1, 1),
                 cluster=(split, 1, 1),
@@ -812,7 +845,7 @@ def _make_program(
                 stream=stream,
             )
         else:
-            fused_kernel(gIn, gW, gNw, gOut).launch(
+            fused_kernel(gIn, gW, gIdx, gNw, gOut).launch(
                 grid=(1, grid_y, 1),
                 block=(nthr, 1, 1),
                 min_blocks_per_mp=1,
@@ -850,7 +883,7 @@ class _WorkspaceAddresses(TypedDict):
     gen: int
 
 
-_PROGRAMS: dict[tuple[int, int, float, float], "_Program"] = {}
+_PROGRAMS: dict[tuple[int, int, int, int, float, float], "_Program"] = {}
 
 
 def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
@@ -938,24 +971,25 @@ class _Program:
         self.fn = fn
         self.ffi = ffi
 
-    def __call__(self, a, b, c, d, stream):
+    def __call__(self, a, b, c, d, e, stream):
         if self.ffi:
-            self.fn(a, b, c, d, stream)
+            self.fn(a, b, c, d, e, stream)
         else:
             self.fn(
                 from_dlpack(a, assumed_align=16),
                 from_dlpack(b, assumed_align=16),
                 from_dlpack(c, assumed_align=16),
                 from_dlpack(d, assumed_align=16),
+                from_dlpack(e, assumed_align=16),
                 stream,
             )
 
 
-def _build(key, a, b, c, d, stream):
+def _build(key, a, b, c, d, e, stream):
     # The generated program embeds process-local symmetric-memory and multicast
     # addresses. It must therefore remain in the process cache rather than the
     # persistent CuTe-DSL cache, whose objects are reusable across processes.
-    n_tok, mode, eps, gain_center = key
+    n_tok, num_rows, row_stride, mode, eps, gain_center = key
     split = _pick_split(n_tok, _WS.nsm)
     nthr = H_DIM // (VEC * split)
     grid_y = min(n_tok, _WS.nsm // split)
@@ -964,6 +998,8 @@ def _build(key, a, b, c, d, stream):
         raise RuntimeError("TP MoE finalize workspace addresses are unavailable")
     host = _make_program(
         n_tok,
+        num_rows,
+        row_stride,
         grid_y,
         split,
         nthr,
@@ -977,7 +1013,8 @@ def _build(key, a, b, c, d, stream):
     )
     try:
         args = [
-            from_dlpack(x, assumed_align=16, enable_tvm_ffi=True) for x in (a, b, c, d)
+            from_dlpack(x, assumed_align=16, enable_tvm_ffi=True)
+            for x in (a, b, c, d, e)
         ]
         compiled = cute.compile(host, *args, stream, options="--enable-tvm-ffi")
         return _Program(compiled, True)
@@ -987,36 +1024,60 @@ def _build(key, a, b, c, d, stream):
             "process-local CuTe callable: %s",
             error,
         )
-        args = [from_dlpack(x, assumed_align=16) for x in (a, b, c, d)]
+        args = [from_dlpack(x, assumed_align=16) for x in (a, b, c, d, e)]
         return _Program(cute.compile(host, *args, stream), False)
 
 
 def _run(
-    partial_rows,
+    gemm2_permuted,
     expert_weights,
+    expanded_idx_to_permuted_idx,
     norm_weight,
     eps,
     gain_center,
     weight_before_norm,
     output,
 ):
-    n_tok = partial_rows.shape[0]
+    n_tok = expanded_idx_to_permuted_idx.shape[0]
     if n_tok == 0:
         return
     if not _WS.available:
         raise RuntimeError("TP MoE finalize workspace was not initialized")
-    key = (n_tok, int(weight_before_norm), float(eps), float(gain_center))
+    key = (
+        n_tok,
+        gemm2_permuted.shape[0],
+        gemm2_permuted.stride(0),
+        int(weight_before_norm),
+        float(eps),
+        float(gain_center),
+    )
     stream = _cur_stream(_WS.dev_ord)
     prog = _PROGRAMS.get(key)
     if prog is None:
-        prog = _build(key, partial_rows, expert_weights, norm_weight, output, stream)
+        prog = _build(
+            key,
+            gemm2_permuted,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            output,
+            stream,
+        )
         _PROGRAMS[key] = prog
-    prog(partial_rows, expert_weights, norm_weight, output, stream)
+    prog(
+        gemm2_permuted,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        norm_weight,
+        output,
+        stream,
+    )
 
 
 def run(
-    partial_rows,
+    gemm2_permuted,
     expert_weights,
+    expanded_idx_to_permuted_idx,
     norm_weight,
     eps,
     gain_center,
@@ -1027,12 +1088,17 @@ def run(
     if not init_tp_moe_finalize_rmsnorm():
         raise RuntimeError("TP4 multicast finalize is unavailable")
     if not supports_tp_moe_finalize_rmsnorm(
-        partial_rows, expert_weights, norm_weight, output
+        gemm2_permuted,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        norm_weight,
+        output,
     ):
         raise ValueError("tensors do not satisfy the TP MoE finalize contract")
     _run(
-        partial_rows,
+        gemm2_permuted,
         expert_weights,
+        expanded_idx_to_permuted_idx,
         norm_weight,
         eps,
         gain_center,
@@ -1042,34 +1108,62 @@ def run(
 
 
 def supports_tp_moe_finalize_rmsnorm(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
     expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
     """Return whether tensors satisfy the TP4 SM103 kernel contract."""
+    if (
+        not _WS.available
+        or gemm2_permuted.ndim != 2
+        or expert_weights.ndim != 2
+        or expanded_idx_to_permuted_idx.ndim != 2
+        or norm_weight.ndim != 1
+        or output.ndim != 2
+    ):
+        return False
     workspace_device = torch.device("cuda", _WS.dev_ord)
+    num_tokens = expanded_idx_to_permuted_idx.shape[0]
+    max_input_offset = (
+        0
+        if gemm2_permuted.shape[0] == 0
+        else (gemm2_permuted.shape[0] - 1) * gemm2_permuted.stride(0) + H_DIM
+    )
+    bf16_tensors = (gemm2_permuted, expert_weights, norm_weight, output)
     return (
-        _WS.available
-        and partial_rows.shape[1:] == (K_EXPERTS, H_DIM)
-        and expert_weights.shape == (partial_rows.shape[0], K_EXPERTS)
+        gemm2_permuted.shape[1] >= H_DIM
+        and gemm2_permuted.stride(1) == 1
+        and gemm2_permuted.stride(0) % VEC == 0
+        and (num_tokens == 0 or gemm2_permuted.shape[0] > 0)
+        and max_input_offset <= torch.iinfo(torch.int32).max
+        and expert_weights.shape == (num_tokens, K_EXPERTS)
+        and expanded_idx_to_permuted_idx.shape == (num_tokens, K_EXPERTS)
         and norm_weight.shape == (H_DIM,)
-        and output.shape == (partial_rows.shape[0], H_DIM)
+        and output.shape == (num_tokens, H_DIM)
         and all(
             tensor.dtype == torch.bfloat16
             and tensor.is_cuda
             and tensor.is_contiguous()
-            and tensor.device == partial_rows.device
+            and tensor.device == gemm2_permuted.device
             and tensor.device == workspace_device
             and tensor.data_ptr() % 16 == 0
-            for tensor in (partial_rows, expert_weights, norm_weight, output)
+            for tensor in bf16_tensors
         )
+        and expanded_idx_to_permuted_idx.dtype == torch.int32
+        and expanded_idx_to_permuted_idx.is_cuda
+        and expanded_idx_to_permuted_idx.is_contiguous()
+        and expanded_idx_to_permuted_idx.device == gemm2_permuted.device
+        and expanded_idx_to_permuted_idx.device == workspace_device
+        and expanded_idx_to_permuted_idx.data_ptr() % 16 == 0
     )
 
 
 def _tp_moe_finalize_impl(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
     expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     norm_weight: torch.Tensor,
     output: torch.Tensor,
     eps: float,
@@ -1077,12 +1171,17 @@ def _tp_moe_finalize_impl(
     weight_before_norm: bool,
 ) -> None:
     if not supports_tp_moe_finalize_rmsnorm(
-        partial_rows, expert_weights, norm_weight, output
+        gemm2_permuted,
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        norm_weight,
+        output,
     ):
         raise ValueError("tensors do not satisfy the TP MoE finalize contract")
     _run(
-        partial_rows,
+        gemm2_permuted,
         expert_weights,
+        expanded_idx_to_permuted_idx,
         norm_weight,
         eps,
         gain_center,
@@ -1092,8 +1191,9 @@ def _tp_moe_finalize_impl(
 
 
 def _tp_moe_finalize_fake(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
     expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     norm_weight: torch.Tensor,
     output: torch.Tensor,
     eps: float,
@@ -1113,8 +1213,9 @@ _tp_moe_finalize_fake = register_fake_op("flashinfer::tp_moe_finalize_rmsnorm")(
 
 @flashinfer_api(trace=tp_moe_finalize_rmsnorm_trace)
 def tp_moe_finalize_rmsnorm(
-    partial_rows: torch.Tensor,
+    gemm2_permuted: torch.Tensor,
     expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
     norm_weight: torch.Tensor,
     output: torch.Tensor,
     *,
@@ -1122,7 +1223,14 @@ def tp_moe_finalize_rmsnorm(
     gain_center: float,
     weight_before_norm: bool,
 ) -> None:
-    """Finalize replicated TP4 expert rows and apply per-expert RMSNorm.
+    """Gather and finalize TP4 expert rows, then apply per-expert RMSNorm.
+
+    ``gemm2_permuted`` contains the raw, unweighted GEMM2 rows in physical
+    expert order. ``expanded_idx_to_permuted_idx[t, k]`` selects the physical
+    row for logical token ``t`` and expert slot ``k``; a negative or
+    out-of-range index contributes zero. The input may have a padded trailing
+    dimension, but its first 4096 columns and every row start must be contiguous
+    and 16-byte aligned.
 
     Initialize the workspace collectively with
     :func:`init_tp_moe_finalize_rmsnorm` before the first invocation. The
@@ -1130,8 +1238,9 @@ def tp_moe_finalize_rmsnorm(
     initialization.
     """
     _tp_moe_finalize_impl(
-        partial_rows,
+        gemm2_permuted,
         expert_weights,
+        expanded_idx_to_permuted_idx,
         norm_weight,
         output,
         eps,

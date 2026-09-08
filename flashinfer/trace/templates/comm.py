@@ -21,28 +21,37 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 @torch.no_grad()
 def _tp_moe_finalize_rmsnorm_reference(
-    partial_rows,
+    gemm2_permuted,
     expert_weights,
+    expanded_idx_to_permuted_idx,
     norm_weight,
     eps,
     gain_center,
     weight_before_norm,
     **_unused,
 ):
-    """Single-rank reference treating ``partial_rows`` as already reduced."""
-    rows = partial_rows.to(torch.float32)
+    """Single-rank reference treating gathered GEMM2 rows as already reduced."""
+    num_tokens, num_experts = expanded_idx_to_permuted_idx.shape
+    hidden_size = norm_weight.shape[0]
+    indices = expanded_idx_to_permuted_idx.reshape(-1).to(torch.int64)
+    valid = (indices >= 0) & (indices < gemm2_permuted.shape[0])
+    if gemm2_permuted.shape[0] == 0:
+        rows = gemm2_permuted.new_zeros((num_tokens, num_experts, hidden_size))
+    else:
+        rows = gemm2_permuted.index_select(
+            0, indices.clamp(0, gemm2_permuted.shape[0] - 1)
+        )[:, :hidden_size]
+        rows = rows.reshape(num_tokens, num_experts, hidden_size)
+        rows = rows.masked_fill(~valid.reshape(num_tokens, num_experts, 1), 0)
+    rows = rows.to(torch.float32)
     if weight_before_norm:
         rows = rows * (norm_weight.to(torch.float32) + float(gain_center))
     inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + float(eps))
-    normalized = (rows * inv_rms).to(torch.bfloat16)
+    normalized = rows * inv_rms
     if not weight_before_norm:
-        normalized = (
-            normalized.to(torch.float32)
-            * (norm_weight.to(torch.float32) + float(gain_center))
-        ).to(torch.bfloat16)
+        normalized = normalized * (norm_weight.to(torch.float32) + float(gain_center))
     return (
-        normalized.to(torch.float32)
-        .mul(expert_weights.to(torch.float32).unsqueeze(-1))
+        normalized.mul(expert_weights.to(torch.float32).unsqueeze(-1))
         .sum(dim=1)
         .to(torch.bfloat16)
     )
@@ -52,17 +61,23 @@ tp_moe_finalize_rmsnorm_trace = TraceTemplate(
     op_type="tp_moe_finalize_rmsnorm",
     name_prefix="tp_moe_finalize_rmsnorm",
     description=(
-        "TP4 expert-row reduction, per-expert RMSNorm, and routing-weighted "
-        "finalize. The trace reference treats partial_rows as already reduced."
+        "Gather raw permuted GEMM2 rows, reduce them across TP4, apply "
+        "per-expert RMSNorm, and perform the routing-weighted finalize. The "
+        "trace reference treats the gathered rows as already TP-reduced."
     ),
     axes={
         "num_tokens": Var(),
+        "num_permuted_rows": Var(),
         "num_experts": Const(abbrev="e"),
         "hidden_size": Const(abbrev="h"),
+        "hidden_size_padded": Const(abbrev="hp"),
     },
     inputs={
-        "partial_rows": Tensor(["num_tokens", "num_experts", "hidden_size"]),
+        "gemm2_permuted": Tensor(["num_permuted_rows", "hidden_size_padded"]),
         "expert_weights": Tensor(["num_tokens", "num_experts"]),
+        "expanded_idx_to_permuted_idx": Tensor(
+            ["num_tokens", "num_experts"], dtype="int32"
+        ),
         "norm_weight": Tensor(["hidden_size"]),
         "eps": Scalar("float32"),
         "gain_center": Scalar("float32"),
@@ -71,7 +86,7 @@ tp_moe_finalize_rmsnorm_trace = TraceTemplate(
     outputs={
         "output": Tensor(
             ["num_tokens", "hidden_size"],
-            dtype_from="partial_rows",
+            dtype_from="gemm2_permuted",
             param="output",
         )
     },
