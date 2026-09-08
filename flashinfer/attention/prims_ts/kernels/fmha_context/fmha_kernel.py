@@ -133,6 +133,7 @@ Entry points:
 """
 
 import functools
+import os
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -2060,6 +2061,49 @@ def _configure_common_launch_flags(
     cfg.has_variable_window = has_variable_window
 
 
+# Tuning knob for the causal heavy-first (workload-balancing) raster. Unset
+# keeps the resolved policy value; "1" forces the reversed raster on for
+# every causal topology, "0" forces it off.
+_BALANCE_CAUSAL_WORKLOAD_ENV = "FLASHINFER_FMHA_CONTEXT_BALANCE_CAUSAL_WORKLOAD"
+
+
+def _resolve_balance_causal_workload(resolved: bool) -> bool:
+    """Return the env override for causal workload balancing, if set."""
+    override = os.environ.get(_BALANCE_CAUSAL_WORKLOAD_ENV)
+    if override is not None:
+        return override == "1"
+    return resolved
+
+
+def _resolve_context_balance_causal_workload(
+    cfg: FmhaConfig, *, requested: bool, is_clc_dynamic: bool
+) -> bool:
+    """Resolve the causal workload balancer once ``cfg.mma_order`` is known.
+
+    The heavy-first reversed Q-tile raster (``balance_causal_workload``)
+    auto-enables for causal + CLC-dynamic query-paired topologies, and a caller
+    may also request it explicitly (``requested`` -- e.g. the static-persistent
+    heavy-first raster). Both sources are vetoed on the interleaved
+    ``Qk0Pv0Qk1Pv1`` schedule: there the reversed raster is a measured net loss
+    (on the TRTLLM-15650 H32/Hkv4 D128 B16 causal workload, fp16 pays ~1.4-2.2%
+    vs. the same interleaved order without it and fp8 is ~neutral), and the
+    interleaved causal path already carries its own peer0-balancing drains, so
+    the raster buys nothing. Interleaved + balance-off passes the context
+    accuracy bar.
+
+    The FLASHINFER_FMHA_CONTEXT_BALANCE_CAUSAL_WORKLOAD env override keeps final
+    say (``"1"`` can still force the raster on for any causal topology, ``"0"``
+    off), so the interleaved schedule stays measurable. Call AFTER
+    ``_configure_pipeline_stages`` sets ``cfg.mma_order``.
+    """
+    policy = requested or (
+        cfg.is_causal and is_clc_dynamic and not cfg.single_qkv_instance
+    )
+    if cfg.mma_order == MmaOrder.Qk0Pv0Qk1Pv1:
+        policy = False
+    return _resolve_balance_causal_workload(policy)
+
+
 def _causal_domain_kwargs(
     *,
     num_kv_tiles: int | Int32,
@@ -2464,7 +2508,9 @@ class FmhaTs:
         Use TRT-style causal workload balancing: head_batch_seq logical tile
         order with reversed Q sequence tiles. Paired causal CLC schedules
         enable this automatically; setting the flag also requests it for other
-        causal scheduler topologies.
+        causal scheduler topologies. The environment variable
+        ``FLASHINFER_FMHA_CONTEXT_BALANCE_CAUSAL_WORKLOAD`` overrides the
+        resolved value for tuning ("1" forces on, "0" forces off).
     is_clc_dynamic : bool, optional
         Use CLC dynamic persistent scheduling (default: False).
         Requires ``is_persistent=True``.
@@ -2594,14 +2640,20 @@ class FmhaTs:
         cfg.o_dtype = o_dtype
         cfg.head_paired = head_paired
         cfg.is_causal = is_causal
-        balance_causal_workload = balance_causal_workload or (
-            is_causal and is_clc_dynamic and not cfg.single_qkv_instance
-        )
+        # balance_causal_workload is resolved per-branch AFTER
+        # _configure_pipeline_stages (which sets cfg.mma_order): the interleaved
+        # Qk0Pv0Qk1Pv1 veto in _resolve_context_balance_causal_workload needs the
+        # resolved MMA order. Keep the raw constructor arg here as the request.
 
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)
             _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+            balance_causal_workload = _resolve_context_balance_causal_workload(
+                cfg,
+                requested=balance_causal_workload,
+                is_clc_dynamic=is_clc_dynamic,
+            )
             if cfg.single_qkv_instance:
                 _configure_single_instance_tmem_layout(cfg)
                 _configure_single_instance_warp_layout(cfg)
@@ -2632,6 +2684,11 @@ class FmhaTs:
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         _configure_head_dim_staging(cfg)
         _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+        balance_causal_workload = _resolve_context_balance_causal_workload(
+            cfg,
+            requested=balance_causal_workload,
+            is_clc_dynamic=is_clc_dynamic,
+        )
         if cfg.single_qkv_instance:
             _configure_single_instance_tmem_layout(cfg)
             _configure_single_instance_warp_layout(cfg)
