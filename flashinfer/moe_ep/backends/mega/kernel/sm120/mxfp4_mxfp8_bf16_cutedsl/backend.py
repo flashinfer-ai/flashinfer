@@ -42,6 +42,8 @@ def _effective_clamp(
 
 @register_mega_kernel("sm120_mxfp4_mxfp8_bf16_cutedsl")
 class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     def __init__(
         self, config: Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     ) -> None:
@@ -189,6 +191,18 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             and output.shape[0] >= workspace.config.max_tokens_per_rank
             else None
         )
+        if (
+            direct_output is not None
+            and torch.cuda.is_current_stream_capturing()
+            and not workspace._has_prepared_frontend(
+                transformed_weights, direct_output
+            )
+        ):
+            # CUDA Graph capture uses a private allocator pool, so an output
+            # allocated inside capture can have a different address from the
+            # one used by warmup.  Reuse the prepared workspace graph instead
+            # of attempting CuTeDSL compilation during capture.
+            direct_output = None
         full_output = run_split_mega_moe(
             workspace,
             transformed_weights,

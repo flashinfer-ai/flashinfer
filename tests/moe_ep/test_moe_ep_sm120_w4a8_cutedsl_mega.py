@@ -325,6 +325,7 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
         torch.cuda.synchronize()
         assert torch.isfinite(eager0).all()
         torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
+        frontends_before_capture = len(layer._workspace._frontends)
         reference = _torch_reference(problem)
         rel_l2 = (
             (eager0.float() - reference).norm()
@@ -335,6 +336,7 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = layer(problem["inputs"])
+        assert len(layer._workspace._frontends) == frontends_before_capture
         graph.replay()
         replay0 = captured.clone()
         graph.replay()
@@ -342,6 +344,21 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
         torch.cuda.synchronize()
         torch.testing.assert_close(replay0, replay1, atol=0.0, rtol=0.0)
         torch.testing.assert_close(eager0, replay0, atol=0.0, rtol=0.0)
+
+        # A serving engine can prebind its graph output.  Once that exact
+        # address is warmed, capture must retain the zero-copy direct path.
+        direct_output = torch.empty_like(problem["inputs"].hidden_states)
+        problem["inputs"].output = direct_output
+        layer.warmup(problem["inputs"])
+        direct_frontends_before_capture = len(layer._workspace._frontends)
+        direct_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(direct_graph):
+            direct_captured = layer(problem["inputs"])
+        assert direct_captured.data_ptr() == direct_output.data_ptr()
+        assert len(layer._workspace._frontends) == direct_frontends_before_capture
+        direct_graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(eager0, direct_captured, atol=0.0, rtol=0.0)
     finally:
         layer.destroy()
 

@@ -176,7 +176,14 @@ class MoEEpMegaLayer(nn.Module):
                     device=device,
                 ),
             )
-        self.forward(t)
+        # Output-view-capable backends capture their internal graph against a
+        # stable workspace address.  Warming that path is what makes a later
+        # outer CUDA Graph capture safe; a materialized output may come from a
+        # graph-private allocator pool and therefore have a different address.
+        self.forward(
+            t,
+            return_workspace_view=self.supports_output_view and t.output is None,
+        )
         torch.cuda.synchronize()
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:

@@ -174,6 +174,17 @@ class MegaMoESm120W4A8Workspace:
     _staged_tokens: int = 0
     _destroyed: bool = False
 
+    def _has_prepared_frontend(
+        self,
+        transformed_weights: TransformedWeights,
+        output: torch.Tensor,
+    ) -> bool:
+        key = _frontend_graph_cache_key(
+            transformed_weights, output, self._compile_bucket
+        )
+        frontend = self._frontends.get(key)
+        return frontend is not None and frontend._compiled is not None
+
     def destroy(self) -> None:
         if self._destroyed:
             return
