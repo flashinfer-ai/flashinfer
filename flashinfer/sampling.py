@@ -54,6 +54,8 @@ def get_seed_and_offset(
     # add mutex if multi-trheading needed
     state = generator.get_state()
     seed, offset = state.view(torch.int64)
+    seed = int(seed.item())
+    offset = int(offset.item())
     offset += (increment + 3) // 4 * 4
     generator.set_state(
         torch.tensor(
