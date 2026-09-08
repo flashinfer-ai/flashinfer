@@ -82,6 +82,11 @@ class Sm90SwigluFp8Fc12Kernel:
         mma_mode = "bw"
         if self.fp8_scale_mode == "per_tensor":
             mma_mode = f"pt_{self.fp8_accum_mode[:2]}"
+        elif self.fp8_scale_mode == "mxfp4_hybrid":
+            # IKET event names have a hard 32-character limit.  Keep the
+            # specialization visible while leaving room for the swap-AB,
+            # FC1/FC2, and mainloop prefixes below.
+            mma_mode = "mx4hyb"
 
         self._iket_fc1_mma_mainloop_range = (
             f"{variant}_fc1_mma_mainloop_{mma_mode}"
@@ -94,6 +99,9 @@ class Sm90SwigluFp8Fc12Kernel:
         if self.fp8_scale_mode == "blockwise":
             activation_load = "act_sf_tma_bw"
             weight_load = "wgt_sf_cpasync_bw"
+        elif self.fp8_scale_mode == "mxfp4_hybrid":
+            activation_load = "act_sf_tma_mxfp4"
+            weight_load = "wgt_aux_cpa_humming"
         self._iket_fc1_activation_load_range = (
             f"{variant}_fc1_{activation_load}"
         )
@@ -128,6 +136,7 @@ class Sm90SwigluFp8Fc12Kernel:
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
         fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
         fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
         pingpong: bool = False,
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
@@ -204,6 +213,12 @@ class Sm90SwigluFp8Fc12Kernel:
                 f"got {fp8_accum_mode!r}."
             )
         self.fp8_accum_mode = fp8_accum_mode
+        if execution_phase not in ("fused", "fc1", "fc2"):
+            raise ValueError(
+                "execution_phase must be 'fused', 'fc1', or 'fc2'; "
+                f"got {execution_phase!r}."
+            )
+        self.execution_phase = execution_phase
         self.pingpong = pingpong
         self._set_iket_range_names()
         if ab_dtype == cutlass.Float8E4M3FN:
@@ -579,7 +594,7 @@ class Sm90SwigluFp8Fc12Kernel:
         ) * atom_thr_size
 
     def _activation_sf_bytes_per_stage(self) -> int:
-        if self.fp8_scale_mode != "blockwise":
+        if self.fp8_scale_mode not in ("blockwise", "mxfp4_hybrid"):
             return 0
         return self.token_tile_size * 4 * cutlass.Float32.width // 8
 
@@ -638,37 +653,36 @@ class Sm90SwigluFp8Fc12Kernel:
         return num_acc_stage, num_ab_stage, num_sched_stages
 
     def _apply_mega_warp_layout(self) -> None:
-        """Derive the MegaMoE warp topology (single source of truth).
+        """Derive the role-aware MegaMoE warp topology.
 
-        Called from the Mega ctor and again from ``_setup_attributes`` at
-        ``__call__`` time; idempotent.  Two layouts:
+        The helper is called from the Mega constructor and again during
+        attribute setup. Fused execution either keeps a separate producer
+        warpgroup or folds its three active roles into idle dispatch slots.
 
-        default (producer warpgroup kept)::
-
-            [epi x 4*wgs][tma_a][tma_b][sched][epi_aux][disp0..disp3][tb?]
-
-        ``fold_producer_warps`` (needs active_dispatch_warps == 1)::
-
-            [epi x 4*wgs][disp0][tma_a][tma_b][sched][tb?]
-
-        With one active dispatch warp the other three dispatch slots are
-        idle, so TMA-A / TMA-B / scheduler move into them and the whole
-        producer warpgroup (128 threads + its register file) disappears.
-        ``dispatch_warp_id`` stays a 4-tuple so every TokenComm count that
-        keys on the physical dispatch warpgroup (num_dispatch_warps, the
-        128-thread nvlink barrier, the kernel-tail range) is unchanged; the
-        repurposed warps simply idle through the dispatch hook like the
-        reserved slots did.  There is no epi_aux warp in this layout, so the
-        FC1 store offload is unavailable and early publication is forced.
+        Split K1 keeps separate producer and dispatch warpgroups. Split K2 has
+        no dispatch role and launches only the epilogue and producer
+        warpgroups. A logical dispatch_warp_id remains available to construct
+        the common TokenComm object, but it is not a physical K2 role.
         """
         n_epi = len(self.epilogue_warp_id)
+        enable_dispatch_warps = getattr(self, "enable_dispatch_warps", True)
+
+        # Rebuild producer IDs on every call so the helper remains idempotent
+        # after a folded call installed the aux-warp sentinel.
+        self.tma_a_warp_id = n_epi
+        self.tma_b_warp_id = self.tma_a_warp_id + 1
+        self.sched_warp_id = self.tma_b_warp_id + 1
+        self.epi_aux_warp_id = self.sched_warp_id + 1
+
         if self.fold_producer_warps:
+            if not enable_dispatch_warps:
+                raise ValueError(
+                    "fold_producer_warps requires a physical dispatch warpgroup"
+                )
             dispatch_warp_start = n_epi
             self.tma_a_warp_id = dispatch_warp_start + 1
             self.tma_b_warp_id = dispatch_warp_start + 2
             self.sched_warp_id = dispatch_warp_start + 3
-            # Sentinel: never matches a real warp index, so the epi_aux
-            # role branch is dead and the offload server hook is const-off.
             self.epi_aux_warp_id = -1
             producer_ids = ()
         else:
@@ -679,30 +693,50 @@ class Sm90SwigluFp8Fc12Kernel:
                 self.sched_warp_id,
                 self.epi_aux_warp_id,
             )
+
+        # Keep four logical slots even when only a subset performs dispatch:
+        # the physical role and its named-barrier accounting are warpgroup
+        # aligned. K2 retains these IDs only as an unused constructor ABI.
         self.dispatch_warp_id = tuple(
             range(dispatch_warp_start, dispatch_warp_start + 4)
         )
-        # ``standalone_warps`` dedicates four token-back warps after dispatch;
-        # ``reuse_dispatch_warps`` runs the push inline on the dispatch warps.
         token_back_warp_start = dispatch_warp_start + 4
         self.token_back_warp_id = (
             tuple(range(token_back_warp_start, token_back_warp_start + 4))
-            if self.token_back_standalone
+            if self.token_back_standalone and enable_dispatch_warps
             else None
+        )
+        physical_dispatch_ids = (
+            self.dispatch_warp_id if enable_dispatch_warps else ()
         )
         token_back_warp_ids = self.token_back_warp_id or ()
         self.threads_per_cta = 32 * len(
             (
                 *self.epilogue_warp_id,
                 *producer_ids,
-                *self.dispatch_warp_id,
+                *physical_dispatch_ids,
                 *token_back_warp_ids,
             )
         )
+        if self.threads_per_cta % 128 != 0:
+            raise ValueError(
+                "MegaMoE warp roles must form complete SM90 warpgroups; "
+                f"got {self.threads_per_cta} threads."
+            )
+        if enable_dispatch_warps and self.dispatch_warp_id[0] % 4 != 0:
+            raise ValueError(
+                "dispatch warps must start on a 4-warp boundary; "
+                f"got warp {self.dispatch_warp_id[0]}."
+            )
 
     def estimated_register_budget(self) -> int:
         """Return the CTA register target implied by the current warp roles."""
-        dispatch_warps = len(self.dispatch_warp_id) if self.dispatch_warp_id else 0
+        enable_dispatch_warps = getattr(self, "enable_dispatch_warps", True)
+        dispatch_warps = (
+            len(self.dispatch_warp_id)
+            if enable_dispatch_warps and self.dispatch_warp_id
+            else 0
+        )
         token_back_warps = (
             len(self.token_back_warp_id)
             if self.token_back_standalone and self.token_back_warp_id
@@ -840,10 +874,10 @@ class Sm90SwigluFp8Fc12Kernel:
             data_total_rows * intermediate_downproj * self.ab_dtype.width // 8
         )
 
-        if self.fp8_scale_mode == "blockwise":
+        if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
             if intermediate_downproj % Fp8Fc2ActivationScaleK != 0:
                 raise ValueError(
-                    "blockwise FP8 requires intermediate_downproj divisible by "
+                    "blockwise/hybrid FP8 requires intermediate_downproj divisible by "
                     f"{Fp8Fc2ActivationScaleK}, got {intermediate_downproj}."
                 )
             fc1_output_sf_bytes = (
@@ -1580,6 +1614,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gA_mkl = cute.local_tile(
             real_a,
@@ -1792,6 +1827,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gA_mkl = cute.local_tile(
             real_a,
@@ -1847,9 +1883,12 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             if _iket_active:
                 iket.range_pop()
-            scale_group_tile = handle.count // cutlass.Int32(
-                k_tiles_per_scale_group
-            )
+            if cutlass.const_expr(reuse_single_scale_tile):
+                scale_group_tile = cutlass.Int32(0)
+            else:
+                scale_group_tile = handle.count // cutlass.Int32(
+                    k_tiles_per_scale_group
+                )
             if _iket_active:
                 iket.range_push("tma_activation_sf_copy")
             cute.copy(
@@ -1935,6 +1974,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gB_nkl = cute.local_tile(
             real_b,
@@ -1990,9 +2030,12 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             if _iket_active:
                 iket.range_pop()
-            scale_group_tile = handle.count // cutlass.Int32(
-                k_tiles_per_scale_group
-            )
+            if cutlass.const_expr(reuse_single_scale_tile):
+                scale_group_tile = cutlass.Int32(0)
+            else:
+                scale_group_tile = handle.count // cutlass.Int32(
+                    k_tiles_per_scale_group
+                )
             if _iket_active:
                 iket.range_push("tma_activation_sf_copy")
             cute.copy(
@@ -2454,6 +2497,7 @@ class Sm90SwigluFp8Fc12Kernel:
             load_balance_counter_ptr=load_balance_counter_ptr,
             override_num_stages=self.num_sched_stages,
             is_swap_ab=False,
+            execution_phase=self.execution_phase,
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
         )
