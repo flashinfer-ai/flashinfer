@@ -357,7 +357,7 @@ def test_nvfp4_quantize_append_paged_mla_kv_cache_dequant_close():
     # dequant via the shared utility pins the cache to the repo-wide NVFP4 format
     ckv_dequant = e2m1_and_ufp8sf_scale_to_float(
         ckv_cache[pages, entries],
-        ckv_sf_cache[pages, entries].view(torch.uint8).reshape(-1),
+        ckv_sf_cache[pages, entries].view(torch.uint8),
         torch.tensor([ckv_scale], dtype=torch.float32, device=device),
         sf_vec_size=16,
         is_sf_swizzled_layout=False,
