@@ -37,7 +37,8 @@ Both reusable wrappers use a static-spec lifecycle. `plan()` receives only
 device, capacity, head, dtype, mask, window, and default-scale information. The
 contiguous plan also freezes its `packed` storage-mode choice (`False` for fixed
 BSHD, `True` for packed THD); the paged plan additionally receives page size
-and optional `uniform_packed_lengths` / `has_q_offset` metadata contracts.
+and optional `uniform_packed_lengths`, `has_q_offset`, and
+`paged_v_tail_is_zero` contracts.
 Neither plan retains Q/K/V tensors or request metadata. Every `run()` supplies
 the current tensors and metadata: packed
 contiguous offsets, per-token variable-window bounds for fixed-shape inputs, or
@@ -160,20 +161,26 @@ extent. For causal attention, every per-run `Sq[b]` is no greater than `Sk[b]`.
 `uniform_packed_lengths=True` is a caller promise that every Q delta equals
 `max_seq_len_q` and every K/V length equals `max_kv_len`.
 `has_q_offset=False` is a separate causal promise that `Sq[b] == Sk[b]` for
-every request; dense attention ignores and canonicalizes this flag. These
-promises compile exactly one narrower specialization rather than a runtime
-choice between kernels. Re-plan before changing a promise. The one-shot paged
-API already reads the metadata and derives the tightest valid flags for its
-temporary plan.
+every request; dense attention ignores and canonicalizes this flag.
+`paged_v_tail_is_zero=True` promises that unused rows following each request's
+logical K/V length in its active final V page contain zero. This removes the
+consumer-side post-TMA V-tail clear. The default `False` preserves correctness
+for arbitrary contents, including NaNs, in those unused rows. These promises
+compile exactly one specialization rather than a runtime choice between
+kernels. Re-plan before changing a promise. The one-shot paged API derives the
+tightest valid length flags for its temporary plan and conservatively keeps the
+V-tail clear.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
 dtypes, devices, scales, output, aliasing, page-table strides, sequence
 lengths, and active page IDs. Those metadata checks read device values back to
-the host and may synchronize. `validate=False` skips validation and host
-readback; callers using that path must enforce every dtype, device, shape,
-stride, alignment, value, aliasing, lifetime, and selected plan-promise
-obligation because invalid offsets, lengths, page IDs, or false compile-time
-promises can produce incorrect results or out-of-bounds access.
+the host and may synchronize. Validation does not inspect V-cache contents, so
+the caller owns `paged_v_tail_is_zero=True` even with `validate=True`.
+`validate=False` skips validation and host readback; callers using that path
+must enforce every dtype, device, shape, stride, alignment, value, aliasing,
+lifetime, and selected plan-promise obligation because invalid offsets,
+lengths, page IDs, or false compile-time promises can produce incorrect results
+or out-of-bounds access.
 CUDA Graph capture requires `validate=False` plus stable tensor shapes,
 strides, and addresses, although values may change between completed replays.
 
@@ -291,11 +298,11 @@ assert out.shape == q.shape
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
 run-time tensor shape, stride, and address stable, preserve any explicit
-`uniform_packed_lengths` / `has_q_offset` promises, and pass a preallocated,
-non-overlapping `out`. Callers must keep storage unmodified until queued work
-completes. Before running on a CUDA stream that is not already ordered after the
-planning stream, the caller must establish that dependency. Keep the wrapper and
-all captured runtime tensors alive until every graph using that plan is destroyed.
+length or zero-tail promises, and pass a preallocated, non-overlapping `out`.
+Callers must keep storage unmodified until queued work completes. Before
+running on a CUDA stream that is not already ordered after the planning stream,
+the caller must establish that dependency. Keep the wrapper and all captured
+runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 

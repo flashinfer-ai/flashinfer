@@ -546,6 +546,7 @@ def _plan_paged_wrapper(
     row_stride_multiplier: int = 1,
     uniform_packed_lengths: bool = False,
     has_q_offset: bool = True,
+    paged_v_tail_is_zero: bool = False,
 ) -> _NativePagedMetadata:
     """Compile a conservative paged plan and return its per-run metadata."""
 
@@ -575,6 +576,7 @@ def _plan_paged_wrapper(
         output_scale=reference.output_scale,
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
+        paged_v_tail_is_zero=paged_v_tail_is_zero,
     )
     return metadata
 
@@ -930,6 +932,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "output_scale",
         "uniform_packed_lengths",
         "has_q_offset",
+        "paged_v_tail_is_zero",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -953,10 +956,40 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert run_parameters["validate"].default is True
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
+    assert plan_parameters["paged_v_tail_is_zero"].default is False
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
     assert context_module._PagedContextPlanState.__dataclass_params__.frozen is True
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    (
+        pytest.param(0, id="int-zero"),
+        pytest.param(1, id="int-one"),
+        pytest.param(None, id="none"),
+        pytest.param("true", id="string"),
+    ),
+)
+def test_attention_ts_context_paged_plan_rejects_non_bool_zero_tail_contract(
+    invalid_value,
+) -> None:
+    wrapper = BatchPrefillPagedTSWrapper()
+
+    with pytest.raises(TypeError, match="paged_v_tail_is_zero must be a bool"):
+        wrapper.plan(
+            device="cuda:0",
+            batch_size=1,
+            max_seq_len_q=64,
+            max_kv_len=64,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+            paged_v_tail_is_zero=invalid_value,
+        )
 
 
 def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contract():
@@ -1104,6 +1137,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         output_dtype=torch.float16,
         uniform_packed_lengths=False,
         has_q_offset=False,
+        paged_v_tail_is_zero=False,
     )
 
     def resolve(*args, **kwargs):
@@ -1144,6 +1178,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert calls["plan"]["max_kv_len"] == 65
     assert calls["plan"]["uniform_packed_lengths"] is False
     assert calls["plan"]["has_q_offset"] is False
+    assert calls["plan"]["paged_v_tail_is_zero"] is False
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
@@ -1552,15 +1587,18 @@ def test_attention_ts_context_paged_explicit_uniform_plan_compiles_once(
         mask_type="causal",
         uniform_packed_lengths=True,
         has_q_offset=False,
+        paged_v_tail_is_zero=True,
     )
 
     assert len(compile_specs) == 1
     assert compile_specs[0].uniform_packed_lengths is True
     assert compile_specs[0].has_q_offset is False
+    assert compile_specs[0].paged_v_tail_is_zero is True
     state = wrapper._plan_state
     assert state is not None
     assert state.geometry.uniform_packed_lengths is True
     assert state.geometry.has_q_offset is False
+    assert state.geometry.paged_v_tail_is_zero is True
     assert dict(state.policy)["marker"] == "uniform"
     assert not hasattr(state, "uniform_compiled")
     assert not hasattr(state, "uniform_policy")
@@ -3041,15 +3079,26 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         **common,
         mask_type="dense",
     )
+    zero_tail_geometry = context_module._resolve_paged_plan_geometry(
+        **common,
+        mask_type="causal",
+        paged_v_tail_is_zero=True,
+    )
 
     assert causal_geometry.uniform_packed_lengths is False
     assert causal_geometry.has_q_offset is True
+    assert causal_geometry.paged_v_tail_is_zero is False
     assert causal_geometry.packed_dense_k_mask is False
     assert dense_geometry.uniform_packed_lengths is False
     assert dense_geometry.has_q_offset is False
+    assert dense_geometry.paged_v_tail_is_zero is False
     assert dense_geometry.packed_dense_k_mask is True
+    assert zero_tail_geometry.paged_v_tail_is_zero is True
     assert context_module._paged_context_compile_spec(causal_geometry) != (
         context_module._paged_context_compile_spec(dense_geometry)
+    )
+    assert context_module._paged_context_compile_spec(causal_geometry) != (
+        context_module._paged_context_compile_spec(zero_tail_geometry)
     )
 
 
@@ -3071,6 +3120,18 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
             },
             True,
             id="dynamic-paged",
+        ),
+        pytest.param(
+            {
+                "use_paged_kv": True,
+                "has_uniform_varlen": False,
+                "is_causal": True,
+                "paged_v_tail_is_zero": True,
+                "uniform_seq_len_q": 1024,
+                "uniform_seq_len_k": 1024,
+            },
+            False,
+            id="caller-zeroed-paged-v-tail",
         ),
         pytest.param(
             {
@@ -3158,7 +3219,7 @@ def test_attention_ts_context_paged_v_tail_clear_policy(
     config_overrides,
     expected,
 ):
-    """Only complete exact-uniform causal grids omit the V-tail clear."""
+    """Exact full grids and caller-zeroed tails omit the V-tail clear."""
 
     cfg = FmhaConfig(kv_tile_n=128, q_tile_m=128, **config_overrides)
 

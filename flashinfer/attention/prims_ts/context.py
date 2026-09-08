@@ -166,6 +166,7 @@ class _PagedContextPlanGeometry:
     head_paired: bool
     uniform_packed_lengths: bool
     has_q_offset: bool
+    paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
 
 
@@ -237,6 +238,7 @@ class _PagedContextCompileSpec:
     head_paired: bool
     uniform_packed_lengths: bool
     has_q_offset: bool
+    paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
 
@@ -1368,6 +1370,7 @@ def _resolve_paged_plan_geometry(
     output_dtype: torch.dtype,
     uniform_packed_lengths: bool = False,
     has_q_offset: bool = True,
+    paged_v_tail_is_zero: bool = False,
 ) -> _PagedContextPlanGeometry:
     """Validate explicit static bounds for a reusable paged specialization."""
 
@@ -1377,6 +1380,8 @@ def _resolve_paged_plan_geometry(
         raise TypeError("uniform_packed_lengths must be a bool")
     if not isinstance(has_q_offset, bool):
         raise TypeError("has_q_offset must be a bool")
+    if not isinstance(paged_v_tail_is_zero, bool):
+        raise TypeError("paged_v_tail_is_zero must be a bool")
     if mask_type == "variable_window":
         raise NotImplementedError(
             "mask_type='variable_window' is not supported for paged context"
@@ -1426,6 +1431,7 @@ def _resolve_paged_plan_geometry(
         head_paired=head_paired,
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
+        paged_v_tail_is_zero=paged_v_tail_is_zero,
         packed_dense_k_mask=(
             mask_type == "dense"
             and (not uniform_packed_lengths or max_kv_len % _CONTEXT_KV_TILE_N != 0)
@@ -1537,6 +1543,7 @@ def _paged_context_compile_spec(
         head_paired=geometry.head_paired,
         uniform_packed_lengths=geometry.uniform_packed_lengths,
         has_q_offset=geometry.has_q_offset,
+        paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_paged_context_scheduler(geometry),
     )
@@ -1776,6 +1783,7 @@ def _get_compiled_paged_context(
     head_paired = compile_spec.head_paired
     uniform_packed_lengths = compile_spec.uniform_packed_lengths
     has_q_offset = compile_spec.has_q_offset
+    paged_v_tail_is_zero = compile_spec.paged_v_tail_is_zero
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
     scheduler = compile_spec.scheduler
 
@@ -1815,6 +1823,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
+    fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -1916,6 +1925,7 @@ def _get_compiled_paged_context(
         ("page_size", page_size),
         ("uniform_packed_lengths", uniform_packed_lengths),
         ("has_q_offset", has_q_offset),
+        ("paged_v_tail_is_zero", paged_v_tail_is_zero),
         ("causal_single_kv_tile", False),
         ("packed_dense_k_mask", packed_dense_k_mask),
     )
@@ -2593,11 +2603,14 @@ class BatchPrefillPagedTSWrapper:
     ``run`` may replace either scale tensor without changing the compiled
     specialization. Plans default to a conservative dynamic-length contract;
     callers may instead promise exact-uniform packed lengths or no causal Q
-    offset to compile one narrower specialization. Validation reads request
-    metadata back to the host, checks those promises, and may synchronize. With
-    caller-owned output, ``validate=False`` performs no allocation, metadata
-    readback, or synchronization and is suitable for CUDA graph capture only
-    when the caller already enforces the selected contract.
+    offset to compile one narrower specialization. Callers whose cache
+    preparation zeroes every unused row in an active final V page may also
+    compile out the defensive consumer-side V-tail clear. Validation reads
+    request metadata back to the host, checks the length promises, and may
+    synchronize; it does not inspect V-cache values. With caller-owned output,
+    ``validate=False`` performs no allocation, metadata readback, or
+    synchronization and is suitable for CUDA graph capture only when the caller
+    already enforces the selected contract.
     Replanning invalidates captured graphs; prior launches and replays must
     finish before ``plan`` is called again. Keep the wrapper and all captured
     runtime tensors alive until every graph using the current plan is destroyed.
@@ -2640,6 +2653,7 @@ class BatchPrefillPagedTSWrapper:
         output_scale: float = 1.0,
         uniform_packed_lengths: bool = False,
         has_q_offset: bool = True,
+        paged_v_tail_is_zero: bool = False,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
@@ -2650,10 +2664,13 @@ class BatchPrefillPagedTSWrapper:
         and every runtime K/V length equals ``max_kv_len``.
         ``has_q_offset=False`` promises that every causal request has
         ``Sq == Sk``. Dense attention ignores and canonicalizes the latter
-        flag. The selected contract compiles exactly one specialization and is
-        checked by ``run(validate=True)``. ``validate=False`` skips the checks,
-        so violating either promise can produce incorrect results or invalid
-        memory accesses.
+        flag. ``paged_v_tail_is_zero=True`` separately promises that the unused
+        rows following each request's logical K/V length in its active final V
+        page are zero. The selected contract compiles exactly one
+        specialization. ``run(validate=True)`` checks the length promises but
+        cannot cheaply inspect V-cache contents; callers always own the V-tail
+        promise. Violating a selected promise can produce incorrect results or
+        invalid memory accesses.
 
         ``batch_size`` is exact. Runtime page-table rows must expose at least
         ``ceil(max_kv_len / page_size)`` columns, including inactive padding
@@ -2703,6 +2720,10 @@ class BatchPrefillPagedTSWrapper:
             ``Sk - Sq``. Setting this to ``False`` promises ``Sq == Sk`` for
             every request. Dense attention ignores this flag. Defaults to
             ``True``.
+        paged_v_tail_is_zero : bool
+            Whether unused rows in every active final V-cache page are
+            guaranteed to contain zero. Setting this to ``True`` compiles out
+            the consumer-side V-tail clear. Defaults to ``False``.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -2722,6 +2743,7 @@ class BatchPrefillPagedTSWrapper:
             output_dtype=resolved_out_dtype,
             uniform_packed_lengths=uniform_packed_lengths,
             has_q_offset=has_q_offset,
+            paged_v_tail_is_zero=paged_v_tail_is_zero,
         )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -3118,6 +3140,7 @@ def batch_prefill_with_paged_kv_cache(
         output_scale=output_scale,
         uniform_packed_lengths=geometry.uniform_packed_lengths,
         has_q_offset=geometry.has_q_offset,
+        paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
     )
     return wrapper.run(
         q,
