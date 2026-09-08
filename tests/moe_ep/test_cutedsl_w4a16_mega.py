@@ -2,7 +2,7 @@
 
 Run the single-rank cases with pytest, or the two-rank cases with::
 
-    torchrun --standalone --nproc_per_node=2 -m pytest \
+    torchrun --master-addr=127.0.0.1 --master-port=29531 --nproc_per_node=2 -m pytest \
         tests/moe_ep/test_cutedsl_w4a16_mega.py -v -m gpu_2
 
 The oracle decodes the original packed weights independently of the backend.
@@ -119,7 +119,7 @@ def _decode_nvfp4(packed, block_scale):
     return decoded.to(torch.bfloat16)
 
 
-def _reference_terms(tensors, weights):
+def _reference_terms(tensors, weights, *, gate_up_clamp=None):
     """Return weighted FP32 terms before the final BF16 output conversion."""
     x = tensors.hidden_states.float()
     w13 = _decode_nvfp4(weights.w13, weights.w13_scale).float()
@@ -140,6 +140,9 @@ def _reference_terms(tensors, weights):
                 continue
             fc1 = (x[tokens] @ w13[expert].T) * weights.w13_global_scale[expert]
             gate, up = fc1.chunk(2, dim=-1)
+            if gate_up_clamp is not None:
+                gate = gate.clamp(max=gate_up_clamp)
+                up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
             intermediate = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
             fc2 = (intermediate.float() @ w2[expert].T) * weights.w2_global_scale[
                 expert
@@ -180,7 +183,7 @@ def _inputs(rank, num_tokens, *, skewed=False, sparse=False, hidden=_HIDDEN):
     return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=scores)
 
 
-def _layer(bootstrap, global_weights, *, capacity=_CAPACITY):
+def _layer(bootstrap, global_weights, *, capacity=_CAPACITY, knobs=None):
     from flashinfer.moe_ep import (
         FleetParams,
         MegaConfig,
@@ -209,7 +212,9 @@ def _layer(bootstrap, global_weights, *, capacity=_CAPACITY):
         weights=local_weights,
         backend=MegaConfig(
             megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=global_weights.w13.shape[1] // 2, top_k=_TOP_K
+                intermediate_size=global_weights.w13.shape[1] // 2,
+                top_k=_TOP_K,
+                knobs=knobs,
             )
         ),
     )
@@ -221,10 +226,13 @@ def _check_numerical(
     hidden=_HIDDEN,
     intermediate=_INTERMEDIATE,
     num_tokens=None,
+    knobs=None,
 ):
     bootstrap = _bootstrap(expected_world_size)
     weights = _weights(hidden=hidden, intermediate=intermediate)
-    layer = _layer(bootstrap, weights, capacity=max(_CAPACITY, num_tokens or 0))
+    layer = _layer(
+        bootstrap, weights, capacity=max(_CAPACITY, num_tokens or 0), knobs=knobs
+    )
     try:
         # Reuse one workspace across changing routing and token counts. The
         # empty source rank still owns experts needed by its peers.
@@ -240,7 +248,9 @@ def _check_numerical(
             rounds = (("skewed_tiles", num_tokens, True),)
         for name, count, skewed in rounds:
             tensors = _inputs(bootstrap.rank, count, skewed=skewed, hidden=hidden)
-            terms = _reference_terms(tensors, weights)
+            terms = _reference_terms(
+                tensors, weights, gate_up_clamp=(knobs or {}).get("gate_up_clamp")
+            )
             _barrier()
             actual = layer.forward(tensors)
             _barrier()
@@ -262,7 +272,7 @@ def _check_numerical(
         _barrier()
 
 
-def _check_scale_and_routing_contract(expected_world_size):
+def _check_scale_and_routing_contract(expected_world_size, *, knobs=None):
     bootstrap = _bootstrap(expected_world_size)
     weights = _weights(sparse=True)
     tensors = _inputs(bootstrap.rank, 4, sparse=True)
@@ -285,7 +295,7 @@ def _check_scale_and_routing_contract(expected_world_size):
         "fixture must detect early global-scale rounding"
     )
 
-    layer = _layer(bootstrap, weights)
+    layer = _layer(bootstrap, weights, knobs=knobs)
     try:
         actual = layer.forward(tensors)
         _barrier()
@@ -295,9 +305,9 @@ def _check_scale_and_routing_contract(expected_world_size):
         _barrier()
 
 
-def _check_graph_replay(expected_world_size):
+def _check_graph_replay(expected_world_size, *, knobs=None):
     bootstrap = _bootstrap(expected_world_size)
-    layer = _layer(bootstrap, _weights())
+    layer = _layer(bootstrap, _weights(), knobs=knobs)
     tensors = _inputs(bootstrap.rank, 17)
     try:
         layer.warmup()
@@ -355,12 +365,52 @@ def test_w4a16_mega_two_rank(check):
 )
 def test_w4a16_mega_geometry(expected_world_size, hidden, intermediate, num_tokens):
     # The skew sends every token to experts 0 and 1. 257 rows cross both the
-    # 128-row CTA and 256-row cluster boundaries; EP2 also leaves one rank
-    # without local expert work. The feature tails exercise FC1 and FC2 stores.
-    # H1024/I512 gives 16/8 K tiles, wrapping the six-stage B pipeline in both.
+    # 128-token tiles; EP2 also leaves one rank without local expert work.
+    # The feature tails exercise FC1 and FC2 stores. H1024/I512 gives four/two
+    # K256 tiles and multiple work tiles wrap the two-stage operand pipelines.
     _check_numerical(
         expected_world_size,
         hidden=hidden,
         intermediate=intermediate,
         num_tokens=num_tokens,
+    )
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("token_back_mode", ("epi_warps", "reuse_dispatch_warps"))
+@pytest.mark.parametrize(
+    "expected_world_size",
+    (pytest.param(1, id="ep1"), pytest.param(2, id="ep2", marks=pytest.mark.gpu_2)),
+)
+def test_w4a16_mega_reference_schedule(expected_world_size, token_back_mode):
+    # Existing swapped Mega tuning base. Batched completion must flush at
+    # phase/tail boundaries, including empty experts and consecutive launches.
+    knobs = {
+        "group_hint": 512,
+        "epi_flag_batch": (2, 4),
+        "load_balance_mode": "atomic_counter",
+        "flag_batch": 4,
+        "token_back_mode": token_back_mode,
+    }
+    _check_numerical(expected_world_size, knobs=knobs)
+    # Both K tails, a padded feature CTA, and three logical routed-token tiles.
+    _check_numerical(
+        expected_world_size, hidden=288, intermediate=448, num_tokens=257, knobs=knobs
+    )
+    _check_scale_and_routing_contract(expected_world_size, knobs=knobs)
+    _check_graph_replay(expected_world_size, knobs=knobs)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "expected_world_size",
+    (pytest.param(1, id="ep1"), pytest.param(2, id="ep2", marks=pytest.mark.gpu_2)),
+)
+def test_w4a16_mega_clamp(expected_world_size):
+    _check_numerical(
+        expected_world_size,
+        hidden=288,
+        intermediate=448,
+        num_tokens=257,
+        knobs={"gate_up_clamp": 1.5},
     )

@@ -31,6 +31,39 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.backen
 _E, _H, _I = 2, 64, 64
 
 
+def _native_sf_bytes(scales):
+    """Independent CPU byte address oracle for native128x4 scale blocks."""
+    data = scales.view(torch.uint8)
+    experts, rows, columns = data.shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_columns = (columns + 3) // 4 * 4
+    out = torch.zeros(experts * padded_rows * padded_columns, dtype=torch.uint8)
+    for expert in range(experts):
+        for row in range(rows):
+            for column in range(columns):
+                offset = (
+                    expert * padded_rows * padded_columns
+                    + (row // 128) * 128 * padded_columns
+                    + (column // 4) * 512
+                    + (row % 32) * 16
+                    + (row // 32 % 4) * 4
+                    + column % 4
+                )
+                out[offset] = data[expert, row, column]
+    return out
+
+
+@pytest.fixture(autouse=True)
+def native_scale_interleave():
+    # Production preprocessing remains GPU-only. Host contract tests replace
+    # only the CUDA swizzler, preserving the actual backend row permutation,
+    # dtype reinterpretation and prepared-layout validation around it.
+    with mock.patch(
+        "flashinfer.quantization.block_scale_interleave", side_effect=_native_sf_bytes
+    ) as interleave:
+        yield interleave
+
+
 def _pack():
     def packed(shape):
         rows = torch.arange(shape[0] * shape[1]).reshape(*shape[:2], 1)
@@ -203,7 +236,9 @@ def test_workspace_pool_accepts_list_tuning_values():
     assert pool[keys[1]] is group
 
 
-def test_preparation_preserves_packed_weights_and_separate_fp32_globals():
+def test_preparation_preserves_packed_weights_and_separate_fp32_globals(
+    native_scale_interleave,
+):
     source = _pack()
     alpha13 = torch.tensor([1.00390625, 0.71013], dtype=torch.float32)
     alpha2 = torch.tensor([0.83023, 1.17019], dtype=torch.float32)
@@ -224,12 +259,14 @@ def test_preparation_preserves_packed_weights_and_separate_fp32_globals():
     )
     torch.testing.assert_close(prepared[0][0], source.w13[:, rows], rtol=0, atol=0)
     assert torch.equal(
-        prepared[0][1].view(torch.uint8), source.w13_scale.view(torch.uint8)[:, rows]
+        prepared[0][1].view(torch.uint8),
+        _native_sf_bytes(source.w13_scale.view(torch.uint8)[:, rows]),
     )
     assert torch.equal(prepared[1][0], source.w2)
     assert torch.equal(
-        prepared[1][1].view(torch.uint8), source.w2_scale.view(torch.uint8)
+        prepared[1][1].view(torch.uint8), _native_sf_bytes(source.w2_scale)
     )
+    assert native_scale_interleave.call_count == 4  # Two legs, two preparations.
     for default_leg, scaled_leg, alpha in zip(
         plain, prepared, (alpha13, alpha2), strict=True
     ):
@@ -323,3 +360,34 @@ def test_forward_rejects_prequantized_activation_mode_and_capacity_overflow():
         backend.validate_forward(_inputs(), _fleet(), quantize_input=False)
     with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
         backend.validate_forward(_inputs(num_tokens=5), _fleet(), quantize_input=True)
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(64, 64), (192, 320), (256, 256)])
+def test_native_sf_preparation_and_pretransformed_validation_with_tails(
+    hidden, intermediate
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    pack = PrequantizedMoEWeights(
+        torch.zeros(_E, 2 * intermediate, hidden // 2, dtype=torch.uint8),
+        torch.zeros(_E, hidden, intermediate // 2, dtype=torch.uint8),
+        torch.zeros(_E, 2 * intermediate, hidden // 16, dtype=torch.float8_e4m3fn),
+        torch.zeros(_E, hidden, intermediate // 16, dtype=torch.float8_e4m3fn),
+    )
+    prepared = preprocess_w4a16_cutedsl_mega_weights(
+        pack, intermediate_size=intermediate, hidden_size=hidden
+    )
+    kwargs = dict(
+        intermediate_size=intermediate, hidden_size=hidden, world_size=1, num_experts=_E
+    )
+    validate_transformed_mega_weights(prepared, **kwargs)
+    # A caller supplying pretransformed weights must pass native flat scales,
+    # including padded N rows and K/16 columns, rather than the canonical plane.
+    bad_fc2 = (prepared[1][0], pack.w2_scale, prepared[1][2])
+    with pytest.raises(ValueError, match="native flat E4M3"):
+        validate_transformed_mega_weights((prepared[0], bad_fc2), **kwargs)
+    truncated = (prepared[1][0], prepared[1][1][:-1], prepared[1][2])
+    with pytest.raises(ValueError, match="native flat E4M3"):
+        validate_transformed_mega_weights((prepared[0], truncated), **kwargs)

@@ -22,15 +22,29 @@ def _global_scale(scale: torch.Tensor | None, weight: torch.Tensor) -> torch.Ten
 
 
 def _validate_weight(
-    weight: torch.Tensor, scale: torch.Tensor, shape: tuple[int, int, int]
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shape: tuple[int, int, int],
+    *,
+    native_sf: bool = False,
 ) -> None:
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if weight.dtype not in (torch.uint8, fp4_dtype) or tuple(weight.shape) != shape:
         raise ValueError(f"W4A16 packed weights must be uint8/FP4 with shape {shape}")
-    expected_scale_shape = (*shape[:2], shape[2] // 8)
+    expected_scale_shape: tuple[int, ...]
+    if native_sf:
+        # block_scale_interleave pads each expert's N rows to128 and K/16
+        # scale columns to4, then returns one flat native buffer.
+        padded_rows = ((shape[1] + 127) // 128) * 128
+        padded_columns = ((shape[2] // 8 + 3) // 4) * 4
+        expected_scale_shape = (shape[0] * padded_rows * padded_columns,)
+        layout = "native flat"
+    else:
+        expected_scale_shape = (*shape[:2], shape[2] // 8)
+        layout = "linear"
     if scale.dtype != torch.float8_e4m3fn or tuple(scale.shape) != expected_scale_shape:
         raise ValueError(
-            f"W4A16 block scales must be linear E4M3 with shape {expected_scale_shape}"
+            f"W4A16 block scales must be {layout} E4M3 with shape {expected_scale_shape}"
         )
     if scale.device != weight.device:
         raise ValueError("W4A16 packed weights and scales must be on the same device")
@@ -44,10 +58,14 @@ def preprocess_mega_weights(
 ) -> TransformedMegaWeights:
     """Canonical gate/up weights → packed kernel layout and separate alphas.
 
-    FC1 uses alternating 32-row gate/up blocks. FC2 stays in canonical N,K
-    order. Global scales remain FP32 epilogue operands: multiplying them into
+    FC1 uses alternating32-row gate/up blocks. FC2 stays in canonical N,K
+    order. Block scales are converted once to flat native storage here;
+    runtime launches consume these prepared buffers directly. Global scales
+    remain FP32 epilogue operands: multiplying them into
     decoded BF16 weights would change the existing W4A16 rounding contract.
     """
+    from flashinfer.quantization import block_scale_interleave
+
     local_experts = weights.w13.shape[0]
     if isinstance(weights, PrequantizedMoEWeights):
         w13, w2 = weights.w13, weights.w2
@@ -79,10 +97,20 @@ def preprocess_mega_weights(
             _interleave_gate_up_32(
                 w13.view(torch.uint8), intermediate_size
             ).contiguous(),
-            _interleave_gate_up_32(s13, intermediate_size).contiguous(),
+            block_scale_interleave(
+                _interleave_gate_up_32(s13, intermediate_size)
+                .contiguous()
+                .view(torch.uint8)
+            ).view(torch.float8_e4m3fn),
             alpha1,
         ),
-        (w2.view(torch.uint8).contiguous(), s2.contiguous(), alpha2),
+        (
+            w2.view(torch.uint8).contiguous(),
+            block_scale_interleave(s2.contiguous().view(torch.uint8)).view(
+                torch.float8_e4m3fn
+            ),
+            alpha2,
+        ),
     )
 
 
@@ -104,7 +132,7 @@ def validate_transformed_mega_weights(
         (local_experts, hidden_size, intermediate_size // 2),
     )
     for (weight, scale, alpha), shape in zip(transformed, shapes, strict=True):
-        _validate_weight(weight, scale, shape)
+        _validate_weight(weight, scale, shape, native_sf=True)
         _global_scale(alpha, weight)
         if not all(t.is_contiguous() for t in (weight, scale, alpha)):
             raise ValueError("W4A16 transformed weight tensors must be contiguous")

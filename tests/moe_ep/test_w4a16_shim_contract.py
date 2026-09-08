@@ -176,3 +176,160 @@ def test_buffer_knobs_cannot_replace_required_geometry(symm_factory, field):
     message = "unexpected keyword" if field == "unknown_knob" else "multiple values"
     with pytest.raises(TypeError, match=message):
         symm_factory(4, 4, 2, 64, 64, 0, 1, knobs={field: 1})
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(64, 64), (192, 320), (7168, 2048)])
+def test_tmem_config_preserves_public_geometry_and_swapped_knobs(hidden, intermediate):
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
+        MegaMoEW4A16Config,
+        MegaMoEW4A16Frontend,
+    )
+
+    config = MegaMoEW4A16Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=4,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    assert config.mma_tiler_mnk == (256, 128, 256)
+    frontend = MegaMoEW4A16Frontend(config)
+    frontend.apply_knobs({"mma_tiler_mnk": (256, 128, 256), "group_hint": 512})
+    assert frontend.config.group_hint == 512
+    with pytest.raises(ValueError, match="mma_tiler_mnk"):
+        frontend.apply_knobs({"mma_tiler_mnk": (256, 256, 64)})
+
+
+def test_frontend_validates_native_flat_scale_storage_before_compile():
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
+        MegaMoEW4A16Config,
+        MegaMoEW4A16Frontend,
+        MegaMoEW4A16Inputs,
+    )
+
+    config = MegaMoEW4A16Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=4,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=64,
+        intermediate=64,
+    )
+
+    def tensor(shape, dtype):
+        result = mock.Mock(spec=torch.Tensor)
+        result.shape = shape
+        result.dtype = dtype
+        result.is_cuda = True
+        result.is_contiguous.return_value = True
+        return result
+
+    inputs = MegaMoEW4A16Inputs(
+        tensor((4, 64), torch.bfloat16),
+        tensor((4, 2), torch.int64),
+        tensor((4, 2), torch.float32),
+        tensor((4, 128, 32), torch.uint8),
+        tensor((2048,), torch.float8_e4m3fn),
+        tensor((4,), torch.float32),
+        tensor((4, 64, 32), torch.uint8),
+        tensor((2048,), torch.float8_e4m3fn),
+        tensor((4,), torch.float32),
+        tensor((4, 2, 64), torch.bfloat16),
+    )
+    frontend = MegaMoEW4A16Frontend(config)
+    frontend._validate(inputs, 1)
+    inputs.fc2_weight_sf.shape = (4, 64, 4)
+    with pytest.raises(ValueError, match="native flat E4M3"):
+        frontend._validate(inputs, 1)
+
+
+@pytest.mark.parametrize("hidden,intermediate", ((32, 64), (288, 448)))
+@pytest.mark.parametrize("mode", ("epi_warps", "reuse_dispatch_warps"))
+@pytest.mark.parametrize(
+    "clamp,epi_flags", ((None, (1, 1)), (1.5, (2, 4)), (2.0, (32, 32)))
+)
+def test_tmem_kernel_preserves_public_knob_contract(
+    symm_factory, hidden, intermediate, mode, clamp, epi_flags
+):
+    import cutlass
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.kernel import (
+        Sm100W4A16MegaMoEKernel,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.epilogue import (
+        W4A16Epilogue,
+    )
+
+    workspace = symm_factory(
+        4,
+        257,
+        2,
+        hidden,
+        intermediate,
+        0,
+        1,
+        knobs={
+            "gate_up_clamp": clamp,
+            "token_back_mode": mode,
+            "epi_flag_batch": epi_flags,
+            "load_balance_mode": "atomic_counter",
+        },
+    )
+    try:
+        config = workspace._frontend.config
+        kernel = Sm100W4A16MegaMoEKernel(
+            local_rank=config.rank,
+            mma_tiler_mnk=config.mma_tiler_mnk,
+            cluster_shape_mnk=config.cluster_shape_mnk,
+            use_2cta_instrs=config.use_2cta_instrs,
+            group_hint=512,
+            token_padding_block=128,
+            load_balance_mode=config.load_balance_mode,
+            static_expert_shape=(4, 2 * intermediate, hidden),
+            force_static_sched=True,
+            world_size=1,
+            num_topk=2,
+            max_tokens_per_rank=257,
+            hidden=hidden,
+            token_back_mode=config.token_back_mode,
+            token_back_by_dispatch=mode == "reuse_dispatch_warps",
+            gate_up_clamp=config.gate_up_clamp,
+            epi_flag_batch=config.epi_flag_batch,
+        )
+        epi = W4A16Epilogue(
+            mma_tiler_mnk=config.mma_tiler_mnk,
+            cluster_shape_mn=(2, 1),
+            use_2cta_instrs=True,
+            fc1_output_dtype=cutlass.BFloat16,
+            combine_format=kernel.combine_format,
+            static_expert_shape=(4, 2 * intermediate, hidden),
+            token_back_by_dispatch=kernel.token_back_by_dispatch,
+            gate_up_clamp=kernel.gate_up_clamp,
+            epi_flag_batch=kernel.epi_flag_batch,
+        )
+        assert (epi.fc1_epi_flag_batch, epi.fc2_epi_flag_batch) == epi_flags
+        assert epi.gate_up_clamp == clamp
+        assert epi.epi_smem_bytes == 0 and epi.acc_sf_cols == 0
+        assert not epi.reduce_topk_in_kernel
+        assert kernel.token_comm.num_total_threads == 512
+        assert kernel.token_comm.sf_uint32_per_token == 0
+        by_dispatch = mode == "reuse_dispatch_warps"
+        assert epi.token_back_by_dispatch == by_dispatch
+        regions = kernel._local_region_by_name
+        assert ("fc2_output_workspace" in regions) == by_dispatch
+        assert ("fc2_done_counter" in regions) == by_dispatch
+        if by_dispatch:
+            assert regions["fc2_output_workspace"].cute_dtype is cutlass.BFloat16
+            assert kernel.token_comm.fc2_publishes_per_token_cluster_tile == (
+                2 * ((hidden + 255) // 256)
+            )
+            assert kernel.token_comm.token_back_schedule_mode == "atomic_counter"
+            assert kernel._local_offsets["fc2_done_counter"] + 16 <= (
+                kernel.local_zero_i32_count * 4
+            )
+    finally:
+        workspace.destroy()

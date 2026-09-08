@@ -31,7 +31,7 @@ class MegaMoEW4A16Config:
     num_total_experts: int
     hidden: int
     intermediate: int
-    mma_tiler_mnk: Tuple[int, int, int] = (256, 256, 64)
+    mma_tiler_mnk: Tuple[int, int, int] = (256, 128, 256)
     cluster_shape_mnk: Tuple[int, int, int] = (2, 1, 1)
     use_2cta_instrs: bool = True
     load_balance_mode: Literal["static", "atomic_counter"] = "static"
@@ -66,8 +66,8 @@ class MegaMoEW4A16Config:
             raise ValueError("hidden must be divisible by 32.")
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
-        if self.mma_tiler_mnk != (256, 256, 64):
-            raise ValueError("W4A16 MegaMoE requires mma_tiler_mnk=(256, 256, 64).")
+        if self.mma_tiler_mnk != (256, 128, 256):
+            raise ValueError("W4A16 MegaMoE requires mma_tiler_mnk=(256, 128, 256).")
         if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
             raise ValueError(
                 "W4A16 MegaMoE requires cluster_shape_mnk=(2, 1, 1) "
@@ -127,10 +127,16 @@ class MegaMoEW4A16Frontend:
             self._mega = None
 
     def apply_knobs(self, knobs: dict) -> None:
-        """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from ..tuner import is_valid_bf16, with_knobs
+        """Apply a validated swapped-MMA tuning configuration and invalidate its compile."""
+        from ..tuner import is_valid, with_knobs
 
-        if not is_valid_bf16(knobs):
+        if not is_valid(
+            {
+                "mma_tiler_mnk": self.config.mma_tiler_mnk,
+                "cluster_shape_mnk": self.config.cluster_shape_mnk,
+                **knobs,
+            }
+        ):
             raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
@@ -242,8 +248,10 @@ class MegaMoEW4A16Frontend:
         )
         kwargs = self._runtime_kwargs(inputs, mega)
         kwargs["max_active_clusters"] = max_active_clusters
+        # Match the established local W4A16 compilation resource bound.
+        kwargs["options"] = "--ptxas-options='-maxrregcount=128'"
         if c.enable_iket:
-            kwargs["options"] = "iket"
+            kwargs["options"] += " iket"
         try:
             mega.compiled = cute.compile(kernel, **kwargs)
         except Exception:
@@ -378,10 +386,12 @@ class MegaMoEW4A16Frontend:
             (inputs.fc1_weight, inputs.fc1_weight_sf, inputs.fc1_alpha),
             (inputs.fc2_weight, inputs.fc2_weight_sf, inputs.fc2_alpha),
         ):
-            expected_sf = (*weight.shape[:2], weight.shape[2] // 8)
+            padded_rows = ((weight.shape[1] + 127) // 128) * 128
+            padded_columns = ((weight.shape[2] // 8 + 3) // 4) * 4
+            expected_sf = (weight.shape[0] * padded_rows * padded_columns,)
             if scale.shape != expected_sf or scale.dtype != torch.float8_e4m3fn:
                 raise ValueError(
-                    f"weight scales must be E4M3 with shape {expected_sf}."
+                    f"weight scales must be native flat E4M3 with shape {expected_sf}."
                 )
             if alpha.shape != (c.num_experts_per_rank,) or alpha.dtype != torch.float32:
                 raise ValueError("weight global scales must be FP32 per expert.")

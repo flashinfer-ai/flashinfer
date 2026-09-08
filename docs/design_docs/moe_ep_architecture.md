@@ -56,6 +56,16 @@ local experts, hidden size `H`, and intermediate size `I`, supply:
   omitted scales mean one. These are weight scales, applied after FP32
   GEMM accumulation. Folding them into BF16 decoded weights changes rounding.
 
+Weight preparation interleaves FC1 gate/up rows in groups of 32 and converts
+each scale plane once with `block_scale_interleave`. Prepared scales are flat,
+contiguous E4M3 buffers of `E * round_up(N, 128) * round_up(K/16, 4)` elements
+for each weight plane `[E, N, K/2]`; callers still supply the canonical linear
+scales above. Inside the fused kernel, packed weights and scales are loaded
+with TMA and decoded directly into BF16 operand-A TMEM for GEMM consumption.
+The producer maps FC1 rows to gate16/up16 within each warp. The kernel uses
+M256/N128/K256 allocation geometry with two CTAs and a dynamic routed-token
+MMA width; it does not materialize a full BF16 expert-weight matrix.
+
 ```python
 from flashinfer.moe_ep import (
     MegaConfig,
