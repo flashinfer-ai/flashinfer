@@ -69,15 +69,10 @@ class _ScaledTokenCommArgs:
 
 
 class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
-    """Reuse W4A16's conversion and layout code with two bounded stages.
+    """Reuse local W4A16 layouts with Mega-fitted raw and two TMEM stages."""
 
-    The standalone stage fitter reserves its own epilogue/scheduler storage.
-    Mega has different storage, so this kernel uses the existing minimum of
-    two load and two transform stages and verifies the TMEM partition explicitly.
-    """
-
-    @staticmethod
     def _compute_stages_and_tmem_cols(
+        self,
         tiled_mma,
         mma_tiler_mnk,
         cta_tile_shape_mnk,
@@ -99,7 +94,7 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         cols_per_a = cute.round_up(cta_tile_shape_mnk[2] // 2, 4)
         assert cols_per_acc == 128 and cols_per_a == 128
         # load, transform, acc, unused-C, unused-tile-info, ACC-cols, A-cols.
-        return 2, 2, 2, 1, 1, 2 * cols_per_acc, 2 * cols_per_a
+        return self._raw_stage_count, 2, 2, 1, 1, 2 * cols_per_acc, 2 * cols_per_a
 
 
 class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
@@ -153,8 +148,11 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         self.hidden_bytes = 2 * self.hidden
         self.sf_uint32_per_token = 0
         self.sf_padding_block = 1
-        self.transform_warp_id = (12, 13, 14, 15)
-        self.threads_per_cta = 512
+        # Reuse the local W4A16 same-K-tile split across two transform groups.
+        self.num_transform_warpgroups = 2
+        self.num_transform_warps = 4 * self.num_transform_warpgroups
+        self.transform_warp_id = tuple(range(12, 12 + self.num_transform_warps))
+        self.threads_per_cta = 32 * (12 + self.num_transform_warps)
         # Mirror swapped Mega's per-expert completion threshold. Every FC2
         # feature CTA publishes, including the padded CTA of a partial cluster.
         cluster_fc2_tile_hidden = (
@@ -183,7 +181,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cluster_tile_tokens=self.cluster_tile_tokens,
             cluster_shape_mn=self.cluster_shape_mn,
             dispatch_warp_start=8,
-            num_other_warps=12,
+            num_other_warps=8 + self.num_transform_warps,
             flag_batch=self.flag_batch,
             is_swap_ab=True,
             token_back_schedule_mode=self.token_back_schedule_mode,
@@ -213,7 +211,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
     def name(self):
         return "w4a16_" + super().name()
 
-    def _make_mixed(self, fragment_size, output_tensor):
+    def _make_mixed(self, fragment_size, output_tensor, raw_stages):
         mixed = _MegaMixedInput(
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=True,
@@ -237,11 +235,76 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         mixed.b_dtype = mixed.c_dtype = mixed.mma_dtype = cutlass.BFloat16
         mixed.a_major_mode = mixed.b_major_mode = tcgen05.OperandMajorMode.K
         mixed.c_layout = utils.LayoutEnum.from_tensor(output_tensor)
-        mixed.num_transform_warpgroups = 1
-        mixed.num_transform_warps = 4
+        mixed.num_transform_warpgroups = self.num_transform_warpgroups
+        mixed.num_transform_warps = self.num_transform_warps
         mixed.transform_warp_id = self.transform_warp_id
+        mixed._raw_stage_count = raw_stages
         mixed._setup_attributes()
+        # Only packed A+SF use the fitted depth. The inherited layout helper
+        # shares a load count for A and B; recover its original two-stage B
+        # layout explicitly, leaving activation and both TMEM rings unchanged.
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            mixed.mma_dtype,
+            mixed.a_major_mode,
+            mixed.b_major_mode,
+            mixed.acc_dtype,
+            mixed.cta_group,
+            mixed.mma_tiler[:2],
+            mixed.transform_a_source,
+        )
+        _, _, mixed.smem_layout_b = mixed_input_utils.compute_smem_layout(
+            tiled_mma,
+            mixed.mma_tiler,
+            mixed.a_dtype,
+            mixed.b_dtype,
+            2,
+            mixed.num_trans2mma_stage,
+        )
         return mixed
+
+    @staticmethod
+    def _make_shared_storage(sched_storage_cls, raw_stages):
+        @cute.struct
+        class SharedStorage:
+            raw_barriers: cute.struct.MemRange[cutlass.Int64, 2 * raw_stages]
+            transform_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            activation_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            acc_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            sched_storage: sched_storage_cls  # type: ignore[valid-type]
+            tmem_dealloc: cutlass.Int64
+            tmem_holding: cutlass.Int32
+
+        return SharedStorage
+
+    @staticmethod
+    def _smem_size(shared_storage_cls, comm_storage_cls, mixed):
+        # Keep this order and alignment identical to kernel()'s SmemAllocator.
+        allocations = (
+            (shared_storage_cls.__sizeof__(), shared_storage_cls.__alignof__()),
+            (comm_storage_cls.__sizeof__(), comm_storage_cls.__alignof__()),
+            (cute.size_in_bytes(cutlass.Float4E2M1FN, mixed.smem_layout_a), 128),
+            (cute.size_in_bytes(cutlass.Float8E4M3FN, mixed.smem_layout_scale), 128),
+            (cute.size_in_bytes(cutlass.BFloat16, mixed.smem_layout_b), 128),
+        )
+        size = 0
+        for nbytes, alignment in allocations:
+            size = (size + alignment - 1) // alignment * alignment + nbytes
+        return size
+
+    def _fit_raw_stages(self, output_tensor, sched_params):
+        sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
+            sched_params, SwapABSwigluFp4Fc12SchedExtension, num_drain_warps=0
+        )
+        comm_storage_cls = self.token_comm_extra_smem_storage_class()
+        # CuTe's 227KiB per-block capacity already excludes CUDA's 1KiB
+        # reservation from the SM's 228KiB. All user storage is counted below.
+        capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        for raw_stages in range(5, 1, -1):
+            mixed = self._make_mixed(128, output_tensor, raw_stages)
+            storage_cls = self._make_shared_storage(sched_storage_cls, raw_stages)
+            if self._smem_size(storage_cls, comm_storage_cls, mixed) <= capacity:
+                return mixed, storage_cls
+        raise ValueError("W4A16 MegaMoE cannot fit two raw stages in shared memory.")
 
     @cute.jit
     def __call__(
@@ -486,7 +549,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         e, gateup, h = self.static_expert_shape
         i = gateup // 2
         # Packed uint8 ABI becomes logical FP4 A without copying. Both stages
-        # retain canonical feature order; conversion does not permute gate/up.
+        # expose prepared feature order; the transform permutes gate/up below.
         a1 = cute.make_tensor(
             cute.recast_ptr(fc1_weight.iterator, dtype=cutlass.Float4E2M1FN),
             cute.make_layout((gateup, h, e), stride=(h, 1, gateup * h)),
@@ -517,10 +580,32 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             fc1_output.iterator,
             cute.make_layout((i, fc1_output.shape[0], 1), stride=(1, i, 0)),
         )
-        self.mixed_fc1 = self._make_mixed(128, c_layout_view)
-        self.mixed_fc2 = self._make_mixed(32, c_layout_view)
-        mix = self.mixed_fc1
+        # The minimum-depth layout establishes the scheduler's CTA geometry.
+        mix = self._make_mixed(128, c_layout_view, 2)
         self.cta_tile_shape_mnk = mix.cta_tile_shape_mnk
+        counter_ptr = None
+        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+            counter_ptr = load_balance_counter.iterator
+        sched = MoEFusedFc12SchedulerParams(
+            scenario=self.scenario,
+            expert_shape=self.static_expert_shape,
+            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+            cluster_shape_mn=self.cluster_shape_mn,
+            group_hint=self.group_hint,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=1,
+            load_balance_mode=self.load_balance_mode,
+            load_balance_counter_ptr=counter_ptr,
+            override_num_stages=self.num_sched_stages,
+            is_swap_ab=True,
+            expert_token_prefix_sum=None,
+            expert_token_sizes=expert_token_sizes,
+        )
+        self.mixed_fc1, self.shared_storage_cls = self._fit_raw_stages(
+            c_layout_view, sched
+        )
+        mix = self.mixed_fc1
+        self.mixed_fc2 = self._make_mixed(32, c_layout_view, mix.num_load2trans_stage)
         self.cluster_layout_vmnk = mix.cluster_layout_vmnk
         self.num_acc_stage = self.num_acc_pipeline_stages = 2
         self.num_tmem_alloc_cols = 512
@@ -597,24 +682,6 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cutlass.Float4E2M1FN, raw_stage
         ) + cute.size_in_bytes(cutlass.Float8E4M3FN, mix.smem_layout_scale_per_stage)
         self.b_tx_bytes = cute.size_in_bytes(cutlass.BFloat16, b_stage) * 2
-        counter_ptr = None
-        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
-            counter_ptr = load_balance_counter.iterator
-        sched = MoEFusedFc12SchedulerParams(
-            scenario=self.scenario,
-            expert_shape=self.static_expert_shape,
-            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
-            cluster_shape_mn=self.cluster_shape_mn,
-            group_hint=self.group_hint,
-            token_padding_block=self.token_padding_block,
-            sf_padding_block=1,
-            load_balance_mode=self.load_balance_mode,
-            load_balance_counter_ptr=counter_ptr,
-            override_num_stages=self.num_sched_stages,
-            is_swap_ab=True,
-            expert_token_prefix_sum=None,
-            expert_token_sizes=expert_token_sizes,
-        )
         self.kernel(
             tiled_mma,
             wa1,
@@ -643,7 +710,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             token_comm_args,
         ).launch(
             grid=sched.get_grid_shape(max_active_clusters),
-            block=(512, 1, 1),
+            block=(self.threads_per_cta, 1, 1),
             cluster=(2, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -828,29 +895,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             ),
         )
         sched_cls = sched_params.get_scheduler_type()
-        sched_storage_cls = sched_cls.make_storage_struct(
-            sched_params, ext, num_drain_warps=0
-        )
-
-        @cute.struct
-        class SharedStorage:
-            raw_barriers: cute.struct.MemRange[cutlass.Int64, 4]
-            transform_barriers: cute.struct.MemRange[cutlass.Int64, 4]
-            activation_barriers: cute.struct.MemRange[cutlass.Int64, 4]
-            acc_barriers: cute.struct.MemRange[cutlass.Int64, 4]
-            sched_storage: sched_storage_cls
-            tmem_dealloc: cutlass.Int64
-            tmem_holding: cutlass.Int32
-
         smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        storage = smem.allocate(self.shared_storage_cls)
         comm_storage = smem.allocate(self.token_comm_extra_smem_storage_class())
         raw_pipe = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.raw_barriers.data_ptr(),
-            num_stages=2,
+            num_stages=mix.num_load2trans_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, mix.num_mcast_ctas_a * 4
+                pipeline.Agent.Thread, mix.num_mcast_ctas_a * self.num_transform_warps
             ),
             tx_count=self.a_tx_bytes,
             cta_layout_vmnk=cluster_layout,
@@ -861,7 +914,9 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         transform_pipe = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.transform_barriers.data_ptr(),
             num_stages=2,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128 * 2),
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * self.num_transform_warps * 2
+            ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout,
             defer_sync=True,
@@ -889,7 +944,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         tmem = utils.TmemAllocator(
             storage.tmem_holding.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(
-                barrier_id=self.tmem_alloc_sync_bar_id, num_threads=32 * 9
+                barrier_id=self.tmem_alloc_sync_bar_id,
+                num_threads=32 * (5 + self.num_transform_warps),
             ),
             allocator_warp_id=0,
             is_two_cta=True,
@@ -901,7 +957,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cute.arch.block_idx(),
             cute.arch.grid_dim(),
             sched_storage=storage.sched_storage,
-            num_consumer_threads=32 * 11,
+            num_consumer_threads=32 * (7 + self.num_transform_warps),
             ext=ext,
         )
         consumer = scheduler.make_consumer()
@@ -936,8 +992,11 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         if warp < 5 or warp >= 12:
             tmem.wait_for_alloc()
 
-        if warp == 7:
+        if warp >= 4 and warp < 8:
+            # A warpgroup must execute the same register-redistribution instruction.
             cute.arch.setmaxregister_decrease(80)
+
+        if warp == 7:
             self.token_comm_hook_sched_warp_pre_init_wait(token_comm_args)
             if cutlass.const_expr(not early_init):
                 scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
@@ -950,8 +1009,9 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             scheduler.produce_tail()
 
         if warp == 5:
-            cute.arch.setmaxregister_decrease(80)
-            state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
+            state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, mix.num_load2trans_stage
+            )
             work = consumer.consume_work()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
@@ -992,7 +1052,6 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             raw_pipe.producer_tail(state)
 
         if warp == 6:
-            cute.arch.setmaxregister_decrease(80)
             state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
             work = consumer.consume_work()
             while work.is_valid_tile:
@@ -1039,6 +1098,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             activation_pipe.producer_tail(state)
 
         if warp >= 12:
+            # Redistribute only the CTA's initial 640*96 register allocation.
+            # 128*(176+80+64+80+80) = 61440 registers after redistribution.
+            cute.arch.setmaxregister_decrease(80)
+            # Both groups decode disjoint halves of the same K tile. This
+            # 80-register budget keeps both groups within the CTA register pool.
+            transform_group_idx = (warp - self.transform_warp_id[0]) // 4
+            transform_local_tidx = tidx - 32 * (
+                self.transform_warp_id[0] + transform_group_idx * 4
+            )
             # Mirror local W4A16's gated transform view: the public prepared
             # weights remain gate32/up32, but each MMA/epilogue warp owns a
             # gate16/up16 TMEM band. Permute packed A and SF identically,
@@ -1067,8 +1135,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 None,
                 sf_fc1_transform,
                 accumulators,
-                tidx - 384,
-                cutlass.Int32(0),
+                transform_local_tidx,
+                transform_group_idx,
             )
             parts_fc2 = self.mixed_fc2._setup_transform_partitions(
                 mma,
@@ -1079,11 +1147,11 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 None,
                 sf_for_transform,
                 accumulators,
-                tidx - 384,
-                cutlass.Int32(0),
+                transform_local_tidx,
+                transform_group_idx,
             )
             raw_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 2
+                pipeline.PipelineUserType.Consumer, mix.num_load2trans_stage
             )
             transform_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, 2
@@ -1112,7 +1180,6 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             transform_pipe.producer_tail(transform_state)
 
         if warp == 4:
-            cute.arch.setmaxregister_decrease(80)
             acc = cute.make_tensor(tmem.retrieve_ptr(cutlass.Float32), acc_fake.layout)
             a_ptr = cute.recast_ptr(acc.iterator + 256, dtype=cutlass.BFloat16)
             a_frag = cute.make_tensor(

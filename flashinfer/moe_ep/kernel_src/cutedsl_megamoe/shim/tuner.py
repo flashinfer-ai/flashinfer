@@ -153,6 +153,10 @@ _MXFP8_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "atomic_counter",
 }
 
+# W4A16 uses the measured flag4/epi-warp atomic profile at every buffer size.
+# Reuse the existing N128 profile without NVFP4's larger-batch transitions.
+_W4A16_TOKEN_KNOBS: Dict[str, Any] = dict(_SMALL_TOKEN_KNOBS)
+
 # TODO: WIP BF16 supports one validated fixed MMA/cluster geometry.
 _BF16_TOKEN_KNOBS: Dict[str, Any] = {
     "mma_tiler_mnk": (256, 256, 64),
@@ -181,6 +185,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     ``mma_tiler_mnk``: the MXFP8 kernel hard-requires
     ``mma_tiler (M, N) = (256, 256)``.
 
+    ``dtype="w4a16"`` -> fixed N128, flag4, epi-warp atomic profile.
+
     ``dtype="bf16"`` -> one validated fixed MMA/cluster geometry.
 
     NVFP4 profiles were re-validated 2026-07-15 on the corrected K-major
@@ -193,6 +199,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
 
     Returns a fresh dict each call.
     """
+    if dtype == "w4a16":
+        return dict(_W4A16_TOKEN_KNOBS)
     if dtype == "bf16":
         return dict(_BF16_TOKEN_KNOBS)
     if dtype == "mxfp8":

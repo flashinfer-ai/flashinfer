@@ -14,6 +14,7 @@ is present. Graph comparisons use exact eager/replay equality.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 
 import pytest
@@ -227,9 +228,16 @@ def _check_numerical(
     intermediate=_INTERMEDIATE,
     num_tokens=None,
     knobs=None,
+    normalize_fc1=False,
 ):
     bootstrap = _bootstrap(expected_world_size)
     weights = _weights(hidden=hidden, intermediate=intermediate)
+    if normalize_fc1:
+        # Keep random FC1 variance bounded as fan-in grows. This changes only
+        # the fixture's FP32 global scale, after the decoded BF16-weight MMA.
+        weights = dataclasses.replace(
+            weights, w13_global_scale=weights.w13_global_scale / math.sqrt(hidden)
+        )
     layer = _layer(
         bootstrap, weights, capacity=max(_CAPACITY, num_tokens or 0), knobs=knobs
     )
@@ -355,24 +363,35 @@ def test_w4a16_mega_two_rank(check):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    ("hidden", "intermediate", "num_tokens"),
-    ((64, 64, 257), (192, 320, 257), (1024, 512, 257)),
-    ids=("h64_i64_m257", "h192_i320_m257", "h1024_i512_m257"),
+    ("hidden", "intermediate", "num_tokens", "normalize_fc1"),
+    (
+        (64, 64, 257, False),
+        (192, 320, 257, False),
+        (1024, 512, 257, False),
+        (9216, 64, 257, True),
+    ),
+    ids=("h64_i64_m257", "h192_i320_m257", "h1024_i512_m257", "h9216_i64_m257"),
 )
 @pytest.mark.parametrize(
     "expected_world_size",
     (pytest.param(1, id="ep1"), pytest.param(2, id="ep2", marks=pytest.mark.gpu_2)),
 )
-def test_w4a16_mega_geometry(expected_world_size, hidden, intermediate, num_tokens):
+def test_w4a16_mega_geometry(
+    expected_world_size, hidden, intermediate, num_tokens, normalize_fc1
+):
     # The skew sends every token to experts 0 and 1. 257 rows cross both the
     # 128-token tiles; EP2 also leaves one rank without local expert work.
     # The feature tails exercise FC1 and FC2 stores. H1024/I512 gives four/two
     # K256 tiles and multiple work tiles wrap the two-stage operand pipelines.
+    # H9216/I64 fits four preferred-five raw stages; its 36 FC1 K tiles
+    # exercise that fitted ring repeatedly, alongside the one-tile FC2 tail.
+    # Only that large-fan-in fixture scales FC1 globals by 1/sqrt(H).
     _check_numerical(
         expected_world_size,
         hidden=hidden,
         intermediate=intermediate,
         num_tokens=num_tokens,
+        normalize_fc1=normalize_fc1,
     )
 
 

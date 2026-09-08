@@ -248,8 +248,9 @@ class MegaMoEW4A16Frontend:
         )
         kwargs = self._runtime_kwargs(inputs, mega)
         kwargs["max_active_clusters"] = max_active_clusters
-        # Match the established local W4A16 compilation resource bound.
-        kwargs["options"] = "--ptxas-options='-maxrregcount=128'"
+        # The 640-thread launch starts with 96 registers per thread; steady
+        # targets 176/80/64/80/80 reuse its initial 61440 registers.
+        kwargs["options"] = "--ptxas-options='-maxrregcount=96'"
         if c.enable_iket:
             kwargs["options"] += " iket"
         try:
@@ -496,7 +497,15 @@ def get_symm_buffer_for_w4a16_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
+    from ..tuner import default_knobs
+
+    # Match other Mega frontends: an explicit dict (including {}) bypasses
+    # defaults. Named correctness arguments retain their existing precedence.
+    default_config = (
+        default_knobs(num_max_tokens, dtype="w4a16") if knobs is None else {}
+    )
     optional_config = {
+        **default_config,
         "gate_up_clamp": clamp,
         "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
         "token_back_mode": token_back_mode,

@@ -62,9 +62,24 @@ contiguous E4M3 buffers of `E * round_up(N, 128) * round_up(K/16, 4)` elements
 for each weight plane `[E, N, K/2]`; callers still supply the canonical linear
 scales above. Inside the fused kernel, packed weights and scales are loaded
 with TMA and decoded directly into BF16 operand-A TMEM for GEMM consumption.
+Two decode warpgroups use the existing local W4A16 partition to transform
+disjoint halves of each K tile and publish one complete TMEM operand stage.
 The producer maps FC1 rows to gate16/up16 within each warp. The kernel uses
 M256/N128/K256 allocation geometry with two CTAs and a dynamic routed-token
 MMA width; it does not materialize a full BF16 expert-weight matrix.
+
+The packed-weight and scale ring uses up to five stages, selected from the
+actual shared-memory layouts and scheduler storage. The BF16 activation,
+decoded TMEM, and accumulator rings retain two stages. Larger hidden sizes
+reduce the raw ring depth to fit shared memory; shapes that cannot fit two
+raw stages are rejected before compilation.
+
+With `knobs=None`, W4A16 uses the existing small-token scheduling profile:
+`group_hint=512`, `flag_batch=4`, `epi_flag_batch=(2, 4)`,
+`load_balance_mode="atomic_counter"`, and `token_back_mode="epi_warps"`.
+An explicit knob dictionary, including `{}`, preserves the existing manual
+configuration behavior instead of merging these defaults. This backend does
+not yet use the on-disk knob cache or online tuner.
 
 ```python
 from flashinfer.moe_ep import (

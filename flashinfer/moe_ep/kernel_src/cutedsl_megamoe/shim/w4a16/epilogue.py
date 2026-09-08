@@ -205,7 +205,7 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
 
             work_tile_info = sched_consumer.consume_work()
 
-            # Drain fc1 TMA stores and sf stores before publishing the fc1-done counter.
+            # Drain pending FC1 stores before publishing the fc1-done counter.
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)

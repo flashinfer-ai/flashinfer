@@ -137,6 +137,63 @@ def symm_factory():
         yield factory
 
 
+@pytest.mark.parametrize("num_tokens", (1, 4096))
+@pytest.mark.parametrize(
+    ("knobs", "token_back_mode", "expected"),
+    (
+        (None, "epi_warps", (512, 4, (2, 4), "atomic_counter", "epi_warps")),
+        (
+            None,
+            "reuse_dispatch_warps",
+            (512, 4, (2, 4), "atomic_counter", "reuse_dispatch_warps"),
+        ),
+        ({}, "epi_warps", (None, 1, (1, 1), "static", "epi_warps")),
+        (
+            {
+                "group_hint": 64,
+                "flag_batch": 8,
+                "token_back_mode": "reuse_dispatch_warps",
+            },
+            "epi_warps",
+            (64, 8, (1, 1), "static", "reuse_dispatch_warps"),
+        ),
+    ),
+    ids=("default", "named_return", "empty", "explicit"),
+)
+def test_buffer_default_profile_and_explicit_overrides(
+    symm_factory, num_tokens, knobs, token_back_mode, expected
+):
+    original = None if knobs is None else dict(knobs)
+    workspace = symm_factory(
+        4,
+        num_tokens,
+        2,
+        64,
+        64,
+        0,
+        1,
+        gate_up_clamp=1.5,
+        token_back_mode=token_back_mode,
+        knobs=knobs,
+    )
+    try:
+        config = workspace._frontend.config
+        assert (
+            config.group_hint,
+            config.flag_batch,
+            config.epi_flag_batch,
+            config.load_balance_mode,
+            config.token_back_mode,
+        ) == expected
+        assert config.mma_tiler_mnk == (256, 128, 256)
+        assert config.cluster_shape_mnk == (2, 1, 1)
+        assert config.gate_up_clamp == 1.5
+        assert not config.apply_topk_in_fc1 and not config.in_kernel_fc2_reduce
+        assert knobs == original
+    finally:
+        workspace.destroy()
+
+
 @pytest.mark.parametrize("default_reduce", (False, True))
 def test_buffer_knobs_override_optional_defaults(symm_factory, default_reduce):
     workspace = symm_factory(
@@ -315,7 +372,7 @@ def test_tmem_kernel_preserves_public_knob_contract(
         assert epi.gate_up_clamp == clamp
         assert epi.epi_smem_bytes == 0 and epi.acc_sf_cols == 0
         assert not epi.reduce_topk_in_kernel
-        assert kernel.token_comm.num_total_threads == 512
+        assert kernel.token_comm.num_total_threads == 640
         assert kernel.token_comm.sf_uint32_per_token == 0
         by_dispatch = mode == "reuse_dispatch_warps"
         assert epi.token_back_by_dispatch == by_dispatch
