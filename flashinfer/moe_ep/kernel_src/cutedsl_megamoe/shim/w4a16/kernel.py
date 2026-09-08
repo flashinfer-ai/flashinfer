@@ -494,11 +494,26 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEBf16Kernel):
                 )
                 sf = cutlass.Uint32(sf_ptr[0])
             decoded = e2m1x16_e4m3_to_bf16x16(lo, hi, sf)
-            for element in cutlass.range_constexpr(16):
-                kc = col + element
-                sB[
-                    ((row % atom_n, kc % atom_k), row // atom_n, kc // atom_k, stage)
-                ] = decoded[element]
+            # Slice the actual MMA B tensor, preserving its shared-memory
+            # swizzle. Each 16-value block stays within one atom-K slice.
+            assert atom_k % 16 == 0
+            sB_row = sB[((row % atom_n, None), row // atom_n, col // atom_k, stage)]
+            store_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.BFloat16,
+                num_bits_per_copy=128,
+            )
+            # Use two exact 8-BF16 views: SW128 can permute these 16-byte
+            # segments, so the entire 32-byte decoded block is not flattened.
+            for half in cutlass.range_constexpr(2):
+                rB_half = cute.make_rmem_tensor(8, cutlass.BFloat16)
+                rB_half = cute.make_tensor(
+                    rB_half.iterator.align(min_align=16), rB_half.layout
+                )
+                for element in cutlass.range_constexpr(8):
+                    rB_half[element] = decoded[half * 8 + element]
+                sB_half = cute.local_tile(sB_row, (8,), (col % atom_k // 8 + half,))
+                cute.copy(store_atom, rB_half, sB_half)
 
     @cute.kernel
     def kernel(
