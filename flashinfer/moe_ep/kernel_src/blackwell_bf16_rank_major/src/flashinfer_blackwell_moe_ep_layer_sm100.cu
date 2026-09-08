@@ -19,8 +19,12 @@
 #include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 struct __align__(128) FlashInferTensorMap { uint64_t opaque[16]; };
+struct __align__(64) FlashInferTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(FlashInferTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(FlashInferTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 template <int N>
 struct __align__(128) FlashInferTensorMapPack { FlashInferTensorMap maps[N]; };
 
@@ -51,6 +55,11 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
+__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
+    asm volatile("mbarrier.init.b64 [%0], %1;"
+        :: "l"(mbar_addr), "r"(count));
+}
+
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
     asm volatile(
@@ -79,6 +88,7 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
+
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
 // explicit loop still makes this helper blocking until acquire succeeds.
@@ -97,19 +107,104 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+
+__device__ __forceinline__ void mbarrier_wait_suspend(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_SUSPEND:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_SUSPEND;\n\t"
+        "bra.uni LAB_WAIT_SUSPEND;\n\t"
+        "DONE_SUSPEND:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT_CLUSTER:\n\t"
         "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE_CLUSTER;\n\t"
         "bra.uni LAB_WAIT_CLUSTER;\n\t"
         "DONE_CLUSTER:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        ".reg .u32 WAIT_ADDR;\n\t"
+        "mov.u32 WAIT_ADDR, %0;\n\t"
+        "LAB_WAIT_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [WAIT_ADDR], %1, %2;\n\t"
+        "@P1 bra.uni DONE_HINT;\n\t"
+        "bra.uni LAB_WAIT_HINT;\n\t"
+        "DONE_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED_HINT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra DONE_RELAXED_HINT;\n\t"
+        "bra LAB_WAIT_RELAXED_HINT;\n\t"
+        "DONE_RELAXED_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
@@ -118,9 +213,30 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
     }
 }
 
+__device__ __forceinline__ void mbarrier_wait_token_suspend(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
 __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
     if (token == 0) {
         mbarrier_wait_cluster(mbar_addr, phase);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
     }
 }
 
@@ -352,8 +468,9 @@ __global__ __launch_bounds__(32) void
 kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __restrict__ topk_ids, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -429,12 +546,16 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ hidden_states, __nv_bfloat16* const* __restrict__ hidden_states_peers, int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, float* __restrict__ topk_weights, float* const* __restrict__ topk_weights_peers)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int mbar_base = smem;
+    #define row_full_addr (mbar_base + 0)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -447,7 +568,7 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     float* weights_stage = reinterpret_cast<float*>(smem_raw + 15392);
     const int weights_stage_addr = smem + 15392;
 
-    // Mbarrier init (1 groups, 1 barriers)
+    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
     // Mbarriers at smem_raw[0..8)
 
     if (warp == 0) {
@@ -460,9 +581,6 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     }
 
     __syncthreads();
-
-    const int mbar_base = smem;
-    #define row_full_addr (mbar_base + 0)
 
     // === Task calls (dependency order) ===
     int active_token = bid;
@@ -563,8 +681,9 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_route_reset_exact_v1(int* __restrict__ expert_scatter_offsets, __nv_bfloat16* __restrict__ zero_sentinel)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -596,8 +715,9 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_route_count_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -637,8 +757,9 @@ __global__ __launch_bounds__(32) void
 kernel_rank_major_route_finalize_exact_v1(int* __restrict__ expert_scatter_offsets, int* __restrict__ cta_to_expert, int* __restrict__ cta_to_mn_limit, int* __restrict__ expert_padded_row_offsets, int* __restrict__ num_non_exiting_ctas, int* __restrict__ total_padded_rows, int* __restrict__ route_map)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -718,8 +839,9 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_route_scatter_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_padded_row_offsets, int* __restrict__ route_map, int* __restrict__ token_to_permuted, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -773,8 +895,8 @@ kernel_rank_major_route_scatter_exact_v1(int* __restrict__ recv_local_ids, int* 
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_FAST_DRAIN_RESPONSE_OFF 214064
-#define SMEM_FAST_DRAIN_RESPONSE_STAGE_BYTES 16
-#define SMEM_FAST_DRAIN_RESPONSE_STRIDE 16
+#define SMEM_FAST_DRAIN_RESPONSE_STAGE_BYTES 64
+#define SMEM_FAST_DRAIN_RESPONSE_STRIDE 64
 #define SMEM_TOTAL 223232
 #define THREADS 384
 
@@ -784,12 +906,26 @@ __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
 kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashInferTensorMap const* recv_hidden, FlashInferTensorMap const* compact_intermediate, int* __restrict__ route_map, int* __restrict__ num_non_exiting_ctas, int* __restrict__ cta_idx_y_to_batch_idx, int* __restrict__ cta_idx_y_to_mn_limit, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int mbar_base = smem;
+    #define a_full_addr (mbar_base + 0)
+    #define a_free_addr (mbar_base + 40)
+    #define b_full_addr (mbar_base + 80)
+    #define b_free_addr (mbar_base + 120)
+    #define mma_full_addr (mbar_base + 160)
+    #define mma_free_addr (mbar_base + 176)
+    #define work_full_addr (mbar_base + 192)
+    #define work_empty_addr (mbar_base + 216)
+    #define throttle_full_addr (mbar_base + 240)
+    #define throttle_empty_addr (mbar_base + 264)
+    #define drain_full_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -819,7 +955,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
     unsigned int* fast_drain_response = reinterpret_cast<unsigned int*>(smem_raw + 214064);
     const int fast_drain_response_addr = smem + 214064;
 
-    // Mbarrier init (11 groups, 37 barriers)
+    // Mbarrier init (11 pipeline groups, 0 ordered-sequence groups, 37 barriers)
     // Mbarriers at smem_raw[0..296)
 
     if (warp == 0) {
@@ -898,18 +1034,6 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    const int mbar_base = smem;
-    #define a_full_addr (mbar_base + 0)
-    #define a_free_addr (mbar_base + 40)
-    #define b_full_addr (mbar_base + 80)
-    #define b_free_addr (mbar_base + 120)
-    #define mma_full_addr (mbar_base + 160)
-    #define mma_free_addr (mbar_base + 176)
-    #define work_full_addr (mbar_base + 192)
-    #define work_empty_addr (mbar_base + 216)
-    #define throttle_full_addr (mbar_base + 240)
-    #define throttle_empty_addr (mbar_base + 264)
-    #define drain_full_addr (mbar_base + 288)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -1256,7 +1380,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_3)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_6 = 0;
                 asm volatile(
@@ -1266,7 +1390,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_6)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_7 = 0;
                 asm volatile(
@@ -1276,7 +1400,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_7)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -1468,7 +1592,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
                         : "=r"(_clc_valid_2)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_4 = 0;
                     asm volatile(
@@ -1478,7 +1602,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_4)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_5 = 0;
                     asm volatile(
@@ -1488,7 +1612,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_5)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
@@ -1561,7 +1685,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_0)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_0 = 0;
                 asm volatile(
@@ -1571,7 +1695,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_0)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_1 = 0;
                 asm volatile(
@@ -1581,7 +1705,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_1)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -1660,7 +1784,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_1)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_2 = 0;
                 asm volatile(
@@ -1670,7 +1794,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_2)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_3 = 0;
                 asm volatile(
@@ -1680,7 +1804,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_3)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -1733,28 +1857,28 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 0 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 16), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 1 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 32), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 2 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 48), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 3 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                             }
                             mbarrier_wait(drain_full_addr + (drain_stage) * 8, _phase_drain_full);
@@ -1769,7 +1893,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_4)
-                                : "r"(fast_drain_response_addr)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 0 * 16)
                                 : "memory");
                             canceled += _clc_valid_4;
                             uint32_t _clc_valid_5 = 0;
@@ -1782,7 +1906,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_5)
-                                : "r"(fast_drain_response_addr + 16)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 1 * 16)
                                 : "memory");
                             canceled += _clc_valid_5;
                             uint32_t _clc_valid_6 = 0;
@@ -1795,7 +1919,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_6)
-                                : "r"(fast_drain_response_addr + 32)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 2 * 16)
                                 : "memory");
                             canceled += _clc_valid_6;
                             uint32_t _clc_valid_7 = 0;
@@ -1808,18 +1932,17 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_7)
-                                : "r"(fast_drain_response_addr + 48)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 3 * 16)
                                 : "memory");
                             canceled += _clc_valid_7;
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            drain_stage += 1;
-                            if (drain_stage == 1) { drain_stage = 0; _phase_drain_full ^= 1; }
+                            _phase_drain_full ^= 1;
                             if (canceled == 0) {
                                 break;
                             }
                         }
                     }
-                    mbarrier_wait_cluster(work_empty_addr + (work_stage_4) * 8, _phase_work_empty);
+                    mbarrier_wait_cluster_hint(work_empty_addr + (work_stage_4) * 8, _phase_work_empty, 10000000);
                     if (lane < 2) {
                         asm volatile(
                             "{\n\t"
@@ -1835,7 +1958,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                 ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
                                 " [%0], [%1];"
-                            :: "r"(work_response_addr + work_stage_4 * 16), "r"(work_full_addr + work_stage_4 * 8)
+                            :: "r"(work_response_addr + work_stage_4 * 16 + 0 * 16), "r"(work_full_addr + work_stage_4 * 8)
                             : "memory");
                     }
                     mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
@@ -1849,7 +1972,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
                         : "=r"(_clc_valid_8)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_8 = 0;
                     asm volatile(
@@ -1859,7 +1982,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_8)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_9 = 0;
                     asm volatile(
@@ -1869,7 +1992,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_9)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
@@ -1888,7 +2011,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                 }
                 #pragma unroll
                 for (int _tail = 0; _tail < 3; _tail++) {
-                    mbarrier_wait_cluster(work_empty_addr + (work_stage_4) * 8, _phase_work_empty);
+                    mbarrier_wait_cluster_hint(work_empty_addr + (work_stage_4) * 8, _phase_work_empty, 10000000);
                     work_stage_4 += 1;
                     if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_empty ^= 1; _phase_work_full_4 ^= 1; }
                 }
@@ -1916,7 +2039,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_9)
-                    : "r"(work_response_addr + work_stage_5 * 16)
+                    : "r"(work_response_addr + work_stage_5 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_10 = 0;
                 asm volatile(
@@ -1926,7 +2049,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_10)
-                    : "r"(work_response_addr + work_stage_5 * 16)
+                    : "r"(work_response_addr + work_stage_5 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_11 = 0;
                 asm volatile(
@@ -1936,7 +2059,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_11)
-                    : "r"(work_response_addr + work_stage_5 * 16)
+                    : "r"(work_response_addr + work_stage_5 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -2027,8 +2150,8 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_FAST_DRAIN_RESPONSE_OFF 223280
-#define SMEM_FAST_DRAIN_RESPONSE_STAGE_BYTES 16
-#define SMEM_FAST_DRAIN_RESPONSE_STRIDE 16
+#define SMEM_FAST_DRAIN_RESPONSE_STAGE_BYTES 64
+#define SMEM_FAST_DRAIN_RESPONSE_STRIDE 64
 #define SMEM_TOTAL 223360
 #define THREADS 256
 
@@ -2038,12 +2161,26 @@ __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* C, int* __restrict__ num_non_exiting_ctas, int* __restrict__ cta_idx_y_to_batch_idx, int* __restrict__ cta_idx_y_to_mn_limit, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int mbar_base = smem;
+    #define a_full_addr (mbar_base + 0)
+    #define a_free_addr (mbar_base + 40)
+    #define b_full_addr (mbar_base + 80)
+    #define b_free_addr (mbar_base + 120)
+    #define mma_full_addr (mbar_base + 160)
+    #define mma_free_addr (mbar_base + 176)
+    #define work_full_addr (mbar_base + 192)
+    #define work_empty_addr (mbar_base + 216)
+    #define throttle_full_addr (mbar_base + 240)
+    #define throttle_empty_addr (mbar_base + 264)
+    #define drain_full_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -2075,7 +2212,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     unsigned int* fast_drain_response = reinterpret_cast<unsigned int*>(smem_raw + 223280);
     const int fast_drain_response_addr = smem + 223280;
 
-    // Mbarrier init (11 groups, 37 barriers)
+    // Mbarrier init (11 pipeline groups, 0 ordered-sequence groups, 37 barriers)
     // Mbarriers at smem_raw[0..296)
 
     if (warp == 0) {
@@ -2154,18 +2291,6 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    const int mbar_base = smem;
-    #define a_full_addr (mbar_base + 0)
-    #define a_free_addr (mbar_base + 40)
-    #define b_full_addr (mbar_base + 80)
-    #define b_free_addr (mbar_base + 120)
-    #define mma_full_addr (mbar_base + 160)
-    #define mma_free_addr (mbar_base + 176)
-    #define work_full_addr (mbar_base + 192)
-    #define work_empty_addr (mbar_base + 216)
-    #define throttle_full_addr (mbar_base + 240)
-    #define throttle_empty_addr (mbar_base + 264)
-    #define drain_full_addr (mbar_base + 288)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -2530,7 +2655,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_3)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_9 = 0;
                 asm volatile(
@@ -2540,7 +2665,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_9)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_10 = 0;
                 asm volatile(
@@ -2550,7 +2675,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_10)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_11 = 0;
                 asm volatile(
@@ -2560,7 +2685,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_11)
-                    : "r"(work_response_addr + work_stage * 16)
+                    : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -2756,7 +2881,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
                         : "=r"(_clc_valid_2)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_6 = 0;
                     asm volatile(
@@ -2766,7 +2891,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_6)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_7 = 0;
                     asm volatile(
@@ -2776,7 +2901,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_7)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_8 = 0;
                     asm volatile(
@@ -2786,7 +2911,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_8)
-                        : "r"(work_response_addr + work_stage_1 * 16)
+                        : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
@@ -2860,7 +2985,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_0)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_0 = 0;
                 asm volatile(
@@ -2870,7 +2995,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_0)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_1 = 0;
                 asm volatile(
@@ -2880,7 +3005,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_1)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_2 = 0;
                 asm volatile(
@@ -2890,7 +3015,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_2)
-                    : "r"(work_response_addr + work_stage_2 * 16)
+                    : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -2963,7 +3088,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
                     : "=r"(_clc_valid_1)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_3 = 0;
                 asm volatile(
@@ -2973,7 +3098,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_3)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_4 = 0;
                 asm volatile(
@@ -2983,7 +3108,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_4)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 uint32_t _clc_ctaid_5 = 0;
                 asm volatile(
@@ -2993,7 +3118,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                     "clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
                     "}\n"
                     : "=r"(_clc_ctaid_5)
-                    : "r"(work_response_addr + work_stage_3 * 16)
+                    : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
@@ -3049,28 +3174,28 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 0 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 16), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 1 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 32), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 2 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                                 asm volatile(
                                     "fence.proxy.async.shared::cta;\n\t"
                                     "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                         ".mbarrier::complete_tx::bytes.b128"
                                         " [%0], [%1];"
-                                    :: "r"(fast_drain_response_addr + 48), "r"(drain_full_addr + drain_stage * 8)
+                                    :: "r"(fast_drain_response_addr + drain_stage * 64 + 3 * 16), "r"(drain_full_addr + drain_stage * 8)
                                     : "memory");
                             }
                             mbarrier_wait(drain_full_addr + (drain_stage) * 8, _phase_drain_full);
@@ -3085,7 +3210,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_4)
-                                : "r"(fast_drain_response_addr)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 0 * 16)
                                 : "memory");
                             canceled += _clc_valid_4;
                             uint32_t _clc_valid_5 = 0;
@@ -3098,7 +3223,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_5)
-                                : "r"(fast_drain_response_addr + 16)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 1 * 16)
                                 : "memory");
                             canceled += _clc_valid_5;
                             uint32_t _clc_valid_6 = 0;
@@ -3111,7 +3236,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_6)
-                                : "r"(fast_drain_response_addr + 32)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 2 * 16)
                                 : "memory");
                             canceled += _clc_valid_6;
                             uint32_t _clc_valid_7 = 0;
@@ -3124,18 +3249,17 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 "selp.u32 %0, 1, 0, p1;\n\t"
                                 "}\n"
                                 : "=r"(_clc_valid_7)
-                                : "r"(fast_drain_response_addr + 48)
+                                : "r"(fast_drain_response_addr + drain_stage * 64 + 3 * 16)
                                 : "memory");
                             canceled += _clc_valid_7;
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            drain_stage += 1;
-                            if (drain_stage == 1) { drain_stage = 0; _phase_drain_full ^= 1; }
+                            _phase_drain_full ^= 1;
                             if (canceled == 0) {
                                 break;
                             }
                         }
                     }
-                    mbarrier_wait_cluster(work_empty_addr + (work_stage_4) * 8, _phase_work_empty);
+                    mbarrier_wait_cluster_hint(work_empty_addr + (work_stage_4) * 8, _phase_work_empty, 10000000);
                     if (lane < 2) {
                         asm volatile(
                             "{\n\t"
@@ -3151,7 +3275,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
                                 ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
                                 " [%0], [%1];"
-                            :: "r"(work_response_addr + work_stage_4 * 16), "r"(work_full_addr + work_stage_4 * 8)
+                            :: "r"(work_response_addr + work_stage_4 * 16 + 0 * 16), "r"(work_full_addr + work_stage_4 * 8)
                             : "memory");
                     }
                     mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
@@ -3165,7 +3289,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
                         : "=r"(_clc_valid_8)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_12 = 0;
                     asm volatile(
@@ -3175,7 +3299,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_12)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_13 = 0;
                     asm volatile(
@@ -3185,7 +3309,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_13)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     uint32_t _clc_ctaid_14 = 0;
                     asm volatile(
@@ -3195,7 +3319,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                         "clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
                         "}\n"
                         : "=r"(_clc_ctaid_14)
-                        : "r"(work_response_addr + work_stage_4 * 16)
+                        : "r"(work_response_addr + work_stage_4 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
@@ -3215,7 +3339,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                 }
                 #pragma unroll
                 for (int _tail = 0; _tail < 3; _tail++) {
-                    mbarrier_wait_cluster(work_empty_addr + (work_stage_4) * 8, _phase_work_empty);
+                    mbarrier_wait_cluster_hint(work_empty_addr + (work_stage_4) * 8, _phase_work_empty, 10000000);
                     work_stage_4 += 1;
                     if (work_stage_4 == 3) { work_stage_4 = 0; _phase_work_empty ^= 1; _phase_work_full_4 ^= 1; }
                 }
@@ -3291,8 +3415,9 @@ __global__ __launch_bounds__(128) void
 kernel_rank_major_exact_unpermute_v1(__nv_bfloat16* __restrict__ expert_output, float* __restrict__ topk_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ final_output, unsigned int hidden_size, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -3407,8 +3532,9 @@ __global__ __launch_bounds__(32) void
 kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -3474,12 +3600,16 @@ __global__ __launch_bounds__(256) void
 kernel_rank_major_combine_v1(__nv_bfloat16* __restrict__ output, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ local_partials, __nv_bfloat16* const* __restrict__ local_partials_peers)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int mbar_base = smem;
+    #define row_full_addr (mbar_base + 0)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -3488,7 +3618,7 @@ kernel_rank_major_combine_v1(__nv_bfloat16* __restrict__ output, int32_t pg_worl
     __nv_bfloat16* peer_row = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int peer_row_addr = smem + 1024;
 
-    // Mbarrier init (1 groups, 2 barriers)
+    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
     // Mbarriers at smem_raw[0..16)
 
     if (warp == 0) {
@@ -3503,9 +3633,6 @@ kernel_rank_major_combine_v1(__nv_bfloat16* __restrict__ output, int32_t pg_worl
     }
 
     __syncthreads();
-
-    const int mbar_base = smem;
-    #define row_full_addr (mbar_base + 0)
 
     // === Task calls (dependency order) ===
     int token = bid;
