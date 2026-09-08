@@ -481,8 +481,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEBf16Kernel):
                     cute.AddressSpace.gmem,
                     assumed_align=8,
                 )
-                lo = packed[0]
-                hi = packed[1]
+                lo = cutlass.Uint32(packed[0])
+                hi = cutlass.Uint32(packed[1])
                 sf_offset = (cutlass.Int64(expert) * scale.shape[1] + n) * scale.shape[
                     2
                 ] + k // 16
@@ -597,7 +597,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEBf16Kernel):
             acc_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_acc_stage * 2
             ]
-            sched_storage: SchedStorage
+            sched_storage: SchedStorage  # type: ignore[valid-type]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 

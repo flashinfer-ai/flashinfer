@@ -29,6 +29,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
+| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16 E4M3, optional per-expert FP32 global scales) | BF16 | SM100/SM103 | `knobs=None` or an explicit supported dictionary; online weight decode with BF16 dispatch/combine |
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
@@ -39,6 +40,63 @@ The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the backend quantizes at `preprocess_weights`); kernel-ready
 pre-quantized weights can be supplied instead.
+
+### W4A16 MegaMoE
+
+Select `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` to keep activations and
+communication in BF16 while decoding NVFP4 expert weights online. For `E`
+local experts, hidden size `H`, and intermediate size `I`, supply:
+
+- `w13`: packed E2M1 `uint8` or `float4_e2m1fn_x2`, `[E, 2*I, H/2]`,
+  with the canonical gate half before the up half.
+- `w2`: packed E2M1, `[E, H, I/2]`.
+- `w13_scale` / `w2_scale`: linear E4M3 block scales, respectively
+  `[E, 2*I, H/16]` / `[E, H, I/16]`.
+- `w13_global_scale` / `w2_global_scale`: optional FP32 `[E]` tensors;
+  omitted scales mean one. These are weight scales, applied after FP32
+  GEMM accumulation. Folding them into BF16 decoded weights changes rounding.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    MoEEpTensors,
+    PrequantizedMoEWeights,
+    Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+weights = PrequantizedMoEWeights(
+    w13, w2, w13_scale, w2_scale,
+    w13_global_scale=w13_global_scale,
+    w2_global_scale=w2_global_scale,
+)
+layer = MoEEpLayer(
+    bootstrap, fleet_params, weights,
+    backend=MegaConfig(
+        megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=I, top_k=top_k,
+        ),
+    ),
+)
+tensors = MoEEpTensors(hidden_states=x_bf16, topk_ids=ids, topk_weights=scores_fp32)
+layer.warmup(tensors)  # Collective on all EP ranks, before CUDA graph capture.
+y_bf16 = layer.forward(tensors)
+```
+
+The default `MegaConfig.quantize_input=True` denotes the normal input path;
+this backend copies BF16 inputs without quantizing them. It rejects
+prequantized activation fields (`scales`, `fc1_alpha`, `fc2_alpha`, and
+`fc1_norm_const`). Routing IDs are int32/int64, and routing scores are FP32
+and applied after the BF16 FC2 result. The initial backend supports SwiGLU,
+hidden sizes divisible by 32, intermediate sizes divisible by 64, and
+`top_k <= min(32, num_experts)`. Its final top-k reduction is separate from
+the fused dispatch/GEMM/combine kernel.
+
+`PrequantizedMoEWeights` global scales are optional keyword-only additions.
+Other backends reject non-`None` global scales unless they explicitly support
+the contract. For numerical tests and the shared-weight EP benchmark, see
+`tests/moe_ep/test_cutedsl_w4a16_mega.py` and
+`benchmarks/bench_cute_dsl_moe_distributed.py`.
 
 ### Split (dispatch → inner kernel → combine)
 

@@ -244,7 +244,11 @@ class MegaMoEW4A16Frontend:
         kwargs["max_active_clusters"] = max_active_clusters
         if c.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(kernel, **kwargs)
+        try:
+            mega.compiled = cute.compile(kernel, **kwargs)
+        except Exception:
+            free_sym_tensor(shared_workspace)
+            raise
         self._mega = mega
         self._mega_key = key
         return mega
@@ -391,17 +395,26 @@ class MegaMoEW4A16Frontend:
 
     def reduce_topk(self, combined, scores, output):
         """Apply FP32 routing scores after the BF16 FC2 cast, accumulating in FP32."""
+        # Empty source ranks still execute the collective fused kernel, but
+        # have no local rows to reduce and must not launch a zero-block grid.
+        if output.shape[0] == 0:
+            return
         import cutlass.cute as cute
         import cuda.bindings.driver as cuda
         from common.host_utils import get_cutedsl_target_arch
         from moe_nvfp4_swapab.topk_reduce import TopkReduce
         from src.token_comm import CombineFormat
 
+        def compact(tensor):
+            return self._to_cute(tensor, static_layout=True).mark_compact_shape_dynamic(
+                mode=0, stride_order=tensor.dim_order(), divisibility=1
+            )
+
         args = (
-            self._to_cute(combined),
+            compact(combined),
             None,
-            self._to_cute(output),
-            self._to_cute(scores),
+            compact(output),
+            compact(scores),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         if self._reduce is None:

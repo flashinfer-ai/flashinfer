@@ -26,6 +26,31 @@ class W4A16Epilogue(GluBf16Epilogue):
     """Preserve weight scaling before the FC1 activation and FC2 cast."""
 
     @cute.jit
+    def _swiglu_act(self, t_swiglu, t_up, t_gate, prob=None):
+        # Match the local W4A16 kernel's up * (gate * sigmoid(gate))
+        # association before the BF16 FC1 handoff.
+        for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+            gate = (t_gate[i], t_gate[i + 1])
+            gate_log2e = cute.arch.mul_packed_f32x2(
+                gate, (-1.4426950408889634, -1.4426950408889634)
+            )
+            denominator = cute.arch.add_packed_f32x2(
+                (
+                    cute.math.exp2(gate_log2e[0], fastmath=True),
+                    cute.math.exp2(gate_log2e[1], fastmath=True),
+                ),
+                (1.0, 1.0),
+            )
+            sigmoid = (
+                cute.arch.rcp_approx(denominator[0]),
+                cute.arch.rcp_approx(denominator[1]),
+            )
+            silu = cute.arch.mul_packed_f32x2(gate, sigmoid)
+            t_swiglu[i], t_swiglu[i + 1] = cute.arch.mul_packed_f32x2(
+                (t_up[i], t_up[i + 1]), silu
+            )
+
+    @cute.jit
     def _run_fc1_subtile(
         self,
         subtile_idx,
@@ -176,7 +201,10 @@ class W4A16Epilogue(GluBf16Epilogue):
             sC_thread_row = cute.local_tile(
                 sC_stage, (1, Fc1GateUpInterleave), (thread_in_warp, subtile_idx)
             )
-            cute.copy(r2s_copy_atom, cute.coalesce(c), cute.coalesce(sC_thread_row))
+            c_aligned = cute.make_tensor(c.iterator.align(min_align=16), c.layout)
+            cute.copy(
+                r2s_copy_atom, cute.coalesce(c_aligned), cute.coalesce(sC_thread_row)
+            )
 
         if cutlass.const_expr(self._generate_c):
             if warp_idx == 0:
