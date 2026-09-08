@@ -57,6 +57,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_DOTS3_SWA,
+    _decode_scratch_views,
     _decode_dispatch_error_message,
     _resolve_model_type,
 )
@@ -124,6 +125,43 @@ def test_supported_configs_families() -> None:
     )
     assert "supported_sparse_mla_sm120_configs" in dir(flashinfer.mla)
     assert "SparseMLASm120DecodeConfig" in dir(flashinfer.mla)
+
+
+def test_supported_configs_nvfp4_envelope() -> None:
+    """The shared query API exposes the exact, independently keyed NVFP4 set."""
+    configs = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
+    assert set(configs) == {"dsv4"}
+    dsv4 = configs["dsv4"]
+    assert dsv4.kv_cache_format == "nvfp4"
+    assert dsv4.bytes_per_token == 384
+    assert dsv4.supported_num_heads() == (16, 32, 64, 128)
+    assert dsv4.supported_topk() == (128, 512)
+    assert dsv4.extra_page_block_sizes == frozenset({2, 64})
+    assert dsv4.supports_decode(64, 128)
+    assert not dsv4.supports_decode(8, 128)
+    assert not dsv4.supports_decode(64, 256)
+
+    with pytest.raises(ValueError, match="kv_cache_format"):
+        supported_sparse_mla_sm120_configs(kv_cache_format="int4")
+
+
+def test_nvfp4_exact_head_scratch_view() -> None:
+    """The shared scratch slicer also supports NVFP4's exact-head ABI."""
+    mid_out = torch.empty((8, 64, 9, 512), dtype=torch.bfloat16, device="meta")
+    mid_lse = torch.empty((8, 64, 9), dtype=torch.float32, device="meta")
+
+    out_view, lse_view = _decode_scratch_views(
+        mid_out,
+        mid_lse,
+        num_tokens=2,
+        num_heads=16,
+        num_splits=2,
+        d_v=512,
+        scratch_heads=16,
+    )
+
+    assert out_view.shape == (2, 16, 2, 512)
+    assert lse_view.shape == (2, 16, 2)
 
 
 def test_supported_helpers() -> None:

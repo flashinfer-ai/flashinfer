@@ -51,6 +51,7 @@ from flashinfer.attention.prims_ts.decode import (
     _validate_decode_query_head_extent,
     _validate_decode_output_aliasing,
     _validate_decode_policy_kv_tile_size,
+    _validate_head_geometry,
     _validate_max_kv_len,
 )
 from flashinfer.attention.prims_ts._tensor_aliasing import (
@@ -1155,10 +1156,12 @@ def _exercise_public_paths(
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
     if case.q.dtype == _FP8:
+        policy = dict(wrapper._policy)
         case = _with_reference(
             case,
             qo_indptr=qo_indptr,
-            splits_kv=int(dict(wrapper._policy)["splits_kv"]),
+            splits_kv=int(policy["splits_kv"]),
+            num_insts_kv=int(policy["num_insts_kv"]),
         )
     eager = _run_case(wrapper, case)
     _assert_case_correct(eager, case)
@@ -1194,6 +1197,7 @@ def _with_reference(
     q: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     splits_kv: int = 1,
+    num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
 ):
     """Return a case whose oracle reflects its current mutable Q/K/V data."""
 
@@ -1214,6 +1218,7 @@ def _with_reference(
             window_left=case.window_left,
             qo_indptr=qo_indptr,
             splits_kv=splits_kv,
+            num_insts_kv=num_insts_kv,
         )
     else:
         reference = _decode_reference(
@@ -1445,7 +1450,7 @@ def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
 
 
 def test_attention_ts_decode_public_query_geometry_guards() -> None:
-    """Reject unsupported public Q/head geometry before device probing."""
+    """Reject unsafe Q extents and head ratios above 128."""
 
     int32_max = 2**31 - 1
     _validate_decode_query_head_extent(
@@ -1480,41 +1485,75 @@ def test_attention_ts_decode_public_query_geometry_guards() -> None:
             device="cuda:0",
         )
 
-    with pytest.raises(ValueError, match=r"Hq/Hkv <= 32"):
-        get_prims_ts_batch_decode_workspace_size(
-            batch_size=1,
-            num_qo_heads=33,
-            num_kv_heads=1,
-            head_dim=128,
-            page_size=32,
-            max_seq_len=128,
-            device="cuda:0",
-        )
+    for supported_ratio in range(1, 129):
+        _validate_head_geometry(supported_ratio, 1)
+    with pytest.raises(ValueError, match="must be divisible"):
+        _validate_head_geometry(127, 2)
+    with pytest.raises(ValueError, match=r"1 <= Hq/Hkv <= 128"):
+        _validate_head_geometry(129, 1)
 
+
+@pytest.mark.parametrize(
+    ("head_ratio", "expected_mma", "expected_tile_q"),
+    (
+        (1, "swaps_mma_ab", 8),
+        (8, "swaps_mma_ab", 8),
+        (9, "swaps_mma_ab", 16),
+        (16, "swaps_mma_ab", 16),
+        (17, "swaps_mma_ab", 32),
+        (32, "swaps_mma_ab", 32),
+        (33, "keeps_mma_ab", 64),
+        (64, "keeps_mma_ab", 64),
+        (65, "keeps_mma_ab", 128),
+        (128, "keeps_mma_ab", 128),
+    ),
+)
+@pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
+def test_attention_ts_decode_fp8_head_ratio_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    head_ratio: int,
+    expected_mma: str,
+    expected_tile_q: int,
+    head_dim: int,
+) -> None:
+    """Dispatch each supported ratio range to its smallest qualified Q tile."""
+
+    from contextlib import nullcontext
     from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 152 // cluster_size,
+    )
     decode_module._resolve_decode_launch_spec.cache_clear()
     try:
-        with pytest.raises(ValueError, match=r"Hq/Hkv <= 32"):
-            decode_module._resolve_decode_launch_spec(
-                0,
-                1,
-                33,
-                1,
-                128,
-                32,
-                128,
-                1,
-                "float16",
-                "float16",
-                "float16",
-                "HND",
-                "dense",
-                False,
-                -1,
-            )
+        spec = decode_module._resolve_decode_launch_spec(
+            0,
+            256,
+            head_ratio,
+            1,
+            head_dim,
+            32,
+            4096,
+            1,
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "HND",
+            "dense",
+            False,
+            -1,
+        )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
+
+    policy = dict(spec.policy)
+    assert policy["mma_variant"] == expected_mma
+    assert policy["tile_size_q"] == expected_tile_q
+    assert policy["groups_tokens_heads_q"] is True
 
 
 def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
@@ -4380,6 +4419,37 @@ def test_attention_ts_decode_head_dim_gqa_product(
         max_kv_len=max_kv_len,
         exercise_all_paths=False,
     )
+
+
+@pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
+@pytest.mark.parametrize("head_ratio", (33, 65), ids=lambda value: f"gqa{value}")
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_wide_fp8_gqa_accuracy(
+    head_dim: int,
+    head_ratio: int,
+):
+    """Check partial Q64/Q128 Keeps tiles against the FP8 reference."""
+
+    case = _make_decode_case(
+        kv_lens=(257, 193),
+        num_qo_heads=head_ratio,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=33500 + head_dim + head_ratio,
+    )
+    policy = _exercise_auto_case(case)
+
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["tile_size_q"] == (64 if head_ratio <= 64 else 128)
+    assert policy["groups_tokens_heads_q"] is True
 
 
 @pytest.mark.parametrize(

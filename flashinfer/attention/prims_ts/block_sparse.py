@@ -36,12 +36,13 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.attention import (
-    prims_ts_block_sparse_trace,
+    prims_ts_block_sparse_trace_dispatch,
     prims_ts_block_sparse_wrapper_trace_dispatch,
     prims_ts_paged_block_sparse_trace_dispatch,
     prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 )
 
+from ._block_sparse.common import _validate_contiguous_route_mode
 from ._block_sparse.config import _validate_block_sparse_static_profile
 from ._block_sparse.inspection import (
     _inspect_block_sparse_bsr,
@@ -116,10 +117,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     Q is ``[B, Sq, Hq, D]`` and K/V are ``[B, Skv, Hkv, D]``. Sparse rows are
     owned per batch, KV head, and query block, so every Q head in one grouped
     KV head consumes the same sparse row. A plan fixes geometry and a per-row
-    capacity; every run supplies its own BSR and optional token mask.
-    Callers must keep those tensors alive and immutable until the queued run or
-    captured graph finishes using them. CUDA Graph capture pins plan-owned
-    state only, so captured routing storage remains the caller's responsibility.
+    capacity; every run supplies either BSR or a packed exact-block bitmask.
+    Proxy-enabled plans additionally consume caller-owned K/V summaries, while
+    an optional token mask applies only to exact routes. Callers must keep those
+    tensors alive and immutable until the queued run or captured graph finishes
+    using them. CUDA Graph capture pins plan-owned state only, so captured
+    routing storage remains the caller's responsibility.
 
     One plan revision owns one mutable route workspace. Its runs must be ordered
     on one stream or externally synchronized; unordered concurrent runs require
@@ -141,6 +144,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         device: torch.device | str | int,
         max_blocks_per_row: int,
         use_kv_valid_bits: bool,
+        sparse_format: Literal["bsr", "bitmask"] = "bsr",
+        use_proxy_routes: bool = False,
         mask_type: Literal["dense", "causal"] = "dense",
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
@@ -149,11 +154,16 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         """Choose a legal profile and allocate reusable routing capacity.
 
         The plan owns immutable geometry and a uniform route workspace, not a
-        sparse pattern. ``max_blocks_per_row`` bounds each runtime BSR row in
-        semantic ``kv_block_size`` blocks. ``use_kv_valid_bits`` selects whether
-        every :meth:`run` must supply the shared batch token mask. Callers may
-        pass different routing tensor identities and index extents to each run
-        as long as they fit this declared capacity.
+        sparse pattern. ``max_blocks_per_row`` bounds each runtime sparse row in
+        semantic ``kv_block_size`` blocks. ``sparse_format="bsr"`` consumes
+        canonical CSR-style rows, while ``"bitmask"`` consumes packed exact-
+        block bits. Enabling proxy routes represents unselected blocks through
+        caller-provided K/V summaries and currently requires
+        ``mask_type="dense"``. Exact-only plans continue to support causal
+        masking. ``use_kv_valid_bits`` selects whether every :meth:`run` must
+        supply the shared batch token mask. Callers may pass different routing
+        tensor identities and index extents to each run as long as they fit
+        this declared capacity.
 
         MHA, GQA, and MQA are supported with ``Hq / Hkv`` a power of two no
         greater than 32 and ``D=128``. Q, K, V, and O use one matching
@@ -167,10 +177,13 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         respectively. ``kv_block_size`` may be 8, 16, 32, or a positive
         multiple of 64. The Q tile groups complete Q-head groups and as many Q
         tokens as fit without crossing a semantic Q-block row, up to Q128;
-        fine KV blocks cap this at a SWAPAB Q32 tile. Every run prepares
-        per-KV-head canonical BSR into compact, profile-selected fixed-width
-        route metadata, and the attention core consumes only that metadata.
-        This remains true when every KV block is selected;
+        fine KV blocks cap this at a SWAPAB Q32 tile. Proxy routes reuse the
+        same Q-tile, KV-route, and MMA geometry as exact routes, but currently
+        use the direct scheduler because reusable planning cannot observe live
+        exact-route work. Every run prepares its selected BSR or bitmask into
+        compact, profile-selected fixed-width route metadata, and the attention
+        core consumes only that metadata. This remains true when every KV block
+        is selected;
         callers that know a pattern is dense should choose the dense FMHA API
         explicitly.
 
@@ -187,6 +200,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         runs require distinct wrappers.
         """
 
+        _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -203,6 +217,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             output_dtype=o_data_type,
             max_blocks_per_row=max_blocks_per_row,
         )
+        if use_proxy_routes and static.mask_type != "dense":
+            raise ValueError("block-sparse proxy routes require mask_type='dense'")
         device, device_index = _resolve_cuda_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
@@ -215,6 +231,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 device=device,
                 device_index=device_index,
                 plan_stream=plan_stream,
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -226,9 +244,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        block_indptr: torch.Tensor,
-        block_indices: torch.Tensor,
+        block_indptr: torch.Tensor | None = None,
+        block_indices: torch.Tensor | None = None,
         *,
+        exact_block_bits: torch.Tensor | None = None,
+        k_summary: torch.Tensor | None = None,
+        v_summary: torch.Tensor | None = None,
         kv_valid_bits: torch.Tensor | None = None,
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
@@ -243,17 +264,27 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
 
-        ``block_indptr`` is compact Int32
-        ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and indexes compact
-        ``block_indices``. Every row must fit the planned semantic-block
-        capacity; referenced block IDs must be strictly increasing, unique,
-        and in range. Reusable runs trust these device-side values. CuTe DSL
-        assertions can diagnose violations when enabled before compilation;
-        otherwise invalid values have undefined behavior and may access out of
-        bounds. A masked plan requires
+        A BSR plan consumes compact Int32 ``block_indptr`` with shape
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32
+        ``block_indices``. A bitmask plan instead requires both BSR arguments
+        to be ``None`` and consumes packed UInt32 ``exact_block_bits`` with
+        shape ``[B, Hkv, ceil(Sq / q_block_size), ceil(num_kv_blocks / 32)]``.
+        Bit ``r`` of word ``w`` selects block ``32 * w + r``; final-word
+        padding bits are ignored. A proxy plan additionally consumes compact
+        ``k_summary`` and ``v_summary`` with shape
+        ``[B, num_kv_blocks, Hkv, D]``. K summaries are block means and V
+        summaries are block sums; the final partial block covers only its
+        structural tokens.
+
+        Every row must fit the planned semantic-block capacity. Reusable runs
+        trust routing values. CuTe DSL assertions can diagnose violations when
+        enabled before compilation; otherwise invalid values have undefined
+        behavior and may access out of bounds. A masked plan requires
         ``kv_valid_bits`` with shape
         ``[B, ceil(Skv / 32)]`` and dtype UInt32; an unmasked plan requires
-        ``None``. Routing tensors may have different identities on every run.
+        ``None``. The mask applies only to raw exact routes; proxy summaries and
+        their represented-token mass remain caller-defined. Routing tensors may
+        have different identities on every run.
 
         Keep this wrapper alive until every captured CUDA Graph is destroyed.
 
@@ -266,12 +297,18 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         v : torch.Tensor
             Compact value tensor with the same shape, dtype, and strides as
             ``k``.
-        block_indptr : torch.Tensor
+        block_indptr : torch.Tensor, optional
             Contiguous Int32 BSR row offsets with shape
-            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
-        block_indices : torch.Tensor
+            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``. Required by BSR plans.
+        block_indices : torch.Tensor, optional
             Contiguous Int32 semantic KV-block IDs referenced by
-            ``block_indptr``.
+            ``block_indptr``. Required by BSR plans.
+        exact_block_bits : torch.Tensor, optional
+            Compact packed UInt32 exact-block bitmap required by bitmask plans.
+        k_summary : torch.Tensor, optional
+            Per-block mean K tensor required by proxy plans.
+        v_summary : torch.Tensor, optional
+            Per-block summed V tensor required by proxy plans.
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
             Supply it exactly when the plan enabled token validity bits.
@@ -288,42 +325,51 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         """
 
         state = self._require_run_state()
-        run_stream = torch.cuda.current_stream(state.device)
         run_args = _validate_block_sparse_run(
             q,
             _ContiguousKVStorage(k=k, v=v),
             state=state,
             block_indptr=block_indptr,
             block_indices=block_indices,
+            exact_block_bits=exact_block_bits,
+            k_summary=k_summary,
+            v_summary=v_summary,
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
             out=out,
         )
+        run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_api(trace=prims_ts_block_sparse_trace)
+@flashinfer_api(trace=prims_ts_block_sparse_trace_dispatch)
 def block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_indptr: torch.Tensor,
-    block_indices: torch.Tensor,
+    block_indptr: torch.Tensor | None,
+    block_indices: torch.Tensor | None,
     q_block_size: int,
     kv_block_size: int,
     *,
+    exact_block_bits: torch.Tensor | None = None,
+    k_summary: torch.Tensor | None = None,
+    v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None = None,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
     mask_type: Literal["dense", "causal"] = "dense",
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse attention launch.
 
-    This one-shot form synchronously inspects canonical BSR, derives its largest
-    semantic row, creates a capacity-only plan, and passes the original routing
-    tensors to :meth:`BlockSparseTSWrapper.run`. It therefore cannot be invoked
-    inside CUDA Graph capture; plan a wrapper outside capture and capture only
-    ``run()`` instead.
+    This one-shot form creates a capacity-only plan and passes the original
+    routing tensors to :meth:`BlockSparseTSWrapper.run`. BSR inputs are
+    synchronously inspected to validate canonical rows and derive their maximum
+    width. Bitmask inputs use the structural KV-block count as a conservative
+    capacity bound. It therefore cannot be invoked inside CUDA Graph capture;
+    plan a wrapper outside capture and capture only ``run()`` instead.
 
     Parameters
     ----------
@@ -333,11 +379,12 @@ def block_sparse_attention(
         Compact key tensor ``[B, Skv, Hkv, D]``.
     v : torch.Tensor
         Compact value tensor with the same shape, dtype, and strides as ``k``.
-    block_indptr : torch.Tensor
+    block_indptr : torch.Tensor, optional
         Contiguous Int32 BSR row offsets with shape
-        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
-    block_indices : torch.Tensor
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``. Required in BSR mode.
+    block_indices : torch.Tensor, optional
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
+        Required in BSR mode.
     q_block_size : int
         Positive number of logical query tokens represented by one BSR row.
         The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
@@ -345,8 +392,19 @@ def block_sparse_attention(
     kv_block_size : int
         Number of logical KV tokens represented by one BSR block ID; it must
         be 8, 16, 32, or a positive multiple of 64.
+    exact_block_bits : torch.Tensor, optional
+        Compact UInt32 exact-block bitmap required in bitmask mode.
+    k_summary : torch.Tensor, optional
+        Per-block mean K tensor required when proxy routes are enabled.
+    v_summary : torch.Tensor, optional
+        Per-block summed V tensor required when proxy routes are enabled.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
+    sparse_format : {"bsr", "bitmask"}, optional
+        Runtime sparse representation. Defaults to ``"bsr"``.
+    use_proxy_routes : bool, optional
+        Represent unselected blocks through K/V summaries. Proxy routes
+        currently require dense masking.
     mask_type : {"dense", "causal"}, optional
         Attention mask applied inside each selected sparse block.
     sm_scale : float, optional
@@ -375,6 +433,7 @@ def block_sparse_attention(
         raise ValueError("K and V must have identical shapes")
 
     use_kv_valid_bits = kv_valid_bits is not None
+    _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
     static = _validate_block_sparse_static_profile(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -390,25 +449,37 @@ def block_sparse_attention(
         kv_dtype=k.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
+    if use_proxy_routes and static.mask_type != "dense":
+        raise ValueError("block-sparse proxy routes require mask_type='dense'")
     device, _ = _resolve_cuda_device(q.device)
     _validate_block_sparse_metadata(
-        block_indptr,
-        block_indices,
-        kv_valid_bits,
+        sparse_format=sparse_format,
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=exact_block_bits,
+        kv_valid_bits=kv_valid_bits,
         device=device,
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
         num_kv_heads=static.num_kv_heads,
         q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
         use_kv_valid_bits=static.use_kv_valid_bits,
     )
-    max_blocks_per_row = _inspect_block_sparse_bsr(
-        block_indptr,
-        block_indices,
-        static=static,
-        stream=torch.cuda.current_stream(device),
-    )
+    if sparse_format == "bsr":
+        max_blocks_per_row = _inspect_block_sparse_bsr(
+            block_indptr,
+            block_indices,
+            static=static,
+            stream=torch.cuda.current_stream(device),
+        )
+    elif sparse_format == "bitmask":
+        max_blocks_per_row = (
+            static.seq_len_kv + static.kv_block_size - 1
+        ) // static.kv_block_size
+    else:
+        raise AssertionError(f"unsupported sparse format {sparse_format!r}")
 
     wrapper = BlockSparseTSWrapper()
     wrapper.plan(
@@ -423,6 +494,8 @@ def block_sparse_attention(
         device=device,
         max_blocks_per_row=max_blocks_per_row,
         use_kv_valid_bits=static.use_kv_valid_bits,
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
         mask_type=static.mask_type,
         q_data_type=static.q_dtype,
         kv_data_type=static.kv_dtype,
@@ -434,6 +507,9 @@ def block_sparse_attention(
         v,
         block_indptr,
         block_indices,
+        exact_block_bits=exact_block_bits,
+        k_summary=k_summary,
+        v_summary=v_summary,
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
         out=out,
@@ -740,15 +816,18 @@ def block_sparse_attention_with_paged_kv_cache(
         output_dtype=q.dtype if out is None else out.dtype,
     )
     _validate_block_sparse_metadata(
-        block_indptr,
-        block_indices,
-        kv_valid_bits,
+        sparse_format="bsr",
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=None,
+        kv_valid_bits=kv_valid_bits,
         device=metadata_device,
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
         num_kv_heads=static.num_kv_heads,
         q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
         use_kv_valid_bits=static.use_kv_valid_bits,
     )
     max_blocks_per_row = _inspect_paged_block_sparse_metadata(
