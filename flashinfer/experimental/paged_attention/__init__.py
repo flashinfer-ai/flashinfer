@@ -22,12 +22,15 @@ enforces it with randomized valid and corrupted inputs.
 from ._backends import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedAttentionCapabilities
 from ._contracts import PagedAttentionMetadata, PlanMetadata, Resolution
 from ._controller import PagedAttentionController
+from ._graph import GraphBuffers, GraphCapacity
 from ._planning import Derived, derive
 from ._selection import HEURISTIC_ORDER, resolve_paged_attention
 
 __all__ = [
     "CAPABILITIES",
     "Derived",
+    "GraphBuffers",
+    "GraphCapacity",
     "HEURISTIC_ORDER",
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",

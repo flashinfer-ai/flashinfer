@@ -183,10 +183,21 @@ class PagedAttention:
                 out, lse = attn.run(q, (k_cache, v_cache), sm_scale=layer.scale)
     """
 
-    def __init__(self, device: Optional[torch.device] = None):
+    def __init__(
+        self, device: Optional[torch.device] = None, *, use_cuda_graph: bool = False
+    ):
+        """
+        - ``use_cuda_graph``: reserve metadata storage so ``run()`` can be
+          captured into a CUDA graph and later ``plan()`` calls re-fill that
+          storage instead of allocating.  The FIRST plan fixes the capture
+          shapes (batch size, table width, host maxes, total query tokens);
+          a later plan that would change any of them is rejected, and a plan
+          that fails midway restores the previous plan's buffers.  Use one
+          instance per graph bucket.
+        """
         from .experimental.paged_attention import PagedAttentionController
 
-        self._impl = PagedAttentionController(device)
+        self._impl = PagedAttentionController(device, use_cuda_graph=use_cuda_graph)
 
     @property
     def device(self) -> torch.device:
@@ -237,7 +248,8 @@ class PagedAttention:
 
         Publication is transactional: a failing ``plan()`` leaves the previous
         plan runnable (see ``experimental/paged_attention/_controller.py`` for
-        the one generated-FA caveat).
+        the one generated-FA caveat).  In CUDA-graph mode the new batch is
+        staged into reserved storage and rolled back on failure.
         """
         self._impl.plan(
             metadata,

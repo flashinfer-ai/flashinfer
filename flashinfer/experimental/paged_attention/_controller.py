@@ -32,18 +32,24 @@ from ._contracts import (
     _expect_window_left,
     resolve_config_key,
 )
+from ._graph import GraphBuffers, Transaction
 from ._planning import Derived, validate_causal_envelope
 from ._selection import resolve_paged_attention
 
 
 class PagedAttentionController:
-    def __init__(self, device: Optional[torch.device] = None):
+    def __init__(
+        self, device: Optional[torch.device] = None, *, use_cuda_graph: bool = False
+    ):
         dev = torch.device(device) if device is not None else torch.device("cuda")
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
         self._backends: Dict[Any, Any] = {}
         self._workspace: Optional[torch.Tensor] = None
+        # CUDA-graph mode: reserved storage sized by the first plan (_graph.py)
+        self._use_cuda_graph = use_cuda_graph
+        self._graph: Optional[GraphBuffers] = None
         # published plan state (swapped together, only on success)
         self._planned = False
         self._backend_name: Optional[str] = None
@@ -158,17 +164,39 @@ class PagedAttentionController:
         # takes the heuristic head; the autotune hook (proposal §5.4) would
         # consult its cache here, keyed on bucketed (total_q_tokens, max_kv_len).
         name = resolution.chosen
+        needs_dense = CAPABILITIES[name].needs_dense
 
-        derived = metadata.derived(needs_dense=CAPABILITIES[name].needs_dense)
-        meta = PlanMetadata(
-            qo_indptr=metadata.qo_indptr,
-            kv_seq_lens=metadata.kv_seq_lens,
+        fresh = metadata.derived(needs_dense=needs_dense)
+        if self._use_cuda_graph:
+            # Graph mode: backends only ever see the reserved storage, so the
+            # pointers a captured graph baked in stay valid across re-plans.
+            if self._graph is None:
+                self._graph = GraphBuffers(metadata, self.device)
+            else:
+                self._graph.preflight(metadata)
+            gb = self._graph
+            transaction = Transaction(gb.targets(metadata, fresh))
+            derived = gb.derived_view(needs_dense=needs_dense)
+            qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
+            block_tables = (
+                gb.block_tables
+                if (needs_dense or metadata.block_tables is not None)
+                else None
+            )
+        else:
+            transaction = None
+            derived = fresh
+            qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
             # dense table given by the caller or derived (None where truly absent)
-            block_tables=(
+            block_tables = (
                 metadata.block_tables
                 if metadata.block_tables is not None
                 else derived.block_tables
-            ),
+            )
+        meta = PlanMetadata(
+            qo_indptr=qo_indptr,
+            kv_seq_lens=kv_seq_lens,
+            block_tables=block_tables,
             kv_input_form=kv_input_form,
             page_size=metadata.page_size,
             max_q_len=metadata.max_q_len,
@@ -192,9 +220,22 @@ class PagedAttentionController:
         candidate = self._backends.get(key)
         if candidate is None:
             candidate = make_backend(
-                name, self.device, kv_layout, self._shared_workspace()
+                name,
+                self.device,
+                kv_layout,
+                self._shared_workspace(),
+                graph_capacity=self._graph.capacity
+                if self._graph is not None
+                else None,
             )
-        candidate.plan(meta, derived)
+        if transaction is not None:
+            # stage the new batch into reserved storage; any failure below
+            # (including inside the backend's own plan) restores every buffer
+            with transaction:
+                candidate.plan(meta, derived)
+                transaction.commit()
+        else:
+            candidate.plan(meta, derived)
 
         # publish — nothing above mutated the published state
         self._backends[key] = candidate

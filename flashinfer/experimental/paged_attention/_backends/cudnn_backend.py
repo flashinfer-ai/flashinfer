@@ -54,15 +54,19 @@ class _CudnnBackend:
             dev = meta.qo_indptr.device
             token = torch.arange(meta.total_q_tokens, device=dev, dtype=torch.int64)
             bounds = meta.qo_indptr[1:].to(torch.int64)
-            batch_ids = torch.searchsorted(bounds, token, right=True)
-            pos = token - meta.qo_indptr.to(torch.int64)[batch_ids]
-            native_lse = torch.empty(
-                meta.batch_size,
-                meta.max_q_len,
-                meta.num_qo_heads,
-                device=dev,
-                dtype=torch.float32,
-            )
+            new_batch_ids = torch.searchsorted(bounds, token, right=True)
+            new_pos = token - meta.qo_indptr.to(torch.int64)[new_batch_ids]
+            # Keep the storage stable when the shapes repeat (CUDA-graph
+            # re-plan): refill in place instead of rebinding new tensors.
+            batch_ids, pos, native_lse = self._batch_ids, self._pos, self._native_lse
+            if batch_ids is None or batch_ids.shape != new_batch_ids.shape:
+                batch_ids, pos = new_batch_ids, new_pos
+            else:
+                batch_ids.copy_(new_batch_ids)
+                pos.copy_(new_pos)
+            lse_shape = (meta.batch_size, meta.max_q_len, meta.num_qo_heads)
+            if native_lse is None or tuple(native_lse.shape) != lse_shape:
+                native_lse = torch.empty(*lse_shape, device=dev, dtype=torch.float32)
         # publish only after every allocation above succeeded
         self._meta, self._derived = meta, derived
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos

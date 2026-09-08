@@ -17,18 +17,28 @@ from .fa_backend import _FaBackend
 from .trtllm_gen_backend import _TrtllmGenBackend
 
 _FACTORIES: Dict[str, Callable] = {
-    "fa2": lambda dev, layout, ws: _FaBackend(dev, layout, ws, "fa2"),
-    "fa3": lambda dev, layout, ws: _FaBackend(dev, layout, ws, "fa3"),
-    "cudnn": _CudnnBackend,
-    "trtllm-gen": _TrtllmGenBackend,
+    "fa2": lambda dev, layout, ws, cap: _FaBackend(dev, layout, ws, "fa2", cap),
+    "fa3": lambda dev, layout, ws, cap: _FaBackend(dev, layout, ws, "fa3", cap),
+    "cudnn": lambda dev, layout, ws, cap: _CudnnBackend(dev, layout, ws),
+    "trtllm-gen": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws),
 }
 
 
 def make_backend(
-    name: str, device: torch.device, kv_layout: str, workspace: torch.Tensor
+    name: str,
+    device: torch.device,
+    kv_layout: str,
+    workspace: torch.Tensor,
+    *,
+    graph_capacity=None,
 ):
-    """Construct the backend ``name`` (a key of ``CAPABILITIES``)."""
-    return _FACTORIES[name](device, kv_layout, workspace)
+    """Construct the backend ``name`` (a key of ``CAPABILITIES``).
+
+    ``graph_capacity`` (a ``_graph.GraphCapacity``) is set in CUDA-graph mode so
+    backends that keep their own metadata storage (the generated-FA wrapper)
+    can reserve it up front.
+    """
+    return _FACTORIES[name](device, kv_layout, workspace, graph_capacity)
 
 
 __all__ = [

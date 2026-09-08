@@ -15,13 +15,32 @@ from .._planning import Derived
 
 
 class _FaBackend:
-    def __init__(self, device, kv_layout, workspace, backend: str = "fa2"):
+    def __init__(
+        self, device, kv_layout, workspace, backend: str = "fa2", graph_capacity=None
+    ):
         from ....prefill import BatchPrefillWithPagedKVCacheWrapper
 
         self.name = backend
-        self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            workspace, kv_layout, backend=backend
-        )
+        if graph_capacity is None:
+            self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace, kv_layout, backend=backend
+            )
+        else:
+            # The wrapper's own CUDA-graph protocol: it copies each plan's CSR
+            # metadata into these reserved buffers, so the captured kernel
+            # keeps reading valid pointers across re-plans.
+            b = graph_capacity.batch_size
+            i32 = dict(dtype=torch.int32, device=device)
+            self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                kv_layout,
+                use_cuda_graph=True,
+                qo_indptr_buf=torch.zeros(b + 1, **i32),
+                paged_kv_indptr_buf=torch.zeros(b + 1, **i32),
+                paged_kv_indices_buf=torch.zeros(graph_capacity.flat_capacity, **i32),
+                paged_kv_last_page_len_buf=torch.zeros(b, **i32),
+                backend=backend,
+            )
         self._lse_mode = "none"
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
