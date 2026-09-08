@@ -240,7 +240,10 @@ def test_malformed_act_scale_is_still_rejected():
     num_tokens = 5
 
     # Flat, but numel is not a whole number of per-token scale groups.
-    with pytest.raises(AssertionError, match="not a multiple of num_tokens"):
+    # ValueError, not AssertionError: the flat-scale checks this PR adds
+    # validate caller input, so they must survive `python -O`.  The 2-D check
+    # below is a pre-existing assert and is deliberately left as one.
+    with pytest.raises(ValueError, match="not a multiple of num_tokens"):
         runner._make_tuning_config(
             _make_inputs(num_tokens, torch.ones(97, dtype=torch.uint8)),
             routing_input_mode=RoutingInputMode.PackedPrecomputed,
@@ -505,7 +508,7 @@ def test_malformed_flat_scale_message_cites_the_declared_layout():
     # 4 scales/token implies an SF vector size of 768 — not 16 or 32.
     bogus = torch.ones(num_tokens * 4, dtype=torch.uint8)
 
-    with pytest.raises(AssertionError, match="layout_linear"):
+    with pytest.raises(ValueError, match="layout_linear"):
         _tuning_config(
             runner,
             _make_inputs(num_tokens, bogus),
