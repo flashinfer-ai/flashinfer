@@ -12,7 +12,8 @@ not a perf detail.
 
 This test runs the same shape twice with two scales and checks each result
 against an independent torch reference; without the key fix the second
-iteration fails.
+iteration fails.  The descriptor-metadata tests below apply the same cache-
+identity invariant to metadata baked into cuDNN tensor descriptors.
 """
 
 import math
@@ -55,6 +56,161 @@ def _reference(q, k, v, q_lens, kv_lens, scale, causal):
         qo_off += lq
         kv_off += lkv
     return torch.cat(outs)
+
+
+def _prefill_key(
+    *,
+    q=None,
+    k=None,
+    v=None,
+    scale=0.1,
+    out_dtype=None,
+    offsets=None,
+    block_tables=None,
+    out=None,
+    lse=None,
+):
+    q = torch.empty(8, 4, 128) if q is None else q
+    k = torch.empty(8, 2, 128) if k is None else k
+    v = torch.empty(8, 2, 128) if v is None else v
+    seq = torch.empty(2, 1, 1, 1, dtype=torch.int32)
+    return cudnn_prefill._sdpa_prefill_key_fn(
+        q,
+        k,
+        v,
+        scale,
+        max_token_seq_q=4,
+        max_sequence_kv=4,
+        actual_seq_lens_q=seq,
+        actual_seq_lens_kv=seq,
+        block_tables=block_tables,
+        bottom_right_causal_mask=False,
+        batch_offsets_q=offsets,
+        out=out,
+        lse=lse,
+        o_data_type=out_dtype,
+    )
+
+
+def test_cudnn_prefill_output_dtype_in_graph_cache_key():
+    assert _prefill_key(out_dtype=None) == _prefill_key(out_dtype=torch.float32)
+    assert _prefill_key(out_dtype=torch.bfloat16) != _prefill_key(
+        out_dtype=torch.float16
+    )
+
+
+def test_cudnn_prefill_tensor_descriptors_in_graph_cache_key():
+    contiguous = torch.empty(8, 2, 128)
+    strided = torch.empty(16, 2, 128)[::2, :, :]
+    assert contiguous.shape == strided.shape
+    assert contiguous.stride() != strided.stride()
+    assert _prefill_key(k=contiguous) != _prefill_key(k=strided)
+
+    assert _prefill_key(v=torch.empty(8, 2, 128, dtype=torch.float32)) != _prefill_key(
+        v=torch.empty(8, 2, 128, dtype=torch.bfloat16)
+    )
+
+
+def test_cudnn_prefill_value_dimension_comes_from_v():
+    q = torch.empty(8, 4, 192)
+    k = torch.empty(8, 2, 192)
+    key_128 = _prefill_key(q=q, k=k, v=torch.empty(8, 2, 128))
+    key_64 = _prefill_key(q=q, k=k, v=torch.empty(8, 2, 64))
+    assert key_128[9] == 128
+    assert key_64[9] == 64
+    assert key_128 != key_64
+
+
+def test_cudnn_prefill_optional_descriptor_signature_is_stable():
+    contiguous = torch.empty(3, dtype=torch.int32)
+    same_metadata = torch.ones(3, dtype=torch.int32)
+    strided = torch.empty(6, dtype=torch.int32)[::2]
+    assert _prefill_key(offsets=contiguous) == _prefill_key(offsets=same_metadata)
+    assert _prefill_key(offsets=contiguous) != _prefill_key(offsets=strided)
+
+    block_tables = torch.zeros(2, 3, dtype=torch.int32)
+    paged_k = torch.empty(6, 2, 4, 128)
+    paged_v = torch.empty_like(paged_k)
+    assert _prefill_key(
+        k=paged_k, v=paged_v, block_tables=block_tables
+    ) == _prefill_key(
+        k=paged_k,
+        v=paged_v,
+        block_tables=torch.ones_like(block_tables),
+    )
+    assert _prefill_key(
+        k=paged_k, v=paged_v, block_tables=block_tables
+    ) != _prefill_key(
+        k=paged_k,
+        v=paged_v,
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+    )
+    hash(_prefill_key(offsets=contiguous))
+
+
+def test_cudnn_prefill_graph_key_preserves_descriptor_reuse():
+    key_a = _prefill_key(
+        q=torch.zeros(8, 4, 128),
+        k=torch.zeros(8, 2, 128),
+        v=torch.zeros(8, 2, 128),
+        out=torch.empty(8, 4, 128),
+        lse=torch.empty(2, 4, 4),
+    )
+    key_b = _prefill_key(
+        q=torch.ones(16, 4, 128),
+        k=torch.ones(32, 2, 128),
+        v=torch.ones(32, 2, 128),
+        out=torch.empty(99),
+        lse=torch.empty(1),
+    )
+    assert key_a == key_b
+
+
+def test_cudnn_prefill_attention_scale_remains_in_graph_cache_key():
+    assert _prefill_key(scale=0.1) != _prefill_key(scale=0.2)
+
+
+def test_cudnn_prefill_stride_in_graph_cache_key():
+    device = "cuda:0"
+    _skip_if_unsupported(device)
+
+    torch.manual_seed(1)
+    batch_size, num_heads, head_dim = 1, 4, 128
+    q_lens = torch.tensor([16], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor([24], dtype=torch.int32, device=device)
+    q = torch.randn(
+        int(q_lens.sum()), num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_strided = torch.randn(
+        int(kv_lens.sum()) * 2,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )[::2, :, :]
+    k_contiguous = k_strided.contiguous()
+    assert k_contiguous.shape == k_strided.shape
+    assert k_contiguous.stride() != k_strided.stride()
+    v = torch.randn_like(k_contiguous)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    scale = 1.0 / math.sqrt(head_dim)
+    ref = _reference(q, k_strided, v, q_lens, kv_lens, scale, causal=False)
+
+    for k in (k_contiguous, k_strided):
+        out, _ = cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            scale,
+            workspace,
+            max_token_per_sequence=16,
+            max_sequence_kv=24,
+            actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+            actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+            causal=False,
+            return_lse=False,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 def test_cudnn_prefill_scale_in_graph_cache_key():
