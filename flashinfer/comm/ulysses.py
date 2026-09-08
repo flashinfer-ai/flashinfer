@@ -94,6 +94,17 @@ class UlyssesWorkspace:
         dtype: torch.dtype,
         device: Optional[Union[torch.device, str, int]] = None,
     ):
+        r"""Initialize reusable NCCL send and receive staging buffers.
+
+        Parameters
+        ----------
+        max_elems : int
+            Capacity of each staging buffer in elements.
+        dtype : torch.dtype
+            Element dtype; float16, bfloat16, or float32.
+        device : torch.device or str or int, optional
+            CUDA device. ``None`` uses the current CUDA device.
+        """
         if type(max_elems) is not int or max_elems <= 0:
             raise ValueError(f"max_elems must be a positive int, got {max_elems!r}")
         if max_elems > _INT32_MAX:
@@ -749,6 +760,17 @@ class UlyssesCommunicator:
         This operation is rank-local and non-collective. ``max_elems``
         defaults to the communicator capacity and may be smaller when a
         caller knows the maximum chunk size it will communicate.
+
+        Parameters
+        ----------
+        max_elems : int, optional
+            Capacity of each send and receive staging buffer in elements.
+            ``None`` uses the communicator's ``max_elems`` capacity.
+
+        Returns
+        -------
+        UlyssesWorkspace
+            A workspace on the communicator's device with its dtype.
         """
         if self._state != _OPEN:
             raise RuntimeError(
@@ -862,6 +884,35 @@ class UlyssesCommunicator:
         supplied, the returned tensor aliases the workspace receive buffer and
         remains valid only until that workspace is reused. Pass ``out`` for an
         explicit lifetime.
+
+        Parameters
+        ----------
+        query : torch.Tensor
+            Positive-strided CUDA tensor with shape ``[B, S_local, H, D]``.
+        key : torch.Tensor
+            Positive-strided CUDA tensor with the same shape, dtype, and
+            device as ``query``.
+        value : torch.Tensor
+            Positive-strided CUDA tensor with the same shape, dtype, and
+            device as ``query``.
+        head_offset : int
+            Start of the selected band within each destination rank's
+            ``H // world_size`` local heads.
+        head_count : int
+            Number of consecutive local heads in the selected band.
+        out : torch.Tensor, optional
+            Preallocated contiguous result with shape
+            ``[B, S_local * world_size, head_count, 3 * D]``. It must not
+            alias ``query``, ``key``, or ``value``.
+        workspace : UlyssesWorkspace, optional
+            Reusable staging storage large enough for the fused Q/K/V
+            payload. A workspace cannot service concurrent collectives.
+
+        Returns
+        -------
+        torch.Tensor
+            Fused Q/K/V payload with shape
+            ``[B, S_global, head_count, 3 * D]``.
         """
         from .ulysses_head_chunk import (
             _launch_pack_qkv,
@@ -1073,6 +1124,29 @@ class UlyssesCommunicator:
         and merges the received head band directly into ``out``. The NVLink
         path uses its fused-transpose collective followed by the same merge
         primitive. Runs on the current CUDA stream.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Positive-strided CUDA tensor with shape
+            ``[B, S_global, head_count, D]``.
+        local_heads : int
+            Total number of attention-output heads owned by this rank before
+            the output all-to-all.
+        head_offset : int
+            Start of this band within the rank's ``local_heads``.
+        out : torch.Tensor
+            Preallocated contiguous destination with shape
+            ``[B, S_global // world_size, world_size * local_heads, D]``.
+            Only this head band is modified.
+        workspace : UlyssesWorkspace, optional
+            Reusable staging storage large enough for ``x``. A workspace
+            cannot service concurrent collectives.
+
+        Returns
+        -------
+        torch.Tensor
+            ``out`` after merging the gathered head band.
         """
         from .ulysses_head_chunk import (
             _launch_merge_rank_major,

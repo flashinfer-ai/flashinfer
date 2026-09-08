@@ -204,6 +204,34 @@ def pack_ulysses_qkv_head_chunk(
 
     This operation runs on the caller's current CUDA stream and allocates only
     when ``out`` is omitted.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Positive-strided CUDA tensor with shape ``[B, S_local, H, D]``.
+    key : torch.Tensor
+        Positive-strided CUDA tensor with the same shape, dtype, and device
+        as ``query``.
+    value : torch.Tensor
+        Positive-strided CUDA tensor with the same shape, dtype, and device
+        as ``query``.
+    world_size : int
+        Number of Ulysses ranks. ``H`` must be divisible by ``world_size``.
+    head_offset : int
+        Start of the selected band within every destination rank's
+        ``H // world_size`` local heads.
+    head_count : int
+        Number of consecutive local heads in the selected band.
+    out : torch.Tensor, optional
+        Preallocated contiguous result with shape
+        ``[B, S_local, world_size * head_count, 3 * D]``. It must not alias
+        ``query``, ``key``, or ``value``.
+
+    Returns
+    -------
+    torch.Tensor
+        Contiguous fused Q/K/V payload with shape
+        ``[B, S_local, world_size * head_count, 3 * D]``.
     """
     _, _, local_heads, _, _ = _validate_qkv_geometry(
         query,
@@ -313,6 +341,28 @@ def merge_ulysses_output_head_chunk(
     whose head counts sum to ``local_heads`` reconstructs the ordinary
     whole-head Ulysses result. It runs on the caller's current CUDA stream and
     performs no allocation.
+
+    Parameters
+    ----------
+    received : torch.Tensor
+        Contiguous gathered head band with shape
+        ``[B, S_local, world_size * head_count, D]``.
+    world_size : int
+        Number of Ulysses ranks represented in ``received`` and ``out``.
+    local_heads : int
+        Number of attention-output heads contributed by each rank to the full
+        output.
+    head_offset : int
+        Start of the selected band within each rank's ``local_heads``.
+    out : torch.Tensor
+        Preallocated contiguous destination with shape
+        ``[B, S_local, world_size * local_heads, D]``. It must not alias
+        ``received``; elements outside the selected band remain unchanged.
+
+    Returns
+    -------
+    torch.Tensor
+        ``out`` after merging the selected head band.
     """
     batch, local_seq, head_count, head_dim = _validate_merge_geometry(
         received,
