@@ -11,11 +11,29 @@ import re
 
 import pytest
 
-from flashinfer.jit import flash_kda, flash_kda_training
+from flashinfer.jit import core, flash_kda, flash_kda_training
 
 
 def _kernel_symbols(source: str) -> set[str]:
     return set(re.findall(r"kernel_flashkda_[A-Za-z0-9_]+", source))
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_flash_kda_generated_direct_serving_uses_cxx20(monkeypatch, target):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    variant_id = next(
+        variant_id
+        for variant_id, module in flash_kda.get_flash_kda_generated_registry().items()
+        if module.target == target
+        and module.abi_family == "direct_m128"
+        and module.abi_variant == "serving"
+    )
+
+    flash_kda.gen_flash_kda_generated_module.cache_clear()
+    spec = flash_kda.gen_flash_kda_generated_module(variant_id)
+
+    assert "-std=c++20" in spec.extra_cuda_cflags
+    assert "-std=c++17" not in spec.extra_cuda_cflags
 
 
 @pytest.mark.parametrize(

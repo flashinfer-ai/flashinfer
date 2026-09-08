@@ -564,3 +564,14 @@ jobs:
           git add -A
           git commit -m "update whl for release ${RELEASE_VERSION}"
           git push
+
+  deploy-docs:
+    needs: [setup, create-release, publish-to-pypi, update-wheel-index]
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/build-doc.yml
+    with:
+      release_tag: ${{ needs.setup.outputs.release_tag }}
