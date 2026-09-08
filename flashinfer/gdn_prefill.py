@@ -24,12 +24,12 @@ from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
 
 try:
-    from .jit import gdn_noncp as _gdn_noncp
+    from .jit import cake_gdn as _cake_gdn
 
-    _GDN_NONCP_AVAILABLE = True
+    _CAKE_GDN_AVAILABLE = True
 except (ImportError, RuntimeError):
-    _gdn_noncp = None
-    _GDN_NONCP_AVAILABLE = False
+    _cake_gdn = None
+    _CAKE_GDN_AVAILABLE = False
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
     chunk_gated_delta_rule_sm90,
@@ -54,13 +54,13 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
 )
 
 
-_GDN_NONCP_HOST_INTS: dict[
+_CAKE_GDN_HOST_INTS: dict[
     tuple[int, int, int, int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
 ] = {}
 
 
-def _gdn_noncp_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
+def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
     """Resolve immutable CUDA integer metadata once, outside Graph capture."""
 
     key = (
@@ -69,31 +69,31 @@ def _gdn_noncp_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ..
         int(values._version),
         int(values.numel()),
     )
-    cached = _GDN_NONCP_HOST_INTS.get(key)
+    cached = _CAKE_GDN_HOST_INTS.get(key)
     if cached is not None and cached[0]() is values:
         return cached[1]
     if torch.cuda.is_current_stream_capturing():
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             f"GDN non-CP prefill requires one eager {purpose} resolution before CUDA Graph capture"
         )
     resolved = tuple(int(value) for value in values.detach().cpu().tolist())
-    _GDN_NONCP_HOST_INTS[key] = (weakref.ref(values), resolved)
+    _CAKE_GDN_HOST_INTS[key] = (weakref.ref(values), resolved)
     return resolved
 
 
-def _gdn_noncp_prefill_seq_lens(
+def _cake_gdn_prefill_seq_lens(
     cu_seqlens: torch.Tensor, total_seq_len: int
 ) -> tuple[int, ...]:
     """Resolve immutable launch metadata once, outside CUDA Graph capture."""
 
-    offsets = _gdn_noncp_host_ints(cu_seqlens, purpose="cu_seqlens metadata")
+    offsets = _cake_gdn_host_ints(cu_seqlens, purpose="cu_seqlens metadata")
     if (
         len(offsets) < 2
         or offsets[0] != 0
         or offsets[-1] != total_seq_len
         or any(end < start for start, end in zip(offsets, offsets[1:], strict=False))
     ):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
         )
     seq_lens = tuple(
@@ -102,7 +102,7 @@ def _gdn_noncp_prefill_seq_lens(
     return seq_lens
 
 
-def _gdn_noncp_assert_state_slots(
+def _cake_gdn_assert_state_slots(
     indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
 ) -> None:
     """Validate CUDA-resident state slots without a host synchronization."""
@@ -117,7 +117,7 @@ def _gdn_noncp_assert_state_slots(
     )
 
 
-def _gdn_noncp_prefill_dtype_name(dtype: torch.dtype) -> str:
+def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
     names = {
         torch.float32: "float32",
         torch.bfloat16: "bfloat16",
@@ -128,12 +128,12 @@ def _gdn_noncp_prefill_dtype_name(dtype: torch.dtype) -> str:
     try:
         return names[dtype]
     except KeyError as exc:
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             f"unsupported GDN non-CP prefill dtype {dtype}"
         ) from exc
 
 
-def _run_gdn_noncp_prefill(
+def _run_cake_gdn_prefill(
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -154,10 +154,10 @@ def _run_gdn_noncp_prefill(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Launch one exact manifest-backed GDN non-CP non-CP prefill row."""
 
-    if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
-        raise RuntimeError("the source-only GDN non-CP GDN backend is not installed")
+    if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
     if use_qk_l2norm_in_kernel:
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP non-CP prefill requires caller-normalized Q/K"
         )
     tensors = tuple(
@@ -179,21 +179,21 @@ def _run_gdn_noncp_prefill(
         if tensor is not None
     )
     if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires all tensors on one CUDA device"
         )
     if q.dtype not in (torch.float16, torch.bfloat16) or any(
         tensor.dtype != q.dtype for tensor in (k, v, output)
     ):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires matching FP16 or BF16 Q/K/V/output"
         )
     if any(not tensor.is_contiguous() for tensor in (q, k, v, output)):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires contiguous Q/K/V/output"
         )
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or output.ndim != 3:
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill tensors must be rank 3"
         )
     total_seq_len, num_q_heads, head_size = map(int, q.shape)
@@ -206,7 +206,7 @@ def _run_gdn_noncp_prefill(
         or tuple(v.shape) != (total_seq_len, num_v_heads, 128)
         or tuple(output.shape) != (total_seq_len, num_o_heads, 128)
     ):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires exact [tokens,heads,128] tensors"
         )
     if (
@@ -214,10 +214,10 @@ def _run_gdn_noncp_prefill(
         or cu_seqlens.dtype not in (torch.int32, torch.int64)
         or not cu_seqlens.is_contiguous()
     ):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires contiguous int32/int64 cu_seqlens"
         )
-    seq_lens = _gdn_noncp_prefill_seq_lens(cu_seqlens, total_seq_len)
+    seq_lens = _cake_gdn_prefill_seq_lens(cu_seqlens, total_seq_len)
     num_seqs = len(seq_lens)
     gates_present = g is not None and beta is not None
 
@@ -235,7 +235,7 @@ def _run_gdn_noncp_prefill(
             or tuple(tensor.shape) != (total_seq_len, num_o_heads)
             or not tensor.is_contiguous()
         ):
-            raise _gdn_noncp.GDNNonCPUnsupportedError(
+            raise _cake_gdn.CakeGDNUnsupportedError(
                 f"GDN non-CP prefill requires contiguous FP32 {name} [tokens,heads]"
             )
 
@@ -256,10 +256,10 @@ def _run_gdn_noncp_prefill(
     ]
     state_dtype = active_states[0].dtype if active_states else torch.float32
     if any(tensor.dtype != state_dtype for tensor in active_states):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires one state dtype across initial/final/checkpoints"
         )
-    state_dtype_name = _gdn_noncp_prefill_dtype_name(state_dtype)
+    state_dtype_name = _cake_gdn_prefill_dtype_name(state_dtype)
     for name, tensor in (
         ("initial_state", initial_state),
         ("output_state", output_state if output_final_state else None),
@@ -271,7 +271,7 @@ def _run_gdn_noncp_prefill(
             or tuple(tensor.shape[1:]) != (num_o_heads, 128, 128)
             or tuple(tensor.stride()[1:]) != (16384, 128, 1)
         ):
-            raise _gdn_noncp.GDNNonCPUnsupportedError(
+            raise _cake_gdn.CakeGDNUnsupportedError(
                 f"GDN non-CP prefill requires {name} with contiguous [H,V,K] rows"
             )
     if state_indices is not None and (
@@ -280,7 +280,7 @@ def _run_gdn_noncp_prefill(
         or state_indices.dtype not in (torch.int32, torch.int64)
         or not state_indices.is_contiguous()
     ):
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires one contiguous integer state index per sequence"
         )
     if state_indices is not None:
@@ -293,7 +293,7 @@ def _run_gdn_noncp_prefill(
             if tensor is not None
         )
         if indexed_pools:
-            _gdn_noncp_assert_state_slots(
+            _cake_gdn_assert_state_slots(
                 state_indices,
                 min(int(tensor.shape[0]) for tensor in indexed_pools),
                 name="GDN non-CP prefill state_indices",
@@ -308,7 +308,7 @@ def _run_gdn_noncp_prefill(
             or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
             or not checkpoint_cu_starts.is_contiguous()
         ):
-            raise _gdn_noncp.GDNNonCPUnsupportedError(
+            raise _cake_gdn.CakeGDNUnsupportedError(
                 "GDN non-CP checkpoint prefill requires contiguous state/cumulative buffers"
             )
         checkpoint_counts = tuple(
@@ -324,24 +324,24 @@ def _run_gdn_noncp_prefill(
             128,
             128,
         ):
-            raise _gdn_noncp.GDNNonCPUnsupportedError(
+            raise _cake_gdn.CakeGDNUnsupportedError(
                 "GDN non-CP state_checkpoints must have shape "
                 "[sum(floor(seq_len/interval)),H,128,128]"
             )
-        observed_checkpoint_cu = _gdn_noncp_host_ints(
+        observed_checkpoint_cu = _cake_gdn_host_ints(
             checkpoint_cu_starts,
             purpose="checkpoint cumulative metadata",
         )
         if observed_checkpoint_cu != expected_checkpoint_cu:
-            raise _gdn_noncp.GDNNonCPUnsupportedError(
+            raise _cake_gdn.CakeGDNUnsupportedError(
                 "GDN non-CP checkpoint_cu_starts does not match cu_seqlens and checkpoint interval"
             )
 
     major, minor = torch.cuda.get_device_capability(q.device)
-    arch = _gdn_noncp.arch_for_compute_capability(major, minor)
-    route = _gdn_noncp.select_gdn_noncp_prefill_variant(
+    arch = _cake_gdn.arch_for_compute_capability(major, minor)
+    route = _cake_gdn.select_cake_gdn_prefill_variant(
         arch=arch,
-        io_dtype=_gdn_noncp_prefill_dtype_name(q.dtype),
+        io_dtype=_cake_gdn_prefill_dtype_name(q.dtype),
         state_dtype=state_dtype_name,
         num_seqs=num_seqs,
         total_seq_len=total_seq_len,
@@ -356,7 +356,7 @@ def _run_gdn_noncp_prefill(
         gates_present=gates_present,
         seq_lens=seq_lens,
     )
-    entry = _gdn_noncp.load_gdn_noncp_kernel(route.variant_name, arch)
+    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
     active_clusters = int(
         torch.cuda.get_device_properties(q.device).multi_processor_count
     )
@@ -525,7 +525,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "gdn_noncp"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -629,9 +629,9 @@ def chunk_gated_delta_rule(
         host sync); the caller's slot allocator is expected to guarantee it.
 
 
-    backend : {"auto", "flashinfer", "gdn_noncp"}
+    backend : {"auto", "flashinfer", "cake_gdn"}
         ``auto`` selects GDN non-CP only for an exact frozen non-CP manifest row;
-        explicit ``gdn_noncp`` requests fail closed.
+        explicit ``cake_gdn`` requests fail closed.
 
     Returns
     -------
@@ -654,12 +654,12 @@ def chunk_gated_delta_rule(
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
     """
-    if backend not in ("auto", "flashinfer", "gdn_noncp"):
+    if backend not in ("auto", "flashinfer", "cake_gdn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
-    if backend == "gdn_noncp" and (not _GDN_NONCP_AVAILABLE or _gdn_noncp is None):
-        raise RuntimeError("the source-only GDN non-CP GDN backend is not installed")
-    if backend == "gdn_noncp" and use_cp is True:
-        raise _gdn_noncp.GDNNonCPUnsupportedError(
+    if backend == "cake_gdn" and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None):
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
+    if backend == "cake_gdn" and use_cp is True:
+        raise _cake_gdn.CakeGDNUnsupportedError(
             "forced context-parallel prefill is outside the GDN non-CP non-CP backend"
         )
     if use_cp not in ("auto", True, False):
@@ -766,7 +766,7 @@ def chunk_gated_delta_rule(
         _device_name,
         device_capability=_device_capability,
     )
-    will_use_cp = backend != "gdn_noncp" and (
+    will_use_cp = backend != "cake_gdn" and (
         use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
     )
     if state_indices is not None:
@@ -882,14 +882,14 @@ def chunk_gated_delta_rule(
                 return output, output_state
             return output
     if backend != "flashinfer":
-        if not _GDN_NONCP_AVAILABLE or _gdn_noncp is None:
-            if backend == "gdn_noncp":
+        if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+            if backend == "cake_gdn":
                 raise RuntimeError(
-                    "the source-only GDN non-CP GDN backend is not installed"
+                    "the source-only Cake GDN backend is not installed"
                 )
         else:
             try:
-                return _run_gdn_noncp_prefill(
+                return _run_cake_gdn_prefill(
                     q=q,
                     k=k,
                     v=v,
@@ -907,8 +907,8 @@ def chunk_gated_delta_rule(
                     checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                     state_indices=state_indices,
                 )
-            except _gdn_noncp.GDNNonCPUnsupportedError:
-                if backend == "gdn_noncp":
+            except _cake_gdn.CakeGDNUnsupportedError:
+                if backend == "cake_gdn":
                     raise
 
     if _arch_major == 10:
