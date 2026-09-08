@@ -8,17 +8,16 @@
 #define FLASHINFER_BLACKWELL_BF16_FP4_SOURCE_READY 1
 #define FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION 3
 #define FLASHINFER_BLACKWELL_BF16_FP4_TARGET_SM 103
-#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "cebf3fe0396099fb2d1624538fd7dc50602d906264c4002270d85cfcebbdc28d"
-#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "430826d793009c01905e1c8a9f27d56ff450fada89ab70b94ea5ffcda516363a"
+#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "ee3ada54977ac00eb5b35728808375b8ae73d78b9da04a8a67f058d50f09f128"
+#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "8442092e9cf2bc80a5b0259a9634e883823ca46bcda1ef6217bbcd9354954491"
 #include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 typedef CUtensorMap FlashInferTensorMap;
 static_assert(sizeof(FlashInferTensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
 static_assert(alignof(FlashInferTensorMap) == 128, "CUtensorMap ABI alignment must remain 128 bytes");
-#include <cuda_fp8.h>
-
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
@@ -44,6 +43,11 @@ __device__ __forceinline__ uint32_t elect_sync() {
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
         :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
+    asm volatile("mbarrier.init.b64 [%0], %1;"
+        :: "l"(mbar_addr), "r"(count));
 }
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
@@ -93,19 +97,104 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+
+__device__ __forceinline__ void mbarrier_wait_suspend(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_SUSPEND:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_SUSPEND;\n\t"
+        "bra.uni LAB_WAIT_SUSPEND;\n\t"
+        "DONE_SUSPEND:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT_CLUSTER:\n\t"
         "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE_CLUSTER;\n\t"
         "bra.uni LAB_WAIT_CLUSTER;\n\t"
         "DONE_CLUSTER:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        ".reg .u32 WAIT_ADDR;\n\t"
+        "mov.u32 WAIT_ADDR, %0;\n\t"
+        "LAB_WAIT_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [WAIT_ADDR], %1, %2;\n\t"
+        "@P1 bra.uni DONE_HINT;\n\t"
+        "bra.uni LAB_WAIT_HINT;\n\t"
+        "DONE_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED_HINT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra DONE_RELAXED_HINT;\n\t"
+        "bra LAB_WAIT_RELAXED_HINT;\n\t"
+        "DONE_RELAXED_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
@@ -114,9 +203,30 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
     }
 }
 
+__device__ __forceinline__ void mbarrier_wait_token_suspend(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
 __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
     if (token == 0) {
         mbarrier_wait_cluster(mbar_addr, phase);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
     }
 }
 
@@ -325,6 +435,150 @@ __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
 }
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+
+__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rn.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rz.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rm.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rm.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rp.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rp.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rn.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rm.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rp.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
 
 __device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
     float2 r;
@@ -588,8 +842,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -624,7 +879,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap con
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -719,7 +974,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap con
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -943,7 +1198,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap con
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -1272,8 +1527,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -1308,7 +1564,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap con
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -1403,7 +1659,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap con
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -1636,7 +1892,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap con
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -1965,8 +2221,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -2001,7 +2258,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap con
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -2096,7 +2353,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap con
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -2323,7 +2580,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap con
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -2652,8 +2909,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -2688,7 +2946,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap con
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -2783,7 +3041,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap con
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -3019,7 +3277,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap con
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -3348,8 +3606,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -3384,7 +3643,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap c
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -3484,7 +3743,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap c
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -3717,7 +3976,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap c
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -4046,8 +4305,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -4082,7 +4342,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap c
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -4182,7 +4442,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap c
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -4424,7 +4684,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap c
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -4753,8 +5013,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -4789,7 +5050,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap c
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -4889,7 +5150,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap c
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -5125,7 +5386,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap c
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -5454,8 +5715,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -5490,7 +5752,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap c
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -5590,7 +5852,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap c
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -5835,7 +6097,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap c
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -6164,8 +6426,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -6200,7 +6463,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap cons
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -6295,7 +6558,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap cons
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -6519,7 +6782,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap cons
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -6848,8 +7111,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -6884,7 +7148,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap cons
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -6979,7 +7243,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap cons
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -7212,7 +7476,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap cons
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -7541,8 +7805,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -7577,7 +7842,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap cons
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -7672,7 +7937,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap cons
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -7899,7 +8164,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap cons
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -8228,8 +8493,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -8264,7 +8530,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap cons
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -8359,7 +8625,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap cons
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -8595,7 +8861,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap cons
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -8924,8 +9190,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -8960,7 +9227,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -9060,7 +9327,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -9293,7 +9560,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -9622,8 +9889,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -9658,7 +9926,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -9758,7 +10026,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -10000,7 +10268,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -10329,8 +10597,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -10365,7 +10634,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -10465,7 +10734,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -10701,7 +10970,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -11030,8 +11299,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -11066,7 +11336,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -11166,7 +11436,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -11411,7 +11681,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -11740,8 +12010,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -11774,7 +12045,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMa
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -11869,7 +12140,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMa
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -12190,7 +12461,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMa
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -12516,8 +12787,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -12550,7 +12822,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMa
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -12645,7 +12917,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMa
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -12975,7 +13247,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMa
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -13301,8 +13573,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -13335,7 +13608,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMa
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -13430,7 +13703,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMa
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -13754,7 +14027,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMa
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -14080,8 +14353,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -14114,7 +14388,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMa
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -14209,7 +14483,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMa
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -14542,7 +14816,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMa
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -14868,8 +15142,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -14902,7 +15177,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensor
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -15002,7 +15277,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensor
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -15332,7 +15607,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensor
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -15658,8 +15933,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -15692,7 +15968,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensor
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -15792,7 +16068,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensor
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -16131,7 +16407,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensor
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -16457,8 +16733,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -16491,7 +16768,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensor
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -16591,7 +16868,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensor
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -16924,7 +17201,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensor
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -17250,8 +17527,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -17284,7 +17562,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensor
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -17384,7 +17662,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensor
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -17726,7 +18004,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensor
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -18052,8 +18330,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -18086,7 +18365,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -18181,7 +18460,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -18502,7 +18781,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -18828,8 +19107,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -18862,7 +19142,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -18957,7 +19237,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -19287,7 +19567,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -19613,8 +19893,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -19647,7 +19928,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -19742,7 +20023,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -20066,7 +20347,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -20392,8 +20673,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -20426,7 +20708,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -20521,7 +20803,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -20854,7 +21136,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -21180,8 +21462,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -21214,7 +21497,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorM
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -21314,7 +21597,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorM
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -21644,7 +21927,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorM
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -21970,8 +22253,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -22004,7 +22288,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorM
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -22104,7 +22388,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorM
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -22443,7 +22727,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorM
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -22769,8 +23053,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -22803,7 +23088,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorM
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -22903,7 +23188,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorM
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -23236,7 +23521,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorM
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -23562,8 +23847,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorMap const* A, uint8_t* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __half* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -23596,7 +23882,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorM
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -23696,7 +23982,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorM
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -24038,7 +24324,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorM
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word_1[1];
             unsigned int _phase_packed_full = 0;
@@ -24364,8 +24650,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -24400,7 +24687,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -24495,7 +24782,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -24719,7 +25006,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -25067,8 +25354,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -25103,7 +25391,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -25198,7 +25486,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -25431,7 +25719,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -25779,8 +26067,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -25815,7 +26104,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -25910,7 +26199,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -26137,7 +26426,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -26485,8 +26774,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -26521,7 +26811,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -26616,7 +26906,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -26852,7 +27142,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -27200,8 +27490,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -27236,7 +27527,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const*
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -27336,7 +27627,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const*
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -27569,7 +27860,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const*
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -27917,8 +28208,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -27953,7 +28245,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const*
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -28053,7 +28345,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const*
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -28295,7 +28587,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const*
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -28643,8 +28935,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -28679,7 +28972,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const*
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -28779,7 +29072,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const*
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -29015,7 +29308,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const*
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -29363,8 +29656,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -29399,7 +29693,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const*
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -29499,7 +29793,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const*
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -29744,7 +30038,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const*
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -30091,8 +30385,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -30127,7 +30422,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 20480);
     const int smem_weight_addr = smem + 20480;
 
-    // Mbarrier init (7 groups, 31 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 31 barriers)
     // Mbarriers at smem_raw[0..248)
 
     if (warp == 0) {
@@ -30204,7 +30499,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -31345,7 +31640,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -31672,8 +31967,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -31708,7 +32004,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 20480);
     const int smem_weight_addr = smem + 20480;
 
-    // Mbarrier init (7 groups, 31 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 31 barriers)
     // Mbarriers at smem_raw[0..248)
 
     if (warp == 0) {
@@ -31785,7 +32081,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -32935,7 +33231,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -33262,8 +33558,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -33298,7 +33595,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 20480);
     const int smem_weight_addr = smem + 20480;
 
-    // Mbarrier init (7 groups, 31 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 31 barriers)
     // Mbarriers at smem_raw[0..248)
 
     if (warp == 0) {
@@ -33375,7 +33672,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -34519,7 +34816,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -34846,8 +35143,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -34882,7 +35180,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 20480);
     const int smem_weight_addr = smem + 20480;
 
-    // Mbarrier init (7 groups, 31 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 31 barriers)
     // Mbarriers at smem_raw[0..248)
 
     if (warp == 0) {
@@ -34959,7 +35257,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -36112,7 +36410,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -36439,8 +36737,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, float* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -36475,7 +36774,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -36570,7 +36869,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -36811,7 +37110,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -37138,8 +37437,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, float* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -37174,7 +37474,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -37269,7 +37569,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             unsigned int _phase_output_full_0 = 0;
             mbarrier_wait(output_full_addr, _phase_output_full_0);
@@ -37519,7 +37819,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -37846,8 +38146,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, float* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -37882,7 +38183,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -37977,7 +38278,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -38221,7 +38522,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -38548,8 +38849,9 @@ __global__ __launch_bounds__(512) void
 kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, float* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -38584,7 +38886,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap co
     __nv_bfloat16* smem_weight = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_weight_addr = smem + 6144;
 
-    // Mbarrier init (7 groups, 49 barriers)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 49 barriers)
     // Mbarriers at smem_raw[0..392)
 
     if (warp == 0) {
@@ -38679,7 +38981,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap co
             int off_n = tile_n * 64;
             int epi_warp = warp % 4;
             int lane_pair = lane % 4;
-            int row_base = epi_warp * 16 + lane / 4;
+            int row_base = (unsigned int)(epi_warp * 16) + lane / 4;
             float alpha_value = 1.0f;
             {
                 alpha_value = alpha[0];
@@ -38932,7 +39234,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap co
             int k_tiles_3 = (k_extent_3 + 64 - 1) / 64;
             unsigned int convert_stage = 0;
             int warp_id_in_role = (warp - 8);
-            int convert_tid = warp_id_in_role * 32 + lane;
+            int convert_tid = (unsigned int)(warp_id_in_role * 32) + lane;
             unsigned int raw_words[2];
             unsigned int scale_word[1];
             unsigned int _phase_packed_full = 0;
@@ -39243,8 +39545,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_split_k2_reduce_pdl0(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int elements)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -39276,8 +39579,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_split_k2_reduce_pdl1(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int elements)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -39330,8 +39634,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -39361,7 +39666,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -39473,7 +39778,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 32 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 32 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -39508,7 +39813,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -39838,8 +40143,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -39869,7 +40175,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -39981,7 +40287,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 32 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 32 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -40016,7 +40322,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -40356,8 +40662,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -40387,7 +40694,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -40499,7 +40806,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 32 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 32 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -40534,7 +40841,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -40867,8 +41174,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -40898,7 +41206,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -41010,7 +41318,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 32 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 32 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -41045,7 +41353,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -41388,8 +41696,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -41419,7 +41728,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -41531,7 +41840,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -41566,7 +41875,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -41754,7 +42063,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -41789,7 +42098,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -42119,8 +42428,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -42150,7 +42460,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -42262,7 +42572,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -42297,7 +42607,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -42485,7 +42795,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -42520,7 +42830,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -42860,8 +43170,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -42891,7 +43202,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -43003,7 +43314,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -43038,7 +43349,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -43226,7 +43537,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -43261,7 +43572,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -43594,8 +43905,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -43625,7 +43937,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -43737,7 +44049,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -43772,7 +44084,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -43960,7 +44272,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 64 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -43995,7 +44307,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -44338,8 +44650,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -44369,7 +44682,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -44481,7 +44794,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -44516,7 +44829,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -44704,7 +45017,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -44739,7 +45052,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -44927,7 +45240,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -44962,7 +45275,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -45292,8 +45605,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -45323,7 +45637,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -45435,7 +45749,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -45470,7 +45784,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -45658,7 +45972,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -45693,7 +46007,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -45881,7 +46195,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -45916,7 +46230,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -46256,8 +46570,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -46287,7 +46602,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -46399,7 +46714,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -46434,7 +46749,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -46622,7 +46937,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -46657,7 +46972,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -46845,7 +47160,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -46880,7 +47195,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -47213,8 +47528,9 @@ __global__ __launch_bounds__(96) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -47244,7 +47560,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int warp_mma_c_addr = smem + 148480;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -47356,7 +47672,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + lane / 16 * 8 * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + lane / 16 * 8 * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -47391,7 +47707,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -47579,7 +47895,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (16 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -47614,7 +47930,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -47802,7 +48118,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 96 + (32 + lane / 16 * 8) * 2)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -47837,7 +48153,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent(FlashInferTensor
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -48176,8 +48492,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* __restrict__ A, int* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -48260,7 +48577,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_20 = stage_valid && global_k_group_18 < total_k_groups;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + (unsigned int)(packed_row_17 * 128 + packed_panel_word_16 * 4 ^ (packed_row_17 * 128 + packed_panel_word_16 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_19 * (N * 2) + packed_off_n * 2 + local_word_14)), "r"((valid_b_20) ? 16 : 0));
-    int _min_7 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_7 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk = warp * 8 + _min_7;
     int local_scale_k_group = scale_chunk / 4;
     int local_scale_n = scale_chunk % 4 * 16;
@@ -48330,7 +48647,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_62 = stage_valid_22 && global_k_group_60 < total_k_groups_24;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 9216 + (unsigned int)(packed_row_59 * 128 + packed_panel_word_58 * 4 ^ (packed_row_59 * 128 + packed_panel_word_58 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_61 * (N * 2) + packed_off_n * 2 + local_word_56)), "r"((valid_b_62) ? 16 : 0));
-    int _min_16 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_16 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_63 = warp * 8 + _min_16;
     int local_scale_k_group_64 = scale_chunk_63 / 4;
     int local_scale_n_65 = scale_chunk_63 % 4 * 16;
@@ -48400,7 +48717,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_110 = stage_valid_70 && global_k_group_108 < total_k_groups_72;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 18432 + (unsigned int)(packed_row_107 * 128 + packed_panel_word_106 * 4 ^ (packed_row_107 * 128 + packed_panel_word_106 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_109 * (N * 2) + packed_off_n * 2 + local_word_104)), "r"((valid_b_110) ? 16 : 0));
-    int _min_25 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_25 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_111 = warp * 8 + _min_25;
     int local_scale_k_group_112 = scale_chunk_111 / 4;
     int local_scale_n_113 = scale_chunk_111 % 4 * 16;
@@ -48440,7 +48757,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base + (lane % 16 * 128 + a_k_byte ^ (lane % 16 * 128 + a_k_byte >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base + (lane % 16 * 128 + (unsigned int)a_k_byte ^ (lane % 16 * 128 + (unsigned int)a_k_byte >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_0[4];
         asm(
@@ -48477,11 +48794,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
         int owner_half = warp / 2;
         int n_region = warp & 1;
-        int u32_pos = lane * 2 + owner_half;
+        int u32_pos = lane * 2 + (unsigned int)owner_half;
         int packed_panel_0 = u32_pos / 32;
         int packed_panel_word_1 = u32_pos - packed_panel_0 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_0 * 128 + packed_panel_word_1 * 4 ^ (packed_panel_0 * 128 + packed_panel_word_1 * 4 >> 7 & 7) << 4))));
-        int sf_linear = base_n + warp * 16;
+        int sf_linear = (unsigned int)base_n + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear / 4 * 4));
         uint8_t scale_byte = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear & 3) * 8) & 255);
         int byte_shift = n_region * 16;
@@ -48521,11 +48838,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_0[0]), "r"(_mma_sync_m16n8k16_a_f16_0[1]), "r"(_mma_sync_m16n8k16_a_f16_0[2]), "r"(_mma_sync_m16n8k16_a_f16_0[3]), "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
         }
-        int u32_pos_2 = 64 + lane * 2 + owner_half;
+        int u32_pos_2 = 64 + lane * 2 + (unsigned int)owner_half;
         int packed_panel_3 = u32_pos_2 / 32;
         int packed_panel_word_4 = u32_pos_2 - packed_panel_3 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_3 * 128 + packed_panel_word_4 * 4 ^ (packed_panel_3 * 128 + packed_panel_word_4 * 4 >> 7 & 7) << 4))));
-        int sf_linear_5 = base_n + 8 + warp * 16;
+        int sf_linear_5 = (unsigned int)(base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_5 / 4 * 4));
         uint8_t scale_byte_6 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_5 & 3) * 8) & 255);
         int byte_shift_7 = n_region * 16;
@@ -48569,7 +48886,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_9 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_8 + (lane % 16 * 128 + a_k_byte_9 ^ (lane % 16 * 128 + a_k_byte_9 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_8 + (lane % 16 * 128 + (unsigned int)a_k_byte_9 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_9 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_1[4];
         asm(
@@ -48606,11 +48923,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
         int owner_half_10 = warp / 2;
         int n_region_11 = warp & 1;
-        int u32_pos_12 = lane * 2 + owner_half_10;
+        int u32_pos_12 = lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_13 = u32_pos_12 / 32;
         int packed_panel_word_14 = u32_pos_12 - packed_panel_13 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 ^ ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 >> 7 & 7) << 4))));
-        int sf_linear_15 = 64 + base_n + warp * 16;
+        int sf_linear_15 = (unsigned int)(64 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_15 / 4 * 4));
         uint8_t scale_byte_16 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_15 & 3) * 8) & 255);
         int byte_shift_17 = n_region_11 * 16;
@@ -48650,11 +48967,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_1[0]), "r"(_mma_sync_m16n8k16_a_f16_1[1]), "r"(_mma_sync_m16n8k16_a_f16_1[2]), "r"(_mma_sync_m16n8k16_a_f16_1[3]), "r"(_mma_sync_m16n8k16_b_2[0]), "r"(_mma_sync_m16n8k16_b_2[1]));
         }
-        int u32_pos_18 = 64 + lane * 2 + owner_half_10;
+        int u32_pos_18 = 64 + lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_19 = u32_pos_18 / 32;
         int packed_panel_word_20 = u32_pos_18 - packed_panel_19 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 ^ ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 >> 7 & 7) << 4))));
-        int sf_linear_21 = 64 + base_n + 8 + warp * 16;
+        int sf_linear_21 = (unsigned int)(64 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_21 / 4 * 4));
         uint8_t scale_byte_22 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_21 & 3) * 8) & 255);
         int byte_shift_23 = n_region_11 * 16;
@@ -48698,7 +49015,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_25 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_24 + (lane % 16 * 128 + a_k_byte_25 ^ (lane % 16 * 128 + a_k_byte_25 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_24 + (lane % 16 * 128 + (unsigned int)a_k_byte_25 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_25 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_2[4];
         asm(
@@ -48735,11 +49052,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
         int owner_half_26 = warp / 2;
         int n_region_27 = warp & 1;
-        int u32_pos_28 = lane * 2 + owner_half_26;
+        int u32_pos_28 = lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_29 = u32_pos_28 / 32;
         int packed_panel_word_30 = u32_pos_28 - packed_panel_29 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 ^ ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 >> 7 & 7) << 4))));
-        int sf_linear_31 = 128 + base_n + warp * 16;
+        int sf_linear_31 = (unsigned int)(128 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_31 / 4 * 4));
         uint8_t scale_byte_32 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_31 & 3) * 8) & 255);
         int byte_shift_33 = n_region_27 * 16;
@@ -48779,11 +49096,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_2[0]), "r"(_mma_sync_m16n8k16_a_f16_2[1]), "r"(_mma_sync_m16n8k16_a_f16_2[2]), "r"(_mma_sync_m16n8k16_a_f16_2[3]), "r"(_mma_sync_m16n8k16_b_4[0]), "r"(_mma_sync_m16n8k16_b_4[1]));
         }
-        int u32_pos_34 = 64 + lane * 2 + owner_half_26;
+        int u32_pos_34 = 64 + lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_35 = u32_pos_34 / 32;
         int packed_panel_word_36 = u32_pos_34 - packed_panel_35 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 ^ ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 >> 7 & 7) << 4))));
-        int sf_linear_37 = 128 + base_n + 8 + warp * 16;
+        int sf_linear_37 = (unsigned int)(128 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_37 / 4 * 4));
         uint8_t scale_byte_38 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_37 & 3) * 8) & 255);
         int byte_shift_39 = n_region_27 * 16;
@@ -48827,7 +49144,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_41 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_40 + (lane % 16 * 128 + a_k_byte_41 ^ (lane % 16 * 128 + a_k_byte_41 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_40 + (lane % 16 * 128 + (unsigned int)a_k_byte_41 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_41 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_3[4];
         asm(
@@ -48864,11 +49181,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
         int owner_half_42 = warp / 2;
         int n_region_43 = warp & 1;
-        int u32_pos_44 = lane * 2 + owner_half_42;
+        int u32_pos_44 = lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_45 = u32_pos_44 / 32;
         int packed_panel_word_46 = u32_pos_44 - packed_panel_45 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 ^ ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 >> 7 & 7) << 4))));
-        int sf_linear_47 = 192 + base_n + warp * 16;
+        int sf_linear_47 = (unsigned int)(192 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_47 / 4 * 4));
         uint8_t scale_byte_48 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_47 & 3) * 8) & 255);
         int byte_shift_49 = n_region_43 * 16;
@@ -48908,11 +49225,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_3[0]), "r"(_mma_sync_m16n8k16_a_f16_3[1]), "r"(_mma_sync_m16n8k16_a_f16_3[2]), "r"(_mma_sync_m16n8k16_a_f16_3[3]), "r"(_mma_sync_m16n8k16_b_6[0]), "r"(_mma_sync_m16n8k16_b_6[1]));
         }
-        int u32_pos_50 = 64 + lane * 2 + owner_half_42;
+        int u32_pos_50 = 64 + lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_51 = u32_pos_50 / 32;
         int packed_panel_word_52 = u32_pos_50 - packed_panel_51 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 ^ ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 >> 7 & 7) << 4))));
-        int sf_linear_53 = 192 + base_n + 8 + warp * 16;
+        int sf_linear_53 = (unsigned int)(192 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_53 / 4 * 4));
         uint8_t scale_byte_54 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_53 & 3) * 8) & 255);
         int byte_shift_55 = n_region_43 * 16;
@@ -48956,7 +49273,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_57 = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_56 + (lane % 16 * 128 + a_k_byte_57 ^ (lane % 16 * 128 + a_k_byte_57 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_56 + (lane % 16 * 128 + (unsigned int)a_k_byte_57 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_57 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_4[4];
         asm(
@@ -48993,11 +49310,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
         int owner_half_58 = warp / 2;
         int n_region_59 = warp & 1;
-        int u32_pos_60 = lane * 2 + owner_half_58;
+        int u32_pos_60 = lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_61 = u32_pos_60 / 32;
         int packed_panel_word_62 = u32_pos_60 - packed_panel_61 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 ^ ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 >> 7 & 7) << 4))));
-        int sf_linear_63 = 256 + base_n + warp * 16;
+        int sf_linear_63 = (unsigned int)(256 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_63 / 4 * 4));
         uint8_t scale_byte_64 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_63 & 3) * 8) & 255);
         int byte_shift_65 = n_region_59 * 16;
@@ -49037,11 +49354,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_4[0]), "r"(_mma_sync_m16n8k16_a_f16_4[1]), "r"(_mma_sync_m16n8k16_a_f16_4[2]), "r"(_mma_sync_m16n8k16_a_f16_4[3]), "r"(_mma_sync_m16n8k16_b_8[0]), "r"(_mma_sync_m16n8k16_b_8[1]));
         }
-        int u32_pos_66 = 64 + lane * 2 + owner_half_58;
+        int u32_pos_66 = 64 + lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_67 = u32_pos_66 / 32;
         int packed_panel_word_68 = u32_pos_66 - packed_panel_67 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 ^ ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 >> 7 & 7) << 4))));
-        int sf_linear_69 = 256 + base_n + 8 + warp * 16;
+        int sf_linear_69 = (unsigned int)(256 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_69 / 4 * 4));
         uint8_t scale_byte_70 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_69 & 3) * 8) & 255);
         int byte_shift_71 = n_region_59 * 16;
@@ -49085,7 +49402,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_73 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_72 + (lane % 16 * 128 + a_k_byte_73 ^ (lane % 16 * 128 + a_k_byte_73 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_72 + (lane % 16 * 128 + (unsigned int)a_k_byte_73 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_73 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_5[4];
         asm(
@@ -49122,11 +49439,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
         int owner_half_74 = warp / 2;
         int n_region_75 = warp & 1;
-        int u32_pos_76 = lane * 2 + owner_half_74;
+        int u32_pos_76 = lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_77 = u32_pos_76 / 32;
         int packed_panel_word_78 = u32_pos_76 - packed_panel_77 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 ^ ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 >> 7 & 7) << 4))));
-        int sf_linear_79 = 320 + base_n + warp * 16;
+        int sf_linear_79 = (unsigned int)(320 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_79 / 4 * 4));
         uint8_t scale_byte_80 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_79 & 3) * 8) & 255);
         int byte_shift_81 = n_region_75 * 16;
@@ -49166,11 +49483,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_5[0]), "r"(_mma_sync_m16n8k16_a_f16_5[1]), "r"(_mma_sync_m16n8k16_a_f16_5[2]), "r"(_mma_sync_m16n8k16_a_f16_5[3]), "r"(_mma_sync_m16n8k16_b_10[0]), "r"(_mma_sync_m16n8k16_b_10[1]));
         }
-        int u32_pos_82 = 64 + lane * 2 + owner_half_74;
+        int u32_pos_82 = 64 + lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_83 = u32_pos_82 / 32;
         int packed_panel_word_84 = u32_pos_82 - packed_panel_83 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 ^ ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 >> 7 & 7) << 4))));
-        int sf_linear_85 = 320 + base_n + 8 + warp * 16;
+        int sf_linear_85 = (unsigned int)(320 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_85 / 4 * 4));
         uint8_t scale_byte_86 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_85 & 3) * 8) & 255);
         int byte_shift_87 = n_region_75 * 16;
@@ -49214,7 +49531,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_89 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_88 + (lane % 16 * 128 + a_k_byte_89 ^ (lane % 16 * 128 + a_k_byte_89 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_88 + (lane % 16 * 128 + (unsigned int)a_k_byte_89 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_89 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_6[4];
         asm(
@@ -49251,11 +49568,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
         int owner_half_90 = warp / 2;
         int n_region_91 = warp & 1;
-        int u32_pos_92 = lane * 2 + owner_half_90;
+        int u32_pos_92 = lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_93 = u32_pos_92 / 32;
         int packed_panel_word_94 = u32_pos_92 - packed_panel_93 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 ^ ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 >> 7 & 7) << 4))));
-        int sf_linear_95 = 384 + base_n + warp * 16;
+        int sf_linear_95 = (unsigned int)(384 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_95 / 4 * 4));
         uint8_t scale_byte_96 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_95 & 3) * 8) & 255);
         int byte_shift_97 = n_region_91 * 16;
@@ -49295,11 +49612,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_6[0]), "r"(_mma_sync_m16n8k16_a_f16_6[1]), "r"(_mma_sync_m16n8k16_a_f16_6[2]), "r"(_mma_sync_m16n8k16_a_f16_6[3]), "r"(_mma_sync_m16n8k16_b_12[0]), "r"(_mma_sync_m16n8k16_b_12[1]));
         }
-        int u32_pos_98 = 64 + lane * 2 + owner_half_90;
+        int u32_pos_98 = 64 + lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_99 = u32_pos_98 / 32;
         int packed_panel_word_100 = u32_pos_98 - packed_panel_99 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 ^ ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 >> 7 & 7) << 4))));
-        int sf_linear_101 = 384 + base_n + 8 + warp * 16;
+        int sf_linear_101 = (unsigned int)(384 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_101 / 4 * 4));
         uint8_t scale_byte_102 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_101 & 3) * 8) & 255);
         int byte_shift_103 = n_region_91 * 16;
@@ -49343,7 +49660,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_105 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_104 + (lane % 16 * 128 + a_k_byte_105 ^ (lane % 16 * 128 + a_k_byte_105 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_104 + (lane % 16 * 128 + (unsigned int)a_k_byte_105 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_105 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_7[4];
         asm(
@@ -49380,11 +49697,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
         int owner_half_106 = warp / 2;
         int n_region_107 = warp & 1;
-        int u32_pos_108 = lane * 2 + owner_half_106;
+        int u32_pos_108 = lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_109 = u32_pos_108 / 32;
         int packed_panel_word_110 = u32_pos_108 - packed_panel_109 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 ^ ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 >> 7 & 7) << 4))));
-        int sf_linear_111 = 448 + base_n + warp * 16;
+        int sf_linear_111 = (unsigned int)(448 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_111 / 4 * 4));
         uint8_t scale_byte_112 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_111 & 3) * 8) & 255);
         int byte_shift_113 = n_region_107 * 16;
@@ -49424,11 +49741,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_7[0]), "r"(_mma_sync_m16n8k16_a_f16_7[1]), "r"(_mma_sync_m16n8k16_a_f16_7[2]), "r"(_mma_sync_m16n8k16_a_f16_7[3]), "r"(_mma_sync_m16n8k16_b_14[0]), "r"(_mma_sync_m16n8k16_b_14[1]));
         }
-        int u32_pos_114 = 64 + lane * 2 + owner_half_106;
+        int u32_pos_114 = 64 + lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_115 = u32_pos_114 / 32;
         int packed_panel_word_116 = u32_pos_114 - packed_panel_115 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 ^ ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 >> 7 & 7) << 4))));
-        int sf_linear_117 = 448 + base_n + 8 + warp * 16;
+        int sf_linear_117 = (unsigned int)(448 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_117 / 4 * 4));
         uint8_t scale_byte_118 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_117 & 3) * 8) & 255);
         int byte_shift_119 = n_region_107 * 16;
@@ -49526,7 +49843,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
         bool valid_b_161 = stage_valid_121 && global_k_group_159 < total_k_groups_123;
         asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
             :: "r"((cute_remaining_small_b_addr + (unsigned int)(stage * 9216) + (unsigned int)(packed_row_158 * 128 + packed_panel_word_157 * 4 ^ (packed_row_158 * 128 + packed_panel_word_157 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_160 * (N * 2) + packed_off_n * 2 + local_word_155)), "r"((valid_b_161) ? 16 : 0));
-        int _min_34 = ((lane) < (7) ? (lane) : (7));
+        unsigned int _min_34 = ((lane) < (7) ? (lane) : (7));
         int scale_chunk_162 = warp * 8 + _min_34;
         int local_scale_k_group_163 = scale_chunk_162 / 4;
         int local_scale_n_164 = scale_chunk_162 % 4 * 16;
@@ -49544,7 +49861,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent(__nv_bfloat16* 
     int row0 = lane / 4;
     int row1 = row0 + 8;
     int output_partition = warp * 16;
-    int col_pair = off_n + output_partition + lane % 4 * 2;
+    int col_pair = (unsigned int)(off_n + output_partition) + lane % 4 * 2;
     if (off_m + row0 < M && col_pair < N) {
         long long row0_base = (long long)(off_m + row0) * (long long)N + (long long)col_pair;
         {
@@ -49656,8 +49973,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* __restrict__ A, int* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -49743,7 +50061,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_20 = stage_valid && global_k_group_18 < total_k_groups;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + (unsigned int)(packed_row_17 * 128 + packed_panel_word_16 * 4 ^ (packed_row_17 * 128 + packed_panel_word_16 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_19 * (N * 2) + packed_off_n * 2 + local_word_14)), "r"((valid_b_20) ? 16 : 0));
-    int _min_7 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_7 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk = warp * 8 + _min_7;
     int local_scale_k_group = scale_chunk / 4;
     int local_scale_n = scale_chunk % 4 * 16;
@@ -49813,7 +50131,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_62 = stage_valid_22 && global_k_group_60 < total_k_groups_24;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 9216 + (unsigned int)(packed_row_59 * 128 + packed_panel_word_58 * 4 ^ (packed_row_59 * 128 + packed_panel_word_58 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_61 * (N * 2) + packed_off_n * 2 + local_word_56)), "r"((valid_b_62) ? 16 : 0));
-    int _min_16 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_16 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_63 = warp * 8 + _min_16;
     int local_scale_k_group_64 = scale_chunk_63 / 4;
     int local_scale_n_65 = scale_chunk_63 % 4 * 16;
@@ -49883,7 +50201,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_110 = stage_valid_70 && global_k_group_108 < total_k_groups_72;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 18432 + (unsigned int)(packed_row_107 * 128 + packed_panel_word_106 * 4 ^ (packed_row_107 * 128 + packed_panel_word_106 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_109 * (N * 2) + packed_off_n * 2 + local_word_104)), "r"((valid_b_110) ? 16 : 0));
-    int _min_25 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_25 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_111 = warp * 8 + _min_25;
     int local_scale_k_group_112 = scale_chunk_111 / 4;
     int local_scale_n_113 = scale_chunk_111 % 4 * 16;
@@ -49923,7 +50241,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base + (lane % 16 * 128 + a_k_byte ^ (lane % 16 * 128 + a_k_byte >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base + (lane % 16 * 128 + (unsigned int)a_k_byte ^ (lane % 16 * 128 + (unsigned int)a_k_byte >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_0[4];
         asm(
@@ -49960,11 +50278,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
         int owner_half = warp / 2;
         int n_region = warp & 1;
-        int u32_pos = lane * 2 + owner_half;
+        int u32_pos = lane * 2 + (unsigned int)owner_half;
         int packed_panel_0 = u32_pos / 32;
         int packed_panel_word_1 = u32_pos - packed_panel_0 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_0 * 128 + packed_panel_word_1 * 4 ^ (packed_panel_0 * 128 + packed_panel_word_1 * 4 >> 7 & 7) << 4))));
-        int sf_linear = base_n + warp * 16;
+        int sf_linear = (unsigned int)base_n + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear / 4 * 4));
         uint8_t scale_byte = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear & 3) * 8) & 255);
         int byte_shift = n_region * 16;
@@ -50004,11 +50322,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_0[0]), "r"(_mma_sync_m16n8k16_a_f16_0[1]), "r"(_mma_sync_m16n8k16_a_f16_0[2]), "r"(_mma_sync_m16n8k16_a_f16_0[3]), "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
         }
-        int u32_pos_2 = 64 + lane * 2 + owner_half;
+        int u32_pos_2 = 64 + lane * 2 + (unsigned int)owner_half;
         int packed_panel_3 = u32_pos_2 / 32;
         int packed_panel_word_4 = u32_pos_2 - packed_panel_3 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_3 * 128 + packed_panel_word_4 * 4 ^ (packed_panel_3 * 128 + packed_panel_word_4 * 4 >> 7 & 7) << 4))));
-        int sf_linear_5 = base_n + 8 + warp * 16;
+        int sf_linear_5 = (unsigned int)(base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_5 / 4 * 4));
         uint8_t scale_byte_6 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_5 & 3) * 8) & 255);
         int byte_shift_7 = n_region * 16;
@@ -50052,7 +50370,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_9 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_8 + (lane % 16 * 128 + a_k_byte_9 ^ (lane % 16 * 128 + a_k_byte_9 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_8 + (lane % 16 * 128 + (unsigned int)a_k_byte_9 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_9 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_1[4];
         asm(
@@ -50089,11 +50407,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
         int owner_half_10 = warp / 2;
         int n_region_11 = warp & 1;
-        int u32_pos_12 = lane * 2 + owner_half_10;
+        int u32_pos_12 = lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_13 = u32_pos_12 / 32;
         int packed_panel_word_14 = u32_pos_12 - packed_panel_13 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 ^ ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 >> 7 & 7) << 4))));
-        int sf_linear_15 = 64 + base_n + warp * 16;
+        int sf_linear_15 = (unsigned int)(64 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_15 / 4 * 4));
         uint8_t scale_byte_16 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_15 & 3) * 8) & 255);
         int byte_shift_17 = n_region_11 * 16;
@@ -50133,11 +50451,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_1[0]), "r"(_mma_sync_m16n8k16_a_f16_1[1]), "r"(_mma_sync_m16n8k16_a_f16_1[2]), "r"(_mma_sync_m16n8k16_a_f16_1[3]), "r"(_mma_sync_m16n8k16_b_2[0]), "r"(_mma_sync_m16n8k16_b_2[1]));
         }
-        int u32_pos_18 = 64 + lane * 2 + owner_half_10;
+        int u32_pos_18 = 64 + lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_19 = u32_pos_18 / 32;
         int packed_panel_word_20 = u32_pos_18 - packed_panel_19 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 ^ ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 >> 7 & 7) << 4))));
-        int sf_linear_21 = 64 + base_n + 8 + warp * 16;
+        int sf_linear_21 = (unsigned int)(64 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_21 / 4 * 4));
         uint8_t scale_byte_22 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_21 & 3) * 8) & 255);
         int byte_shift_23 = n_region_11 * 16;
@@ -50181,7 +50499,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_25 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_24 + (lane % 16 * 128 + a_k_byte_25 ^ (lane % 16 * 128 + a_k_byte_25 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_24 + (lane % 16 * 128 + (unsigned int)a_k_byte_25 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_25 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_2[4];
         asm(
@@ -50218,11 +50536,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
         int owner_half_26 = warp / 2;
         int n_region_27 = warp & 1;
-        int u32_pos_28 = lane * 2 + owner_half_26;
+        int u32_pos_28 = lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_29 = u32_pos_28 / 32;
         int packed_panel_word_30 = u32_pos_28 - packed_panel_29 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 ^ ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 >> 7 & 7) << 4))));
-        int sf_linear_31 = 128 + base_n + warp * 16;
+        int sf_linear_31 = (unsigned int)(128 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_31 / 4 * 4));
         uint8_t scale_byte_32 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_31 & 3) * 8) & 255);
         int byte_shift_33 = n_region_27 * 16;
@@ -50262,11 +50580,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_2[0]), "r"(_mma_sync_m16n8k16_a_f16_2[1]), "r"(_mma_sync_m16n8k16_a_f16_2[2]), "r"(_mma_sync_m16n8k16_a_f16_2[3]), "r"(_mma_sync_m16n8k16_b_4[0]), "r"(_mma_sync_m16n8k16_b_4[1]));
         }
-        int u32_pos_34 = 64 + lane * 2 + owner_half_26;
+        int u32_pos_34 = 64 + lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_35 = u32_pos_34 / 32;
         int packed_panel_word_36 = u32_pos_34 - packed_panel_35 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 ^ ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 >> 7 & 7) << 4))));
-        int sf_linear_37 = 128 + base_n + 8 + warp * 16;
+        int sf_linear_37 = (unsigned int)(128 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_37 / 4 * 4));
         uint8_t scale_byte_38 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_37 & 3) * 8) & 255);
         int byte_shift_39 = n_region_27 * 16;
@@ -50310,7 +50628,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_41 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_40 + (lane % 16 * 128 + a_k_byte_41 ^ (lane % 16 * 128 + a_k_byte_41 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_40 + (lane % 16 * 128 + (unsigned int)a_k_byte_41 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_41 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_3[4];
         asm(
@@ -50347,11 +50665,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
         int owner_half_42 = warp / 2;
         int n_region_43 = warp & 1;
-        int u32_pos_44 = lane * 2 + owner_half_42;
+        int u32_pos_44 = lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_45 = u32_pos_44 / 32;
         int packed_panel_word_46 = u32_pos_44 - packed_panel_45 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 ^ ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 >> 7 & 7) << 4))));
-        int sf_linear_47 = 192 + base_n + warp * 16;
+        int sf_linear_47 = (unsigned int)(192 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_47 / 4 * 4));
         uint8_t scale_byte_48 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_47 & 3) * 8) & 255);
         int byte_shift_49 = n_region_43 * 16;
@@ -50391,11 +50709,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_3[0]), "r"(_mma_sync_m16n8k16_a_f16_3[1]), "r"(_mma_sync_m16n8k16_a_f16_3[2]), "r"(_mma_sync_m16n8k16_a_f16_3[3]), "r"(_mma_sync_m16n8k16_b_6[0]), "r"(_mma_sync_m16n8k16_b_6[1]));
         }
-        int u32_pos_50 = 64 + lane * 2 + owner_half_42;
+        int u32_pos_50 = 64 + lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_51 = u32_pos_50 / 32;
         int packed_panel_word_52 = u32_pos_50 - packed_panel_51 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 ^ ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 >> 7 & 7) << 4))));
-        int sf_linear_53 = 192 + base_n + 8 + warp * 16;
+        int sf_linear_53 = (unsigned int)(192 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_53 / 4 * 4));
         uint8_t scale_byte_54 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_53 & 3) * 8) & 255);
         int byte_shift_55 = n_region_43 * 16;
@@ -50439,7 +50757,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_57 = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_56 + (lane % 16 * 128 + a_k_byte_57 ^ (lane % 16 * 128 + a_k_byte_57 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_56 + (lane % 16 * 128 + (unsigned int)a_k_byte_57 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_57 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_4[4];
         asm(
@@ -50476,11 +50794,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
         int owner_half_58 = warp / 2;
         int n_region_59 = warp & 1;
-        int u32_pos_60 = lane * 2 + owner_half_58;
+        int u32_pos_60 = lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_61 = u32_pos_60 / 32;
         int packed_panel_word_62 = u32_pos_60 - packed_panel_61 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 ^ ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 >> 7 & 7) << 4))));
-        int sf_linear_63 = 256 + base_n + warp * 16;
+        int sf_linear_63 = (unsigned int)(256 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_63 / 4 * 4));
         uint8_t scale_byte_64 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_63 & 3) * 8) & 255);
         int byte_shift_65 = n_region_59 * 16;
@@ -50520,11 +50838,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_4[0]), "r"(_mma_sync_m16n8k16_a_f16_4[1]), "r"(_mma_sync_m16n8k16_a_f16_4[2]), "r"(_mma_sync_m16n8k16_a_f16_4[3]), "r"(_mma_sync_m16n8k16_b_8[0]), "r"(_mma_sync_m16n8k16_b_8[1]));
         }
-        int u32_pos_66 = 64 + lane * 2 + owner_half_58;
+        int u32_pos_66 = 64 + lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_67 = u32_pos_66 / 32;
         int packed_panel_word_68 = u32_pos_66 - packed_panel_67 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 ^ ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 >> 7 & 7) << 4))));
-        int sf_linear_69 = 256 + base_n + 8 + warp * 16;
+        int sf_linear_69 = (unsigned int)(256 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_69 / 4 * 4));
         uint8_t scale_byte_70 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_69 & 3) * 8) & 255);
         int byte_shift_71 = n_region_59 * 16;
@@ -50568,7 +50886,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_73 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_72 + (lane % 16 * 128 + a_k_byte_73 ^ (lane % 16 * 128 + a_k_byte_73 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_72 + (lane % 16 * 128 + (unsigned int)a_k_byte_73 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_73 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_5[4];
         asm(
@@ -50605,11 +50923,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
         int owner_half_74 = warp / 2;
         int n_region_75 = warp & 1;
-        int u32_pos_76 = lane * 2 + owner_half_74;
+        int u32_pos_76 = lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_77 = u32_pos_76 / 32;
         int packed_panel_word_78 = u32_pos_76 - packed_panel_77 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 ^ ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 >> 7 & 7) << 4))));
-        int sf_linear_79 = 320 + base_n + warp * 16;
+        int sf_linear_79 = (unsigned int)(320 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_79 / 4 * 4));
         uint8_t scale_byte_80 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_79 & 3) * 8) & 255);
         int byte_shift_81 = n_region_75 * 16;
@@ -50649,11 +50967,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_5[0]), "r"(_mma_sync_m16n8k16_a_f16_5[1]), "r"(_mma_sync_m16n8k16_a_f16_5[2]), "r"(_mma_sync_m16n8k16_a_f16_5[3]), "r"(_mma_sync_m16n8k16_b_10[0]), "r"(_mma_sync_m16n8k16_b_10[1]));
         }
-        int u32_pos_82 = 64 + lane * 2 + owner_half_74;
+        int u32_pos_82 = 64 + lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_83 = u32_pos_82 / 32;
         int packed_panel_word_84 = u32_pos_82 - packed_panel_83 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 ^ ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 >> 7 & 7) << 4))));
-        int sf_linear_85 = 320 + base_n + 8 + warp * 16;
+        int sf_linear_85 = (unsigned int)(320 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_85 / 4 * 4));
         uint8_t scale_byte_86 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_85 & 3) * 8) & 255);
         int byte_shift_87 = n_region_75 * 16;
@@ -50697,7 +51015,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_89 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_88 + (lane % 16 * 128 + a_k_byte_89 ^ (lane % 16 * 128 + a_k_byte_89 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_88 + (lane % 16 * 128 + (unsigned int)a_k_byte_89 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_89 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_6[4];
         asm(
@@ -50734,11 +51052,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
         int owner_half_90 = warp / 2;
         int n_region_91 = warp & 1;
-        int u32_pos_92 = lane * 2 + owner_half_90;
+        int u32_pos_92 = lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_93 = u32_pos_92 / 32;
         int packed_panel_word_94 = u32_pos_92 - packed_panel_93 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 ^ ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 >> 7 & 7) << 4))));
-        int sf_linear_95 = 384 + base_n + warp * 16;
+        int sf_linear_95 = (unsigned int)(384 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_95 / 4 * 4));
         uint8_t scale_byte_96 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_95 & 3) * 8) & 255);
         int byte_shift_97 = n_region_91 * 16;
@@ -50778,11 +51096,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_6[0]), "r"(_mma_sync_m16n8k16_a_f16_6[1]), "r"(_mma_sync_m16n8k16_a_f16_6[2]), "r"(_mma_sync_m16n8k16_a_f16_6[3]), "r"(_mma_sync_m16n8k16_b_12[0]), "r"(_mma_sync_m16n8k16_b_12[1]));
         }
-        int u32_pos_98 = 64 + lane * 2 + owner_half_90;
+        int u32_pos_98 = 64 + lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_99 = u32_pos_98 / 32;
         int packed_panel_word_100 = u32_pos_98 - packed_panel_99 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 ^ ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 >> 7 & 7) << 4))));
-        int sf_linear_101 = 384 + base_n + 8 + warp * 16;
+        int sf_linear_101 = (unsigned int)(384 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_101 / 4 * 4));
         uint8_t scale_byte_102 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_101 & 3) * 8) & 255);
         int byte_shift_103 = n_region_91 * 16;
@@ -50826,7 +51144,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_105 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_104 + (lane % 16 * 128 + a_k_byte_105 ^ (lane % 16 * 128 + a_k_byte_105 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_104 + (lane % 16 * 128 + (unsigned int)a_k_byte_105 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_105 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_7[4];
         asm(
@@ -50863,11 +51181,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
         int owner_half_106 = warp / 2;
         int n_region_107 = warp & 1;
-        int u32_pos_108 = lane * 2 + owner_half_106;
+        int u32_pos_108 = lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_109 = u32_pos_108 / 32;
         int packed_panel_word_110 = u32_pos_108 - packed_panel_109 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 ^ ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 >> 7 & 7) << 4))));
-        int sf_linear_111 = 448 + base_n + warp * 16;
+        int sf_linear_111 = (unsigned int)(448 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_111 / 4 * 4));
         uint8_t scale_byte_112 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_111 & 3) * 8) & 255);
         int byte_shift_113 = n_region_107 * 16;
@@ -50907,11 +51225,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_7[0]), "r"(_mma_sync_m16n8k16_a_f16_7[1]), "r"(_mma_sync_m16n8k16_a_f16_7[2]), "r"(_mma_sync_m16n8k16_a_f16_7[3]), "r"(_mma_sync_m16n8k16_b_14[0]), "r"(_mma_sync_m16n8k16_b_14[1]));
         }
-        int u32_pos_114 = 64 + lane * 2 + owner_half_106;
+        int u32_pos_114 = 64 + lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_115 = u32_pos_114 / 32;
         int packed_panel_word_116 = u32_pos_114 - packed_panel_115 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 ^ ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 >> 7 & 7) << 4))));
-        int sf_linear_117 = 448 + base_n + 8 + warp * 16;
+        int sf_linear_117 = (unsigned int)(448 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_117 / 4 * 4));
         uint8_t scale_byte_118 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_117 & 3) * 8) & 255);
         int byte_shift_119 = n_region_107 * 16;
@@ -51009,7 +51327,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
         bool valid_b_161 = stage_valid_121 && global_k_group_159 < total_k_groups_123;
         asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
             :: "r"((cute_remaining_small_b_addr + (unsigned int)(stage * 9216) + (unsigned int)(packed_row_158 * 128 + packed_panel_word_157 * 4 ^ (packed_row_158 * 128 + packed_panel_word_157 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_160 * (N * 2) + packed_off_n * 2 + local_word_155)), "r"((valid_b_161) ? 16 : 0));
-        int _min_34 = ((lane) < (7) ? (lane) : (7));
+        unsigned int _min_34 = ((lane) < (7) ? (lane) : (7));
         int scale_chunk_162 = warp * 8 + _min_34;
         int local_scale_k_group_163 = scale_chunk_162 / 4;
         int local_scale_n_164 = scale_chunk_162 % 4 * 16;
@@ -51027,7 +51345,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent(__nv_bfloat16* 
     int row0 = lane / 4;
     int row1 = row0 + 8;
     int output_partition = warp * 16;
-    int col_pair = off_n + output_partition + lane % 4 * 2;
+    int col_pair = (unsigned int)(off_n + output_partition) + lane % 4 * 2;
     if (off_m + row0 < M && col_pair < N) {
         long long row0_base = (long long)(off_m + row0) * (long long)N + (long long)col_pair;
         {
@@ -51147,8 +51465,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* __restrict__ A, int* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -51231,7 +51550,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_20 = stage_valid && global_k_group_18 < total_k_groups;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + (unsigned int)(packed_row_17 * 128 + packed_panel_word_16 * 4 ^ (packed_row_17 * 128 + packed_panel_word_16 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_19 * (N * 2) + packed_off_n * 2 + local_word_14)), "r"((valid_b_20) ? 16 : 0));
-    int _min_7 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_7 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk = warp * 8 + _min_7;
     int local_scale_k_group = scale_chunk / 4;
     int local_scale_n = scale_chunk % 4 * 16;
@@ -51301,7 +51620,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_62 = stage_valid_22 && global_k_group_60 < total_k_groups_24;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 9216 + (unsigned int)(packed_row_59 * 128 + packed_panel_word_58 * 4 ^ (packed_row_59 * 128 + packed_panel_word_58 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_61 * (N * 2) + packed_off_n * 2 + local_word_56)), "r"((valid_b_62) ? 16 : 0));
-    int _min_16 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_16 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_63 = warp * 8 + _min_16;
     int local_scale_k_group_64 = scale_chunk_63 / 4;
     int local_scale_n_65 = scale_chunk_63 % 4 * 16;
@@ -51371,7 +51690,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     bool valid_b_110 = stage_valid_70 && global_k_group_108 < total_k_groups_72;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 18432 + (unsigned int)(packed_row_107 * 128 + packed_panel_word_106 * 4 ^ (packed_row_107 * 128 + packed_panel_word_106 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_109 * (N * 2) + packed_off_n * 2 + local_word_104)), "r"((valid_b_110) ? 16 : 0));
-    int _min_25 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_25 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_111 = warp * 8 + _min_25;
     int local_scale_k_group_112 = scale_chunk_111 / 4;
     int local_scale_n_113 = scale_chunk_111 % 4 * 16;
@@ -51411,7 +51730,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base + (lane % 16 * 128 + a_k_byte ^ (lane % 16 * 128 + a_k_byte >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base + (lane % 16 * 128 + (unsigned int)a_k_byte ^ (lane % 16 * 128 + (unsigned int)a_k_byte >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_0[4];
         asm(
@@ -51448,11 +51767,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
         int owner_half = warp / 2;
         int n_region = warp & 1;
-        int u32_pos = lane * 2 + owner_half;
+        int u32_pos = lane * 2 + (unsigned int)owner_half;
         int packed_panel_0 = u32_pos / 32;
         int packed_panel_word_1 = u32_pos - packed_panel_0 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_0 * 128 + packed_panel_word_1 * 4 ^ (packed_panel_0 * 128 + packed_panel_word_1 * 4 >> 7 & 7) << 4))));
-        int sf_linear = base_n + warp * 16;
+        int sf_linear = (unsigned int)base_n + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear / 4 * 4));
         uint8_t scale_byte = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear & 3) * 8) & 255);
         int byte_shift = n_region * 16;
@@ -51492,11 +51811,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_0[0]), "r"(_mma_sync_m16n8k16_a_f16_0[1]), "r"(_mma_sync_m16n8k16_a_f16_0[2]), "r"(_mma_sync_m16n8k16_a_f16_0[3]), "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
         }
-        int u32_pos_2 = 64 + lane * 2 + owner_half;
+        int u32_pos_2 = 64 + lane * 2 + (unsigned int)owner_half;
         int packed_panel_3 = u32_pos_2 / 32;
         int packed_panel_word_4 = u32_pos_2 - packed_panel_3 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_3 * 128 + packed_panel_word_4 * 4 ^ (packed_panel_3 * 128 + packed_panel_word_4 * 4 >> 7 & 7) << 4))));
-        int sf_linear_5 = base_n + 8 + warp * 16;
+        int sf_linear_5 = (unsigned int)(base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_5 / 4 * 4));
         uint8_t scale_byte_6 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_5 & 3) * 8) & 255);
         int byte_shift_7 = n_region * 16;
@@ -51540,7 +51859,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_9 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_8 + (lane % 16 * 128 + a_k_byte_9 ^ (lane % 16 * 128 + a_k_byte_9 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_8 + (lane % 16 * 128 + (unsigned int)a_k_byte_9 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_9 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_1[4];
         asm(
@@ -51577,11 +51896,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
         int owner_half_10 = warp / 2;
         int n_region_11 = warp & 1;
-        int u32_pos_12 = lane * 2 + owner_half_10;
+        int u32_pos_12 = lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_13 = u32_pos_12 / 32;
         int packed_panel_word_14 = u32_pos_12 - packed_panel_13 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 ^ ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 >> 7 & 7) << 4))));
-        int sf_linear_15 = 64 + base_n + warp * 16;
+        int sf_linear_15 = (unsigned int)(64 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_15 / 4 * 4));
         uint8_t scale_byte_16 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_15 & 3) * 8) & 255);
         int byte_shift_17 = n_region_11 * 16;
@@ -51621,11 +51940,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_1[0]), "r"(_mma_sync_m16n8k16_a_f16_1[1]), "r"(_mma_sync_m16n8k16_a_f16_1[2]), "r"(_mma_sync_m16n8k16_a_f16_1[3]), "r"(_mma_sync_m16n8k16_b_2[0]), "r"(_mma_sync_m16n8k16_b_2[1]));
         }
-        int u32_pos_18 = 64 + lane * 2 + owner_half_10;
+        int u32_pos_18 = 64 + lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_19 = u32_pos_18 / 32;
         int packed_panel_word_20 = u32_pos_18 - packed_panel_19 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 ^ ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 >> 7 & 7) << 4))));
-        int sf_linear_21 = 64 + base_n + 8 + warp * 16;
+        int sf_linear_21 = (unsigned int)(64 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_21 / 4 * 4));
         uint8_t scale_byte_22 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_21 & 3) * 8) & 255);
         int byte_shift_23 = n_region_11 * 16;
@@ -51669,7 +51988,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_25 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_24 + (lane % 16 * 128 + a_k_byte_25 ^ (lane % 16 * 128 + a_k_byte_25 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_24 + (lane % 16 * 128 + (unsigned int)a_k_byte_25 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_25 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_2[4];
         asm(
@@ -51706,11 +52025,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
         int owner_half_26 = warp / 2;
         int n_region_27 = warp & 1;
-        int u32_pos_28 = lane * 2 + owner_half_26;
+        int u32_pos_28 = lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_29 = u32_pos_28 / 32;
         int packed_panel_word_30 = u32_pos_28 - packed_panel_29 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 ^ ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 >> 7 & 7) << 4))));
-        int sf_linear_31 = 128 + base_n + warp * 16;
+        int sf_linear_31 = (unsigned int)(128 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_31 / 4 * 4));
         uint8_t scale_byte_32 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_31 & 3) * 8) & 255);
         int byte_shift_33 = n_region_27 * 16;
@@ -51750,11 +52069,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_2[0]), "r"(_mma_sync_m16n8k16_a_f16_2[1]), "r"(_mma_sync_m16n8k16_a_f16_2[2]), "r"(_mma_sync_m16n8k16_a_f16_2[3]), "r"(_mma_sync_m16n8k16_b_4[0]), "r"(_mma_sync_m16n8k16_b_4[1]));
         }
-        int u32_pos_34 = 64 + lane * 2 + owner_half_26;
+        int u32_pos_34 = 64 + lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_35 = u32_pos_34 / 32;
         int packed_panel_word_36 = u32_pos_34 - packed_panel_35 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 ^ ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 >> 7 & 7) << 4))));
-        int sf_linear_37 = 128 + base_n + 8 + warp * 16;
+        int sf_linear_37 = (unsigned int)(128 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_37 / 4 * 4));
         uint8_t scale_byte_38 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_37 & 3) * 8) & 255);
         int byte_shift_39 = n_region_27 * 16;
@@ -51798,7 +52117,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_41 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_40 + (lane % 16 * 128 + a_k_byte_41 ^ (lane % 16 * 128 + a_k_byte_41 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_40 + (lane % 16 * 128 + (unsigned int)a_k_byte_41 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_41 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_3[4];
         asm(
@@ -51835,11 +52154,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
         int owner_half_42 = warp / 2;
         int n_region_43 = warp & 1;
-        int u32_pos_44 = lane * 2 + owner_half_42;
+        int u32_pos_44 = lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_45 = u32_pos_44 / 32;
         int packed_panel_word_46 = u32_pos_44 - packed_panel_45 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 ^ ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 >> 7 & 7) << 4))));
-        int sf_linear_47 = 192 + base_n + warp * 16;
+        int sf_linear_47 = (unsigned int)(192 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_47 / 4 * 4));
         uint8_t scale_byte_48 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_47 & 3) * 8) & 255);
         int byte_shift_49 = n_region_43 * 16;
@@ -51879,11 +52198,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_3[0]), "r"(_mma_sync_m16n8k16_a_f16_3[1]), "r"(_mma_sync_m16n8k16_a_f16_3[2]), "r"(_mma_sync_m16n8k16_a_f16_3[3]), "r"(_mma_sync_m16n8k16_b_6[0]), "r"(_mma_sync_m16n8k16_b_6[1]));
         }
-        int u32_pos_50 = 64 + lane * 2 + owner_half_42;
+        int u32_pos_50 = 64 + lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_51 = u32_pos_50 / 32;
         int packed_panel_word_52 = u32_pos_50 - packed_panel_51 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 ^ ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 >> 7 & 7) << 4))));
-        int sf_linear_53 = 192 + base_n + 8 + warp * 16;
+        int sf_linear_53 = (unsigned int)(192 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_53 / 4 * 4));
         uint8_t scale_byte_54 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_53 & 3) * 8) & 255);
         int byte_shift_55 = n_region_43 * 16;
@@ -51927,7 +52246,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_57 = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_56 + (lane % 16 * 128 + a_k_byte_57 ^ (lane % 16 * 128 + a_k_byte_57 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_56 + (lane % 16 * 128 + (unsigned int)a_k_byte_57 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_57 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_4[4];
         asm(
@@ -51964,11 +52283,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
         int owner_half_58 = warp / 2;
         int n_region_59 = warp & 1;
-        int u32_pos_60 = lane * 2 + owner_half_58;
+        int u32_pos_60 = lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_61 = u32_pos_60 / 32;
         int packed_panel_word_62 = u32_pos_60 - packed_panel_61 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 ^ ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 >> 7 & 7) << 4))));
-        int sf_linear_63 = 256 + base_n + warp * 16;
+        int sf_linear_63 = (unsigned int)(256 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_63 / 4 * 4));
         uint8_t scale_byte_64 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_63 & 3) * 8) & 255);
         int byte_shift_65 = n_region_59 * 16;
@@ -52008,11 +52327,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_4[0]), "r"(_mma_sync_m16n8k16_a_f16_4[1]), "r"(_mma_sync_m16n8k16_a_f16_4[2]), "r"(_mma_sync_m16n8k16_a_f16_4[3]), "r"(_mma_sync_m16n8k16_b_8[0]), "r"(_mma_sync_m16n8k16_b_8[1]));
         }
-        int u32_pos_66 = 64 + lane * 2 + owner_half_58;
+        int u32_pos_66 = 64 + lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_67 = u32_pos_66 / 32;
         int packed_panel_word_68 = u32_pos_66 - packed_panel_67 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 ^ ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 >> 7 & 7) << 4))));
-        int sf_linear_69 = 256 + base_n + 8 + warp * 16;
+        int sf_linear_69 = (unsigned int)(256 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_69 / 4 * 4));
         uint8_t scale_byte_70 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_69 & 3) * 8) & 255);
         int byte_shift_71 = n_region_59 * 16;
@@ -52056,7 +52375,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_73 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_72 + (lane % 16 * 128 + a_k_byte_73 ^ (lane % 16 * 128 + a_k_byte_73 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_72 + (lane % 16 * 128 + (unsigned int)a_k_byte_73 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_73 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_5[4];
         asm(
@@ -52093,11 +52412,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
         int owner_half_74 = warp / 2;
         int n_region_75 = warp & 1;
-        int u32_pos_76 = lane * 2 + owner_half_74;
+        int u32_pos_76 = lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_77 = u32_pos_76 / 32;
         int packed_panel_word_78 = u32_pos_76 - packed_panel_77 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 ^ ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 >> 7 & 7) << 4))));
-        int sf_linear_79 = 320 + base_n + warp * 16;
+        int sf_linear_79 = (unsigned int)(320 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_79 / 4 * 4));
         uint8_t scale_byte_80 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_79 & 3) * 8) & 255);
         int byte_shift_81 = n_region_75 * 16;
@@ -52137,11 +52456,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_5[0]), "r"(_mma_sync_m16n8k16_a_f16_5[1]), "r"(_mma_sync_m16n8k16_a_f16_5[2]), "r"(_mma_sync_m16n8k16_a_f16_5[3]), "r"(_mma_sync_m16n8k16_b_10[0]), "r"(_mma_sync_m16n8k16_b_10[1]));
         }
-        int u32_pos_82 = 64 + lane * 2 + owner_half_74;
+        int u32_pos_82 = 64 + lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_83 = u32_pos_82 / 32;
         int packed_panel_word_84 = u32_pos_82 - packed_panel_83 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 ^ ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 >> 7 & 7) << 4))));
-        int sf_linear_85 = 320 + base_n + 8 + warp * 16;
+        int sf_linear_85 = (unsigned int)(320 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_85 / 4 * 4));
         uint8_t scale_byte_86 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_85 & 3) * 8) & 255);
         int byte_shift_87 = n_region_75 * 16;
@@ -52185,7 +52504,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_89 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_88 + (lane % 16 * 128 + a_k_byte_89 ^ (lane % 16 * 128 + a_k_byte_89 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_88 + (lane % 16 * 128 + (unsigned int)a_k_byte_89 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_89 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_6[4];
         asm(
@@ -52222,11 +52541,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
         int owner_half_90 = warp / 2;
         int n_region_91 = warp & 1;
-        int u32_pos_92 = lane * 2 + owner_half_90;
+        int u32_pos_92 = lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_93 = u32_pos_92 / 32;
         int packed_panel_word_94 = u32_pos_92 - packed_panel_93 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 ^ ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 >> 7 & 7) << 4))));
-        int sf_linear_95 = 384 + base_n + warp * 16;
+        int sf_linear_95 = (unsigned int)(384 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_95 / 4 * 4));
         uint8_t scale_byte_96 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_95 & 3) * 8) & 255);
         int byte_shift_97 = n_region_91 * 16;
@@ -52266,11 +52585,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_6[0]), "r"(_mma_sync_m16n8k16_a_f16_6[1]), "r"(_mma_sync_m16n8k16_a_f16_6[2]), "r"(_mma_sync_m16n8k16_a_f16_6[3]), "r"(_mma_sync_m16n8k16_b_12[0]), "r"(_mma_sync_m16n8k16_b_12[1]));
         }
-        int u32_pos_98 = 64 + lane * 2 + owner_half_90;
+        int u32_pos_98 = 64 + lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_99 = u32_pos_98 / 32;
         int packed_panel_word_100 = u32_pos_98 - packed_panel_99 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 ^ ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 >> 7 & 7) << 4))));
-        int sf_linear_101 = 384 + base_n + 8 + warp * 16;
+        int sf_linear_101 = (unsigned int)(384 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_101 / 4 * 4));
         uint8_t scale_byte_102 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_101 & 3) * 8) & 255);
         int byte_shift_103 = n_region_91 * 16;
@@ -52314,7 +52633,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         int a_k_byte_105 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_104 + (lane % 16 * 128 + a_k_byte_105 ^ (lane % 16 * 128 + a_k_byte_105 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_104 + (lane % 16 * 128 + (unsigned int)a_k_byte_105 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_105 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_7[4];
         asm(
@@ -52351,11 +52670,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
         int owner_half_106 = warp / 2;
         int n_region_107 = warp & 1;
-        int u32_pos_108 = lane * 2 + owner_half_106;
+        int u32_pos_108 = lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_109 = u32_pos_108 / 32;
         int packed_panel_word_110 = u32_pos_108 - packed_panel_109 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 ^ ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 >> 7 & 7) << 4))));
-        int sf_linear_111 = 448 + base_n + warp * 16;
+        int sf_linear_111 = (unsigned int)(448 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_111 / 4 * 4));
         uint8_t scale_byte_112 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_111 & 3) * 8) & 255);
         int byte_shift_113 = n_region_107 * 16;
@@ -52395,11 +52714,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_7[0]), "r"(_mma_sync_m16n8k16_a_f16_7[1]), "r"(_mma_sync_m16n8k16_a_f16_7[2]), "r"(_mma_sync_m16n8k16_a_f16_7[3]), "r"(_mma_sync_m16n8k16_b_14[0]), "r"(_mma_sync_m16n8k16_b_14[1]));
         }
-        int u32_pos_114 = 64 + lane * 2 + owner_half_106;
+        int u32_pos_114 = 64 + lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_115 = u32_pos_114 / 32;
         int packed_panel_word_116 = u32_pos_114 - packed_panel_115 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 ^ ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 >> 7 & 7) << 4))));
-        int sf_linear_117 = 448 + base_n + 8 + warp * 16;
+        int sf_linear_117 = (unsigned int)(448 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_117 / 4 * 4));
         uint8_t scale_byte_118 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_117 & 3) * 8) & 255);
         int byte_shift_119 = n_region_107 * 16;
@@ -52497,7 +52816,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
         bool valid_b_161 = stage_valid_121 && global_k_group_159 < total_k_groups_123;
         asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
             :: "r"((cute_remaining_small_b_addr + (unsigned int)(stage * 9216) + (unsigned int)(packed_row_158 * 128 + packed_panel_word_157 * 4 ^ (packed_row_158 * 128 + packed_panel_word_157 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_160 * (N * 2) + packed_off_n * 2 + local_word_155)), "r"((valid_b_161) ? 16 : 0));
-        int _min_34 = ((lane) < (7) ? (lane) : (7));
+        unsigned int _min_34 = ((lane) < (7) ? (lane) : (7));
         int scale_chunk_162 = warp * 8 + _min_34;
         int local_scale_k_group_163 = scale_chunk_162 / 4;
         int local_scale_n_164 = scale_chunk_162 % 4 * 16;
@@ -52518,7 +52837,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent(__nv_bfloat16* 
     int row0 = lane / 4;
     int row1 = row0 + 8;
     int output_partition = warp * 16;
-    int col_pair = off_n + output_partition + lane % 4 * 2;
+    int col_pair = (unsigned int)(off_n + output_partition) + lane % 4 * 2;
     if (off_m + row0 < M && col_pair < N) {
         long long row0_base = (long long)(off_m + row0) * (long long)N + (long long)col_pair;
         {
@@ -52630,8 +52949,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* __restrict__ A, int* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -52717,7 +53037,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_20 = stage_valid && global_k_group_18 < total_k_groups;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + (unsigned int)(packed_row_17 * 128 + packed_panel_word_16 * 4 ^ (packed_row_17 * 128 + packed_panel_word_16 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_19 * (N * 2) + packed_off_n * 2 + local_word_14)), "r"((valid_b_20) ? 16 : 0));
-    int _min_7 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_7 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk = warp * 8 + _min_7;
     int local_scale_k_group = scale_chunk / 4;
     int local_scale_n = scale_chunk % 4 * 16;
@@ -52787,7 +53107,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_62 = stage_valid_22 && global_k_group_60 < total_k_groups_24;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 9216 + (unsigned int)(packed_row_59 * 128 + packed_panel_word_58 * 4 ^ (packed_row_59 * 128 + packed_panel_word_58 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_61 * (N * 2) + packed_off_n * 2 + local_word_56)), "r"((valid_b_62) ? 16 : 0));
-    int _min_16 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_16 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_63 = warp * 8 + _min_16;
     int local_scale_k_group_64 = scale_chunk_63 / 4;
     int local_scale_n_65 = scale_chunk_63 % 4 * 16;
@@ -52857,7 +53177,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     bool valid_b_110 = stage_valid_70 && global_k_group_108 < total_k_groups_72;
     asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
         :: "r"((cute_remaining_small_b_addr + 18432 + (unsigned int)(packed_row_107 * 128 + packed_panel_word_106 * 4 ^ (packed_row_107 * 128 + packed_panel_word_106 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_109 * (N * 2) + packed_off_n * 2 + local_word_104)), "r"((valid_b_110) ? 16 : 0));
-    int _min_25 = ((lane) < (7) ? (lane) : (7));
+    unsigned int _min_25 = ((lane) < (7) ? (lane) : (7));
     int scale_chunk_111 = warp * 8 + _min_25;
     int local_scale_k_group_112 = scale_chunk_111 / 4;
     int local_scale_n_113 = scale_chunk_111 % 4 * 16;
@@ -52897,7 +53217,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base + (lane % 16 * 128 + a_k_byte ^ (lane % 16 * 128 + a_k_byte >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base + (lane % 16 * 128 + (unsigned int)a_k_byte ^ (lane % 16 * 128 + (unsigned int)a_k_byte >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_0[4];
         asm(
@@ -52934,11 +53254,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
         int owner_half = warp / 2;
         int n_region = warp & 1;
-        int u32_pos = lane * 2 + owner_half;
+        int u32_pos = lane * 2 + (unsigned int)owner_half;
         int packed_panel_0 = u32_pos / 32;
         int packed_panel_word_1 = u32_pos - packed_panel_0 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_0 * 128 + packed_panel_word_1 * 4 ^ (packed_panel_0 * 128 + packed_panel_word_1 * 4 >> 7 & 7) << 4))));
-        int sf_linear = base_n + warp * 16;
+        int sf_linear = (unsigned int)base_n + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear / 4 * 4));
         uint8_t scale_byte = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear & 3) * 8) & 255);
         int byte_shift = n_region * 16;
@@ -52978,11 +53298,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_0[0]), "r"(_mma_sync_m16n8k16_a_f16_0[1]), "r"(_mma_sync_m16n8k16_a_f16_0[2]), "r"(_mma_sync_m16n8k16_a_f16_0[3]), "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
         }
-        int u32_pos_2 = 64 + lane * 2 + owner_half;
+        int u32_pos_2 = 64 + lane * 2 + (unsigned int)owner_half;
         int packed_panel_3 = u32_pos_2 / 32;
         int packed_panel_word_4 = u32_pos_2 - packed_panel_3 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + (packed_panel_3 * 128 + packed_panel_word_4 * 4 ^ (packed_panel_3 * 128 + packed_panel_word_4 * 4 >> 7 & 7) << 4))));
-        int sf_linear_5 = base_n + 8 + warp * 16;
+        int sf_linear_5 = (unsigned int)(base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_5 / 4 * 4));
         uint8_t scale_byte_6 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_5 & 3) * 8) & 255);
         int byte_shift_7 = n_region * 16;
@@ -53026,7 +53346,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_9 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_8 + (lane % 16 * 128 + a_k_byte_9 ^ (lane % 16 * 128 + a_k_byte_9 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_8 + (lane % 16 * 128 + (unsigned int)a_k_byte_9 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_9 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_1[4];
         asm(
@@ -53063,11 +53383,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
         int owner_half_10 = warp / 2;
         int n_region_11 = warp & 1;
-        int u32_pos_12 = lane * 2 + owner_half_10;
+        int u32_pos_12 = lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_13 = u32_pos_12 / 32;
         int packed_panel_word_14 = u32_pos_12 - packed_panel_13 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 ^ ((4 + packed_panel_13) * 128 + packed_panel_word_14 * 4 >> 7 & 7) << 4))));
-        int sf_linear_15 = 64 + base_n + warp * 16;
+        int sf_linear_15 = (unsigned int)(64 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_15 / 4 * 4));
         uint8_t scale_byte_16 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_15 & 3) * 8) & 255);
         int byte_shift_17 = n_region_11 * 16;
@@ -53107,11 +53427,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_1[0]), "r"(_mma_sync_m16n8k16_a_f16_1[1]), "r"(_mma_sync_m16n8k16_a_f16_1[2]), "r"(_mma_sync_m16n8k16_a_f16_1[3]), "r"(_mma_sync_m16n8k16_b_2[0]), "r"(_mma_sync_m16n8k16_b_2[1]));
         }
-        int u32_pos_18 = 64 + lane * 2 + owner_half_10;
+        int u32_pos_18 = 64 + lane * 2 + (unsigned int)owner_half_10;
         int packed_panel_19 = u32_pos_18 / 32;
         int packed_panel_word_20 = u32_pos_18 - packed_panel_19 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 ^ ((4 + packed_panel_19) * 128 + packed_panel_word_20 * 4 >> 7 & 7) << 4))));
-        int sf_linear_21 = 64 + base_n + 8 + warp * 16;
+        int sf_linear_21 = (unsigned int)(64 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_21 / 4 * 4));
         uint8_t scale_byte_22 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_21 & 3) * 8) & 255);
         int byte_shift_23 = n_region_11 * 16;
@@ -53155,7 +53475,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_25 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_24 + (lane % 16 * 128 + a_k_byte_25 ^ (lane % 16 * 128 + a_k_byte_25 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_24 + (lane % 16 * 128 + (unsigned int)a_k_byte_25 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_25 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_2[4];
         asm(
@@ -53192,11 +53512,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
         int owner_half_26 = warp / 2;
         int n_region_27 = warp & 1;
-        int u32_pos_28 = lane * 2 + owner_half_26;
+        int u32_pos_28 = lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_29 = u32_pos_28 / 32;
         int packed_panel_word_30 = u32_pos_28 - packed_panel_29 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 ^ ((8 + packed_panel_29) * 128 + packed_panel_word_30 * 4 >> 7 & 7) << 4))));
-        int sf_linear_31 = 128 + base_n + warp * 16;
+        int sf_linear_31 = (unsigned int)(128 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_31 / 4 * 4));
         uint8_t scale_byte_32 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_31 & 3) * 8) & 255);
         int byte_shift_33 = n_region_27 * 16;
@@ -53236,11 +53556,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_2[0]), "r"(_mma_sync_m16n8k16_a_f16_2[1]), "r"(_mma_sync_m16n8k16_a_f16_2[2]), "r"(_mma_sync_m16n8k16_a_f16_2[3]), "r"(_mma_sync_m16n8k16_b_4[0]), "r"(_mma_sync_m16n8k16_b_4[1]));
         }
-        int u32_pos_34 = 64 + lane * 2 + owner_half_26;
+        int u32_pos_34 = 64 + lane * 2 + (unsigned int)owner_half_26;
         int packed_panel_35 = u32_pos_34 / 32;
         int packed_panel_word_36 = u32_pos_34 - packed_panel_35 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 ^ ((8 + packed_panel_35) * 128 + packed_panel_word_36 * 4 >> 7 & 7) << 4))));
-        int sf_linear_37 = 128 + base_n + 8 + warp * 16;
+        int sf_linear_37 = (unsigned int)(128 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_37 / 4 * 4));
         uint8_t scale_byte_38 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_37 & 3) * 8) & 255);
         int byte_shift_39 = n_region_27 * 16;
@@ -53284,7 +53604,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_41 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_40 + (lane % 16 * 128 + a_k_byte_41 ^ (lane % 16 * 128 + a_k_byte_41 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_40 + (lane % 16 * 128 + (unsigned int)a_k_byte_41 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_41 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_3[4];
         asm(
@@ -53321,11 +53641,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
         int owner_half_42 = warp / 2;
         int n_region_43 = warp & 1;
-        int u32_pos_44 = lane * 2 + owner_half_42;
+        int u32_pos_44 = lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_45 = u32_pos_44 / 32;
         int packed_panel_word_46 = u32_pos_44 - packed_panel_45 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 ^ ((12 + packed_panel_45) * 128 + packed_panel_word_46 * 4 >> 7 & 7) << 4))));
-        int sf_linear_47 = 192 + base_n + warp * 16;
+        int sf_linear_47 = (unsigned int)(192 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_47 / 4 * 4));
         uint8_t scale_byte_48 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_47 & 3) * 8) & 255);
         int byte_shift_49 = n_region_43 * 16;
@@ -53365,11 +53685,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_3[0]), "r"(_mma_sync_m16n8k16_a_f16_3[1]), "r"(_mma_sync_m16n8k16_a_f16_3[2]), "r"(_mma_sync_m16n8k16_a_f16_3[3]), "r"(_mma_sync_m16n8k16_b_6[0]), "r"(_mma_sync_m16n8k16_b_6[1]));
         }
-        int u32_pos_50 = 64 + lane * 2 + owner_half_42;
+        int u32_pos_50 = 64 + lane * 2 + (unsigned int)owner_half_42;
         int packed_panel_51 = u32_pos_50 / 32;
         int packed_panel_word_52 = u32_pos_50 - packed_panel_51 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 ^ ((12 + packed_panel_51) * 128 + packed_panel_word_52 * 4 >> 7 & 7) << 4))));
-        int sf_linear_53 = 192 + base_n + 8 + warp * 16;
+        int sf_linear_53 = (unsigned int)(192 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_53 / 4 * 4));
         uint8_t scale_byte_54 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_53 & 3) * 8) & 255);
         int byte_shift_55 = n_region_43 * 16;
@@ -53413,7 +53733,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_57 = lane / 16 * 8 * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_56 + (lane % 16 * 128 + a_k_byte_57 ^ (lane % 16 * 128 + a_k_byte_57 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_56 + (lane % 16 * 128 + (unsigned int)a_k_byte_57 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_57 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_4[4];
         asm(
@@ -53450,11 +53770,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
         int owner_half_58 = warp / 2;
         int n_region_59 = warp & 1;
-        int u32_pos_60 = lane * 2 + owner_half_58;
+        int u32_pos_60 = lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_61 = u32_pos_60 / 32;
         int packed_panel_word_62 = u32_pos_60 - packed_panel_61 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 ^ ((16 + packed_panel_61) * 128 + packed_panel_word_62 * 4 >> 7 & 7) << 4))));
-        int sf_linear_63 = 256 + base_n + warp * 16;
+        int sf_linear_63 = (unsigned int)(256 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_63 / 4 * 4));
         uint8_t scale_byte_64 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_63 & 3) * 8) & 255);
         int byte_shift_65 = n_region_59 * 16;
@@ -53494,11 +53814,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_4[0]), "r"(_mma_sync_m16n8k16_a_f16_4[1]), "r"(_mma_sync_m16n8k16_a_f16_4[2]), "r"(_mma_sync_m16n8k16_a_f16_4[3]), "r"(_mma_sync_m16n8k16_b_8[0]), "r"(_mma_sync_m16n8k16_b_8[1]));
         }
-        int u32_pos_66 = 64 + lane * 2 + owner_half_58;
+        int u32_pos_66 = 64 + lane * 2 + (unsigned int)owner_half_58;
         int packed_panel_67 = u32_pos_66 / 32;
         int packed_panel_word_68 = u32_pos_66 - packed_panel_67 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 ^ ((16 + packed_panel_67) * 128 + packed_panel_word_68 * 4 >> 7 & 7) << 4))));
-        int sf_linear_69 = 256 + base_n + 8 + warp * 16;
+        int sf_linear_69 = (unsigned int)(256 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_69 / 4 * 4));
         uint8_t scale_byte_70 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_69 & 3) * 8) & 255);
         int byte_shift_71 = n_region_59 * 16;
@@ -53542,7 +53862,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_73 = (16 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_72 + (lane % 16 * 128 + a_k_byte_73 ^ (lane % 16 * 128 + a_k_byte_73 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_72 + (lane % 16 * 128 + (unsigned int)a_k_byte_73 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_73 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_5[4];
         asm(
@@ -53579,11 +53899,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
         int owner_half_74 = warp / 2;
         int n_region_75 = warp & 1;
-        int u32_pos_76 = lane * 2 + owner_half_74;
+        int u32_pos_76 = lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_77 = u32_pos_76 / 32;
         int packed_panel_word_78 = u32_pos_76 - packed_panel_77 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 ^ ((20 + packed_panel_77) * 128 + packed_panel_word_78 * 4 >> 7 & 7) << 4))));
-        int sf_linear_79 = 320 + base_n + warp * 16;
+        int sf_linear_79 = (unsigned int)(320 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_79 / 4 * 4));
         uint8_t scale_byte_80 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_79 & 3) * 8) & 255);
         int byte_shift_81 = n_region_75 * 16;
@@ -53623,11 +53943,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_5[0]), "r"(_mma_sync_m16n8k16_a_f16_5[1]), "r"(_mma_sync_m16n8k16_a_f16_5[2]), "r"(_mma_sync_m16n8k16_a_f16_5[3]), "r"(_mma_sync_m16n8k16_b_10[0]), "r"(_mma_sync_m16n8k16_b_10[1]));
         }
-        int u32_pos_82 = 64 + lane * 2 + owner_half_74;
+        int u32_pos_82 = 64 + lane * 2 + (unsigned int)owner_half_74;
         int packed_panel_83 = u32_pos_82 / 32;
         int packed_panel_word_84 = u32_pos_82 - packed_panel_83 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 ^ ((20 + packed_panel_83) * 128 + packed_panel_word_84 * 4 >> 7 & 7) << 4))));
-        int sf_linear_85 = 320 + base_n + 8 + warp * 16;
+        int sf_linear_85 = (unsigned int)(320 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_85 / 4 * 4));
         uint8_t scale_byte_86 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_85 & 3) * 8) & 255);
         int byte_shift_87 = n_region_75 * 16;
@@ -53671,7 +53991,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_89 = (32 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_88 + (lane % 16 * 128 + a_k_byte_89 ^ (lane % 16 * 128 + a_k_byte_89 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_88 + (lane % 16 * 128 + (unsigned int)a_k_byte_89 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_89 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_6[4];
         asm(
@@ -53708,11 +54028,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
         int owner_half_90 = warp / 2;
         int n_region_91 = warp & 1;
-        int u32_pos_92 = lane * 2 + owner_half_90;
+        int u32_pos_92 = lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_93 = u32_pos_92 / 32;
         int packed_panel_word_94 = u32_pos_92 - packed_panel_93 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 ^ ((24 + packed_panel_93) * 128 + packed_panel_word_94 * 4 >> 7 & 7) << 4))));
-        int sf_linear_95 = 384 + base_n + warp * 16;
+        int sf_linear_95 = (unsigned int)(384 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_95 / 4 * 4));
         uint8_t scale_byte_96 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_95 & 3) * 8) & 255);
         int byte_shift_97 = n_region_91 * 16;
@@ -53752,11 +54072,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_6[0]), "r"(_mma_sync_m16n8k16_a_f16_6[1]), "r"(_mma_sync_m16n8k16_a_f16_6[2]), "r"(_mma_sync_m16n8k16_a_f16_6[3]), "r"(_mma_sync_m16n8k16_b_12[0]), "r"(_mma_sync_m16n8k16_b_12[1]));
         }
-        int u32_pos_98 = 64 + lane * 2 + owner_half_90;
+        int u32_pos_98 = 64 + lane * 2 + (unsigned int)owner_half_90;
         int packed_panel_99 = u32_pos_98 / 32;
         int packed_panel_word_100 = u32_pos_98 - packed_panel_99 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 ^ ((24 + packed_panel_99) * 128 + packed_panel_word_100 * 4 >> 7 & 7) << 4))));
-        int sf_linear_101 = 384 + base_n + 8 + warp * 16;
+        int sf_linear_101 = (unsigned int)(384 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_101 / 4 * 4));
         uint8_t scale_byte_102 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_101 & 3) * 8) & 255);
         int byte_shift_103 = n_region_91 * 16;
@@ -53800,7 +54120,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         int a_k_byte_105 = (48 + lane / 16 * 8) * 2;
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-            : "r"((a_group_base_104 + (lane % 16 * 128 + a_k_byte_105 ^ (lane % 16 * 128 + a_k_byte_105 >> 7 & 7) << 4)))
+            : "r"(((unsigned int)a_group_base_104 + (lane % 16 * 128 + (unsigned int)a_k_byte_105 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_105 >> 7 & 7) << 4)))
             : "memory");
         uint32_t _mma_sync_m16n8k16_a_f16_7[4];
         asm(
@@ -53837,11 +54157,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
             : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
         int owner_half_106 = warp / 2;
         int n_region_107 = warp & 1;
-        int u32_pos_108 = lane * 2 + owner_half_106;
+        int u32_pos_108 = lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_109 = u32_pos_108 / 32;
         int packed_panel_word_110 = u32_pos_108 - packed_panel_109 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 ^ ((28 + packed_panel_109) * 128 + packed_panel_word_110 * 4 >> 7 & 7) << 4))));
-        int sf_linear_111 = 448 + base_n + warp * 16;
+        int sf_linear_111 = (unsigned int)(448 + base_n) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_111 / 4 * 4));
         uint8_t scale_byte_112 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_111 & 3) * 8) & 255);
         int byte_shift_113 = n_region_107 * 16;
@@ -53881,11 +54201,11 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
                 : "+f"(acc0[0]), "+f"(acc0[1]), "+f"(acc0[2]), "+f"(acc0[3])
                 : "r"(_mma_sync_m16n8k16_a_f16_7[0]), "r"(_mma_sync_m16n8k16_a_f16_7[1]), "r"(_mma_sync_m16n8k16_a_f16_7[2]), "r"(_mma_sync_m16n8k16_a_f16_7[3]), "r"(_mma_sync_m16n8k16_b_14[0]), "r"(_mma_sync_m16n8k16_b_14[1]));
         }
-        int u32_pos_114 = 64 + lane * 2 + owner_half_106;
+        int u32_pos_114 = 64 + lane * 2 + (unsigned int)owner_half_106;
         int packed_panel_115 = u32_pos_114 / 32;
         int packed_panel_word_116 = u32_pos_114 - packed_panel_115 * 32;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])) : "r"((b_base + ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 ^ ((28 + packed_panel_115) * 128 + packed_panel_word_116 * 4 >> 7 & 7) << 4))));
-        int sf_linear_117 = 448 + base_n + 8 + warp * 16;
+        int sf_linear_117 = (unsigned int)(448 + base_n + 8) + warp * 16;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word[0])) : "r"(sf_base + sf_linear_117 / 4 * 4));
         uint8_t scale_byte_118 = (uint8_t)(scale_word[0] >> (unsigned int)((sf_linear_117 & 3) * 8) & 255);
         int byte_shift_119 = n_region_107 * 16;
@@ -53983,7 +54303,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
         bool valid_b_161 = stage_valid_121 && global_k_group_159 < total_k_groups_123;
         asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;"
             :: "r"((cute_remaining_small_b_addr + (unsigned int)(stage * 9216) + (unsigned int)(packed_row_158 * 128 + packed_panel_word_157 * 4 ^ (packed_row_158 * 128 + packed_panel_word_157 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_160 * (N * 2) + packed_off_n * 2 + local_word_155)), "r"((valid_b_161) ? 16 : 0));
-        int _min_34 = ((lane) < (7) ? (lane) : (7));
+        unsigned int _min_34 = ((lane) < (7) ? (lane) : (7));
         int scale_chunk_162 = warp * 8 + _min_34;
         int local_scale_k_group_163 = scale_chunk_162 / 4;
         int local_scale_n_164 = scale_chunk_162 % 4 * 16;
@@ -54004,7 +54324,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent(__nv_bfloat16* 
     int row0 = lane / 4;
     int row1 = row0 + 8;
     int output_partition = warp * 16;
-    int col_pair = off_n + output_partition + lane % 4 * 2;
+    int col_pair = (unsigned int)(off_n + output_partition) + lane % 4 * 2;
     if (off_m + row0 < M && col_pair < N) {
         long long row0_base = (long long)(off_m + row0) * (long long)N + (long long)col_pair;
         {
@@ -54128,8 +54448,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -54160,7 +54481,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int warp_mma_c_addr = smem + 214016;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -54272,7 +54593,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -54307,7 +54628,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -54495,7 +54816,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -54530,7 +54851,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -54718,7 +55039,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -54753,7 +55074,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -54941,7 +55262,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
                     asm(
@@ -54976,7 +55297,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -55164,7 +55485,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -55199,7 +55520,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -55387,7 +55708,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
                     asm(
@@ -55422,7 +55743,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -55610,7 +55931,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -55645,7 +55966,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -55833,7 +56154,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
                     asm(
@@ -55868,7 +56189,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -56201,8 +56522,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -56233,7 +56555,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int warp_mma_c_addr = smem + 214016;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -56345,7 +56667,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -56380,7 +56702,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -56568,7 +56890,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -56603,7 +56925,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -56791,7 +57113,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -56826,7 +57148,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -57014,7 +57336,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
                     asm(
@@ -57049,7 +57371,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -57237,7 +57559,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -57272,7 +57594,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -57460,7 +57782,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
                     asm(
@@ -57495,7 +57817,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -57683,7 +58005,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -57718,7 +58040,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -57906,7 +58228,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
                     asm(
@@ -57941,7 +58263,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -58284,8 +58606,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -58316,7 +58639,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int warp_mma_c_addr = smem + 214016;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -58428,7 +58751,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -58463,7 +58786,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -58651,7 +58974,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -58686,7 +59009,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -58874,7 +59197,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -58909,7 +59232,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -59097,7 +59420,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
                     asm(
@@ -59132,7 +59455,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -59320,7 +59643,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -59355,7 +59678,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -59543,7 +59866,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
                     asm(
@@ -59578,7 +59901,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -59766,7 +60089,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -59801,7 +60124,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -59989,7 +60312,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
                     asm(
@@ -60024,7 +60347,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -60360,8 +60683,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -60392,7 +60716,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int warp_mma_c_addr = smem + 214016;
 
-    // Mbarrier init (2 groups, 32 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
 
     if (warp == 0) {
@@ -60504,7 +60828,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -60539,7 +60863,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_0[3]) : "r"(a_frag[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -60727,7 +61051,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
                     asm(
@@ -60762,7 +61086,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -60950,7 +61274,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -60985,7 +61309,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_2[3]) : "r"(a_frag[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -61173,7 +61497,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
                     asm(
@@ -61208,7 +61532,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -61396,7 +61720,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -61431,7 +61755,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_4[3]) : "r"(a_frag[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -61619,7 +61943,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
                     asm(
@@ -61654,7 +61978,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -61842,7 +62166,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -61877,7 +62201,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_6[3]) : "r"(a_frag[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -62065,7 +62389,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 4096 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 4096) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
                     asm(
@@ -62100,7 +62424,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -62443,8 +62767,9 @@ __global__ __launch_bounds__(128) void
 kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072_k3072(__nv_bfloat16* __restrict__ A, int* __restrict__ B, uint8_t* __restrict__ B_descale, float* __restrict__ alpha, __nv_bfloat16* __restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -62585,8 +62910,8 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
         bool valid_b_58 = stage_valid && global_k_group_56 < total_k_groups;
         asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;"
             :: "r"((v41_cute_k256_p2_b_addr + (unsigned int)(packed_row_55 * 128 + packed_panel_word_54 * 4 ^ (packed_row_55 * 128 + packed_panel_word_54 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_57 * (N * 2) + packed_off_n * 2 + local_word_52)), "r"((valid_b_58) ? 16 : 0));
-        int _min_13 = ((lane) < (15) ? (lane) : (15));
-        int scale_chunk = warp * 16 + _min_13;
+        int _min_13 = (((int)lane) < (15) ? ((int)lane) : (15));
+        int scale_chunk = warp * 16 + (unsigned int)_min_13;
         int local_scale_k_group = scale_chunk / 4;
         int local_scale_n = scale_chunk % 4 * 16;
         int global_scale_k_group = safe_local_kt * 16 + local_scale_k_group;
@@ -62707,8 +63032,8 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
         bool valid_b_138 = stage_valid_60 && global_k_group_136 < total_k_groups_62;
         asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;"
             :: "r"((v41_cute_k256_p2_b_addr + 17408 + (unsigned int)(packed_row_135 * 128 + packed_panel_word_134 * 4 ^ (packed_row_135 * 128 + packed_panel_word_134 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_137 * (N * 2) + packed_off_n * 2 + local_word_132)), "r"((valid_b_138) ? 16 : 0));
-        int _min_28 = ((lane) < (15) ? (lane) : (15));
-        int scale_chunk_139 = warp * 16 + _min_28;
+        int _min_28 = (((int)lane) < (15) ? ((int)lane) : (15));
+        int scale_chunk_139 = warp * 16 + (unsigned int)_min_28;
         int local_scale_k_group_140 = scale_chunk_139 / 4;
         int local_scale_n_141 = scale_chunk_139 % 4 * 16;
         int global_scale_k_group_142 = safe_local_kt_61 * 16 + local_scale_k_group_140;
@@ -62756,13 +63081,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
             {
                 int owner_half = warp / 2;
                 int n_region = warp & 1;
-                int u32_pos0 = lane * 2 + owner_half;
+                int u32_pos0 = lane * 2 + (unsigned int)owner_half;
                 int packed_panel0 = u32_pos0 / 32;
                 int packed_panel_word0 = u32_pos0 - packed_panel0 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + (packed_panel0 * 128 + packed_panel_word0 * 4 ^ (packed_panel0 * 128 + packed_panel_word0 * 4 >> 7 & 7) << 4))));
-                int sf_linear0 = base_n + warp * 16;
+                int sf_linear0 = (unsigned int)base_n + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0 / 4 * 4));
-                int u32_pos1 = 64 + lane * 2 + owner_half;
+                int u32_pos1 = 64 + lane * 2 + (unsigned int)owner_half;
                 int packed_panel1 = u32_pos1 / 32;
                 int packed_panel_word1 = u32_pos1 - packed_panel1 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + (packed_panel1 * 128 + packed_panel_word1 * 4 ^ (packed_panel1 * 128 + packed_panel_word1 * 4 >> 7 & 7) << 4))));
@@ -62772,7 +63097,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte = lane / 16 * 8 * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base + (lane % 16 * 128 + a_k_byte ^ (lane % 16 * 128 + a_k_byte >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base + (lane % 16 * 128 + (unsigned int)a_k_byte ^ (lane % 16 * 128 + (unsigned int)a_k_byte >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_16[4];
                 asm(
@@ -62880,13 +63205,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_16[0]), "r"(_mma_sync_m16n8k16_a_f16_16[1]), "r"(_mma_sync_m16n8k16_a_f16_16[2]), "r"(_mma_sync_m16n8k16_a_f16_16[3]), "r"(_mma_sync_m16n8k16_b_33[0]), "r"(_mma_sync_m16n8k16_b_33[1]));
                 int owner_half_0 = warp / 2;
                 int n_region_1 = warp & 1;
-                int u32_pos0_2 = lane * 2 + owner_half_0;
+                int u32_pos0_2 = lane * 2 + (unsigned int)owner_half_0;
                 int packed_panel0_3 = u32_pos0_2 / 32;
                 int packed_panel_word0_4 = u32_pos0_2 - packed_panel0_3 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((4 + packed_panel0_3) * 128 + packed_panel_word0_4 * 4 ^ ((4 + packed_panel0_3) * 128 + packed_panel_word0_4 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_5 = 64 + base_n + warp * 16;
+                int sf_linear0_5 = (unsigned int)(64 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_5 / 4 * 4));
-                int u32_pos1_6 = 64 + lane * 2 + owner_half_0;
+                int u32_pos1_6 = 64 + lane * 2 + (unsigned int)owner_half_0;
                 int packed_panel1_7 = u32_pos1_6 / 32;
                 int packed_panel_word1_8 = u32_pos1_6 - packed_panel1_7 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((4 + packed_panel1_7) * 128 + packed_panel_word1_8 * 4 ^ ((4 + packed_panel1_7) * 128 + packed_panel_word1_8 * 4 >> 7 & 7) << 4))));
@@ -62896,7 +63221,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_11 = (16 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_10 + (lane % 16 * 128 + a_k_byte_11 ^ (lane % 16 * 128 + a_k_byte_11 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_10 + (lane % 16 * 128 + (unsigned int)a_k_byte_11 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_11 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_17[4];
                 asm(
@@ -63004,13 +63329,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_17[0]), "r"(_mma_sync_m16n8k16_a_f16_17[1]), "r"(_mma_sync_m16n8k16_a_f16_17[2]), "r"(_mma_sync_m16n8k16_a_f16_17[3]), "r"(_mma_sync_m16n8k16_b_35[0]), "r"(_mma_sync_m16n8k16_b_35[1]));
                 int owner_half_15 = warp / 2;
                 int n_region_16 = warp & 1;
-                int u32_pos0_17 = lane * 2 + owner_half_15;
+                int u32_pos0_17 = lane * 2 + (unsigned int)owner_half_15;
                 int packed_panel0_18 = u32_pos0_17 / 32;
                 int packed_panel_word0_19 = u32_pos0_17 - packed_panel0_18 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((8 + packed_panel0_18) * 128 + packed_panel_word0_19 * 4 ^ ((8 + packed_panel0_18) * 128 + packed_panel_word0_19 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_20 = 128 + base_n + warp * 16;
+                int sf_linear0_20 = (unsigned int)(128 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_20 / 4 * 4));
-                int u32_pos1_21 = 64 + lane * 2 + owner_half_15;
+                int u32_pos1_21 = 64 + lane * 2 + (unsigned int)owner_half_15;
                 int packed_panel1_22 = u32_pos1_21 / 32;
                 int packed_panel_word1_23 = u32_pos1_21 - packed_panel1_22 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((8 + packed_panel1_22) * 128 + packed_panel_word1_23 * 4 ^ ((8 + packed_panel1_22) * 128 + packed_panel_word1_23 * 4 >> 7 & 7) << 4))));
@@ -63020,7 +63345,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_26 = (32 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_25 + (lane % 16 * 128 + a_k_byte_26 ^ (lane % 16 * 128 + a_k_byte_26 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_25 + (lane % 16 * 128 + (unsigned int)a_k_byte_26 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_26 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_18[4];
                 asm(
@@ -63128,13 +63453,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_18[0]), "r"(_mma_sync_m16n8k16_a_f16_18[1]), "r"(_mma_sync_m16n8k16_a_f16_18[2]), "r"(_mma_sync_m16n8k16_a_f16_18[3]), "r"(_mma_sync_m16n8k16_b_37[0]), "r"(_mma_sync_m16n8k16_b_37[1]));
                 int owner_half_30 = warp / 2;
                 int n_region_31 = warp & 1;
-                int u32_pos0_32 = lane * 2 + owner_half_30;
+                int u32_pos0_32 = lane * 2 + (unsigned int)owner_half_30;
                 int packed_panel0_33 = u32_pos0_32 / 32;
                 int packed_panel_word0_34 = u32_pos0_32 - packed_panel0_33 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((12 + packed_panel0_33) * 128 + packed_panel_word0_34 * 4 ^ ((12 + packed_panel0_33) * 128 + packed_panel_word0_34 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_35 = 192 + base_n + warp * 16;
+                int sf_linear0_35 = (unsigned int)(192 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_35 / 4 * 4));
-                int u32_pos1_36 = 64 + lane * 2 + owner_half_30;
+                int u32_pos1_36 = 64 + lane * 2 + (unsigned int)owner_half_30;
                 int packed_panel1_37 = u32_pos1_36 / 32;
                 int packed_panel_word1_38 = u32_pos1_36 - packed_panel1_37 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((12 + packed_panel1_37) * 128 + packed_panel_word1_38 * 4 ^ ((12 + packed_panel1_37) * 128 + packed_panel_word1_38 * 4 >> 7 & 7) << 4))));
@@ -63144,7 +63469,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_41 = (48 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_40 + (lane % 16 * 128 + a_k_byte_41 ^ (lane % 16 * 128 + a_k_byte_41 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_40 + (lane % 16 * 128 + (unsigned int)a_k_byte_41 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_41 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_19[4];
                 asm(
@@ -63252,13 +63577,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_19[0]), "r"(_mma_sync_m16n8k16_a_f16_19[1]), "r"(_mma_sync_m16n8k16_a_f16_19[2]), "r"(_mma_sync_m16n8k16_a_f16_19[3]), "r"(_mma_sync_m16n8k16_b_39[0]), "r"(_mma_sync_m16n8k16_b_39[1]));
                 int owner_half_45 = warp / 2;
                 int n_region_46 = warp & 1;
-                int u32_pos0_47 = lane * 2 + owner_half_45;
+                int u32_pos0_47 = lane * 2 + (unsigned int)owner_half_45;
                 int packed_panel0_48 = u32_pos0_47 / 32;
                 int packed_panel_word0_49 = u32_pos0_47 - packed_panel0_48 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((16 + packed_panel0_48) * 128 + packed_panel_word0_49 * 4 ^ ((16 + packed_panel0_48) * 128 + packed_panel_word0_49 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_50 = 256 + base_n + warp * 16;
+                int sf_linear0_50 = (unsigned int)(256 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_50 / 4 * 4));
-                int u32_pos1_51 = 64 + lane * 2 + owner_half_45;
+                int u32_pos1_51 = 64 + lane * 2 + (unsigned int)owner_half_45;
                 int packed_panel1_52 = u32_pos1_51 / 32;
                 int packed_panel_word1_53 = u32_pos1_51 - packed_panel1_52 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((16 + packed_panel1_52) * 128 + packed_panel_word1_53 * 4 ^ ((16 + packed_panel1_52) * 128 + packed_panel_word1_53 * 4 >> 7 & 7) << 4))));
@@ -63268,7 +63593,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_56 = lane / 16 * 8 * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_55 + (lane % 16 * 128 + a_k_byte_56 ^ (lane % 16 * 128 + a_k_byte_56 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_55 + (lane % 16 * 128 + (unsigned int)a_k_byte_56 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_56 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_20[4];
                 asm(
@@ -63376,13 +63701,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_20[0]), "r"(_mma_sync_m16n8k16_a_f16_20[1]), "r"(_mma_sync_m16n8k16_a_f16_20[2]), "r"(_mma_sync_m16n8k16_a_f16_20[3]), "r"(_mma_sync_m16n8k16_b_41[0]), "r"(_mma_sync_m16n8k16_b_41[1]));
                 int owner_half_60 = warp / 2;
                 int n_region_61 = warp & 1;
-                int u32_pos0_62 = lane * 2 + owner_half_60;
+                int u32_pos0_62 = lane * 2 + (unsigned int)owner_half_60;
                 int packed_panel0_63 = u32_pos0_62 / 32;
                 int packed_panel_word0_64 = u32_pos0_62 - packed_panel0_63 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((20 + packed_panel0_63) * 128 + packed_panel_word0_64 * 4 ^ ((20 + packed_panel0_63) * 128 + packed_panel_word0_64 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_65 = 320 + base_n + warp * 16;
+                int sf_linear0_65 = (unsigned int)(320 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_65 / 4 * 4));
-                int u32_pos1_66 = 64 + lane * 2 + owner_half_60;
+                int u32_pos1_66 = 64 + lane * 2 + (unsigned int)owner_half_60;
                 int packed_panel1_67 = u32_pos1_66 / 32;
                 int packed_panel_word1_68 = u32_pos1_66 - packed_panel1_67 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((20 + packed_panel1_67) * 128 + packed_panel_word1_68 * 4 ^ ((20 + packed_panel1_67) * 128 + packed_panel_word1_68 * 4 >> 7 & 7) << 4))));
@@ -63392,7 +63717,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_71 = (16 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_70 + (lane % 16 * 128 + a_k_byte_71 ^ (lane % 16 * 128 + a_k_byte_71 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_70 + (lane % 16 * 128 + (unsigned int)a_k_byte_71 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_71 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_21[4];
                 asm(
@@ -63500,13 +63825,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_21[0]), "r"(_mma_sync_m16n8k16_a_f16_21[1]), "r"(_mma_sync_m16n8k16_a_f16_21[2]), "r"(_mma_sync_m16n8k16_a_f16_21[3]), "r"(_mma_sync_m16n8k16_b_43[0]), "r"(_mma_sync_m16n8k16_b_43[1]));
                 int owner_half_75 = warp / 2;
                 int n_region_76 = warp & 1;
-                int u32_pos0_77 = lane * 2 + owner_half_75;
+                int u32_pos0_77 = lane * 2 + (unsigned int)owner_half_75;
                 int packed_panel0_78 = u32_pos0_77 / 32;
                 int packed_panel_word0_79 = u32_pos0_77 - packed_panel0_78 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((24 + packed_panel0_78) * 128 + packed_panel_word0_79 * 4 ^ ((24 + packed_panel0_78) * 128 + packed_panel_word0_79 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_80 = 384 + base_n + warp * 16;
+                int sf_linear0_80 = (unsigned int)(384 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_80 / 4 * 4));
-                int u32_pos1_81 = 64 + lane * 2 + owner_half_75;
+                int u32_pos1_81 = 64 + lane * 2 + (unsigned int)owner_half_75;
                 int packed_panel1_82 = u32_pos1_81 / 32;
                 int packed_panel_word1_83 = u32_pos1_81 - packed_panel1_82 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((24 + packed_panel1_82) * 128 + packed_panel_word1_83 * 4 ^ ((24 + packed_panel1_82) * 128 + packed_panel_word1_83 * 4 >> 7 & 7) << 4))));
@@ -63516,7 +63841,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_86 = (32 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_85 + (lane % 16 * 128 + a_k_byte_86 ^ (lane % 16 * 128 + a_k_byte_86 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_85 + (lane % 16 * 128 + (unsigned int)a_k_byte_86 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_86 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_22[4];
                 asm(
@@ -63624,13 +63949,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_22[0]), "r"(_mma_sync_m16n8k16_a_f16_22[1]), "r"(_mma_sync_m16n8k16_a_f16_22[2]), "r"(_mma_sync_m16n8k16_a_f16_22[3]), "r"(_mma_sync_m16n8k16_b_45[0]), "r"(_mma_sync_m16n8k16_b_45[1]));
                 int owner_half_90 = warp / 2;
                 int n_region_91 = warp & 1;
-                int u32_pos0_92 = lane * 2 + owner_half_90;
+                int u32_pos0_92 = lane * 2 + (unsigned int)owner_half_90;
                 int packed_panel0_93 = u32_pos0_92 / 32;
                 int packed_panel_word0_94 = u32_pos0_92 - packed_panel0_93 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((28 + packed_panel0_93) * 128 + packed_panel_word0_94 * 4 ^ ((28 + packed_panel0_93) * 128 + packed_panel_word0_94 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_95 = 448 + base_n + warp * 16;
+                int sf_linear0_95 = (unsigned int)(448 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_95 / 4 * 4));
-                int u32_pos1_96 = 64 + lane * 2 + owner_half_90;
+                int u32_pos1_96 = 64 + lane * 2 + (unsigned int)owner_half_90;
                 int packed_panel1_97 = u32_pos1_96 / 32;
                 int packed_panel_word1_98 = u32_pos1_96 - packed_panel1_97 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((28 + packed_panel1_97) * 128 + packed_panel_word1_98 * 4 ^ ((28 + packed_panel1_97) * 128 + packed_panel_word1_98 * 4 >> 7 & 7) << 4))));
@@ -63640,7 +63965,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_101 = (48 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_100 + (lane % 16 * 128 + a_k_byte_101 ^ (lane % 16 * 128 + a_k_byte_101 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_100 + (lane % 16 * 128 + (unsigned int)a_k_byte_101 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_101 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_23[4];
                 asm(
@@ -63748,13 +64073,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_23[0]), "r"(_mma_sync_m16n8k16_a_f16_23[1]), "r"(_mma_sync_m16n8k16_a_f16_23[2]), "r"(_mma_sync_m16n8k16_a_f16_23[3]), "r"(_mma_sync_m16n8k16_b_47[0]), "r"(_mma_sync_m16n8k16_b_47[1]));
                 int owner_half_105 = warp / 2;
                 int n_region_106 = warp & 1;
-                int u32_pos0_107 = lane * 2 + owner_half_105;
+                int u32_pos0_107 = lane * 2 + (unsigned int)owner_half_105;
                 int packed_panel0_108 = u32_pos0_107 / 32;
                 int packed_panel_word0_109 = u32_pos0_107 - packed_panel0_108 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((32 + packed_panel0_108) * 128 + packed_panel_word0_109 * 4 ^ ((32 + packed_panel0_108) * 128 + packed_panel_word0_109 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_110 = 512 + base_n + warp * 16;
+                int sf_linear0_110 = (unsigned int)(512 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_110 / 4 * 4));
-                int u32_pos1_111 = 64 + lane * 2 + owner_half_105;
+                int u32_pos1_111 = 64 + lane * 2 + (unsigned int)owner_half_105;
                 int packed_panel1_112 = u32_pos1_111 / 32;
                 int packed_panel_word1_113 = u32_pos1_111 - packed_panel1_112 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((32 + packed_panel1_112) * 128 + packed_panel_word1_113 * 4 ^ ((32 + packed_panel1_112) * 128 + packed_panel_word1_113 * 4 >> 7 & 7) << 4))));
@@ -63764,7 +64089,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_116 = lane / 16 * 8 * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_115 + (lane % 16 * 128 + a_k_byte_116 ^ (lane % 16 * 128 + a_k_byte_116 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_115 + (lane % 16 * 128 + (unsigned int)a_k_byte_116 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_116 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_24[4];
                 asm(
@@ -63872,13 +64197,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_24[0]), "r"(_mma_sync_m16n8k16_a_f16_24[1]), "r"(_mma_sync_m16n8k16_a_f16_24[2]), "r"(_mma_sync_m16n8k16_a_f16_24[3]), "r"(_mma_sync_m16n8k16_b_49[0]), "r"(_mma_sync_m16n8k16_b_49[1]));
                 int owner_half_120 = warp / 2;
                 int n_region_121 = warp & 1;
-                int u32_pos0_122 = lane * 2 + owner_half_120;
+                int u32_pos0_122 = lane * 2 + (unsigned int)owner_half_120;
                 int packed_panel0_123 = u32_pos0_122 / 32;
                 int packed_panel_word0_124 = u32_pos0_122 - packed_panel0_123 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((36 + packed_panel0_123) * 128 + packed_panel_word0_124 * 4 ^ ((36 + packed_panel0_123) * 128 + packed_panel_word0_124 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_125 = 576 + base_n + warp * 16;
+                int sf_linear0_125 = (unsigned int)(576 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_125 / 4 * 4));
-                int u32_pos1_126 = 64 + lane * 2 + owner_half_120;
+                int u32_pos1_126 = 64 + lane * 2 + (unsigned int)owner_half_120;
                 int packed_panel1_127 = u32_pos1_126 / 32;
                 int packed_panel_word1_128 = u32_pos1_126 - packed_panel1_127 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((36 + packed_panel1_127) * 128 + packed_panel_word1_128 * 4 ^ ((36 + packed_panel1_127) * 128 + packed_panel_word1_128 * 4 >> 7 & 7) << 4))));
@@ -63888,7 +64213,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_131 = (16 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_130 + (lane % 16 * 128 + a_k_byte_131 ^ (lane % 16 * 128 + a_k_byte_131 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_130 + (lane % 16 * 128 + (unsigned int)a_k_byte_131 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_131 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_25[4];
                 asm(
@@ -63996,13 +64321,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_25[0]), "r"(_mma_sync_m16n8k16_a_f16_25[1]), "r"(_mma_sync_m16n8k16_a_f16_25[2]), "r"(_mma_sync_m16n8k16_a_f16_25[3]), "r"(_mma_sync_m16n8k16_b_51[0]), "r"(_mma_sync_m16n8k16_b_51[1]));
                 int owner_half_135 = warp / 2;
                 int n_region_136 = warp & 1;
-                int u32_pos0_137 = lane * 2 + owner_half_135;
+                int u32_pos0_137 = lane * 2 + (unsigned int)owner_half_135;
                 int packed_panel0_138 = u32_pos0_137 / 32;
                 int packed_panel_word0_139 = u32_pos0_137 - packed_panel0_138 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((40 + packed_panel0_138) * 128 + packed_panel_word0_139 * 4 ^ ((40 + packed_panel0_138) * 128 + packed_panel_word0_139 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_140 = 640 + base_n + warp * 16;
+                int sf_linear0_140 = (unsigned int)(640 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_140 / 4 * 4));
-                int u32_pos1_141 = 64 + lane * 2 + owner_half_135;
+                int u32_pos1_141 = 64 + lane * 2 + (unsigned int)owner_half_135;
                 int packed_panel1_142 = u32_pos1_141 / 32;
                 int packed_panel_word1_143 = u32_pos1_141 - packed_panel1_142 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((40 + packed_panel1_142) * 128 + packed_panel_word1_143 * 4 ^ ((40 + packed_panel1_142) * 128 + packed_panel_word1_143 * 4 >> 7 & 7) << 4))));
@@ -64012,7 +64337,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_146 = (32 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_145 + (lane % 16 * 128 + a_k_byte_146 ^ (lane % 16 * 128 + a_k_byte_146 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_145 + (lane % 16 * 128 + (unsigned int)a_k_byte_146 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_146 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_26[4];
                 asm(
@@ -64120,13 +64445,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_26[0]), "r"(_mma_sync_m16n8k16_a_f16_26[1]), "r"(_mma_sync_m16n8k16_a_f16_26[2]), "r"(_mma_sync_m16n8k16_a_f16_26[3]), "r"(_mma_sync_m16n8k16_b_53[0]), "r"(_mma_sync_m16n8k16_b_53[1]));
                 int owner_half_150 = warp / 2;
                 int n_region_151 = warp & 1;
-                int u32_pos0_152 = lane * 2 + owner_half_150;
+                int u32_pos0_152 = lane * 2 + (unsigned int)owner_half_150;
                 int packed_panel0_153 = u32_pos0_152 / 32;
                 int packed_panel_word0_154 = u32_pos0_152 - packed_panel0_153 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((44 + packed_panel0_153) * 128 + packed_panel_word0_154 * 4 ^ ((44 + packed_panel0_153) * 128 + packed_panel_word0_154 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_155 = 704 + base_n + warp * 16;
+                int sf_linear0_155 = (unsigned int)(704 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_155 / 4 * 4));
-                int u32_pos1_156 = 64 + lane * 2 + owner_half_150;
+                int u32_pos1_156 = 64 + lane * 2 + (unsigned int)owner_half_150;
                 int packed_panel1_157 = u32_pos1_156 / 32;
                 int packed_panel_word1_158 = u32_pos1_156 - packed_panel1_157 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((44 + packed_panel1_157) * 128 + packed_panel_word1_158 * 4 ^ ((44 + packed_panel1_157) * 128 + packed_panel_word1_158 * 4 >> 7 & 7) << 4))));
@@ -64136,7 +64461,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_161 = (48 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_160 + (lane % 16 * 128 + a_k_byte_161 ^ (lane % 16 * 128 + a_k_byte_161 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_160 + (lane % 16 * 128 + (unsigned int)a_k_byte_161 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_161 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_27[4];
                 asm(
@@ -64244,13 +64569,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_27[0]), "r"(_mma_sync_m16n8k16_a_f16_27[1]), "r"(_mma_sync_m16n8k16_a_f16_27[2]), "r"(_mma_sync_m16n8k16_a_f16_27[3]), "r"(_mma_sync_m16n8k16_b_55[0]), "r"(_mma_sync_m16n8k16_b_55[1]));
                 int owner_half_165 = warp / 2;
                 int n_region_166 = warp & 1;
-                int u32_pos0_167 = lane * 2 + owner_half_165;
+                int u32_pos0_167 = lane * 2 + (unsigned int)owner_half_165;
                 int packed_panel0_168 = u32_pos0_167 / 32;
                 int packed_panel_word0_169 = u32_pos0_167 - packed_panel0_168 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((48 + packed_panel0_168) * 128 + packed_panel_word0_169 * 4 ^ ((48 + packed_panel0_168) * 128 + packed_panel_word0_169 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_170 = 768 + base_n + warp * 16;
+                int sf_linear0_170 = (unsigned int)(768 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_170 / 4 * 4));
-                int u32_pos1_171 = 64 + lane * 2 + owner_half_165;
+                int u32_pos1_171 = 64 + lane * 2 + (unsigned int)owner_half_165;
                 int packed_panel1_172 = u32_pos1_171 / 32;
                 int packed_panel_word1_173 = u32_pos1_171 - packed_panel1_172 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((48 + packed_panel1_172) * 128 + packed_panel_word1_173 * 4 ^ ((48 + packed_panel1_172) * 128 + packed_panel_word1_173 * 4 >> 7 & 7) << 4))));
@@ -64260,7 +64585,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_176 = lane / 16 * 8 * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_175 + (lane % 16 * 128 + a_k_byte_176 ^ (lane % 16 * 128 + a_k_byte_176 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_175 + (lane % 16 * 128 + (unsigned int)a_k_byte_176 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_176 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_28[4];
                 asm(
@@ -64368,13 +64693,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_28[0]), "r"(_mma_sync_m16n8k16_a_f16_28[1]), "r"(_mma_sync_m16n8k16_a_f16_28[2]), "r"(_mma_sync_m16n8k16_a_f16_28[3]), "r"(_mma_sync_m16n8k16_b_57[0]), "r"(_mma_sync_m16n8k16_b_57[1]));
                 int owner_half_180 = warp / 2;
                 int n_region_181 = warp & 1;
-                int u32_pos0_182 = lane * 2 + owner_half_180;
+                int u32_pos0_182 = lane * 2 + (unsigned int)owner_half_180;
                 int packed_panel0_183 = u32_pos0_182 / 32;
                 int packed_panel_word0_184 = u32_pos0_182 - packed_panel0_183 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((52 + packed_panel0_183) * 128 + packed_panel_word0_184 * 4 ^ ((52 + packed_panel0_183) * 128 + packed_panel_word0_184 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_185 = 832 + base_n + warp * 16;
+                int sf_linear0_185 = (unsigned int)(832 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_185 / 4 * 4));
-                int u32_pos1_186 = 64 + lane * 2 + owner_half_180;
+                int u32_pos1_186 = 64 + lane * 2 + (unsigned int)owner_half_180;
                 int packed_panel1_187 = u32_pos1_186 / 32;
                 int packed_panel_word1_188 = u32_pos1_186 - packed_panel1_187 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((52 + packed_panel1_187) * 128 + packed_panel_word1_188 * 4 ^ ((52 + packed_panel1_187) * 128 + packed_panel_word1_188 * 4 >> 7 & 7) << 4))));
@@ -64384,7 +64709,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_191 = (16 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_190 + (lane % 16 * 128 + a_k_byte_191 ^ (lane % 16 * 128 + a_k_byte_191 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_190 + (lane % 16 * 128 + (unsigned int)a_k_byte_191 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_191 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_29[4];
                 asm(
@@ -64492,13 +64817,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_29[0]), "r"(_mma_sync_m16n8k16_a_f16_29[1]), "r"(_mma_sync_m16n8k16_a_f16_29[2]), "r"(_mma_sync_m16n8k16_a_f16_29[3]), "r"(_mma_sync_m16n8k16_b_59[0]), "r"(_mma_sync_m16n8k16_b_59[1]));
                 int owner_half_195 = warp / 2;
                 int n_region_196 = warp & 1;
-                int u32_pos0_197 = lane * 2 + owner_half_195;
+                int u32_pos0_197 = lane * 2 + (unsigned int)owner_half_195;
                 int packed_panel0_198 = u32_pos0_197 / 32;
                 int packed_panel_word0_199 = u32_pos0_197 - packed_panel0_198 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((56 + packed_panel0_198) * 128 + packed_panel_word0_199 * 4 ^ ((56 + packed_panel0_198) * 128 + packed_panel_word0_199 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_200 = 896 + base_n + warp * 16;
+                int sf_linear0_200 = (unsigned int)(896 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_200 / 4 * 4));
-                int u32_pos1_201 = 64 + lane * 2 + owner_half_195;
+                int u32_pos1_201 = 64 + lane * 2 + (unsigned int)owner_half_195;
                 int packed_panel1_202 = u32_pos1_201 / 32;
                 int packed_panel_word1_203 = u32_pos1_201 - packed_panel1_202 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((56 + packed_panel1_202) * 128 + packed_panel_word1_203 * 4 ^ ((56 + packed_panel1_202) * 128 + packed_panel_word1_203 * 4 >> 7 & 7) << 4))));
@@ -64508,7 +64833,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_206 = (32 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_205 + (lane % 16 * 128 + a_k_byte_206 ^ (lane % 16 * 128 + a_k_byte_206 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_205 + (lane % 16 * 128 + (unsigned int)a_k_byte_206 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_206 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_30[4];
                 asm(
@@ -64616,13 +64941,13 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                     : "r"(_mma_sync_m16n8k16_a_f16_30[0]), "r"(_mma_sync_m16n8k16_a_f16_30[1]), "r"(_mma_sync_m16n8k16_a_f16_30[2]), "r"(_mma_sync_m16n8k16_a_f16_30[3]), "r"(_mma_sync_m16n8k16_b_61[0]), "r"(_mma_sync_m16n8k16_b_61[1]));
                 int owner_half_210 = warp / 2;
                 int n_region_211 = warp & 1;
-                int u32_pos0_212 = lane * 2 + owner_half_210;
+                int u32_pos0_212 = lane * 2 + (unsigned int)owner_half_210;
                 int packed_panel0_213 = u32_pos0_212 / 32;
                 int packed_panel_word0_214 = u32_pos0_212 - packed_panel0_213 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw0[0])) : "r"((b_base + ((60 + packed_panel0_213) * 128 + packed_panel_word0_214 * 4 ^ ((60 + packed_panel0_213) * 128 + packed_panel_word0_214 * 4 >> 7 & 7) << 4))));
-                int sf_linear0_215 = 960 + base_n + warp * 16;
+                int sf_linear0_215 = (unsigned int)(960 + base_n) + warp * 16;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&scale_word0[0])) : "r"(sf_base + sf_linear0_215 / 4 * 4));
-                int u32_pos1_216 = 64 + lane * 2 + owner_half_210;
+                int u32_pos1_216 = 64 + lane * 2 + (unsigned int)owner_half_210;
                 int packed_panel1_217 = u32_pos1_216 / 32;
                 int packed_panel_word1_218 = u32_pos1_216 - packed_panel1_217 * 32;
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&raw1[0])) : "r"((b_base + ((60 + packed_panel1_217) * 128 + packed_panel_word1_218 * 4 ^ ((60 + packed_panel1_217) * 128 + packed_panel_word1_218 * 4 >> 7 & 7) << 4))));
@@ -64632,7 +64957,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
                 int a_k_byte_221 = (48 + lane / 16 * 8) * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                    : "r"((a_group_base_220 + (lane % 16 * 128 + a_k_byte_221 ^ (lane % 16 * 128 + a_k_byte_221 >> 7 & 7) << 4)))
+                    : "r"(((unsigned int)a_group_base_220 + (lane % 16 * 128 + (unsigned int)a_k_byte_221 ^ (lane % 16 * 128 + (unsigned int)a_k_byte_221 >> 7 & 7) << 4)))
                     : "memory");
                 uint32_t _mma_sync_m16n8k16_a_f16_31[4];
                 asm(
@@ -64849,8 +65174,8 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
             bool valid_b_82 = stage_valid_2 && global_k_group_80 < total_k_groups_4;
             asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;"
                 :: "r"((v41_cute_k256_p2_b_addr + (unsigned int)(stage * 17408) + (unsigned int)(packed_row_79 * 128 + packed_panel_word_78 * 4 ^ (packed_row_79 * 128 + packed_panel_word_78 * 4 >> 7 & 7) << 4))), "l"(B + (safe_k_group_81 * (N * 2) + packed_off_n * 2 + local_word_76)), "r"((valid_b_82) ? 16 : 0));
-            int _min_43 = ((lane) < (15) ? (lane) : (15));
-            int scale_chunk_83 = warp * 16 + _min_43;
+            int _min_43 = (((int)lane) < (15) ? ((int)lane) : (15));
+            int scale_chunk_83 = warp * 16 + (unsigned int)_min_43;
             int local_scale_k_group_84 = scale_chunk_83 / 4;
             int local_scale_n_85 = scale_chunk_83 % 4 * 16;
             int global_scale_k_group_86 = safe_local_kt_3 * 16 + local_scale_k_group_84;
@@ -64871,7 +65196,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072
         int row0 = lane / 4;
         int row1 = row0 + 8;
         int output_partition = warp * 16;
-        int col_pair = off_n + output_partition + lane % 4 * 2;
+        int col_pair = (unsigned int)(off_n + output_partition) + lane % 4 * 2;
         if (off_m + row0 < M && col_pair < N) {
             long long row0_base = (long long)(off_m + row0) * (long long)N + (long long)col_pair;
             {
@@ -64997,8 +65322,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -65029,7 +65355,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 65536);
     const int warp_mma_c_addr = smem + 65536;
 
-    // Mbarrier init (2 groups, 6 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
 
     if (warp == 0) {
@@ -65133,7 +65459,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -65171,7 +65497,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
@@ -65207,7 +65533,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -65415,7 +65741,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -65453,7 +65779,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
@@ -65489,7 +65815,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -65697,7 +66023,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -65735,7 +66061,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
@@ -65771,7 +66097,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -65979,7 +66305,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -66017,7 +66343,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
@@ -66053,7 +66379,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -66261,7 +66587,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_8[4];
                     asm(
@@ -66299,7 +66625,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_9[4];
@@ -66335,7 +66661,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_9[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -66543,7 +66869,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_10[4];
                     asm(
@@ -66581,7 +66907,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_11[4];
@@ -66617,7 +66943,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_11[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -66825,7 +67151,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_12[4];
                     asm(
@@ -66863,7 +67189,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_13[4];
@@ -66899,7 +67225,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_13[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -67107,7 +67433,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_14[4];
                     asm(
@@ -67145,7 +67471,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_15[4];
@@ -67181,7 +67507,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_15[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -67580,8 +67906,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -67612,7 +67939,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 65536);
     const int warp_mma_c_addr = smem + 65536;
 
-    // Mbarrier init (2 groups, 6 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
 
     if (warp == 0) {
@@ -67716,7 +68043,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -67754,7 +68081,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
@@ -67790,7 +68117,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -67998,7 +68325,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -68036,7 +68363,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
@@ -68072,7 +68399,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -68280,7 +68607,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -68318,7 +68645,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
@@ -68354,7 +68681,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -68562,7 +68889,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -68600,7 +68927,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
@@ -68636,7 +68963,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -68844,7 +69171,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_8[4];
                     asm(
@@ -68882,7 +69209,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_9[4];
@@ -68918,7 +69245,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_9[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -69126,7 +69453,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_10[4];
                     asm(
@@ -69164,7 +69491,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_11[4];
@@ -69200,7 +69527,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_11[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -69408,7 +69735,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_12[4];
                     asm(
@@ -69446,7 +69773,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_13[4];
@@ -69482,7 +69809,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_13[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -69690,7 +70017,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_14[4];
                     asm(
@@ -69728,7 +70055,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_15[4];
@@ -69764,7 +70091,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_15[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -70173,8 +70500,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -70205,7 +70533,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 65536);
     const int warp_mma_c_addr = smem + 65536;
 
-    // Mbarrier init (2 groups, 6 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
 
     if (warp == 0) {
@@ -70309,7 +70637,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -70347,7 +70675,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
@@ -70383,7 +70711,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -70591,7 +70919,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -70629,7 +70957,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
@@ -70665,7 +70993,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -70873,7 +71201,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -70911,7 +71239,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
@@ -70947,7 +71275,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -71155,7 +71483,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -71193,7 +71521,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
@@ -71229,7 +71557,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -71437,7 +71765,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_8[4];
                     asm(
@@ -71475,7 +71803,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_9[4];
@@ -71511,7 +71839,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_9[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -71719,7 +72047,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_10[4];
                     asm(
@@ -71757,7 +72085,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_11[4];
@@ -71793,7 +72121,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_11[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -72001,7 +72329,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_12[4];
                     asm(
@@ -72039,7 +72367,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_13[4];
@@ -72075,7 +72403,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_13[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -72283,7 +72611,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_14[4];
                     asm(
@@ -72321,7 +72649,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_15[4];
@@ -72357,7 +72685,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_15[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));
@@ -72759,8 +73087,9 @@ __global__ __launch_bounds__(160) void
 kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTensorMap const* A, FlashInferTensorMap const* B, FlashInferTensorMap const* B_descale, float* __restrict__ alpha, FlashInferTensorMap const* C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -72791,7 +73120,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
     __nv_bfloat16* warp_mma_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 65536);
     const int warp_mma_c_addr = smem + 65536;
 
-    // Mbarrier init (2 groups, 6 barriers)
+    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
 
     if (warp == 0) {
@@ -72895,7 +73224,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     int base_n = n_warp * 8 + tc_col;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_0[4];
                     asm(
@@ -72933,7 +73262,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_1[4];
@@ -72969,7 +73298,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_1[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos = n_warp * 64 + lane * 2;
+                    int u32_pos = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + u32_pos * 4));
@@ -73177,7 +73506,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_2[4];
                     asm(
@@ -73215,7 +73544,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_3[4];
@@ -73251,7 +73580,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_3[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_9 = n_warp * 64 + lane * 2;
+                    int u32_pos_9 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (128 + u32_pos_9) * 4));
@@ -73459,7 +73788,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_4[4];
                     asm(
@@ -73497,7 +73826,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_5[4];
@@ -73533,7 +73862,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_5[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_22 = n_warp * 64 + lane * 2;
+                    int u32_pos_22 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (256 + u32_pos_22) * 4));
@@ -73741,7 +74070,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_6[4];
                     asm(
@@ -73779,7 +74108,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)a_base + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_7[4];
@@ -73815,7 +74144,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_7[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_35 = n_warp * 64 + lane * 2;
+                    int u32_pos_35 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (384 + u32_pos_35) * 4));
@@ -74023,7 +74352,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_8[4];
                     asm(
@@ -74061,7 +74390,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + lane / 16 * 8 * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_9[4];
@@ -74097,7 +74426,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_9[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_48 = n_warp * 64 + lane * 2;
+                    int u32_pos_48 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (512 + u32_pos_48) * 4));
@@ -74305,7 +74634,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_10[4];
                     asm(
@@ -74343,7 +74672,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (16 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_11[4];
@@ -74379,7 +74708,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_11[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_61 = n_warp * 64 + lane * 2;
+                    int u32_pos_61 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (640 + u32_pos_61) * 4));
@@ -74587,7 +74916,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_12[4];
                     asm(
@@ -74625,7 +74954,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (32 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_13[4];
@@ -74661,7 +74990,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_13[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_74 = n_warp * 64 + lane * 2;
+                    int u32_pos_74 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (768 + u32_pos_74) * 4));
@@ -74869,7 +75198,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     }
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                        : "r"((a_base + 8192 + ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                        : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                         : "memory");
                     uint32_t _mma_sync_m16n8k16_a_f16_14[4];
                     asm(
@@ -74907,7 +75236,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                     {
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                             : "=r"(a_frag_hi[0]), "=r"(a_frag_hi[1]), "=r"(a_frag_hi[2]), "=r"(a_frag_hi[3])
-                            : "r"((a_base + 8192 + ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ ((m_warp * 16 + 32 + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
+                            : "r"(((unsigned int)(a_base + 8192) + (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 ^ (((unsigned int)(m_warp * 16 + 32) + lane % 16) * 128 + (48 + lane / 16 * 8) * 2 >> 7 & 7) << 4)))
                             : "memory");
                     }
                     uint32_t _mma_sync_m16n8k16_a_f16_15[4];
@@ -74943,7 +75272,7 @@ kernel_flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent(FlashInferTenso
                         "  cvt.f32.bf16 _fp_hi, _bf_hi;          \n\t"
                         "  cvt.rn.f16x2.f32 %0, _fp_hi, _fp_lo; }"
                         : "=r"(_mma_sync_m16n8k16_a_f16_15[3]) : "r"(a_frag_hi[3]));
-                    int u32_pos_87 = n_warp * 64 + lane * 2;
+                    int u32_pos_87 = (unsigned int)(n_warp * 64) + lane * 2;
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&raw[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw[(0) + 1]))
                         : "r"(b_base + (896 + u32_pos_87) * 4));

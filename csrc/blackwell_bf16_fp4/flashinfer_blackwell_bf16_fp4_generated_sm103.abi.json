@@ -2558,7 +2558,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d_9a8665dc59",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d_de03fb5123",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -2906,7 +2906,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d_ce453810aa",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d_3923c00424",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -3254,7 +3254,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d_6d7eac8420",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d_f5711e3a9b",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -3602,7 +3602,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d_af0ba5e152",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d_40360f6cec",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -3957,7 +3957,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat_8cba0eddba",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat_568521e92d",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -4312,7 +4312,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat_5722ce20f3",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat_632d236b93",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -4667,7 +4667,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat_88a6faf198",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat_a6ad3e5b13",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -5022,7 +5022,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat_a0249ed7fb",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat_ebeb17ad79",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -5370,7 +5370,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d_16b995f416",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d_9147912ba9",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -5718,7 +5718,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d_700a0251ed",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d_c32287147b",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -6066,7 +6066,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d_6764f55a44",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d_46a3ea3318",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -6414,7 +6414,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d_928eacddf8",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d_b6d5e3277b",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -6769,7 +6769,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat_74b9b7c833",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat_e43247968f",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -7124,7 +7124,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat_caf69cc1ff",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat_75b7231c32",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -7479,7 +7479,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat_91fe1f119a",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat_3c59300dfc",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -7834,7 +7834,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat_efea948df1",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat_2f0fb1007f",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_tma_v1",
@@ -8182,7 +8182,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d_6c1d47e828",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d_a30b40cb18",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -8394,7 +8394,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d_1177813e04",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d_4bd8d20e78",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -8606,7 +8606,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d_c9e46e7841",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d_69fa5185f5",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -8818,7 +8818,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d_5938904fa9",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d_9bb8da107a",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -9037,7 +9037,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat_c1d5c3bbb2",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat_9944a5cfb3",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -9256,7 +9256,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat_4f1133df44",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat_81464970cf",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -9475,7 +9475,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat_4d90de9f2f",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat_613e5dad00",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -9694,7 +9694,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat_35b36520e7",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat_4517440a6d",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -9906,7 +9906,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d_ce0454ca04",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d_b0cd229009",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -10118,7 +10118,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d_3ba979f5ab",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d_a7e8d4bdbd",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -10330,7 +10330,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d_1970c27de8",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d_fc9bc3e362",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -10542,7 +10542,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d_da758402dd",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d_e66748c5c4",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -10761,7 +10761,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat_1bafb2bcca",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat_58ce666768",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -10980,7 +10980,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat_8d1e5e1707",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat_70c7708e33",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -11199,7 +11199,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat_c9641f0618",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat_b9266f393f",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -11418,7 +11418,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat_5050654773",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat_54dc1b331e",
       "output_dtype": "float16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_cp_async_v1",
@@ -11630,7 +11630,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d_7a8fd70f39",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d_c36c009f50",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -11976,7 +11976,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d_908916b0c3",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d_e5ab70f5d1",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -12322,7 +12322,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d_b05c82c296",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d_1d341edb2e",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -12668,7 +12668,7 @@
         }
       },
       "logical_grid_mode": "two_dimensional",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d_e2fef2dcda",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d_57ca331bff",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -13021,7 +13021,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat_9eb4a74699",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat_311d7268b3",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -13374,7 +13374,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat_d89168d312",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat_df45ed4f24",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -13727,7 +13727,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat_e515bb1373",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat_bcf94ed82d",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -14080,7 +14080,7 @@
         }
       },
       "logical_grid_mode": "flat_overflow",
-      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat_2d16a069ef",
+      "module_ident": "flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat_acf748334c",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_tcgen05_cute_dsl_s0e5m3_v1",
@@ -14412,7 +14412,7 @@
         }
       },
       "logical_grid_mode": "group_m128",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0_849c406b8d",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0_df8302c01f",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_group_m128_v1",
@@ -14737,7 +14737,7 @@
         }
       },
       "logical_grid_mode": "group_m128",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1_0eb2a4cf76",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1_df5e1cb067",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_group_m128_v1",
@@ -15062,7 +15062,7 @@
         }
       },
       "logical_grid_mode": "group_m128",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0_069e6d4876",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0_eb3be40368",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_group_m128_v1",
@@ -15387,7 +15387,7 @@
         }
       },
       "logical_grid_mode": "group_m128",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1_755ad67d8e",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1_d827857311",
       "output_dtype": "bfloat16",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_group_m128_v1",
@@ -15703,7 +15703,7 @@
         }
       },
       "logical_grid_mode": "split_k2_partial",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0_3dd31ff764",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0_90f7a2e88b",
       "output_dtype": "float32_workspace",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -16022,7 +16022,7 @@
         }
       },
       "logical_grid_mode": "split_k2_partial",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1_1874a28f15",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1_030c0e082f",
       "output_dtype": "float32_workspace",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -16341,7 +16341,7 @@
         }
       },
       "logical_grid_mode": "split_k2_partial",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0_599a4fa461",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0_1cd6f2f03d",
       "output_dtype": "float32_workspace",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -16660,7 +16660,7 @@
         }
       },
       "logical_grid_mode": "split_k2_partial",
-      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1_f63eb3591e",
+      "module_ident": "flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1_bfd3e6ca25",
       "output_dtype": "float32_workspace",
       "prepared_abi": "cudnn",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -16959,7 +16959,7 @@
         }
       },
       "logical_grid_mode": "split_k2_reduce",
-      "module_ident": "flashinfer_bf16_fp4_split_k2_reduce_pdl0_6f8523c28f",
+      "module_ident": "flashinfer_bf16_fp4_split_k2_reduce_pdl0_5f39ce2c64",
       "output_dtype": "bfloat16",
       "prepared_abi": "workspace",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -17059,7 +17059,7 @@
         }
       },
       "logical_grid_mode": "split_k2_reduce",
-      "module_ident": "flashinfer_bf16_fp4_split_k2_reduce_pdl1_e3cb3868cd",
+      "module_ident": "flashinfer_bf16_fp4_split_k2_reduce_pdl1_e98339cf66",
       "output_dtype": "bfloat16",
       "prepared_abi": "workspace",
       "route": "prepared_native_tcgen05_cudnn_e4m3_split_k2_v1",
@@ -17216,7 +17216,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent_11d67e90c3",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl0_persistent_1b4a733ba3",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k16_cute_dsl_s0e5m3_f16mma_v2",
@@ -17575,7 +17575,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent_6fb5c84003",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a0_pdl1_persistent_231428b3ca",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k16_cute_dsl_s0e5m3_f16mma_v2",
@@ -17934,7 +17934,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent_681e676117",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl0_persistent_1d8a45d977",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k16_cute_dsl_s0e5m3_f16mma_v2",
@@ -18293,7 +18293,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent_dc2f120c65",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k16_a1_pdl1_persistent_83c0ca849a",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k16_cute_dsl_s0e5m3_f16mma_v2",
@@ -18652,7 +18652,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent_c43f1bfcee",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl0_persistent_7792de1552",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k32_cute_dsl_s0e5m3_f16mma_v2",
@@ -19011,7 +19011,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent_4ccf616cb9",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a0_pdl1_persistent_70d056b3a5",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k32_cute_dsl_s0e5m3_f16mma_v2",
@@ -19370,7 +19370,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent_e35278d2f5",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl0_persistent_6d526053f0",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k32_cute_dsl_s0e5m3_f16mma_v2",
@@ -19729,7 +19729,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent_f770116700",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k32_a1_pdl1_persistent_91e19cb978",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k32_cute_dsl_s0e5m3_f16mma_v2",
@@ -20088,7 +20088,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent_f76c3d3c37",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl0_persistent_1622b467da",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k48_cute_dsl_s0e5m3_f16mma_v2",
@@ -20447,7 +20447,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent_75d1c41c2d",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a0_pdl1_persistent_a5d59dbb3a",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k48_cute_dsl_s0e5m3_f16mma_v2",
@@ -20806,7 +20806,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent_9269571515",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl0_persistent_f84e9058e1",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k48_cute_dsl_s0e5m3_f16mma_v2",
@@ -21165,7 +21165,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent_3f2e6c36fe",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k48_a1_pdl1_persistent_3cf7ab8527",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k48_cute_dsl_s0e5m3_f16mma_v2",
@@ -21517,7 +21517,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent_c5ff8f39d2",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl0_persistent_7f832948bb",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21668,7 +21668,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent_b5a956b126",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a0_pdl1_persistent_0fc7951b87",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21819,7 +21819,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent_1354d9098f",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl0_persistent_363b2c6936",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -21970,7 +21970,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent_20046e482d",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m16_k128_a1_pdl1_persistent_ad12cdc804",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -22128,7 +22128,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent_246e9a54ff",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl0_persistent_23e6f6b7d8",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -22593,7 +22593,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent_714163b0c0",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a0_pdl1_persistent_a0d80a6d23",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -23058,7 +23058,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent_82f98ae782",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl0_persistent_fbc572c7e8",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -23523,7 +23523,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_3cb706b6df",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_d90df96d20",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -24000,7 +24000,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072_k3072_61d66ff492",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m32_k128_a1_pdl1_persistent_exact_m17_n3072_k3072_34f97db1ef",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -24158,7 +24158,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent_d972ade5de",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl0_persistent_1ee62e7d07",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m64n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -24623,7 +24623,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent_f4700643cf",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a0_pdl1_persistent_d2187caf73",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m64n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -25088,7 +25088,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent_2c3df66834",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl0_persistent_2c2636a785",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m64n64k128_cute_dsl_s0e5m3_f16mma_v2",
@@ -25553,7 +25553,7 @@
         }
       },
       "logical_grid_mode": "persistent",
-      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent_e5e5d8f733",
+      "module_ident": "flashinfer_bf16_fp4_cute_warp_m64_k128_a1_pdl1_persistent_02c33c7c5a",
       "output_dtype": "bfloat16",
       "prepared_abi": "cute_dsl",
       "route": "prepared_native_warp_mma_m64n64k128_cute_dsl_s0e5m3_f16mma_v2",
