@@ -976,6 +976,25 @@ def test_source_public_backend_constructor_validation_without_gpu(
         module.SSDCombined(**constructor)
 
 
+@pytest.mark.parametrize(
+    "capability,capacity", [((7, 5), 163840), ((8, 6), 101376), ((8, 9), 101376)]
+)
+def test_vibecuda_constructor_rejects_unsupported_device(
+    monkeypatch, capability, capacity
+):
+    from types import SimpleNamespace
+
+    utils = importlib.import_module("flashinfer.utils")
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: capability)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(shared_memory_per_block_optin=capacity),
+    )
+    with pytest.raises(ValueError, match="opt-in shared memory"):
+        SSDCombined(128, 8, 64, 128, 8, backend="vibecuda")
+
+
 def _public_runner_without_constructor(backend, cake_result=None):
     runner = object.__new__(SSDCombined)
     runner.chunk_size = 128
