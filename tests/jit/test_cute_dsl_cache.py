@@ -259,8 +259,12 @@ def test_nvfp4_kernel_name_is_symbol_safe():
 import torch  # noqa: E402
 
 from flashinfer.gemm.gemm_mm_fp4_cute_dsl import (  # noqa: E402
+    _blockscaled_mxfp8_gemm_cache_key_files,
     _blockscaled_kernel_disk_name,
+    _compile_block_scaled_gemm,
+    _mxfp8_blockscaled_kernel_disk_name,
     _mm_fp4_cache_key,
+    _mm_mxfp8_cache_key,
 )
 
 # A baseline argument set and, for each argument, a distinct alternative.
@@ -323,3 +327,193 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     )
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+# ---------------------------------------------------------------------------
+# mm_mxfp8 SM100 cache adopter
+# ---------------------------------------------------------------------------
+
+MM_MXFP8_NAME_BASELINE = {
+    "sf_vec_size": 32,
+    "mma_tiler_mn": (128, 128),
+    "cluster_shape_mn": (2, 1),
+    "swap_ab": False,
+    "use_prefetch": False,
+    "enable_pdl": False,
+    "out_dtype": torch.bfloat16,
+    "split_k_slices": 1,
+    "batch_size": 1,
+    "max_active_clusters": 74,
+}
+MM_MXFP8_NAME_PERTURBED = {
+    "sf_vec_size": 16,
+    "mma_tiler_mn": (256, 64),
+    "cluster_shape_mn": (1, 2),
+    "swap_ab": True,
+    "use_prefetch": True,
+    "enable_pdl": True,
+    "out_dtype": torch.float16,
+    "split_k_slices": 4,
+    "batch_size": 2,
+    "max_active_clusters": 148,
+}
+
+
+def _mm_mxfp8_name(**kwargs):
+    cache_key = _mm_mxfp8_cache_key(
+        kwargs["sf_vec_size"],
+        kwargs["mma_tiler_mn"],
+        kwargs["cluster_shape_mn"],
+        kwargs["swap_ab"],
+        kwargs["use_prefetch"],
+        kwargs["enable_pdl"],
+        kwargs["out_dtype"],
+        kwargs["split_k_slices"],
+    )
+    return _mxfp8_blockscaled_kernel_disk_name(
+        cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
+    )
+
+
+def test_mm_mxfp8_cache_key_schema_is_fully_exercised():
+    name_only_params = {"batch_size", "max_active_clusters"}
+    assert set(inspect.signature(_mm_mxfp8_cache_key).parameters) == (
+        set(MM_MXFP8_NAME_BASELINE) - name_only_params
+    )
+
+
+@pytest.mark.parametrize("param", sorted(MM_MXFP8_NAME_BASELINE))
+def test_mm_mxfp8_kernel_name_varies_with_every_argument(param):
+    """Every SM100 MXFP8 specialization must own a distinct artifact name."""
+    baseline_name = _mm_mxfp8_name(**MM_MXFP8_NAME_BASELINE)
+    kwargs = dict(MM_MXFP8_NAME_BASELINE)
+    kwargs[param] = MM_MXFP8_NAME_PERTURBED[param]
+    perturbed_name = _mm_mxfp8_name(**kwargs)
+    assert perturbed_name != baseline_name, (
+        f"_mxfp8_blockscaled_kernel_disk_name ignores argument {param!r}: "
+        "two different kernel specializations would collide on one cache artifact."
+    )
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+def test_mm_mxfp8_source_fingerprint_covers_splitk_kernel():
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm100_splitk
+
+    assert (
+        dense_blockscaled_gemm_sm100_splitk.__file__
+        in _blockscaled_mxfp8_gemm_cache_key_files()
+    )
+
+
+def test_blockscaled_compile_accepts_operation_specific_disk_cache(monkeypatch):
+    """MXFP8 can reuse the FP4 harness without reusing its cache schema."""
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl
+    from flashinfer.jit import cute_dsl_core
+
+    cache_key = _mm_mxfp8_cache_key(
+        *(
+            MM_MXFP8_NAME_BASELINE[key]
+            for key in (
+                "sf_vec_size",
+                "mma_tiler_mn",
+                "cluster_shape_mn",
+                "swap_ab",
+                "use_prefetch",
+                "enable_pdl",
+                "out_dtype",
+                "split_k_slices",
+            )
+        )
+    )
+    compile_kernel = object()
+    extra_key_files = ("mxfp8_kernel.py",)
+    calls = []
+
+    monkeypatch.setattr(cute_dsl_utils, "get_max_active_clusters", lambda _: 17)
+    monkeypatch.setattr(
+        gemm_mm_fp4_cute_dsl,
+        "_make_blockscaled_gemm_compile_fn",
+        lambda *args, **kwargs: compile_kernel,
+    )
+
+    def fake_build(module_name, kernel_name, compile_fn, *, extra_key_files):
+        calls.append((module_name, kernel_name, compile_fn, extra_key_files))
+        return "compiled"
+
+    monkeypatch.setattr(cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build)
+
+    result = _compile_block_scaled_gemm(
+        {},
+        cache_key,
+        object,
+        ab_cutlass_dtype=object(),
+        sf_dtype=object(),
+        c_cutlass_dtype=object(),
+        ab_assumed_align=16,
+        cluster_shape_mn=(2, 1),
+        swap_ab=False,
+        sf_m=1,
+        sf_n=1,
+        sf_k=1,
+        batch_size=2,
+        cache_module_name="mm_mxfp8",
+        device_index=0,
+        disk_kernel_name_fn=lambda key, batch, clusters: (
+            f"mxfp8_{key[-1]}_{batch}_{clusters}"
+        ),
+        cache_key_files_fn=lambda: extra_key_files,
+    )
+
+    assert result == ("compiled", 17)
+    assert calls == [("mm_mxfp8", "mxfp8_1_2_17", compile_kernel, extra_key_files)]
+
+
+@pytest.mark.parametrize(
+    "m,n,k,tactic",
+    [
+        pytest.param(
+            64,
+            128,
+            256,
+            ((128, 128), (1, 1), False, False, 1),
+            id="persistent",
+        ),
+        pytest.param(
+            8,
+            128,
+            256,
+            ((128, 8), (1, 1), True, False, 2),
+            id="split-k",
+        ),
+    ],
+)
+def test_mm_mxfp8_runner_routes_to_disk_cache(monkeypatch, m, n, k, tactic):
+    from flashinfer.gemm import gemm_base
+
+    compile_calls = []
+
+    def fake_compile(*args, **kwargs):
+        compile_calls.append((args, kwargs))
+        return (lambda *launch_args: None), 1
+
+    monkeypatch.setattr(gemm_base, "_compile_block_scaled_gemm", fake_compile)
+    monkeypatch.setattr(gemm_base, "_prepare_alpha_for_launch", lambda *args: None)
+    monkeypatch.setattr(gemm_base, "get_device_index", lambda device: 0)
+
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 0, False, torch.bfloat16)
+    a = torch.empty((m, k))
+    b = torch.empty((k, n))
+    out = torch.empty((m, n))
+    scale = torch.empty(1)
+    runner.forward([a, b, scale, scale, torch.bfloat16, out, None], tactic=tactic)
+
+    assert len(compile_calls) == 1
+    args, kwargs = compile_calls[0]
+    split_k_slices = tactic[-1]
+    assert args[1][-1] == split_k_slices
+    assert kwargs["cluster_shape_k"] == split_k_slices
+    assert kwargs["cache_module_name"] == "mm_mxfp8"
+    assert kwargs["disk_kernel_name_fn"] is _mxfp8_blockscaled_kernel_disk_name
+    assert kwargs["cache_key_files_fn"] is _blockscaled_mxfp8_gemm_cache_key_files
