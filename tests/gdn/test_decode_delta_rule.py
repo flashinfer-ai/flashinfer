@@ -1282,6 +1282,9 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
         compile_count += 1
         return original_compile(*args, **kwargs)
 
+    # Pin the disk cache off: a populated cache would satisfy the reuse
+    # property with zero compiles, breaking the count-based assertion.
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
     gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
     gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
     monkeypatch.setattr(cute, "compile", counted_compile)
