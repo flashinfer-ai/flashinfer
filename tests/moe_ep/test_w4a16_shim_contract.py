@@ -340,12 +340,15 @@ def test_frontend_validates_native_flat_scale_storage_before_compile():
 
 
 @pytest.mark.parametrize("hidden,intermediate", ((32, 64), (288, 448)))
+@pytest.mark.parametrize(
+    "tile,cluster", (((256, 128, 256), (2, 1, 1)), ((128, 64, 256), (1, 1, 1)))
+)
 @pytest.mark.parametrize("mode", ("epi_warps", "reuse_dispatch_warps"))
 @pytest.mark.parametrize(
     "clamp,epi_flags", ((None, (1, 1)), (1.5, (2, 4)), (2.0, (32, 32)))
 )
 def test_tmem_kernel_preserves_public_knob_contract(
-    symm_factory, hidden, intermediate, mode, clamp, epi_flags
+    symm_factory, hidden, intermediate, tile, cluster, mode, clamp, epi_flags
 ):
     import cutlass
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.kernel import (
@@ -364,6 +367,9 @@ def test_tmem_kernel_preserves_public_knob_contract(
         0,
         1,
         knobs={
+            "mma_tiler_mnk": tile,
+            "cluster_shape_mnk": cluster,
+            "use_2cta_instrs": tile[0] == 256,
             "gate_up_clamp": clamp,
             "token_back_mode": mode,
             "epi_flag_batch": epi_flags,
@@ -378,7 +384,7 @@ def test_tmem_kernel_preserves_public_knob_contract(
             cluster_shape_mnk=config.cluster_shape_mnk,
             use_2cta_instrs=config.use_2cta_instrs,
             group_hint=512,
-            token_padding_block=128,
+            token_padding_block=tile[1],
             load_balance_mode=config.load_balance_mode,
             static_expert_shape=(4, 2 * intermediate, hidden),
             force_static_sched=True,
@@ -393,8 +399,8 @@ def test_tmem_kernel_preserves_public_knob_contract(
         )
         epi = W4A16Epilogue(
             mma_tiler_mnk=config.mma_tiler_mnk,
-            cluster_shape_mn=(2, 1),
-            use_2cta_instrs=True,
+            cluster_shape_mn=cluster[:2],
+            use_2cta_instrs=config.use_2cta_instrs,
             fc1_output_dtype=cutlass.BFloat16,
             combine_format=kernel.combine_format,
             static_expert_shape=(4, 2 * intermediate, hidden),
@@ -406,6 +412,7 @@ def test_tmem_kernel_preserves_public_knob_contract(
         assert epi.gate_up_clamp == clamp
         assert epi.epi_smem_bytes == 0 and epi.acc_sf_cols == 0
         assert not epi.reduce_topk_in_kernel
+        assert kernel.num_transform_warpgroups == 2
         assert kernel.token_comm.num_total_threads == 640
         assert kernel.token_comm.sf_uint32_per_token == 0
         by_dispatch = mode == "reuse_dispatch_warps"
@@ -415,8 +422,10 @@ def test_tmem_kernel_preserves_public_knob_contract(
         assert ("fc2_done_counter" in regions) == by_dispatch
         if by_dispatch:
             assert regions["fc2_output_workspace"].cute_dtype is cutlass.BFloat16
-            assert kernel.token_comm.fc2_publishes_per_token_cluster_tile == (
-                2 * ((hidden + 255) // 256)
+            expected_publishes = {(32, 2): 2, (288, 2): 4, (32, 1): 1, (288, 1): 3}
+            assert (
+                kernel.token_comm.fc2_publishes_per_token_cluster_tile
+                == (expected_publishes[hidden, cluster[0]])
             )
             assert kernel.token_comm.token_back_schedule_mode == "atomic_counter"
             assert kernel._local_offsets["fc2_done_counter"] + 16 <= (
@@ -424,3 +433,22 @@ def test_tmem_kernel_preserves_public_knob_contract(
             )
     finally:
         workspace.destroy()
+
+
+@pytest.mark.parametrize("tile", ((128, 128, 256), (256, 64, 256), (256, 128, 256)))
+def test_cluster_one_rejects_geometries_outside_curated_support(symm_factory, tile):
+    with pytest.raises(ValueError, match="cluster"):
+        symm_factory(
+            4,
+            4,
+            2,
+            64,
+            64,
+            0,
+            1,
+            knobs={
+                "mma_tiler_mnk": tile,
+                "cluster_shape_mnk": (1, 1, 1),
+                "use_2cta_instrs": tile[0] == 256,
+            },
+        )

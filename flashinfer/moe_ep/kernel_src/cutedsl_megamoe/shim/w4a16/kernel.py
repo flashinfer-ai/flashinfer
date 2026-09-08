@@ -151,8 +151,13 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             raise ValueError(
                 "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
             )
-        if kwargs["cluster_shape_mnk"] != (2, 1, 1):
-            raise ValueError("W4A16 MegaMoE requires cluster (2,1,1).")
+        if kwargs["cluster_shape_mnk"] != (2, 1, 1) and not (
+            kwargs["cluster_shape_mnk"] == (1, 1, 1)
+            and kwargs["mma_tiler_mnk"] == (128, 64, 256)
+        ):
+            raise ValueError(
+                "W4A16 requires cluster (2,1,1), or (1,1,1) for M128/N64/K256."
+            )
         if kwargs["use_2cta_instrs"] != (kwargs["mma_tiler_mnk"][0] == 256):
             raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
         _, gateup, hidden = kwargs["static_expert_shape"]
@@ -749,7 +754,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         ).launch(
             grid=sched.get_grid_shape(max_active_clusters),
             block=(self.threads_per_cta, 1, 1),
-            cluster=(2, 1, 1),
+            cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
         )

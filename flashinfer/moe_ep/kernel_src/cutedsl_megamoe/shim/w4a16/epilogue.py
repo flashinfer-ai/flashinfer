@@ -59,12 +59,13 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
         if (
             mma_tiler_mnk
             not in ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
-            or cluster_shape_mn != (2, 1)
+            or (
+                cluster_shape_mn != (2, 1)
+                and not (cluster_shape_mn == (1, 1) and mma_tiler_mnk == (128, 64, 256))
+            )
             or use_2cta_instrs != (mma_tiler_mnk[0] == 256)
         ):
-            raise ValueError(
-                "W4A16 requires M128/M256, N64/N128, K256 and cluster (2,1)"
-            )
+            raise ValueError("W4A16 requires a supported M/N/K tile and cluster shape.")
         if (
             fc1_output_dtype is not cutlass.BFloat16
             or combine_format.act_dtype is not cutlass.BFloat16

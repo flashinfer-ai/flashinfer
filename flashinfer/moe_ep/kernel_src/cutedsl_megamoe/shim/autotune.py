@@ -123,7 +123,7 @@ def bf16_candidates() -> List[Dict[str, Any]]:
 
 
 def w4a16_candidates() -> List[Dict[str, Any]]:
-    """Twelve W4A16 tactics: validated geometry x flag batch x token return.
+    """Sixteen W4A16 tactics: curated geometry x flag batch x token return.
 
     The kernel keeps two dequantization warp groups and derives its pipeline
     depths from the existing resource fitters. Precision, clamps and the
@@ -133,12 +133,18 @@ def w4a16_candidates() -> List[Dict[str, Any]]:
         dict(
             _SWEEP_BASE,
             mma_tiler_mnk=tile,
+            cluster_shape_mnk=cluster,
             use_2cta_instrs=tile[0] == 256,
             flag_batch=flag_batch,
             token_back_mode=token_back,
             in_kernel_fc2_reduce=False,
         )
-        for tile in ((256, 128, 256), (256, 64, 256), (128, 64, 256))
+        for tile, cluster in (
+            ((256, 128, 256), (2, 1, 1)),
+            ((256, 64, 256), (2, 1, 1)),
+            ((128, 64, 256), (2, 1, 1)),
+            ((128, 64, 256), (1, 1, 1)),
+        )
         for flag_batch in (4, 8)
         for token_back in ("epi_warps", "reuse_dispatch_warps")
     ]

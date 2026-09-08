@@ -78,8 +78,12 @@ class MegaMoEW4A16Config:
             raise ValueError(
                 "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
             )
-        if self.cluster_shape_mnk != (2, 1, 1):
-            raise ValueError("W4A16 MegaMoE requires cluster (2,1,1).")
+        if self.cluster_shape_mnk != (2, 1, 1) and not (
+            self.cluster_shape_mnk == (1, 1, 1) and self.mma_tiler_mnk == (128, 64, 256)
+        ):
+            raise ValueError(
+                "W4A16 requires cluster (2,1,1), or (1,1,1) for M128/N64/K256."
+            )
         if self.use_2cta_instrs != (self.mma_tiler_mnk[0] == 256):
             raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
         if self.token_back_mode not in (

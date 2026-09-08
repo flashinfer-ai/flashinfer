@@ -245,3 +245,36 @@ def test_apply_knobs_capture_guard_preserves_existing_config(factory):
         release.assert_not_called()
     finally:
         workspace.destroy()
+
+
+def test_cached_c1_geometry_and_cluster_change_preserve_lifecycle(factory):
+    knobs = {
+        "mma_tiler_mnk": [128, 64, 256],
+        "cluster_shape_mnk": [1, 1, 1],
+        "use_2cta_instrs": False,
+        "flag_batch": 8,
+        "token_back_mode": "reuse_dispatch_warps",
+    }
+    _record(knobs)
+    workspace = factory(4, 257, 2, 64, 64, 0, 1, gate_up_clamp=1.5)
+    frontend = workspace._frontend
+    try:
+        config = frontend.config
+        assert config.mma_tiler_mnk == (128, 64, 256)
+        assert config.cluster_shape_mnk == (1, 1, 1)
+        assert not config.use_2cta_instrs
+        assert config.flag_batch == 8
+        assert config.token_back_mode == "reuse_dispatch_warps"
+        first_key = frontend._compile_key()
+        hash(first_key)
+        with mock.patch.object(frontend, "_release_workspace") as release:
+            frontend.apply_knobs({"cluster_shape_mnk": [2, 1, 1]})
+        release.assert_called_once_with()
+        assert frontend._compile_key() != first_key
+        assert frontend._mega is None and frontend._mega_key is None
+        assert frontend.config.mma_tiler_mnk == (128, 64, 256)
+        assert frontend.config.cluster_shape_mnk == (2, 1, 1)
+        assert frontend.config.gate_up_clamp == 1.5
+        assert frontend.config.token_back_mode == "reuse_dispatch_warps"
+    finally:
+        workspace.destroy()
