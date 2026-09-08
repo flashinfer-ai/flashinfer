@@ -19,7 +19,7 @@ model here) drives the top-k differently, and several review findings on this
 API were only visible under those patterns:
 
 * several CUDA streams / CUDA graphs in flight on one device (the gvr_2
-  default workspace is one slab per device);
+  default workspace is one slab per device and stream, created eagerly);
 * a top-k issued on a side stream with ``wait_stream`` hand-offs (dual-stream
   indexer overlap);
 * CUDA graphs captured at a padded batch and replayed with fewer live rows,
@@ -167,8 +167,11 @@ def _concurrent_graph_replays(private_workspace, streams=4, launches=8, rounds=6
             workspace={"gvr2_workspace": ws} if private_workspace else None,
         )
 
-    for w in work:  # compile eagerly before capture
-        launch(w, w[3][0])
+    # compile eagerly before capture, on the stream that will capture: the
+    # eager call also creates that stream's default workspace slab
+    for s, w in enumerate(work):
+        with torch.cuda.stream(cuda_streams[s]):
+            launch(w, w[3][0])
     torch.cuda.synchronize()
     graphs = []
     for s, w in enumerate(work):
@@ -222,16 +225,67 @@ def test_gvr2_concurrent_graph_replays_private_workspaces():
     or not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()),
     reason="gvr_2 unsupported on this device",
 )
-@pytest.mark.xfail(
-    strict=False,
-    reason="DOCUMENTED HAZARD: workspace=None resolves to one gvr_2 slab per "
-    "device, so concurrently replayed graphs race on its counters and candidate "
-    "buffer (measured 17/5120 corrupted rows on B100). Flips to XPASS if a "
-    "per-stream/per-graph default ever lands; callers must pass a workspace.",
-)
-def test_gvr2_default_workspace_shared_across_concurrent_graphs():
+def test_gvr2_default_workspace_per_stream_across_concurrent_graphs():
+    """workspace=None: the default slab is per (device, stream), so four graphs
+    captured on four streams, each warmed eagerly on its own stream, replay
+    concurrently without sharing scratch. (A device-wide default slab measured
+    17/5120 corrupted rows here.)"""
     bad, total = _concurrent_graph_replays(private_workspace=False)
-    assert bad == 0, f"{bad}/{total} rows corrupted through the shared default slab"
+    assert bad == 0, (
+        f"{bad}/{total} rows corrupted through the per-stream default slabs"
+    )
+
+
+@pytest.mark.skipif(
+    not _FLASHINFER_AVAILABLE
+    or not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()),
+    reason="gvr_2 unsupported on this device",
+)
+def test_gvr2_default_workspace_capture_needs_eager_launch_on_stream():
+    """A slab-using plan captured on a stream that never ran an eager gvr_2
+    launch raises loudly instead of allocating the slab from the graph pool;
+    one eager launch on that stream makes the same capture succeed."""
+    rows, k, work = _split_case(1, 1)
+    logits, seq, pre, outs, _ = work[0]
+    fresh = torch.cuda.Stream()
+    # compile the launcher on the default stream (does not create fresh's slab)
+    flashinfer.top_k_varlen(
+        logits, seq, k, pre_idx=pre, out_indices=outs[0], backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="default workspace: no slab for this stream"),
+        torch.cuda.stream(fresh),
+        torch.cuda.graph(g, stream=fresh),
+    ):
+        flashinfer.top_k_varlen(
+            logits, seq, k, pre_idx=pre, out_indices=outs[0], backend="gvr_2"
+        )
+    torch.cuda.synchronize()
+    with torch.cuda.stream(fresh):  # eager launch on the capturing stream
+        flashinfer.top_k_varlen(
+            logits, seq, k, pre_idx=pre, out_indices=outs[0], backend="gvr_2"
+        )
+    torch.cuda.synchronize()
+    g2 = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(fresh), torch.cuda.graph(g2, stream=fresh):
+        flashinfer.top_k_varlen(
+            logits, seq, k, pre_idx=pre, out_indices=outs[0], backend="gvr_2"
+        )
+    outs[0].fill_(-7)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(fresh):
+        g2.replay()
+    torch.cuda.synchronize()
+    for r in range(rows):
+        idx = outs[0][r].long()
+        n = int(seq[r])
+        assert bool(((idx >= 0) & (idx < n)).all())
+        assert torch.equal(
+            torch.sort(logits[r][idx]).values,
+            torch.sort(torch.topk(logits[r, :n], k).values).values,
+        )
 
 
 def test_side_stream_handoff_every_backend():

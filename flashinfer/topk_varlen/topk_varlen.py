@@ -33,7 +33,10 @@ Backend choices
 ``"gvr_2"``          — self-sampling GVR V2 (sample-calibrated threshold
                        ladders; TRT-LLM PR #17821 port). Requires a datacentre
                        Blackwell-class GPU (sm_100/103, or Rubin sm_107),
-                       nvidia-cutlass-dsl, ``pre_idx``, and fp32 logits.
+                       nvidia-cutlass-dsl and fp32 logits; ``pre_idx`` is
+                       optional (a cached synthetic anchor is used when it is
+                       absent — exact either way, the hint only steers
+                       sampling).
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
@@ -1546,9 +1549,16 @@ def top_k_varlen(
                               is ignored (the kernel families load-balance
                               internally). CUDA graphs: warm up each
                               (num_rows, N, top_k, next_n, compress_ratio)
-                              geometry with one eager call before capture
-                              (an uncompiled launcher raises loudly under
-                              capture); replays may change ``seq_lens``
+                              geometry with one eager call, ON THE STREAM
+                              THAT WILL CAPTURE, before capture: the eager
+                              call compiles the launcher, sizes the
+                              hint-free anchor table (hinted or not, so hint
+                              mode is not a warm-up dimension) and creates
+                              that stream's default workspace slab (one per
+                              device and stream, so graphs captured on
+                              different streams never share scratch); any
+                              of the three missing raises loudly under
+                              capture; replays may change ``seq_lens``
                               CONTENTS freely in either direction. All finite
                               values, ``+inf`` and ``-inf`` are tie-aware
                               exact (TRT-LLM #18501/#18625 ported); NaN
@@ -1614,7 +1624,7 @@ def top_k_varlen(
         (CUDA tensor of at least
         ``flashinfer.topk_varlen.kernels.gvr2_topk_host.workspace_bytes()``
         = 20,973,568 bytes, zero-initialized before first use, 16-byte
-        aligned) overrides the per-device cached slab.
+        aligned) overrides the cached default slab.
 
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
@@ -1622,15 +1632,19 @@ def top_k_varlen(
             on the device tensors.  For the ``"gvr"`` backend, ``workspace=None``
             (default) allocates per call and is safe for any concurrency.
             For ``"gvr_2"``, ``workspace=None`` resolves to **one slab per
-            device**, shared by every launch on that device: it holds the
-            cross-CTA counters, offsets and candidate buffer of the multi-CTA
-            streaming path (selected by the kernel's ``route()`` from row
-            count, envelope and ``top_k``; small batches with long rows), so
-            two such launches in flight at once — two eager streams, or two
-            CUDA graphs replayed concurrently — race on it. Every concurrently
-            active stream, and every CUDA graph that may replay concurrently
-            with another launch, must pass its own ``"gvr2_workspace"``;
-            stream-ordered use needs nothing.
+            device and CUDA stream**: it holds the cross-CTA counters,
+            offsets and candidate buffer of the multi-CTA streaming path
+            (selected by the kernel's ``route()`` from row count, envelope
+            and ``top_k``; small batches with long rows), so launches that
+            can overlap must not share it — and with per-stream slabs, two
+            eager streams or two CUDA graphs captured on different streams
+            and replayed concurrently do not. The slab is created by the
+            first **eager** launch on a stream; a graph captured on a stream
+            that has never run an eager ``gvr_2`` launch (and whose plan
+            needs the slab) raises under capture instead of allocating from
+            the graph pool. Graphs captured on the SAME stream share that
+            stream's slab and must not be replayed concurrently with each
+            other; pass a private ``"gvr2_workspace"`` for that pattern.
 
     Returns
     -------

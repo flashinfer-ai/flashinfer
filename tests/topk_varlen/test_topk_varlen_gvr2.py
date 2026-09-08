@@ -495,7 +495,7 @@ def test_gvr2_logits_on_non_current_device():
 @requires_gvr2
 def test_gvr2_workspace_override():
     """Caller-provided workspace (multi-stream escape hatch) must agree with
-    the default per-device slab."""
+    the default per-(device, stream) slab."""
     kv, top_k = [131075, 32800, 2000], 512
     logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(kv, 1, 1, top_k, seed=17)
     idx_default, _ = _run_gvr2(logits, seq_lens, top_k, pre_idx)
@@ -1200,14 +1200,19 @@ def test_gvr2_route_pure_and_total():
         ([8192 * 4, 6000 * 4, 2048 * 4], 2, 4, 512),  # MTP rows, cr=4
         ([65536, 40000, 1000], 1, 1, 1024),  # reg_clus band
         ([262144, 100000, 2047], 1, 1, 2048),  # main/clus band, K=2048
-        ([4096] * 200 + [100] * 56, 1, 1, 512),  # b > 148 BLK=512 rung
+        ([8192] * 200 + [100] * 56, 1, 1, 512),  # b > sms BLK=512/VPT=4 rung
     ],
 )
 def test_gvr2_hint_free_exact(kv, next_n, cr, top_k):
     """pre_idx=None is exact on every family (the hint only steers sampling);
     short rows take the identity path, tails are -1, poisoned padding is
-    never read."""
-    logits, seq_lens, _, n_r, _ = _make_varlen_case(kv, next_n, cr, top_k, seed=7)
+    never read. The 256-row case must land on the FlashInfer-local BLK=512
+    rung (asserted through the launcher cache), not the pre-existing
+    n4 <= 1024 branch."""
+    logits, seq_lens, _, n_r, msl_c = _make_varlen_case(kv, next_n, cr, top_k, seed=7)
+    if len(kv) == 256:
+        want = _host.route(256, msl_c, msl_c, top_k, sms=_host._sm_count())
+        assert want["kernel"] == "reg" and want["tpl"][:3] == (512, 4, 2), want["tpl"]
     indices, values = _run_gvr2(
         logits,
         seq_lens,
@@ -1233,11 +1238,12 @@ def test_gvr2_hint_free_cuda_graph_replay():
         kv_a, 1, 1, top_k, seed=3, msl_c=n
     )
     out = torch.empty(len(kv_a), top_k, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()  # every eager warm-up below runs on the capturing stream
     # eager call: compiles the launcher and sizes the table
-    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    with torch.cuda.stream(s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
         _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
@@ -1255,37 +1261,59 @@ def test_gvr2_hint_free_cuda_graph_replay():
     g.replay()
     torch.cuda.synchronize()
     _check_varlen_rows(logits, out, n_r_b, top_k)
-    # table growth under capture is refused: warm the launcher at a larger
-    # batch WITH a hint (table untouched), then capture hint-free
-    big = (
-        4 * len(kv_a) + _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0]
-    )
+    # hint mode is not a warm-up dimension: a HINTED eager call at a larger
+    # batch also sizes the anchor table, so a hint-free capture of the same
+    # geometry succeeds without any hint-free eager call
+    cap0 = _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0]
+    big = 4 * len(kv_a) + cap0
     logits_b = torch.randn(big, n, device=_DEV)
     seq_b = torch.full((big,), n, dtype=torch.int32, device=_DEV)
     hint = torch.zeros(big, top_k, dtype=torch.int32, device=_DEV)
     out_b = torch.empty(big, top_k, dtype=torch.int32, device=_DEV)
-    _run_gvr2(logits_b, seq_b, top_k, hint, out_indices=out_b)
+    with torch.cuda.stream(s):  # hinted eager warm-up, on the capturing stream
+        _run_gvr2(logits_b, seq_b, top_k, hint, out_indices=out_b)
     torch.cuda.synchronize()
+    assert _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0] >= big
     g2 = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
-    with (
-        pytest.raises(RuntimeError, match="hint-free gvr_2"),
-        torch.cuda.stream(s),
-        torch.cuda.graph(g2, stream=s),
-    ):
+    with torch.cuda.stream(s), torch.cuda.graph(g2, stream=s):
         _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
+    torch.cuda.current_stream().wait_stream(s)
+    g2.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits_b, out_b, [n] * big, top_k)
+    # table growth under capture is refused: a batch no eager call has seen
+    huge = 2 * _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0] + 8
+    logits_h = torch.randn(huge, n, device=_DEV)
+    seq_h = torch.full((huge,), n, dtype=torch.int32, device=_DEV)
+    out_h = torch.empty(huge, top_k, dtype=torch.int32, device=_DEV)
+    # compile the launcher for this row count on the capturing stream, but
+    # with a hint from a table-free path: legacy warmup_varlen cannot help here
+    # since it would size the table too, so capture straight away
+    g3 = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with (
+        pytest.raises(
+            RuntimeError, match="hint-free gvr_2|varlen launcher not compiled"
+        ),
+        torch.cuda.stream(s),
+        torch.cuda.graph(g3, stream=s),
+    ):
+        _run_gvr2(logits_h, seq_h, top_k, None, out_indices=out_h)
     torch.cuda.synchronize()
     # warmup_varlen sizes the table for its largest batch, so the same
     # capture then succeeds
-    _host.warmup_varlen(top_k, n, num_rows_list=(big,))
-    g3 = torch.cuda.CUDAGraph()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s), torch.cuda.graph(g3, stream=s):
-        _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
-    torch.cuda.current_stream().wait_stream(s)
-    g3.replay()
+    with torch.cuda.stream(s):
+        _host.warmup_varlen(top_k, n, num_rows_list=(huge,))
     torch.cuda.synchronize()
-    _check_varlen_rows(logits_b, out_b, [n] * big, top_k)
+    g4 = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g4, stream=s):
+        _run_gvr2(logits_h, seq_h, top_k, None, out_indices=out_h)
+    torch.cuda.current_stream().wait_stream(s)
+    g4.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits_h, out_h, [n] * huge, top_k)
 
 
 @requires_gvr2
@@ -1401,4 +1429,118 @@ def test_gvr2_route_sm_count_aware():
         ).multi_processor_count
         if torch.cuda.is_available()
         else True
+    )
+
+
+@requires_gvr2
+def test_gvr2_hint_free_table_growth_is_serialized_and_stream_ordered():
+    """Concurrent cold-start / growth of the hint-free anchor table from several
+    threads on several streams: the published capacity is the maximum ever
+    requested (never a smaller table overwriting a larger one), every row of
+    the published table reads arange(k) from any stream, and hint-free calls
+    on every stream are exact afterwards."""
+    import threading
+
+    top_k, n = 1024, 8192
+    key = (torch.cuda.current_device(), top_k)
+    with _host._HINT_FREE_LOCK:
+        _host._HINT_FREE.pop(key, None)  # cold start for this k
+    batches = [8, 200, 64, 512, 16, 300, 128, 40]
+    streams = [torch.cuda.Stream() for _ in batches]
+    errors = []
+    barrier = threading.Barrier(len(batches))
+
+    def grow(i, b):
+        try:
+            with torch.cuda.stream(streams[i]):
+                barrier.wait()
+                t = _host._hint_free_pre_idx(b, top_k, torch.device("cuda"))
+                assert t.shape == (b, top_k)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=grow, args=(i, b)) for i, b in enumerate(batches)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    table = _host._HINT_FREE[key]
+    assert table.shape[0] >= max(batches), table.shape
+    ref = torch.arange(top_k, dtype=torch.int32, device=_DEV)
+    for s in streams:  # complete contents visible from every stream
+        with torch.cuda.stream(s):
+            assert bool((table == ref).all())
+    torch.cuda.synchronize()
+    logits = torch.randn(max(batches), n, device=_DEV)
+    seq = torch.full((max(batches),), n, dtype=torch.int32, device=_DEV)
+    for s, b in zip(streams, batches, strict=True):
+        with torch.cuda.stream(s):
+            idx, _ = _run_gvr2(logits[:b], seq[:b], top_k, None)
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits[:b], idx, [n] * b, top_k)
+
+
+def test_gvr2_route_reg_clus_sm_count_aware():
+    """The clustered-register admission (`av`) follows the SM count on parts with
+    >= 148 SMs (Rubin/B300: bigger clusters, reg_clus where B200 falls to the
+    slab) and keeps upstream's 148 below it (DRIVE P2021 measured mixed)."""
+    r = _host.route
+    # Rubin: 4-CTA clusters instead of 2-CTA at b 38-48, 16K-32K
+    for n in (16388, 24576, 32768):
+        assert r(40, n, _round64(n), 512)["tpl"] == (1024, 4, 2)
+        assert r(40, n, _round64(n), 512, sms=208)["tpl"] == (1024, 2, 4)
+        # reg_clus instead of main at b 80-104
+        assert r(96, n, _round64(n), 512)["kernel"] == "main"
+        assert r(96, n, _round64(n), 512, sms=208)["kernel"] == "reg_clus"
+    # Rubin/B300: reg_clus instead of main/clus at 48K-64K, b 38-48
+    for sms in (158, 160, 208):
+        assert r(38, 49152, 49152, 512, sms=sms)["kernel"] == "reg_clus"
+        assert r(38, 65536, 65536, 1024, sms=sms)["kernel"] == "reg_clus"
+    assert r(38, 49152, 49152, 512)["kernel"] == "main"
+    assert r(38, 65536, 65536, 1024)["kernel"] == "clus"
+    # below 148 SMs the upstream admission is kept
+    for n in (16388, 65536, 131072):
+        for b in (9, 12, 24, 48):
+            assert r(b, n, _round64(n), 512, sms=68) == r(b, n, _round64(n), 512)
+    # the factorization stays lossless with the extra rung selections
+    for b, n, sms in ((40, 16388, 208), (96, 32768, 208), (38, 65536, 160)):
+        assert _host.route_split(b, n, _round64(n), 512, sms=sms) == r(
+            b, n, _round64(n), 512, sms=sms
+        )
+
+
+def test_gvr2_route_bands_follow_sm_count():
+    """route_bands(sms=...) enumerates the bands of the part it is given: at
+    b=160 the 148-SM bands put 8K<n<=16K on the slab (one BLK=512 wave covers
+    only n<=8K there), the 208-SM bands keep all of 4K<n<=16K on the register
+    kernels (b=160 is `wide`), and every band's plan equals route_static at
+    both ends."""
+    b, npad, k = 160, 16384, 512
+    for sms in (148, 208):
+        bands = _host.route_bands(b, npad, k, n_lo=4097, n_hi=16384, sms=sms)
+        assert bands and bands[0][0] == 4097 and bands[-1][1] == 16384
+        for lo, hi, plan in bands:
+            assert plan == _host.route_static(b, lo, npad, k, sms=sms)
+            assert plan == _host.route_static(b, hi, npad, k, sms=sms)
+    kinds_148 = {
+        p["kernel"] for _, _, p in _host.route_bands(b, npad, k, 4097, 16384, sms=148)
+    }
+    kinds_208 = {
+        p["kernel"] for _, _, p in _host.route_bands(b, npad, k, 4097, 16384, sms=208)
+    }
+    # (n=4097..4099 still has n4 == 1024: the regimg flavour where b=160 is
+    # `wide`, i.e. on the 208-SM part only)
+    assert kinds_148 == {"reg", "main"} and kinds_208 == {"reg", "regimg"}
+    # the 148-SM slab band starts at the first n with n4 = n >> 2 > 2048
+    slab = [
+        (lo, hi)
+        for lo, hi, p in _host.route_bands(b, npad, k, 4097, 16384, sms=148)
+        if p["kernel"] == "main"
+    ]
+    assert slab and slab[0][0] == 8196 and slab[-1][1] == 16384
+    assert _host.route_bands(b, npad, k, 4097, 16384) == _host.route_bands(
+        b, npad, k, 4097, 16384, sms=148
     )
