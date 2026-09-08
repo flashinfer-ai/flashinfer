@@ -11,16 +11,30 @@ Compares two activation contracts over the same routed-MoE workload:
 
 Use torchrun to benchmark both real expert- and tensor-parallel communication:
 
-    torchrun --standalone --nproc-per-node=8 \\
+    torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py
 
 Compare split W4A16 with MegaMoE using CUPTI and CUDA graphs. Token counts
 are GLOBAL across the EP group, including empty ranks below eight tokens:
 
-    torchrun --standalone --nproc-per-node=8 \\
+    torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py \\
         --parallel-modes ep --variants w4a16,w4a16_megamoe \\
         --timing cupti --cuda-graph --refcheck --no-fused-finalize
+
+With ``--no-fused-finalize``, both W4A16 paths cast FC2 results to BF16 before
+applying FP32 routing weights. Split EP rounds each rank's weighted partial
+sum to BF16 before combine; MegaMoE reduces all per-route BF16 results at the
+source rank. The refcheck keeps a fixed tolerance for this reduction difference.
+
+Both timers measure the full forward, including routing, input staging,
+communication, expert compute, and output handling. CUPTI measures the span
+from the first GPU activity's start to the last activity's end on each rank,
+then takes the maximum rank span per iteration and the median across
+iterations. This includes gaps and overlap; it is not a sum of kernel times.
+Weight preparation, compilation, autotuning, warmup, graph capture, and L2
+flushing are excluded. Nsight Systems' breakdown instead sums activity
+durations across ranks and must not be substituted for this latency metric.
 
 Run Nsight Systems mode directly to capture and report per-kernel breakdowns
 for all four topology/activation combinations:
@@ -31,7 +45,8 @@ for all four topology/activation combinations:
 Nsight Compute mode uses kernel replay to capture every local compute kernel
 with the full metric set and embeds correlated sources found recursively under
 the FlashInfer repository. It simulates the exact post-communication EP/TP
-shapes in one process; use Nsight Systems mode for real communication:
+shapes in one process, without replaying the distributed routing or autotuned
+tactics; use Nsight Systems mode to identify the real distributed kernels:
 
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \\
         --mode profile_ncu --profile-iters 1
@@ -50,8 +65,10 @@ import argparse
 import csv
 import gc
 import itertools
+import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -156,6 +173,10 @@ def _profile_worker_arguments(args, num_tokens):
         "--parallel-modes",
         args.parallel_modes,
     ]
+    if args.megamoe_knobs is not None:
+        arguments.extend(
+            ("--megamoe-knobs", json.dumps(args.megamoe_knobs, sort_keys=True))
+        )
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
     if not args.use_fused_finalize:
@@ -200,7 +221,9 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
             if table in tables
         )
         if not launch_apis:
-            raise RuntimeError(f"Nsight Systems recorded no CUDA launch APIs in {report}")
+            raise RuntimeError(
+                f"Nsight Systems recorded no CUDA launch APIs in {report}"
+            )
         raw_rows = connection.execute(
             f"""
             WITH stage_ranges AS (
@@ -347,6 +370,22 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
     print(f"Kernel CSV: {csv_report}")
 
 
+def _profile_torchrun_arguments(num_gpus):
+    # Static localhost rendezvous avoids advertising a container hostname
+    # that peers cannot resolve. Each sequential capture gets a free port.
+    with socket.socket() as rendezvous_socket:
+        rendezvous_socket.bind(("127.0.0.1", 0))
+        port = rendezvous_socket.getsockname()[1]
+    return [
+        "--nnodes=1",
+        "--node-rank=0",
+        "--rdzv-backend=static",
+        "--master-addr=127.0.0.1",
+        f"--master-port={port}",
+        f"--nproc-per-node={num_gpus}",
+    ]
+
+
 def _run_nsys_profiles(args, token_counts):
     nsys = shutil.which("nsys")
     torchrun = shutil.which("torchrun")
@@ -379,8 +418,7 @@ def _run_nsys_profiles(args, token_counts):
             f"--show-output={'true' if args.verbose else 'false'}",
             f"--output={output}",
             torchrun,
-            "--standalone",
-            f"--nproc-per-node={args.num_gpus}",
+            *_profile_torchrun_arguments(args.num_gpus),
             str(script),
             *_profile_worker_arguments(args, num_tokens),
         ]
@@ -455,8 +493,7 @@ def _run_ncu_profiles(args, token_counts):
             ]
             launcher = [
                 shutil.which("torchrun"),
-                "--standalone",
-                f"--nproc-per-node={args.num_gpus}",
+                *_profile_torchrun_arguments(args.num_gpus),
             ]
             description = "coordinated EP collective kernels"
         else:
@@ -473,7 +510,11 @@ def _run_ncu_profiles(args, token_counts):
             description = "simulated post-communication kernels"
         command = [
             ncu,
-            "--set=full",
+            *(
+                [f"--metrics={args.ncu_metrics}"]
+                if args.ncu_metrics
+                else ["--set=full"]
+            ),
             "--target-processes=all",
             *replay_arguments,
             "--profile-from-start=off",
@@ -1084,7 +1125,9 @@ def _benchmark_distributed_megamoe(
         weights=weights,
         backend=MegaConfig(
             megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=CFG.intermediate_size, top_k=CFG.top_k
+                intermediate_size=CFG.intermediate_size,
+                top_k=CFG.top_k,
+                knobs=args.megamoe_knobs,
             )
         ),
     )
@@ -1519,6 +1562,14 @@ def _run_parallel_mode(
             else f"timing=max rank {args.timing}, cuda_graph={args.cuda_graph}"
         )
         print(f"\nMode: real {mode.upper()}{world_size}, {measurement}, cache=cold L2")
+        if any(variant.use_megamoe for variant in variants):
+            print(
+                "MEGAMOE_KNOBS_JSON,"
+                + json.dumps(
+                    args.megamoe_knobs or {}, sort_keys=True, separators=(",", ":")
+                ),
+                flush=True,
+            )
         if not is_profiling:
             if default_comparison:
                 print(
@@ -1677,6 +1728,18 @@ def _run_distributed_benchmark(args, token_counts):
         dist.destroy_process_group()
 
 
+def _parse_megamoe_knobs(value):
+    try:
+        knobs = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(
+            "--megamoe-knobs must be a JSON object"
+        ) from error
+    if not isinstance(knobs, dict):
+        raise argparse.ArgumentTypeError("--megamoe-knobs must be a JSON object")
+    return knobs
+
+
 def main():
     warnings.filterwarnings(
         "ignore",
@@ -1699,6 +1762,12 @@ def main():
         "--variants",
         default="w4a4,w4a16",
         help="Comma-separated variants: w4a4,w4a16,w4a16_megamoe (MegaMoE is EP only).",
+    )
+    parser.add_argument(
+        "--megamoe-knobs",
+        type=_parse_megamoe_knobs,
+        default=None,
+        help="JSON object of W4A16 MegaMoE kernel knobs, recorded in benchmark output.",
     )
     parser.add_argument(
         "--parallel-modes",
@@ -1745,13 +1814,13 @@ def main():
         "--no-fused-finalize",
         action="store_false",
         dest="use_fused_finalize",
-        help="Use deterministic two-stage finalize.",
+        help="Use deterministic two-stage finalize for the split W4A4/W4A16 variants.",
     )
     parser.add_argument(
         "--no-pdl",
         action="store_false",
         dest="enable_pdl",
-        help="Disable Programmatic Dependent Launch.",
+        help="Disable Programmatic Dependent Launch for the split variants.",
     )
     parser.add_argument(
         "--mode",
@@ -1776,6 +1845,11 @@ def main():
         type=str,
         default=None,
         help="Directory for Nsight Compute reports (default: a temporary directory).",
+    )
+    parser.add_argument(
+        "--ncu-metrics",
+        default=None,
+        help="Comma-separated NCU metrics; default captures the full metric set.",
     )
     parser.add_argument(
         "--ncu-megamoe-kernel",
@@ -1804,6 +1878,8 @@ def main():
         parser.error("--parallel-modes must contain unique ep,tp values")
     if variant_names == ["w4a16_megamoe"] and parallel_modes == ["tp"]:
         parser.error("W4A16 MegaMoE supports expert parallelism only")
+    if args.megamoe_knobs is not None and "w4a16_megamoe" not in variant_names:
+        parser.error("--megamoe-knobs requires the w4a16_megamoe variant")
     if args.refcheck and (
         args.mode != "benchmark"
         or "ep" not in parallel_modes
