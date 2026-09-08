@@ -190,6 +190,5 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             workspace,
             num_tokens=output.shape[0],
             gate_up_clamp=self._kernel_config.gate_up_clamp,
-            fast_math=self._kernel_config.fast_math,
         )
         return output

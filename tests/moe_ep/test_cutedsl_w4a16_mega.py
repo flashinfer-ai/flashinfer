@@ -52,13 +52,13 @@ def _barrier():
         dist.barrier()
 
 
-def _weights(*, sparse=False):
+def _weights(*, sparse=False, hidden=_HIDDEN, intermediate=_INTERMEDIATE):
     from flashinfer.moe_ep import PrequantizedMoEWeights
 
     generator = torch.Generator(device="cuda").manual_seed(20260907)
     shapes = (
-        (_EXPERTS, 2 * _INTERMEDIATE, _HIDDEN // 2),
-        (_EXPERTS, _HIDDEN, _INTERMEDIATE // 2),
+        (_EXPERTS, 2 * intermediate, hidden // 2),
+        (_EXPERTS, hidden, intermediate // 2),
     )
     packed = [
         torch.randint(
@@ -92,7 +92,7 @@ def _weights(*, sparse=False):
         # and opposite FC2, making FP32 routing precision observable after
         # cancellation. Codes 2/10 are +1/-1 in E2M1, in the low nibble.
         packed[0][:, 0, 0] = 2
-        packed[0][:, _INTERMEDIATE, 0] = 2
+        packed[0][:, intermediate, 0] = 2
         packed[1][0, 0, 0] = 2
         packed[1][-1, 0, 0] = 10
         alphas[0].fill_(1.00390625)
@@ -125,7 +125,9 @@ def _reference_terms(tensors, weights):
     w13 = _decode_nvfp4(weights.w13, weights.w13_scale).float()
     w2 = _decode_nvfp4(weights.w2, weights.w2_scale).float()
     terms = torch.zeros(
-        (x.shape[0], _TOP_K, _HIDDEN), device=x.device, dtype=torch.float32
+        (x.shape[0], tensors.topk_ids.shape[1], x.shape[1]),
+        device=x.device,
+        dtype=torch.float32,
     )
     # FP32 torch GEMMs must not substitute TF32 operands for the exact BF16
     # values. The fused kernel uses BF16 MMA with FP32 accumulation.
@@ -150,12 +152,12 @@ def _reference_terms(tensors, weights):
     return terms * tensors.topk_weights.float().unsqueeze(-1)
 
 
-def _inputs(rank, num_tokens, *, skewed=False, sparse=False):
+def _inputs(rank, num_tokens, *, skewed=False, sparse=False, hidden=_HIDDEN):
     from flashinfer.moe_ep import MoEEpTensors
 
     generator = torch.Generator(device="cuda").manual_seed(73 + rank)
     x = torch.randn(
-        num_tokens, _HIDDEN, dtype=torch.bfloat16, device="cuda", generator=generator
+        num_tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
     )
     rows = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
     ids = torch.stack((rows % _EXPERTS, (rows + 2) % _EXPERTS), dim=-1)
@@ -178,7 +180,7 @@ def _inputs(rank, num_tokens, *, skewed=False, sparse=False):
     return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=scores)
 
 
-def _layer(bootstrap, global_weights):
+def _layer(bootstrap, global_weights, *, capacity=_CAPACITY):
     from flashinfer.moe_ep import (
         FleetParams,
         MegaConfig,
@@ -201,47 +203,59 @@ def _layer(bootstrap, global_weights):
         bootstrap=bootstrap,
         fleet_params=FleetParams(
             num_experts=_EXPERTS,
-            max_tokens_per_rank=_CAPACITY,
-            token_hidden_size=_HIDDEN,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=global_weights.w2.shape[1],
         ),
         weights=local_weights,
         backend=MegaConfig(
             megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=_INTERMEDIATE, top_k=_TOP_K
+                intermediate_size=global_weights.w13.shape[1] // 2, top_k=_TOP_K
             )
         ),
     )
 
 
-def _check_numerical(expected_world_size):
+def _check_numerical(
+    expected_world_size,
+    *,
+    hidden=_HIDDEN,
+    intermediate=_INTERMEDIATE,
+    num_tokens=None,
+):
     bootstrap = _bootstrap(expected_world_size)
-    weights = _weights()
-    layer = _layer(bootstrap, weights)
+    weights = _weights(hidden=hidden, intermediate=intermediate)
+    layer = _layer(bootstrap, weights, capacity=max(_CAPACITY, num_tokens or 0))
     try:
         # Reuse one workspace across changing routing and token counts. The
         # empty source rank still owns experts needed by its peers.
-        for name, count, skewed in (
+        rounds = (
             ("balanced", 17, False),
             ("skewed", 17, True),
             ("single_token", 1 if bootstrap.rank == 0 else 0, False),
             ("empty_source", 0 if bootstrap.rank == 0 else 11, False),
             ("all_empty", 0, False),
             ("refill", 9, False),
-        ):
-            tensors = _inputs(bootstrap.rank, count, skewed=skewed)
+        )
+        if num_tokens is not None:
+            rounds = (("skewed_tiles", num_tokens, True),)
+        for name, count, skewed in rounds:
+            tensors = _inputs(bootstrap.rank, count, skewed=skewed, hidden=hidden)
             terms = _reference_terms(tensors, weights)
             _barrier()
             actual = layer.forward(tensors)
             _barrier()
             assert actual.dtype == torch.bfloat16
-            assert actual.shape == (count, _HIDDEN)
+            assert actual.shape == (count, hidden)
             assert torch.isfinite(actual).all()
             if count:
                 _assert_mega_oracle_term_band_close(
                     actual,
                     terms,
                     ikr=False,
-                    label=f"W4A16 {name} rank={bootstrap.rank}",
+                    label=(
+                        f"W4A16 {name} H={hidden} I={intermediate} "
+                        f"rank={bootstrap.rank}"
+                    ),
                 )
     finally:
         layer.destroy()
@@ -327,3 +341,25 @@ def test_w4a16_mega_single_rank(check):
 )
 def test_w4a16_mega_two_rank(check):
     check(2)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    ("hidden", "intermediate", "num_tokens"),
+    ((64, 64, 257), (192, 320, 257)),
+    ids=("h64_i64_m257", "h192_i320_m257"),
+)
+@pytest.mark.parametrize(
+    "expected_world_size",
+    (pytest.param(1, id="ep1"), pytest.param(2, id="ep2", marks=pytest.mark.gpu_2)),
+)
+def test_w4a16_mega_geometry(expected_world_size, hidden, intermediate, num_tokens):
+    # The skew sends every token to experts 0 and 1. 257 rows cross both the
+    # 128-row CTA and 256-row cluster boundaries; EP2 also leaves one rank
+    # without local expert work. The feature tails exercise FC1 and FC2 stores.
+    _check_numerical(
+        expected_world_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_tokens=num_tokens,
+    )

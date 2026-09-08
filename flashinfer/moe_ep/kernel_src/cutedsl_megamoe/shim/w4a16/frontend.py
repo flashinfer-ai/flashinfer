@@ -533,15 +533,25 @@ def w4a16_mega_moe(
     num_tokens: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    fast_math: bool = True,
     sync: bool = False,
 ) -> None:
-    del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
     if y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
         raise ValueError(f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden}).")
+    if not y.is_cuda or not y.is_contiguous():
+        raise ValueError("y must be a contiguous CUDA tensor.")
+    if (
+        n > 0
+        and symm_buffer._frontend._reduce is None
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "W4A16 top-k reducer cannot compile during CUDA graph capture; "
+            "call warmup() with its default batch on all EP ranks before "
+            "capturing a nonempty forward."
+        )
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
@@ -561,12 +571,13 @@ def w4a16_mega_moe(
             symm_buffer.combine_output,
         ),
         num_tokens=n,
-        sync=sync,
     )
     if symm_buffer._frontend.config.in_kernel_fc2_reduce:
         y.copy_(result[:, 0])
     else:
         symm_buffer._frontend.reduce_topk(result, symm_buffer.topk_weights[:n], y)
+    if sync:
+        torch.cuda.synchronize()
 
 
 def w4a16_mega_launch_thunk(
