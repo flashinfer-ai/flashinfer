@@ -31,6 +31,7 @@ gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
+gemm_mxfp8_dynamic_quant_N160_K256.json
 gemm_mxfp8_N4096_K4096.json
 gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
@@ -449,6 +450,22 @@ try:
     flashinfer.gemm.mm_mxfp8(a_mxfp8, weight_mxfp8.T, a_ds, b_ds)
 except Exception:
     pass  # Requires Blackwell (SM100+)
+
+# ── Dynamic-quant MXFP8 GEMM (Blackwell: BF16 M×256 @ MXFP8 160×256) ─────────
+major, minor = torch.cuda.get_device_capability(torch.device(device))
+if flashinfer.mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", major * 10 + minor):
+    M, K, N = 3, 256, 160
+    a_bf16 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    weight_bf16 = torch.zeros(N, K, dtype=torch.bfloat16, device=device)
+    weight_mxfp8, weight_scale = flashinfer.mxfp8_quantize(
+        weight_bf16,
+        sf_swizzle_layout=flashinfer.SfLayout.layout_linear,
+    )
+    weight_prepared, scale_prepared = flashinfer.prepare_mxfp8_trtllm_weights(
+        weight_mxfp8,
+        weight_scale,
+    )
+    flashinfer.mm_mxfp8_dynamic_quant(a_bf16, weight_prepared, scale_prepared)
 
 # ── BMM mxfp8 (Blackwell SM100+: 2×128×128, block=32) ────────────────────────
 try:

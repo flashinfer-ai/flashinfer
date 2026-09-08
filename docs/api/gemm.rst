@@ -50,6 +50,8 @@ MXFP8 GEMM
     :toctree: ../generated
 
     mm_mxfp8
+    mm_mxfp8_dynamic_quant
+    prepare_mxfp8_trtllm_weights
     bmm_mxfp8
 
 FP8 GEMM
