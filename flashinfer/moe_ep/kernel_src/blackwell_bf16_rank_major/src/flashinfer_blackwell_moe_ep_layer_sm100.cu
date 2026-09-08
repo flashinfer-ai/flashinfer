@@ -1029,9 +1029,9 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
+    __syncthreads();
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
-    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int taddr = tmem_addr_storage[0];
@@ -2286,9 +2286,9 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
 
+    __syncthreads();
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
-    __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
     const int taddr = tmem_addr_storage[0];
