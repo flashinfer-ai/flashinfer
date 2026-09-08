@@ -653,3 +653,55 @@ def test_compile_cache_digest_isolated_by_nvcc_identity(tmp_path) -> None:
     assert len(baseline) == 64
     assert len({baseline, changed_path, changed_version}) == 3
     assert len({baseline[:16], changed_path[:16], changed_version[:16]}) == 3
+
+
+def test_compile_cubin_adds_manifest_header_include_paths(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "gdn" / "cake" / "cuda" / "kernel.cu"
+    source.parent.mkdir(parents=True)
+    source.write_text('#include "cake_gdn_common.cuh"\n', encoding="utf-8")
+    include_path = tmp_path / "gdn"
+    (include_path / "cake_gdn_common.cuh").write_text(
+        "// header\n", encoding="utf-8"
+    )
+    nvcc = tmp_path / "cuda" / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text("compiler", encoding="utf-8")
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        Path(command[-1]).write_bytes(b"cubin")
+        return Result()
+
+    monkeypatch.setattr(cake_gdn.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(cake_gdn.subprocess, "run", fake_run)
+
+    cubin = cake_gdn._compile_cubin(
+        source,
+        arch="sm_100a",
+        digest="digest",
+        compile_options=("--use_fast_math",),
+        include_paths=(include_path,),
+        nvcc=nvcc,
+    )
+
+    assert cubin == b"cubin"
+    assert calls[0][0] == [
+        str(nvcc),
+        "--cubin",
+        "--std=c++17",
+        "-O3",
+        "--gpu-architecture=sm_100a",
+        f"-I{include_path}",
+        "--use_fast_math",
+        *cake_gdn.get_nvcc_parallelism_flags(),
+        str(source),
+        "-o",
+        calls[0][0][-1],
+    ]

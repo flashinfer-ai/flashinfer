@@ -173,6 +173,7 @@ def _compile_cubin(
     arch: CakeGDNArch,
     digest: str,
     compile_options: tuple[str, ...],
+    include_paths: tuple[Path, ...],
     nvcc: Path,
 ) -> bytes:
     cache_dir = jit_env.FLASHINFER_JIT_DIR / "cake_gdn" / arch
@@ -195,6 +196,7 @@ def _compile_cubin(
                     "--std=c++17",
                     "-O3",
                     f"--gpu-architecture={arch}",
+                    *(f"-I{path}" for path in include_paths),
                     *compile_options,
                     *get_nvcc_parallelism_flags(),
                     str(source),
@@ -262,6 +264,9 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
         arch=arch,
         digest=compile_digest,
         compile_options=compile_options,
+        include_paths=tuple(
+            dict.fromkeys((root / header["path"]).parent for header in headers)
+        ),
         nvcc=nvcc,
     )
     module_digest = hashlib.sha256(
