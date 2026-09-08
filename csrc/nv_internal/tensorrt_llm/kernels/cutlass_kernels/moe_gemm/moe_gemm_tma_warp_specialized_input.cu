@@ -23,7 +23,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
-std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+std::array<size_t, 21> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type) {
   size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
   size_t stride_act_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
@@ -49,6 +49,7 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
   size_t int4_groupwise_stride_sf_a_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
 
   size_t ptr_token_map_size = sizeof(int**) * num_experts;
+  size_t ptr_gather_a_index_size = sizeof(int*) * num_experts;
 
   return std::array{problem_shape_size,
                     stride_act_size,
@@ -69,7 +70,8 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
                     int4_groupwise_stride_sf_a_size,
                     ptr_buf_size,
                     scale_buf_size,
-                    ptr_token_map_size};
+                    ptr_token_map_size,
+                    ptr_gather_a_index_size};
 }
 
 size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts,
@@ -83,7 +85,7 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
     void* precomputed_scheduler_workspace, size_t precomputed_scheduler_workspace_size,
     FpXBlockScalingType scaling_type) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
-  std::array<int8_t*, 20> pointers{};
+  std::array<int8_t*, 21> pointers{};
   TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(),
                        "Mismatching workspace size and number of buffers");
   for (int i = 0; i < buffers.size(); i++) {
@@ -122,6 +124,8 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
   fused_finalize_epilogue.ptr_bias = reinterpret_cast<void const**>(pointers[17]);
   fused_finalize_epilogue.ptr_router_scales = reinterpret_cast<float const**>(pointers[18]);
   fused_finalize_epilogue.ptr_source_token_index = reinterpret_cast<int const**>(pointers[19]);
+
+  ptr_gather_a_index = reinterpret_cast<int const**>(pointers[20]);
 
   this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
   this->gemm_workspace_size = gemm_workspace_size;

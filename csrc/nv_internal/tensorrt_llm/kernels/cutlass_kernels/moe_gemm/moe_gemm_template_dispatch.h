@@ -538,17 +538,17 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getConfigs(
-    bool supports_finalize_fusion) const {
-  return getConfigs(sm_, supports_finalize_fusion);
+    bool supports_finalize_fusion, bool supports_gather_a) const {
+  return getConfigs(sm_, supports_finalize_fusion, supports_gather_a);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getConfigs(
-    int sm, bool supports_finalize_fusion) {
+    int sm, bool supports_finalize_fusion, bool supports_gather_a) {
   std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs =
-      getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
+      getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion, supports_gather_a);
   std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
   std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
   return candidate_configs;
@@ -587,8 +587,8 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
           bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
-              Sm90Wfp4Afp8Mode>::getTmaWarpSpecializedConfigs(int sm,
-                                                              bool supports_finalize_fusion) {
+              Sm90Wfp4Afp8Mode>::getTmaWarpSpecializedConfigs(int sm, bool supports_finalize_fusion,
+                                                              bool supports_gather_a) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -678,6 +678,23 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
     tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
                                         [](auto& config) { return !config.swap_ab; }),
                          tma_ws_configs.end());
+  }
+
+  if (supports_gather_a && sm == 90) {
+    // Append a gather-A twin for each eligible config: same tile, but the A
+    // rows are gathered by the consumer warpgroups inside the GEMM instead of
+    // being materialized by the expandInputRowsKernel copy.
+    std::vector<cutlass_extensions::CutlassGemmConfig> gather_configs;
+    for (auto config : tma_ws_configs) {
+      if (!config.swap_ab &&
+          config.cluster_shape == cutlass_extensions::ClusterShape::ClusterShape_1x1x1 &&
+          config.epilogue_fusion_type ==
+              cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE) {
+        config.gather_a = true;
+        gather_configs.push_back(config);
+      }
+    }
+    tma_ws_configs.insert(tma_ws_configs.end(), gather_configs.begin(), gather_configs.end());
   }
 
   if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {
