@@ -769,6 +769,37 @@ def test_direct_binding_refreshes_unnormalized_qk_aliases(
     assert prepared.k_normalized is k
 
 
+def test_direct_replay_uses_the_callers_current_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared.q = SimpleNamespace(device=torch.device("cuda"))
+    prepared.output = object()
+    prepared.final_state = None
+    prepared.output_final_state = False
+    prepared._graph = None
+    prepared._stream = SimpleNamespace(cuda_stream=7)
+    current_stream = SimpleNamespace(cuda_stream=11)
+    launches: list[str] = []
+    recorded_streams: list[object] = []
+    retained = SimpleNamespace(
+        record_stream=lambda stream: recorded_streams.append(stream)
+    )
+    prepared._retained_tensors = (retained,)
+    prepared._launch_direct = lambda: launches.append("direct")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "current_stream",
+        lambda _device: current_stream,
+    )
+    monkeypatch.setattr(gdn_cp.torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(gdn_cp.tvm_ffi, "use_torch_stream", nullcontext)
+
+    assert prepared.replay() == (prepared.output, None)
+    assert launches == ["direct"]
+    assert recorded_streams == [current_stream]
+
+
 def test_public_gdn_cp_cache_accepts_inference_metadata_during_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

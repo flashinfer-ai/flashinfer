@@ -1038,18 +1038,22 @@ class GDNCPPrefill:
                 )
 
     def replay(self) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Replay the captured route once on its preparation stream."""
+        """Replay the route once on the caller's current stream."""
 
         current = torch.cuda.current_stream(self.q.device)
-        if current.cuda_stream != self._stream.cuda_stream:
-            raise RuntimeError("GDNCPPrefill must replay on its preparation stream")
         if self._graph is None:
             with torch.cuda.device(self.q.device), tvm_ffi.use_torch_stream():
                 self._launch_direct()
+            launch_stream = current
         else:
+            if current.cuda_stream != self._stream.cuda_stream:
+                raise RuntimeError(
+                    "captured GDNCPPrefill must replay on its preparation stream"
+                )
             self._graph.replay()
+            launch_stream = self._stream
         for tensor in self._retained_tensors:
-            tensor.record_stream(self._stream)
+            tensor.record_stream(launch_stream)
         return self.output, self.final_state if self.output_final_state else None
 
 
