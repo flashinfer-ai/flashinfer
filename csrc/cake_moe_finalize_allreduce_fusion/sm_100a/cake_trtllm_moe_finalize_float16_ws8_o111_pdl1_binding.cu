@@ -23,9 +23,40 @@
 extern "C" __global__ void kernel_cake_trtllm_moe_finalize_float16_ws8_o111(__half* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __half* __restrict__ expert_scales, __half* __restrict__ shared_expert_output, __half* __restrict__ residual, __half* __restrict__ norm_weight, __half* __restrict__ residual_out, __half* __restrict__ norm_out, __half* __restrict__ quant_out, __half* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor);
 
 
-namespace cake_host_shim_2159751eb16a27a4 {
+namespace cake_host_shim_4eaaacb9fe99a6bc {
 
+using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
+
+class ScopedCudaDevice {
+ public:
+  explicit ScopedCudaDevice(int device_id) {
+    cudaError_t error = cudaGetDevice(&previous_device_);
+    TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
+        << "cudaGetDevice failed before host-shim launch: cudaError="
+        << static_cast<int>(error);
+    if (previous_device_ != device_id) {
+      error = cudaSetDevice(device_id);
+      TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
+          << "cudaSetDevice failed before host-shim launch for cuda:"
+          << device_id << ": cudaError=" << static_cast<int>(error);
+      restore_ = true;
+    }
+  }
+
+  ScopedCudaDevice(const ScopedCudaDevice&) = delete;
+  ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
+
+  ~ScopedCudaDevice() noexcept {
+    if (restore_) {
+      (void)cudaSetDevice(previous_device_);
+    }
+  }
+
+ private:
+  int previous_device_ = -1;
+  bool restore_ = false;
+};
 
 inline int64_t CakeDeviceMultiprocessorCount(int device_id) {
   constexpr int kMaxCachedCudaDevices = 64;
@@ -118,6 +149,8 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
 }
 
 void Run(TensorView arg_allreduce_in, TensorView arg_inverse_indices, TensorView arg_expert_scales, TensorView arg_shared_expert_output, TensorView arg_residual, TensorView arg_norm_weight, TensorView arg_residual_out, TensorView arg_norm_out, TensorView arg_quant_out, TensorView arg_scale_out, TensorView arg_workspace_tensor, int64_t arg_world_rank, int64_t arg_tokens, int64_t arg_top_k, int64_t arg_has_shared_expert, double arg_routed_scaling_factor, double arg_epsilon, double arg_weight_bias, double arg_scale_factor, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  DLDevice dev = arg_allreduce_in.device();
+  ScopedCudaDevice device_guard(dev.device_id);
   CheckCudaTensor(arg_allreduce_in, "allreduce_in");
   CheckDtype(arg_allreduce_in, "allreduce_in", 2, 16, 1);
   CheckContiguous(arg_allreduce_in, "allreduce_in");
@@ -185,7 +218,6 @@ void Run(TensorView arg_allreduce_in, TensorView arg_inverse_indices, TensorView
   TVM_FFI_CHECK(grid_z == 1, ValueError)
       << "grid_z must equal " << (1)      << ", got " << grid_z;
 
-  DLDevice dev = arg_allreduce_in.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   __half* p_allreduce_in = static_cast<__half*>(arg_allreduce_in.data_ptr());
   int* p_inverse_indices = static_cast<int*>(arg_inverse_indices.data_ptr());
@@ -237,6 +269,6 @@ void Run(TensorView arg_allreduce_in, TensorView arg_inverse_indices, TensorView
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_2159751eb16a27a4
+}  // namespace cake_host_shim_4eaaacb9fe99a6bc
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_2159751eb16a27a4::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_4eaaacb9fe99a6bc::Run);

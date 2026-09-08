@@ -16,6 +16,9 @@ static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 template <int N>
 struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
@@ -81,8 +84,9 @@ __global__ __launch_bounds__(224) __cluster_dims__(4,1,1) void
 kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111(__nv_bfloat16* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __nv_bfloat16* __restrict__ expert_scales, __nv_bfloat16* __restrict__ shared_expert_output, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
