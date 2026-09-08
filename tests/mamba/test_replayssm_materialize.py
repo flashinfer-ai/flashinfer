@@ -44,14 +44,18 @@ def _materialize(
     heads_per_group: int = 1,
     active_request_indices: torch.Tensor | None = None,
     pad_slot_id: int = -1,
-    state_dtype: torch.dtype = torch.bfloat16,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 0,
     dependency_inputs: list[torch.Tensor] | None = None,
     dependency_outputs: list[torch.Tensor] | None = None,
+    state_scales: list[torch.Tensor] | None = None,
 ) -> None:
     layers = len(state)
     zero_table = torch.zeros(layers, dtype=torch.int64, device="cuda")
+    if (state[0].element_size() == 1) != (state_scales is not None):
+        raise ValueError("state_scales are required exactly for one-byte state storage")
+    if state_scales is not None and len(state_scales) != layers:
+        raise ValueError("state_scales must have one tensor per layer")
     replayssm_materialize(
         _ptr_table(state),
         _stride_table(state),
@@ -62,8 +66,8 @@ def _materialize(
         _ptr_table(dt_cache),
         _stride_table(dt_cache),
         _ptr_table(a),
-        zero_table,
-        zero_table,
+        _ptr_table(state_scales) if state_scales is not None else zero_table,
+        _stride_table(state_scales) if state_scales is not None else zero_table,
         src_slots,
         dst_slots,
         ring_start,
@@ -71,11 +75,11 @@ def _materialize(
         active_request_indices
         if active_request_indices is not None
         else _active_request_indices(replay_prefix_len),
-        state_dtype=state_dtype,
-        input_dtype=torch.bfloat16,
-        matrixA_dtype=torch.float32,
-        dim=64,
-        dstate=64,
+        state_dtype=state[0].dtype,
+        input_dtype=x_cache[0].dtype,
+        matrixA_dtype=a[0].dtype,
+        dim=state[0].size(-2),
+        dstate=state[0].size(-1),
         num_heads=state[0].size(1),
         heads_per_group=heads_per_group,
         max_window=8,
@@ -407,7 +411,6 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay(
         ring_start[:1],
         accepted[:1],
         ring_buffer_len,
-        state_dtype=state_dtype,
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
     )
@@ -487,16 +490,18 @@ def test_replayssm_materialize_8bit_matches_checkpointing_ssu_replay(
         algorithm="monolith",
     )
     actual_state, actual_scales = state.clone(), scales.clone()
-    _materialize_int8(
-        actual_state,
-        actual_scales,
-        x_cache,
-        b_cache,
-        dt_cache,
-        a_values,
+    _materialize(
+        [actual_state],
+        [x_cache],
+        [b_cache],
+        [dt_cache],
+        [a_values],
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[1]], dtype=torch.int32, device="cuda"),
         ring_start[:1],
         accepted[:1],
         ring_buffer_len,
+        state_scales=[actual_scales],
     )
     torch.cuda.synchronize()
     assert torch.equal(actual_state[1], expected_state[0])
@@ -518,59 +523,21 @@ def test_replayssm_materialize_8bit_zero_count_copies_state_and_scale(
         state = torch.randn(2, 1, 64, 128, device="cuda").to(state_dtype)
     scales = torch.rand(2, 1, 64, device="cuda") + 0.01
     state_before, scales_before = state.clone(), scales.clone()
-    _materialize_int8(
-        state,
-        scales,
-        torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda"),
-        torch.empty(1, 1, 1, 128, dtype=torch.bfloat16, device="cuda"),
-        torch.empty(1, 1, 1, device="cuda"),
-        torch.empty(1, device="cuda"),
+    _materialize(
+        [state],
+        [torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")],
+        [torch.empty(1, 1, 1, 128, dtype=torch.bfloat16, device="cuda")],
+        [torch.empty(1, 1, 1, device="cuda")],
+        [torch.empty(1, device="cuda")],
+        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[1]], dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"),
         torch.zeros(1, dtype=torch.int32, device="cuda"),
         ring_buffer_len=1,
+        state_scales=[scales],
     )
     torch.cuda.synchronize()
     assert torch.equal(state[0], state_before[0])
     assert torch.equal(state[1], state_before[0])
     assert torch.equal(scales[0], scales_before[0])
     assert torch.equal(scales[1], scales_before[0])
-
-
-def _materialize_int8(
-    state: torch.Tensor,
-    scales: torch.Tensor,
-    x_cache: torch.Tensor,
-    b_cache: torch.Tensor,
-    dt_cache: torch.Tensor,
-    a: torch.Tensor,
-    ring_start: torch.Tensor,
-    replay_prefix_len: torch.Tensor,
-    ring_buffer_len: int,
-) -> None:
-    replayssm_materialize(
-        _ptr_table([state]),
-        _stride_table([state]),
-        _ptr_table([x_cache]),
-        _stride_table([x_cache]),
-        _ptr_table([b_cache]),
-        _stride_table([b_cache]),
-        _ptr_table([dt_cache]),
-        _stride_table([dt_cache]),
-        _ptr_table([a]),
-        _ptr_table([scales]),
-        _stride_table([scales]),
-        torch.tensor([[0]], dtype=torch.int32, device="cuda"),
-        torch.tensor([[1]], dtype=torch.int32, device="cuda"),
-        ring_start,
-        replay_prefix_len,
-        _active_request_indices(replay_prefix_len),
-        state_dtype=state.dtype,
-        input_dtype=torch.bfloat16,
-        matrixA_dtype=torch.float32,
-        dim=64,
-        dstate=128,
-        num_heads=1,
-        heads_per_group=1,
-        max_window=8,
-        ring_buffer_len=ring_buffer_len,
-    )
