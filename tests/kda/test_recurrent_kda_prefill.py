@@ -1692,6 +1692,11 @@ def test_frozen_prefill_missing_selected_module_is_fail_closed(
         seed=23_306,
     )
     monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
         kda_prefill_cute_api,
         "_is_cute_dsl_kda_prefill_eligible",
         lambda **kwargs: False,
