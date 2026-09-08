@@ -4197,13 +4197,9 @@ def _make_mixed_kv_dtype_config(
     (
         pytest.param(64, None, False, None, id="keeps-kv128-q64"),
         pytest.param(128, None, False, None, id="keeps-kv128-q128"),
-        pytest.param(
-            64,
-            {"use_keeps_mma_ab": False},
-            False,
-            "k_dtype != v_dtype requires",
-            id="swaps",
-        ),
+        pytest.param(8, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q8"),
+        pytest.param(16, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q16"),
+        pytest.param(32, {"use_keeps_mma_ab": False}, False, None, id="swaps-kv128-q32"),
         pytest.param(
             64,
             {"tile_size_kv": 256},
@@ -4219,10 +4215,10 @@ def _make_mixed_kv_dtype_config(
             id="block-sparse",
         ),
         pytest.param(
-            64,
+            8,
             {"use_keeps_mma_ab": False},
             True,
-            "k_dtype != v_dtype requires",
+            None,
             id="swaps-no-shape-args",
         ),
     ),
@@ -4233,20 +4229,23 @@ def test_attention_ts_decode_config_mixed_kv_dtype_profile_gate(
     via_static_path: bool,
     expected_error: str | None,
 ) -> None:
-    """k_dtype != v_dtype only builds on KeepsMmaAb + KV128 + non-block-sparse."""
+    """k_dtype != v_dtype builds on KV128 + non-block-sparse, either MMA layout."""
 
     if via_static_path:
-        with pytest.raises(ValueError, match=expected_error):
-            make_decode_config(
-                headdim=128,
-                args={
-                    "q_dtype": BFloat16,
-                    "k_dtype": BFloat16,
-                    "v_dtype": Float8E4M3FN,
-                    "out_dtype": BFloat16,
-                    **config_args,
-                },
-            )
+        static_args = {
+            "q_dtype": BFloat16,
+            "k_dtype": BFloat16,
+            "v_dtype": Float8E4M3FN,
+            "out_dtype": BFloat16,
+            **config_args,
+        }
+        if expected_error is not None:
+            with pytest.raises(ValueError, match=expected_error):
+                make_decode_config(headdim=128, args=static_args)
+            return
+        cfg = make_decode_config(headdim=128, args=static_args)
+        assert cfg.k_dtype != cfg.v_dtype
+        assert cfg.use_keeps_mma_ab is False
         return
 
     if expected_error is not None:
@@ -4258,15 +4257,28 @@ def test_attention_ts_decode_config_mixed_kv_dtype_profile_gate(
     assert cfg.k_dtype != cfg.v_dtype
     assert cfg.use_fp8_qkv is False
 
-    bf16_cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, v_dtype=BFloat16)
+    bf16_cfg = _make_mixed_kv_dtype_config(
+        tile_size_q=tile_size_q, v_dtype=BFloat16, config_args=config_args
+    )
     assert cfg.smem_p_tile_bytes == bf16_cfg.smem_p_tile_bytes // 2
 
 
-@pytest.mark.parametrize("tile_size_q", (64, 128))
-def test_attention_ts_decode_mixed_kv_dtype_resources_build(tile_size_q: int) -> None:
+@pytest.mark.parametrize(
+    ("tile_size_q", "config_args"),
+    (
+        pytest.param(64, None, id="keeps-q64"),
+        pytest.param(128, None, id="keeps-q128"),
+        pytest.param(8, {"use_keeps_mma_ab": False}, id="swaps-q8"),
+        pytest.param(16, {"use_keeps_mma_ab": False}, id="swaps-q16"),
+        pytest.param(32, {"use_keeps_mma_ab": False}, id="swaps-q32"),
+    ),
+)
+def test_attention_ts_decode_mixed_kv_dtype_resources_build(
+    tile_size_q: int, config_args: dict[str, object] | None
+) -> None:
     """Build K/V SMEM resources and pipelines for k_dtype != v_dtype case."""
 
-    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q)
+    cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
     resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
 
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
@@ -4281,14 +4293,23 @@ def test_attention_ts_decode_mixed_kv_dtype_resources_build(tile_size_q: int) ->
         pytest.param(32, 8, id="gqa"),
     ),
 )
+@pytest.mark.parametrize(
+    "use_keeps_mma_ab,tile_size_q",
+    (
+        pytest.param(True, 64, id="keeps"),
+        pytest.param(False, 8, id="swaps"),
+    ),
+)
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     monkeypatch: pytest.MonkeyPatch,
+    use_keeps_mma_ab: bool,
+    tile_size_q: int,
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> None:
-    """KeepsMmaAb + KV128 grouped kernel compile and run stays accurate for QK-BF16/PV-FP8."""
+    """Grouped KV128 kernel compile and run stays accurate for QK-BF16/PV-FP8, either MMA layout."""
 
     case = _make_decode_case(
         kv_lens=(200, 300),
@@ -4318,8 +4339,8 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
 
     original_make_decode_config = fmha_decode_config.make_decode_config
     explicit_profile = {
-        "use_keeps_mma_ab": True,
-        "tile_size_q": 64,
+        "use_keeps_mma_ab": use_keeps_mma_ab,
+        "tile_size_q": tile_size_q,
         "tile_size_kv": 128,
         "groups_tokens_heads_q": True,
     }
@@ -4339,6 +4360,55 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     finally:
         _resolve_decode_launch_spec.cache_clear()
         _get_compiled_decode.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len_kv", "seq_len_q", "expected_use_keeps_mma_ab", "expected_tile_size_q"),
+    (
+        pytest.param(4, 1024, 8, False, 16, id="baseline"),
+        pytest.param(1, 1024, 8, False, 8, id="batch-1"),
+        pytest.param(4, 512, 8, False, 8, id="skv-512"),
+        pytest.param(4, 1024, 16, False, 32, id="sqo-16-batch-4"),
+        pytest.param(16, 1024, 16, True, 64, id="sqo-16-batch-16"),
+        pytest.param(64, 1024, 16, True, 64, id="sqo-16-batch-64"),
+    ),
+)
+def test_attention_ts_decode_mixed_kv_dtype_auto_selects_mma_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    seq_len_kv: int,
+    seq_len_q: int,
+    expected_use_keeps_mma_ab: bool,
+    expected_tile_size_q: int,
+) -> None:
+    """auto_tuner picks SwapsMmaAb by default, KeepsMmaAb once draft length/batch grow enough."""
+
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        spec = _resolve_decode_launch_spec(
+            0, batch_size, 32, 8, 128, 32, seq_len_kv, seq_len_q,
+            "bfloat16", "bfloat16", "float8_e4m3fn", "bfloat16",
+            "HND", "causal", False, -1,
+        )
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+    assert spec.config.use_keeps_mma_ab is expected_use_keeps_mma_ab
+    assert spec.config.tile_size_q == expected_tile_size_q
 
 
 @pytest.mark.parametrize(

@@ -541,10 +541,14 @@ def _build_decode_gen_schedule(
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
-    use_per_inst_kv_resources = (cfg.use_block_sparse and cfg.tile_size_kv != 256) or (
-        cfg.use_keeps_mma_ab
-        and cfg.tile_size_kv != 256
-        and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
+    use_per_inst_kv_resources = (
+        (cfg.use_block_sparse and cfg.tile_size_kv != 256)
+        or (cfg.k_dtype != cfg.v_dtype and cfg.tile_size_kv != 256)
+        or (
+            cfg.use_keeps_mma_ab
+            and cfg.tile_size_kv != 256
+            and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
+        )
     )
     # B8/B16 issue enough fine-grained TMA copies to benefit from reusing a
     # padding warp as a second issuer. The host policy applies one KV-side

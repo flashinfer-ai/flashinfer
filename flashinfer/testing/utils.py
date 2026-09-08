@@ -708,6 +708,7 @@ def attention_tb_per_sec_with_actual_seq_lens(
     q_dtype=torch.bfloat16,
     kv_dtype=torch.bfloat16,
     o_dtype=torch.bfloat16,
+    v_dtype=None,
 ):
     """
     Calculate TB per second perf achieved for a given attention layer with actual sequence lengths.
@@ -722,12 +723,14 @@ def attention_tb_per_sec_with_actual_seq_lens(
         num_kv_heads (int): Number of key and value heads.
         time (float): Execution time in milliseconds.
         q_dtype (torch.dtype): Data type of the query.
-        kv_dtype (torch.dtype): Data type of the key and value.
+        kv_dtype (torch.dtype): Data type of the key.
         o_dtype (torch.dtype): Data type of the output.
+        v_dtype (torch.dtype, optional): Data type of the value. Defaults to kv_dtype.
 
     Returns:
         tb_per_sec (float): TB per second for the layer.
     """
+    v_dtype = v_dtype if v_dtype is not None else kv_dtype
     q_bytes = (
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_qk * q_dtype.itemsize
     )
@@ -735,7 +738,7 @@ def attention_tb_per_sec_with_actual_seq_lens(
         torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_qk * kv_dtype.itemsize
     )
     v_bytes = (
-        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * kv_dtype.itemsize
+        torch.sum(actual_seq_lens_kv) * num_kv_heads * head_dim_vo * v_dtype.itemsize
     )
     o_bytes = (
         torch.sum(actual_seq_lens_q) * num_qo_heads * head_dim_vo * o_dtype.itemsize

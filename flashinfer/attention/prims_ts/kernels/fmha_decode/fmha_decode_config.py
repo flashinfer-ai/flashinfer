@@ -102,9 +102,9 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (BFloat16, BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
     (Float16, Float16, Float16, Float16, 256, 128, 1, 1),
 }
-# Mixed k_dtype != v_dtype feature compatibility is validated by
-# ``_validate_mixed_kv_dtype_profile``. This profile selects the Keeps MMA
-# resource recipe qualified for that already-validated launch domain.
+# This profile qualifies the Keeps MMA resource recipe for
+# ``supports_grouped_keeps``. Mixed k_dtype != v_dtype itself is validated by
+# ``_validate_mixed_kv_dtype_profile``.
 _GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE: _GroupedKeepsProfileKey = (
     BFloat16,
     BFloat16,
@@ -1188,7 +1188,7 @@ class FmhaDecodeConfig:
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
-            if self.use_fp8_qkv
+            if (self.use_fp8_qkv or self.v_dtype_bytes == 1)
             else FP16_P_PACKED_REGS_PER_Q_REPEAT
         )
         return regs_per_repeat * q_repeats
@@ -3622,12 +3622,11 @@ def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
     """Reject k_dtype != v_dtype profiles outside the supported combination."""
     if cfg.k_dtype == cfg.v_dtype:
         return
-    if cfg.use_block_sparse or not cfg.use_keeps_mma_ab or cfg.tile_size_kv == 256:
+    if cfg.use_block_sparse or cfg.tile_size_kv == 256:
         raise ValueError(
-            "k_dtype != v_dtype requires use_block_sparse=False, "
-            "use_keeps_mma_ab=True, and tile_size_kv=128; got "
+            "k_dtype != v_dtype requires use_block_sparse=False and "
+            "tile_size_kv=128; got "
             f"use_block_sparse={cfg.use_block_sparse}, "
-            f"use_keeps_mma_ab={cfg.use_keeps_mma_ab}, "
             f"tile_size_kv={cfg.tile_size_kv}"
         )
 
