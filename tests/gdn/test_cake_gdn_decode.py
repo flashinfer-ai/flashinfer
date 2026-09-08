@@ -664,9 +664,7 @@ def test_compile_cubin_adds_manifest_header_include_paths(
     source.parent.mkdir(parents=True)
     source.write_text('#include "cake_gdn_common.cuh"\n', encoding="utf-8")
     include_path = tmp_path / "gdn"
-    (include_path / "cake_gdn_common.cuh").write_text(
-        "// header\n", encoding="utf-8"
-    )
+    (include_path / "cake_gdn_common.cuh").write_text("// header\n", encoding="utf-8")
     nvcc = tmp_path / "cuda" / "bin" / "nvcc"
     nvcc.parent.mkdir(parents=True)
     nvcc.write_text("compiler", encoding="utf-8")
