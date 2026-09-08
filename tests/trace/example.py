@@ -15,6 +15,7 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 bmm_mxfp8_N128_K128.json
+cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
@@ -990,6 +991,41 @@ with contextlib.suppress(Exception):
         renormalize=True,
     )
 
+# ── SM90 CuTe-DSL fused MoE (Qwen3-30B-A3B: E=128, topk=8, h=2048, i=768) ───
+# Unquantized bf16, pre-routed. SM90-only and JIT-built, so wrapped in
+# suppress(): the trace JSON dumps before the kernel launches, so the
+# definition files appear even when the kernel can't run here.
+with contextlib.suppress(Exception):
+    _s9_T, _s9_H, _s9_I, _s9_E, _s9_K = 128, 2048, 768, 128, 8
+    _s9_x = torch.randn(_s9_T, _s9_H, dtype=torch.bfloat16, device=device)
+    _s9_w13 = torch.randn(_s9_E, 2 * _s9_I, _s9_H, dtype=torch.bfloat16, device=device)
+    _s9_w2 = torch.randn(_s9_E, _s9_H, _s9_I, dtype=torch.bfloat16, device=device)
+    _s9_scores = torch.rand(_s9_T, _s9_E, device=device)
+    _s9_wt, _s9_ids = torch.topk(_s9_scores, _s9_K, dim=-1)
+    _s9_scales = (_s9_wt / _s9_wt.sum(dim=-1, keepdim=True)).float()
+    # Frameworks repack [gate; up]-concatenated w13 into the kernel's
+    # 32-column up/gate interleave once at weight load.
+    _s9_w1 = (
+        torch.stack(
+            (
+                _s9_w13[:, _s9_I:].reshape(_s9_E, _s9_I // 32, 32, _s9_H),
+                _s9_w13[:, :_s9_I].reshape(_s9_E, _s9_I // 32, 32, _s9_H),
+            ),
+            dim=2,
+        )
+        .reshape(_s9_E, 2 * _s9_I, _s9_H)
+        .contiguous()
+    )
+    flashinfer.fused_moe.cute_dsl_fused_moe_bf16(
+        _s9_x,
+        _s9_ids.to(torch.int32),
+        _s9_scales,
+        _s9_w1,
+        _s9_w2,
+        num_experts=_s9_E,
+        top_k=_s9_K,
+    )
+
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
 #                      3=Llama4,   4=RenormalizeNaive, 5=TopK
@@ -1513,6 +1549,43 @@ with contextlib.suppress(Exception):
         (_nqsm_k_sf, _nqsm_v_sf),
         _nqsm_k_scale,
         _nqsm_v_scale,
+    )
+
+# nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_mla_kv_cache
+
+    _nqam_CKV, _nqam_KPE, _nqam_PS = 512, 64, 4
+    _nqam_nnz = 4
+    _nqam_ckv_cache = torch.zeros(
+        4, _nqam_PS, _nqam_CKV // 2, dtype=torch.uint8, device=device
+    )
+    _nqam_ckv_sf = torch.zeros(
+        4, _nqam_PS, _nqam_CKV // 16, dtype=torch.float8_e4m3fn, device=device
+    )
+    _nqam_kpe_cache = torch.zeros(
+        4, _nqam_PS, _nqam_KPE, dtype=torch.float8_e4m3fn, device=device
+    )
+    _nqam_ckv = torch.randn(_nqam_nnz, _nqam_CKV, dtype=torch.bfloat16, device=device)
+    _nqam_kpe = torch.randn(_nqam_nnz, _nqam_KPE, dtype=torch.bfloat16, device=device)
+    _nqam_bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _nqam_pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _nqam_kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _nqam_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _nqam_last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    nvfp4_quantize_append_paged_mla_kv_cache(
+        _nqam_ckv,
+        _nqam_kpe,
+        _nqam_bidx,
+        _nqam_pos,
+        _nqam_ckv_cache,
+        _nqam_ckv_sf,
+        _nqam_kpe_cache,
+        _nqam_kv_idx,
+        _nqam_kv_indptr,
+        _nqam_last,
+        1.0,
+        1.0,
     )
 
 # SegmentGEMMWrapper: small per-segment matmul.

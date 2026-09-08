@@ -25,8 +25,12 @@ from __future__ import annotations
 
 import functools
 import warnings
+import weakref
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, ClassVar, List, Optional
+from types import MappingProxyType
+from typing import Any, ClassVar, List, Mapping, Optional
 
 import torch
 
@@ -101,6 +105,38 @@ def _validate_cutile_int32_routing(
             f"{runner} requires fewer than 2^31 routed and padded assignments; "
             f"got assignments={num_assignments}, padded={max_padded_assignments}."
         )
+
+
+_CAKE_QUARANTINED_WORKSPACES: dict[tuple[int, int], tuple[Any, torch.Tensor, str]] = {}
+
+
+def _retire_cake_workspace_receipt(
+    module: Any, workspace: torch.Tensor, receipt: int
+) -> None:
+    """Strictly retire one receipt, retaining unsafe storage on failure."""
+    try:
+        module.cake_fused_moe_warp_decode_release_workspace(receipt)
+    except Exception as error:
+        # A failed release can mean accepted GPU work has no trustworthy
+        # completion event. Keep the storage alive for process lifetime so the
+        # caching allocator cannot recycle it beneath in-flight work.
+        _CAKE_QUARANTINED_WORKSPACES[(id(module), receipt)] = (
+            module,
+            workspace,
+            f"{type(error).__name__}: {error}",
+        )
+        raise
+
+
+def _finalize_cake_workspace_receipt(
+    module: Any, workspace: torch.Tensor, receipt: int
+) -> None:
+    """Retire at runner teardown; quarantine storage instead of freeing it."""
+
+    with suppress(Exception):
+        _retire_cake_workspace_receipt(module, workspace, receipt)
+        # The strict helper has retained the allocation. Finalizers cannot
+        # surface an exception usefully, but they must never permit reuse.
 
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
@@ -412,6 +448,14 @@ class MoERunner(TunableRunner):
     Concrete runners implement ``_check_support()`` and ``_build()``. Keeping
     the public methods here ensures a failed support check cannot authorize a
     build and execution cannot silently initialize backend resources.
+
+    Preserve the exact object returned by ``pack_inputs()`` until ``forward()``:
+    a runner may attach per-call tuning and launch metadata to a ``list``
+    subclass. Direct ``forward(packed_inputs)`` recovers that metadata from the
+    object. Callers invoking ``AutoTuner.choose_one()`` directly must pass
+    ``tuning_config_for(packed_inputs)`` and
+    ``**launch_kwargs_for(packed_inputs)`` because profiling synthesizes plain
+    tensor lists without the attached Python attributes.
     """
 
     backend_key: ClassVar[str] = ""
@@ -433,6 +477,28 @@ class MoERunner(TunableRunner):
     def __init__(self) -> None:
         self._support_checked = False
         self._built = False
+
+    def tuning_config_for(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        """Return the tuning config paired with ``inputs`` when one is present."""
+        packed_config = getattr(inputs, "tuning_config", None)
+        if packed_config is not None:
+            return packed_config
+        runner_config = getattr(self, "tuning_config", None)
+        if runner_config is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: pack_inputs must return a per-call "
+                "tuning config or the runner must initialize tuning_config."
+            )
+        return runner_config
+
+    def launch_state_for(self, inputs: List[torch.Tensor]) -> Any:
+        """Return immutable per-call launch metadata paired with ``inputs``."""
+        return getattr(inputs, "launch_state", None)
+
+    def launch_kwargs_for(self, inputs: List[torch.Tensor]) -> dict[str, Any]:
+        """Return only the launch kwargs required by this packed call."""
+        launch_state = self.launch_state_for(inputs)
+        return {"launch_state": launch_state} if launch_state is not None else {}
 
     def check_support(self) -> None:
         self._support_checked = False
@@ -567,6 +633,700 @@ class MoERunner(TunableRunner):
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         # Configuration-only, so synthesized profiling inputs use the same key.
         return self._cache_key_extras()
+
+
+# ---------------------------------------------------------------------------
+# Cake exact-SM103 NVFP4 warp-decode runner
+# ---------------------------------------------------------------------------
+
+
+class CakeWarpDecodeRunner(MoERunner):
+    """Exact-SM103 Cake runner for two calibrated NVFP4 decode geometries.
+
+    The runner consumes the physical tensor view produced by
+    :class:`TrtllmFp4Config`: packed E2M1 weights and activations, E4M3 block
+    scales, and per-expert FP32 epilogue scales. The generated kernel fixes
+    SwiGLU ``alpha=1`` and ``beta=0``; the compatible ``gemm1_alpha`` field in
+    the TRTLLM view is therefore not a launch argument.
+    """
+
+    backend_key = "cake"
+    supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_activation_classes = (SwiGLU,)
+    supports_expert_parallelism = False
+
+    _SUPPORTED_GEOMETRIES: ClassVar[set[tuple[int, int, int, int]]] = {
+        # hidden_size, intermediate_size, num_experts, top_k
+        (2048, 512, 512, 10),
+        (2048, 1536, 60, 4),
+    }
+    _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm1_alpha",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    )
+    _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
+    _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        from ..utils import get_compute_capability
+
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"CakeWarpDecodeRunner requires CUDA, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        self._device_arch = major * 10 + minor
+        self._module: Any = None
+        self._workspace_cache: OrderedDict[
+            tuple[int, tuple[int, int, int, int, int]],
+            tuple[Any, torch.Tensor],
+        ] = OrderedDict()
+        self._prepared_workspaces: dict[
+            tuple[int, int, tuple[int, int, int, int, int]],
+            tuple[torch.Tensor, int],
+        ] = {}
+        self._workspace_receipt_finalizers: dict[
+            tuple[int, int, tuple[int, int, int, int, int]], weakref.finalize
+        ] = {}
+        self._workspace_stream_claims: dict[
+            tuple[int, int, tuple[int, int, int, int, int]],
+            tuple[torch.Tensor, int],
+        ] = {}
+        self._topk_validation_receipts: OrderedDict[
+            int, tuple[torch.Tensor, int, int | None, int]
+        ] = OrderedDict()
+        # There is exactly one adaptive schedule. Exact runtime shapes are
+        # profiled as-is, so the autotuner never synthesizes invalid expert ids.
+        self.tuning_config = TuningConfig(use_cuda_graph=True)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self._device_arch != 103:
+            raise NotImplementedError(
+                f"CakeWarpDecodeRunner requires exact SM103, got SM{self._device_arch}."
+            )
+        if self.config.activation != SwiGLU():
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner supports only default SwiGLU() "
+                "(alpha=1, beta=0, default clamp)."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
+        if self.config.execution.enable_pdl is not True:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
+            )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner does not support per-token activation scaling."
+            )
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner requires the linear NVFP4 scale layout."
+            )
+
+        routing = self.config.routing
+        experts = self.config.experts
+        local_num_experts = (
+            routing.num_experts
+            if experts.local_num_experts is None
+            else experts.local_num_experts
+        )
+        if experts.local_expert_offset != 0 or local_num_experts != routing.num_experts:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner requires local_expert_offset=0 and "
+                "local_num_experts=num_experts."
+            )
+        geometry_without_hidden = (
+            experts.intermediate_size,
+            local_num_experts,
+            routing.top_k,
+        )
+        supported_without_hidden = {
+            (intermediate_size, num_experts, top_k)
+            for _, intermediate_size, num_experts, top_k in self._SUPPORTED_GEOMETRIES
+        }
+        if geometry_without_hidden not in supported_without_hidden:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner supports only "
+                "(intermediate_size, num_experts, top_k) = (512, 512, 10) "
+                "or (1536, 60, 4); got "
+                f"{geometry_without_hidden}."
+            )
+
+    def _build(self) -> None:
+        from ..jit.cake_fused_moe_warp_decode import (
+            get_cake_fused_moe_warp_decode_module,
+        )
+
+        self._module = get_cake_fused_moe_warp_decode_module(device=self.device)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    @staticmethod
+    def _workspace_identity(
+        workspace: torch.Tensor,
+        geometry: tuple[int, int, int, int, int],
+    ) -> tuple[int, int, tuple[int, int, int, int, int]]:
+        return (workspace.data_ptr(), workspace.numel(), geometry)
+
+    def _ensure_workspace_prepared(
+        self,
+        workspace: torch.Tensor,
+        geometry: tuple[int, int, int, int, int],
+        *,
+        force: bool = False,
+    ) -> int:
+        identity = self._workspace_identity(workspace, geometry)
+        prepared = self._prepared_workspaces.get(identity)
+        if not force and prepared is not None and prepared[0] is workspace:
+            return prepared[1]
+        if self._is_current_stream_capturing():
+            raise RuntimeError(
+                "Cake warp decode workspace must be prepared before CUDA Graph "
+                "capture; warm up this exact token/geometry shape first."
+            )
+        if prepared is not None:
+            # Explicitly retire the previous generation before replacement.
+            # This prevents repeated autotuner preparation from accumulating
+            # dormant finalizers for receipts the binding has already revoked.
+            finalizer = self._workspace_receipt_finalizers.pop(identity, None)
+            if finalizer is not None and finalizer.alive:
+                finalizer.detach()
+            _retire_cake_workspace_receipt(self._module, prepared[0], prepared[1])
+            self._prepared_workspaces.pop(identity, None)
+            self._workspace_stream_claims.pop(identity, None)
+        receipt = int(
+            self._module.cake_fused_moe_warp_decode_prepare_workspace(
+                workspace, *geometry
+            )
+        )
+        if receipt <= 0:
+            raise RuntimeError(
+                "cake_fused_moe_warp_decode_prepare_workspace returned an "
+                "invalid preparation receipt."
+            )
+        # Hold the tensor itself, not just its address. This prevents a stale
+        # receipt from matching a later allocator reuse of the same address.
+        self._prepared_workspaces[identity] = (workspace, receipt)
+        self._workspace_stream_claims.pop(identity, None)
+        finalizer = weakref.finalize(
+            self,
+            _finalize_cake_workspace_receipt,
+            self._module,
+            workspace,
+            receipt,
+        )
+        finalizer.atexit = False
+        self._workspace_receipt_finalizers[identity] = finalizer
+        return receipt
+
+    def _is_current_stream_capturing(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
+    def _current_stream(self) -> Any:
+        if self.device.type != "cuda":
+            return None
+        with torch.cuda.device(self.device):
+            return torch.cuda.current_stream(self.device)
+
+    @staticmethod
+    def _stream_token(stream: Any) -> int:
+        return 0 if stream is None else int(stream.cuda_stream)
+
+    @staticmethod
+    def _topk_version(topk_ids: torch.Tensor) -> int | None:
+        try:
+            return int(topk_ids._version)
+        except RuntimeError:
+            # Inference tensors do not expose a version counter. Their receipt
+            # is therefore identity-only; callers retain the same obligation
+            # to keep graph-time mutations in range as on graph replay.
+            return None
+
+    def _validate_expert_id_range(
+        self, topk_ids: torch.Tensor, num_experts: int
+    ) -> None:
+        # The adaptive direct schedules use each ID as an expert-array/TMA
+        # coordinate. Validate while inputs are packed, never in the timed or
+        # captured launch path. CUDA Graph callers must keep later mutations in
+        # the same documented range.
+        if not torch.is_tensor(topk_ids):
+            return
+        cache_key = id(topk_ids)
+        data_ptr = topk_ids.data_ptr()
+        version = self._topk_version(topk_ids)
+        receipt = self._topk_validation_receipts.get(cache_key)
+        if (
+            receipt is not None
+            and receipt[0] is topk_ids
+            and receipt[1] == data_ptr
+            and receipt[2] == version
+            and receipt[3] == num_experts
+        ):
+            self._topk_validation_receipts.move_to_end(cache_key)
+            return
+        if self._is_current_stream_capturing():
+            raise RuntimeError(
+                "Cake warp decode topk_ids must be range-validated before CUDA "
+                "Graph capture; warm up this exact tensor version first."
+            )
+        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
+        if not bool(in_range.item()):
+            raise ValueError(
+                "CakeWarpDecodeRunner requires every topk_ids value to satisfy "
+                f"0 <= id < {num_experts}."
+            )
+        if (
+            cache_key not in self._topk_validation_receipts
+            and len(self._topk_validation_receipts)
+            >= self._MAX_TOPK_VALIDATION_RECEIPTS
+        ):
+            raise RuntimeError(
+                "Cake warp decode supports at most 64 live routing-validation "
+                "receipts; construct a new runner before validating another "
+                "topk_ids tensor."
+            )
+        self._topk_validation_receipts[cache_key] = (
+            topk_ids,
+            data_ptr,
+            version,
+            num_experts,
+        )
+        self._topk_validation_receipts.move_to_end(cache_key)
+
+    def _cache_workspace_for_stream(
+        self,
+        stream: Any,
+        geometry: tuple[int, int, int, int, int],
+        workspace: torch.Tensor,
+    ) -> None:
+        key = (self._stream_token(stream), geometry)
+        existing = self._workspace_cache.get(key)
+        if existing is not None and existing[1] is not workspace:
+            raise RuntimeError(
+                "Cake warp decode already has a different workspace for this "
+                "stream and geometry."
+            )
+        removable_keys = [
+            cached_key
+            for cached_key, (_, cached_workspace) in self._workspace_cache.items()
+            if cached_workspace is workspace
+        ]
+        projected_size = len(self._workspace_cache) - len(removable_keys) + 1
+        if projected_size > self._MAX_STREAM_WORKSPACES:
+            raise RuntimeError(
+                "Cake warp decode supports at most 64 cached stream workspaces; "
+                "construct a new runner before using another stream."
+            )
+        for cached_key in removable_keys:
+            self._workspace_cache.pop(cached_key)
+        self._workspace_cache[key] = (stream, workspace)
+        self._workspace_cache.move_to_end(key)
+
+    def _allocate_workspace_for_stream(
+        self,
+        stream: Any,
+        geometry: tuple[int, int, int, int, int],
+        *,
+        prepare: bool = True,
+    ) -> torch.Tensor:
+        if self._is_current_stream_capturing():
+            raise RuntimeError(
+                "Cake warp decode workspace must be allocated and prepared "
+                "before CUDA Graph capture; warm up this exact token/geometry "
+                "shape first."
+            )
+        if len(self._workspace_cache) >= self._MAX_STREAM_WORKSPACES:
+            raise RuntimeError(
+                "Cake warp decode supports at most 64 cached stream workspaces; "
+                "construct a new runner before using another stream."
+            )
+        workspace_size = int(
+            self._module.cake_fused_moe_warp_decode_workspace_size(*geometry)
+        )
+        if workspace_size <= 0:
+            raise RuntimeError(
+                "cake_fused_moe_warp_decode_workspace_size returned a "
+                "non-positive size."
+            )
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=self.device)
+        if prepare:
+            self._ensure_workspace_prepared(workspace, geometry)
+        self._cache_workspace_for_stream(stream, geometry, workspace)
+        return workspace
+
+    def _prepared_workspace_for_capture(
+        self,
+        stream: Any,
+        geometry: tuple[int, int, int, int, int],
+    ) -> torch.Tensor:
+        # pack_inputs runs before forward on every MoELayer call. During graph
+        # capture it cannot allocate, so transfer the most recently used,
+        # already-prepared workspace for this exact geometry to the capture
+        # stream. forward records the stream claim and C++ inserts the external
+        # completion-event dependency on any prior warmup submission.
+        for cached_key, (_, workspace) in reversed(self._workspace_cache.items()):
+            if cached_key[1] != geometry:
+                continue
+            identity = self._workspace_identity(workspace, geometry)
+            prepared = self._prepared_workspaces.get(identity)
+            if prepared is not None and prepared[0] is workspace:
+                self._cache_workspace_for_stream(stream, geometry, workspace)
+                return workspace
+        raise RuntimeError(
+            "Cake warp decode has no prepared workspace for this geometry "
+            "during CUDA Graph capture; warm up this exact token/geometry "
+            "shape first."
+        )
+
+    def _workspace_for_forward(
+        self,
+        packed_workspace: torch.Tensor,
+        geometry: tuple[int, int, int, int, int],
+        stream: Any,
+        *,
+        prepare_new: bool = True,
+    ) -> torch.Tensor:
+        stream_token = self._stream_token(stream)
+        key = (stream_token, geometry)
+        cached = self._workspace_cache.get(key)
+        if cached is not None:
+            self._workspace_cache.move_to_end(key)
+            return cached[1]
+
+        identity = self._workspace_identity(packed_workspace, geometry)
+        prepared = self._prepared_workspaces.get(identity)
+        claimed = self._workspace_stream_claims.get(identity)
+        capturing = self._is_current_stream_capturing()
+        if (
+            prepared is not None
+            and prepared[0] is packed_workspace
+            and (
+                capturing
+                or claimed is None
+                or (claimed[0] is packed_workspace and claimed[1] == stream_token)
+            )
+        ):
+            # A framework may pack on its caller stream and perform the first
+            # real launch on an internal side stream. During capture, the C++
+            # completion event records the dependency on any prior warmup
+            # submission, so the prepared packed workspace can transfer without
+            # allocation. Eager cross-stream calls still allocate independently.
+            self._cache_workspace_for_stream(stream, geometry, packed_workspace)
+            return packed_workspace
+
+        if capturing:
+            raise RuntimeError(
+                "Cake warp decode has no prepared workspace for the current "
+                "CUDA stream during capture; warm up that stream first."
+            )
+        return self._allocate_workspace_for_stream(
+            stream, geometry, prepare=prepare_new
+        )
+
+    @staticmethod
+    def _geometry_from_inputs(
+        inputs: List[torch.Tensor],
+    ) -> tuple[int, int, int, int, int]:
+        num_tokens = int(inputs[2].shape[0])
+        hidden_size = int(inputs[2].shape[1]) * 2
+        intermediate_size = int(inputs[8].shape[2]) * 2
+        num_experts = int(inputs[6].shape[0])
+        top_k = int(inputs[4].shape[1])
+        return num_tokens, hidden_size, intermediate_size, num_experts, top_k
+
+    @staticmethod
+    def _require_tensor(
+        tensor: torch.Tensor,
+        *,
+        name: str,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}.")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}."
+            )
+        if tensor.device != device:
+            raise ValueError(f"{name} is on {tensor.device}, expected {device}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous.")
+
+    @staticmethod
+    def _require_e4m3_storage(
+        tensor: torch.Tensor,
+        *,
+        name: str,
+        shape: tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        if tensor.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise TypeError(
+                f"{name} must use uint8 or float8_e4m3fn byte storage, "
+                f"got {tensor.dtype}."
+            )
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}."
+            )
+        if tensor.device != device:
+            raise ValueError(f"{name} is on {tensor.device}, expected {device}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous.")
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        """Validate and flatten the exact warp-decode TVM-FFI input ABI."""
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed:
+            raise NotImplementedError(
+                "CakeWarpDecodeRunner requires "
+                "routing_input_mode=RoutingInputMode.UnpackedPrecomputed."
+            )
+
+        num_tokens = int(act.hidden_states_q.shape[0])
+        if not 1 <= num_tokens <= 32:
+            raise ValueError(
+                "CakeWarpDecodeRunner requires 1 <= num_tokens <= 32, "
+                f"got {num_tokens}."
+            )
+        if act.hidden_states_q.ndim != 2:
+            raise ValueError(
+                "hidden_states_q must be 2-D [num_tokens, hidden_size / 2]."
+            )
+        hidden_size = int(act.hidden_states_q.shape[1]) * 2
+        routing = self.config.routing
+        intermediate_size = self.config.experts.intermediate_size
+        geometry = (
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        if geometry not in self._SUPPORTED_GEOMETRIES:
+            raise ValueError(
+                "CakeWarpDecodeRunner supports only "
+                "(hidden_size, intermediate_size, num_experts, top_k) = "
+                "(2048, 512, 512, 10) or (2048, 1536, 60, 4); "
+                f"got {geometry}."
+            )
+
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.bfloat16,),
+            require_contiguous=True,
+        )
+        self._validate_expert_id_range(act.topk_ids, routing.num_experts)
+        device = act.hidden_states_q.device
+        if device != self.device:
+            raise ValueError(
+                f"hidden_states_q is on {device}, expected runner device {self.device}."
+            )
+        self._require_tensor(
+            act.hidden_states_q,
+            name="hidden_states_q",
+            dtype=torch.uint8,
+            shape=(num_tokens, hidden_size // 2),
+            device=device,
+        )
+        if act.hidden_states_scale is None:
+            raise ValueError("CakeWarpDecodeRunner requires hidden_states_scale.")
+        self._require_e4m3_storage(
+            act.hidden_states_scale,
+            name="hidden_states_scale",
+            shape=(num_tokens, hidden_size // 16),
+            device=device,
+        )
+        if act.per_token_scale is not None:
+            raise ValueError("CakeWarpDecodeRunner does not consume per_token_scale.")
+
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self._REQUIRED_WEIGHT_KEYS if key not in view]
+        if missing:
+            raise KeyError(f"Cake warp decode weight view is missing {missing}.")
+        allowed = set(self._REQUIRED_WEIGHT_KEYS)
+        unexpected = sorted(
+            key
+            for key, value in view.items()
+            if key not in allowed and value is not None
+        )
+        if unexpected:
+            raise ValueError(
+                "Cake warp decode does not accept bias, LoRA, custom activation, "
+                f"or other extra weight fields: {unexpected}."
+            )
+
+        num_experts = routing.num_experts
+        gemm1_rows = 2 * intermediate_size
+        self._require_tensor(
+            view["gemm1_weights"],
+            name="gemm1_weights",
+            dtype=torch.uint8,
+            shape=(num_experts, gemm1_rows, hidden_size // 2),
+            device=device,
+        )
+        self._require_e4m3_storage(
+            view["gemm1_weights_scale"],
+            name="gemm1_weights_scale",
+            shape=(num_experts, gemm1_rows, hidden_size // 16),
+            device=device,
+        )
+        self._require_tensor(
+            view["gemm1_alpha"],
+            name="gemm1_alpha",
+            dtype=torch.float32,
+            shape=(num_experts,),
+            device=device,
+        )
+        self._require_tensor(
+            view["gemm2_weights"],
+            name="gemm2_weights",
+            dtype=torch.uint8,
+            shape=(num_experts, hidden_size, intermediate_size // 2),
+            device=device,
+        )
+        self._require_e4m3_storage(
+            view["gemm2_weights_scale"],
+            name="gemm2_weights_scale",
+            shape=(num_experts, hidden_size, intermediate_size // 16),
+            device=device,
+        )
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            self._require_tensor(
+                view[name],
+                name=name,
+                dtype=torch.float32,
+                shape=(num_experts,),
+                device=device,
+            )
+
+        workspace_geometry = (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            routing.top_k,
+        )
+        stream = self._current_stream()
+        workspace_key = (self._stream_token(stream), workspace_geometry)
+        cached_workspace = self._workspace_cache.get(workspace_key)
+        if cached_workspace is None:
+            if self._is_current_stream_capturing():
+                workspace = self._prepared_workspace_for_capture(
+                    stream, workspace_geometry
+                )
+            else:
+                workspace = self._allocate_workspace_for_stream(
+                    stream, workspace_geometry
+                )
+        else:
+            self._workspace_cache.move_to_end(workspace_key)
+            workspace = cached_workspace[1]
+            self._ensure_workspace_prepared(workspace, workspace_geometry)
+        output = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
+        )
+        return [
+            output,
+            workspace,
+            act.hidden_states_q,
+            act.hidden_states_scale,
+            act.topk_ids,
+            act.topk_weights,
+            view["gemm1_weights"],
+            view["gemm1_weights_scale"],
+            view["gemm2_weights"],
+            view["gemm2_weights_scale"],
+            view["output1_scale_scalar"],
+            view["output1_scale_gate_scalar"],
+            view["output2_scale_scalar"],
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError("CakeWarpDecodeRunner supports only tactic -1.")
+        if len(inputs) != 13:
+            raise ValueError(
+                "CakeWarpDecodeRunner expects 13 flattened tensor inputs, "
+                f"got {len(inputs)}."
+            )
+        geometry = self._geometry_from_inputs(inputs)
+        stream = self._current_stream()
+        workspace = self._workspace_for_forward(
+            inputs[1], geometry, stream, prepare_new=not do_preparation
+        )
+        if do_preparation:
+            self._ensure_workspace_prepared(workspace, geometry, force=True)
+            return inputs[0]
+        identity = self._workspace_identity(workspace, geometry)
+        prepared = self._prepared_workspaces.get(identity)
+        if prepared is None or prepared[0] is not workspace:
+            raise RuntimeError(
+                "Cake warp decode workspace is not prepared for this identity "
+                "and shape; call pack_inputs outside the timed/capture region."
+            )
+        launch_inputs = inputs
+        if workspace is not inputs[1]:
+            launch_inputs = list(inputs)
+            launch_inputs[1] = workspace
+        # Record ownership conservatively before crossing the FFI boundary. If
+        # the extension raises after claiming the workspace, the strong stream
+        # reference must still survive for receipt cleanup.
+        self._workspace_stream_claims[identity] = (
+            workspace,
+            self._stream_token(stream),
+        )
+        try:
+            self._module.cake_fused_moe_warp_decode(*launch_inputs, prepared[1], True)
+        except Exception:
+            finalizer = self._workspace_receipt_finalizers.pop(identity, None)
+            if finalizer is not None and finalizer.alive:
+                finalizer.detach()
+            try:
+                _retire_cake_workspace_receipt(self._module, workspace, prepared[1])
+            except Exception:
+                # Preserve the launch diagnostic. The strict retirement helper
+                # has already retained unsafe storage in the quarantine.
+                pass
+            else:
+                self._prepared_workspaces.pop(identity, None)
+                self._workspace_stream_claims.pop(identity, None)
+            raise
+        return inputs[0]
 
 
 def _mxfp8_swizzled_act_sf_numel(num_tokens: int, hidden_size: int) -> int:
@@ -2093,7 +2853,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.BF16,)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _num_top_tactics_per_stage: ClassVar[int] = 2
@@ -2144,15 +2904,6 @@ class CuTileBf16Runner(MoERunner):
                 f"cuTile {self._precision_name} requires cuda-tile and a "
                 "tileiras/NVRTC toolchain "
                 f"that supports SM{self._device_arch}."
-            )
-
-    def _check_activation_parameters(self) -> None:
-        if (
-            isinstance(self.config.activation, SwiGLU)
-            and self.config.activation != SwiGLU()
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} cannot represent non-default SwiGLU scalars."
             )
 
     def _build(self) -> None:
@@ -2306,6 +3057,7 @@ class CuTileBf16Runner(MoERunner):
             stage,
             block_size,
             int(self.config.activation.type),
+            repr(self.config.activation),
             self.config.routing.num_experts,
             self.config.routing.top_k,
             self.config.experts.intermediate_size,
@@ -2465,7 +3217,7 @@ class CuTileBf16Runner(MoERunner):
             inputs[5],
             inputs[0],
             self._workspace,
-            activation_type=self.config.activation.type,
+            activation=self.config.activation,
             block_size=block_size,
             gemm1_config=gemm1_config,
             gemm2_config=gemm2_config,
@@ -2681,6 +3433,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             self._w4a4_fusion_modes(inputs, block_size) if stage == 1 else (False,),
             problem.input_sorted,
             int(self.config.activation.type),
+            repr(self.config.activation),
             self.config.routing.num_experts,
             self.config.routing.top_k,
             self.config.experts.intermediate_size,
@@ -2969,7 +3722,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             inputs[9],
             inputs[0],
             self._workspace,
-            activation_type=self.config.activation.type,
+            activation=self.config.activation,
             fuse_gemm1=bool(fuse_gemm1),
             num_sms=self._num_sms,
             block_size=block_size,
@@ -3030,6 +3783,66 @@ class CuteDslRunner(MoERunner):
 
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+        self._assert_rubin_cute_dsl_available()
+
+    def _assert_rubin_cute_dsl_available(self) -> None:
+        """Reject SM107 when the installed CuTe DSL cannot provide its kernels.
+
+        The SM107 gather/activation-fusion and finalize-fusion kernels are built
+        on ``cutlass.utils.rubin_helpers``, which only exists from CuTe DSL 4.8.
+        Without it the kernel factories raise ``NotImplementedError`` when they
+        are first called -- that is, in the middle of ``forward()``, long after
+        this backend has been accepted as a candidate.
+
+        Declining here instead lets ``MoELayer`` drop the backend at build time,
+        so ``auto`` routes elsewhere and callers that enumerate backends see it
+        absent rather than failing mid-call.
+
+        The probe is arch-conditional on purpose: only the SM107 kernels need
+        ``rubin_helpers``, so an older DSL is perfectly usable on SM100/SM103.
+        """
+        from ..utils import get_compute_capability
+
+        # #4787 put this on CuteDslNvfp4Runner; #4793 unified that into
+        # CuteDslRunner. Keep the original blast radius -- only the NVFP4 path
+        # reaches the SM107 rubin kernels. MXFP4/W4A8 is already declined on
+        # SM107 above, and W4A16 gates itself via require_cute_dsl_arch().
+        if self.config.quant.variant is not QuantVariant.NVFP4:
+            return
+
+        # check_support() is also exercised on runners built with __new__ and only
+        # a config attached (see TestMoERunnerSupport), so there may be no bound
+        # device. Nothing arch-specific can be decided in that case; the real
+        # dispatch path always sets device in __init__ before check_support().
+        device = getattr(self, "device", None)
+        if device is None:
+            return
+        if get_compute_capability(device) != (10, 7):
+            return
+
+        # ``cute_dsl.utils`` imports cutlass at module scope, so on a stack with no
+        # CuTe DSL installed the probe cannot be reached at all. Failing to import
+        # it is itself proof the SM107 kernels are unavailable, so decline rather
+        # than propagating an ImportError out of a support check.
+        #
+        # #4753 adds a cutlass-free ``cute_dsl.availability`` module and reroutes
+        # the package off ``utils``; once that lands this collapses to a plain
+        # ``from ..cute_dsl.availability import is_rubin_cute_dsl_available``,
+        # matching what release-v0.6.18 already does. The try/except is kept so
+        # this commit is correct whichever of the two merges first.
+        try:
+            from ..cute_dsl.utils import is_rubin_cute_dsl_available
+
+            rubin_dsl_available = is_rubin_cute_dsl_available()
+        except ImportError:
+            rubin_dsl_available = False
+
+        if not rubin_dsl_available:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires CuTe DSL >= 4.8 on SM107 "
+                "(Rubin), which provides cutlass.utils.rubin_helpers; the "
+                "installed CuTe DSL does not have it."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -3242,12 +4055,55 @@ class CuteDslRunner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, eq=False)
+class _TrtllmLaunchState:
+    """Immutable kwargs for one TRTLLM ``pack_inputs``/``forward`` pair."""
+
+    static_kwargs: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "static_kwargs", MappingProxyType(dict(self.static_kwargs))
+        )
+
+    def with_overrides(self, **kwargs: Any) -> "_TrtllmLaunchState":
+        updated = dict(self.static_kwargs)
+        updated.update(kwargs)
+        return _TrtllmLaunchState(updated)
+
+
+class _TrtllmPackedInputs(list[torch.Tensor]):
+    """Tensor-list ABI plus launch metadata local to one TRTLLM call.
+
+    The list remains mutable because the autotuner synthesizes token-bucket
+    tensors. The associated tuning config and launch kwargs are immutable and
+    never stored on the shared runner.
+    """
+
+    def __init__(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tuning_config: TuningConfig,
+        launch_state: _TrtllmLaunchState,
+    ) -> None:
+        super().__init__(inputs)
+        self.tuning_config = tuning_config
+        self.launch_state = launch_state
+
+    def with_launch_overrides(self, **kwargs: Any) -> "_TrtllmPackedInputs":
+        return _TrtllmPackedInputs(
+            list(self),
+            tuning_config=self.tuning_config,
+            launch_state=self.launch_state.with_overrides(**kwargs),
+        )
+
+
 class _TrtllmRunnerBase(MoERunner):
     """Load the shared TRTLLM-gen module after support validation."""
 
     _module: Any
     _inner: Any
-    _static_kwargs: dict[str, Any]
 
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
@@ -3259,12 +4115,19 @@ class _TrtllmRunnerBase(MoERunner):
         inputs: List[torch.Tensor],
         tactic: Any,
         do_preparation: bool,
+        launch_state: _TrtllmLaunchState | None = None,
     ) -> torch.Tensor | List[torch.Tensor]:
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState):
+            raise RuntimeError(
+                "TRTLLM forward requires the launch state returned by pack_inputs."
+            )
         result = self._inner.forward(
             inputs,
             tactic=tactic,
             do_preparation=do_preparation,
-            **self._static_kwargs,
+            **launch_state.static_kwargs,
         )
         if self.config.finalize.do_finalize:
             return inputs[0]
@@ -3275,9 +4138,10 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
-    plus the static weight/config kwargs that ``core.MoERunner.forward``
-    consumes, then delegates tactic enumeration, tuning-config construction, and
-    the tactic'd forward to that inner runner.  This mirrors
+    plus the immutable per-call weight/config kwargs that
+    ``core.MoERunner.forward`` consumes, then delegates tactic enumeration,
+    tuning-config construction, and the tactic'd forward to that inner runner.
+    This mirrors
     ``CuteDslRunner`` (which wraps ``CuteDslFusedMoERunner``) and keeps
     the fragile raw-op positional launch in exactly one place —
     ``core.MoERunner.forward``.
@@ -3410,8 +4274,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
         # Built lazily on first pack_inputs once hidden_size is known.
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -3440,7 +4302,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     ) -> List[Any]:
         self._require_built()
         # The inner runner reads num_tokens from inputs + its own instance key;
-        # no static kwargs are needed for tactic enumeration.
+        # no launch kwargs are needed for tactic enumeration.
         return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
@@ -3451,10 +4313,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        # MoELayer's autotuner call passes no kwargs, so the static weight/config
-        # kwargs are injected here. Finalized calls write into inputs[0];
-        # unfinalized calls return the flat API's three-tensor result.
-        return self._forward_inner(inputs, tactic, do_preparation)
+        # Finalized calls write into inputs[0]; unfinalized calls return the flat
+        # API's three-tensor result. Launch kwargs come from the same packed call
+        # even when another pack_inputs invocation interleaves before forward.
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_fp4_tensors(
         self,
@@ -3608,7 +4472,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         on the config this runner was built with.  ``topk_ids`` carries
         GLOBAL expert ids and is packed as-is; the kernel performs the
         global→local mapping itself by subtracting ``local_expert_offset``
-        (passed via the static kwargs) and dropping ids outside
+        (passed via the paired launch state) and dropping ids outside
         ``[offset, offset + local_num_experts)``.
         """
         self._require_built()
@@ -3743,9 +4607,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
 
         # Static (num_tokens-invariant) launch arguments for the fp4 branch of
-        # MoERunner.forward.  None-valued entries are the optional gemm bias /
-        # swiglu beta-clamp / per-token-scale paths not used by the MVP.
-        self._static_kwargs = dict(
+        # MoERunner.forward. None-valued entries are optional GEMM bias and
+        # activation-scalar paths. per_token_scale intentionally stays in
+        # MoeRunnerInputs because it is num_tokens-dynamic and the autotuner
+        # resizes it with the synthesized token bucket.
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
@@ -3760,7 +4626,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             output1_scale_scalar=v.get("output1_scale_scalar"),
             output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
             output2_scale_scalar=v.get("output2_scale_scalar"),
-            per_token_scale=act.per_token_scale,
             num_experts=routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
@@ -3775,7 +4640,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._ensure_inner(hidden_size)
         # Reuse the inner runner's tuning-config builder so the num_tokens
         # buckets honor ExecutionConfig.tune_max_num_tokens (CR5).
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
@@ -3785,7 +4650,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3873,8 +4742,6 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -3912,7 +4779,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_fp8_tensors(
         self,
@@ -4079,7 +4948,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
@@ -4110,13 +4979,17 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4202,8 +5075,6 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4242,7 +5113,9 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def _validate_tensors(
         self, act: MoEActivationPack, view: dict, hidden_size: int
@@ -4372,7 +5245,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
@@ -4394,14 +5267,18 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4475,8 +5352,6 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4513,7 +5388,9 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -4596,7 +5473,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 
         from ..tllm_enums import WeightLayout
 
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
@@ -4620,14 +5497,18 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4687,8 +5568,6 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
 
         self._inner: Any = None
-        self._static_kwargs: dict = {}
-        self.tuning_config: Any = None
 
     def _ensure_inner(self, hidden_size: int) -> None:
         self._require_built()
@@ -4725,7 +5604,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(inputs, tactic, do_preparation)
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -4863,7 +5744,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             per_token_scale=None,
         )
 
-        self._static_kwargs = dict(
+        static_kwargs = dict(
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
@@ -4884,14 +5765,18 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         )
 
         self._ensure_inner(hidden_size)
-        self.tuning_config = self._inner._make_tuning_config(
+        tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
-        return moe_inputs.to_list()
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=_TrtllmLaunchState(static_kwargs),
+        )
 
 
 # ---------------------------------------------------------------------------

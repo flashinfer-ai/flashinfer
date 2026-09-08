@@ -29,7 +29,7 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
-# working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
+# working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
 # default (best-effort) on `pip install .` — see the moe_ep section at the top
 # of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
@@ -77,6 +77,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 # Their in-package JIT kernel source, compiled on demand by
 # flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
+"flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
@@ -119,9 +121,22 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
+  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  # DKG filtered top-k kernels, vendored verbatim from dynamic-kernel-generator
+  # (see the provenance header in each file). Kept byte-faithful so upstream
+  # fixes can be re-applied by re-vendoring. The two reported errors are typing
+  # artifacts, not defects: `_get_num_sms` memoises via a function attribute,
+  # and `compiled_filter_topk_dict` is an untyped dict holding two distinct key
+  # shapes that cannot collide (each leads with a different wrapper-mode string
+  # and they differ in length).
+  "flashinfer/topk_varlen/kernels/filtered_topk_util.py",
+  "flashinfer/topk_varlen/kernels/filtered_topk_decode.py",
+  # Self-sampling GVR V2: verbatim TRT-LLM drops (see the ruff exclude note).
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
   "build/",
 ]
 
@@ -144,8 +159,11 @@ extend-exclude = [
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
+  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",

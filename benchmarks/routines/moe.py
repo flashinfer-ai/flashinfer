@@ -96,6 +96,8 @@ def run_moe_test(args):
         return testCutlassFusedMoe(args)
     elif args.routine == "cute_dsl_fp4_block_scale_moe":
         return testCuteDslFp4BlockScaleMoe(args)
+    elif args.routine == "cute_dsl_bf16_moe":
+        return testCuteDslBf16Moe(args)
     elif args.routine == "b12x_fused_moe":
         return testB12xFusedMoe(args)
     elif args.routine == "bgmv_moe":
@@ -1639,6 +1641,263 @@ def testCuteDslFp4BlockScaleMoe(args):
     return res
 
 
+def testCuteDslBf16Moe(args):
+    """
+    Test the cute_dsl_bf16_moe routine (the SM90 CuTe DSL BF16/FP16 MoE,
+    ``cute_dsl_fused_moe_bf16``).
+
+    This test:
+    1. Creates bf16/fp16 weights ([gate; up] w13 repacked to the kernel's
+       32-column up/gate interleave) and pre-routed top-k ids/scales
+    2. Runs MoE via CuteDslBf16MoEWrapper (or cute_dsl_fused_moe_bf16 when
+       ``--use_functional_api`` is set). SwiGLU only. ``--autotune`` runs the
+       AutoTuner pass, compiling each candidate specialization as it is profiled.
+    3. Measures performance metrics (TFLOPS, TB/sec)
+
+    Pass per-rank ``--hidden_size`` / ``--intermediate_size`` for TP shapes
+    (this routine has no tp_size/ep_size flags; EP uses
+    ``--local_num_experts`` / ``--local_expert_offset``).
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testCuteDslBf16Moe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    from flashinfer import CuteDslBf16MoEWrapper
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+    )
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    local_expert_offset = args.local_expert_offset
+    local_num_experts = args.local_num_experts or num_experts
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = ["cute-dsl"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    activation_type = args.activation_type
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError(
+            f"cute_dsl_fused_moe_bf16 only supports Swiglu activation, "
+            f"got {activation_type.name}."
+        )
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts} "
+            f"(local {local_num_experts} @ {local_expert_offset}), top_k={top_k}"
+        )
+
+    torch.manual_seed(args.random_seed)
+    x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device) / 10
+    # [gate; up]-concatenated w13 (vLLM layout), repacked to the kernel's
+    # 32-column up/gate interleave.
+    w_gate_up = (
+        torch.randn(
+            local_num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=input_dtype,
+            device=device,
+        )
+        / 10
+    )
+    w1 = interleave_up_gate_sm90(w_gate_up)
+    w2 = (
+        torch.randn(
+            local_num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=input_dtype,
+            device=device,
+        )
+        / 10
+    )
+
+    router_logits = torch.randn(
+        num_tokens, num_experts, dtype=input_dtype, device=device
+    )
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    token_selected_experts = selected_experts.to(torch.int32)
+    token_final_scales = routing_weights.to(torch.float32)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] x.shape = {x.shape}")
+        print(f"[VVERBOSE] w1.shape = {w1.shape} (interleaved)")
+        print(f"[VVERBOSE] w2.shape = {w2.shape}")
+
+    moe_output = torch.empty(num_tokens, hidden_size, dtype=input_dtype, device=device)
+
+    use_functional = getattr(args, "use_functional_api", False)
+    if use_functional:
+        from functools import partial
+        from flashinfer import cute_dsl_fused_moe_bf16
+
+        if args.verbose >= 1:
+            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe_bf16)")
+        runner = partial(
+            cute_dsl_fused_moe_bf16,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+            enable_pdl=args.enable_pdl,
+        )
+    else:
+        moe = CuteDslBf16MoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            enable_pdl=args.enable_pdl,
+        )
+
+        def runner(x, ids, scales, w1, w2):
+            return moe.run(x, ids, scales, w1, w2, moe_output=moe_output)
+
+    def run_cute_dsl_bf16_moe(x, token_selected_experts, token_final_scales, w1, w2):
+        return runner(x, token_selected_experts, token_final_scales, w1, w2)
+
+    input_args = (x, token_selected_experts, token_final_scales, w1, w2)
+
+    # Snapshot active expert count before any kernel execution, since
+    # autotune tactic exploration may corrupt input tensors.
+    num_active_experts = int(token_selected_experts.unique().numel())
+
+    backend = "cute-dsl"
+
+    if args.refcheck:
+        out = run_cute_dsl_bf16_moe(*input_args).float()
+        gate, up = w_gate_up[:, :intermediate_size], w_gate_up[:, intermediate_size:]
+        ref = torch.zeros(num_tokens, hidden_size, device=device)
+        for slot in range(top_k):
+            e_global = token_selected_experts[:, slot].long()
+            scale = token_final_scales[:, slot].unsqueeze(1)
+            local = e_global - local_expert_offset
+            mask = (local >= 0) & (local < local_num_experts)
+            e = local.clamp(0, local_num_experts - 1)
+            g = torch.einsum("th,tih->ti", x.float(), gate.float()[e])
+            u = torch.einsum("th,tih->ti", x.float(), up.float()[e])
+            act = torch.nn.functional.silu(g) * u
+            contrib = torch.einsum("ti,thi->th", act, w2.float()[e])
+            ref += torch.where(mask.unsqueeze(1), scale * contrib, 0.0)
+        max_err = (out - ref).abs().max().item()
+        ok = torch.allclose(out, ref, atol=0.3, rtol=0.05)
+        status = "PASS" if ok else "FAIL"
+        print(f"[INFO] Refcheck {status} (max abs err {max_err:.3e})")
+        if not ok and not args.allow_output_mismatch:
+            raise AssertionError(f"refcheck failed: max abs err {max_err:.3e}")
+
+    # Optional autotune warmup.
+    # Clone input_args so autotune tactic exploration doesn't corrupt the
+    # original tensors used by the subsequent benchmark.
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        backend = "cute-dsl_autotune"
+        if args.verbose >= 1:
+            print("[INFO] Autotune warmup for CuteDSL SM90 MoE")
+        autotune_args = tuple(
+            t.clone() if isinstance(t, torch.Tensor) else t for t in input_args
+        )
+        with autotune(True, cache=cache_path):
+            run_cute_dsl_bf16_moe(*autotune_args)
+        del autotune_args
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
+    # Benchmark timing
+    times = bench_gpu_time(
+        fn=run_cute_dsl_bf16_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        cold_l2_cache=True,
+        input_args=input_args,
+    )
+
+    # Compute performance metrics
+    median_time = np.median(times)
+    std_time = np.std(times)
+    tflops = calculate_moe_tflops(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        is_gated=True,
+    )
+    tb_per_sec = calculate_moe_kernel_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        input_dtype,
+        input_dtype,
+        input_format="base",
+        weight_format="base",
+        routing_logits_dtype=None,
+        active_experts=num_active_experts,
+        verbose=args.verbose,
+        is_gated=True,
+    )
+
+    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+    if args.output_path is not None:
+        cur_res = defaultdict(str)
+        cur_res["routine"] = args.routine
+        cur_res["median_time"] = median_time
+        cur_res["std_time"] = std_time
+        cur_res["tflops"] = tflops
+        cur_res["tb_per_sec"] = tb_per_sec
+        cur_res["backend"] = backend
+        cur_res["num_tokens"] = num_tokens
+        cur_res["hidden_size"] = hidden_size
+        cur_res["intermediate_size"] = intermediate_size
+        cur_res["num_experts"] = num_experts
+        cur_res["top_k"] = top_k
+        cur_res["local_expert_offset"] = local_expert_offset
+        cur_res["local_num_experts"] = local_num_experts
+        cur_res["input_dtype"] = input_dtype
+        cur_res["weight_dtype"] = input_dtype
+        cur_res["activation_type"] = activation_type.name
+        res.append(cur_res)
+
+    return res
+
+
 def testB12xFusedMoe(args):
     """
     Test b12x_fused_moe (SM120/SM121 CuTe DSL FP4-weight MoE).
@@ -2653,16 +2912,18 @@ def testUnifiedNvfp4Moe(args):
     tuner = AutoTuner.get()
     for runner in layer.runners:
         inputs = runner.pack_inputs(act_pack, weight_pack)
+        launch_kwargs = runner.launch_kwargs_for(inputs)
         with autotune(True):
             _, tactic = tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
-                tuning_config=runner.tuning_config,
+                tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
+                **launch_kwargs,
             )
 
-        def _call(r=runner, i=inputs, t=tactic):
-            return r.forward(i, tactic=t)
+        def _call(r=runner, i=inputs, t=tactic, kw=launch_kwargs):
+            return r.forward(i, tactic=t, **kw)
 
         times = bench_gpu_time(
             fn=_call,
@@ -2710,7 +2971,7 @@ def testUnifiedNvfp4Moe(args):
         # Shared-reference accuracy check for this candidate (CR10/CR11).
         refcheck_passed = None
         if ref_output is not None:
-            out = runner.forward(inputs, tactic=tactic)
+            out = runner.forward(inputs, tactic=tactic, **launch_kwargs)
             refcheck_passed, pct, atol = check_accuracy(out, ref_output)
             status = "PASS" if refcheck_passed else "FAIL"
             print(

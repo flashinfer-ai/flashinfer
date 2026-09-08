@@ -38,6 +38,11 @@ from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
+    mm_M1_16_K7168_N256_bf16 as mm_M1_16_K7168_N256_bf16,
+    mm_M1_16_K7168_N384 as mm_M1_16_K7168_N384,
+    mm_M1_16_K7168_N384_bf16 as mm_M1_16_K7168_N384_bf16,
+    mm_M1_16_K7168_N896 as mm_M1_16_K7168_N896,
+    mm_M1_16_K7168_N896_bf16 as mm_M1_16_K7168_N896_bf16,
     tinygemm_bf16 as tinygemm_bf16,
 )
 
@@ -57,11 +62,15 @@ try:
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
         )
+        from .kernels.cute_dsl.low_latency_blockscaled_gemm import (
+            LowLatencyBlockscaledGemmKernel as LowLatencyBlockscaledGemmKernel,
+        )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
+            "LowLatencyBlockscaledGemmKernel",
         ]
 
         # The SM107 kernel imports cutlass.utils.rubin_helpers at module scope,
@@ -133,6 +142,11 @@ __all__ = (
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
+        "mm_M1_16_K7168_N256_bf16",
+        "mm_M1_16_K7168_N384",
+        "mm_M1_16_K7168_N384_bf16",
+        "mm_M1_16_K7168_N896",
+        "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
     ]
     + _cute_dsl_kernels

@@ -30,6 +30,7 @@ from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeWarpDecodeConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -54,6 +55,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -79,6 +81,7 @@ from .utils import map_to_hybrid_bucket
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -102,6 +105,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
@@ -127,12 +131,11 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
 class MoELayer:
     """Stateful MoE layer with cross-backend autotune.
 
-    Not thread-safe: the layer and its runners follow the autotuner's
-    sequential ``pack_inputs -> forward`` contract and stash per-call launch
-    state on the runner (``_static_kwargs``) between the two steps, so
-    concurrent calls on one instance can interleave that state. Use one
-    ``MoELayer`` per thread/stream; a stateless calling convention is a
-    tracked follow-up.
+    TRTLLM runners bind their immutable launch metadata to each packed input
+    list, so interleaved ``pack_inputs -> forward`` pairs cannot exchange
+    weights or routing configuration. Other backend adapters may still retain
+    per-call workspace or prepared-weight state; use one ``MoELayer`` per
+    thread/stream until those adapters adopt the same convention.
 
     Example
     -------
@@ -258,7 +261,11 @@ class MoELayer:
         self._last_winner_backend = runner.backend_key
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        return runner.forward(inputs, tactic=tactic)
+        return runner.forward(
+            inputs,
+            tactic=tactic,
+            **runner.launch_kwargs_for(inputs),
+        )
 
     def _select_winner(
         self,
@@ -280,12 +287,14 @@ class MoELayer:
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
+            launch_kwargs = runner.launch_kwargs_for(inputs)
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
                 custom_op=f"moe_{runner.backend_key}",
                 runners=[runner],
-                tuning_config=runner.tuning_config,
+                tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
+                **launch_kwargs,
             )
             # Measure runner at its winning tactic.  Use CUDA-graph timing so
             # the cross-backend comparison reflects production (graph-captured)
@@ -294,7 +303,9 @@ class MoELayer:
             # by that overhead and picks the wrong backend.  Requires a warmed-up
             # layer (the autotune pass above), not a cold capture.
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic: r.forward(i, tactic=t),
+                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
+                    i, tactic=t, **kw
+                ),
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,
