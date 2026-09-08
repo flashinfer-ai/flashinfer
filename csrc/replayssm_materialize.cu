@@ -32,6 +32,9 @@
 namespace flashinfer::mamba {
 using namespace checkpointing;
 
+// The 8-bit replay helpers require this four-warp configuration.
+constexpr int kNumWarps = 4;
+
 struct MaterializeParams {
   const int64_t* state_ptrs;
   const int64_t* state_slot_strides;
@@ -74,7 +77,7 @@ __device__ __forceinline__ void advance_persistent_coordinates(
 // CTA pool grid-strides over the logical (virtual request, layer, head) work.
 template <typename T>
 __global__ void materialize_replay_kernel(MaterializeParams p) {
-  constexpr int NUM_WARPS = 4;
+  constexpr int NUM_WARPS = kNumWarps;
   static_assert(MAX_WINDOW > 0 && MAX_WINDOW <= 16,
                 "ReplaySSM materialization supports max_window in [1, 16]");
   static_assert(sizeof(T) != 1 || (DIM == 64 && DSTATE == 128),
@@ -198,7 +201,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
       view.state_scale_stride_seq = scale_slot_strides[layer];
       auto tiled_mma_chain =
           cute::make_tiled_mma(cute::MMA_Atom<cute::MMA_Traits<checkpointing::MMA_prop::AtomK16>>{},
-                               cute::Layout<cute::Shape<cute::_4, cute::_1>>{});
+                               cute::Layout<cute::Shape<cute::Int<kNumWarps>, cute::_1>>{});
       auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
       // frag_y_dxt is used in replay_state_* below for output token results, which we ignore.
       auto id_dxt = cute::make_identity_tensor(
@@ -424,7 +427,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
              CheckpointingSsuStorage < input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE >>);
   FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(materialize_replay_kernel<state_t>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-  constexpr int kThreadsPerCta = warpSize * 4;
+  constexpr int kThreadsPerCta = warpSize * kNumWarps;
   int device = 0, sm_count = 0, blocks_per_sm = 0;
   FLASHINFER_CUDA_CHECK(cudaGetDevice(&device));
   FLASHINFER_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
@@ -433,7 +436,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   int64_t const persistent_ctas = int64_t(sm_count) * blocks_per_sm;
   FLASHINFER_CHECK(persistent_ctas > 0, "ReplaySSM materialize has no resident CTA configuration");
   dim3 grid(work_items < persistent_ctas ? int(work_items) : int(persistent_ctas));
-  materialize_replay_kernel<state_t><<<grid, dim3(warpSize, 4), smem, stream>>>(p);
+  materialize_replay_kernel<state_t><<<grid, dim3(warpSize, kNumWarps), smem, stream>>>(p);
   FLASHINFER_CUDA_CHECK(cudaGetLastError());
 }
 }  // namespace flashinfer::mamba
