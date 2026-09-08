@@ -29,6 +29,8 @@ import sys
 import textwrap
 import time
 
+import pytest
+
 from flashinfer.autotuner import AutoTuner
 
 
@@ -346,16 +348,58 @@ from flashinfer.autotuner import (
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 store_file = os.environ["GLOO_STORE_FILE"]
+failure_phase = os.environ["FAILURE_PHASE"]
 
 
 class PreparationRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
+        if failure_phase == "nested_empty" and rank == 1:
+            return ()
         return (0,)
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-        if do_preparation and rank == 0:
+        if do_preparation and rank == 0 and failure_phase != "nested_input":
             raise MemoryError("simulated workspace allocation failure")
         return inputs[0]
+
+
+class NestedRunner(TunableRunner):
+    from flashinfer.fused_moe.runners import _CutlassRunnerBase
+
+    get_valid_tactics = _CutlassRunnerBase.get_valid_tactics
+    _num_top_tactics_per_stage = 2
+    backend_key = "cutlass"
+    _device_arch = 90
+
+    def __init__(self):
+        self._inner = PreparationRunner()
+
+    def _require_built(self):
+        pass
+
+    def _validate_input_count(self, inputs):
+        pass
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return inputs[0]
+
+
+def profile(self, *args, **kwargs):
+    elapsed = torch.tensor([1.0], dtype=torch.float64)
+    dist.all_reduce(elapsed, op=dist.ReduceOp.SUM)
+    return elapsed.item() / world_size
+
+
+prepare_inputs = AutoTuner._prepare_input_tensors
+preparation_calls = 0
+
+
+def prepare(self, *args, **kwargs):
+    global preparation_calls
+    preparation_calls += 1
+    if failure_phase == "nested_input" and rank == 0 and preparation_calls == 2:
+        raise MemoryError("simulated nested input allocation failure")
+    return prepare_inputs(self, *args, **kwargs)
 
 
 dist.init_process_group(
@@ -368,15 +412,16 @@ dist.init_process_group(
 try:
     torch.cuda.is_current_stream_capturing = lambda: False
     torch.cuda.empty_cache = lambda: None
-    AutoTuner._profile_single_kernel = lambda self, *args, **kwargs: 1.0
+    AutoTuner._profile_single_kernel = profile
+    AutoTuner._prepare_input_tensors = prepare
     set_autotune_process_group(dist.group.WORLD)
 
     with autotune(True):
         _, tactic = AutoTuner.get().choose_one(
             "distributed_preparation_oom",
-            [PreparationRunner()],
+            [PreparationRunner() if failure_phase == "runner" else NestedRunner()],
             TuningConfig(),
-            [torch.empty((8, 8))],
+            [torch.empty((8, 8)) for _ in range(6)],
         )
 
     if tactic != -1:
@@ -388,7 +433,10 @@ finally:
 """
 
 
-def test_preparation_memory_error_falls_back_on_every_rank(tmp_path):
+@pytest.mark.parametrize(
+    "failure_phase", ("runner", "nested_input", "nested_runner", "nested_empty")
+)
+def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_phase):
     """A rank-local preparation OOM produces one group-wide fallback."""
     store_file = str(tmp_path / "preparation_oom_rendezvous")
     procs = []
@@ -396,7 +444,13 @@ def test_preparation_memory_error_falls_back_on_every_rank(tmp_path):
     try:
         for rank in range(2):
             env = dict(os.environ)
-            env.update(RANK=str(rank), WORLD_SIZE="2", GLOO_STORE_FILE=store_file)
+            env.update(
+                RANK=str(rank),
+                WORLD_SIZE="2",
+                GLOO_STORE_FILE=store_file,
+                FAILURE_PHASE=failure_phase,
+                TORCH_DISTRIBUTED_DEBUG="DETAIL",
+            )
             procs.append(
                 subprocess.Popen(
                     [sys.executable, "-c", _PREPARATION_OOM_WORKER_SRC],

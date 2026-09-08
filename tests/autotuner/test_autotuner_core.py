@@ -534,6 +534,80 @@ def test_choose_one_recovers_from_memory_error_during_profiling(monkeypatch):
     empty_cache.assert_called_once_with()
 
 
+@pytest.mark.parametrize("failure_phase", ("input_hook", "runner"))
+@pytest.mark.parametrize("error_type", (MemoryError, torch.cuda.OutOfMemoryError))
+@pytest.mark.parametrize("distributed", (False, True))
+def test_rank_tactics_preparation_oom_error_and_input_lifetime(
+    monkeypatch, failure_phase, error_type, distributed
+):
+    class SyntheticInput:
+        pass
+
+    local_errors = []
+
+    def fail_preparation():
+        error = error_type("workspace allocation failed")
+        if not distributed:
+            local_errors.append(error)
+        raise error
+
+    class PreparationRunner(DummyRunner):
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            if failure_phase == "runner" and do_preparation:
+                fail_preparation()
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    synthetic_ref = None
+
+    def prepare_inputs(*_args):
+        nonlocal synthetic_ref
+        value = SyntheticInput()
+        synthetic_ref = weakref.ref(value)
+        return [value]
+
+    def input_hook(tensors):
+        if failure_phase == "input_hook":
+            fail_preparation()
+        return tensors
+
+    def sync_oom(local_oom):
+        if local_oom:
+            gc.collect()
+            assert synthetic_ref() is None
+        return local_oom
+
+    monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_inputs)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._tune_process_group",
+        object() if distributed else None,
+    )
+    sync = MagicMock(side_effect=sync_oom)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync
+    )
+    profile = MagicMock()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+
+    with (
+        autotune(True),
+        pytest.raises(MemoryError if distributed else error_type) as exc,
+    ):
+        tuner.rank_tactics(
+            "ranking_preparation_oom",
+            [PreparationRunner(valid_tactics=(0,))],
+            TuningConfig(inputs_pre_hook=input_hook),
+            [torch.empty((8, 8))],
+            k=2,
+        )
+
+    if distributed:
+        sync.assert_any_call(True)
+    else:
+        assert exc.value is local_errors[0]
+    profile.assert_not_called()
+
+
 def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     """rank_tactics should return best-first shortlist and cache the winner."""
     tuner = reset_autotuner()

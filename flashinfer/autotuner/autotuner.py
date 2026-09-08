@@ -2569,17 +2569,43 @@ class AutoTuner:
             if cached_ranking is not None:
                 return list(cached_ranking[:k])
 
-            tensors = self._prepare_input_tensors(profile, inputs)
-            if tuning_config.inputs_pre_hook is not None:
-                tensors = list(tuning_config.inputs_pre_hook(tensors))
+            tensors = None
+            input_preparation_oom = False
+            try:
+                tensors = self._prepare_input_tensors(profile, inputs)
+                if tuning_config.inputs_pre_hook is not None:
+                    tensors = list(tuning_config.inputs_pre_hook(tensors))
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                input_preparation_oom = True
+                tensors = None
 
-            valid_tactics = runner.get_valid_tactics(tensors, profile)
-            valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+            # Ranking can run inside another runner's get_valid_tactics().
+            # Every rank must leave preparation before nested timing reduces.
+            if _sync_oom_across_tune_group(input_preparation_oom):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking input preparation")
+
+            assert tensors is not None
+            runner_preparation_oom = False
+            try:
+                valid_tactics = runner.get_valid_tactics(tensors, profile)
+                valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+                if valid_tactics and "do_preparation" in runner_arg_names:
+                    runner(tensors, tactic=-1, do_preparation=True, **kwargs)
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                runner_preparation_oom = True
+                tensors = None
+
+            if _sync_oom_across_tune_group(runner_preparation_oom):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking runner preparation")
+
             if not valid_tactics:
                 return [-1]
-
-            if "do_preparation" in runner_arg_names:
-                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
 
             scored: list[tuple[float, Any]] = []
             for tac in valid_tactics:
