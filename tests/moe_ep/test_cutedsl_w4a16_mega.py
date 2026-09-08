@@ -346,8 +346,8 @@ def test_w4a16_mega_two_rank(check):
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("hidden", "intermediate", "num_tokens"),
-    ((64, 64, 257), (192, 320, 257)),
-    ids=("h64_i64_m257", "h192_i320_m257"),
+    ((64, 64, 257), (192, 320, 257), (1024, 512, 257)),
+    ids=("h64_i64_m257", "h192_i320_m257", "h1024_i512_m257"),
 )
 @pytest.mark.parametrize(
     "expected_world_size",
@@ -357,6 +357,7 @@ def test_w4a16_mega_geometry(expected_world_size, hidden, intermediate, num_toke
     # The skew sends every token to experts 0 and 1. 257 rows cross both the
     # 128-row CTA and 256-row cluster boundaries; EP2 also leaves one rank
     # without local expert work. The feature tails exercise FC1 and FC2 stores.
+    # H1024/I512 gives 16/8 K tiles, wrapping the six-stage B pipeline in both.
     _check_numerical(
         expected_world_size,
         hidden=hidden,

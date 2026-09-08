@@ -117,3 +117,62 @@ def test_empty_capture_does_not_require_a_compiled_reducer(shim, buffer):
     with mock.patch("torch.cuda.is_current_stream_capturing", return_value=True):
         _call(shim, buffer, _output(0))
     buffer._frontend.run.assert_called_once()
+
+
+@pytest.fixture
+def symm_factory():
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        get_symm_buffer_for_w4a16_mega_moe,
+    )
+
+    factory = get_symm_buffer_for_w4a16_mega_moe
+    with (
+        mock.patch(
+            f"{factory.__module__}.sym_zeros",
+            side_effect=lambda shape, dtype: torch.zeros(shape, dtype=dtype),
+        ),
+        mock.patch(f"{factory.__module__}.free_sym_tensor"),
+    ):
+        yield factory
+
+
+@pytest.mark.parametrize("default_reduce", (False, True))
+def test_buffer_knobs_override_optional_defaults(symm_factory, default_reduce):
+    workspace = symm_factory(
+        4,
+        4,
+        2,
+        64,
+        64,
+        0,
+        1,
+        gate_up_clamp=2.0,
+        in_kernel_fc2_reduce=default_reduce,
+        token_back_mode="epi_warps",
+        knobs={
+            "gate_up_clamp": 1.5,
+            "in_kernel_fc2_reduce": False,
+            "token_back_mode": "reuse_dispatch_warps",
+        },
+    )
+    try:
+        config = workspace._frontend.config
+        assert config.gate_up_clamp == 1.5
+        assert config.token_back_mode == "reuse_dispatch_warps"
+        assert not config.in_kernel_fc2_reduce
+        assert workspace.combine_output.shape == (4, 2, 64)
+    finally:
+        workspace.destroy()
+
+
+def test_buffer_knobs_reject_routing_reduction(symm_factory):
+    with pytest.raises(ValueError, match="routing scores are applied after FC2"):
+        symm_factory(4, 4, 2, 64, 64, 0, 1, knobs={"in_kernel_fc2_reduce": True})
+
+
+@pytest.mark.parametrize("field", ("unknown_knob", "rank", "world_size", "hidden"))
+def test_buffer_knobs_cannot_replace_required_geometry(symm_factory, field):
+    message = "unexpected keyword" if field == "unknown_knob" else "multiple values"
+    with pytest.raises(TypeError, match=message):
+        symm_factory(4, 4, 2, 64, 64, 0, 1, knobs={field: 1})

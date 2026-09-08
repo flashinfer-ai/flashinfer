@@ -79,9 +79,13 @@ layer = MoEEpLayer(
     ),
 )
 tensors = MoEEpTensors(hidden_states=x_bf16, topk_ids=ids, topk_weights=scores_fp32)
-layer.warmup(tensors)  # Collective on all EP ranks, before CUDA graph capture.
+layer.warmup()  # Collective on all EP ranks, before CUDA graph capture.
 y_bf16 = layer.forward(tensors)
 ```
+
+Use the default `warmup()` batch to compile the final reducer on every rank.
+Warming up only with an empty local batch does not prepare a later nonempty
+CUDA graph capture.
 
 The default `MegaConfig.quantize_input=True` denotes the normal input path;
 this backend copies BF16 inputs without quantizing them. It rejects

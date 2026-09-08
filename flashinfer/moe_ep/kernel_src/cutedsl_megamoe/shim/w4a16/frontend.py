@@ -486,6 +486,12 @@ def get_symm_buffer_for_w4a16_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
+    optional_config = {
+        "gate_up_clamp": clamp,
+        "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
+        "token_back_mode": token_back_mode,
+        **(knobs or {}),
+    }
     cfg = MegaMoEW4A16Config(
         rank=rank,
         world_size=world_size,
@@ -494,17 +500,14 @@ def get_symm_buffer_for_w4a16_mega_moe(
         num_total_experts=num_total_experts,
         hidden=hidden,
         intermediate=intermediate,
-        gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back_mode,
-        **(knobs or {}),
+        **optional_config,
     )
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     combine_output = sym_zeros(
-        (num_max_tokens, 1 if in_kernel_fc2_reduce else num_topk, hidden),
+        (num_max_tokens, 1 if cfg.in_kernel_fc2_reduce else num_topk, hidden),
         torch.bfloat16,
     )
     return MegaMoEW4A16SymmBuffer(
