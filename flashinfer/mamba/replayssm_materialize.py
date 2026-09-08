@@ -142,7 +142,10 @@ def replayssm_materialize(
         JIT state-storage dtype. One-byte state requires ``dim=64`` and
         ``dstate=128``.
     input_dtype : torch.dtype
-        JIT dtype of ``x`` and ``B`` cache entries.
+        JIT dtype of ``x`` and ``B`` cache entries. Must be
+        ``torch.bfloat16``, matching checkpointing SSU's BF16 replay MMA
+        operands. The pointer tables cannot validate the pointed-to tensor
+        dtypes, so callers must ensure both cache families use BF16 storage.
     matrixA_dtype : torch.dtype
         JIT dtype of the per-head ``A`` values.
     dim : int
@@ -179,6 +182,11 @@ def replayssm_materialize(
     write the state after token 128.
 
     """
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            "ReplaySSM materialization requires input_dtype=torch.bfloat16: "
+            "the replay x and B caches are BF16 MMA operands"
+        )
     tables = (
         state_ptrs,
         state_slot_strides,

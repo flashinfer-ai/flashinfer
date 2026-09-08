@@ -5,6 +5,9 @@ import torch
 
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.mamba.replayssm_materialize import replayssm_materialize
+from flashinfer.jit.mamba.replayssm_materialize import (
+    gen_replayssm_materialize_module,
+)
 from flashinfer.utils import is_cvt_rs_supported
 
 
@@ -79,6 +82,27 @@ def _materialize(
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
     )
+
+
+@pytest.mark.parametrize(
+    "input_dtype",
+    [torch.float16, torch.float32, torch.int8, torch.float8_e4m3fn],
+    ids=["fp16", "fp32", "int8", "fp8"],
+)
+def test_replayssm_materialize_rejects_non_bf16_input_dtype(
+    input_dtype: torch.dtype,
+) -> None:
+    """Replay operands are BF16, not merely arbitrary two-byte storage."""
+    with pytest.raises(ValueError, match="input_dtype=torch.bfloat16"):
+        gen_replayssm_materialize_module(
+            torch.bfloat16,
+            input_dtype,
+            torch.float32,
+            64,
+            64,
+            1,
+            8,
+        )
 
 
 def test_replayssm_materialize_bf16_replay_and_copy() -> None:

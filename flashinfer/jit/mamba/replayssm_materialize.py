@@ -38,6 +38,8 @@ _NAME = {
     torch.float8_e4m3fn: "e4m3",
 }
 
+_INPUT_DTYPE = torch.bfloat16
+
 
 def gen_replayssm_materialize_module(
     state_dtype,
@@ -49,6 +51,11 @@ def gen_replayssm_materialize_module(
     max_window,
     philox_rounds=0,
 ) -> JitSpec:
+    if input_dtype != _INPUT_DTYPE:
+        raise ValueError(
+            "ReplaySSM materialization requires input_dtype=torch.bfloat16: "
+            "the replay x and B caches are BF16 MMA operands"
+        )
     uri = (
         f"replayssm_materialize_s_{_NAME[state_dtype]}_i_{_NAME[input_dtype]}"
         f"_a_{_NAME[matrixA_dtype]}_d_{dim}_ds_{dstate}_hpg_{heads_per_group}"
