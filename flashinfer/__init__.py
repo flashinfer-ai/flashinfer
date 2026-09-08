@@ -265,7 +265,11 @@ from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
 from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
 from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+from .norm import (
+    supports_gated_residual_next_rmsnorm as supports_gated_residual_next_rmsnorm,
+)
 from .norm import (
     supports_gated_residual_rmsnorm as supports_gated_residual_rmsnorm,
 )
