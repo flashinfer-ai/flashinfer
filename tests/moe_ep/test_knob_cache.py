@@ -162,33 +162,6 @@ def test_permitted_session_falls_back_to_a_deterministic_entry(monkeypatch, tmp_
     )
 
 
-def test_resolve_requires_ikr_mode_matches_exactly_for_bf16(monkeypatch, tmp_path):
-    """BF16 and BF16-MXFP8 require their ikr mode, so the other entry is a miss.
-    This is because the user API changes based on the flag, so we need to match exactly.
-    """
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-        default_knobs,
-        lookup_knobs,
-        record_knobs,
-    )
-
-    _cache_env(monkeypatch, tmp_path)
-    key = dict(_KEY, dtype="bf16")
-    deterministic = default_knobs(2048, dtype="bf16")
-    record_knobs(deterministic, max_tokens=2048, device="testgpu", **key)
-
-    assert lookup_knobs(max_tokens=2048, device="testgpu", **key) == deterministic
-    assert (
-        lookup_knobs(
-            max_tokens=2048,
-            device="testgpu",
-            enable_in_kernel_fc2_reduce=True,
-            **key,
-        )
-        is None
-    )
-
-
 def test_resolve_ignores_an_ikr_entry_for_a_deterministic_session(
     monkeypatch, tmp_path
 ):

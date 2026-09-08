@@ -18,10 +18,7 @@ Two knob classes:
     (``group_hint``, ``flag_batch``, ``epi_flag_batch``).
 
 ``in_kernel_fc2_reduce`` additionally makes the output accumulation order
-nondeterministic, and the values it can take depend on the kernel:
-  * NVFP4 / MXFP8 its value is invisible to the caller, either value is allowed if the user specifies enable_in_kernel_fc2_reduce
-  * BF16 / mixed BF16xMXFP8 size their ``combine_output`` buffer from it, which also decides
-    whether the caller may take a workspace output view. The value must match the value of `enable_in_kernel_fc2_reduce` to ensure the expected behaviour.
+nondeterministic, it is enabled by ``enable_in_kernel_fc2_reduce``.
 
 Other knobs are set from the usual flow: pinned dict, the knob cache, or :func:`default_knobs`.
 
@@ -242,7 +239,7 @@ def _mxfp8_default_knobs(
 def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     """One validated fixed MMA/cluster geometry."""
     knobs = dict(_BF16_TOKEN_KNOBS)
-    # Match the user's requested IKR mode
+    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     if enable_in_kernel_fc2_reduce:
         # IKR requires reuse dispatch warps
@@ -254,7 +251,7 @@ def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
 def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     """The default mixed implementation tuple (``is_valid_bf16_mxfp8``)."""
     knobs = dict(_BF16_MXFP8_TOKEN_KNOBS)
-    # Match the user's requested IKR mode
+    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     return knobs
 
@@ -271,10 +268,10 @@ def default_knobs(
     Dispatches to the per-dtype pickers above, which carry the measurement
     provenance.  ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` are
     session axes the profile is made valid against, so the result is always
-    directly applicable to that session.  On NVFP4/MXFP8 permitting ikr also
-    selects it; BF16 and mixed own ikr on the session, so there the profile
-    restates the flag's value and constrains the token-back carrier to match
-    it.  Only NVFP4 has quantized combine.
+    directly applicable to that session.  Permitting ikr also selects it by
+    default on every dtype (an autotune sweep may still turn it back off);
+    BF16 additionally constrains the token-back carrier to match.  Only NVFP4
+    has quantized combine.
 
     Returns a fresh dict each call.
     """
@@ -394,11 +391,11 @@ def _effective_knobs(config: Any, knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {**current, **knobs}
 
 
-def _ikr_knob_agrees_with_config(config: Any, knobs: Dict[str, Any]) -> bool:
-    """Check if the knobs dict conflicts with the ikr setting in the config."""
+def _ikr_knob_permitted(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Check the knobs dict only selects ikr when the session permitted it."""
     return (
-        knobs.get("in_kernel_fc2_reduce", config.in_kernel_fc2_reduce)
-        == config.in_kernel_fc2_reduce
+        not knobs.get("in_kernel_fc2_reduce", config.in_kernel_fc2_reduce)
+        or config.enable_in_kernel_fc2_reduce
     )
 
 
@@ -413,10 +410,11 @@ def describe_invalid_knobs(
     value; knobs that are legal alone and illegal together say so instead.
     """
     reasons: List[str] = []
-    if not _ikr_knob_agrees_with_config(config, knobs):
+    if not _ikr_knob_permitted(config, knobs):
         reasons.append(
-            f"in_kernel_fc2_reduce={knobs['in_kernel_fc2_reduce']!r} contradicts the "
-            f"provided user config; BF16 and BF16xMXFP8 supports_output_view depends on this setting"
+            "in_kernel_fc2_reduce=True is not permitted by this session; pass "
+            "enable_in_kernel_fc2_reduce=True (it makes the combine accumulation "
+            "order nondeterministic)"
         )
     if not predicate(config, {}):
         reasons.append("the session config is itself outside the supported knob space")
@@ -431,14 +429,14 @@ def describe_invalid_knobs(
 
 def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate BF16 knobs against the requested configuration."""
-    return _ikr_knob_agrees_with_config(config, knobs) and is_valid_bf16(
+    return _ikr_knob_permitted(config, knobs) and is_valid_bf16(
         _effective_knobs(config, knobs)
     )
 
 
 def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
-    """Validate mixed BF16/MXFP8 knobs against a session's IKR setting."""
-    return _ikr_knob_agrees_with_config(config, knobs) and is_valid_bf16_mxfp8(
+    """Validate mixed BF16/MXFP8 knobs against a session's IKR permission."""
+    return _ikr_knob_permitted(config, knobs) and is_valid_bf16_mxfp8(
         _effective_knobs(config, knobs)
     )
 

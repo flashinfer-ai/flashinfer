@@ -331,8 +331,9 @@ misses) — both are the right behavior as long as internal drops carry the
   The FI shim default (`dtype="bf16_mxfp8"`) is the N128 small-batch profile;
   `bf16_mxfp8_candidates()` sweeps all three impl tuples × `flag_batch`
   {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``}, the
-  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates;
-  per-size winners above are the measured starting point).
+  dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates, or
+  36 when ikr is permitted; per-size winners above are the measured starting
+  point).
 - Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
@@ -341,20 +342,16 @@ misses) — both are the right behavior as long as internal drops carry the
   MAX (slowest rank = collective latency), argmin winner applied
   identically everywhere.  Cost: one `cute.compile` per candidate
   (~1-2 min), once per session.  Candidates mirror the tester sweep
-  restriction; for NVFP4 and MXFP8 that INCLUDES `in_kernel_fc2_reduce`
-  whenever the config sets `enable_in_kernel_fc2_reduce=True` (24 and 6
-  candidates respectively — their symm-buffer output is always sym-heap
-  allocated at the same shape, so the knob flips per-compile).  ikr is ~par
-  with the bf16 wire at the FI default geometry at >=1024 tok/rank and slower
-  at small batch — see "Measured results" below; it stays a sweep candidate
-  rather than a default because the tuner keeps it only if it wins the live
-  problem.  An ikr winner makes the output accumulation order
+  restriction; that INCLUDES `in_kernel_fc2_reduce`
+  whenever the config sets `enable_in_kernel_fc2_reduce=True` (NVFP4 24,
+  MXFP8 6, mixed BF16×MXFP8 36, BF16 2 — each session sym-heap allocates all
+  of its combine destinations up front, so the knob flips per-compile).  ikr
+  is ~par with the bf16 wire at the FI default geometry at >=1024 tok/rank
+  and slower at small batch — see "Measured results" below; it stays a sweep
+  candidate rather than a default because the tuner keeps it only if it wins
+  the live problem.  An ikr winner makes the output accumulation order
   nondeterministic — leave `enable_in_kernel_fc2_reduce=False` if
-  bit-reproducibility matters.  BF16 and mixed BF16×MXFP8 force
-  `in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce` (their `combine_output`
-  buffer is sized from it, which also decides whether
-  `forward(return_workspace_view=True)` is available), so their
-  sweeps never vary it, the knob must match enable_in_kernel_fc2_reduce.
+  bit-reproducibility matters.
 - The kernel-repo tester remains the wide-sweep tool
   (`torchrun -m tester.tester --mode Perf --sweep --use_knob ...`); winners
   transfer via the `knobs=` dict.  Its problems (`nvfp4_perf.jsonl`) are

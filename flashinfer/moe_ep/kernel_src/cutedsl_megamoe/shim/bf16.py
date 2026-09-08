@@ -42,6 +42,7 @@ class MegaMoEBf16Config:
     num_sched_stages: Optional[int] = None
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (1, 1)
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -76,6 +77,12 @@ class MegaMoEBf16Config:
             "reuse_dispatch_warps",
         ):
             raise ValueError(f"unsupported token_back_mode={self.token_back_mode!r}.")
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce is tuner-owned and needs the session's "
+                "permission: pass enable_in_kernel_fc2_reduce=True (it makes the "
+                "combine accumulation order nondeterministic)."
+            )
         if self.in_kernel_fc2_reduce and self.token_back_mode == "epi_warps":
             raise ValueError(
                 "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
@@ -383,9 +390,17 @@ class MegaMoEBf16SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     combine_output: torch.Tensor
+    reduced_output: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+
+    @property
+    def kernel_combine_output(self) -> torch.Tensor:
+        """The tensor the kernel writes: reduced rows under ikr, else partials."""
+        if self._frontend.config.in_kernel_fc2_reduce:
+            return self.reduced_output
+        return self.combine_output
 
     def destroy(self) -> None:
         if not self._destroyed:
@@ -415,7 +430,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
@@ -437,7 +452,7 @@ def get_symm_buffer_for_bf16_mega_moe(
             num_experts=num_total_experts,
             topk=num_topk,
             max_tokens=num_max_tokens,
-            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
     cfg = MegaMoEBf16Config(
         rank=rank,
@@ -448,12 +463,7 @@ def get_symm_buffer_for_bf16_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        # We need to set this here before __post_init__ validates the config
-        token_back_mode=knobs.get(
-            "token_back_mode",
-            "reuse_dispatch_warps" if in_kernel_fc2_reduce else "epi_warps",
-        ),
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
@@ -466,10 +476,9 @@ def get_symm_buffer_for_bf16_mega_moe(
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    combine_output = sym_zeros(
-        (num_max_tokens, 1 if cfg.in_kernel_fc2_reduce else num_topk, hidden),
-        torch.bfloat16,
-    )
+    # We need to allocate both since we dont always know what final knobs will be selected
+    combine_output = sym_zeros((num_max_tokens, num_topk, hidden), torch.bfloat16)
+    reduced_output = sym_zeros((num_max_tokens, 1, hidden), torch.bfloat16)
     return MegaMoEBf16SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -482,8 +491,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         topk_idx,
         topk_weights,
         combine_output,
+        reduced_output,
         MegaMoEBf16Frontend(cfg),
-        [x, topk_idx, topk_weights, combine_output],
+        [x, topk_idx, topk_weights, combine_output, reduced_output],
     )
 
 
@@ -504,13 +514,6 @@ def bf16_mega_moe(
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
     in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
-    if y is None and not in_kernel_reduce:
-        # Without the in-kernel reduce the kernel emits per-topk partials, so
-        # the top-k sum needs its own destination outside the workspace.
-        raise ValueError(
-            "y=None requires in_kernel_fc2_reduce=True; the explicit top-k sum "
-            "cannot be returned as a workspace view."
-        )
     if y is not None and (
         y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
     ):
@@ -527,21 +530,31 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         ),
         num_tokens=n,
-        sync=sync,
+        sync=False,
     )
-    if not in_kernel_reduce:
-        y.copy_(result.sum(dim=1))
-        return None
-    reduced = result[:, 0]
-    if y is None:
-        # Zero-copy: the caller consumes the workspace view under stream
-        # ordering (valid until the next launch on this session's buffers).
-        return reduced
-    y.copy_(reduced)
-    return None
+    if in_kernel_reduce:
+        out = result[:, 0]
+    elif y is not None:
+        # Reduce straight into the caller's buffer: one fewer (n, hidden)
+        # write than routing through reduced_output.  bf16 in / bf16 out sums
+        # in fp32 (torch's acc_type), matching the old result.sum(dim=1).
+        out = y
+        torch.sum(result, dim=1, out=y)
+    else:
+        out = symm_buffer.reduced_output[:n, 0]
+        torch.sum(result, dim=1, out=out)
+
+    if y is not None and out is not y:
+        y.copy_(out)
+
+    if sync and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+
+    # Return the inplace zero-copy result if y is None
+    return out if y is None else None
 
 
 def _create_dummy_weights(
@@ -583,7 +596,7 @@ def create_dummy_inputs(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
     seed: int = 0,
 ) -> tuple[
@@ -615,7 +628,7 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         knobs=knobs,
     )
 
@@ -663,16 +676,29 @@ def bf16_mega_launch_thunk(
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16SymmBuffer,
 ) -> Callable[[], None]:
-    return symm_buffer._frontend.make_launch_thunk(
+    launch = symm_buffer._frontend.make_launch_thunk(
         MegaMoEBf16Inputs(
             symm_buffer.x,
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         )
     )
+    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        return launch
+
+    # Form A's host reduce is part of the forward; a thunk without it would
+    # under-report the deterministic path against ikr.
+    partials = symm_buffer.combine_output
+    out = symm_buffer.reduced_output[:, 0]
+
+    def thunk() -> None:
+        launch()
+        torch.sum(partials, dim=1, out=out)
+
+    return thunk
 
 
 __all__ = [

@@ -162,26 +162,13 @@ def lookup_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
     )
-    # BF16 and BF16-MXFP8 have different user interfaces for in_kernel_fc2_reduce, so we filter by exact match
-    # MXFP8 and NVFP4 can turn it on or off, without changing the API surface
-    # TODO: Remove this if we fuse the reduction into the kernel without IKR, like for MXFP8/NVFP4
-    session_owns_ikr = dtype in (
-        "bf16",
-        "bf16_mxfp8",
-        "bf16_mxfp8_e4m3",
-        "bf16_mxfp8_e5m2",
-    )
     matches = [
         e
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
-        and (
-            _entry_needs_ikr(e) == bool(enable_in_kernel_fc2_reduce)
-            if session_owns_ikr
-            else (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
-        )
+        and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
     ]
     if not matches:
         return None
@@ -295,10 +282,10 @@ def resolve_knobs(
     ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` describe the calling
     session, so resolution can never hand back a knob set the session's config
     would reject: the heuristic is built against them (see
-    :func:`.tuner.default_knobs`) and the lookup only considers entries tuned
-    under a compatible ikr objective (see :func:`lookup_knobs`), so a cache
-    populated with ``--allow-nondeterministic`` stays safe to share with
-    sessions that need a reproducible combine.
+    :func:`.tuner.default_knobs`) and the lookup only considers entries the
+    session permits (see :func:`lookup_knobs`), so a cache populated with
+    ``--allow-nondeterministic`` stays safe to share with sessions that need a
+    reproducible combine.
     """
     cached = lookup_knobs(
         dtype=dtype,

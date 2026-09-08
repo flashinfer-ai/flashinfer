@@ -35,8 +35,6 @@ Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
 default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
 winner makes the engine's output accumulation order nondeterministic).  The
 engine still must opt into ``enable_in_kernel_fc2_reduce=True``.
-
-BF16 and BF16 x MXFP8 require this flag into order to run with in_kernel_fc2_reduce enabled.
 """
 
 from __future__ import annotations

@@ -111,10 +111,11 @@ The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
 the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
 `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
 `in_kernel_fc2_reduce` (ikr — makes the accumulation order
-nondeterministic); the NVFP4/MXFP8 knobs may select it, but only when the
-config sets `enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce` at `False`
-keeps the session bit-reproducible.
-For BF16/BF16xMXFP8 `enable_in_kernel_fc2_reduce` directly sets `in_kernel_fc2_reduce`
+nondeterministic); the knobs may select it, but only when the config sets
+`enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce`
+at `False` keeps the session bit-reproducible. Every kernel treats it as a
+permission this way: both reduce paths land in the session workspace, so ikr
+is invisible to the caller and can flip per-compile.
 - **perf knobs** are output-neutral and free to sweep: `group_hint`,
   `flag_batch`, `epi_flag_batch`.
 
