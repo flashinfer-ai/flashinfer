@@ -873,6 +873,55 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 #endif
 }
 
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
+__global__ void nvfp4QuantWithStaticScaleKernel(
+    // input
+    uint32_t m, uint32_t n, T const* input, float globalEncodeScale,
+    int32_t* expandedIdxToPermutedIdx,
+    // output
+    uint8_t* weightOutput, uint8_t* scaleOutput) {
+  constexpr int SF_VEC_SIZE = 16;
+  int rowIdx = blockIdx.x;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  if (rowIdx >= m) return;
+  if (expandedIdxToPermutedIdx != nullptr) {
+    rowIdx = expandedIdxToPermutedIdx[rowIdx];
+  }
+  if (rowIdx < 0) return;
+
+  using InType = PackedVec<T, SF_VEC_SIZE>;
+  using PackedFp4Type = uint64_t;
+  uint32_t const numVecsPerRow = n / SF_VEC_SIZE;
+
+  for (uint32_t vecIdx = threadIdx.x; vecIdx < numVecsPerRow; vecIdx += BLOCK_SIZE) {
+    int64_t const vecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx;
+    InType vecIn;
+    loadPackedVec(vecIn, reinterpret_cast<InType const*>(input) + vecOffset);
+
+    uint8_t fp8Scale;
+    auto const fp4Vals =
+        cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
+                             NVFP4_4OVER6_CONFIG>(vecIn, globalEncodeScale, &fp8Scale);
+    reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
+
+    int64_t sfOffset;
+    if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
+      sfOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx;
+    } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+      sfOffset = get_sf_out_offset_128x4(rowIdx, vecIdx, numVecsPerRow);
+    } else {
+      sfOffset = get_sf_out_offset_8x4(rowIdx, vecIdx, numVecsPerRow);
+    }
+    scaleOutput[sfOffset] = fp8Scale;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 // Fast approximation of nvfp4 quantization.
 // This kernel first quantizes the input to fp4 with local amax only,
 // then calculates the e4m3 scales with the global amax and cached local amax.

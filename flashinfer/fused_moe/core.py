@@ -1857,6 +1857,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
             use_per_token_scaling: bool = False,
+            gemm2_use_per_token_scaling: Optional[bool] = None,
             num_experts: Optional[int] = None,
             num_fused_shared_experts: int = 0,
         ):
@@ -1877,6 +1878,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
             self.use_per_token_scaling = use_per_token_scaling
+            self.gemm2_use_per_token_scaling = (
+                use_per_token_scaling and dtype_act == DtypeTrtllmGen.E2m1
+                if gemm2_use_per_token_scaling is None
+                else gemm2_use_per_token_scaling
+            )
+            if self.gemm2_use_per_token_scaling and not use_per_token_scaling:
+                raise ValueError(
+                    "GEMM2 per-token scaling requires GEMM1 per-token scaling."
+                )
             self.num_experts = (
                 num_experts if num_experts is not None else num_local_experts
             )
@@ -2022,6 +2032,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 self.use_shuffled_weight,
                 self.weight_layout,
                 self.use_per_token_scaling,
+                self.gemm2_use_per_token_scaling,
                 num_tokens,
                 has_gemm1_lora_delta,
             )
@@ -2059,6 +2070,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 self.use_shuffled_weight,
                 self.weight_layout,
                 self.use_per_token_scaling,
+                self.gemm2_use_per_token_scaling,
                 moe_inputs.hidden_states.shape[0],
                 moe_inputs.gemm1_lora_delta is not None,
             )
@@ -2408,6 +2420,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     kwargs["output1_scale_gate_scalar"],
                     kwargs["output2_scale_scalar"],
                     moe_inputs.per_token_scale,
+                    self.gemm2_use_per_token_scaling,
                     kwargs["num_experts"],
                     self.top_k,
                     kwargs.get("num_fused_shared_experts", 0),
@@ -4019,6 +4032,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output1_scale_gate_scalar: Optional[torch.Tensor],
         output2_scale_scalar: Optional[torch.Tensor],
         per_token_scale: Optional[torch.Tensor],
+        gemm2_use_per_token_scaling: bool,
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -4128,6 +4142,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
+            gemm2_use_per_token_scaling=gemm2_use_per_token_scaling,
             num_experts=num_experts,
             num_fused_shared_experts=num_fused_shared_experts,
         )
@@ -4165,6 +4180,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             "output1_scale_scalar": output1_scale_scalar,
             "output1_scale_gate_scalar": output1_scale_gate_scalar,
             "output2_scale_scalar": output2_scale_scalar,
+            "gemm2_use_per_token_scaling": gemm2_use_per_token_scaling,
             "n_group": n_group,
             "topk_group": topk_group,
             "local_expert_offset": local_expert_offset,
@@ -4209,6 +4225,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 output1_scale_gate_scalar,
                 output2_scale_scalar,
                 per_token_scale,
+                gemm2_use_per_token_scaling,
                 num_experts,
                 top_k,
                 num_fused_shared_experts,
@@ -4319,6 +4336,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output1_scale_gate_scalar: Optional[torch.Tensor],
         output2_scale_scalar: Optional[torch.Tensor],
         per_token_scale: Optional[torch.Tensor],
+        gemm2_use_per_token_scaling: bool,
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -4338,7 +4356,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         num_fused_shared_experts: int = 0,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
-        _ = routing_replay_out
+        _ = routing_replay_out, gemm2_use_per_token_scaling
         return _fake_trtllm_moe_output(
             hidden_states,
             hidden_size=gemm2_weights.shape[1],
@@ -5198,6 +5216,18 @@ def _validate_routing_replay_out(
         )
     if not routing_replay_out.is_contiguous():
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
+
+
+def _resolve_fp4_gemm2_per_token_scaling(
+    per_token_scale: Optional[torch.Tensor],
+    gemm2_use_per_token_scaling: Optional[bool],
+) -> bool:
+    """Resolve the FC2 activation quantization mode while preserving legacy behavior."""
+    if gemm2_use_per_token_scaling is None:
+        return per_token_scale is not None
+    if gemm2_use_per_token_scaling and per_token_scale is None:
+        raise ValueError("gemm2_use_per_token_scaling=True requires per_token_scale.")
+    return gemm2_use_per_token_scaling
 
 
 def _validate_fp8_block_scale_gemm1_activation_params(
@@ -6689,6 +6719,7 @@ def trtllm_fp4_block_scale_moe(
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
     num_fused_shared_experts: Optional[int] = None,
+    gemm2_use_per_token_scaling: Optional[bool] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6793,6 +6824,12 @@ def trtllm_fp4_block_scale_moe(
         ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
+    gemm2_use_per_token_scaling : Optional[bool]
+        Whether FC2 dynamically quantizes its activation with per-token outer
+        scales. ``None`` preserves the legacy behavior, which enables it when
+        ``per_token_scale`` is provided. Set to ``False`` to keep FC1 input
+        per-token scaling while using ``output1_scale_scalar`` as FC2's static
+        activation scale.
     output : Optional[torch.Tensor]
         Optional in-place ``[seq_len, hidden_size]`` output tensor.
     tune_max_num_tokens : int
@@ -6849,6 +6886,9 @@ def trtllm_fp4_block_scale_moe(
             f"with DeepSeekV3 routing; got routing_method_type={routing_method_type}."
         )
     _validate_routing_replay_out(routing_replay_out, top_k, nsfe)
+    gemm2_use_per_token_scaling = _resolve_fp4_gemm2_per_token_scaling(
+        per_token_scale, gemm2_use_per_token_scaling
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
         routing_logits,
@@ -6871,6 +6911,7 @@ def trtllm_fp4_block_scale_moe(
         output1_scale_gate_scalar,
         output2_scale_scalar,
         per_token_scale,
+        gemm2_use_per_token_scaling,
         num_experts,
         top_k,
         n_group,
@@ -6925,6 +6966,7 @@ def trtllm_fp4_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
+    gemm2_use_per_token_scaling: Optional[bool] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -7054,6 +7096,9 @@ def trtllm_fp4_block_scale_routed_moe(
         see :func:`trtllm_bf16_routed_moe` for the table.
     """
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+    gemm2_use_per_token_scaling = _resolve_fp4_gemm2_per_token_scaling(
+        per_token_scale, gemm2_use_per_token_scaling
+    )
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
     # when the input is Fp8 or NvFp4 and DeepSeekFp8 is not used (see trtllm-gen
@@ -7099,6 +7144,7 @@ def trtllm_fp4_block_scale_routed_moe(
         output1_scale_gate_scalar,
         output2_scale_scalar,
         per_token_scale,
+        gemm2_use_per_token_scaling,
         num_experts,
         top_k,
         n_group,

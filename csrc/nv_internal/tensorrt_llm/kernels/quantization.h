@@ -79,6 +79,12 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, cudaStream_t stream = 0);
 
 template <typename T>
+void invokeNvfp4QuantWithStaticScale(uint32_t m, uint32_t n, T const* input,
+                                     float globalEncodeScale, int32_t* expanded_idx_to_permuted_idx,
+                                     uint8_t* weightOutput, uint8_t* scaleOutput,
+                                     QuantizationSFLayout sfLayout, cudaStream_t stream = 0);
+
+template <typename T>
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,
                                 T* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
 

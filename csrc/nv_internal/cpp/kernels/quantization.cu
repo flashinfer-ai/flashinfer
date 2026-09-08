@@ -429,6 +429,60 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
     float* perTokenScaleOutput, QuantizationSFLayout sfLayout, cudaStream_t stream);
 #endif
 
+template <typename T>
+void invokeNvfp4QuantWithStaticScale(uint32_t m, uint32_t n, T const* input,
+                                     float globalEncodeScale, int32_t* expandedIdxToPermutedIdx,
+                                     uint8_t* weightOutput, uint8_t* scaleOutput,
+                                     QuantizationSFLayout sfLayout, cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+  constexpr uint32_t BLOCK_SIZE = 128;
+  dim3 block(BLOCK_SIZE);
+  dim3 grid(m);
+  bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+  bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+
+  auto launchKernel = [&](auto sfLayoutTag, auto disableFP4QuantFastMathTag,
+                          auto nvfp4_4over6_config_tag) {
+    constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
+    nvfp4QuantWithStaticScaleKernel<T, BLOCK_SIZE, SF_LAYOUT,
+                                    decltype(disableFP4QuantFastMathTag)::value,
+                                    decltype(nvfp4_4over6_config_tag)><<<grid, block, 0, stream>>>(
+        m, n, input, globalEncodeScale, expandedIdxToPermutedIdx, weightOutput, scaleOutput);
+  };
+
+  dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
+    auto launchWithLayout = [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
+      launchKernel(sfLayoutTag, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
+    };
+    if (use4Over6) {
+      NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+      bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+      int e4m3Max = 448;
+      if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
+        e4m3Max = 256;
+      }
+      dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
+                                e4m3Max, launchWithLayout);
+    } else {
+      dispatchNVFP44Over6Config(std::false_type{}, disableFP4QuantFastMath, NVFP44Over6ErrMode::MAE,
+                                false, 448, launchWithLayout);
+    }
+  });
+}
+
+template void invokeNvfp4QuantWithStaticScale<half>(uint32_t m, uint32_t n, half const* input,
+                                                    float globalEncodeScale,
+                                                    int32_t* expandedIdxToPermutedIdx,
+                                                    uint8_t* weightOutput, uint8_t* scaleOutput,
+                                                    QuantizationSFLayout sfLayout,
+                                                    cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeNvfp4QuantWithStaticScale<__nv_bfloat16>(
+    uint32_t m, uint32_t n, __nv_bfloat16 const* input, float globalEncodeScale,
+    int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
+    QuantizationSFLayout sfLayout, cudaStream_t stream);
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
 
