@@ -15,8 +15,9 @@
 import importlib
 import json
 import math
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 from packaging.version import Version
 
 import flashinfer
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
 from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
@@ -32,7 +34,10 @@ kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
+small_bh_api = importlib.import_module("flashinfer.kda_prefill_cute_small_bh")
 cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
+
+_SMALL_BH_KERNEL_MODULE = "flashinfer.kda_kernels.kda_chunked_bt16_small_bh"
 
 
 @pytest.fixture(autouse=True)
@@ -304,6 +309,360 @@ def _cpu_route_tensors(token_count=2):
         "lower_bound": -5.0,
         "beta_is_logit": True,
     }
+
+
+def _small_bh_inputs(*, batch_size=1, token_count=2, num_heads=1):
+    shape = (batch_size, token_count, num_heads, 128)
+    return {
+        "q": torch.empty(shape, dtype=torch.bfloat16),
+        "k": torch.empty(shape, dtype=torch.bfloat16),
+        "v": torch.empty(shape, dtype=torch.bfloat16),
+        "g": torch.empty(shape, dtype=torch.bfloat16),
+        "beta": torch.empty((batch_size, token_count, num_heads), dtype=torch.bfloat16),
+        "A_log": torch.empty(num_heads, dtype=torch.float32),
+        "dt_bias": torch.empty((num_heads, 128), dtype=torch.float32),
+    }
+
+
+def _small_bh_run_kwargs(inputs, **overrides):
+    kwargs = {
+        **inputs,
+        "scale": None,
+        "initial_state": None,
+        "output_final_state": False,
+        "lower_bound": -5.0,
+        "cu_seqlens": None,
+        "output": torch.empty_like(inputs["q"]),
+        "prefill_workspace": None,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _mock_small_bh_cuda(monkeypatch):
+    def packed_max_sequence_length(q, cu_seqlens, prefill_workspace):
+        offsets = cu_seqlens.tolist()
+        return max(
+            right - left for left, right in zip(offsets, offsets[1:], strict=False)
+        )
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        small_bh_api,
+        "_packed_max_sequence_length",
+        packed_max_sequence_length,
+    )
+
+
+def _mock_small_bh_kernel(monkeypatch, implementation):
+    module = ModuleType(_SMALL_BH_KERNEL_MODULE)
+    module.chunk_kda_fwd = implementation
+    monkeypatch.setitem(sys.modules, _SMALL_BH_KERNEL_MODULE, module)
+
+
+def test_public_backend_requires_cute_dsl_runtime(monkeypatch):
+    monkeypatch.setattr(
+        kda_api,
+        "is_cute_dsl_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: pytest.fail("eligibility must not run without CuTe DSL"),
+    )
+    with pytest.raises(ImportError, match="optional CuTe DSL runtime"):
+        recurrent_kda(
+            **_small_bh_inputs(),
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+            backend="small-bh",
+        )
+
+
+def test_explicit_small_bh_rejects_ineligible_contract(monkeypatch):
+    monkeypatch.setattr(kda_api, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_run_kda_prefill_cute_small_bh",
+        lambda **kwargs: pytest.fail("an ineligible small-bh call must not run"),
+    )
+
+    with pytest.raises(ValueError, match="does not support this recurrent_kda"):
+        recurrent_kda(
+            **_small_bh_inputs(),
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+            backend="small-bh",
+        )
+
+
+def test_auto_backend_selects_small_bh_at_half_sm_count_boundary(monkeypatch):
+    sentinel = (object(), object())
+    monkeypatch.setattr(kda_api, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_run_kda_prefill_cute_small_bh",
+        lambda **kwargs: sentinel,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=16),
+    )
+
+    assert (
+        recurrent_kda(
+            **_small_bh_inputs(batch_size=2, num_heads=4),
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+            backend="auto",
+        )
+        is sentinel
+    )
+
+
+def test_auto_backend_uses_logical_batch_size_for_packed_input(monkeypatch):
+    fallback = (object(), object())
+    monkeypatch.setattr(kda_api, "is_cute_dsl_available", lambda: True)
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_run_kda_prefill_cute_small_bh",
+        lambda **kwargs: pytest.fail("small-bh must not run above half the SM count"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=5),
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill,
+        "_sm120_kda_prefill_is_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: fallback,
+    )
+
+    inputs = _small_bh_inputs(token_count=6, num_heads=2)
+    assert (
+        recurrent_kda(
+            **inputs,
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            cu_seqlens=torch.tensor([0, 2, 4, 6], dtype=torch.int64),
+            beta_is_logit=True,
+            backend="auto",
+        )
+        is fallback
+    )
+
+
+@pytest.mark.parametrize(
+    ("small_bh_available", "expected_eligibility_calls", "expected_backend"),
+    ((False, 0, "cake"), (True, 1, "cute-dsl")),
+)
+def test_auto_backend_falls_through_when_small_bh_cannot_run(
+    monkeypatch,
+    small_bh_available,
+    expected_eligibility_calls,
+    expected_backend,
+):
+    fallback = (object(), object())
+    eligibility_calls = []
+    route_calls = []
+    monkeypatch.setattr(
+        kda_api,
+        "is_cute_dsl_available",
+        lambda: small_bh_available,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: eligibility_calls.append(kwargs) or False,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_run_kda_prefill_cute_small_bh",
+        lambda **kwargs: pytest.fail("small-bh must not run"),
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill,
+        "_sm120_kda_prefill_is_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: small_bh_available,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill_cute,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: route_calls.append("cute-dsl") or fallback,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill,
+        "_flash_kda_prefill_is_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_api._kda_prefill,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: route_calls.append("cake") or fallback,
+    )
+
+    assert (
+        recurrent_kda(
+            **_small_bh_inputs(),
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+            backend="auto",
+        )
+        is fallback
+    )
+    assert len(eligibility_calls) == expected_eligibility_calls
+    assert route_calls == [expected_backend]
+
+
+@pytest.mark.parametrize(
+    ("lower_bound", "expected_gate_scale", "expected_gate_lower_bound"),
+    ((-5.0, -5.0, True), (None, 1.0, False)),
+)
+def test_small_bh_dense_runner_translates_gate_and_reuses_initial_state(
+    monkeypatch,
+    lower_bound,
+    expected_gate_scale,
+    expected_gate_lower_bound,
+):
+    _mock_small_bh_cuda(monkeypatch)
+    calls = []
+
+    def implementation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return kwargs["output"], kwargs["state_output"]
+
+    _mock_small_bh_kernel(monkeypatch, implementation)
+    inputs = _small_bh_inputs(num_heads=1)
+    state = torch.empty((1, 1, 128, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(inputs["q"])
+
+    result = small_bh_api._run_kda_prefill_cute_small_bh(
+        **_small_bh_run_kwargs(
+            inputs,
+            initial_state=state,
+            output=output,
+            lower_bound=lower_bound,
+        )
+    )
+
+    assert result[0] is output
+    assert result[1] is None
+    args, kwargs = calls[0]
+    assert args[0] is inputs["q"]
+    assert args[1] is inputs["k"]
+    assert args[2] is inputs["v"]
+    assert args[3] is inputs["g"]
+    assert args[4] is inputs["beta"]
+    assert kwargs["gate_scale"] == expected_gate_scale
+    assert kwargs["gate_lower_bound"] is expected_gate_lower_bound
+    assert kwargs["transpose_state"] is True
+    assert kwargs["state_input"] is state
+    assert kwargs["state_output"] is state
+    assert kwargs["output"] is output
+    assert len(kwargs["workspace_tensors"]) == 6
+
+
+def test_small_bh_packed_runner_uses_flat_abi_and_padded_workspace(
+    monkeypatch,
+):
+    _mock_small_bh_cuda(monkeypatch)
+    calls = []
+
+    def implementation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return kwargs["output"], kwargs["state_output"]
+
+    _mock_small_bh_kernel(monkeypatch, implementation)
+    inputs = _small_bh_inputs(token_count=3, num_heads=8)
+    output = torch.empty_like(inputs["q"])
+    state = torch.empty((2, 8, 128, 128), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int64)
+
+    result = small_bh_api._run_kda_prefill_cute_small_bh(
+        **_small_bh_run_kwargs(
+            inputs,
+            initial_state=state,
+            output_final_state=True,
+            output=output,
+            cu_seqlens=cu_seqlens,
+        )
+    )
+
+    assert result[0] is output
+    assert result[1] is state
+    args, kwargs = calls[0]
+    for index, name in enumerate(("q", "k", "v", "g", "beta")):
+        assert args[index].data_ptr() == inputs[name].data_ptr()
+        assert args[index].ndim == inputs[name].ndim - 1
+    assert kwargs["output"].data_ptr() == output.data_ptr()
+    assert kwargs["cu_seqlens"] is cu_seqlens
+    assert kwargs["cu_seqlens"].dtype == torch.int64
+    assert kwargs["max_seqlen"] == 2
+    qd, kd, kr, mqk, mkk, gk = kwargs["workspace_tensors"]
+    assert qd.shape == kd.shape == kr.shape == (131, 8, 128)
+    assert mqk.shape == mkk.shape == (9, 8, 16, 16)
+    assert gk.shape == (9, 8, 128)
+
+
+def test_small_bh_packed_max_sequence_length_reuses_warmed_metadata(monkeypatch):
+    workspace = SimpleNamespace(
+        _packed_metadata_lock=threading.Lock(),
+        _packed_metadata_tensor=None,
+        _packed_metadata_signature=None,
+        _packed_metadata=None,
+    )
+    q = torch.empty((1, 6, 8, 128), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 1, 2, 6], dtype=torch.int64)
+    monkeypatch.setattr(small_bh_api, "_get_stream_workspace", lambda device: workspace)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    assert small_bh_api._packed_max_sequence_length(q, cu_seqlens, None) == 4
+    warmed_metadata = workspace._packed_metadata
+    assert small_bh_api._packed_max_sequence_length(q, cu_seqlens, None) == 4
+    assert workspace._packed_metadata is warmed_metadata
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert small_bh_api._packed_max_sequence_length(q, cu_seqlens, workspace) == 4
+    cu_seqlens.copy_(torch.tensor([0, 3, 4, 6], dtype=torch.int64))
+    with pytest.raises(RuntimeError, match="metadata is not warmed"):
+        small_bh_api._packed_max_sequence_length(q, cu_seqlens, workspace)
 
 
 def test_public_prefill_backend_option_routes_to_cute_dsl(monkeypatch):
@@ -1027,6 +1386,13 @@ def flash_kda_device(cuda_device):
     return cuda_device
 
 
+@pytest.fixture
+def small_bh_device(flash_kda_device):
+    if not is_cute_dsl_available():
+        pytest.skip("small-bh prefill requires the optional CuTe DSL runtime")
+    return flash_kda_device
+
+
 @pytest.mark.parametrize(
     ("compute_capability", "cuda_version", "expected_target", "error_match"),
     [
@@ -1324,6 +1690,11 @@ def test_frozen_prefill_missing_selected_module_is_fail_closed(
         packed=False,
         initial_state=True,
         seed=23_306,
+    )
+    monkeypatch.setattr(
+        small_bh_api,
+        "_is_kda_prefill_cute_small_bh_eligible",
+        lambda **kwargs: False,
     )
     monkeypatch.setattr(
         kda_prefill_cute_api,
@@ -3686,6 +4057,7 @@ def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
     output, state = recurrent_kda(
         **_strict_prefill_kwargs(inputs, lower_bound=None),
         output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
 
     assert output.shape == inputs["q"].shape
@@ -4359,6 +4731,7 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=16,
+        backend="cake",
     )
     assert output.shape == inputs["q"].shape
     assert returned_state is state_pool
@@ -4395,7 +4768,9 @@ def test_unaligned_strided_beta_uses_internal_tma_workspace(cuda_device, monkeyp
     inputs["beta"] = beta_carrier[None, :, 7:19]
 
     recurrent_kda(
-        **_strict_prefill_kwargs(inputs), output=torch.empty_like(inputs["q"])
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
 
     (args,) = module.calls
@@ -4425,7 +4800,9 @@ def test_aligned_h6_strided_beta_uses_head_padded_tma_workspace(
     assert inputs["beta"].stride(-2) == 32
 
     recurrent_kda(
-        **_strict_prefill_kwargs(inputs), output=torch.empty_like(inputs["q"])
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
     )
 
     (args,) = module.calls
@@ -4472,6 +4849,7 @@ def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
         recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             output=inputs["q"].view_as(inputs["q"]),
+            backend="cake",
         )
     assert module.calls == []
 
@@ -5209,6 +5587,147 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_cuda_graph_replay(
     )
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "num_heads", "packed", "has_initial_state", "lower_bound"),
+    (
+        pytest.param((17,), 1, False, False, -5.0, id="fixed-h1-bounded"),
+        pytest.param((65,), 4, False, True, None, id="fixed-h4-unbounded"),
+        pytest.param((17, 33), 8, True, False, -5.0, id="packed-h8-bounded"),
+        pytest.param((1, 65), 12, True, True, None, id="packed-h12-unbounded"),
+    ),
+)
+def test_small_bh_prefill_matches_reference(
+    small_bh_device,
+    seq_lens,
+    num_heads,
+    packed,
+    has_initial_state,
+    lower_bound,
+):
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=has_initial_state,
+        seed=3100 + num_heads,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": (
+            inputs["initial_state"].clone()
+            if inputs["initial_state"] is not None
+            else None
+        ),
+    }
+    expected_output, expected_state = _reference(
+        reference_inputs,
+        lower_bound=lower_bound,
+    )
+    output = torch.empty_like(inputs["q"])
+    state_identity = inputs["initial_state"]
+    seq_order = (
+        torch.arange(
+            len(seq_lens) - 1,
+            -1,
+            -1,
+            dtype=torch.int32,
+            device=small_bh_device,
+        )
+        if packed
+        else None
+    )
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=lower_bound),
+        output=output,
+        output_final_state=True,
+        seq_order=seq_order,
+        backend="small-bh",
+    )
+
+    assert actual_output.data_ptr() == output.data_ptr()
+    if state_identity is None:
+        assert actual_state is not None
+    else:
+        assert actual_state is state_identity
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_small_bh_prefill_cuda_graph_replay_matches_reference(small_bh_device):
+    inputs = _make_inputs(
+        seq_lens=(17, 33),
+        num_heads=4,
+        packed=True,
+        initial_state=True,
+        seed=3141,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(small_bh_device)
+    seq_order = torch.tensor([1, 0], dtype=torch.int32, device=small_bh_device)
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "seq_order": seq_order,
+        "prefill_workspace": workspace,
+        "backend": "small-bh",
+    }
+    capture_stream = torch.cuda.Stream(device=small_bh_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(small_bh_device))
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.zero_()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    expected_output, expected_state = _reference(
+        {
+            **inputs,
+            "initial_state": initial_state_seed.clone(),
+        }
+    )
+    inputs["initial_state"].copy_(initial_state_seed)
+    eager_output, eager_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="small-bh",
+    )
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    torch.testing.assert_close(replay_output, eager_output, atol=0, rtol=0)
+    torch.testing.assert_close(replay_state, eager_state, atol=0, rtol=0)
+    torch.testing.assert_close(
+        replay_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("non_default_stream", [False, True])
 def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_stream):
@@ -5241,6 +5760,7 @@ def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_
                 output=output,
                 output_final_state=True,
                 seq_order=seq_order,
+                backend="cake",
             )
         stream.synchronize()
     else:
@@ -5249,6 +5769,7 @@ def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_
             output=output,
             output_final_state=True,
             seq_order=seq_order,
+            backend="cake",
         )
 
     assert actual_output.data_ptr() == output.data_ptr()
@@ -5768,6 +6289,7 @@ def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        backend="cake",
     )
 
     assert actual_state is state_pool
@@ -5818,6 +6340,7 @@ def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
         return recurrent_kda(
             **_strict_prefill_kwargs(sliced, lower_bound=None),
             output_final_state=True,
+            backend="cake",
         )
 
     full_output, full_state = run_slice(0, 321, initial_state.clone())
@@ -6135,6 +6658,7 @@ def test_frozen_prefill_non_aligned_heads_graph_refreshes_beta(
         "output": output,
         "output_final_state": True,
         "prefill_workspace": workspace,
+        "backend": "cake",
     }
 
     with torch.cuda.stream(capture_stream):
@@ -6178,6 +6702,7 @@ def test_frozen_prefill_non_aligned_heads_graph_refreshes_beta(
         output=eager_output_storage,
         output_final_state=True,
         prefill_workspace=eager_workspace,
+        backend="cake",
     )
     torch.cuda.synchronize()
 
@@ -6218,6 +6743,7 @@ def test_frozen_prefill_cuda_graph_workspaces_are_isolated(flash_kda_device):
             "output": output,
             "output_final_state": True,
             "prefill_workspace": workspace,
+            "backend": "cake",
         }
         capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
         with torch.cuda.stream(capture_stream):
