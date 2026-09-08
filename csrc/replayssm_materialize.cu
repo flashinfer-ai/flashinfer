@@ -50,7 +50,7 @@ struct MaterializeParams {
   const int32_t* replay_prefix_len;
   const int32_t* active_request_indices;
   const int64_t* rand_seed;
-  int batch, layers, heads, ring_buffer_len, pad_slot_id;
+  int32_t batch, layers, heads, ring_buffer_len, pad_slot_id;
 };
 
 __device__ __forceinline__ void advance_persistent_coordinates(
