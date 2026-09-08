@@ -363,7 +363,10 @@ def _assert_grouped_close(y, ref, *, combine_format: str):
     else:
         assert snr_db > 20.0, f"quantized combine SNR {snr_db:.1f} dB"
         torch.testing.assert_close(
-            y.float(), ref.float(), rtol=0.25, atol=0.08,
+            y.float(),
+            ref.float(),
+            rtol=0.25,
+            atol=0.08,
         )
     print(f"grouped combine ({combine_format}) SNR vs exact ref: {snr_db:.1f} dB")
 
@@ -843,12 +846,41 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_blockwise_coop_n256(cluster_shape_mnk):
         # heuristic rows re-calibrated on 2026-09-02/03 (see TUNING.md).
         ("per_tensor", True, (256, 16, 128), False, (2, 1, 1), "epi_warps", 8),
         ("per_tensor", True, (128, 64, 128), False, (1, 2, 1), "epi_warps", 64),
-        ("blockwise", False, (64, 256, 128), False, (2, 2, 1), "reuse_dispatch_warps", 2048),
-        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "reuse_dispatch_warps", 2048),
-        ("blockwise", False, (64, 256, 128), False, (1, 2, 1), "reuse_dispatch_warps", 2048),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 1, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (1, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
     ],
-    ids=["pt8_coop_M256N16", "pt64_basic_M128N64", "bw_coop_N256_cga22_reuse",
-         "bw_coop_N256_cga21_reuse", "bw_coop_N256_cga12_reuse"],
+    ids=[
+        "pt8_coop_M256N16",
+        "pt64_basic_M128N64",
+        "bw_coop_N256_cga22_reuse",
+        "bw_coop_N256_cga21_reuse",
+        "bw_coop_N256_cga12_reuse",
+    ],
 )
 def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
     """Bit-exact check of every heuristic row changed by the fold re-calibration.
