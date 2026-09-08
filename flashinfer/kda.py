@@ -32,6 +32,7 @@ import torch
 from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
+from .jit import flash_kda_indexed as _flash_kda_indexed
 from .api_logging import flashinfer_api
 from .kda_backward import (
     RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
@@ -79,6 +80,9 @@ def recurrent_kda(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     *,
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
     backend: Literal["auto", "cute-dsl", "cake"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -99,6 +103,11 @@ def recurrent_kda(
     contracts and keeps Cake as the feature-complete fallback; use
     ``backend="cake"`` to select and benchmark the generated portfolio
     explicitly.
+    Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
+    frozen Cake specialization automatically. The Cake path accepts any
+    positive runtime head count, so Kimi-Linear tensor parallelism maps global
+    H32 to per-rank H32/H16/H8/H4 without an adapter. Other decode and
+    speculative-decode calls retain the CuTe DSL backend.
 
     Args:
         q (torch.Tensor):
@@ -132,13 +141,15 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
-            decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
-            count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
-            omitted. For eligible frozen prefill with ``ssm_state_indices``,
-            this is a state pool ``[N_pool, H, 128, 128]`` whose inner slots
-            are contiguous; padding between pool slots is allowed.
+            Initial state of shape ``[N, HV, V, K]``. Must normally be
+            bfloat16; the source-only generated indexed prefill domain requires
+            float32. If ``None``, zero-initialized. Updated in-place. For
+            batched spec decode without ``cu_seqlens``, ``N`` is the packed
+            checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
+            ``ssm_state_indices`` is omitted. For eligible frozen prefill with
+            ``ssm_state_indices``, this is a state pool
+            ``[N_pool, H, 128, 128]`` whose inner slots are contiguous;
+            padding between pool slots is allowed.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -148,7 +159,9 @@ def recurrent_kda(
             ``g``. Default: ``False``.
         lower_bound (Optional[float]):
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula instead of softplus. Must be negative.
+            gate formula. If ``None``, uses
+            ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
+            negative.
         cu_seqlens (Optional[torch.Tensor]):
             Contiguous CUDA cumulative sequence lengths of shape ``[N+1]``.
             May be int32 or int64. Frozen prefill converts int32 offsets to
@@ -192,6 +205,19 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        disable_state_update (bool):
+            Frozen / speculative-verify mode: compute outputs for up to 16
+            tokens per sequence from the committed state and never write any
+            state back (``final_state`` is ``None``). See
+            :func:`flashinfer.kda_decode.recurrent_kda` for the full mode
+            contract, including the optional slot-indexed
+            ``correction_cache`` / ``kg_cache`` verify outputs.
+        correction_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed float32 per-token delta-rule
+            corrections ``[num_slots, HV, T_max, V]``.
+        kg_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
+            cache ``[num_slots, HV, T_max, 2*K]``.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
             permutation of shape ``[N]``. For eager CuTe DSL packed engine
@@ -219,10 +245,14 @@ def recurrent_kda(
             Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
             frozen prefill. Row zero for each sequence is its initial state;
             later rows are the states before token blocks beginning at
-            ``N, 2N, ...``. Required when ``checkpoint_every_n_tokens > 0``.
+            ``N, 2N, ...``. ``C`` must be at least
+            ``checkpoint_cu_starts[N_seq]``; this capacity contract is not
+            host-validated. Required when ``checkpoint_every_n_tokens > 0``.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
-            Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
+            The first value must be zero, and each consecutive difference must
+            equal ``ceil(seq_len / checkpoint_every_n_tokens)`` for that
+            sequence.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
@@ -322,9 +352,122 @@ def recurrent_kda(
                 **sm120_prefill_kwargs
             )
 
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        # Frozen / speculative-verify mode (mirrors GDN's
+        # gated_delta_rule_mtp flag): outputs only, no state writes,
+        # optional slot-indexed correction/kg caches. Handled ahead of the
+        # prefill routing — none of the prefill-only features apply.
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if output_final_state:
+            raise ValueError(
+                "output_final_state=True is incompatible with "
+                "disable_state_update=True (no state is produced)"
+            )
+        if num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens applies to the state-updating fused "
+                "spec path, not the frozen-verify mode"
+            )
+        if (
+            seq_order is not None
+            or prefill_workspace is not None
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or checkpoint_every_n_tokens != 0
+        ):
+            raise ValueError(
+                "prefill-only arguments are incompatible with disable_state_update=True"
+            )
+        return _kda_decode._run_frozen_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            output=output,
+            initial_state=initial_state,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+        )
+
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    use_generated_indexed_prefill = (
+        backend == "cake"
+        and is_plain_prefill
+        and _flash_kda_indexed.flash_kda_indexed_prefill_is_eligible(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+    )
+    if use_generated_indexed_prefill:
+        assert A_log is not None
+        assert dt_bias is not None
+        assert initial_state is not None
+        assert ssm_state_indices is not None
+        assert lower_bound is not None
+        return _flash_kda_indexed._run_flash_kda_indexed_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            state_indices=ssm_state_indices,
+        )
     try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
@@ -393,7 +536,16 @@ def recurrent_kda(
             )
 
     use_flash_kda_prefill = (
-        backend != "cute-dsl"
+        not (
+            isinstance(initial_state, torch.Tensor)
+            and initial_state.dtype == torch.float32
+            and (
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            )
+        )
+        and backend != "cute-dsl"
         and _kda_prefill._flash_kda_prefill_is_eligible(
             q=q,
             k=k,
@@ -419,10 +571,21 @@ def recurrent_kda(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
     )
+    if (
+        backend in ("auto", "cake")
+        and is_plain_prefill
+        and isinstance(initial_state, torch.Tensor)
+        and initial_state.dtype == torch.float32
+        and (
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        )
+    ):
+        raise ValueError("FP32 state checkpoints are not supported by Cake prefill")
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None
-        assert lower_bound is not None
         return _kda_prefill._run_flash_kda_prefill(
             q=q,
             k=k,
@@ -443,7 +606,6 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            backend="cake",
         )
 
     if backend == "cake" and is_plain_prefill:
@@ -496,7 +658,7 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
-        backend="cake" if backend == "cake" else "cute-dsl",
+        backend=backend,
     )
 
 

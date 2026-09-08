@@ -514,7 +514,9 @@ class B12xMoEWrapper:
         static_max_rows = (
             min(
                 max_routed_rows,
-                _get_static_compact_cutover_pairs(self.activation_precision),
+                _get_static_compact_cutover_pairs(
+                    self.activation_precision, quant_mode=self.quant_mode
+                ),
             )
             if needs_dynamic
             else max_routed_rows

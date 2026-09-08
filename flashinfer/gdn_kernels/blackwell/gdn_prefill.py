@@ -64,7 +64,13 @@ def _get_compiled_cache(
     initial_state_inner_strides: tuple[int, ...] | None,
     output_state_inner_strides: tuple[int, ...] | None,
 ):
-    """Return a mutable dict that lazily stores the compiled kernel."""
+    """Return a mutable dict that lazily stores the compiled kernel.
+
+    Holds only the compiled callable and static metadata (``num_sm``). Mutable
+    execution state such as workspaces must not be stored here: the dict is
+    process-global per specialization, so any buffer it holds is shared across
+    streams and CUDA graphs.
+    """
     return {}
 
 
@@ -339,10 +345,11 @@ def chunk_gated_delta_rule_sm100(
     workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
         num_sm, B, HQ, HV, True
     )
-    ws_key = f"workspace_{q.device.index}"
-    if ws_key not in cache or cache[ws_key].size(0) < workspace_size:
-        cache[ws_key] = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
-    workspace = cache[ws_key]
+    # Fresh per-call allocation: the kernel writes TMA tensormap descriptors into
+    # the workspace on every launch, so a cached buffer shared across streams lets
+    # concurrent same-specialization calls clobber each other's descriptors. The
+    # caching allocator makes this near-free next to the prefill kernel itself.
+    workspace = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(

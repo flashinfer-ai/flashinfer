@@ -45,11 +45,9 @@ from flashinfer.attention.prims_ts import (
     batch_decode_mla_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
-    MAX_SPLITS,
     make_mla_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
-    MlaDecodeTs,
     build_mla_decode_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
@@ -57,6 +55,12 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources 
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.kernel_policy import (
     select_mla_ts_kernel,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
+    FlatQueryTileLayout,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+    make_throughput_latency_mla_config,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_decode_mla_workspace_size,
@@ -78,6 +82,10 @@ _ROPE_DIM = 64
 _QK_DIM = _LATENT_DIM + _ROPE_DIM
 _DEFAULT_PAGE_SIZE = 32
 _FP8_PROBABILITY_SCALE = 448.0
+# CUTLASS DSL CUDA graphs retain raw pointers into their wrapper and input
+# allocations. Keep only graph-parity anchor owners alive until module teardown
+# so later parametrized cases cannot reuse those allocations prematurely.
+_CUDA_GRAPH_ANCHOR_OWNERS: list[tuple[object, ...]] = []
 _MLA_INTERNAL_TUNING_PARAMETERS = frozenset(
     {
         "autotuner",
@@ -123,6 +131,39 @@ _INTERNAL_TUNING_TOKEN_SEQUENCES = (
     ("single", "kv"),
     ("tensor", "cores"),
 )
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,tile_size_q,expected",
+    (
+        (128, 3, 128, (384, 3, 128)),
+        (96, 3, 128, (288, 3, 32)),
+        (12, 11, 128, (132, 2, 4)),
+        (12, 2, 8, (24, 3, 8)),
+        (96, 2, 64, (192, 3, 64)),
+        (12, 4, 16, (48, 3, 16)),
+        (48, 4, 64, (192, 3, 64)),
+    ),
+)
+def test_attention_ts_mla_flat_query_tile_layout(
+    num_heads, seq_len_q, tile_size_q, expected
+):
+    layout = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, tile_size_q)
+    assert (layout.total_rows, layout.num_tiles, layout.tail_rows) == expected
+    assert layout.logical_num_heads_q == num_heads
+    assert layout.logical_seq_len_q == seq_len_q
+    assert layout.tile_size_q == tile_size_q
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,tile_size_q",
+    ((0, 1, 128), (64, 0, 128), (64, 1, 0), (-1, 1, 8)),
+)
+def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
+    num_heads, seq_len_q, tile_size_q
+):
+    with pytest.raises(ValueError):
+        FlatQueryTileLayout.for_tile(num_heads, seq_len_q, tile_size_q)
 
 
 @dataclass(frozen=True)
@@ -255,8 +296,8 @@ def _pack_mla_case(
 
     if case.query.ndim != 4 or len(q_lens) != case.query.shape[0]:
         raise ValueError("packed-Q source must be [B, SQ, H, 576] with B lengths")
-    if min(q_lens) <= 0 or max(q_lens) > case.query.shape[1]:
-        raise ValueError("packed Q lengths must be positive and within source SQ")
+    if min(q_lens) < 0 or max(q_lens) > case.query.shape[1]:
+        raise ValueError("packed Q lengths must be nonnegative and within source SQ")
     offsets = [0]
     for q_len in q_lens:
         offsets.append(offsets[-1] + q_len)
@@ -433,7 +474,16 @@ def _mla_reference(
                     probabilities @ visible_cache[:, :_LATENT_DIM] * case.bmm2_scale
                 )
             request_outputs.append(output)
-        outputs.append(torch.stack(request_outputs))
+        if request_outputs:
+            outputs.append(torch.stack(request_outputs))
+        else:
+            outputs.append(
+                torch.empty(
+                    (0, request_queries.shape[1], _LATENT_DIM),
+                    dtype=torch.float32,
+                    device=request_queries.device,
+                )
+            )
     return torch.cat(outputs) if qo_indptr is not None else torch.stack(outputs)
 
 
@@ -464,32 +514,6 @@ def _case(
     }
 
 
-def _policy(
-    kernel: str,
-    tile_size_q: int,
-    split_kv: int,
-    head_dim_per_cta_v: int,
-    *,
-    cluster: bool,
-    persistent: bool = False,
-    clc: bool = False,
-    schedulers: bool = True,
-) -> dict[str, object]:
-    expected = {
-        "kernel": kernel,
-        "tile_size_q": tile_size_q,
-        "split_kv": split_kv,
-        "head_dim_per_cta_v": head_dim_per_cta_v,
-        "use_cluster_reduction": cluster,
-    }
-    if schedulers:
-        expected.update(
-            use_persistent_scheduler=persistent,
-            use_clc_dynamic_persistent_scheduler=clc,
-        )
-    return expected
-
-
 def _param(
     case_kwargs: dict[str, object],
     expected_policy: dict[str, object],
@@ -512,39 +536,48 @@ def _param(
 _MLA_CASES = (
     _param(
         _case(2, 8, 2048, torch.bfloat16, 32001),
-        _policy("throughput_latency_1cta", 8, 8, 128, cluster=True),
+        {
+            "kernel": "throughput_latency_1cta",
+            "use_cluster_reduction": True,
+        },
         "identity",
         False,
         exercise_all_paths=True,
-        id="M1-bf16-q8-v128-s8-cluster",
+        id="bf16-1cta-cluster-reduction",
     ),
     _param(
         _case(4, 16, 4097, torch.float8_e4m3fn, 32002),
-        _policy("throughput_latency_1cta", 16, 9, 128, cluster=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "mixed",
         True,
-        id="M2-fp8-q16-v128-s9-separate",
+        id="fp8-1cta-parallel-reduction",
     ),
     _param(
         _case(128, 32, 2048, torch.bfloat16, 32003),
-        _policy("throughput_latency_1cta", 32, 1, 512, cluster=False),
+        {"kernel": "throughput_latency_1cta", "split_kv": 1},
         None,
         False,
-        id="M3-bf16-q32-v512-direct-one-wave",
+        id="bf16-1cta-direct",
     ),
     _param(
         _case(128, 64, 2048, torch.float8_e4m3fn, 32004),
-        _policy("throughput_latency_1cta", 64, 1, 512, cluster=False),
+        {"kernel": "throughput_latency_1cta", "split_kv": 1},
         "identity",
         False,
-        id="M4-fp8-q64-keeps-direct-static",
+        id="fp8-1cta-direct",
     ),
     _param(
         _case(8, 128, 2048, torch.float8_e4m3fn, 32005),
-        _policy("throughput_2cta", 128, 8, 256, cluster=False),
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         "mixed",
         False,
-        id="M5-fp8-2cta-q128-v256-s8-separate",
+        id="fp8-2cta-reference-reduction",
     ),
     _param(
         _case(
@@ -555,18 +588,24 @@ _MLA_CASES = (
             32006,
             seq_len_q=4,
         ),
-        _policy("throughput_latency_1cta", 64, 17, 256, cluster=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "mixed",
         False,
-        id="M6-fp8-sq4-grouped-q64-v256-s17",
+        id="fp8-multi-q-1cta-parallel-reduction",
     ),
     _param(
         _case(4, 16, 4097, torch.bfloat16, 32007, seq_len_q=8),
-        _policy("throughput_2cta", 128, 17, 256, cluster=False),
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         "identity",
         False,
         exercise_all_paths=True,
-        id="M7-bf16-sq8-grouped-2cta-q128-v256-s17",
+        id="bf16-multi-q-2cta-reference-reduction",
     ),
     _param(
         _case(
@@ -578,40 +617,45 @@ _MLA_CASES = (
             seq_len_q=4,
             mask_type="dense",
         ),
-        _policy("throughput_latency_1cta", 64, 9, 128, cluster=False, schedulers=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "tail",
         False,
-        id="M8-spec-dense-tail-visible",
+        id="speculative-dense-tail",
     ),
     _param(
         _case(2, 16, 2049, torch.bfloat16, 32008, seq_len_q=4),
-        _policy("throughput_latency_1cta", 64, 9, 128, cluster=False, schedulers=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "tail",
         False,
-        id="M9-spec-causal-tail-progressive",
+        id="speculative-causal-tail",
     ),
     _param(
         _case(128, 128, 2048, torch.bfloat16, 32009),
-        _policy(
-            "throughput_2cta",
-            128,
-            1,
-            256,
-            cluster=False,
-            persistent=True,
-            clc=True,
-        ),
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
         None,
         False,
-        id="M10-bf16-2cta-q128-direct-clc",
+        id="bf16-2cta-persistent-direct",
     ),
     _param(
         _case(5, 65, 256, torch.bfloat16, 32010, seq_len_q=2),
-        _policy("throughput_2cta", 128, 2, 256, cluster=False)
-        | {"separate_reducer_impl": "reference"},
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         None,
         False,
-        id="M11-bf16-2cta-q128-s2-reducer-tail",
+        id="bf16-2cta-reference-reducer-tail",
     ),
     _param(
         _case(
@@ -622,18 +666,15 @@ _MLA_CASES = (
             32011,
             page_size=128,
         ),
-        _policy(
-            "throughput_2cta",
-            128,
-            1,
-            256,
-            cluster=False,
-            persistent=True,
-            clc=True,
-        ),
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
         None,
         False,
-        id="M12-bf16-b128-h128-k4097-page128-direct-clc",
+        id="bf16-page128-2cta-persistent-direct",
     ),
 )
 
@@ -765,14 +806,15 @@ def _assert_auto_policy(
     *,
     device: torch.device,
 ) -> None:
-    """Contract exact B200 coverage and portable Blackwell legality."""
+    """Contract requested feature coverage and portable Blackwell legality."""
 
     assert policy["source"] == "auto"
     assert policy["kernel"] in ("throughput_latency_1cta", "throughput_2cta")
     assert policy["tile_size_q"] in (8, 16, 32, 64, 128)
     assert policy["tile_size_kv"] == 128
     assert int(policy["num_insts_kv"]) in (1, 2)
-    assert int(policy["split_kv"]) >= 1
+    split_kv = int(policy["split_kv"])
+    assert split_kv >= 1
     head_dim_per_cta_v = int(policy["head_dim_per_cta_v"])
     num_ctas_per_head_dim = int(policy["num_ctas_per_head_dim"])
     assert head_dim_per_cta_v in (128, 256, 512)
@@ -781,9 +823,16 @@ def _assert_auto_policy(
     use_cluster = bool(policy["use_cluster_reduction"])
     persistent = bool(policy["use_persistent_scheduler"])
     use_clc = bool(policy["use_clc_dynamic_persistent_scheduler"])
+    separate_reducer = policy["separate_reducer_impl"]
+    assert separate_reducer in ("none", "reference", "parallel")
     if use_cluster:
-        assert int(policy["split_kv"]) > 1
+        assert split_kv > 1
         assert policy["kernel"] == "throughput_latency_1cta"
+        assert separate_reducer == "none"
+    if separate_reducer != "none":
+        assert split_kv > 1
+    if split_kv == 1:
+        assert separate_reducer == "none"
     if use_clc:
         assert persistent
     if policy["kernel"] == "throughput_2cta":
@@ -830,6 +879,8 @@ def _assert_case_correct(output, case, policy, *, qo_indptr=None):
     )
     rtol, atol = _mla_tolerances(case.query.dtype)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    if expected.numel() == 0:
+        return
     relative_l2 = torch.linalg.vector_norm(
         actual - expected
     ) / torch.linalg.vector_norm(expected)
@@ -872,6 +923,7 @@ def _exercise_public_paths(
     torch.cuda.synchronize()
     _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+    _CUDA_GRAPH_ANCHOR_OWNERS.append((graph, graph_out, wrapper, case))
     return eager
 
 
@@ -989,7 +1041,6 @@ def _make_clc_work_queue(cfg) -> MlaWorkQueue:
         cfg=cfg,
         static_split_kv=1,
         static_seq_len_k=128,
-        groups_tokens_heads_q_ratio=1,
         logical_num_heads_q=128,
         logical_seq_len_q=1,
         static_problem_shape_b=1,
@@ -1222,6 +1273,33 @@ def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
         )
 
 
+def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
+    """Keep partial flat-row tails on the predicated standalone reducer."""
+
+    config_kwargs = {
+        "batch_size": 1,
+        "num_heads_q": 8,
+        "seq_len_q": 1,
+        "seq_len_kv": 4096,
+        "logical_num_heads_q": 5,
+        "logical_seq_len_q": 1,
+        "tile_size_q": 8,
+        "explicit_split_kv": 2,
+        "max_active_clusters": 148,
+    }
+    automatic = make_throughput_latency_mla_config(**config_kwargs)
+    assert automatic.use_cluster_reduction == 0
+
+    with pytest.raises(
+        ValueError,
+        match=r"cluster reduction requires every launched Q tile.*tail_rows=5",
+    ):
+        make_throughput_latency_mla_config(
+            **config_kwargs,
+            reduction_mode="cluster",
+        )
+
+
 def test_attention_ts_mla_int32_kv_coordinate_bound():
     """The public K/V bound reserves the largest padded split-KV span."""
 
@@ -1252,6 +1330,12 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
         batch_size=1,
         num_heads=1,
         max_seq_len_q=2**31 - 1,
+    )
+    mla_decode_module._validate_mla_query_head_extent(
+        batch_size=1,
+        num_heads=1,
+        max_seq_len_q=1,
+        total_q=0,
     )
     with pytest.raises(
         NotImplementedError,
@@ -1285,16 +1369,25 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
         )
 
 
-def test_attention_ts_mla_2cta_reduction_capacity_bound():
-    """The producer and standalone reducer expose the same split capacity."""
-
-    assert MAX_SPLITS == 128
-    assert MlaDecodeTs().reduction_split_capacity == MAX_SPLITS
+@pytest.mark.parametrize(
+    ("offsets", "expected"),
+    (
+        pytest.param((0, 8, 8, 9, 12), (8, 12, (8, 0, 1, 3)), id="mixed"),
+        pytest.param((0, 0, 0), (0, 0, (0, 0)), id="all-empty"),
+    ),
+)
+def test_attention_ts_mla_packed_q_offsets_allow_zero_lengths(offsets, expected):
+    qo_indptr = torch.tensor(offsets, dtype=torch.int32)
     assert (
-        MlaDecodeTs(static_split_kv=MAX_SPLITS).reduction_split_capacity == MAX_SPLITS
+        mla_decode_module._derive_max_seq_len_q(qo_indptr, batch_size=len(offsets) - 1)
+        == expected
     )
-    with pytest.raises(ValueError, match=r"static_split_kv must be in \[1, 128\]"):
-        MlaDecodeTs(static_split_kv=MAX_SPLITS + 1)
+
+
+def test_attention_ts_mla_packed_q_offsets_reject_decrease():
+    qo_indptr = torch.tensor((0, 2, 1), dtype=torch.int32)
+    with pytest.raises(ValueError, match="qo_indptr must be nondecreasing"):
+        mla_decode_module._derive_max_seq_len_q(qo_indptr, batch_size=2)
 
 
 def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
@@ -1497,23 +1590,12 @@ def test_attention_ts_mla_fp8_reference_uses_p448():
                 "qkv_dtype": torch.float8_e4m3fn,
                 "seed": 20260808,
             },
-            _policy("throughput_latency_1cta", 16, 3, 128, cluster=True),
+            {
+                "kernel": "throughput_latency_1cta",
+                "use_cluster_reduction": True,
+            },
             0,
             id="smem-p-cluster",
-        ),
-        pytest.param(
-            {
-                "batch_size": 64,
-                "num_qo_heads": 64,
-                "max_seq_len": 257,
-                "kv_seq_lens": (257,) + (1,) * 63,
-                "qkv_dtype": torch.float8_e4m3fn,
-                "seed": 20260809,
-            },
-            _policy("throughput_latency_1cta", 64, 2, 512, cluster=False)
-            | {"separate_reducer_impl": "parallel"},
-            8_421_376,
-            id="tmem-p-separate",
         ),
     ),
 )
@@ -1559,9 +1641,9 @@ def test_attention_ts_mla_speculative_mask_oracle_distinguishes_tail_visibility(
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_q_public_parity():
-    """Define variable runtime Q lengths exclusively with cumulative offsets."""
+    """Define variable and empty runtime Q lengths with cumulative offsets."""
 
-    q_lens = (1, 3, 8)
+    q_lens = (1, 0, 8)
     max_seq_len_q = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
@@ -1633,10 +1715,10 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_packed_q_clc_empty_group_progress():
-    """Advance CLC bookkeeping when a packed request has no row in a Q group."""
+def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
+    """Advance CLC bookkeeping when a packed request has no row in a Q tile."""
 
-    q_lens = tuple(1 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
+    q_lens = tuple(0 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
     max_seq_len_q = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
@@ -1784,7 +1866,7 @@ def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
 def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     """One replay reloads packed Q offsets, K lengths, and every page-table row."""
 
-    q_lens = tuple(1 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
+    q_lens = tuple(0 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
     replay_q_lens = tuple(reversed(q_lens))
     max_seq_len_q = max(q_lens)
     case = _make_mla_case(
@@ -1961,6 +2043,210 @@ def test_attention_ts_mla_decode_head_dtype_product(
     _exercise_auto_mla_case(case)
 
 
+@pytest.mark.parametrize("num_qo_heads", (12, 96), ids=("h12", "h96"))
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
+    num_qo_heads: int,
+    packed_query: bool,
+):
+    """One resolved topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_mla_case(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=1024,
+            qkv_dtype=torch.bfloat16,
+            device="cuda",
+            seed=39000 + num_qo_heads + batch_size,
+        )
+        qo_indptr = None
+        if packed_query:
+            case, qo_indptr = _pack_mla_case(case, (1,) * batch_size)
+        wrapper = _plan_case(
+            case,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=1 if packed_query else None,
+        )
+        policy = _policy_dict(wrapper)
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(6, 8, id="h6-sq8"),
+        pytest.param(12, 4, id="h12-sq4"),
+        pytest.param(24, 2, id="h24-sq2"),
+        pytest.param(48, 1, id="h48-sq1"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
+    num_qo_heads: int,
+    seq_len_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """Decode equivalent 48-row non-power head shapes with public auto dispatch."""
+
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=257,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40000 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    _exercise_auto_mla_case(
+        case,
+        expected_b200={"kernel": "throughput_latency_1cta"},
+    )
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_heads_1cta_split_reduction(
+    qkv_dtype: torch.dtype,
+):
+    """Validate split reduction for non-power query heads in the 1CTA family."""
+
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=12,
+        max_seq_len=32769,
+        seq_len_q=1,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40112 + (1 if qkv_dtype == _FP8 else 0),
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={"kernel": "throughput_latency_1cta"},
+    )
+    assert int(policy["split_kv"]) > 1
+
+
+@pytest.mark.parametrize(
+    "batch_size,num_qo_heads,seq_len_q,seed",
+    (
+        pytest.param(160, 6, 8, 40564, id="direct-grid"),
+        pytest.param(320, 8, 1, 40508, id="persistent-grid"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_one_cta_multiwave_progress(
+    batch_size: int,
+    num_qo_heads: int,
+    seq_len_q: int,
+    seed: int,
+):
+    """Execute every request when 1CTA work exceeds one resident wave."""
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=129,
+        seq_len_q=seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=seed,
+    )
+    _exercise_auto_mla_case(
+        case,
+        expected_b200={"kernel": "throughput_latency_1cta"},
+    )
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(96, 4, id="h96-sq4"),
+        pytest.param(48, 8, id="h48-sq8"),
+        pytest.param(24, 16, id="h24-sq16"),
+        pytest.param(12, 32, id="h12-sq32"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
+    num_qo_heads: int,
+    seq_len_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """Decode equal-row non-power head shapes through public 2CTA dispatch."""
+
+    case = _make_mla_case(
+        batch_size=16,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=1024,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=41000 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": "throughput_2cta"},
+        device=case.query.device,
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=False)
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_heads_2cta_split_reduction(
+    qkv_dtype: torch.dtype,
+):
+    """Validate split reduction for a partial M128 query tile."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=96,
+        max_seq_len=32769,
+        seq_len_q=1,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=41596 + (1 if qkv_dtype == _FP8 else 0),
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={"kernel": "throughput_2cta"},
+    )
+    assert int(policy["split_kv"]) > 1
+
+
 @pytest.mark.parametrize("num_qo_heads", (8, 16, 32, 64), ids=lambda value: f"h{value}")
 @pytest.mark.parametrize(
     "qkv_dtype",
@@ -1975,7 +2261,7 @@ def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     qkv_dtype: torch.dtype,
     mask_type: str,
 ):
-    """Cross SQ2 grouped heads with dtype and speculative mask semantics."""
+    """Cross SQ2 flat query rows with dtype and speculative mask semantics."""
 
     case = _make_mla_case(
         batch_size=3,
@@ -2030,6 +2316,172 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
         max_seq_len_q=max_seq_len_q,
     )
     assert policy["source"] == "auto"
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,expected_kernel",
+    (
+        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
+        pytest.param(96, "throughput_2cta", id="h96-2cta"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
+    num_qo_heads: int,
+    expected_kernel: str | None,
+    qkv_dtype: torch.dtype,
+):
+    """Mixed empty packed requests predicate flat tiles in both families."""
+
+    q_lens = (8, 1, 0, 3)
+    max_seq_len_q = max(q_lens)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=num_qo_heads,
+        max_seq_len=1024,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=qkv_dtype,
+        mask_type="causal",
+        page_size=64,
+        device="cuda",
+        seed=43000 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    case = _apply_mla_tail_markers(case)
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": expected_kernel} if expected_kernel is not None else {},
+        device=case.query.device,
+    )
+    assert policy["kernel"] in ("throughput_latency_1cta", "throughput_2cta")
+    eager = _exercise_public_paths(
+        wrapper,
+        case,
+        policy,
+        exercise_all_paths=True,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    one_shot = batch_decode_mla_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        mask_type=case.mask_type,
+        max_kv_len=case.max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        out_dtype=case.output_dtype,
+    )
+    _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
+    torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,expected_kernel",
+    (
+        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
+        pytest.param(96, "throughput_2cta", id="h96-2cta"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_all_empty_packed_query_noop(
+    num_qo_heads: int,
+    expected_kernel: str,
+):
+    """An explicitly bounded all-empty batch returns empty public outputs."""
+
+    q_lens = (0, 0, 0, 0)
+    max_seq_len_q = 8
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=num_qo_heads,
+        max_seq_len=257,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        page_size=64,
+        device="cuda",
+        seed=44000 + num_qo_heads,
+    )
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+
+    with pytest.raises(
+        ValueError, match="max_seq_len_q is required for an all-empty packed query"
+    ):
+        _plan_case(case, qo_indptr=qo_indptr)
+    with pytest.raises(
+        ValueError, match="max_seq_len_q is required for an all-empty packed query"
+    ):
+        batch_decode_mla_with_paged_kv_cache(
+            case.query,
+            case.kv_cache,
+            case.block_tables,
+            case.seq_lens,
+            qo_indptr=qo_indptr,
+            max_kv_len=case.max_seq_len,
+        )
+
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {"kernel": expected_kernel},
+        device=case.query.device,
+    )
+
+    eager_out = torch.empty(
+        (0, num_qo_heads, _LATENT_DIM),
+        dtype=case.output_dtype,
+        device=case.query.device,
+    )
+    eager = _run_case(wrapper, case, out=eager_out)
+    assert eager is eager_out
+    _assert_case_correct(eager, case, policy, qo_indptr=qo_indptr)
+
+    standalone = _run_standalone(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    _assert_case_correct(standalone, case, policy, qo_indptr=qo_indptr)
+
+    one_shot_out = torch.empty_like(eager)
+    one_shot = batch_decode_mla_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        mask_type=case.mask_type,
+        max_kv_len=case.max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        out=one_shot_out,
+        out_dtype=case.output_dtype,
+    )
+    assert one_shot is one_shot_out
+    _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
 
 
 @pytest.mark.parametrize(

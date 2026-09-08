@@ -16,13 +16,18 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields, replace
 import importlib
 import inspect
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
-from typing import get_args
+from typing import Callable, get_args
 import warnings
 
 import pytest
@@ -510,6 +515,58 @@ _GQA_CASES = (
 )
 
 
+_PROXY_ROUTE_CASES = (
+    _Case(
+        "proxy_bk8_swaps",
+        1,
+        1,
+        128,
+        269,
+        64,
+        8,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=32,
+        expected_kv_tile=128,
+    ),
+    _Case(
+        "proxy_bk64_keeps",
+        1,
+        1,
+        64,
+        269,
+        64,
+        64,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=64,
+        expected_kv_tile=256,
+    ),
+    _Case(
+        "proxy_bk64_keeps_kv128",
+        1,
+        1,
+        128,
+        269,
+        128,
+        64,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=128,
+        expected_kv_tile=128,
+    ),
+)
+
+
 def _make_patterns(case: _Case) -> _Patterns:
     num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
     num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
@@ -556,6 +613,11 @@ def _make_patterns(case: _Case) -> _Patterns:
                 if case.pattern == "unaligned_tail":
                     rows.append((*range(1, 9), *range(22, 30)))
                     continue
+                if case.pattern == "proxy_tail":
+                    rows.append(
+                        (0, 32) if row_idx % 2 == 1 and num_kv_blocks > 32 else (1, 3)
+                    )
+                    continue
                 selected = {0, num_kv_blocks - 1}
                 if num_kv_blocks > 2:
                     selected.add(
@@ -583,6 +645,43 @@ def _make_bsr(patterns: _Patterns) -> tuple[torch.Tensor, torch.Tensor]:
         torch.tensor(pointer_batches, device="cuda", dtype=torch.int32),
         torch.tensor(flat_indices, device="cuda", dtype=torch.int32),
     )
+
+
+def _make_exact_block_bits(
+    patterns: _Patterns,
+    num_kv_blocks: int,
+) -> torch.Tensor:
+    words_per_row = math.ceil(num_kv_blocks / 32)
+    packed_batches: list[list[list[list[int]]]] = []
+    for batch in patterns:
+        packed_heads: list[list[list[int]]] = []
+        for head in batch:
+            packed_rows: list[list[int]] = []
+            for exact_blocks in head:
+                words = [0] * words_per_row
+                for block_idx in exact_blocks:
+                    words[block_idx // 32] |= 1 << (block_idx % 32)
+                if num_kv_blocks % 32:
+                    # Out-of-range bits are intentionally high: prepare must ignore them.
+                    words[-1] |= (-1 << (num_kv_blocks % 32)) & 0xFFFFFFFF
+                packed_rows.append(words)
+            packed_heads.append(packed_rows)
+        packed_batches.append(packed_heads)
+    return torch.tensor(packed_batches, device="cuda", dtype=torch.uint32)
+
+
+def _summarize_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k_blocks: list[torch.Tensor] = []
+    v_blocks: list[torch.Tensor] = []
+    for begin in range(0, k.shape[1], kv_block_size):
+        end = min(begin + kv_block_size, k.shape[1])
+        k_blocks.append(k[:, begin:end].float().mean(dim=1).to(k.dtype))
+        v_blocks.append(v[:, begin:end].float().sum(dim=1).to(v.dtype))
+    return torch.stack(k_blocks, dim=1), torch.stack(v_blocks, dim=1)
 
 
 def _pack_token_mask(
@@ -689,6 +788,66 @@ def _reference(
             head_outputs.append(probabilities @ v[batch_idx, :, kv_head_idx].float())
         batch_outputs.append(torch.stack(head_outputs, dim=1))
     return torch.stack(batch_outputs).to(case.dtype)
+
+
+@torch.no_grad()
+def _single_row_proxy_reference(
+    case: _Case,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    exact_blocks: tuple[int, ...],
+    valid_tokens: frozenset[int],
+    k_summary: torch.Tensor,
+    v_summary: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Evaluate one MHA row with exact tokens and proxy block summaries."""
+
+    assert case.batch_size == case.num_heads == case.effective_num_kv_heads == 1
+    assert q.shape[1] <= case.q_block_size
+    exact_tokens = torch.tensor(
+        [
+            token_idx
+            for token_idx in valid_tokens
+            if token_idx // case.kv_block_size in exact_blocks
+        ],
+        device=q.device,
+        dtype=torch.int64,
+    )
+    num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
+    proxy_blocks = tuple(
+        block_idx for block_idx in range(num_kv_blocks) if block_idx not in exact_blocks
+    )
+    q_rows = q[0, :, 0].float()
+    exact_logits = (q_rows @ k[0, exact_tokens, 0].float().transpose(0, 1)) * sm_scale
+    proxy_logits = (
+        q_rows @ k_summary[0, proxy_blocks, 0].float().transpose(0, 1)
+    ) * sm_scale
+    logits = torch.cat((exact_logits, proxy_logits), dim=1)
+    weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
+    exact_count = exact_logits.shape[1]
+    exact_weights = weights[:, :exact_count]
+    proxy_weights = weights[:, exact_count:]
+    numerator = exact_weights @ v[0, exact_tokens, 0].float()
+    numerator = numerator + proxy_weights @ v_summary[0, proxy_blocks, 0].float()
+    proxy_masses = torch.tensor(
+        [
+            min(
+                case.kv_block_size,
+                case.seq_len_kv - block_idx * case.kv_block_size,
+            )
+            for block_idx in proxy_blocks
+        ],
+        device=q.device,
+        dtype=torch.float32,
+    )
+    denominator = exact_weights.sum(dim=1, keepdim=True)
+    denominator = denominator + (proxy_weights * proxy_masses[None, :]).sum(
+        dim=1,
+        keepdim=True,
+    )
+    return (numerator / denominator).to(case.dtype)[None, :, None]
 
 
 @pytest.mark.parametrize(
@@ -798,6 +957,9 @@ def test_block_sparse_wrapper_routes_are_run_inputs() -> None:
     plan_routing_parameters = {
         "block_indptr",
         "block_indices",
+        "exact_block_bits",
+        "k_summary",
+        "v_summary",
         "kv_valid_bits",
         "dynamic_metadata",
     }
@@ -809,13 +971,356 @@ def test_block_sparse_wrapper_routes_are_run_inputs() -> None:
         block_sparse_module.BlockSparseTSWrapper.run
     ).parameters
     for name in ("block_indptr", "block_indices"):
-        assert run_parameters[name].default is inspect.Parameter.empty
-    assert "kv_valid_bits" in run_parameters
+        assert run_parameters[name].default is None
+    assert {
+        "exact_block_bits",
+        "k_summary",
+        "v_summary",
+        "kv_valid_bits",
+    } <= set(run_parameters)
 
     state_fields = {field.name for field in fields(_BlockSparsePlanState)}
-    assert {"block_indptr", "block_indices", "kv_valid_bits"}.isdisjoint(state_fields)
-    assert {"num_qo_heads", "num_kv_heads"} <= state_fields
+    assert plan_routing_parameters.isdisjoint(state_fields)
+    assert {
+        "num_qo_heads",
+        "num_kv_heads",
+        "sparse_format",
+        "use_proxy_routes",
+    } <= state_fields
     assert "num_heads" not in state_fields
+
+
+def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
+    """Trace a reusable contiguous run while keeping plan geometry optional."""
+
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    q = torch.empty((2, 64, 8, 128), dtype=torch.float16)
+    k = torch.empty((2, 256, 4, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "block_indptr": torch.empty((2, 4, 2), dtype=torch.int32),
+        "block_indices": torch.empty((16,), dtype=torch.int32),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(**kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(wrapper.run, **kwargs)
+
+    # A successful plan atomically publishes this state. Avoid a CUDA plan here.
+    wrapper._plan_state = SimpleNamespace(
+        sparse_format="bsr",
+        use_proxy_routes=False,
+    )
+    defn = fi_trace(wrapper.run, **kwargs)
+    assert defn["name"].startswith("prims_ts_block_sparse_wrapper")
+    assert defn["inputs"]["q"]["shape"] == [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim",
+    ]
+    assert defn["inputs"]["k"]["shape"] == [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim",
+    ]
+    for name in ("q_block_size", "kv_block_size", "mask_type"):
+        assert defn["inputs"][name]["optional"] is True
+    assert defn["inputs"]["block_indptr"].get("optional") is not True
+
+
+@pytest.mark.parametrize(
+    ("sparse_format", "use_proxy_routes", "expected_max_blocks"),
+    (
+        ("bsr", False, 3),
+        ("bitmask", False, 4),
+        ("bsr", True, 3),
+        ("bitmask", True, 4),
+    ),
+)
+def test_contiguous_one_shot_forwards_route_mode_and_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    sparse_format: str,
+    use_proxy_routes: bool,
+    expected_max_blocks: int,
+) -> None:
+    """One-shot planning should differ from the wrapper only by inspection."""
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    sentinel = object()
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cpu"), 0),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_inspect_block_sparse_bsr",
+        lambda *_args, **_kwargs: 3,
+    )
+    monkeypatch.setattr(
+        block_sparse_module.BlockSparseTSWrapper,
+        "plan",
+        lambda _self, *_args, **kwargs: calls.append(("plan", kwargs)),
+    )
+    monkeypatch.setattr(
+        block_sparse_module.BlockSparseTSWrapper,
+        "run",
+        lambda _self, *_args, **kwargs: calls.append(("run", kwargs)) or sentinel,
+    )
+
+    q = torch.empty((1, 64, 2, 128), dtype=torch.float16)
+    k = torch.empty((1, 256, 1, 128), dtype=torch.float16)
+    block_indptr = torch.tensor([[[0, 2]]], dtype=torch.int32)
+    block_indices = torch.tensor([0, 2], dtype=torch.int32)
+    exact_block_bits = torch.tensor([[[[0b0101]]]], dtype=torch.uint32)
+    summaries = torch.empty((1, 4, 1, 128), dtype=torch.float16)
+
+    result = block_sparse_module.block_sparse_attention(
+        q,
+        k,
+        k,
+        block_indptr if sparse_format == "bsr" else None,
+        block_indices if sparse_format == "bsr" else None,
+        64,
+        64,
+        exact_block_bits=(exact_block_bits if sparse_format == "bitmask" else None),
+        k_summary=summaries if use_proxy_routes else None,
+        v_summary=summaries if use_proxy_routes else None,
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
+    )
+
+    assert result is sentinel
+    plan_kwargs = calls[0][1]
+    run_kwargs = calls[1][1]
+    assert calls[0][0] == "plan"
+    assert plan_kwargs["max_blocks_per_row"] == expected_max_blocks
+    assert plan_kwargs["sparse_format"] == sparse_format
+    assert plan_kwargs["use_proxy_routes"] is use_proxy_routes
+    assert calls[1][0] == "run"
+    assert run_kwargs["exact_block_bits"] is (
+        exact_block_bits if sparse_format == "bitmask" else None
+    )
+    assert run_kwargs["k_summary"] is (summaries if use_proxy_routes else None)
+    assert run_kwargs["v_summary"] is (summaries if use_proxy_routes else None)
+
+
+def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
+    """Trace both public paged-cache forms with live run metadata."""
+
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = block_sparse_module.BlockSparsePagedTSWrapper()
+    q = torch.empty((2, 4, 8, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((8, 4, 64, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    common_kwargs = {
+        "q": q,
+        "paged_kv_indptr": torch.empty((3,), dtype=torch.int32),
+        "paged_kv_indices": torch.empty((8,), dtype=torch.int32),
+        "seq_lens_kv": torch.empty((2,), dtype=torch.int32),
+        "block_indptr": torch.empty((2, 4, 2), dtype=torch.int32),
+        "block_indices": torch.empty((16,), dtype=torch.int32),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(paged_kv_cache=(k_cache, v_cache), **common_kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(
+            wrapper.run,
+            paged_kv_cache=(k_cache, v_cache),
+            **common_kwargs,
+        )
+
+    wrapper._plan_state = SimpleNamespace()
+    cache_forms = (
+        ((k_cache, v_cache), "tuple"),
+        (torch.stack((k_cache, v_cache), dim=1), "combined"),
+    )
+    for paged_kv_cache, cache_form in cache_forms:
+        defn = fi_trace(
+            wrapper.run,
+            paged_kv_cache=paged_kv_cache,
+            **common_kwargs,
+        )
+        assert defn["name"].startswith(
+            f"prims_ts_paged_block_sparse_wrapper_{cache_form}"
+        )
+        for name in (
+            "q_block_size",
+            "kv_block_size",
+            "max_seq_len_kv",
+            "mask_type",
+        ):
+            assert defn["inputs"][name]["optional"] is True
+        for name in (
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "seq_lens_kv",
+            "block_indptr",
+            "block_indices",
+        ):
+            assert defn["inputs"][name].get("optional") is not True
+
+
+def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
+    """Paged plans own capacity, while attention consumes caller live lengths."""
+
+    from flashinfer.attention.prims_ts._block_sparse import (
+        runtime as block_sparse_runtime,
+    )
+
+    plan_parameters = inspect.signature(
+        block_sparse_module.BlockSparsePagedTSWrapper.plan
+    ).parameters
+    assert tuple(plan_parameters)[:10] == (
+        "self",
+        "batch_size",
+        "seq_len_q",
+        "max_seq_len_kv",
+        "num_qo_heads",
+        "num_kv_heads",
+        "head_dim",
+        "q_block_size",
+        "kv_block_size",
+        "page_size",
+    )
+    assert {"paged_kv_indptr", "paged_kv_indices", "seq_lens_kv"}.isdisjoint(
+        plan_parameters
+    )
+    for name in (
+        "device",
+        "max_blocks_per_row",
+        "use_kv_valid_bits",
+    ):
+        assert plan_parameters[name].default is inspect.Parameter.empty
+
+    run_parameters = inspect.signature(
+        block_sparse_module.BlockSparsePagedTSWrapper.run
+    ).parameters
+    for name in (
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_lens_kv",
+        "block_indptr",
+        "block_indices",
+    ):
+        assert run_parameters[name].default is inspect.Parameter.empty
+
+    one_shot_parameters = inspect.signature(
+        block_sparse_module.block_sparse_attention_with_paged_kv_cache
+    ).parameters
+    assert "max_seq_len_kv" in one_shot_parameters
+    assert "seq_len_kv" not in one_shot_parameters
+    assert one_shot_parameters["max_seq_len_kv"].default is inspect.Parameter.empty
+    assert one_shot_parameters["seq_lens_kv"].default is inspect.Parameter.empty
+
+    state_fields = {
+        field.name for field in fields(block_sparse_plan._BlockSparsePlanState)
+    }
+    assert {
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_lens_kv",
+        "paged_kv",
+        "validated_seq_lens_kv",
+    }.isdisjoint(state_fields)
+    assert "page_size" in state_fields
+    assert "validated_seq_lens_kv" not in {
+        field.name for field in fields(block_sparse_runtime._PagedKVLaunchPayload)
+    }
+
+
+@pytest.mark.skipif(
+    os.environ.get("FLASHINFER_TEST_DEVICE_ASSERT") != "1",
+    reason="fatal device assertions require explicit isolated-test opt-in",
+)
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
+    tmp_path: Path,
+) -> None:
+    """One invalid request reports once without poisoning pytest's CUDA context."""
+
+    script = textwrap.dedent(
+        """
+        import torch
+
+        from flashinfer.attention.prims_ts.block_sparse import (
+            BlockSparsePagedTSWrapper,
+        )
+
+        q = torch.empty((1, 64, 1, 128), device="cuda", dtype=torch.float16)
+        paged_kv_cache = torch.empty(
+            (1, 2, 1, 64, 128), device="cuda", dtype=torch.float16
+        )
+        paged_kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        paged_kv_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+        seq_lens_kv = torch.tensor([0], device="cuda", dtype=torch.int32)
+        block_indptr = torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32)
+        block_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+
+        wrapper = BlockSparsePagedTSWrapper()
+        wrapper.plan(
+            1,
+            64,
+            128,
+            1,
+            1,
+            128,
+            64,
+            64,
+            64,
+            device=q.device,
+            max_blocks_per_row=1,
+            use_kv_valid_bits=False,
+        )
+        wrapper.run(
+            q,
+            paged_kv_cache,
+            paged_kv_indptr,
+            paged_kv_indices,
+            seq_lens_kv,
+            block_indptr,
+            block_indices,
+        )
+        torch.cuda.synchronize()
+        print("UNEXPECTED_SUCCESS", flush=True)
+        """
+    )
+    env = dict(
+        os.environ,
+        CUTE_DSL_ENABLE_ASSERTIONS="1",
+        CUTE_DSL_CACHE_DIR=os.fspath(tmp_path),
+        PYTHONPATH=os.pathsep.join(path for path in sys.path if path),
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    output = result.stdout + result.stderr
+    assertion_message = "seq_lens_kv is outside the planned live-length range"
+    assert result.returncode != 0, output
+    assert "UNEXPECTED_SUCCESS" not in output, output
+    assert output.count(assertion_message) == 1, output
 
 
 def test_block_sparse_plan_rejects_cuda_graph_capture_before_allocation(
@@ -927,16 +1432,12 @@ def test_one_shot_rejects_invalid_static_profile_before_inspection(
 
 def test_one_shot_inspection_publishes_only_the_semantic_row_bound() -> None:
     from flashinfer.attention.prims_ts._block_sparse.inspection import (
-        _BlockSparseInspection,
         _inspect_block_sparse_bsr,
     )
     from flashinfer.attention.prims_ts.kernels.fmha_decode.block_sparse_inspect import (
         compile_block_sparse_inspection,
     )
 
-    assert [field.name for field in fields(_BlockSparseInspection)] == [
-        "max_row_block_count"
-    ]
     assert (
         "kv_route_size" not in inspect.signature(_inspect_block_sparse_bsr).parameters
     )
@@ -1242,10 +1743,10 @@ def test_block_sparse_builds_standard_decode_schedule(
     else:
         assert "smemKv" not in resource_names
         assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resource_names
-    for task_name, resource_name in (
-        ("Softmax0Task", "tmemS0"),
-        ("Softmax1Task", "tmemS1"),
-    ):
+    for inst_idx in (0, 1):
+        task_name = f"Softmax{inst_idx}Task"
+        resource_name = f"tmemS{inst_idx}"
+        metadata_name = f"smemBlockSparseSoftmaxMetadata{inst_idx}"
         softmax_task = tasks_by_name[task_name]
         tmem_s = next(
             resource
@@ -1259,6 +1760,23 @@ def test_block_sparse_builds_standard_decode_schedule(
             if entry[0] is tmem_s and entry[1] == ScheduleStage.ConsumerWork
         ]
         assert consumer_labels == ["compute_block_sparse_softmax_loop"]
+        schedule_positions = {
+            (entry[0].name, entry[1], entry[-1]): position
+            for position, entry in enumerate(softmax_task.loop_schedule_list)
+        }
+        metadata_wait = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerWait, None)
+        ]
+        metadata_load = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerWork, "load_route")
+        ]
+        metadata_release = schedule_positions[
+            (metadata_name, ScheduleStage.ConsumerRelease, None)
+        ]
+        score_wait = schedule_positions[
+            (resource_name, ScheduleStage.ConsumerWait, None)
+        ]
+        assert metadata_wait < metadata_load < metadata_release < score_wait
 
 
 @pytest.mark.parametrize("storage", ("dense", "sparse"))
@@ -1657,6 +2175,34 @@ def test_prepared_block_sparse_layout_geometry(
     assert layout.workspace_size_words == 4 + 3 * layout.route_metadata_stride_words
 
 
+@pytest.mark.parametrize(
+    ("kv_route_size", "kv_block_size", "has_token_bits", "page_size", "expected"),
+    (
+        (128, 8, True, None, True),
+        (256, 8, True, None, False),
+        (128, 64, False, None, False),
+        (128, 64, True, 64, False),
+    ),
+)
+def test_prepared_route_layout_selects_one_warp_transport(
+    kv_route_size: int,
+    kv_block_size: int,
+    has_token_bits: bool,
+    page_size: int | None,
+    expected: bool,
+) -> None:
+    layout = _BlockSparseRouteLayout.create(
+        kv_route_size=kv_route_size,
+        kv_block_size=kv_block_size,
+        has_token_bits=has_token_bits,
+        route_metadata_capacity=0,
+        num_rows=1,
+        page_size=page_size,
+    )
+
+    assert layout.uses_one_warp_transport is expected
+
+
 def test_keeps_softmax_staging_rejects_more_than_four_route_origins() -> None:
     """Keeps consumers have registers for at most four staged origins."""
 
@@ -1676,75 +2222,6 @@ def test_keeps_softmax_staging_rejects_more_than_four_route_origins() -> None:
             route_layout=route_layout,
             num_stages=2,
         )
-
-
-def test_prepared_route_logical_origin_accessors_are_layout_nfc() -> None:
-    """Naming logical origins must not add or move prepared-record words."""
-
-    layout = _BlockSparseRouteLayout.create(
-        kv_route_size=128,
-        kv_block_size=64,
-        has_token_bits=True,
-        route_metadata_capacity=3,
-        num_rows=2,
-    )
-
-    assert tuple(field.name for field in fields(layout)) == (
-        "kv_route_size",
-        "atom_size",
-        "has_token_bits",
-        "num_rows",
-        "route_metadata_stride_words",
-        "route_metadata_base_word_offset",
-        "workspace_size_words",
-        "page_size",
-    )
-    assert tuple(getattr(layout, field.name) for field in fields(layout)) == (
-        128,
-        64,
-        True,
-        2,
-        8,
-        4,
-        28,
-        None,
-    )
-    assert layout.logical_origins_per_route == 2
-    # Logical origins remain the unchanged two-word record prefix.
-    assert layout.atom_valid_mask_word_offset == 2
-    assert layout.route_flags_word_offset == 3
-    assert layout.token_words_word_offset == 4
-
-
-def test_logical_origins_feed_masks_while_contiguous_loads_are_identity() -> None:
-    """Mask coordinates stay logical; contiguous K/V loads preserve them."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import (
-        block_sparse_prepare,
-    )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources import (
-        smem_block_sparse_metadata,
-        smem_resources,
-        tmem_s,
-    )
-
-    assert (
-        "logical_origin"
-        in inspect.signature(block_sparse_prepare._load_atom_token_chunk).parameters
-    )
-    assert hasattr(block_sparse_prepare, "_resolve_route_logical_atom_origin")
-
-    resource = smem_block_sparse_metadata.SmemBlockSparseKvMetadataResource
-    assert "_prepared_route_logical_origin" in inspect.getsource(resource.resolve_route)
-    assert (
-        "logical_b_idx" in inspect.signature(resource.route_tma_coordinate).parameters
-    )
-    kv_load_sources = inspect.getsource(
-        smem_resources.SmemKvTileResource
-    ) + inspect.getsource(smem_resources.SmemKvResource)
-    assert ".route_tma_coordinate(" in kv_load_sources
-    assert ".route_origin(" not in kv_load_sources
-    assert "route_load_origin" not in inspect.getsource(tmem_s.TmemSResource)
 
 
 def test_sparse_task_cache_accessors_reuse_the_existing_two_slots() -> None:
@@ -1771,38 +2248,6 @@ def test_sparse_task_cache_accessors_reuse_the_existing_two_slots() -> None:
     route_begin = helpers_common._sparse_task_cache_route_begin.__wrapped__(cache)
     route_count = helpers_common._sparse_task_cache_route_count.__wrapped__(cache)
     assert (int(route_begin), int(route_count)) == (5, 6)
-
-
-def test_paged_route_seam_extends_only_the_shared_compile_key() -> None:
-    """Storage axes live on the shared key without an intermediate policy type."""
-
-    assert tuple(
-        field.name for field in fields(block_sparse_config._BlockSparseCompileKey)
-    ) == (
-        "device_index",
-        "batch_size",
-        "seq_len_q",
-        "seq_len_kv",
-        "num_qo_heads",
-        "num_kv_heads",
-        "head_dim",
-        "q_block_size",
-        "kv_block_size",
-        "kv_route_size",
-        "dtype_key",
-        "mask_type",
-        "use_kv_valid_bits",
-        "use_persistent_scheduler",
-        "use_parallel_sparse_kv_loads",
-        "page_size",
-        "use_variable_seqlens_kv",
-    )
-    assert not hasattr(block_sparse_module, "_BlockSparseExecutionPolicy")
-    assert not hasattr(block_sparse_module, "_resolve_block_sparse_execution_policy")
-    assert not hasattr(
-        block_sparse_module,
-        "_resolve_validated_block_sparse_execution_policy",
-    )
 
 
 @pytest.mark.parametrize(
@@ -2000,7 +2445,7 @@ def test_prepared_block_sparse_layout_allows_empty_route_metadata() -> None:
     assert layout.workspace_size_words == layout.route_metadata_base_word_offset
 
 
-def test_public_api_rejects_invalid_usage() -> None:
+def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     metadata = torch.empty((1, 1, 2), dtype=torch.int32)
     indices = torch.empty((0,), dtype=torch.int32)
     with pytest.raises(RuntimeError, match=r"plan\(\).*before run"):
@@ -2025,11 +2470,63 @@ def test_public_api_rejects_invalid_usage() -> None:
             64,
         )
 
+    def unexpected_device_work(_device: object) -> None:
+        pytest.fail("causal proxy routes must fail before resolving the CUDA device")
+
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_resolve_cuda_device",
+        unexpected_device_work,
+    )
+    with pytest.raises(ValueError, match="proxy routes require mask_type='dense'"):
+        block_sparse_module.BlockSparseTSWrapper().plan(
+            batch_size=1,
+            seq_len_q=64,
+            seq_len_kv=128,
+            num_qo_heads=1,
+            num_kv_heads=1,
+            head_dim=_HEAD_DIM,
+            q_block_size=64,
+            kv_block_size=64,
+            device="cuda:0",
+            max_blocks_per_row=1,
+            use_kv_valid_bits=False,
+            use_proxy_routes=True,
+            mask_type="causal",
+        )
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        CAUSAL,
+        FmhaDecodeConfig,
+    )
+
+    cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        use_block_sparse_proxy_routes=True,
+        mask_type=CAUSAL,
+    )
+    with pytest.raises(ValueError, match="proxy routes require mask_type='dense'"):
+        cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
+    exact_causal_cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=64,
+        kv_block_size=64,
+        tile_size_q=64,
+        tile_size_kv=128,
+        use_keeps_mma_ab=True,
+        mask_type=CAUSAL,
+    )
+    exact_causal_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
 
 def _validate_cpu_routing(
     *,
+    sparse_format: str = "bsr",
     block_indptr: torch.Tensor | None = None,
     block_indices: torch.Tensor | None = None,
+    exact_block_bits: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None = None,
     use_kv_valid_bits: bool = False,
 ) -> None:
@@ -2038,27 +2535,44 @@ def _validate_cpu_routing(
     )
 
     validate_block_sparse_metadata(
-        torch.tensor([[[0, 0]]], dtype=torch.int32)
-        if block_indptr is None
-        else block_indptr,
-        torch.empty(0, dtype=torch.int32) if block_indices is None else block_indices,
-        kv_valid_bits,
+        sparse_format=sparse_format,
+        block_indptr=(
+            torch.tensor([[[0, 0]]], dtype=torch.int32)
+            if sparse_format == "bsr" and block_indptr is None
+            else block_indptr
+        ),
+        block_indices=(
+            torch.empty(0, dtype=torch.int32)
+            if sparse_format == "bsr" and block_indices is None
+            else block_indices
+        ),
+        exact_block_bits=exact_block_bits,
+        kv_valid_bits=kv_valid_bits,
         device=torch.device("cpu"),
         batch_size=1,
         seq_len_q=1,
         seq_len_kv=1,
         num_kv_heads=1,
         q_block_size=1,
+        kv_block_size=8,
         use_kv_valid_bits=use_kv_valid_bits,
     )
 
 
-def test_runtime_metadata_allows_unreferenced_spare_indices() -> None:
-    """Per-row capacity is checked on device; spare flat storage is legal."""
+def test_reusable_runtime_trusts_routing_values() -> None:
+    """Reusable validation checks tensor ABI without inspecting route values."""
 
     _validate_cpu_routing(
         block_indptr=torch.tensor([[[0, 1]]], dtype=torch.int32),
-        block_indices=torch.arange(17, dtype=torch.int32),
+        block_indices=torch.tensor([17], dtype=torch.int32),
+    )
+    _validate_cpu_routing(
+        sparse_format="bitmask",
+        exact_block_bits=torch.full(
+            (1, 1, 1, 1),
+            0xFFFFFFFF,
+            dtype=torch.uint32,
+        ),
     )
 
 
@@ -2163,6 +2677,9 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         num_kv_heads=1,
         head_dim=_HEAD_DIM,
         q_block_size=8,
+        kv_block_size=64,
+        sparse_format="bsr",
+        use_proxy_routes=False,
         use_kv_valid_bits=False,
         q_dtype=torch.float16,
         kv_dtype=torch.float16,
@@ -2170,7 +2687,7 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         dummy_kv_valid_bits=torch.zeros((1, 2), dtype=torch.uint32),
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=torch.zeros(4, dtype=torch.int32),
-        paged_kv=None,
+        page_size=None,
     )
     q = torch.empty((1, 8, 8, _HEAD_DIM), dtype=torch.float16)
     k = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
@@ -2238,7 +2755,9 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
     )
 
     state = SimpleNamespace(
-        paged_kv=None,
+        page_size=None,
+        sparse_format="bsr",
+        use_proxy_routes=False,
         row_route_offsets=object(),
         route_workspace=object(),
         max_blocks_per_row=3,
@@ -2288,6 +2807,77 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
     ]
 
 
+def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
+    from flashinfer.attention.prims_ts._block_sparse.runtime import (
+        _BlockSparseRunArgs,
+        _PagedKVLaunchPayload,
+        launch_block_sparse,
+    )
+
+    calls: list[tuple[object, ...]] = []
+    state = SimpleNamespace(
+        page_size=64,
+        sparse_format="bsr",
+        use_proxy_routes=False,
+        row_route_offsets=object(),
+        route_workspace=object(),
+        max_blocks_per_row=3,
+        compiled=lambda *args: calls.append(args),
+    )
+    values = {
+        name: object()
+        for name in (
+            "q",
+            "k",
+            "v",
+            "out",
+            "block_indptr",
+            "block_indices",
+            "kv_valid_bits",
+        )
+    }
+    live_seq_lens_kv = object()
+    paged_kv = _PagedKVLaunchPayload(
+        paged_kv_indptr=object(),
+        paged_kv_indices=object(),
+        seq_lens_kv=live_seq_lens_kv,
+        num_physical_kv_pages=17,
+        k_page_stride=19,
+        v_page_stride=23,
+    )
+    run_args = _BlockSparseRunArgs(
+        **values,
+        kv_valid_bits_is_live=True,
+        sm_scale=1.25,
+        paged_kv=paged_kv,
+    )
+
+    result = launch_block_sparse(run_args, state=state)
+
+    assert result is run_args.out
+    assert calls == [
+        (
+            run_args.q,
+            run_args.k,
+            run_args.v,
+            run_args.out,
+            run_args.block_indptr,
+            run_args.block_indices,
+            run_args.kv_valid_bits,
+            paged_kv.paged_kv_indptr,
+            paged_kv.paged_kv_indices,
+            live_seq_lens_kv,
+            state.row_route_offsets,
+            state.route_workspace,
+            3,
+            17,
+            19,
+            23,
+            1.25,
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     "aliased_name",
     ("block_indptr", "block_indices", "kv_valid_bits"),
@@ -2331,6 +2921,9 @@ def test_runtime_output_must_not_alias_sparse_metadata(aliased_name: str) -> Non
             num_kv_heads=1,
             head_dim=_HEAD_DIM,
             q_block_size=1,
+            kv_block_size=8,
+            sparse_format="bsr",
+            use_proxy_routes=False,
             use_kv_valid_bits=True,
             q_dtype=torch.float16,
             kv_dtype=torch.float16,
@@ -2338,7 +2931,7 @@ def test_runtime_output_must_not_alias_sparse_metadata(aliased_name: str) -> Non
             dummy_kv_valid_bits=None,
             row_route_offsets=torch.zeros(2, dtype=torch.int32),
             route_workspace=torch.zeros(4, dtype=torch.int32),
-            paged_kv=None,
+            page_size=None,
         )
         validate_block_sparse_run(
             q,
@@ -2377,6 +2970,9 @@ def test_runtime_output_must_not_alias_plan_owned_route_workspace() -> None:
         num_kv_heads=1,
         head_dim=_HEAD_DIM,
         q_block_size=1,
+        kv_block_size=8,
+        sparse_format="bsr",
+        use_proxy_routes=False,
         use_kv_valid_bits=False,
         q_dtype=torch.float16,
         kv_dtype=torch.float16,
@@ -2384,7 +2980,7 @@ def test_runtime_output_must_not_alias_plan_owned_route_workspace() -> None:
         dummy_kv_valid_bits=torch.zeros((1, 1), dtype=torch.uint32),
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=route_workspace,
-        paged_kv=None,
+        page_size=None,
     )
 
     with pytest.raises(
@@ -2695,6 +3291,63 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
     assert spec.compile_key.num_kv_heads == 1
 
 
+@pytest.mark.parametrize("use_proxy_routes", (False, True))
+def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
+    monkeypatch: pytest.MonkeyPatch,
+    use_proxy_routes: bool,
+) -> None:
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    selector_calls: list[dict[str, object]] = []
+
+    def select_persistent(**kwargs: object) -> str:
+        selector_calls.append(kwargs)
+        return "persistent"
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        select_persistent,
+    )
+    monkeypatch.setattr(
+        block_sparse_config,
+        "_make_block_sparse_config",
+        lambda _key: None,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+
+    block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        spec = block_sparse_config._resolve_block_sparse_launch_spec(
+            device_index=0,
+            batch_size=1,
+            seq_len_q=128,
+            seq_len_kv=4096,
+            num_qo_heads=8,
+            num_kv_heads=8,
+            head_dim=_HEAD_DIM,
+            q_block_size=64,
+            kv_block_size=64,
+            kv_route_size=256,
+            dtype_key="bfloat16",
+            mask_type="dense",
+            use_kv_valid_bits=False,
+            max_row_route_capacity=16,
+            sparse_format="bitmask",
+            use_proxy_routes=use_proxy_routes,
+        )
+    finally:
+        block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+
+    policy = dict(spec.policy)
+    expected_persistent = not use_proxy_routes
+    assert len(selector_calls) == int(expected_persistent)
+    assert spec.compile_key.use_persistent_scheduler is expected_persistent
+    assert policy["scheduler"] == ("persistent" if expected_persistent else "static")
+    assert policy["use_persistent_scheduler"] is expected_persistent
+    assert "scheduler_policy" not in policy
+
+
 def test_clc_capacity_gates_control_launch_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2811,6 +3464,390 @@ def test_static_fallback_reselects_sparse_load_policy(
     assert policy["use_parallel_sparse_kv_loads"] is True
 
 
+@dataclass(frozen=True)
+class _PagedOneShotCase:
+    lengths: tuple[int, ...] = (64,)
+    page_ptr: tuple[int, ...] = (0, 1)
+    pages: tuple[int, ...] = (0,)
+    mask: str = "dense"
+    bsr: tuple[int, ...] = (0,)
+    bsr_ptr: object | None = None
+
+    def arguments(self) -> dict[str, object]:
+        batch = len(self.lengths)
+        bsr_ptr = self.bsr_ptr
+        if bsr_ptr is None:
+            bsr_ptr = tuple(((idx, idx + 1),) for idx in range(batch))
+        cuda_i32 = {"device": "cuda", "dtype": torch.int32}
+        return {
+            "q": torch.empty(
+                (batch, 64, 1, _HEAD_DIM),
+                device="cuda",
+                dtype=torch.float16,
+            ),
+            "paged_kv_cache": torch.empty(
+                (2, 2, 1, 64, _HEAD_DIM),
+                device="cuda",
+                dtype=torch.float16,
+            ),
+            "paged_kv_indptr": torch.tensor(self.page_ptr, **cuda_i32),
+            "paged_kv_indices": torch.tensor(self.pages, **cuda_i32),
+            "block_indptr": torch.tensor(bsr_ptr, **cuda_i32),
+            "block_indices": torch.tensor(self.bsr, **cuda_i32),
+            "q_block_size": 64,
+            "kv_block_size": 64,
+            "max_seq_len_kv": 128,
+            "seq_lens_kv": torch.tensor(self.lengths, **cuda_i32),
+            "kv_valid_bits": torch.empty((batch, 4), device="cuda", dtype=torch.uint32),
+            "mask_type": self.mask,
+        }
+
+
+class _MetadataTensorAbiOverride(torch.Tensor):
+    _violation: str
+
+    @classmethod
+    def wrap(cls, tensor: torch.Tensor, violation: str) -> torch.Tensor:
+        result = tensor.as_subclass(cls)
+        result._violation = violation
+        return result
+
+    def data_ptr(self) -> int:
+        pointer = super().data_ptr()
+        return pointer + 1 if self._violation == "alignment" else pointer
+
+    def numel(self) -> int:
+        return 1 << 31 if self._violation == "int32_extent" else super().numel()
+
+
+def _fail_if_planned(
+    monkeypatch: pytest.MonkeyPatch, wrapper_type: type[object]
+) -> None:
+    monkeypatch.setattr(
+        wrapper_type,
+        "plan",
+        lambda *_args, **_kwargs: pytest.fail("plan() must not be reached"),
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        (_PagedOneShotCase((0,)), r"seq_lens_kv.*\[1, 128\]"),
+        (_PagedOneShotCase((129,), (0, 2), (0, 1)), r"seq_lens_kv.*\[1, 128\]"),
+        (_PagedOneShotCase((63,), mask="causal"), r"seq_lens_kv.*\[64, 128\]"),
+        (
+            _PagedOneShotCase(page_ptr=(1, 2), pages=(0, 1)),
+            r"paged_kv_indptr.*start at zero",
+        ),
+        (
+            _PagedOneShotCase((64, 64), (0, 2, 1), (0, 1), bsr=(0, 0)),
+            r"paged_kv_indptr.*bounded and monotone",
+        ),
+        (
+            _PagedOneShotCase(page_ptr=(0, 2)),
+            r"paged_kv_indptr.*bounded and monotone",
+        ),
+        (_PagedOneShotCase((65,)), r"paged_kv_indptr.*enough pages.*seq_lens_kv"),
+        (_PagedOneShotCase(pages=(2,)), r"paged_kv_indices.*physical page ID"),
+        (
+            _PagedOneShotCase(page_ptr=(0, 2), pages=(0, 2)),
+            r"paged_kv_indices.*physical page ID",
+        ),
+        (
+            _PagedOneShotCase((128, 64), (0, 2, 3), (0, 1, 0), bsr=(1, 1)),
+            r"block_indptr/block_indices.*live seq_lens_kv",
+        ),
+    ),
+)
+def test_paged_one_shot_rejects_invalid_live_metadata_before_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _PagedOneShotCase,
+    message: str,
+) -> None:
+    _fail_if_planned(
+        monkeypatch,
+        block_sparse_module.BlockSparsePagedTSWrapper,
+    )
+    with pytest.raises(ValueError, match=message):
+        block_sparse_module.block_sparse_attention_with_paged_kv_cache(
+            **case.arguments()
+        )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    (
+        _PagedOneShotCase((1,)),
+        _PagedOneShotCase((128,), (0, 2), (1, 1)),
+        _PagedOneShotCase(pages=(0, 2), mask="causal"),
+        _PagedOneShotCase(
+            (64, 128),
+            (0, 1, 3),
+            (0, 0, 1),
+            bsr=(0, 1),
+            bsr_ptr=(((0, 1),), ((1, 2),)),
+        ),
+    ),
+    ids=(
+        "dense-min",
+        "dense-max-duplicate",
+        "causal-min-spare",
+        "batch-live-bounds",
+    ),
+)
+def test_paged_one_shot_accepts_valid_live_metadata_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _PagedOneShotCase,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    sentinel = object()
+
+    wrapper = block_sparse_module.BlockSparsePagedTSWrapper
+    monkeypatch.setattr(
+        wrapper,
+        "plan",
+        lambda _self, *_a, **kw: calls.append(("plan", kw["max_blocks_per_row"])),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "run",
+        lambda *_a, **_kw: calls.append(("run", None)) or sentinel,
+    )
+    if case.bsr_ptr is None:
+        case = replace(case, bsr_ptr=(((1, 2),),), bsr=(-1, 0, -1))
+    result = block_sparse_module.block_sparse_attention_with_paged_kv_cache(
+        **case.arguments()
+    )
+    assert result is sentinel
+    assert calls == [("plan", 1), ("run", None)]
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    ("field", "violation"),
+    [
+        pytest.param(field, violation, id=f"{field}-{violation}")
+        for field in ("paged_kv_indptr", "paged_kv_indices", "seq_lens_kv")
+        for violation in (
+            "rank",
+            "dtype",
+            "device",
+            "compactness",
+            "alignment",
+            "int32_extent",
+        )
+    ]
+    + [
+        pytest.param(field, "shape", id=f"{field}-shape")
+        for field in ("paged_kv_indptr", "seq_lens_kv")
+    ],
+)
+def test_paged_one_shot_rejects_invalid_metadata_abi_before_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    violation: str,
+) -> None:
+    error_type = {
+        "dtype": TypeError,
+        "int32_extent": OverflowError,
+    }.get(violation, ValueError)
+    messages = {
+        "rank": f"{field} must be rank 1",
+        "dtype": f"{field} must have dtype torch.int32",
+        "device": f"{field} must be on planned device cuda",
+        "compactness": f"{field} must have compact rank-1 strides",
+        "alignment": f"{field} data pointer must be 4-byte aligned",
+        "int32_extent": rf"{field}\.numel\(\).*signed int32",
+        "shape": rf"{field} must have shape "
+        + (r"\(2,\)" if field == "paged_kv_indptr" else r"\(1,\)"),
+    }
+    _fail_if_planned(
+        monkeypatch,
+        block_sparse_module.BlockSparsePagedTSWrapper,
+    )
+    arguments = _PagedOneShotCase().arguments()
+    tensor = arguments[field]
+    assert isinstance(tensor, torch.Tensor)
+    if violation == "rank":
+        arguments[field] = tensor.unsqueeze(0)
+    elif violation == "dtype":
+        arguments[field] = tensor.to(torch.int64)
+    elif violation == "device":
+        arguments[field] = tensor.cpu()
+    elif violation == "compactness":
+        arguments[field] = torch.empty(
+            tensor.numel() * 2, dtype=tensor.dtype, device=tensor.device
+        )[::2]
+    elif violation in ("alignment", "int32_extent"):
+        arguments[field] = _MetadataTensorAbiOverride.wrap(tensor, violation)
+    elif field == "paged_kv_indptr":
+        arguments[field] = torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda")
+    else:
+        arguments[field] = torch.tensor([64, 64], dtype=torch.int32, device="cuda")
+    with pytest.raises(error_type, match=messages[violation]):
+        block_sparse_module.block_sparse_attention_with_paged_kv_cache(**arguments)
+
+
+def test_paged_inspection_launches_share_one_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flashinfer.attention.prims_ts._block_sparse import inspection
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import block_sparse_inspect
+
+    inspect_paged = inspection._inspect_paged_block_sparse_metadata
+
+    tolist_calls: list[None] = []
+    summary = SimpleNamespace(tolist=lambda: tolist_calls.append(None) or [0, 3])
+    stream = object()
+    active_stream: list[object] = []
+    compile_kwargs: list[dict[str, object]] = []
+    invocations: list[tuple[object, object]] = []
+
+    @contextmanager
+    def use_stream(selected: object) -> object:
+        active_stream.append(selected)
+        yield
+        active_stream.pop()
+
+    def compile_paged_block_sparse_metadata_inspection(
+        **kwargs: object,
+    ) -> Callable[..., None]:
+        compile_kwargs.append(kwargs)
+
+        def launch(*args: object) -> None:
+            invocations.append((args[-1], active_stream[-1]))
+
+        return launch
+
+    monkeypatch.setattr(
+        block_sparse_inspect,
+        "compile_paged_block_sparse_metadata_inspection",
+        compile_paged_block_sparse_metadata_inspection,
+        raising=False,
+    )
+    monkeypatch.setattr(inspection.torch, "zeros", lambda *_a, **_k: summary)
+    monkeypatch.setattr(inspection.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(inspection.torch.cuda, "device", lambda _d: nullcontext())
+    monkeypatch.setattr(inspection.torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(
+        inspection.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+
+    metadata = tuple(
+        torch.tensor(value, dtype=torch.int32)
+        for value in ([[[0, 1]]], [0], [0, 1], [0], [64])
+    )
+    result = inspect_paged(
+        *metadata,
+        static=SimpleNamespace(
+            batch_size=1,
+            num_kv_heads=1,
+            seq_len_q=64,
+            seq_len_kv=128,
+            q_block_size=64,
+            kv_block_size=64,
+            page_size=64,
+            mask_type="dense",
+        ),
+        num_physical_kv_pages=2,
+        stream=stream,
+    )
+    assert len(compile_kwargs) == 1
+    assert len(invocations) == 1
+    assert compile_kwargs[0]["minimum_seq_len_kv"] == 1
+    assert invocations == [(summary, stream)]
+    assert len(tolist_calls) == 1
+    assert result == 3
+
+
+def test_paged_metadata_compile_adapter_launch_order_contract() -> None:
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import block_sparse_inspect
+
+    call_sequence: list[tuple[str, tuple[object, ...]]] = []
+
+    class _FakeInspector:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __call__(self, *args: object) -> None:
+            call_sequence.append((self.name, args))
+
+    adapter = block_sparse_inspect._InspectPagedBlockSparseMetadata(
+        inspect_requests=_FakeInspector("request"),
+        inspect_bsr=_FakeInspector("bsr"),
+    )
+    block_indptr = object()
+    block_indices = object()
+    paged_kv_indptr = object()
+    paged_kv_indices = object()
+    seq_lens_kv = object()
+    num_physical_kv_pages = object()
+    summary = object()
+    stream = object()
+
+    block_sparse_inspect._InspectPagedBlockSparseMetadata.__call__.__wrapped__(
+        adapter,
+        block_indptr,
+        block_indices,
+        paged_kv_indptr,
+        paged_kv_indices,
+        seq_lens_kv,
+        num_physical_kv_pages,
+        summary,
+        stream,
+    )
+
+    assert [name for name, _ in call_sequence] == ["request", "bsr"]
+    _, request_args = call_sequence[0]
+    _, bsr_args = call_sequence[1]
+    assert request_args == (
+        paged_kv_indptr,
+        paged_kv_indices,
+        seq_lens_kv,
+        num_physical_kv_pages,
+        summary,
+        stream,
+    )
+    assert bsr_args == (
+        block_indptr,
+        block_indices,
+        seq_lens_kv,
+        summary,
+        stream,
+    )
+    assert request_args[-2] is summary
+    assert request_args[-1] is stream
+    assert bsr_args[-2] is summary
+    assert bsr_args[-1] is stream
+    assert request_args[-2] is bsr_args[-2]
+    assert request_args[-1] is bsr_args[-1]
+
+
+def test_metadata_inspection_scan_positions_use_int64() -> None:
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import block_sparse_inspect
+
+    contracts = (
+        (
+            block_sparse_inspect._validate_bsr_row_lane,
+            ("selected_kv_block_count", "bsr_entry_offset", "entry_position"),
+        ),
+        (
+            block_sparse_inspect._InspectPagedKvMetadata.kernel,
+            ("request_page_count", "page_offset", "page_position"),
+        ),
+    )
+    for target, names in contracts:
+        source = inspect.getsource(target)
+        assert all(f"{name} = cutlass.Int64(" in source for name in names)
+        assert "+= cutlass.Int64(_WARP_SIZE)" in source
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
@@ -2827,10 +3864,15 @@ def test_static_fallback_reselects_sparse_load_policy(
     ),
 )
 def test_one_shot_rejects_noncanonical_bsr(
+    monkeypatch: pytest.MonkeyPatch,
     indptr: list[list[list[int]]],
     indices: tuple[int, ...],
     message: str,
 ) -> None:
+    _fail_if_planned(
+        monkeypatch,
+        block_sparse_module.BlockSparseTSWrapper,
+    )
     block_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
     block_indices = torch.tensor(indices, device="cuda", dtype=torch.int32)
     q = torch.empty((1, 64, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
@@ -2846,110 +3888,6 @@ def test_one_shot_rejects_noncanonical_bsr(
             64,
             64,
         )
-
-
-@_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
-@torch.no_grad()
-def test_block_capacity_is_not_weakened_by_route_packing() -> None:
-    """Runtime preparation enforces the semantic block bound before packing."""
-
-    block_indptr = torch.tensor([[[0, 2]]], device="cuda", dtype=torch.int32)
-    block_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    # A prepared route may pack multiple B64 semantic blocks. Reserve the
-    # second index slot, then prove that replay still enforces max_blocks=1.
-    block_indptr.copy_(torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32))
-    block_indices[1] = -1
-    valid_bits = torch.full(
-        (1, 4),
-        0xFFFFFFFF,
-        device="cuda",
-        dtype=torch.uint32,
-    )
-    wrapper = block_sparse_module.BlockSparseTSWrapper()
-    _plan(
-        wrapper,
-        block_indptr,
-        block_indices,
-        kv_valid_bits=valid_bits,
-        max_blocks_per_row=1,
-    )
-    q = torch.randn((1, 64, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
-    k = torch.randn((1, 128, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
-    v = torch.randn_like(k)
-    block_indices.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
-    block_indptr.copy_(torch.tensor([[[0, 2]]], device="cuda", dtype=torch.int32))
-
-    overflow = wrapper.run(
-        q,
-        k,
-        v,
-        block_indptr,
-        block_indices,
-        kv_valid_bits=valid_bits,
-    )
-    torch.cuda.synchronize()
-
-    state = wrapper._published_state()
-    assert state.route_workspace[0].item() < 0
-    assert torch.count_nonzero(overflow).item() == 0
-
-    # Contract-invalid live IDs must still fail safely before address
-    # arithmetic; in particular, the token-mask path must not read word -1.
-    block_indices[0] = -1
-    block_indptr.copy_(torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32))
-    invalid_index = wrapper.run(
-        q,
-        k,
-        v,
-        block_indptr,
-        block_indices,
-        kv_valid_bits=valid_bits,
-    )
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(invalid_index).item() == 0
-
-
-@_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize(
-    "indices",
-    (
-        pytest.param((0, 0), id="duplicate"),
-        pytest.param((2, 1), id="unsorted"),
-        pytest.param((0, 4, 2), id="mixed-valid-out-of-range"),
-    ),
-)
-@torch.no_grad()
-def test_runtime_routes_fail_closed_for_noncanonical_row(
-    indices: tuple[int, ...],
-) -> None:
-    """Prepare rejects the whole row before retaining any partial route."""
-
-    block_indptr = torch.tensor(
-        [[[0, len(indices)]]],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    block_indices = torch.tensor(indices, device="cuda", dtype=torch.int32)
-    wrapper = block_sparse_module.BlockSparseTSWrapper()
-    _plan(
-        wrapper,
-        block_indptr,
-        block_indices,
-        seq_len_kv=256,
-        max_blocks_per_row=3,
-    )
-    q = torch.zeros((1, 64, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
-    k = torch.zeros((1, 256, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
-    v = torch.ones_like(k)
-
-    out = wrapper.run(q, k, v, block_indptr, block_indices)
-    torch.cuda.synchronize()
-
-    state = wrapper._published_state()
-    assert state.route_workspace[0].item() < 0
-    assert torch.count_nonzero(out).item() == 0
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -3127,6 +4065,134 @@ def test_public_block_sparse_correctness(
             rtol=tolerance,
             atol=tolerance,
         )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    _PROXY_ROUTE_CASES,
+    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128"),
+)
+@torch.no_grad()
+def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
+    case: _Case,
+) -> None:
+    """Both route frontends preserve exact/proxy mass, including the KV tail."""
+
+    block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    torch.manual_seed(2026082602)
+    patterns = _make_patterns(case)
+    block_indptr, block_indices = _make_bsr(patterns)
+    num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
+    exact_block_bits = _make_exact_block_bits(patterns, num_kv_blocks)
+    valid_bits, valid_by_batch = _make_token_mask(case)
+    q = torch.randn(
+        (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+        device="cuda",
+        dtype=case.dtype,
+    )
+    k = torch.randn(
+        (
+            case.batch_size,
+            case.seq_len_kv,
+            case.effective_num_kv_heads,
+            _HEAD_DIM,
+        ),
+        device="cuda",
+        dtype=case.dtype,
+    )
+    v = torch.randn_like(k)
+    k_summary, v_summary = _summarize_kv(k, v, case.kv_block_size)
+    sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
+    expected = torch.cat(
+        [
+            _single_row_proxy_reference(
+                case,
+                q[:, row_idx * case.q_block_size : (row_idx + 1) * case.q_block_size],
+                k,
+                v,
+                exact_blocks,
+                valid_by_batch[0],
+                k_summary,
+                v_summary,
+                sm_scale,
+            )
+            for row_idx, exact_blocks in enumerate(patterns[0][0])
+        ],
+        dim=1,
+    )
+    max_blocks_per_row = max(
+        len(row) for batch in patterns for head in batch for row in head
+    )
+    outputs: list[torch.Tensor] = []
+
+    try:
+        for sparse_format in ("bsr", "bitmask"):
+            wrapper = block_sparse_module.BlockSparseTSWrapper()
+            wrapper.plan(
+                case.batch_size,
+                case.seq_len_q,
+                case.seq_len_kv,
+                case.num_heads,
+                case.effective_num_kv_heads,
+                _HEAD_DIM,
+                case.q_block_size,
+                case.kv_block_size,
+                device=q.device,
+                max_blocks_per_row=max_blocks_per_row,
+                use_kv_valid_bits=valid_bits is not None,
+                sparse_format=sparse_format,
+                use_proxy_routes=True,
+                mask_type=case.mask_type,
+                q_data_type=case.dtype,
+            )
+            policy = dict(wrapper._policy)
+            assert policy["tile_size_q"] == case.expected_q_tile
+            assert policy["tile_size_kv"] == case.expected_kv_tile
+            assert policy["scheduler"] == case.scheduler
+
+            out = torch.full_like(q, float("nan"))
+            routing = (
+                {
+                    "block_indptr": block_indptr,
+                    "block_indices": block_indices,
+                }
+                if sparse_format == "bsr"
+                else {"exact_block_bits": exact_block_bits}
+            )
+            returned = wrapper.run(
+                q,
+                k,
+                v,
+                k_summary=k_summary,
+                v_summary=v_summary,
+                kv_valid_bits=valid_bits,
+                sm_scale=sm_scale,
+                out=out,
+                **routing,
+            )
+            assert returned is out
+            outputs.append(out)
+        torch.cuda.synchronize()
+    finally:
+        block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+
+    tolerance = 2e-2
+    for output in outputs:
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(
+            output,
+            expected,
+            rtol=tolerance,
+            atol=tolerance,
+        )
+    torch.testing.assert_close(
+        outputs[0],
+        outputs[1],
+        rtol=tolerance,
+        atol=tolerance,
+    )
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -3561,7 +4627,8 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
     state = wrapper._published_state()
-    assert state.route_workspace[0].item() == 1
+    # Two KV192 blocks contain six KV64 atoms, which require two KV256 routes.
+    assert state.route_workspace[0].item() == 2
 
     block_indices.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
     valid_bits.copy_(replay_valid_bits)
@@ -3580,7 +4647,7 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
-    assert state.route_workspace[0].item() == 1
+    assert state.route_workspace[0].item() == 2
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -3669,17 +4736,6 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
     torch.testing.assert_close(initial, initial_expected, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(replay, replay_expected, rtol=1e-2, atol=1e-2)
 
-    # Exceeding the declared envelope is still a caller error, but prepare
-    # fails closed instead of overwriting the following row's route slice.
-    block_indices[:4].copy_(
-        torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
-    )
-    block_indptr.copy_(torch.tensor([[[0, 4, 4]]], device="cuda", dtype=torch.int32))
-    overflow = wrapper.run(q, k, v, block_indptr, block_indices, sm_scale=sm_scale)
-    torch.cuda.synchronize()
-    assert state.route_workspace[0].item() == -4
-    assert torch.count_nonzero(overflow).item() == 0
-
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
@@ -3703,6 +4759,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         expected_kv_tile=256,
     )
     page_size = 64
+    live_seq_len_kv = 96
     paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
     paged_kv_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
     block_indptr, block_indices = _make_bsr(
@@ -3757,7 +4814,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
                 ((1,),),
             ),
         ),
-        (frozenset(range(case.seq_len_kv)),),
+        (frozenset(range(live_seq_len_kv)),),
         sm_scale,
     )
 
@@ -3770,7 +4827,8 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference() -> None:
         block_indices,
         case.q_block_size,
         case.kv_block_size,
-        seq_len_kv=case.seq_len_kv,
+        max_seq_len_kv=case.seq_len_kv,
+        seq_lens_kv=torch.tensor([live_seq_len_kv], dtype=torch.int32, device=q.device),
         sm_scale=sm_scale,
     )
     torch.cuda.synchronize()
@@ -3873,8 +4931,14 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     )
 
     wrapper = prims_ts.BlockSparsePagedTSWrapper()
+    seq_lens_kv = torch.full(
+        (case.batch_size,),
+        case.seq_len_kv,
+        device="cuda",
+        dtype=torch.int32,
+    )
     wrapper.plan(
-        paged_kv_indptr,
+        case.batch_size,
         case.seq_len_q,
         case.seq_len_kv,
         case.num_heads,
@@ -3883,6 +4947,7 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
         case.q_block_size,
         case.kv_block_size,
         page_size,
+        device=q.device,
         max_blocks_per_row=3,
         use_kv_valid_bits=False,
         mask_type="dense",
@@ -3896,7 +4961,9 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     actual = wrapper.run(
         q,
         paged_kv_cache,
+        paged_kv_indptr,
         paged_kv_indices,
+        seq_lens_kv,
         block_indptr,
         block_indices,
         sm_scale=sm_scale,
@@ -3910,7 +4977,9 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
         captured = wrapper.run(
             q,
             paged_kv_cache,
+            paged_kv_indptr,
             paged_kv_indices,
+            seq_lens_kv,
             block_indptr,
             block_indices,
             sm_scale=sm_scale,
@@ -3948,7 +5017,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     expected_kv_tile: int,
     dtype: torch.dtype,
 ) -> None:
-    """Public KV128/KV256 plans reload routes/pages and fail bad rows closed."""
+    """Public KV128/KV256 plans reload valid routes and pages."""
 
     torch.manual_seed(20260814)
     case = _Case(
@@ -3983,18 +5052,6 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
             ((0,),),
         ),
     )
-    patterns_invalid = (
-        (
-            ((second_page_block,),),
-            ((0,),),
-        ),
-    )
-    patterns_fail_closed = (
-        (
-            ((),),
-            ((0,),),
-        ),
-    )
 
     def padded_bsr(patterns: object) -> tuple[torch.Tensor, torch.Tensor]:
         indptr, indices = _make_bsr(patterns)
@@ -4004,10 +5061,8 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 
     indptr_a, indices_a = padded_bsr(patterns_a)
     indptr_b, indices_b = padded_bsr(patterns_b)
-    indptr_invalid, indices_invalid = padded_bsr(patterns_invalid)
     page_ids_a = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     page_ids_b = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
-    page_ids_invalid = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
 
     q = torch.randn((1, 8, 16, _HEAD_DIM), device="cuda", dtype=case.dtype) * 0.25
     k_pages = (
@@ -4057,18 +5112,8 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     all_tokens = (frozenset(range(case.seq_len_kv)),)
     k_a, v_a = logical_kv((0, 1))
     k_b, v_b = logical_kv((2, 3))
-    k_fail_closed, v_fail_closed = logical_kv((2, 0))
     expected_a = _reference(case, q, k_a, v_a, patterns_a, all_tokens, sm_scale)
     expected_b = _reference(case, q, k_b, v_b, patterns_b, all_tokens, sm_scale)
-    expected_fail_closed = _reference(
-        case,
-        q,
-        k_fail_closed,
-        v_fail_closed,
-        patterns_fail_closed,
-        all_tokens,
-        sm_scale,
-    )
     assert not torch.allclose(
         expected_a.float(), expected_b.float(), rtol=1e-3, atol=1e-3
     )
@@ -4077,9 +5122,15 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     block_indices = indices_a.clone()
     paged_kv_indices = page_ids_a.clone()
     paged_kv_indptr = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    seq_lens_kv = torch.full(
+        (case.batch_size,),
+        case.seq_len_kv,
+        device="cuda",
+        dtype=torch.int32,
+    )
     wrapper = prims_ts.BlockSparsePagedTSWrapper()
     wrapper.plan(
-        paged_kv_indptr,
+        case.batch_size,
         case.seq_len_q,
         case.seq_len_kv,
         case.num_heads,
@@ -4088,6 +5139,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
         case.q_block_size,
         case.kv_block_size,
         page_size,
+        device=q.device,
         max_blocks_per_row=2,
         use_kv_valid_bits=False,
         mask_type="dense",
@@ -4102,7 +5154,9 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     eager = wrapper.run(
         q,
         paged_kv_cache,
+        paged_kv_indptr,
         paged_kv_indices,
+        seq_lens_kv,
         block_indptr,
         block_indices,
         sm_scale=sm_scale,
@@ -4116,7 +5170,9 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
         captured = wrapper.run(
             q,
             paged_kv_cache,
+            paged_kv_indptr,
             paged_kv_indices,
+            seq_lens_kv,
             block_indptr,
             block_indices,
             sm_scale=sm_scale,
@@ -4141,20 +5197,6 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     replay()
     assert torch.isfinite(graph_out).all()
     torch.testing.assert_close(graph_out, expected_b, rtol=1e-2, atol=1e-2)
-
-    block_indptr.copy_(indptr_invalid)
-    block_indices.copy_(indices_invalid)
-    paged_kv_indices.copy_(page_ids_invalid)
-    replay()
-    assert torch.isfinite(graph_out).all()
-    assert torch.count_nonzero(graph_out[:, :, :8]).item() == 0
-    assert torch.count_nonzero(graph_out[:, :, 8:]).item() > 0
-    torch.testing.assert_close(
-        graph_out,
-        expected_fail_closed,
-        rtol=1e-2,
-        atol=1e-2,
-    )
     assert wrapper._published_state() is planned_state
 
 
@@ -4164,7 +5206,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_sparse_routes() -> (
     None
 ):
-    """Varlen-K plan snapshots live lengths while graph replays remap live routes."""
+    """One graph reloads every live paged input while its plan stays fixed."""
 
     torch.manual_seed(20260814)
     case = _Case(
@@ -4187,7 +5229,10 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     num_physical_pages = 6
     max_nnz = 6
     sm_scale = _HEAD_DIM**-0.5
-    seq_lens_kv = torch.tensor([48, 128], device="cuda", dtype=torch.int32)
+    seq_lens_a = torch.tensor([48, 128], device="cuda", dtype=torch.int32)
+    seq_lens_b = torch.tensor([96, 64], device="cuda", dtype=torch.int32)
+    paged_kv_indptr_a = torch.tensor([0, 1, 4], device="cuda", dtype=torch.int32)
+    paged_kv_indptr_b = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
     patterns_a = (
         (
             ((0,),),
@@ -4200,12 +5245,12 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     )
     patterns_b = (
         (
-            ((0,),),
-            ((0,),),
+            ((0, 1),),
+            ((1,),),
         ),
         (
-            ((1,),),
-            ((0, 1),),
+            ((0,),),
+            ((0,),),
         ),
     )
 
@@ -4295,19 +5340,17 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         frozenset(range(case.seq_len_kv)),
     )
     valid_by_batch_b = (
-        frozenset(range(48)),
         frozenset(range(96)),
+        frozenset(token for token in range(64) if token % 5 != 2),
     )
     kv_valid_bits_a = _pack_token_mask(case.seq_len_kv, valid_by_batch_a)
     kv_valid_bits_b = _pack_token_mask(case.seq_len_kv, valid_by_batch_b)
-    page_ids_a = torch.tensor([0, 2, 3, 6], device="cuda", dtype=torch.int32)
-    page_ids_b = torch.tensor([1, 4, 2, 6], device="cuda", dtype=torch.int32)
+    page_ids_a = torch.tensor([0, 2, 3, 5], device="cuda", dtype=torch.int32)
+    page_ids_b = torch.tensor([1, 4, 2, 5], device="cuda", dtype=torch.int32)
 
-    caller_seq_lens = seq_lens_kv.clone()
     wrapper = prims_ts.BlockSparsePagedTSWrapper()
-    paged_kv_indptr = torch.tensor([0, 1, 4], device="cuda", dtype=torch.int32)
     wrapper.plan(
-        paged_kv_indptr,
+        case.batch_size,
         case.seq_len_q,
         case.seq_len_kv,
         case.num_heads,
@@ -4316,31 +5359,29 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         case.q_block_size,
         case.kv_block_size,
         page_size,
+        device=q.device,
         max_blocks_per_row=2,
         use_kv_valid_bits=True,
-        seq_lens_kv=caller_seq_lens,
         mask_type=case.mask_type,
         q_data_type=case.dtype,
     )
-    caller_seq_lens.fill_(case.seq_len_kv)
     planned_state = wrapper._published_state()
-    assert planned_state.paged_kv is not None
-    assert planned_state.paged_kv.seq_lens_kv.tolist() == [48, 128]
+    assert planned_state.page_size == page_size
     assert ("tile_size_q", case.expected_q_tile) in wrapper._policy
     assert ("tile_size_kv", case.expected_kv_tile) in wrapper._policy
-    assert ("use_variable_seqlens_kv", True) in wrapper._policy
 
     k_a, v_a = logical_kv(((0, 1), (2, 3)))
-    k_b, v_b = logical_kv(((1, 0), (4, 2)))
+    k_b, v_b = logical_kv(((1, 4), (2, 0)))
 
     def varlen_reference(
         k: torch.Tensor,
         v: torch.Tensor,
         patterns: object,
         valid_by_batch: tuple[frozenset[int], ...],
+        seq_lens_kv: tuple[int, int],
     ) -> torch.Tensor:
         outputs: list[torch.Tensor] = []
-        for batch_idx, live_kv in enumerate((48, 128)):
+        for batch_idx, live_kv in enumerate(seq_lens_kv):
             live_case = replace(case, batch_size=1, seq_len_kv=live_kv)
             outputs.append(
                 _reference(
@@ -4361,8 +5402,20 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
             )
         return torch.cat(outputs)
 
-    expected_a = varlen_reference(k_a, v_a, patterns_a, valid_by_batch_a)
-    expected_b = varlen_reference(k_b, v_b, patterns_b, valid_by_batch_b)
+    expected_a = varlen_reference(
+        k_a,
+        v_a,
+        patterns_a,
+        valid_by_batch_a,
+        (48, 128),
+    )
+    expected_b = varlen_reference(
+        k_b,
+        v_b,
+        patterns_b,
+        valid_by_batch_b,
+        (96, 64),
+    )
     wrong_static_a0 = _reference(
         replace(case, batch_size=1),
         q[:1],
@@ -4385,12 +5438,16 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     block_indptr = indptr_a.clone()
     block_indices = indices_a.clone()
     paged_kv_indices = page_ids_a.clone()
+    paged_kv_indptr = paged_kv_indptr_a.clone()
+    seq_lens_kv = seq_lens_a.clone()
     kv_valid_bits = kv_valid_bits_a.clone()
 
     eager = wrapper.run(
         q,
         paged_kv_cache,
+        paged_kv_indptr,
         paged_kv_indices,
+        seq_lens_kv,
         block_indptr,
         block_indices,
         kv_valid_bits=kv_valid_bits,
@@ -4405,7 +5462,9 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         captured = wrapper.run(
             q,
             paged_kv_cache,
+            paged_kv_indptr,
             paged_kv_indices,
+            seq_lens_kv,
             block_indptr,
             block_indices,
             kv_valid_bits=kv_valid_bits,
@@ -4425,21 +5484,11 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
 
     block_indptr.copy_(indptr_b)
     block_indices.copy_(indices_b)
+    paged_kv_indptr.copy_(paged_kv_indptr_b)
     paged_kv_indices.copy_(page_ids_b)
+    seq_lens_kv.copy_(seq_lens_b)
     kv_valid_bits.copy_(kv_valid_bits_b)
     replay()
     assert torch.isfinite(graph_out).all()
-    torch.testing.assert_close(graph_out, expected_b, rtol=1e-2, atol=1e-2)
-
-    invalid_page_ids = page_ids_b.clone()
-    invalid_page_ids[0] = num_physical_pages
-    paged_kv_indices.copy_(invalid_page_ids)
-    replay()
-    assert torch.isfinite(graph_out).all()
-    assert torch.count_nonzero(graph_out[0]).item() == 0
-    torch.testing.assert_close(graph_out[1:], expected_b[1:], rtol=1e-2, atol=1e-2)
-
-    paged_kv_indices.copy_(page_ids_b)
-    replay()
     torch.testing.assert_close(graph_out, expected_b, rtol=1e-2, atol=1e-2)
     assert wrapper._published_state() is planned_state
