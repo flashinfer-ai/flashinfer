@@ -78,6 +78,16 @@ _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE = 256
 _CONTEXT_PADDED_EXTENT_MAX = _INT32_MAX - (_CONTEXT_MAX_Q_ROWS_PER_WORK_TILE - 1)
 
 
+def _variable_window_tile_size_q(head_dim: int) -> int:
+    """Return the number of Q rows sharing one variable-window CTA bound."""
+
+    return (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
+    )
+
+
 @dataclass(frozen=True)
 class _ContextGeometry:
     """Validated request geometry used by the contiguous one-shot adapter."""
@@ -512,7 +522,7 @@ def _validate_variable_window_bounds(
     ends: Optional[torch.Tensor],
     *,
     geometry: _ContextGeometry | _ContextPlanGeometry,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     """Validate inclusive per-query K bounds for contiguous attention."""
     if starts is None or ends is None:
         raise ValueError(
@@ -551,7 +561,7 @@ def _validate_variable_window_bounds(
                 f"{offset} has start={start}, end={end}, and "
                 f"max_kv_len={geometry.max_seq_len_k}"
             )
-    return starts.flatten(), ends.flatten()
+    return starts.flatten(), ends.flatten(), start_values
 
 
 def _refresh_variable_window_cta_starts(
@@ -560,11 +570,7 @@ def _refresh_variable_window_cta_starts(
     """Refresh plan-owned CTA minima from the current variable-window bounds."""
 
     geometry = state.geometry
-    tile_size_q = (
-        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
-        if geometry.head_dim == _CONTEXT_TILE_SIZE_Q
-        else _CONTEXT_TILE_SIZE_Q
-    )
+    tile_size_q = _variable_window_tile_size_q(geometry.head_dim)
     num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
     padded_rows = num_seq_tiles * tile_size_q
     starts_2d = starts.view(geometry.batch_size, geometry.max_seq_len_q)
@@ -581,6 +587,56 @@ def _refresh_variable_window_cta_starts(
         out=state.variable_window_cta_starts.view(geometry.batch_size, num_seq_tiles),
     )
     return state.variable_window_cta_starts
+
+
+def _validate_variable_window_cta_starts(
+    cta_starts: torch.Tensor,
+    *,
+    token_start_values: tuple[int, ...],
+    geometry: _ContextPlanGeometry,
+) -> torch.Tensor:
+    """Validate caller-precomputed per-CTA minimum K-token starts."""
+
+    _validate_tensor(cta_starts, "variable_window_cta_starts")
+    if cta_starts.device != geometry.device:
+        raise ValueError(
+            "variable_window_cta_starts must be on "
+            f"{geometry.device}, got {cta_starts.device}"
+        )
+    if cta_starts.dtype != torch.int32:
+        raise ValueError(
+            "variable_window_cta_starts must have dtype torch.int32, "
+            f"got {cta_starts.dtype}"
+        )
+    tile_size_q = _variable_window_tile_size_q(geometry.head_dim)
+    num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
+    expected_shape = (geometry.batch_size, num_seq_tiles)
+    if tuple(cta_starts.shape) != expected_shape:
+        raise ValueError(
+            "variable_window_cta_starts must have shape "
+            f"{expected_shape}, got {tuple(cta_starts.shape)}"
+        )
+    _validate_compact(cta_starts, "variable_window_cta_starts", "[B, Q tiles]")
+    _validate_alignment(cta_starts, "variable_window_cta_starts", 4)
+
+    actual_values = tuple(int(value) for value in cta_starts.flatten().tolist())
+    for batch_idx in range(geometry.batch_size):
+        row_offset = batch_idx * geometry.max_seq_len_q
+        for tile_idx in range(num_seq_tiles):
+            tile_begin = row_offset + tile_idx * tile_size_q
+            tile_end = min(
+                tile_begin + tile_size_q,
+                row_offset + geometry.max_seq_len_q,
+            )
+            expected = min(token_start_values[tile_begin:tile_end])
+            actual = actual_values[batch_idx * num_seq_tiles + tile_idx]
+            if actual != expected:
+                raise ValueError(
+                    "variable_window_cta_starts must contain the exact minimum "
+                    f"token start for each Q tile; entry [{batch_idx}, "
+                    f"{tile_idx}] is {actual}, expected {expected}"
+                )
+    return cta_starts.flatten()
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -1712,11 +1768,7 @@ def _get_compiled_context(
         if packed:
             raise RuntimeError("variable-window context requires fixed tensors")
         variable_window_shape = (batch_size * max_seq_len_q,)
-        variable_window_tile_size_q = (
-            _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
-            if head_dim == _CONTEXT_TILE_SIZE_Q
-            else _CONTEXT_TILE_SIZE_Q
-        )
+        variable_window_tile_size_q = _variable_window_tile_size_q(head_dim)
         variable_window_cta_shape = (
             batch_size * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),
         )
@@ -2254,16 +2306,17 @@ class BatchPrefillTSWrapper:
     """Compile and reuse fixed or packed-ragged contiguous context attention.
 
     ``plan`` accepts only static compilation geometry. Q/K/V tensors, packed
-    cumulative offsets, variable-window bounds, and optional scale overrides
-    are supplied to ``run``. Packed offset values may change between launches
-    while their request lengths stay within the planned capacities.
+    cumulative offsets, variable-window metadata, and optional scale overrides
+    are supplied to ``run``. Variable-window metadata may include precomputed
+    CTA minima. Packed offset values may change between launches while their
+    request lengths stay within the planned capacities.
 
     Plan-time scalar defaults are stored as one-element device tensors.
-    Variable-window plans also own private reduction scratch refreshed from
-    the current bounds on every run, so launches through one such wrapper must
-    not overlap across streams or captured graphs. With caller-owned output,
-    ``validate=False`` performs no allocation or metadata readback and is
-    CUDA-graph-capturable when the caller guarantees the complete runtime
+    Variable-window plans also own private fallback reduction scratch refreshed
+    when a run omits precomputed CTA minima; only launches using that scratch
+    must not overlap across streams or captured graphs. With caller-owned
+    output, ``validate=False`` performs no allocation or metadata readback and
+    is CUDA-graph-capturable when the caller guarantees the complete runtime
     contract and stable addresses. Replanning replaces plan-owned tensors and
     invalidates graphs captured from the previous plan; all prior launches and
     replays must finish before ``plan`` is called again. Keep the wrapper and
@@ -2374,11 +2427,7 @@ class BatchPrefillTSWrapper:
         )
         empty_i32 = torch.empty(1, dtype=torch.int32, device=geometry.device)
         if geometry.mask_type == "variable_window":
-            tile_size_q = (
-                _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
-                if geometry.head_dim == _CONTEXT_TILE_SIZE_Q
-                else _CONTEXT_TILE_SIZE_Q
-            )
+            tile_size_q = _variable_window_tile_size_q(geometry.head_dim)
             num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
             padded_rows = num_seq_tiles * tile_size_q
             variable_window_cta_starts = torch.empty(
@@ -2425,6 +2474,7 @@ class BatchPrefillTSWrapper:
         *,
         variable_window_token_starts: Optional[torch.Tensor] = None,
         variable_window_token_ends: Optional[torch.Tensor] = None,
+        variable_window_cta_starts: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
@@ -2442,6 +2492,12 @@ class BatchPrefillTSWrapper:
         variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
             Inclusive K-token bounds for every fixed Q row. Required only for
             ``mask_type='variable_window'`` and shaped ``[B, max_seq_len_q]``.
+        variable_window_cta_starts : torch.Tensor, optional
+            Precomputed exact minimum start bound for each Q work tile, shaped
+            ``[B, ceil(max_seq_len_q / tile_size_q)]`` where ``tile_size_q``
+            is 256 for head dimension 128 and 128 for head dimension 256.
+            Valid only for ``mask_type='variable_window'``. When omitted, the
+            wrapper derives these values from ``variable_window_token_starts``.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         scale_softmax_log2 : torch.Tensor, optional
@@ -2494,27 +2550,39 @@ class BatchPrefillTSWrapper:
                     "variable-window plans require start and end bounds in run()"
                 )
             if validate:
-                runtime_window_starts, runtime_window_ends = (
-                    _validate_variable_window_bounds(
-                        variable_window_token_starts,
-                        variable_window_token_ends,
-                        geometry=geometry,
-                    )
+                (
+                    runtime_window_starts,
+                    runtime_window_ends,
+                    runtime_window_start_values,
+                ) = _validate_variable_window_bounds(
+                    variable_window_token_starts,
+                    variable_window_token_ends,
+                    geometry=geometry,
                 )
             else:
                 runtime_window_starts = variable_window_token_starts.flatten()
                 runtime_window_ends = variable_window_token_ends.flatten()
-            runtime_window_cta_starts = _refresh_variable_window_cta_starts(
-                runtime_window_starts,
-                state=state,
-            )
+            if variable_window_cta_starts is None:
+                runtime_window_cta_starts = _refresh_variable_window_cta_starts(
+                    runtime_window_starts,
+                    state=state,
+                )
+            elif validate:
+                runtime_window_cta_starts = _validate_variable_window_cta_starts(
+                    variable_window_cta_starts,
+                    token_start_values=runtime_window_start_values,
+                    geometry=geometry,
+                )
+            else:
+                runtime_window_cta_starts = variable_window_cta_starts.flatten()
         else:
             if (
                 variable_window_token_starts is not None
                 or variable_window_token_ends is not None
+                or variable_window_cta_starts is not None
             ):
                 raise ValueError(
-                    "variable-window bounds require mask_type='variable_window'"
+                    "variable-window metadata requires mask_type='variable_window'"
                 )
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
@@ -2563,7 +2631,10 @@ class BatchPrefillTSWrapper:
                         ("variable_window_cta_starts", runtime_window_cta_starts),
                     )
                 )
-                if state.variable_window_padded_starts is not None:
+                if (
+                    variable_window_cta_starts is None
+                    and state.variable_window_padded_starts is not None
+                ):
                     alias_inputs.append(
                         (
                             "variable_window_padded_starts",
