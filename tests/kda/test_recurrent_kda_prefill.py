@@ -28,6 +28,8 @@ from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
+from tests.test_helpers.kda_prefill import cpu_route_tensors
+
 kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
@@ -229,83 +231,6 @@ def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
         )
 
 
-def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
-    wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    wrapper.plan(torch.tensor([0, 0, 7, 7, 12], device=cuda_device))
-
-    cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
-    seq_order_ptr = wrapper._seq_order_buf.data_ptr()
-    cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
-    assert wrapper._cu_seqlens_buf.dtype == torch.int64
-    assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
-    assert wrapper._seq_order_buf.tolist() == [1, 3, 0, 2]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 0, 1, 1, 2]
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
-
-    wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
-    assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
-    assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
-    assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
-    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
-
-    with pytest.raises(ValueError, match="total token count is fixed"):
-        wrapper.plan(torch.tensor([0, 0, 2, 2, 13], device=cuda_device))
-
-    with pytest.raises(ValueError, match="number of sequences is fixed"):
-        wrapper.plan(torch.tensor([0, 2, 12], device=cuda_device))
-
-    chunk_wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    chunk_wrapper.plan(torch.tensor([0, 16, 16, 32], device=cuda_device))
-    with pytest.raises(ValueError, match="chunk count is fixed"):
-        chunk_wrapper.plan(torch.tensor([0, 1, 17, 32], device=cuda_device))
-
-    with pytest.raises(ValueError, match="non-decreasing"):
-        RecurrentKDAPrefillWrapper(cuda_device).plan(
-            torch.tensor([0, 2, 1, 12], device=cuda_device)
-        )
-
-
-def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
-    wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    wrapper.plan(torch.tensor([0, 1, 3], device=cuda_device))
-    calls = []
-    sentinel = (object(), object())
-    monkeypatch.setattr(
-        kda_api,
-        "recurrent_kda",
-        lambda **kwargs: calls.append(kwargs) or sentinel,
-    )
-    tensors = _cpu_route_tensors(token_count=3)
-    tensors = {
-        key: value.to(cuda_device) if isinstance(value, torch.Tensor) else value
-        for key, value in tensors.items()
-    }
-
-    assert wrapper.run(**tensors) is sentinel
-    assert calls[0]["cu_seqlens"] is wrapper._cu_seqlens_buf
-    assert calls[0]["seq_order"] is wrapper._seq_order_buf
-    assert calls[0]["prefill_workspace"] is wrapper._workspace
-    assert calls[0]["backend"] == "cute-dsl"
-    assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
-
-
-def _cpu_route_tensors(token_count=2):
-    shape = (1, token_count, 1, 128)
-    return {
-        "q": torch.empty(shape, dtype=torch.bfloat16),
-        "k": torch.empty(shape, dtype=torch.bfloat16),
-        "v": torch.empty(shape, dtype=torch.bfloat16),
-        "g": torch.empty(shape, dtype=torch.bfloat16),
-        "beta": torch.empty((1, token_count, 1), dtype=torch.bfloat16),
-        "A_log": torch.empty(1, dtype=torch.float32),
-        "dt_bias": torch.empty((1, 128), dtype=torch.float32),
-        "use_gate_in_kernel": True,
-        "lower_bound": -5.0,
-        "beta_is_logit": True,
-    }
-
-
 def test_public_prefill_backend_option_routes_to_cute_dsl(monkeypatch):
     sentinel = (object(), object())
     monkeypatch.setattr(
@@ -319,7 +244,7 @@ def test_public_prefill_backend_option_routes_to_cute_dsl(monkeypatch):
         lambda **kwargs: sentinel,
     )
 
-    assert recurrent_kda(**_cpu_route_tensors(), backend="cute-dsl") is sentinel
+    assert recurrent_kda(**cpu_route_tensors(), backend="cute-dsl") is sentinel
 
 
 def test_public_prefill_auto_prefers_cute_dsl(monkeypatch):
@@ -340,7 +265,7 @@ def test_public_prefill_auto_prefers_cute_dsl(monkeypatch):
         lambda **kwargs: pytest.fail("auto should not probe Cake after a CuTe match"),
     )
 
-    assert recurrent_kda(**_cpu_route_tensors()) is sentinel
+    assert recurrent_kda(**cpu_route_tensors()) is sentinel
 
 
 def test_public_prefill_forwards_sequence_order_to_cute_dsl(monkeypatch):
@@ -360,7 +285,7 @@ def test_public_prefill_forwards_sequence_order_to_cute_dsl(monkeypatch):
     seq_order = torch.tensor([1, 0], dtype=torch.int32)
     assert (
         recurrent_kda(
-            **_cpu_route_tensors(token_count=3),
+            **cpu_route_tensors(token_count=3),
             cu_seqlens=torch.tensor([0, 1, 3], dtype=torch.int64),
             seq_order=seq_order,
         )
@@ -387,7 +312,7 @@ def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
         lambda **kwargs: sentinel,
     )
 
-    assert recurrent_kda(**_cpu_route_tensors()) is sentinel
+    assert recurrent_kda(**cpu_route_tensors()) is sentinel
 
 
 def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
@@ -414,7 +339,7 @@ def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
     checkpoint_starts = torch.tensor([0, 1], dtype=torch.int64)
     assert (
         recurrent_kda(
-            **_cpu_route_tensors(),
+            **cpu_route_tensors(),
             state_checkpoints=checkpoint_state,
             checkpoint_cu_starts=checkpoint_starts,
             checkpoint_every_n_tokens=32,
@@ -442,7 +367,7 @@ def test_public_prefill_auto_routes_supported_checkpoints_to_cute_dsl(monkeypatc
     starts = torch.tensor([0, 1], dtype=torch.int64)
     assert (
         recurrent_kda(
-            **_cpu_route_tensors(),
+            **cpu_route_tensors(),
             state_checkpoints=checkpoints,
             checkpoint_cu_starts=starts,
             checkpoint_every_n_tokens=32,
@@ -462,7 +387,7 @@ def test_public_prefill_cake_backend_is_strict(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="backend='cake' does not support"):
-        recurrent_kda(**_cpu_route_tensors(), backend="cake")
+        recurrent_kda(**cpu_route_tensors(), backend="cake")
 
 
 def test_public_decode_backend_option_forwards_to_decode_layer(monkeypatch):
@@ -474,15 +399,13 @@ def test_public_decode_backend_option_forwards_to_decode_layer(monkeypatch):
         return sentinel
 
     monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", run)
-    assert (
-        recurrent_kda(**_cpu_route_tensors(token_count=1), backend="cake") is sentinel
-    )
+    assert recurrent_kda(**cpu_route_tensors(token_count=1), backend="cake") is sentinel
     assert calls[0]["backend"] == "cake"
 
 
 def test_public_backend_option_rejects_unknown_value():
     with pytest.raises(ValueError, match="backend must be"):
-        recurrent_kda(**_cpu_route_tensors(), backend="unknown")
+        recurrent_kda(**cpu_route_tensors(), backend="unknown")
 
 
 def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
@@ -519,7 +442,7 @@ def test_cute_dsl_prefill_adapter_preserves_indexed_in_place_state_semantics(
         torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
     )
 
-    inputs = _cpu_route_tensors()
+    inputs = cpu_route_tensors()
     state = torch.empty((3, 1, 128, 128), dtype=torch.bfloat16)
     state_indices = torch.tensor([2], dtype=torch.int32)
     output = torch.empty_like(inputs["q"])
@@ -595,7 +518,7 @@ def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
         torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=7)
     )
 
-    inputs = _cpu_route_tensors()
+    inputs = cpu_route_tensors()
     output = torch.empty_like(inputs["q"])
     cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
     seq_order = torch.tensor([1, 0], dtype=torch.int32) if explicit_order else None
@@ -675,7 +598,7 @@ def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
             "has_state_indices": False,
         },
     )
-    inputs = _cpu_route_tensors()
+    inputs = cpu_route_tensors()
     cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int64)
 
     with pytest.raises(RuntimeError, match=r"Wrapper\.plan\(\)"):
