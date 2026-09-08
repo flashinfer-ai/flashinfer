@@ -198,7 +198,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
 @cute.kernel
 def gdn_verify_kernel_mtp(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -219,6 +219,7 @@ def gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -682,7 +683,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             it0 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1240,7 +1241,7 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1411,7 +1412,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1530,6 +1531,7 @@ def run_gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1597,6 +1599,7 @@ def run_gdn_verify_kernel_mtp(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -1623,7 +1626,7 @@ def run_gdn_verify_kernel_mtp(
 @cute.kernel
 def gdn_verify_kernel_mtp_inline(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -1644,6 +1647,7 @@ def gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1967,7 +1971,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2301,7 +2305,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2417,6 +2421,7 @@ def run_gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2477,6 +2482,7 @@ def run_gdn_verify_kernel_mtp_inline(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -2794,6 +2800,7 @@ def run_mtp_decode(
                 scale=scale,
                 HV=HV,
                 T=T,
+                cache_steps=cache_steps,
                 H=H,
                 K=K,
                 V=V,
@@ -2834,6 +2841,7 @@ def run_mtp_decode(
                 scale=scale,
                 HV=HV,
                 T=T,
+                cache_steps=cache_steps,
                 H=H,
                 K=K,
                 V=V,
