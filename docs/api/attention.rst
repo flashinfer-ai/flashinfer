@@ -305,3 +305,62 @@ PageAttention for MLA
     ``DeprecationWarning``.  Explicit ``backend="cutlass"`` callers that omit
     ``plan`` remain supported through a deprecated compatibility adapter when
     ``kv_len`` and ``page_table`` are supplied.
+
+CUDA graph plan updates
+-----------------------
+
+``BatchMLAPagedAttentionWrapper.update_cuda_graph_plan(metadata=...)`` updates
+the dynamic CSR scheduling state of an existing FA2 or FA3 CUDA graph plan
+without changing captured buffer addresses.  Construct the wrapper with
+``use_cuda_graph=True`` and ``enable_cuda_graph_plan_update=True``, provide its
+reserved graph metadata buffers, complete one successful ``plan()``, capture
+``run()``, and call the update outside active CUDA graph capture before replay.
+The update flag is a temporary compatibility opt-in so legacy graph callers do
+not retain update state they never use; it may become the default after the
+legacy private replanning bridge is retired.  The first call that passes the
+wrapper's lifecycle, capability, and capture checks binds the current CUDA
+stream on the wrapper device, even if backend delegation later fails.  Each
+corresponding graph replay must execute on that same stream.  Cross-stream
+replay and concurrent use are unsupported, and the wrapper cannot observe or
+validate the stream used by an external replay.
+
+The update accepts only complete CSR ``MLAPlanMetadata``.  ``qo_indptr``,
+``kv_indptr``, and ``kv_len_arr`` are host control tensors and must be
+contiguous CPU ``torch.int32`` tensors.  ``kv_indices`` must be contiguous
+``torch.int32`` on the wrapper device, must not overlap any capture-reserved
+wrapper buffer, and must remain alive until its queued publication completes.
+Page indices are not read back to the host.  The addressed page-index prefix
+must fit the capture reservation; publication copies only that prefix, so the
+unused reserved tail remains unchanged.
+
+The initial plan freezes the backend and generated module, reserved tensor
+identities and capacities, batch/output shape, layouts, dtypes, scale and LSE
+contracts, launch geometry, ``plan_info``, and staged workspace size.  An
+update that would change any frozen value fails.  FA2 and FA3 retain one device
+candidate schedule, two pinned-host planner/control staging slots, and their
+events during graph planning/warm-up.  When the existing device and pinned
+planner workspaces can hold two staged prefixes, those schedules are disjoint
+views of their unused tails; otherwise FlashInfer allocates only the missing
+region.  The small control tensors remain separate.  No committed schedule or
+page-index image is retained.  An update queries the existing slot events
+without waiting; if both slots are busy, it fails instead of allocating or
+synchronizing.
+CUTLASS, cuTile, and any backend that has not explicitly opted in reject this operation.
+A slot whose event cannot be recorded is poisoned; if both slots are poisoned,
+call ``plan()`` again to create fresh update state.
+
+Validation, planning, staging, and failures before native publication
+submission leave the preceding live plan untouched.  Once publication has been
+submitted, asynchronous CUDA execution or context failures are outside this
+no-sync guarantee by design.
+
+The private ``_cached_module`` and workspace/metadata mirrors used by older
+callers remain behavior-compatible in this release, as do legacy flat/CSR
+``plan()`` forms and the native planner bridge.  This compatibility bridge is
+deprecated in documentation only in this release.  It emits no runtime warning
+because untouched older SGLang accesses ``_cached_module`` and can promote
+``DeprecationWarning`` to an exception.  The public ``plan()`` /
+``update_cuda_graph_plan()`` / ``run()`` lifecycle is the replacement.
+Removing these private compatibility attributes requires a separately
+announced future change and evidence that the applicable support policy no
+longer includes callers that depend on them.

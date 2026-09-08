@@ -581,6 +581,9 @@ class _MLAPlanArguments:
     _kv_indptr_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _kv_indices_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _kv_len_arr_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
+    _enable_cuda_graph_plan_update: bool = field(
+        default=False, repr=False, compare=False
+    )
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
         default=None, repr=False, compare=False
     )

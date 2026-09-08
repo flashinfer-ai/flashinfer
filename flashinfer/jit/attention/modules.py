@@ -100,6 +100,81 @@ class _BatchMLAModuleProxy:
             device_bytes[:staged_int_workspace_bytes].copy_(staging, non_blocking=True)
         return plan_info, staged_int_workspace_bytes
 
+    def plan_with_preallocated_staging(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        page_locked_int_workspace_buffer: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        num_heads: int,
+        head_dim_o: int,
+        causal: bool,
+    ) -> tuple[list[int], int]:
+        """Run the raw planner using caller-owned scratch without copying it."""
+
+        if not isinstance(int_workspace_buffer, torch.Tensor) or not isinstance(
+            page_locked_int_workspace_buffer, torch.Tensor
+        ):
+            raise ValueError("Batch MLA plan requires integer and pinned workspaces.")
+        self._validate_workspace(int_workspace_buffer, page_locked_int_workspace_buffer)
+        plan_info, staged_int_workspace_bytes = self._module.plan(
+            float_workspace_buffer,
+            int_workspace_buffer,
+            page_locked_int_workspace_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_len_arr,
+            num_heads,
+            head_dim_o,
+            causal,
+        )
+        staged_int_workspace_bytes = int(staged_int_workspace_bytes)
+        scratch_bytes = page_locked_int_workspace_buffer.view(torch.uint8)
+        device_bytes = int_workspace_buffer.view(torch.uint8)
+        if (
+            staged_int_workspace_bytes < 0
+            or staged_int_workspace_bytes > scratch_bytes.numel()
+            or staged_int_workspace_bytes > device_bytes.numel()
+        ):
+            raise ValueError(
+                "Batch MLA planner returned invalid "
+                f"staged_int_workspace_bytes={staged_int_workspace_bytes} for "
+                f"scratch={scratch_bytes.numel()} and device={device_bytes.numel()}."
+            )
+        return plan_info, staged_int_workspace_bytes
+
+    def commit_cuda_graph_plan_update(
+        self,
+        live_int_workspace: torch.Tensor,
+        live_qo_indptr: torch.Tensor,
+        live_kv_indptr: torch.Tensor,
+        live_kv_indices: torch.Tensor,
+        live_kv_len_arr: torch.Tensor,
+        candidate_int_workspace: torch.Tensor,
+        candidate_qo_indptr: torch.Tensor,
+        candidate_kv_indptr: torch.Tensor,
+        source_kv_indices: torch.Tensor,
+        candidate_kv_len_arr: torch.Tensor,
+        staged_int_workspace_bytes: int,
+        live_kv_indices_length: int,
+    ) -> None:
+        self._module.commit_cuda_graph_plan_update(
+            live_int_workspace,
+            live_qo_indptr,
+            live_kv_indptr,
+            live_kv_indices,
+            live_kv_len_arr,
+            candidate_int_workspace,
+            candidate_qo_indptr,
+            candidate_kv_indptr,
+            source_kv_indices,
+            candidate_kv_len_arr,
+            staged_int_workspace_bytes,
+            live_kv_indices_length,
+        )
+
     def plan(self, *args: object) -> object:
         return self.plan_with_staged_workspace_bytes(*args)[0]
 
@@ -167,7 +242,7 @@ def get_batch_mla_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
         f"head_dim_kpe_{head_dim_kpe}_"
-        f"profiler_{use_profiler}_planabi2"
+        f"profiler_{use_profiler}_planabi4"
     ) + ("_sm90" if backend == "fa3" else "")
 
 
@@ -216,6 +291,7 @@ def gen_batch_mla_module(
         for filename in [
             "batch_mla_plan.cu",
             "batch_mla_run.cu",
+            "batch_mla_plan_update.cu",
             "batch_mla_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
@@ -243,6 +319,7 @@ def gen_batch_mla_module(
         for filename in [
             "batch_mla_sm90_plan.cu",
             "batch_mla_sm90_run.cu",
+            "batch_mla_plan_update.cu",
             "batch_mla_sm90_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename

@@ -15,6 +15,7 @@ class MLAPlanCapabilities:
     supports_skip_softmax_with_lse: bool = False
     requires_packed_query: bool = False
     requires_packed_kv_cache: bool = False
+    supports_cuda_graph_plan_update: bool = False
 
 
 class _CapabilityPlanArguments(Protocol):
