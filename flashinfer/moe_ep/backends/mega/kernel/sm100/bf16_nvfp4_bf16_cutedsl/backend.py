@@ -41,6 +41,8 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._autotune_pending = config.knobs == "auto"
+        self._autotune_winner: dict | None = None
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
@@ -105,11 +107,15 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
-            knobs=config.knobs,
+            knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
+        if config.knobs == "auto":
+            # Tuning mutates this session's frontend; never share it with a
+            # separately tuned layer (same rule as the NVFP4 Mega backend).
+            return None
         return (
             self.kernel_name(),
             torch.cuda.current_device(),
@@ -183,6 +189,20 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> torch.Tensor:
         from ......kernel_src.cutedsl_megamoe import w4a16_mega_moe
 
+        if self._autotune_pending:
+            from ......kernel_src.cutedsl_megamoe import autotune_w4a16_mega_moe
+
+            self._autotune_winner = dict(
+                autotune_w4a16_mega_moe(
+                    output,
+                    transformed_weights[0],
+                    transformed_weights[1],
+                    workspace,
+                    num_tokens=output.shape[0],
+                    gate_up_clamp=self._kernel_config.gate_up_clamp,
+                )
+            )
+            self._autotune_pending = False
         w4a16_mega_moe(
             output,
             transformed_weights[0],

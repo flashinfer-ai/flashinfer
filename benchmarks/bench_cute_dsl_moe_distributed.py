@@ -184,7 +184,12 @@ def _profile_worker_arguments(args, num_tokens):
     ]
     if args.megamoe_knobs is not None:
         arguments.extend(
-            ("--megamoe-knobs", json.dumps(args.megamoe_knobs, sort_keys=True))
+            (
+                "--megamoe-knobs",
+                args.megamoe_knobs
+                if args.megamoe_knobs == "auto"
+                else json.dumps(args.megamoe_knobs, sort_keys=True),
+            )
         )
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
@@ -422,9 +427,9 @@ def _run_nsys_profiles(args, token_counts):
             "--force-overwrite=true",
             "--sample=none",
             "--cpuctxsw=none",
-            "--trace=cuda,nvtx,nccl",
+            f"--trace={args.nsys_cuda_trace},nvtx,nccl",
             "--capture-range=cudaProfilerApi",
-            "--capture-range-end=stop",
+            f"--capture-range-end={args.nsys_capture_range_end}",
             f"--show-output={'true' if args.verbose else 'false'}",
             f"--output={output}",
             torchrun,
@@ -1211,6 +1216,23 @@ def _benchmark_distributed_megamoe(
     try:
         route()
         layer.warmup(tensors)
+        if args.megamoe_knobs == "auto":
+            print(
+                "MEGAMOE_TACTIC_JSON,"
+                + json.dumps(
+                    {
+                        "variant": "w4a16_megamoe",
+                        "global_tokens": num_tokens,
+                        "local_tokens": local_num_tokens,
+                        "max_tokens_per_rank": capacity,
+                        "rank": rank,
+                        "knobs": layer._kernel._autotune_winner,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
         if reference_outputs is not None:
             _check_megamoe_output(
                 layer.forward(tensors),
@@ -1797,14 +1819,18 @@ def _run_distributed_benchmark(args, token_counts):
 
 
 def _parse_megamoe_knobs(value):
+    if value == "auto":
+        return value
     try:
         knobs = json.loads(value)
     except json.JSONDecodeError as error:
         raise argparse.ArgumentTypeError(
-            "--megamoe-knobs must be a JSON object"
+            "--megamoe-knobs must be a JSON object or 'auto'"
         ) from error
     if not isinstance(knobs, dict):
-        raise argparse.ArgumentTypeError("--megamoe-knobs must be a JSON object")
+        raise argparse.ArgumentTypeError(
+            "--megamoe-knobs must be a JSON object or 'auto'"
+        )
     return knobs
 
 
@@ -1835,7 +1861,10 @@ def main():
         "--megamoe-knobs",
         type=_parse_megamoe_knobs,
         default=None,
-        help="JSON object of W4A16 MegaMoE kernel knobs, recorded in benchmark output.",
+        help=(
+            "JSON object of W4A16 MegaMoE kernel knobs, or auto to collectively "
+            "tune during warmup. Recorded in benchmark output."
+        ),
     )
     parser.add_argument(
         "--parallel-modes",
@@ -1907,6 +1936,24 @@ def main():
         type=str,
         default=None,
         help="Directory for Nsight Systems reports (default: a temporary directory).",
+    )
+    parser.add_argument(
+        "--nsys-cuda-trace",
+        choices=("cuda", "cuda-sw"),
+        default="cuda",
+        help=(
+            "Nsight CUDA trace mode; cuda-sw requests software tracing when "
+            "hardware tracing loses events (requires Nsight support)."
+        ),
+    )
+    parser.add_argument(
+        "--nsys-capture-range-end",
+        choices=("stop", "none"),
+        default="stop",
+        help=(
+            "Nsight capture range end; none keeps collecting after profiler "
+            "stop until the worker process tree exits."
+        ),
     )
     parser.add_argument(
         "--ncu-output-dir",

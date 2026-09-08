@@ -122,6 +122,28 @@ def bf16_candidates() -> List[Dict[str, Any]]:
     return [default_knobs(0, dtype="bf16")]
 
 
+def w4a16_candidates() -> List[Dict[str, Any]]:
+    """Twelve W4A16 tactics: validated geometry x flag batch x token return.
+
+    The kernel keeps two dequantization warp groups and derives its pipeline
+    depths from the existing resource fitters. Precision, clamps and the
+    post-FC2 routing/reduction contract are unchanged across candidates.
+    """
+    return [
+        dict(
+            _SWEEP_BASE,
+            mma_tiler_mnk=tile,
+            use_2cta_instrs=tile[0] == 256,
+            flag_batch=flag_batch,
+            token_back_mode=token_back,
+            in_kernel_fc2_reduce=False,
+        )
+        for tile in ((256, 128, 256), (256, 64, 256), (128, 64, 256))
+        for flag_batch in (4, 8)
+        for token_back in ("epi_warps", "reuse_dispatch_warps")
+    ]
+
+
 def autotune_knobs(
     frontend: Any,
     launch: Callable[[], None],
@@ -398,12 +420,78 @@ def autotune_bf16_mega_moe(
     )
 
 
+def autotune_w4a16_mega_moe(
+    y: torch.Tensor,
+    transformed_l1: Any,
+    transformed_l2: Any,
+    symm_buffer: Any,
+    *,
+    num_tokens: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    activation_clamp: Optional[float] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    warmup_iters: int = 3,
+    timed_iters: int = 10,
+) -> Dict[str, Any]:
+    """Collectively tune W4A16 on staged BF16 inputs and prepared NVFP4 weights.
+
+    The full synchronized wrapper includes the post-FC2 routing reduction.
+    Its output overwrites ``y``. See :func:`autotune_knobs` for rank ordering
+    and timing semantics; call outside graph capture on every EP rank.
+    """
+    from .w4a16 import w4a16_mega_moe
+
+    def launch() -> None:
+        w4a16_mega_moe(
+            y,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=gate_up_clamp,
+            activation_clamp=activation_clamp,
+            sync=True,
+        )
+
+    cfg = symm_buffer._frontend.config
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype="w4a16",
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                combine_dtype="bf16",
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
+
+    return autotune_knobs(
+        symm_buffer._frontend,
+        launch,
+        w4a16_candidates() if candidates is None else candidates,
+        label="w4a16_mega",
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=_record,
+    )
+
+
 __all__ = [
     "autotune_knobs",
     "autotune_bf16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "autotune_w4a16_mega_moe",
     "bf16_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
+    "w4a16_candidates",
 ]

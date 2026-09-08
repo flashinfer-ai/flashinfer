@@ -30,6 +30,12 @@ _TOP_K = 2
 _CAPACITY = 64
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_tactics(monkeypatch):
+    # Keep default-N128/raw-ring coverage independent of a user's tuned cache.
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "0")
+
+
 def _bootstrap(expected_world_size):
     from flashinfer.moe_ep import BootstrapConfig, ensure_moe_ep_cuda_device
 
@@ -368,9 +374,9 @@ def test_w4a16_mega_two_rank(check):
         (64, 64, 257, False),
         (192, 320, 257, False),
         (1024, 512, 257, False),
-        (9216, 64, 257, True),
+        (9472, 64, 257, True),
     ),
-    ids=("h64_i64_m257", "h192_i320_m257", "h1024_i512_m257", "h9216_i64_m257"),
+    ids=("h64_i64_m257", "h192_i320_m257", "h1024_i512_m257", "h9472_i64_m257"),
 )
 @pytest.mark.parametrize(
     "expected_world_size",
@@ -383,8 +389,8 @@ def test_w4a16_mega_geometry(
     # 128-token tiles; EP2 also leaves one rank without local expert work.
     # The feature tails exercise FC1 and FC2 stores. H1024/I512 gives four/two
     # K256 tiles and multiple work tiles wrap the two-stage operand pipelines.
-    # H9216/I64 fits four preferred-five raw stages; its 36 FC1 K tiles
-    # exercise that fitted ring repeatedly, alongside the one-tile FC2 tail.
+    # H9472/I64 fits four raw stages at default M256/N128. Its 37 FC1 K256
+    # tiles repeatedly wrap that ring alongside the one-tile FC2 tail.
     # Only that large-fan-in fixture scales FC1 globals by 1/sqrt(H).
     _check_numerical(
         expected_world_size,

@@ -133,8 +133,10 @@ from .tuner import (
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
     autotune_bf16_mega_moe,
+    autotune_w4a16_mega_moe,
     autotune_knobs,
     bf16_candidates,
+    w4a16_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
     mxfp8_candidates,
@@ -247,8 +249,10 @@ __all__ = [
     # autotune
     "autotune_knobs",
     "autotune_bf16_mega_moe",
+    "autotune_w4a16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "mxfp8_candidates",
     "nvfp4_candidates",
+    "w4a16_candidates",
 ]

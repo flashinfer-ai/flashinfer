@@ -50,6 +50,9 @@ class MegaMoEW4A16Config:
     enable_iket: bool = False
 
     def __post_init__(self) -> None:
+        # Geometry knobs also arrive as JSON arrays from the benchmark.
+        object.__setattr__(self, "mma_tiler_mnk", tuple(self.mma_tiler_mnk))
+        object.__setattr__(self, "cluster_shape_mnk", tuple(self.cluster_shape_mnk))
         if self.apply_topk_in_fc1 or self.in_kernel_fc2_reduce:
             raise ValueError("W4A16 routing scores are applied after FC2.")
         if self.token_back_mode == "standalone_warps":
@@ -66,13 +69,19 @@ class MegaMoEW4A16Config:
             raise ValueError("hidden must be divisible by 32.")
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
-        if self.mma_tiler_mnk != (256, 128, 256):
-            raise ValueError("W4A16 MegaMoE requires mma_tiler_mnk=(256, 128, 256).")
-        if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
+        if self.mma_tiler_mnk not in (
+            (128, 64, 256),
+            (128, 128, 256),
+            (256, 64, 256),
+            (256, 128, 256),
+        ):
             raise ValueError(
-                "W4A16 MegaMoE requires cluster_shape_mnk=(2, 1, 1) "
-                "and use_2cta_instrs=True."
+                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
             )
+        if self.cluster_shape_mnk != (2, 1, 1):
+            raise ValueError("W4A16 MegaMoE requires cluster (2,1,1).")
+        if self.use_2cta_instrs != (self.mma_tiler_mnk[0] == 256):
+            raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
         if self.token_back_mode not in (
             "epi_warps",
             "standalone_warps",
@@ -140,6 +149,9 @@ class MegaMoEW4A16Frontend:
             raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
+            from ..comm import ensure_not_capturing
+
+            ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
             self._config = new_config
             self._mega_key = None
@@ -208,7 +220,7 @@ class MegaMoEW4A16Frontend:
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=c.group_hint or max_active_clusters,
-            token_padding_block=128,
+            token_padding_block=c.mma_tiler_mnk[1],
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=(
                 c.num_experts_per_rank,
@@ -489,26 +501,36 @@ def get_symm_buffer_for_w4a16_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     in_kernel_fc2_reduce: bool = False,
-    token_back_mode: Literal[
-        "epi_warps", "standalone_warps", "reuse_dispatch_warps"
-    ] = "epi_warps",
+    token_back_mode: Optional[
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+    ] = None,
     knobs: Optional[dict] = None,
 ) -> MegaMoEW4A16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    from ..tuner import default_knobs
+    from ..knob_cache import resolve_knobs
 
-    # Match other Mega frontends: an explicit dict (including {}) bypasses
-    # defaults. Named correctness arguments retain their existing precedence.
-    default_config = (
-        default_knobs(num_max_tokens, dtype="w4a16") if knobs is None else {}
-    )
+    # Match the existing Mega cache contract: None is a pure capacity-keyed
+    # lookup; an explicit dict (including {}) bypasses cache and defaults.
+    if knobs is None:
+        resolved_knobs, _ = resolve_knobs(
+            dtype="w4a16",
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            combine_dtype="bf16",
+        )
+    else:
+        resolved_knobs = {}
     optional_config = {
-        **default_config,
+        **resolved_knobs,
         "gate_up_clamp": clamp,
         "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
-        "token_back_mode": token_back_mode,
+        **({"token_back_mode": token_back_mode} if token_back_mode is not None else {}),
         **(knobs or {}),
     }
     cfg = MegaMoEW4A16Config(

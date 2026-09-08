@@ -1,6 +1,7 @@
 """CuTe DSL W4A16 MegaMoE configuration."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -17,4 +18,14 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     top_k: int
     kernel_name: str = "sm100_bf16_nvfp4_bf16_cutedsl"
     gate_up_clamp: float | None = None
-    knobs: dict | None = None
+    # None looks up a recorded winner or the built-in profile; a dict overrides
+    # both. "auto" tunes collectively on the first forward, before capture.
+    knobs: dict | Literal["auto"] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.knobs is not None
+            and not isinstance(self.knobs, dict)
+            and self.knobs != "auto"
+        ):
+            raise ValueError("W4A16 knobs must be a dict, 'auto', or None")

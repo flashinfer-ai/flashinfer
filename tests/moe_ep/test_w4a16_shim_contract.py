@@ -120,7 +120,9 @@ def test_empty_capture_does_not_require_a_compiled_reducer(shim, buffer):
 
 
 @pytest.fixture
-def symm_factory():
+def symm_factory(monkeypatch):
+    # These tests assert built-in defaults; cache lookup has its own isolated tests.
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "0")
     pytest.importorskip("cutlass")
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_w4a16_mega_moe,
@@ -236,7 +238,12 @@ def test_buffer_knobs_cannot_replace_required_geometry(symm_factory, field):
 
 
 @pytest.mark.parametrize("hidden,intermediate", [(64, 64), (192, 320), (7168, 2048)])
-def test_tmem_config_preserves_public_geometry_and_swapped_knobs(hidden, intermediate):
+@pytest.mark.parametrize(
+    "tile", ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
+)
+def test_tmem_config_preserves_public_geometry_and_swapped_knobs(
+    hidden, intermediate, tile
+):
     pytest.importorskip("cutlass")
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
         MegaMoEW4A16Config,
@@ -254,10 +261,37 @@ def test_tmem_config_preserves_public_geometry_and_swapped_knobs(hidden, interme
     )
     assert config.mma_tiler_mnk == (256, 128, 256)
     frontend = MegaMoEW4A16Frontend(config)
-    frontend.apply_knobs({"mma_tiler_mnk": (256, 128, 256), "group_hint": 512})
+    # Benchmark JSON arrays must canonicalize before configuration/cache use.
+    frontend.apply_knobs(
+        {
+            "mma_tiler_mnk": list(tile),
+            "cluster_shape_mnk": [2, 1, 1],
+            "use_2cta_instrs": tile[0] == 256,
+            "group_hint": 512,
+        }
+    )
+    assert frontend.config.mma_tiler_mnk == tile
+    assert frontend.config.cluster_shape_mnk == (2, 1, 1)
+    assert frontend.config.use_2cta_instrs == (tile[0] == 256)
     assert frontend.config.group_hint == 512
+    hash(frontend._compile_key())
     with pytest.raises(ValueError, match="mma_tiler_mnk"):
         frontend.apply_knobs({"mma_tiler_mnk": (256, 256, 64)})
+
+
+@pytest.mark.parametrize("tile", ((128, 64, 256), (256, 64, 256)))
+def test_buffer_geometry_rejects_mismatched_mma_instruction_group(symm_factory, tile):
+    with pytest.raises(ValueError, match="M128/M256 requires one/two-CTA"):
+        symm_factory(
+            4,
+            4,
+            2,
+            64,
+            64,
+            0,
+            1,
+            knobs={"mma_tiler_mnk": list(tile), "use_2cta_instrs": tile[0] != 256},
+        )
 
 
 def test_frontend_validates_native_flat_scale_storage_before_compile():
