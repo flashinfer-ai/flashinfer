@@ -83,7 +83,9 @@ def test_generated_source_inventory_and_hashes() -> None:
         implementation_paths.append(kernel["host_binding"]["path"])
         implementation_paths.extend(record["path"] for record in kernel["outputs"])
     assert len(implementation_paths) == 70
-    assert all(Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths)
+    assert all(
+        Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths
+    )
     assert manifest["launch_order"] == [
         "t_precompute",
         "mn_precompute",
@@ -1781,11 +1783,14 @@ def test_structurally_supported_public_route_uses_generated_state_and_lifecycle(
         cu_values.append(cu_values[-1] + length)
     cu_seqlens = torch.tensor(cu_values, dtype=case["cu_dtype"], device="cuda")
     pool_rows = num_seqs + 5 if case["indexed"] else num_seqs
-    state_values = torch.randn(
-        (pool_rows, state_heads, 128, 128),
-        dtype=case["initial_dtype"],
-        device="cuda",
-    ) * input_scale
+    state_values = (
+        torch.randn(
+            (pool_rows, state_heads, 128, 128),
+            dtype=case["initial_dtype"],
+            device="cuda",
+        )
+        * input_scale
+    )
     candidate_initial = _allocate_state_pool(
         pool_rows,
         state_heads,
