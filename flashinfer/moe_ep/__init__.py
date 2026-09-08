@@ -99,6 +99,11 @@ Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
 
+from .cake_mxfp8_megamoe_ep16 import (
+    CakeMxfp8MegaMoeEp16,
+    CakeMxfp8MegaMoeEp16Weights,
+    preprocess_cake_mxfp8_megamoe_ep16_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -163,6 +168,9 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "CakeMxfp8MegaMoeEp16",
+    "CakeMxfp8MegaMoeEp16Weights",
+    "preprocess_cake_mxfp8_megamoe_ep16_weights",
     "Bf16CutedslMegaMoeConfig",
     "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
     "CombineInputParams",
