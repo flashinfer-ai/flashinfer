@@ -305,6 +305,7 @@ def trtllm_batch_decode_mla(
     MAX_SEQ_LEN: int,
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool = True,
+    use_fp16_softmax: bool = False,
     use_cum_seq_lens_q: bool = False,
     max_q_len_exceeds_total_q: bool = False,
 ):
@@ -343,6 +344,12 @@ def trtllm_batch_decode_mla(
         pytest.skip("skips_softmax is only supported for trtllm-gen backend")
     if use_cum_seq_lens_q and backend == "xqa":
         pytest.skip("XQA does not support cum_seq_lens_q")
+
+    if use_fp16_softmax and backend != "trtllm-gen":
+        pytest.skip("use_fp16_softmax=True is only supported for trtllm-gen backend")
+    if use_fp16_softmax and get_compute_capability(torch.device("cuda:0")) != (10, 7):
+        # trtllm-gen only exports the Fp16Softmax cubin variants for sm107a.
+        pytest.skip("use_fp16_softmax=True is only supported on SM107 (Rubin)")
 
     torch.manual_seed(42)
     device = "cuda:0"
@@ -522,6 +529,7 @@ def trtllm_batch_decode_mla(
         enable_pdl=enable_pdl,
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        use_fp16_softmax=use_fp16_softmax,
         lse=provided_lse,
         return_lse=check_lse,
         cum_seq_lens_q=cum_seq_lens_q,
@@ -626,6 +634,9 @@ def trtllm_batch_decode_mla(
             rtol, atol = 1e-1, 1e-1
         else:
             rtol, atol = 1e-2, 1e-2
+
+        if use_fp16_softmax and dtype != torch.float8_e4m3fn:
+            rtol, atol = 3e-2, 3e-2
 
         try:
             torch.testing.assert_close(output_view, o_ref_view, rtol=rtol, atol=atol)
@@ -1253,6 +1264,77 @@ def test_trtllm_batch_decode_q1_mla():
     )
 
 
+def test_trtllm_batch_decode_q1_mla_uses_cga_kernel():
+    if get_compute_capability(torch.device("cuda")) != (10, 0):
+        pytest.skip("MLA H512 CGA kernel selection is specific to SM100")
+
+    device = "cuda:0"
+    batch_size = 1
+    num_heads = 128
+    page_size = 32
+    max_seq_len = 4096
+    head_dim_qk = 576
+    head_dim_v = 512
+    num_pages = max_seq_len // page_size
+
+    query = torch.randn(
+        batch_size,
+        1,
+        num_heads,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = torch.randn(
+        num_pages,
+        1,
+        page_size,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    seq_lens = torch.tensor([max_seq_len], dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
+
+    def run_decode():
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=128,
+            kv_lora_rank=head_dim_v,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=1.0 / (192**0.5),
+            bmm2_scale=1.0,
+            enable_pdl=False,
+            backend="trtllm-gen",
+        )
+
+    # Warm up JIT compilation so the profile contains only the runtime selection and launch.
+    run_decode()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as kernel_profile:
+        run_decode()
+        torch.cuda.synchronize()
+
+    fmha_kernel_names = {
+        event.name for event in kernel_profile.events() if event.name.startswith("fmha")
+    }
+    expected_kernel = "HQk576HV512HVPerCta128PagedKvDenseP32MultiCtasKvCga"
+    assert any(expected_kernel in name for name in fmha_kernel_names), fmha_kernel_names
+
+
 def test_trtllm_batch_decode_grouped_mla_fixed_q_batch_stride():
     trtllm_batch_decode_mla(
         MLALayerDimensions(deepseek_mla_dimensions, 8),
@@ -1600,3 +1682,35 @@ def test_trtllm_batch_decode_mla_preallocated_out(
                 backend="trtllm-gen",
                 multi_ctas_kv_counter_buffer=offset_counter_buffer,
             )
+
+
+@pytest.mark.parametrize(
+    "layer_dimensions",
+    supported_mla_layer_dimensions,
+)
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("page_size", [32, 64])
+@pytest.mark.parametrize("q_len_per_request", [1, 2])
+def test_trtllm_batch_decode_mla_use_fp16_softmax(
+    layer_dimensions: MLALayerDimensions,
+    batch_size: int,
+    dtype: torch.dtype,
+    page_size: int,
+    q_len_per_request: int,
+):
+    trtllm_batch_decode_mla(
+        layer_dimensions=layer_dimensions,
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=dtype,
+        page_size=page_size,
+        q_len_per_request=q_len_per_request,
+        dynamic_scale=False,
+        enable_pdl=None,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=True,
+        use_fp16_softmax=True,
+    )

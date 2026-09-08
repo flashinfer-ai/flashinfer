@@ -45,6 +45,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
+from common.host_utils import get_cutedsl_target_arch
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 from .topk_reduce import TopkReduce
 from src.token_comm import (
@@ -1496,7 +1497,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )
-            TopkReduce(self.hidden, self.num_topk, self.combine_format)(
+            TopkReduce(
+                self.hidden,
+                self.num_topk,
+                self.combine_format,
+                sm_arch=get_cutedsl_target_arch(),
+            )(
                 combine_target,
                 combine_sf,
                 output_activation,

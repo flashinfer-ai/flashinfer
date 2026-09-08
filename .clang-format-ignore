@@ -1,0 +1,11 @@
+# Byte-faithful generated gated-activation kernels.
+csrc/gated_act_mxfp8/gated_act_mxfp8_fwd_row.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_fwd_row_noalloc.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_fwd_col.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_fwd_both.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_fwd_both_noalloc.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_row.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_row_sm103.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_col.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both_sm103.cu

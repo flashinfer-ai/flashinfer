@@ -39,6 +39,14 @@ _Fp8Kinds = _Fp8KindsE4M3 + _Fp8KindsE5M2
 # ---------------------------------------------------------------------------
 
 
+def get_cutedsl_target_arch() -> str:
+    """Return the active cuTeDSL compilation target as an ``sm_XX`` string."""
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    return f"sm_{arch.major}{arch.minor}"
+
+
 def kind_data_dtype(kind: str) -> torch.dtype:
     if kind == "nvfp4":
         return _Nvfp4DataDtype

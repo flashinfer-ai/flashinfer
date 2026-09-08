@@ -6,7 +6,7 @@
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka @Anerudhan
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
@@ -32,8 +32,8 @@ include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv
 tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
 
 # ── MOE_EP ──
-flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
-tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
+flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka
+tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan

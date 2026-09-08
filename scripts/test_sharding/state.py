@@ -93,6 +93,9 @@ def _normalize_source_git_sha(value: Any) -> str | None:
 def source_git_sha_from_env() -> str | None:
     """Return the optional CI archive identity used to validate resume."""
 
+    # SOURCE_GIT_SHA is injected by callers that want plan and run jobs to prove
+    # they are using the same source archive. Local runs and older wrappers may
+    # omit it, so absence is treated as "no SHA guard available".
     return _normalize_source_git_sha(os.environ.get("SOURCE_GIT_SHA"))
 
 
@@ -204,11 +207,20 @@ class ManifestBuild:
     selection: dict[str, Any]
     estimate_files: dict[str, str | None]
     pytest_command_prefix: tuple[str, ...] = ()
+    test_paths: tuple[Path, ...] | None = None
+
+
+def _resolved_test_paths(
+    test_path: Path, test_paths: Sequence[Path] | None = None
+) -> tuple[Path, ...]:
+    if test_paths:
+        return tuple(path.resolve() for path in test_paths)
+    return (test_path.resolve(),)
 
 
 def build_manifest(request: ManifestBuild) -> dict[str, Any]:
     repo_root = request.repo_root
-    test_path = request.test_path
+    test_paths = _resolved_test_paths(request.test_path, request.test_paths)
     plan = request.plan
     return {
         "schema_version": SCHEMA_VERSION,
@@ -217,7 +229,8 @@ def build_manifest(request: ManifestBuild) -> dict[str, Any]:
         "repository_root": str(repo_root.resolve()),
         "source_git_sha": request.source_git_sha,
         "collection_fingerprint": collection_fingerprint(plan),
-        "test_path": str(test_path.resolve()),
+        "test_path": " ".join(str(path) for path in test_paths),
+        "test_paths": [str(path) for path in test_paths],
         "selection": request.selection,
         "pytest_command_prefix": list(request.pytest_command_prefix),
         "estimate_files": request.estimate_files,
@@ -233,16 +246,18 @@ def verify_manifest(
     selection: dict[str, Any],
     planning_options: dict[str, Any],
     pytest_command_prefix: tuple[str, ...] = (),
-    estimate_files: dict[str, str | None] | None = None,
+    test_paths: Sequence[Path] | None = None,
 ) -> None:
     mismatches: list[str] = []
+    resolved_paths = _resolved_test_paths(test_path, test_paths)
+    expected_test_path = " ".join(str(path) for path in resolved_paths)
     checks = {
         "schema_version": (manifest.get("schema_version"), SCHEMA_VERSION),
         "algorithm_version": (
             manifest.get("algorithm_version"),
             ALGORITHM_VERSION,
         ),
-        "test_path": (manifest.get("test_path"), str(test_path.resolve())),
+        "test_path": (manifest.get("test_path"), expected_test_path),
         "selection": (manifest.get("selection"), selection),
         "pytest_command_prefix": (
             tuple(manifest.get("pytest_command_prefix", ())),
@@ -253,13 +268,19 @@ def verify_manifest(
             planning_options,
         ),
     }
-    if estimate_files is not None:
-        checks["estimate_files"] = (manifest.get("estimate_files"), estimate_files)
+    if "test_paths" in manifest:
+        checks["test_paths"] = (
+            manifest.get("test_paths"),
+            [str(path) for path in resolved_paths],
+        )
     for name, (saved, current) in checks.items():
         if saved != current:
             mismatches.append(f"{name}: saved={saved!r}, current={current!r}")
     saved_source_git_sha = _normalize_source_git_sha(manifest.get("source_git_sha"))
     current_source_git_sha = _normalize_source_git_sha(source_git_sha)
+    # The source SHA is an optional compatibility guard. When both sides provide
+    # it, a mismatch means the saved plan belongs to a different source state.
+    # When either side omits it, rely on the mandatory manifest fields above.
     if (
         saved_source_git_sha is not None
         and current_source_git_sha is not None
