@@ -42,12 +42,22 @@ def _reference(inputs, weight_before_norm: bool):
     return alpha * residual + beta * values
 
 
+def test_gated_residual_rmsnorm_supports_blackwell_devices():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("SM100 or SM103 is required")
+    assert supports_gated_residual_rmsnorm(*_inputs(1))
+
+
 @pytest.mark.parametrize("weight_before_norm", [False, True])
 @pytest.mark.parametrize("rows", [0, 1, 17, 128])
 def test_gated_residual_rmsnorm_matches_reference(rows, weight_before_norm):
     inputs = _inputs(rows)
     if not supports_gated_residual_rmsnorm(*inputs):
-        pytest.skip("gated residual RMSNorm requires BF16/FP32 tensors on SM103")
+        pytest.skip(
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+        )
     expected = _reference(inputs, weight_before_norm)
     api_inputs = list(inputs)
     if not weight_before_norm:
@@ -72,7 +82,9 @@ def test_gated_residual_rmsnorm_rejects_wrong_hidden_size():
 def test_gated_residual_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_rmsnorm(*inputs):
-        pytest.skip("gated residual RMSNorm requires BF16/FP32 tensors on SM103")
+        pytest.skip(
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+        )
 
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[
         ::2
@@ -96,7 +108,9 @@ def test_gated_residual_rmsnorm_rejects_unsafe_layouts():
 def test_gated_residual_rmsnorm_cuda_graph(weight_before_norm):
     inputs = list(_inputs(17))
     if not supports_gated_residual_rmsnorm(*inputs):
-        pytest.skip("gated residual RMSNorm requires BF16/FP32 tensors on SM103")
+        pytest.skip(
+            "gated residual RMSNorm requires BF16/FP32 tensors on SM100 or SM103"
+        )
     kwargs = {
         "eps": EPS,
         "gain_center": 1.0 if weight_before_norm else 0.0,

@@ -88,9 +88,9 @@ try:
         supports_rmsnorm_sigmoid_gate,
     )
 
-    _HAS_SM103_FUSED_NORM = True
+    _HAS_CUTE_DSL_FUSED_NORM = True
 except (ImportError, AttributeError):
-    _HAS_SM103_FUSED_NORM = False
+    _HAS_CUTE_DSL_FUSED_NORM = False
 
     def supports_rmsnorm_sigmoid_gate(
         dtype: torch.dtype,
@@ -165,6 +165,7 @@ def _normalize_scale_tensor(
 
 
 _GATED_RESIDUAL_HIDDEN_SIZE = 8192
+_GATED_RESIDUAL_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _FUSED_NORM_ALIGNMENT = 16
 _DUAL_NORM_ALIGNMENT = 32
 
@@ -180,10 +181,10 @@ def supports_gated_residual_rmsnorm(
     alpha: torch.Tensor,
     beta: torch.Tensor,
 ) -> bool:
-    """Return whether tensors satisfy the SM103 fused-kernel contract."""
+    """Return whether tensors satisfy the SM100/SM103 fused-kernel contract."""
     tensors = (branch, residual, alpha, beta)
     return (
-        _HAS_SM103_FUSED_NORM
+        _HAS_CUTE_DSL_FUSED_NORM
         and branch.ndim == 2
         and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
         and residual.shape == branch.shape
@@ -211,7 +212,8 @@ def supports_gated_residual_rmsnorm(
                 and _is_aligned(weight)
             )
         )
-        and torch.cuda.get_device_capability(branch.device) == (10, 3)
+        and torch.cuda.get_device_capability(branch.device)
+        in _GATED_RESIDUAL_COMPUTE_CAPABILITIES
     )
 
 
@@ -225,7 +227,7 @@ def supports_gated_residual_next_rmsnorm(
     """Return whether tensors satisfy the SM103 two-norm kernel contract."""
     tensors = (branch, residual, next_weight, alpha, beta)
     return (
-        _HAS_SM103_FUSED_NORM
+        _HAS_CUTE_DSL_FUSED_NORM
         and branch.ndim == 2
         and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
         and residual.shape == branch.shape
@@ -397,7 +399,7 @@ def gated_residual_rmsnorm(
     before its RMS reduction. When it is ``None``, the branch is unweighted.
 
     This optimized implementation currently supports contiguous BF16 tensors
-    with hidden size 8192 on SM103 GPUs.
+    with hidden size 8192 on SM100 and SM103 GPUs.
 
     Parameters
     ----------

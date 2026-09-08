@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""Fused gated residual RMSNorm (CuTe DSL, SM103).
+"""Fused gated residual RMSNorm (CuTe DSL, SM100/SM103).
 
     x      = f32(branch)                        (MODE == 0)
     x      = f32(branch) * f32(norm_weight)     (MODE == 1, weight before the norm)
