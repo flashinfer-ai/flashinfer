@@ -1045,9 +1045,11 @@ def _validate_full_domain_row(row, index, repeat_iters, *, legacy=False):
                 if legacy
                 else cell["route_call_count"] == 0
             )
-            if cell["variant_name"] is not None or not route_count_is_valid or cell[
-                "fallback_call_count"
-            ] < 1:
+            if (
+                cell["variant_name"] is not None
+                or not route_count_is_valid
+                or cell["fallback_call_count"] < 1
+            ):
                 raise RuntimeError(f"{shape} baseline route proof is invalid")
         else:
             if (
@@ -1151,9 +1153,8 @@ def _load_full_domain_rows(
             expected_identity_sha256 = inherited_identity_sha256_by_row[index]
         else:
             expected_identity_sha256 = identity_sha256
-        inherited = (
-            inherited_identity_sha256_by_row is not None
-            and index < len(inherited_identity_sha256_by_row)
+        inherited = inherited_identity_sha256_by_row is not None and index < len(
+            inherited_identity_sha256_by_row
         )
         valid_schemas = (
             {_FULL_DOMAIN_ROW_SCHEMA, _LEGACY_FULL_DOMAIN_ROW_SCHEMA}
@@ -1259,7 +1260,8 @@ def _checkpoint_receipt_identity_sha256_by_row(
     predecessor = json.loads(predecessor_bytes)
     predecessor_identity = predecessor.get("identity")
     if (
-        predecessor.get("schema") not in (
+        predecessor.get("schema")
+        not in (
             _FULL_DOMAIN_SCHEMA,
             _LEGACY_FULL_DOMAIN_SCHEMA,
         )
@@ -1286,8 +1288,10 @@ def _checkpoint_receipt_identity_sha256_by_row(
 
 
 def _require_sha256(value, description):
-    if not isinstance(value, str) or len(value) != 64 or any(
-        character not in "0123456789abcdef" for character in value
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise RuntimeError(f"{description} is not a SHA-256 digest")
 
@@ -1439,11 +1443,9 @@ def _validate_equivalence_receipt(
             "tvm_ffi_version",
         )
     }
-    if (
-        verifier["script_sha256"]
-        != hashlib.sha256(verifier_path.read_bytes()).hexdigest()
-        or verifier["toolchain_sha256"] != _canonical_json_sha256(toolchain)
-    ):
+    if verifier["script_sha256"] != hashlib.sha256(
+        verifier_path.read_bytes()
+    ).hexdigest() or verifier["toolchain_sha256"] != _canonical_json_sha256(toolchain):
         raise RuntimeError("equivalence verifier or toolchain identity is invalid")
 
     predecessor = receipt["predecessor"]
@@ -1537,9 +1539,11 @@ def _validate_equivalence_receipt(
         name = current_variant.get("name")
         if predecessor_variant.get("name") != name or proof["name"] != name:
             raise RuntimeError("equivalence variant order or name changed")
-        predecessor_abi = predecessor_manifest.get("contract", {}).get(
-            "kernel_abis", {}
-        ).get(predecessor_variant.get("abi_kind"))
+        predecessor_abi = (
+            predecessor_manifest.get("contract", {})
+            .get("kernel_abis", {})
+            .get(predecessor_variant.get("abi_kind"))
+        )
         metadata_equal = (
             predecessor_variant.get("target") == current_variant.get("target")
             and predecessor_variant.get("abi_kind") == current_variant.get("abi_kind")
@@ -1573,11 +1577,10 @@ def _validate_equivalence_receipt(
             capture_output=True,
         ).stdout
         current_source = (repo_root / current_variant["body"]).read_bytes()
-        if (
-            hashlib.sha256(predecessor_source).hexdigest()
-            != predecessor_variant.get("source_sha256")
-            or hashlib.sha256(current_source).hexdigest()
-            != current_variant.get("source_sha256")
+        if hashlib.sha256(predecessor_source).hexdigest() != predecessor_variant.get(
+            "source_sha256"
+        ) or hashlib.sha256(current_source).hexdigest() != current_variant.get(
+            "source_sha256"
         ):
             raise RuntimeError(f"source identity changed for {name!r}")
         predecessor_normalized = _normalize_kernel_symbol(

@@ -60,9 +60,7 @@ def _fake_inputs():
         "weight": _FakeTensor(
             (3, 4, hidden), (4 * hidden, hidden, 1), torch.float32, contiguous=True
         ),
-        "conv_state": _FakeTensor(
-            (slots, qkv, 3), (3 * qkv, 1, qkv), torch.bfloat16
-        ),
+        "conv_state": _FakeTensor((slots, qkv, 3), (3 * qkv, 1, qkv), torch.bfloat16),
         "raw_gate": _FakeTensor(
             (1, rows, heads, 128),
             (rows * hidden, hidden, 128, 1),
@@ -152,12 +150,16 @@ def test_cake_selector_rejects_misaligned_mutable_buffers(monkeypatch, name, dat
         contiguous=original.is_contiguous(),
         data_ptr=data_ptr,
     )
-    monkeypatch.setattr(fused, "get_cake_fused_kda_decode_variants", lambda: (object(),))
+    monkeypatch.setattr(
+        fused, "get_cake_fused_kda_decode_variants", lambda: (object(),)
+    )
     monkeypatch.setattr(fused, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         fused,
         "select_cake_fused_kda_decode_variant",
-        lambda **kwargs: pytest.fail("misaligned inputs must be rejected before routing"),
+        lambda **kwargs: pytest.fail(
+            "misaligned inputs must be rejected before routing"
+        ),
     )
 
     assert (

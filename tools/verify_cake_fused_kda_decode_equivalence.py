@@ -213,8 +213,8 @@ def _normalize_predecessor_binding(source):
     for predecessor, current in replacements:
         source = source.replace(predecessor, current)
     return source.replace(
-        "identity must be a full SHA-256\");\n\n\n#include",
-        "identity must be a full SHA-256\");\n\n#include",
+        'identity must be a full SHA-256");\n\n\n#include',
+        'identity must be a full SHA-256");\n\n#include',
         1,
     )
 
@@ -253,9 +253,11 @@ def _cuobjdump_record(cuobjdump, library, symbol, option):
     output = _run((cuobjdump, option, "--function", symbol, str(library)))
     if symbol not in output:
         raise RuntimeError(f"cuobjdump did not report {symbol!r} from {library}")
-    return output.replace(str(library), "<CONTAINER>").replace(
-        library.name, "<CONTAINER>"
-    ).replace(symbol, "CAKE_FUSED_KDA_KERNEL_SYMBOL")
+    return (
+        output.replace(str(library), "<CONTAINER>")
+        .replace(library.name, "<CONTAINER>")
+        .replace(symbol, "CAKE_FUSED_KDA_KERNEL_SYMBOL")
+    )
 
 
 def _ninja_object_for_source(spec, source):
@@ -274,9 +276,7 @@ def _ninja_object_for_source(spec, source):
 
 def _tensor_digest(torch, tensors, scalars):
     digest = hashlib.sha256()
-    digest.update(
-        json.dumps(scalars, sort_keys=True, separators=(",", ":")).encode()
-    )
+    digest.update(json.dumps(scalars, sort_keys=True, separators=(",", ":")).encode())
     for name, tensor in tensors:
         metadata = {
             "name": name,
@@ -295,9 +295,12 @@ def _tensor_digest(torch, tensors, scalars):
 def _page_strides(torch, num_heads, state_dtype):
     hidden = num_heads * _HEAD_DIM
     conv_bytes = 3 * hidden * 3 * torch.bfloat16.itemsize
-    state_bytes = num_heads * _HEAD_DIM * _HEAD_DIM * torch.empty(
-        (), dtype=state_dtype
-    ).element_size()
+    state_bytes = (
+        num_heads
+        * _HEAD_DIM
+        * _HEAD_DIM
+        * torch.empty((), dtype=state_dtype).element_size()
+    )
     page_bytes = conv_bytes + state_bytes
     return page_bytes // torch.bfloat16.itemsize, page_bytes // torch.empty(
         (), dtype=state_dtype
@@ -306,9 +309,7 @@ def _page_strides(torch, num_heads, state_dtype):
 
 def _wide_num_slots(num_rows, conv_stride, state_stride, qkv_size, num_heads):
     int32_max = 2**31 - 1
-    conv_slots = (
-        math.floor((int32_max - (3 * qkv_size - 1)) / conv_stride) + 2
-    )
+    conv_slots = math.floor((int32_max - (3 * qkv_size - 1)) / conv_stride) + 2
     state_elements = num_heads * _HEAD_DIM * _HEAD_DIM
     state_slots = math.floor((int32_max - (state_elements - 1)) / state_stride) + 2
     return max(num_rows + 1, min(conv_slots, state_slots))
@@ -336,9 +337,7 @@ def _make_inputs(torch, variant_name, seed):
     num_heads, num_rows, state_dtype_name, layout, slot_class = _VARIANT_CASES[
         base_name
     ]
-    state_dtype = (
-        torch.bfloat16 if state_dtype_name == "bfloat16" else torch.float32
-    )
+    state_dtype = torch.bfloat16 if state_dtype_name == "bfloat16" else torch.float32
     hidden = num_heads * _HEAD_DIM
     qkv_size = 3 * hidden
     generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -382,13 +381,9 @@ def _make_inputs(torch, variant_name, seed):
         (num_rows, hidden + output_gate_padding), torch.bfloat16
     )
     if slot_class == "positive":
-        state_indices = torch.arange(
-            num_rows, 0, -1, dtype=torch.int32, device="cuda"
-        )
+        state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device="cuda")
     elif slot_class == "null":
-        state_indices = torch.arange(
-            num_rows, 0, -1, dtype=torch.int32, device="cuda"
-        )
+        state_indices = torch.arange(num_rows, 0, -1, dtype=torch.int32, device="cuda")
         state_indices[0] = 0
         if num_rows >= 3:
             state_indices[1] = -1
@@ -413,9 +408,7 @@ def _make_inputs(torch, variant_name, seed):
     conv_state.index_copy_(
         0,
         selected_slots,
-        randn(
-            (selected_slots.numel(), qkv_size, 3), torch.bfloat16, 0.1
-        ),
+        randn((selected_slots.numel(), qkv_size, 3), torch.bfloat16, 0.1),
     )
     state.index_copy_(
         0,
@@ -565,10 +558,10 @@ def _worker(args):
     if not torch.cuda.is_available():
         raise RuntimeError("equivalence proof requires CUDA")
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if (
-        (properties.major, properties.minor) != (10, 0)
-        or "B200" not in properties.name.upper()
-    ):
+    if (properties.major, properties.minor) != (
+        10,
+        0,
+    ) or "B200" not in properties.name.upper():
         raise RuntimeError("equivalence proof requires one B200")
     gpu_rows = [
         row.strip()
@@ -642,7 +635,9 @@ def _worker(args):
             for command in commands
         ]
         if any(flags != compile_flags for flags in all_compile_flags):
-            raise RuntimeError(f"translation-unit compile flags differ for {variant.name}")
+            raise RuntimeError(
+                f"translation-unit compile flags differ for {variant.name}"
+            )
         object_path = _ninja_object_for_source(
             spec, Path(commands[device_command_index]["file"])
         )
@@ -682,20 +677,14 @@ def _worker(args):
             "positive": "positive_unique",
             "null": "unique_or_null",
             "repeated": "repeated_positive",
-        }[
-            _VARIANT_CASES[
-                variant.name.removesuffix("_wide_slot_offsets")
-            ][4]
-        ]
+        }[_VARIANT_CASES[variant.name.removesuffix("_wide_slot_offsets")][4]]
         selector_kwargs = {
             "target": variant.target,
             "num_heads": tensors["A_log"].numel(),
             "num_rows": tensors["x"].shape[0],
             "num_slots": tensors["conv_state"].shape[0],
             "state_dtype": (
-                "bfloat16"
-                if tensors["state"].dtype == torch.bfloat16
-                else "float32"
+                "bfloat16" if tensors["state"].dtype == torch.bfloat16 else "float32"
             ),
             "lower_bound": scalars["lower_bound"],
             "norm_eps": scalars["norm_eps"],
@@ -739,10 +728,13 @@ def _worker(args):
             _mutable_views(torch, tensors, selected_slots),
             scalars,
         )
-        if execution_sha256 == mutable_before_sha256 or not torch.count_nonzero(
-            tensors["output"]
-        ).item():
-            raise RuntimeError(f"execution fixture was not observable for {variant.name}")
+        if (
+            execution_sha256 == mutable_before_sha256
+            or not torch.count_nonzero(tensors["output"]).item()
+        ):
+            raise RuntimeError(
+                f"execution fixture was not observable for {variant.name}"
+            )
         peak_allocated_bytes = torch.cuda.max_memory_allocated()
         if peak_allocated_bytes > 24 * 1024**3:
             raise RuntimeError(
@@ -763,7 +755,9 @@ def _worker(args):
                 "resource_usage_sha256": _canonical_json_sha256(
                     {
                         "object": hashlib.sha256(object_resources.encode()).hexdigest(),
-                        "library": hashlib.sha256(library_resources.encode()).hexdigest(),
+                        "library": hashlib.sha256(
+                            library_resources.encode()
+                        ).hexdigest(),
                     }
                 ),
                 "execution_input_sha256": input_sha256,
@@ -773,9 +767,7 @@ def _worker(args):
                 "library_sha256": _file_sha256(library),
             }
         )
-        _record_progress(
-            f"{args.side}: variant {index + 1}/44 {variant.name}: sealed"
-        )
+        _record_progress(f"{args.side}: variant {index + 1}/44 {variant.name}: sealed")
         del module, tensors
         torch.cuda.empty_cache()
 
@@ -801,9 +793,7 @@ def _worker(args):
             "toolchain": toolchain,
             "toolchain_sha256": _canonical_json_sha256(toolchain),
             "program_identity_sha256": (
-                None
-                if api["program_identity"] is None
-                else api["program_identity"]()
+                None if api["program_identity"] is None else api["program_identity"]()
             ),
             "variants": result_variants,
             "routes": route_records,
@@ -839,7 +829,9 @@ def _orchestrator(args):
     work_root = Path(args.work_root).resolve()
     checkpoint_path = Path(args.predecessor_checkpoint).resolve()
     rows_root = Path(args.predecessor_rows_root).resolve()
-    manifest_path = predecessor_root / "csrc/kda/fused_kda_decode_generated_manifest.json"
+    manifest_path = (
+        predecessor_root / "csrc/kda/fused_kda_decode_generated_manifest.json"
+    )
     script_path = Path(__file__).resolve()
     current_commit = _clean_commit(current_root)
     predecessor_commit = _clean_commit(predecessor_root, _PREDECESSOR_COMMIT)
@@ -935,7 +927,9 @@ def _orchestrator(args):
         current_root / "csrc/kda/cake_fused_kda_decode_binding.cuh"
     ).read_text()
     if _normalize_predecessor_binding(predecessor_binding) != current_binding:
-        raise RuntimeError("old/new host launch bindings are not branding-only equivalent")
+        raise RuntimeError(
+            "old/new host launch bindings are not branding-only equivalent"
+        )
     manifest_variants = manifest.get("variants")
     old_variants = predecessor_result["variants"]
     new_variants = current_result["variants"]
@@ -952,7 +946,9 @@ def _orchestrator(args):
         name = manifest_variant.get("name")
         if old["name"] != name or new["name"] != name:
             raise RuntimeError("variant order changed")
-        old_source = (predecessor_root / "csrc/kda" / manifest_variant["body"]).read_text()
+        old_source = (
+            predecessor_root / "csrc/kda" / manifest_variant["body"]
+        ).read_text()
         new_source = (current_csrc / new["body"]).read_text()
         old_normalized = _normalize_kernel_symbol(
             old_source, old["kernel_symbol"], f"predecessor {name}"
@@ -973,13 +969,18 @@ def _orchestrator(args):
         )
         flags_equal = old["compile_flags"] == new["compile_flags"]
         sass_equal = old["sass_sha256"] == new["sass_sha256"]
-        resources_equal = (
-            old["resource_usage_sha256"] == new["resource_usage_sha256"]
-        )
+        resources_equal = old["resource_usage_sha256"] == new["resource_usage_sha256"]
         inputs_equal = old["execution_input_sha256"] == new["execution_input_sha256"]
         execution_equal = old["execution_sha256"] == new["execution_sha256"]
         if not all(
-            (static_equal, flags_equal, sass_equal, resources_equal, inputs_equal, execution_equal)
+            (
+                static_equal,
+                flags_equal,
+                sass_equal,
+                resources_equal,
+                inputs_equal,
+                execution_equal,
+            )
         ):
             raise RuntimeError(f"equivalence failed for {name}")
         proof_variants.append(
@@ -998,9 +999,7 @@ def _orchestrator(args):
                 "compile_flags_sha256": new["compile_flags_sha256"],
                 "predecessor_sass_sha256": old["sass_sha256"],
                 "current_sass_sha256": new["sass_sha256"],
-                "predecessor_resource_usage_sha256": old[
-                    "resource_usage_sha256"
-                ],
+                "predecessor_resource_usage_sha256": old["resource_usage_sha256"],
                 "current_resource_usage_sha256": new["resource_usage_sha256"],
                 "execution_input_sha256": new["execution_input_sha256"],
                 "predecessor_execution_sha256": old["execution_sha256"],
@@ -1028,8 +1027,7 @@ def _orchestrator(args):
         raise RuntimeError(f"full-domain route equivalence failed: {mismatches[:8]}")
     used_variants = sorted({record["variant_name"] for record in new_routes})
     shape_inventory = [
-        {"num_heads": heads, "num_rows": rows}
-        for heads, rows in _FULL_DOMAIN_SHAPES
+        {"num_heads": heads, "num_rows": rows} for heads, rows in _FULL_DOMAIN_SHAPES
     ]
     receipt = {
         "schema": _SCHEMA,
@@ -1049,9 +1047,7 @@ def _orchestrator(args):
         },
         "current": {
             "commit": current_commit,
-            "program_identity_sha256": current_result[
-                "program_identity_sha256"
-            ],
+            "program_identity_sha256": current_result["program_identity_sha256"],
             "registry_sha256": _file_sha256(
                 current_root / "flashinfer/jit/cake_fused_kda_decode.py"
             ),
