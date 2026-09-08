@@ -49,6 +49,11 @@ def _arch() -> cake_gdn.CakeGDNArch:
         pytest.skip(str(error))
 
 
+@pytest.fixture(autouse=True)
+def _require_cake_gdn_arch():
+    _arch()
+
+
 def _make_inputs(batch_size: int) -> dict[str, torch.Tensor]:
     torch.manual_seed(2026)
     device = torch.device("cuda")

@@ -17,6 +17,17 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit import cake_gdn as cake_gdn
 
 
+@pytest.fixture(autouse=True)
+def _require_cake_gdn_arch():
+    if not torch.cuda.is_available():
+        pytest.skip("Cake GDN requires CUDA")
+    major, minor = torch.cuda.get_device_capability()
+    try:
+        cake_gdn.arch_for_compute_capability(major, minor)
+    except cake_gdn.CakeGDNUnsupportedError as error:
+        pytest.skip(str(error))
+
+
 def _expand_heads(q, k, v):
     if q.shape[1] >= v.shape[1]:
         k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
@@ -526,6 +537,7 @@ def test_public_cake_gdn_prefill_checkpoint_is_cuda_graph_safe():
     )
 
 
+@torch.inference_mode()
 def test_public_cake_gdn_prefill_is_cuda_graph_safe():
     case = _make_case(
         seq_lens=(128,),

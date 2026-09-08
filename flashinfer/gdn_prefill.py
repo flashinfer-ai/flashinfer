@@ -55,7 +55,7 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
 
 
 _CAKE_GDN_HOST_INTS: dict[
-    tuple[int, int, int, int],
+    tuple[int, int, Optional[int], int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
 ] = {}
 
@@ -63,10 +63,14 @@ _CAKE_GDN_HOST_INTS: dict[
 def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
     """Resolve immutable CUDA integer metadata once, outside Graph capture."""
 
+    # Inference tensors intentionally have no version counter.  Their metadata
+    # is immutable by this adapter's contract, so object identity and storage
+    # identity are the available cache key during inference and Graph replay.
+    version = None if values.is_inference() else int(values._version)
     key = (
         int(values.device.index or 0),
         int(values.data_ptr()),
-        int(values._version),
+        version,
         int(values.numel()),
     )
     cached = _CAKE_GDN_HOST_INTS.get(key)
@@ -182,6 +186,8 @@ def _run_cake_gdn_prefill(
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires all tensors on one CUDA device"
         )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _cake_gdn.arch_for_compute_capability(major, minor)
     if q.dtype not in (torch.float16, torch.bfloat16) or any(
         tensor.dtype != q.dtype for tensor in (k, v, output)
     ):
@@ -337,8 +343,6 @@ def _run_cake_gdn_prefill(
                 "GDN non-CP checkpoint_cu_starts does not match cu_seqlens and checkpoint interval"
             )
 
-    major, minor = torch.cuda.get_device_capability(q.device)
-    arch = _cake_gdn.arch_for_compute_capability(major, minor)
     route = _cake_gdn.select_cake_gdn_prefill_variant(
         arch=arch,
         io_dtype=_cake_gdn_prefill_dtype_name(q.dtype),
