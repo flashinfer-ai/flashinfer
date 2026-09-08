@@ -733,6 +733,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             final_scale_dtype = cutlass.Float16
 
         def _tactic_ok(tactic):
+            """Return whether both GEMM kernels support this tactic and workload."""
             tile_size, gemm1_tactic, gemm2_tactic = tactic
             permuted_m = get_max_num_permuted_tokens(
                 num_tokens, self.top_k, self.num_local_experts, tile_size

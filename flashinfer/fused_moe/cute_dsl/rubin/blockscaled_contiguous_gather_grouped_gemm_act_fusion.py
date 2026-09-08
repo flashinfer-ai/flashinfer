@@ -199,6 +199,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         enable_pdl: Optional[bool] = None,
         gated: bool = True,
     ):
+        """Configure an SM107 gather GEMM for gated SwiGLU or ReLU2."""
         # flashinfer dispatcher compatibility: the pre-sync kernel took
         # `enable_pdl`; TRT-LLM renamed it to `use_pdl`. Explicit enable_pdl
         # wins over the use_pdl default.
@@ -3984,6 +3985,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         c_stride_m: cutlass.Int64 = cutlass.Int64(0),
         c_sf_n_tile_offset: cutlass.Int64 = cutlass.Int64(0),
     ):
+        """Build runtime tensor views and launch the activation-fused kernel."""
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
         num_tiles = m // tile_size
@@ -4786,6 +4788,7 @@ def run(
             )
 
     def generate_tensors():
+        """Create a fresh tensor set for one cold-L2 benchmark workspace."""
         (
             a_tensor,
             b_tensor,

@@ -1611,6 +1611,7 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Exercise finalize tactics with cluster padding and partial N tiles."""
         from flashinfer.autotuner import AutoTuner
 
         if is_sm107():
@@ -1642,6 +1643,7 @@ class TestCuteDslFusedMoeFunctional:
         def choose_tail_config(
             _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
         ):
+            """Force the padding-sensitive tactic for this regression test."""
             return runners[0], tail_config
 
         monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
