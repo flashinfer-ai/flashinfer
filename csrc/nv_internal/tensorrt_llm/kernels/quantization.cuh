@@ -834,7 +834,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     }
     __syncthreads();
     perTokenScale = perTokenScaleOutput[rowIdx];
-    globalEncodeScale = reciprocal_approximate_ftz(perTokenScale);
+    globalEncodeScale = perTokenScale != 0.0f ? reciprocal_approximate_ftz(perTokenScale) : 0.0f;
   }
 
   // quantize to fp4 with per-token scale, reading inputs from smem (each thread reads
@@ -950,7 +950,8 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
   uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_sf_vecs_per_row; vecIdx += blockDim.x) {
     float localScale = localScaleSmem[vecIdx];
-    float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
+    float const denom = perTokenScale * localScale;
+    float fp32Scale = denom != 0.0f ? reciprocal_approximate_ftz(denom) : 0.0f;
     fp8Scale = __nv_fp8_e4m3(fp32Scale).__x;
     int64_t sfOffset;
     if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
