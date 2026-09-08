@@ -155,7 +155,7 @@ class TestErrorMapping:
         with pytest.raises(MoEEpFaultToleranceUnsupportedError) as ei:
             ffi.mask_clean(_FakeGroup(), 0x2)
         assert "ncclEpMaskClean" in str(ei.value)
-        assert "nccl4py" in str(ei.value)
+        assert "nccl-extensions" in str(ei.value)
 
     def test_result_names_cover_the_nccl_enum(self):
         assert _NCCL_RESULT_NAMES[0] == "ncclSuccess"

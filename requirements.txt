@@ -1,9 +1,25 @@
 apache-tvm-ffi>=0.1.10,<0.2
 click
-# cuda-python + nccl4py: runtime deps for the moe_ep EP transport backends
-# (default since the EP install became opt-out; CUDA-13 wheels only — see
-# build_backend.py). NCCL-EP is the released nccl4py wheel (`nccl.ep` API +
-# bundled libnccl_ep.so); no in-tree NCCL build.
+# cuda-python + nccl-extensions: runtime deps for the moe_ep EP transport
+# backends (default since the EP install became opt-out; CUDA-13 wheels only
+# — see build_backend.py). NCCL-EP is the released nccl-extensions wheel
+# (`nccl.ep` API + bundled libnccl_ep.so); no in-tree NCCL build.
+#
+# nccl.ep MOVED: it used to ship inside nccl4py, but the EP/M2N libraries were
+# split out to https://github.com/NVIDIA/nccl-extensions and nccl4py 0.4.1
+# dropped `nccl/ep` entirely. Depending on nccl4py alone therefore resolves to
+# a wheel with no nccl.ep at all. Both distributions install into the shared
+# `nccl` namespace package: nccl4py owns nccl/core + nccl/bindings (we still
+# need `nccl.core.Communicator`, and nccl-extensions pulls it in transitively),
+# nccl-extensions owns nccl/ep + nccl/m2n + nccl/_extensions. The explicit
+# nccl4py>=0.4.1 floor is a *conflict* guard, not a feature floor: nccl4py
+# 0.3.1 still shipped its own nccl/ep into that same namespace directory, so
+# co-installing it with nccl-extensions overwrites files and yields an
+# ambiguous nccl.ep.
+#
+# The nccl-extensions cu12/cu13 extras are deliberately NOT used here: they
+# pin nvidia-nccl-cuXX==2.30.7 exactly, which trips the torch-eviction problem
+# described below. Plain `nccl-extensions` pulls no nvidia-nccl wheel.
 #
 # nvidia-nccl-cu13 is deliberately NOT a base dep: torch's cu13 wheels pin it
 # EXACTLY (e.g. ==2.29.7), so any floor here (>=2.30.7 for B200 EP) makes the
@@ -25,7 +41,8 @@ click
 cuda-python>=12.0
 cuda-tile>=1.4.0
 einops
-nccl4py>=0.3.1
+nccl-extensions>=0.1.0
+nccl4py>=0.4.1
 ninja
 numpy
 nvidia-cudnn-frontend>=1.25.0
