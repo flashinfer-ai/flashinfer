@@ -83,6 +83,17 @@ FP8 Quantization
     mxfp8_dequantize_host
     per_token_group_quant_8bit
 
+Fused gated-activation MXFP8 quantization
+-----------------------------------------
+
+.. currentmodule:: flashinfer.gated_act_mxfp8
+
+.. autosummary::
+    :toctree: ../generated
+
+    silu_and_mul_mxfp8_quantize
+    silu_and_mul_mxfp8_quantize_backward
+
 .. note::
 
     ``mxfp8_grouped_quantize`` uses a cuTile backend and requires SM100+ and

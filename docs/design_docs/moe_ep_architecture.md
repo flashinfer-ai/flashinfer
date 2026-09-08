@@ -60,8 +60,7 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 | `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
 | `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
-| `fused_moe` with `CuteDslConfig` | NVFP4 (block-16) or BF16 (W4A16) | NVFP4 or 4-bit (W4A16) | BF16 | SM100/SM103 | same `MoELayer` AutoTuner |
-| `sm100_mxfp8_mxfp4_bf16_cutedsl` (`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig`) | MXFP8 (block-32 UE8M0; quantized post-dispatch, or pre-dispatch packed payload with `mxfp8_dispatch=True`, nccl_ep only, bit-identical) | MXFP4 (block-32 UE8M0) | BF16 | SM100/SM103 | `tactic=` pins a kernel tactic; unpinned runs the AutoTuner default tactic (tactic sweep only under an autotune context — not tuned in the shipped benchmarks) |
+| `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |
 
 `fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
 views are prepared for the first match only). The W4A8 split kernel requires
@@ -186,7 +185,7 @@ moe_ep/
   config.py, tensors.py, weights.py, layer.py, algo_knobs.py, errors.py
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
-  backends/split/kernel/{identity,fused_moe,sm100/mxfp8_mxfp4_bf16_cutedsl}
+  backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
@@ -239,7 +238,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 - LL **EXPERT_MAJOR** — `[num_local_experts, cap, hidden]` (`cap = max_tokens_per_rank * world`), each row pre-assigned to one expert; the bridge synthesizes `top_k=1` / `final_scales=1` and **combine owns the real top-k reweight**.
 - LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
 
-Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). W4A8 (MXFP8 activations × MXFP4 weights) is a separate dedicated split kernel backend, `sm100_mxfp8_mxfp4_bf16_cutedsl`, with its own routing synthesis mirroring this bridge and an optional MXFP8-packed dispatch payload (see **Available backends**).
+BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant.variant`); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
@@ -277,7 +276,7 @@ classDiagram
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
-| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; bf16 + NVFP4; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
+| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; BF16 + W4A4/W4A8/W4A16; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |

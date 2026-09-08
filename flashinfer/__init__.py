@@ -29,10 +29,19 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
+)
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
+)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
 )
+from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import autotune_v2 as autotune_v2
+from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
@@ -60,6 +69,10 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
+from .cake_dcp import (
+    get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
+)
 from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,
@@ -108,14 +121,19 @@ from .fused_moe import (
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
+        cute_dsl_fused_moe as cute_dsl_fused_moe,
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper as CuteDslMoEWrapper,
         cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
+        CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+
+
 # The fused GDN decode step is surfaced here like the other GDN APIs; the
 # code lives under flashinfer/gdn_kernels/experimental/ (see its README),
 # but "experimental" describes the file location, not the import path.
@@ -214,6 +232,9 @@ from .page import (
 )
 from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
+    nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
 )
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper

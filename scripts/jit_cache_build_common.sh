@@ -5,6 +5,8 @@
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
 
 SCCACHE_VERSION="0.17.0"
+SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
+SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
 # The v0.17 client-side architecture remains opt-in while this change isolates
 # the version upgrade from a separate execution-mode change.
 
@@ -76,9 +78,9 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
-# Download and install sccache to /usr/local/bin/sccache, verifying the
-# upstream sha256 checksum.
-install_sccache() {
+# Download and install a released sccache binary to /usr/local/bin/sccache,
+# verifying the upstream sha256 checksum.
+install_released_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
   local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
@@ -86,6 +88,9 @@ install_sccache() {
   local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
   local sccache_sha256
+  local sccache_install_started_at=${SECONDS}
+
+  echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum is required to verify sccache downloads"
@@ -106,6 +111,110 @@ install_sccache() {
   mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
   rm -rf "${sccache_tmpdir}"
   chmod +x /usr/local/bin/sccache
+  echo "::endgroup::"
+  echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
+}
+
+# Build a pinned sccache revision natively. Building inside each manylinux
+# builder produces the matching x86_64 or aarch64 binary without relying on an
+# unpublished binary artifact.
+build_patched_sccache() {
+  local sccache_revision=$1
+  local expected_sha256=$2
+  local output_path=$3
+  local sccache_package="sccache-${sccache_revision}"
+  local sccache_archive="${sccache_package}.tar.gz"
+  local sccache_url="https://github.com/mozilla/sccache/archive/${sccache_revision}.tar.gz"
+  local sccache_tmpdir
+  local required_command
+  local sccache_build_started_at=${SECONDS}
+
+  for required_command in cargo curl env install make perl sha256sum tar; do
+    if ! command -v "${required_command}" >/dev/null 2>&1; then
+      echo "ERROR: ${required_command} is required to build patched sccache"
+      exit 1
+    fi
+  done
+
+  sccache_tmpdir=$(mktemp -d)
+  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
+  printf '%s  %s\n' "${expected_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
+
+  echo "Building sccache revision ${sccache_revision} for $(uname -m)"
+  # Do not expose cache credentials to third-party Cargo build scripts.
+  env \
+    -u AWS_ACCESS_KEY_ID \
+    -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_SESSION_TOKEN \
+    CARGO_INCREMENTAL=0 \
+    cargo build \
+    --locked \
+    --release \
+    --no-default-features \
+    --features s3,vendored-openssl \
+    --bin sccache \
+    --manifest-path "${sccache_tmpdir}/${sccache_package}/Cargo.toml"
+  mkdir -p "$(dirname "${output_path}")"
+  install -m 0755 \
+    "${sccache_tmpdir}/${sccache_package}/target/release/sccache" \
+    "${output_path}"
+  rm -rf "${sccache_tmpdir}"
+  echo "patched sccache build duration: $((SECONDS - sccache_build_started_at)) seconds"
+}
+
+# Install the pinned source build, reusing a binary produced by a dedicated
+# workflow step when available. Other call sites retain a self-contained
+# fallback that builds directly into /usr/local/bin.
+install_patched_sccache() {
+  local sccache_revision=$1
+  local expected_sha256=$2
+
+  if [ -n "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
+    if [ ! -x "${SCCACHE_PATCHED_BINARY_PATH}" ]; then
+      echo "ERROR: Prebuilt patched sccache not found: ${SCCACHE_PATCHED_BINARY_PATH}"
+      exit 1
+    fi
+    echo "Installing prebuilt patched sccache from ${SCCACHE_PATCHED_BINARY_PATH}"
+    install -m 0755 "${SCCACHE_PATCHED_BINARY_PATH}" /usr/local/bin/sccache
+  else
+    build_patched_sccache \
+      "${sccache_revision}" \
+      "${expected_sha256}" \
+      /usr/local/bin/sccache
+  fi
+}
+
+# Install the official release by default. CUDA 13.4 uses the first upstream
+# revision containing the CUDA 13.3+ dry-run parser fix while that fix remains
+# unreleased: https://github.com/mozilla/sccache/pull/2722
+install_sccache() {
+  local sccache_version=$1
+  local sccache_arch=$2
+
+  case "${sccache_arch}" in
+    x86_64|aarch64)
+      ;;
+    *)
+      echo "ERROR: Unsupported sccache build architecture: ${sccache_arch}"
+      exit 1
+      ;;
+  esac
+
+  case "${CUDA_VERSION:-}" in
+    13.4|134)
+      install_patched_sccache \
+        "${SCCACHE_CUDA_134_REVISION}" \
+        "${SCCACHE_CUDA_134_SOURCE_SHA256}"
+      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
+      export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
+      ;;
+    *)
+      install_released_sccache "${sccache_version}" "${sccache_arch}"
+      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+      export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
+      ;;
+  esac
 }
 
 # Install sccache (if missing), configure environment, and start the server.
@@ -130,19 +239,7 @@ setup_sccache() {
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
   export FLASHINFER_CXX_LAUNCHER="sccache"
-
-  # sccache v0.17 cannot parse CUDA 13.3+ nvcc dry-run output, which can leave
-  # fatbinary without its input cubins. Keep host C++ caching enabled, but run
-  # cu134 nvcc directly until a release includes the upstream fix:
-  # https://github.com/mozilla/sccache/pull/2722
-  case "${CUDA_VERSION:-}" in
-    13.4|134)
-      unset FLASHINFER_NVCC_LAUNCHER
-      ;;
-    *)
-      export FLASHINFER_NVCC_LAUNCHER="sccache"
-      ;;
-  esac
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -163,6 +260,8 @@ setup_sccache() {
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
+  echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
+  echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
@@ -177,6 +276,8 @@ setup_sccache() {
     {
       printf 'git_commit=%s\n' "${git_commit:-unknown}"
       printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_install_source=%s\n' "${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
+      printf 'sccache_revision=%s\n' "${FLASHINFER_SCCACHE_REVISION}"
       printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
       printf 'sccache_bucket=%s\n' "${SCCACHE_BUCKET}"
       printf 'sccache_region=%s\n' "${SCCACHE_REGION}"
