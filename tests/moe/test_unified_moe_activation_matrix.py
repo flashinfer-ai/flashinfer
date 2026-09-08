@@ -18,7 +18,7 @@ def test_activation_matrix_rows_are_unique_and_complete():
     assert rows
     assert len(keys) == len(set(keys))
     assert all(activations for _, _, _, activations in rows)
-    # The two W4A16 encodings must not collapse to one QuantVariant name.
+    # The two W4A16 encodings must not collapse to one pair label.
     assert "MXFP4×BF16" in labels
     assert "NVFP4×BF16" in labels
 

@@ -2711,7 +2711,7 @@ def testUnifiedNvfp4Moe(args):
         MoELayer,
         MoEWeightPack,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         SwiGLU,
         RoutingConfig,
         TrtllmFp4Config,
@@ -2865,7 +2865,7 @@ def testUnifiedNvfp4Moe(args):
             topk_group=args.topk_group,
             routed_scaling_factor=args.routed_scaling_factor,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,
