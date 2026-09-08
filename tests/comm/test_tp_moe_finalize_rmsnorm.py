@@ -30,6 +30,7 @@ def _assert_model_close(
     max_abs = delta.abs().max()
     prefix = f"{context}: " if context else ""
     assert rel_l2 < 1e-3, f"{prefix}relative L2 error {rel_l2.item():.6g}"
+    # One BF16 ULP for output magnitudes in [8, 16); relative L2 limits aggregate error.
     assert max_abs <= 0.0625, f"{prefix}maximum absolute error {max_abs.item():.6g}"
 
 
@@ -149,8 +150,17 @@ def _worker(local_rank: int, master_port: int) -> None:
         world_size=WORLD_SIZE,
         init_method=f"tcp://127.0.0.1:{master_port}",
     )
-    assert init_tp_moe_finalize_rmsnorm()
     device = torch.device("cuda", local_rank)
+    finalize_module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
+    assert not finalize_module._group_all(local_rank != 0, device, dist.group.WORLD), (
+        "one rank's failed initialization verdict must disable every rank"
+    )
+    assert init_tp_moe_finalize_rmsnorm()
+    assert torch.cuda.get_device_properties(device).multi_processor_count <= (
+        finalize_module.NSLOT
+    )
+    execution_stream = torch.cuda.Stream(device=device)
+    torch.cuda.set_stream(execution_stream)
     contract_rows = torch.empty(
         1, TOPK, HIDDEN_SIZE, dtype=torch.bfloat16, device=device
     )
@@ -167,6 +177,21 @@ def _worker(local_rank: int, master_port: int) -> None:
         contract_norm,
         contract_output,
     )
+    contract_weights_fp32 = contract_weights.float()
+    assert supports_tp_moe_finalize_rmsnorm(
+        contract_gemm2,
+        contract_weights_fp32,
+        contract_indices,
+        contract_norm,
+        contract_output,
+    )
+    assert not supports_tp_moe_finalize_rmsnorm(
+        contract_gemm2,
+        contract_weights.to(torch.float16),
+        contract_indices,
+        contract_norm,
+        contract_output,
+    )
     misaligned_rows = torch.empty(
         contract_gemm2.numel() + 1, dtype=torch.bfloat16, device=device
     )[1:].view_as(contract_gemm2)
@@ -179,7 +204,6 @@ def _worker(local_rank: int, master_port: int) -> None:
         contract_output,
     )
 
-    finalize_module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
     initialized_device = finalize_module._WS.dev_ord
     finalize_module._WS.dev_ord = (initialized_device + 1) % torch.cuda.device_count()
     try:
@@ -193,89 +217,112 @@ def _worker(local_rank: int, master_port: int) -> None:
     finally:
         finalize_module._WS.dev_ord = initialized_device
 
-    for weight_before_norm in (False, True):
-        for num_tokens in (1, 17, 65):
-            generator = torch.Generator(device=device).manual_seed(1000 + local_rank)
-            partial_rows = torch.randn(
-                num_tokens,
-                TOPK,
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device=device,
-                generator=generator,
-            )
-            gemm2_permuted, expanded_idx_to_permuted_idx = _make_permuted(
-                partial_rows,
-                seed=3000 + 100 * num_tokens + local_rank,
-            )
-            shared = torch.Generator(device=device).manual_seed(2000)
-            expert_weights = torch.randn(
-                num_tokens,
-                TOPK,
-                dtype=torch.bfloat16,
-                device=device,
-                generator=shared,
-            )
-            norm_weight = torch.randn(
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device=device,
-                generator=shared,
-            )
-            expected = _reference(
-                gemm2_permuted,
-                expanded_idx_to_permuted_idx,
-                expert_weights,
-                norm_weight,
-                1e-8,
-                1.0,
-                weight_before_norm,
-            )
-            output = torch.empty_like(expected)
-            tp_moe_finalize_rmsnorm(
-                gemm2_permuted,
-                expert_weights,
-                expanded_idx_to_permuted_idx,
-                norm_weight,
-                output,
-                eps=1e-8,
-                gain_center=1.0,
-                weight_before_norm=weight_before_norm,
-            )
-            if num_tokens == 65 and not weight_before_norm:
-                identity_gemm2 = torch.full_like(gemm2_permuted, float("nan"))
-                identity_indices = torch.arange(
-                    1,
-                    num_tokens * TOPK + 1,
-                    dtype=torch.int32,
-                    device=device,
-                ).view(num_tokens, TOPK)
-                identity_gemm2[1 : num_tokens * TOPK + 1, :HIDDEN_SIZE] = (
-                    partial_rows.view(-1, HIDDEN_SIZE)
+    for expert_weights_dtype in (torch.bfloat16, torch.float32):
+        for weight_before_norm in (False, True):
+            for num_tokens in (1, 17, 65):
+                generator = torch.Generator(device=device).manual_seed(
+                    1000 + local_rank
                 )
-                identity_output = torch.empty_like(output)
-                tp_moe_finalize_rmsnorm(
-                    identity_gemm2,
+                partial_rows = torch.randn(
+                    num_tokens,
+                    TOPK,
+                    HIDDEN_SIZE,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=generator,
+                )
+                gemm2_permuted, expanded_idx_to_permuted_idx = _make_permuted(
+                    partial_rows,
+                    seed=3000 + 100 * num_tokens + local_rank,
+                )
+                shared = torch.Generator(device=device).manual_seed(2000)
+                expert_weights = torch.randn(
+                    num_tokens,
+                    TOPK,
+                    dtype=expert_weights_dtype,
+                    device=device,
+                    generator=shared,
+                )
+                norm_weight = torch.randn(
+                    HIDDEN_SIZE,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=shared,
+                )
+                expected = _reference(
+                    gemm2_permuted,
+                    expanded_idx_to_permuted_idx,
                     expert_weights,
-                    identity_indices,
                     norm_weight,
-                    identity_output,
+                    1e-8,
+                    1.0,
+                    weight_before_norm,
+                )
+                output = torch.empty_like(expected)
+                tp_moe_finalize_rmsnorm(
+                    gemm2_permuted,
+                    expert_weights,
+                    expanded_idx_to_permuted_idx,
+                    norm_weight,
+                    output,
                     eps=1e-8,
                     gain_center=1.0,
                     weight_before_norm=weight_before_norm,
                 )
-                torch.testing.assert_close(output, identity_output, atol=0, rtol=0)
-            _assert_model_close(
-                output,
-                expected,
-                context=f"tokens={num_tokens}, weight_before_norm={weight_before_norm}",
-            )
+                if num_tokens == 65 and not weight_before_norm:
+                    identity_gemm2 = torch.full_like(gemm2_permuted, float("nan"))
+                    identity_indices = torch.arange(
+                        1,
+                        num_tokens * TOPK + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    ).view(num_tokens, TOPK)
+                    identity_gemm2[1 : num_tokens * TOPK + 1, :HIDDEN_SIZE] = (
+                        partial_rows.view(-1, HIDDEN_SIZE)
+                    )
+                    identity_output = torch.empty_like(output)
+                    tp_moe_finalize_rmsnorm(
+                        identity_gemm2,
+                        expert_weights,
+                        identity_indices,
+                        norm_weight,
+                        identity_output,
+                        eps=1e-8,
+                        gain_center=1.0,
+                        weight_before_norm=weight_before_norm,
+                    )
+                    torch.testing.assert_close(output, identity_output, atol=0, rtol=0)
+                _assert_model_close(
+                    output,
+                    expected,
+                    context=(
+                        f"tokens={num_tokens}, weight_before_norm="
+                        f"{weight_before_norm}, expert_weights_dtype="
+                        f"{expert_weights_dtype}"
+                    ),
+                )
 
-            gathered = [torch.empty_like(output) for _ in range(WORLD_SIZE)]
-            dist.all_gather(gathered, output)
-            assert all(
-                torch.equal(gathered[0], rank_output) for rank_output in gathered
-            )
+                gathered = [torch.empty_like(output) for _ in range(WORLD_SIZE)]
+                dist.all_gather(gathered, output)
+                assert all(
+                    torch.equal(gathered[0], rank_output) for rank_output in gathered
+                )
+
+    other_stream = torch.cuda.Stream(device=device)
+    with (
+        torch.cuda.stream(other_stream),
+        pytest.raises(RuntimeError, match="same CUDA stream"),
+    ):
+        tp_moe_finalize_rmsnorm(
+            gemm2_permuted,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            output,
+            eps=1e-8,
+            gain_center=1.0,
+            weight_before_norm=True,
+        )
 
     # Invalid entries must contribute zero without touching row zero or another
     # padded row, both of which intentionally contain NaNs.
@@ -396,6 +443,48 @@ def _worker(local_rank: int, master_port: int) -> None:
         rounded_error = (output.float() - rounded.float()).abs().mean()
         assert fp32_error < rounded_error
 
+    fp32_weights = torch.randn(
+        rounding_tokens,
+        TOPK,
+        dtype=torch.float32,
+        device=device,
+        generator=shared,
+    )
+    expected_fp32_weights = _reference(
+        rounding_gemm2,
+        rounding_indices,
+        fp32_weights,
+        rounding_norm,
+        1e-8,
+        1.0,
+        True,
+    )
+    expected_bf16_weights = _reference(
+        rounding_gemm2,
+        rounding_indices,
+        fp32_weights.to(torch.bfloat16),
+        rounding_norm,
+        1e-8,
+        1.0,
+        True,
+    )
+    assert torch.count_nonzero(expected_fp32_weights != expected_bf16_weights) > 0
+    fp32_weights_output = torch.empty_like(expected_fp32_weights)
+    tp_moe_finalize_rmsnorm(
+        rounding_gemm2,
+        fp32_weights,
+        rounding_indices,
+        rounding_norm,
+        fp32_weights_output,
+        eps=1e-8,
+        gain_center=1.0,
+        weight_before_norm=True,
+    )
+    _assert_model_close(fp32_weights_output, expected_fp32_weights)
+    fp32_error = (fp32_weights_output.float() - expected_fp32_weights.float()).norm()
+    bf16_error = (fp32_weights_output.float() - expected_bf16_weights.float()).norm()
+    assert fp32_error < bf16_error
+
     graph_rows_generator = torch.Generator(device=device).manual_seed(7000 + local_rank)
     graph_logical_rows = torch.randn(
         17,
@@ -433,8 +522,12 @@ def _worker(local_rank: int, master_port: int) -> None:
         gain_center=1.0,
         weight_before_norm=True,
     )
+    execution_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        assert torch.cuda.is_current_stream_capturing()
+        capture_stream_handle = int(torch._C._cuda_getCurrentRawStream(local_rank))
+        assert capture_stream_handle != finalize_module._WS.stream_handle
         tp_moe_finalize_rmsnorm(
             graph_gemm2,
             graph_weights,
@@ -472,7 +565,44 @@ def _worker(local_rank: int, master_port: int) -> None:
         )
         graph.replay()
         _assert_model_close(graph_output, expected)
+
+    # Graph capture must not replace the execution stream pinned by eager warmup.
+    tp_moe_finalize_rmsnorm(
+        graph_gemm2,
+        graph_weights,
+        graph_indices,
+        graph_norm,
+        graph_output,
+        eps=1e-4,
+        gain_center=1.0,
+        weight_before_norm=True,
+    )
+    execution_stream.synchronize()
     dist.destroy_process_group()
+
+
+def _allocation_failure_worker(local_rank: int, master_port: int) -> None:
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        "nccl",
+        rank=local_rank,
+        world_size=WORLD_SIZE,
+        init_method=f"tcp://127.0.0.1:{master_port}",
+    )
+    import torch.distributed._symmetric_memory as symm_mem
+
+    original_empty = symm_mem.empty
+    if local_rank == 0:
+
+        def fail_empty(*args, **kwargs):
+            raise torch.OutOfMemoryError("injected workspace allocation failure")
+
+        symm_mem.empty = fail_empty
+    try:
+        assert not init_tp_moe_finalize_rmsnorm()
+    finally:
+        symm_mem.empty = original_empty
+        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -482,3 +612,12 @@ def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph() -> None:
     if torch.cuda.device_count() < WORLD_SIZE:
         pytest.skip("Four GPUs are required")
     mp.spawn(_worker, args=(_free_port(),), nprocs=WORLD_SIZE)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent() -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("TP MoE finalize requires SM103")
+    if torch.cuda.device_count() < WORLD_SIZE:
+        pytest.skip("Four GPUs are required")
+    mp.spawn(_allocation_failure_worker, args=(_free_port(),), nprocs=WORLD_SIZE)

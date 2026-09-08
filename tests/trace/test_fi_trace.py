@@ -569,13 +569,14 @@ def test_rmsnorm_sigmoid_gate_fi_trace():
     assert defn["outputs"]["output"]["dtype"] == "bfloat16"
 
 
-def test_tp_moe_finalize_rmsnorm_fi_trace():
+@pytest.mark.parametrize("expert_weights_dtype", [torch.bfloat16, torch.float32])
+def test_tp_moe_finalize_rmsnorm_fi_trace(expert_weights_dtype):
     import flashinfer.comm
 
     if not hasattr(flashinfer.comm, "tp_moe_finalize_rmsnorm"):
         pytest.skip("TP MoE finalize dependencies are unavailable")
     gemm2_permuted = torch.empty(19, 4128, dtype=torch.bfloat16)
-    expert_weights = torch.empty(2, 8, dtype=torch.bfloat16)
+    expert_weights = torch.empty(2, 8, dtype=expert_weights_dtype)
     expanded_idx_to_permuted_idx = torch.empty(2, 8, dtype=torch.int32)
     norm_weight = torch.empty(4096, dtype=torch.bfloat16)
     output = torch.empty(2, 4096, dtype=torch.bfloat16)
@@ -597,6 +598,9 @@ def test_tp_moe_finalize_rmsnorm_fi_trace():
     assert defn["axes"]["num_experts"]["value"] == 8
     assert defn["axes"]["hidden_size"]["value"] == 4096
     assert defn["axes"]["hidden_size_padded"]["value"] == 4128
+    assert defn["inputs"]["expert_weights"]["dtype"] == str(
+        expert_weights_dtype
+    ).removeprefix("torch.")
 
 
 # ---------------------------------------------------------------------------

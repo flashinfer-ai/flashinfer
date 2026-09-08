@@ -85,8 +85,9 @@ _HAS_CLUSTER = hasattr(cute.arch, "cluster_arrive") and hasattr(
 )
 
 
-def _cur_stream(dev_ord):
-    h = torch._C._cuda_getCurrentRawStream(dev_ord)
+def _cur_stream(dev_ord, h=None):
+    if h is None:
+        h = torch._C._cuda_getCurrentRawStream(dev_ord)
     s = _STREAMS.get(h)
     if s is None:
         s = _drv.CUstream(h)
@@ -449,6 +450,7 @@ def _make_program(
     mode,
     eps,
     gain_center,
+    expert_weights_fp32,
     ws,
     use_mc,
     addrs,
@@ -543,9 +545,13 @@ def _make_program(
         lane = tidx % 32
         warp = tidx // 32
 
-        # issue the two small vector loads first; they overlap the fabric wait
+        # Issue the small vector loads first; they overlap the fabric wait.
+        # FP32 routing weights occupy two 128-bit vectors, while the original
+        # BF16 path remains one vector.
         nrm = ld_global_v4(gNw.iterator + h0)
-        wgt = ld_global_v4(gW.iterator + tok * K_EXPERTS)
+        wgt_lo = ld_global_v4(gW.iterator + tok * K_EXPERTS)
+        if cutlass.const_expr(expert_weights_fp32):
+            wgt_hi = ld_global_v4(gW.iterator + tok * K_EXPERTS + 4)
 
         # Resolve physical GEMM2 rows directly from the expanded-to-permuted
         # map.  A missing or out-of-range slot contributes literal zero without
@@ -631,10 +637,16 @@ def _make_program(
             nw.append(lo + gain_center)
             nw.append(hi + gain_center)
         ew = []
-        for r2 in cutlass.range_constexpr(4):
-            lo, hi = cvt_bf16x2_to_2xf32(wgt[r2])
-            ew.append(lo)
-            ew.append(hi)
+        if cutlass.const_expr(expert_weights_fp32):
+            for r2 in cutlass.range_constexpr(4):
+                ew.append(bitcast_i32_f32(wgt_lo[r2]))
+            for r2 in cutlass.range_constexpr(4):
+                ew.append(bitcast_i32_f32(wgt_hi[r2]))
+        else:
+            for r2 in cutlass.range_constexpr(4):
+                lo, hi = cvt_bf16x2_to_2xf32(wgt_lo[r2])
+                ew.append(lo)
+                ew.append(hi)
 
         ssq = []
         for ko in cutlass.range_constexpr(NLOC):
@@ -871,6 +883,7 @@ class _Ws:
     nsm = 148
     dev_ord = 0
     group = None
+    stream_handle: int | None = None
 
 
 _WS = _Ws()
@@ -883,14 +896,31 @@ class _WorkspaceAddresses(TypedDict):
     gen: int
 
 
-_PROGRAMS: dict[tuple[int, int, int, int, float, float], "_Program"] = {}
+_PROGRAMS: dict[tuple[int, int, int, int, int, float, float], "_Program"] = {}
+
+
+def _group_all(
+    local_ok: bool,
+    device: torch.device,
+    group,
+    flag: torch.Tensor | None = None,
+) -> bool:
+    """Return a rank-consistent logical AND of an initialization verdict."""
+    import torch.distributed as dist
+
+    if flag is None:
+        flag = torch.empty((1,), dtype=torch.int32, device=device)
+    flag.fill_(int(local_ok))
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
 
 
 def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     """Collectively initialize the process-wide TP4 multicast workspace.
 
     ``group`` is the exact four-rank tensor-parallel process group. The default
-    process group is used when it is omitted.
+    process group is used when it is omitted. Availability is reduced across
+    the group, so every rank returns the same verdict.
     """
     if _WS.initialized:
         if group is not None and group is not _WS.group:
@@ -903,6 +933,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
 
     if group is None:
         group = dist.group.WORLD
+    _WS.group = group
     world_size = dist.get_world_size(group)
     if world_size != 4:
         _WS.initialized = True
@@ -910,15 +941,31 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
     props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor) != (10, 3):
+    local_supported = (props.major, props.minor) == (10, 3)
+    local_supported = local_supported and props.multi_processor_count <= NSLOT
+    if not _group_all(local_supported, device, group):
+        if not local_supported:
+            logger.warning(
+                "TP MoE finalize requires SM103 and at most %d SMs; got SM%d%d "
+                "with %d SMs.",
+                NSLOT,
+                props.major,
+                props.minor,
+                props.multi_processor_count,
+            )
+        else:
+            logger.warning(
+                "TP MoE finalize is unavailable because another rank does not "
+                "satisfy the device or workspace-slot contract."
+            )
         _WS.initialized = True
         return False
 
-    _WS.nsm = torch.cuda.get_device_properties(device).multi_processor_count
+    _WS.nsm = props.multi_processor_count
     _WS.dev_ord = torch.cuda.current_device()
     _WS.ws = world_size
     _WS.rank = dist.get_rank(group)
-    _WS.group = group
+    _WS.stream_handle = None
     _WS.addrs = {"lam_uc": 0, "lam_mc": 0, "lam_peers": [], "gen": 0}
 
     import torch.distributed._symmetric_memory as symm_mem
@@ -926,21 +973,49 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     ko = K_EXPERTS // _WS.ws
     a_i32 = NGEN * NSLOT * ko * _WS.ws * H_DIM // 2  # BF16 region, in int32 words
     b_i32 = NGEN * NSLOT * _WS.ws * H_DIM  # FP32 region, in int32 words
-    lam = symm_mem.empty((a_i32 + b_i32,), dtype=torch.int32, device=device)
+    allocation_flag = torch.empty((1,), dtype=torch.int32, device=device)
+    lam = None
+    generation = None
+    allocation_error = None
+    try:
+        lam = symm_mem.empty((a_i32 + b_i32,), dtype=torch.int32, device=device)
+        generation = torch.zeros((NSLOT,), dtype=torch.int32, device=device)
+    except RuntimeError as error:
+        allocation_error = error
+    if not _group_all(allocation_error is None, device, group, flag=allocation_flag):
+        if allocation_error is not None:
+            logger.warning(
+                "TP MoE finalize workspace allocation failed; using the native "
+                "finalize: %s",
+                allocation_error,
+            )
+        else:
+            logger.warning(
+                "TP MoE finalize is unavailable because another rank could not "
+                "allocate its workspace."
+            )
+        _WS.initialized = True
+        return False
+    assert lam is not None and generation is not None
     lam[:a_i32].fill_(SENT_A_I32)
     lam[a_i32:].fill_(SENT_B_I32)
-    generation = torch.zeros((NSLOT,), dtype=torch.int32, device=device)
     _WS.gen = generation
     torch.cuda.synchronize()
     hdl = symm_mem.rendezvous(lam, group=group)
     _WS.lam, _WS.hdl = lam, hdl
 
     mc = int(getattr(hdl, "multicast_ptr", 0) or 0)
-    if mc == 0:
-        logger.warning(
-            "TP MoE finalize requires NVLink multicast memory; "
-            "using the native finalize."
-        )
+    if not _group_all(mc != 0, device, group):
+        if mc == 0:
+            logger.warning(
+                "TP MoE finalize requires NVLink multicast memory; "
+                "using the native finalize."
+            )
+        else:
+            logger.warning(
+                "TP MoE finalize is unavailable because another rank has no "
+                "NVLink multicast mapping."
+            )
         _WS.initialized = True
         return False
     _WS.use_mc = True
@@ -989,7 +1064,7 @@ def _build(key, a, b, c, d, e, stream):
     # The generated program embeds process-local symmetric-memory and multicast
     # addresses. It must therefore remain in the process cache rather than the
     # persistent CuTe-DSL cache, whose objects are reusable across processes.
-    n_tok, num_rows, row_stride, mode, eps, gain_center = key
+    n_tok, num_rows, row_stride, expert_weights_fp32, mode, eps, gain_center = key
     split = _pick_split(n_tok, _WS.nsm)
     nthr = H_DIM // (VEC * split)
     grid_y = min(n_tok, _WS.nsm // split)
@@ -1006,6 +1081,7 @@ def _build(key, a, b, c, d, e, stream):
         mode,
         eps,
         gain_center,
+        expert_weights_fp32,
         _WS.ws,
         _WS.use_mc,
         addrs,
@@ -1047,12 +1123,28 @@ def _run(
         n_tok,
         gemm2_permuted.shape[0],
         gemm2_permuted.stride(0),
+        int(expert_weights.dtype == torch.float32),
         int(weight_before_norm),
         float(eps),
         float(gain_center),
     )
-    stream = _cur_stream(_WS.dev_ord)
+    stream_handle = int(torch._C._cuda_getCurrentRawStream(_WS.dev_ord))
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        if _WS.stream_handle is None:
+            _WS.stream_handle = stream_handle
+        elif stream_handle != _WS.stream_handle:
+            raise RuntimeError(
+                "TP MoE finalize uses a process-wide Lamport workspace and must be "
+                "invoked on the same CUDA stream for its lifetime"
+            )
+    stream = _cur_stream(_WS.dev_ord, stream_handle)
     prog = _PROGRAMS.get(key)
+    if capturing and prog is None:
+        raise RuntimeError(
+            "TP MoE finalize specialization must be compiled by a non-capturing "
+            "warmup before CUDA graph capture"
+        )
     if prog is None:
         prog = _build(
             key,
@@ -1131,7 +1223,7 @@ def supports_tp_moe_finalize_rmsnorm(
         if gemm2_permuted.shape[0] == 0
         else (gemm2_permuted.shape[0] - 1) * gemm2_permuted.stride(0) + H_DIM
     )
-    bf16_tensors = (gemm2_permuted, expert_weights, norm_weight, output)
+    bf16_tensors = (gemm2_permuted, norm_weight, output)
     return (
         gemm2_permuted.shape[1] >= H_DIM
         and gemm2_permuted.stride(1) == 1
@@ -1142,6 +1234,12 @@ def supports_tp_moe_finalize_rmsnorm(
         and expanded_idx_to_permuted_idx.shape == (num_tokens, K_EXPERTS)
         and norm_weight.shape == (H_DIM,)
         and output.shape == (num_tokens, H_DIM)
+        and expert_weights.dtype in (torch.bfloat16, torch.float32)
+        and expert_weights.is_cuda
+        and expert_weights.is_contiguous()
+        and expert_weights.device == gemm2_permuted.device
+        and expert_weights.device == workspace_device
+        and expert_weights.data_ptr() % 16 == 0
         and all(
             tensor.dtype == torch.bfloat16
             and tensor.is_cuda
@@ -1230,12 +1328,16 @@ def tp_moe_finalize_rmsnorm(
     row for logical token ``t`` and expert slot ``k``; a negative or
     out-of-range index contributes zero. The input may have a padded trailing
     dimension, but its first 4096 columns and every row start must be contiguous
-    and 16-byte aligned.
+    and 16-byte aligned. ``expert_weights`` may be BF16 or FP32; either dtype is
+    converted to FP32 registers and remains FP32 through the routing reduction.
 
     Initialize the workspace collectively with
     :func:`init_tp_moe_finalize_rmsnorm` before the first invocation. The
-    operation writes its BF16 result to ``output`` and is CUDA-graph safe after
-    initialization.
+    operation writes its BF16 result to ``output``. The process-wide Lamport
+    workspace is a single-stream resource: each rank must use one fixed execution
+    stream, with the same call sequence on every rank, for the workspace lifetime.
+    CUDA graph capture may use a separate capture stream after every specialization
+    has been warmed up; replay must be enqueued on the fixed execution stream.
     """
     _tp_moe_finalize_impl(
         gemm2_permuted,
