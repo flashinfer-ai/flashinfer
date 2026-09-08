@@ -21,7 +21,7 @@ from ..core.validation.common import (
     validate_bootstrap_world_size,
     validate_fleet_weights,
 )
-from ..weights import MoEWeightPack
+from ..weights import MoEWeightPack, validate_global_scale_support
 from .config import MegaConfig
 
 if TYPE_CHECKING:
@@ -61,6 +61,8 @@ class MoEEpMegaLayer(nn.Module):
         ensure_moe_ep_cuda_device(bootstrap)
 
         self._kernel = create_mega_kernel(self._megakernel_config)
+        if backend.transformed_weights is None:
+            validate_global_scale_support(weights, self._kernel)
         self._kernel.bind_ep_bootstrap(bootstrap)
         self._runtime = None
         if bootstrap.auto_bootstrap:

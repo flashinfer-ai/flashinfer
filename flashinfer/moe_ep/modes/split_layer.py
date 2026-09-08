@@ -42,7 +42,7 @@ from ..core.validation.common import (
     validate_fleet_weights,
     validate_split_forward_inputs,
 )
-from ..weights import MoEWeightPack
+from ..weights import MoEWeightPack, validate_global_scale_support
 from .config import SplitConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
@@ -74,6 +74,7 @@ class MoEEpSplitLayer(nn.Module):
             self._kernel_config = IdentityConfig()
 
         self._kernel: SplitKernelBackend = create_split_kernel(self._kernel_config)
+        validate_global_scale_support(weights, self._kernel)
 
         ensure_moe_ep_cuda_device(bootstrap)
 

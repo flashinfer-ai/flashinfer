@@ -1,0 +1,329 @@
+"""Public W4A16 MegaMoE correctness on one or two Blackwell ranks.
+
+Run the single-rank cases with pytest, or the two-rank cases with::
+
+    torchrun --standalone --nproc_per_node=2 -m pytest \
+        tests/moe_ep/test_cutedsl_w4a16_mega.py -v -m gpu_2
+
+The oracle decodes the original packed weights independently of the backend.
+It retains both BF16 activation boundaries, FP32 post-MMA global scales, and
+FP32 routing after the BF16 FC2 output. No activation or combine quantization
+is present. Graph comparisons use exact eager/replay equality.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from .mega_oracle_compare import _assert_mega_oracle_term_band_close
+
+_HIDDEN = 256
+_INTERMEDIATE = 256
+_EXPERTS = 4
+_TOP_K = 2
+_CAPACITY = 64
+
+
+def _bootstrap(expected_world_size):
+    from flashinfer.moe_ep import BootstrapConfig, ensure_moe_ep_cuda_device
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != expected_world_size:
+        pytest.skip(f"requires {expected_world_size} ranks, got {world_size}")
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    bootstrap = BootstrapConfig(
+        world_size=world_size, rank=int(os.environ.get("RANK", "0"))
+    )
+    ensure_moe_ep_cuda_device(bootstrap)
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100 or SM103")
+    return bootstrap
+
+
+def _barrier():
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _weights(*, sparse=False):
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    generator = torch.Generator(device="cuda").manual_seed(20260907)
+    shapes = (
+        (_EXPERTS, 2 * _INTERMEDIATE, _HIDDEN // 2),
+        (_EXPERTS, _HIDDEN, _INTERMEDIATE // 2),
+    )
+    packed = [
+        torch.randint(
+            0, 256, shape, dtype=torch.uint8, device="cuda", generator=generator
+        )
+        for shape in shapes
+    ]
+    scales = [
+        torch.randint(
+            -3,
+            0,
+            (*shape[:-1], shape[-1] // 8),
+            device="cuda",
+            generator=generator,
+        )
+        .float()
+        .exp2()
+        .to(torch.float8_e4m3fn)
+        for shape in shapes
+    ]
+    alphas = [
+        torch.linspace(start, end, _EXPERTS, device="cuda", dtype=torch.float32)
+        for start, end in ((0.71013, 1.23017), (1.17019, 0.83023))
+    ]
+    if sparse:
+        for tensor in packed:
+            tensor.zero_()
+        for tensor in scales:
+            tensor.fill_(1.0)
+        # Canonical FC1 is [gate; up]. Experts 0 and 3 have identical FC1
+        # and opposite FC2, making FP32 routing precision observable after
+        # cancellation. Codes 2/10 are +1/-1 in E2M1, in the low nibble.
+        packed[0][:, 0, 0] = 2
+        packed[0][:, _INTERMEDIATE, 0] = 2
+        packed[1][0, 0, 0] = 2
+        packed[1][-1, 0, 0] = 10
+        alphas[0].fill_(1.00390625)
+        alphas[1].fill_(1.001953125)
+    return PrequantizedMoEWeights(
+        w13=packed[0],
+        w2=packed[1],
+        w13_scale=scales[0],
+        w2_scale=scales[1],
+        w13_global_scale=alphas[0],
+        w2_global_scale=alphas[1],
+    )
+
+
+def _decode_nvfp4(packed, block_scale):
+    # Independent E2M1 decode: low nibble is the first logical K element.
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=packed.device,
+    )
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+    decoded = lut[codes.long()] * block_scale.float().repeat_interleave(16, dim=-1)
+    return decoded.to(torch.bfloat16)
+
+
+def _reference_terms(tensors, weights):
+    """Return weighted FP32 terms before the final BF16 output conversion."""
+    x = tensors.hidden_states.float()
+    w13 = _decode_nvfp4(weights.w13, weights.w13_scale).float()
+    w2 = _decode_nvfp4(weights.w2, weights.w2_scale).float()
+    terms = torch.zeros(
+        (x.shape[0], _TOP_K, _HIDDEN), device=x.device, dtype=torch.float32
+    )
+    # FP32 torch GEMMs must not substitute TF32 operands for the exact BF16
+    # values. The fused kernel uses BF16 MMA with FP32 accumulation.
+    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for expert in range(_EXPERTS):
+            tokens, slots = torch.where(tensors.topk_ids == expert)
+            if tokens.numel() == 0:
+                continue
+            fc1 = (x[tokens] @ w13[expert].T) * weights.w13_global_scale[expert]
+            gate, up = fc1.chunk(2, dim=-1)
+            intermediate = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+            fc2 = (intermediate.float() @ w2[expert].T) * weights.w2_global_scale[
+                expert
+            ]
+            # FC2 is stored unweighted in BF16; the external reducer consumes
+            # FP32 routing weights and accumulates before its final BF16 cast.
+            terms[tokens, slots] = fc2.to(torch.bfloat16).float()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+    return terms * tensors.topk_weights.float().unsqueeze(-1)
+
+
+def _inputs(rank, num_tokens, *, skewed=False, sparse=False):
+    from flashinfer.moe_ep import MoEEpTensors
+
+    generator = torch.Generator(device="cuda").manual_seed(73 + rank)
+    x = torch.randn(
+        num_tokens, _HIDDEN, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    rows = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    ids = torch.stack((rows % _EXPERTS, (rows + 2) % _EXPERTS), dim=-1)
+    scores = (
+        torch.rand(
+            num_tokens, _TOP_K, dtype=torch.float32, device="cuda", generator=generator
+        )
+        + 0.12513
+    )
+    if skewed:
+        ids[:] = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    if sparse:
+        x.zero_()
+        x[:, 0] = torch.tensor([0.5, 1.0, 2.0, 4.0], device="cuda")
+        ids[:] = torch.tensor([0, _EXPERTS - 1], dtype=torch.int32, device="cuda")
+        # The first score is exactly halfway between BF16 1 and 1+2^-7.
+        # A BF16 routing cast turns the expected nonzero difference into zero.
+        scores[:, 0] = 1.00390625
+        scores[:, 1] = 1.0
+    return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=scores)
+
+
+def _layer(bootstrap, global_weights):
+    from flashinfer.moe_ep import (
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    local_experts = _EXPERTS // bootstrap.world_size
+    start = bootstrap.rank * local_experts
+    local_weights = dataclasses.replace(
+        global_weights,
+        **{
+            field.name: getattr(global_weights, field.name)[
+                start : start + local_experts
+            ].clone()
+            for field in dataclasses.fields(global_weights)
+        },
+    )
+    return MoEEpLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=_EXPERTS,
+            max_tokens_per_rank=_CAPACITY,
+            token_hidden_size=_HIDDEN,
+        ),
+        weights=local_weights,
+        backend=MegaConfig(
+            megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=_INTERMEDIATE, top_k=_TOP_K
+            )
+        ),
+    )
+
+
+def _check_numerical(expected_world_size):
+    bootstrap = _bootstrap(expected_world_size)
+    weights = _weights()
+    layer = _layer(bootstrap, weights)
+    try:
+        # Reuse one workspace across changing routing and token counts. The
+        # empty source rank still owns experts needed by its peers.
+        for name, count, skewed in (
+            ("balanced", 17, False),
+            ("skewed", 17, True),
+            ("single_token", 1 if bootstrap.rank == 0 else 0, False),
+            ("empty_source", 0 if bootstrap.rank == 0 else 11, False),
+            ("all_empty", 0, False),
+            ("refill", 9, False),
+        ):
+            tensors = _inputs(bootstrap.rank, count, skewed=skewed)
+            terms = _reference_terms(tensors, weights)
+            _barrier()
+            actual = layer.forward(tensors)
+            _barrier()
+            assert actual.dtype == torch.bfloat16
+            assert actual.shape == (count, _HIDDEN)
+            assert torch.isfinite(actual).all()
+            if count:
+                _assert_mega_oracle_term_band_close(
+                    actual,
+                    terms,
+                    ikr=False,
+                    label=f"W4A16 {name} rank={bootstrap.rank}",
+                )
+    finally:
+        layer.destroy()
+        _barrier()
+
+
+def _check_scale_and_routing_contract(expected_world_size):
+    bootstrap = _bootstrap(expected_world_size)
+    weights = _weights(sparse=True)
+    tensors = _inputs(bootstrap.rank, 4, sparse=True)
+    expected = _reference_terms(tensors, weights).sum(dim=1).to(torch.bfloat16)
+    assert torch.count_nonzero(expected[:, 0]) == 4
+    rounded_routing = dataclasses.replace(
+        tensors, topk_weights=tensors.topk_weights.bfloat16().float()
+    )
+    assert torch.count_nonzero(_reference_terms(rounded_routing, weights)) > 0
+    assert (
+        torch.count_nonzero(_reference_terms(rounded_routing, weights).sum(dim=1)) == 0
+    )
+    rounded_globals = dataclasses.replace(
+        weights,
+        w13_global_scale=weights.w13_global_scale.bfloat16().float(),
+        w2_global_scale=weights.w2_global_scale.bfloat16().float(),
+    )
+    wrong = _reference_terms(tensors, rounded_globals).sum(dim=1).to(torch.bfloat16)
+    assert not torch.equal(expected, wrong), (
+        "fixture must detect early global-scale rounding"
+    )
+
+    layer = _layer(bootstrap, weights)
+    try:
+        actual = layer.forward(tensors)
+        _barrier()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        layer.destroy()
+        _barrier()
+
+
+def _check_graph_replay(expected_world_size):
+    bootstrap = _bootstrap(expected_world_size)
+    layer = _layer(bootstrap, _weights())
+    tensors = _inputs(bootstrap.rank, 17)
+    try:
+        layer.warmup()
+        eager = layer.forward(tensors).clone()
+        _barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = layer.forward(tensors)
+        _barrier()
+        for _ in range(3):
+            graph.replay()
+            _barrier()
+            torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+        tensors.hidden_states.mul_(0.5)
+        tensors.topk_ids.copy_(tensors.topk_ids.roll(1, dims=0))
+        tensors.topk_weights.mul_(0.71013)
+        graph.replay()
+        _barrier()
+        replay = captured.clone()
+        eager = layer.forward(tensors)
+        _barrier()
+        torch.testing.assert_close(replay, eager, rtol=0, atol=0)
+    finally:
+        layer.destroy()
+        _barrier()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "check", (_check_numerical, _check_scale_and_routing_contract, _check_graph_replay)
+)
+def test_w4a16_mega_single_rank(check):
+    check(1)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "check", (_check_numerical, _check_scale_and_routing_contract, _check_graph_replay)
+)
+def test_w4a16_mega_two_rank(check):
+    check(2)

@@ -99,8 +99,22 @@ _LAZY_HELPERS = (
     "compute_megamoe_reference_mxfp8",
 )
 
+_W4A16_EXPORTS = (
+    "MegaMoEW4A16Config",
+    "MegaMoEW4A16Frontend",
+    "MegaMoEW4A16Inputs",
+    "MegaMoEW4A16SymmBuffer",
+    "get_symm_buffer_for_w4a16_mega_moe",
+    "w4a16_mega_launch_thunk",
+    "w4a16_mega_moe",
+)
+
 
 def __getattr__(name):  # PEP 562
+    if name in _W4A16_EXPORTS:
+        from . import shim
+
+        return getattr(shim, name)
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -112,6 +126,7 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    *_W4A16_EXPORTS,
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",
     "MegaMoEBf16SymmBuffer",

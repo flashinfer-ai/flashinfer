@@ -153,7 +153,27 @@ from .quant_stage import (
 # Persistent offline-tuning knob cache (pure-lookup hot path).
 from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
+_W4A16_EXPORTS = (
+    "MegaMoEW4A16Config",
+    "MegaMoEW4A16Frontend",
+    "MegaMoEW4A16Inputs",
+    "MegaMoEW4A16SymmBuffer",
+    "get_symm_buffer_for_w4a16_mega_moe",
+    "w4a16_mega_launch_thunk",
+    "w4a16_mega_moe",
+)
+
+
+def __getattr__(name):
+    if name in _W4A16_EXPORTS:
+        from . import w4a16
+
+        return getattr(w4a16, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
+    *_W4A16_EXPORTS,
     # paths
     "bootstrap_paths",
     # quant_stage
