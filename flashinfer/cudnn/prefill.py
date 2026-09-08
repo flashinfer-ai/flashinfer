@@ -179,6 +179,21 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        # The graph is built from the tensors' strides and dtypes too: an HND
+        # graph replayed on NHD-strided (permuted) K/V, or a bf16-KV graph on
+        # fp8 KV, silently reads the wrong elements. Found by the PagedAttention
+        # fuzzer when an HND and an NHD problem shared every other key field.
+        tuple(q.stride()),
+        tuple(k_cache.stride()),
+        tuple(v_cache.stride()),
+        k_cache.dtype,
+        v_cache.dtype,
+        o_data_type,
+        batch_offsets_q is not None,
+        batch_offsets_o is not None,
+        batch_offsets_k is not None,
+        batch_offsets_v is not None,
+        batch_offsets_stats is not None,
     )
     return key
 
