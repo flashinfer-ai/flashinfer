@@ -1871,6 +1871,10 @@ def _resolve_moe_act_sf_layout(
         )
         return _SUPPORTED_MOE_ACT_SF_LAYOUT
 
+    # Annotated wide because the fallback keeps the caller's raw value: an int
+    # outside the enum has no SfLayout member, and it is that unrecognized value
+    # the error message must echo back.
+    layout: Union[int, SfLayout]
     try:
         layout = SfLayout(hidden_states_scale_layout)
     except ValueError:
@@ -1885,7 +1889,9 @@ def _resolve_moe_act_sf_layout(
             "the activations with is_sf_swizzled_layout=False (equivalently "
             "sf_swizzle_layout=SfLayout.layout_linear)."
         )
-    return layout
+    # Equal to the sole supported layout, so hand back the canonical enum member
+    # rather than a bare int that merely compares equal to it.
+    return _SUPPORTED_MOE_ACT_SF_LAYOUT
 
 
 def _alloc_trtllm_moe_output(
