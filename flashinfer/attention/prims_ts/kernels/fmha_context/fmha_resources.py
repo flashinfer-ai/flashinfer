@@ -1600,7 +1600,17 @@ class SmemPageOffsetsKvResource(MemoryResource):
 class SmemKVResource(MemoryResource):
     """SMEM buffer for K and V tiles with a capacity-derived TmaUmma pipeline.
 
-    K and V tiles alternate in the pipeline stages: K0, V0, K1, V1, ...
+    Fill order depends on the schedule:
+
+    * Lockstep: ``K0, V0, K1, V1, ...`` — iter i consumes K_i then V_i.
+    * K-ahead (staged split S/P and paired ``Qk0_Pv0_Qk1_Pv1``):
+      ``K0, K1, V0, K2, V1, ...`` — iter i's QK reads K_{i+1} while PV reads
+      V_i. QK issues as soon as its K lands (no wait on V's TMA), and each K
+      slot is released right after its last QK — one PV earlier than V — so
+      the load warp can prefetch K further ahead.
+
+    K and V share this single FIFO ring, so release order must match wait
+    order (K before V).
     Producer: LoadTask (TMA loads K/V tiles).
     Consumer: MmaTask (builds SMEM descriptors for QK and PV MMAs).
     """

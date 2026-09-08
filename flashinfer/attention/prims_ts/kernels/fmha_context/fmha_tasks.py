@@ -545,13 +545,130 @@ def create_load_task(
     if smem_page_offsets_kv is not None or smem_page_offsets_v is not None:
         raise ValueError("paired context resolves paged K/V IDs directly")
 
-    def load_schedule_body(
+    def _load_body_k_ahead(
         gqkv: GmemQKVResource,
         sq: SmemQResource,
         skv: SmemKVResource,
         wq: WorkQueue | None,
     ) -> None:
-        """Load paired Q instances and their directly addressed K/V tiles."""
+        """Load paired Q instances with K streamed one tile ahead of V.
+
+        Fill order is ``K0, K1, V0, K2, V1, ..., K_{n-1}, V_{n-2}, V_{n-1}``:
+        the head prefetches ``K0`` alone, each loop iteration streams the next
+        ``K_j`` followed by the previous ``V_{j-1}``, and the tail flushes the
+        final ``V_{n-1}``. This keeps the next K tile at the shared SmemKV FIFO
+        front ahead of the current V so the MMA task can release each K slot
+        right after its second QK -- freeing the K buffer ~one PV MMA earlier
+        and deepening the K prefetch. It matches the trtllm-gen
+        ``Qk0_Pv0_Qk1_Pv1`` reference and mirrors the single-Q-instance staged
+        loader above (head K, ``domain_loop(loop_start + 1, ...)`` with a
+        previous-V, trailing V). The K/V count is unchanged versus a lockstep
+        ``K_i, V_i`` loop: head + tail absorb exactly the one K and one V the
+        loop no longer emits.
+        """
+        sq.init_load_state()
+        skv.init_load_state()
+        with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
+            # HEAD (once per work tile): resolve coords, load Q0, prefetch the
+            # one-tile-ahead K0 (loop_offset 0), then load Q1.
+            (
+                _seq_coord,
+                head_coord,
+                kv_head_coord,
+                _head_coord_kv,
+                batch_coord,
+                seq_coord_q,
+                cuseqlen_q,
+                cuseqlen_k,
+                seqlen_q,
+                _seqlen_k,
+                kv_tile_start,
+            ) = gqkv.compute_coords()
+            # Load Q0 for the first Q tile in this work tile.
+            sq.acquire()
+            sq.tma_load(
+                seq_coord_q=seq_coord_q,
+                head_coord=head_coord,
+                batch_coord=batch_coord,
+                cuseqlen_q=cuseqlen_q,
+                seqlen_q=seqlen_q,
+                inst_idx=0,
+            )
+            sq.commit()
+            # Prefetch K0 ahead of any V so it sits at the FIFO front.
+            skv.try_acquire()
+            skv.acquire()
+            skv.k_load(
+                kv_head_coord=kv_head_coord,
+                batch_coord=batch_coord,
+                cuseqlen_k=cuseqlen_k,
+                kv_tile_start=kv_tile_start,
+            )
+            skv.commit()
+            # Load Q1 for the second Q tile in this work tile.
+            sq.acquire()
+            sq.tma_load(
+                seq_coord_q=seq_coord_q,
+                head_coord=head_coord,
+                batch_coord=batch_coord,
+                cuseqlen_q=cuseqlen_q,
+                seqlen_q=seqlen_q,
+                inst_idx=1,
+            )
+            sq.commit()
+
+            # LOOP: stream the current K_j then the previous V_{j-1} so K stays
+            # one tile ahead of V in the FIFO. Runs j = loop_start+1 .. n-1.
+            with domain_loop(loop_start + 1, loop_end, loop_step):
+                # Throttle TMA before reserving a KV stage.
+                skv.try_acquire()
+                skv.acquire()
+                skv.k_load(
+                    kv_head_coord=kv_head_coord,
+                    batch_coord=batch_coord,
+                    cuseqlen_k=cuseqlen_k,
+                    kv_tile_start=kv_tile_start,
+                )
+                skv.commit()
+                # Previous V tile (tile_offset -1 -> loop_offset - 1).
+                skv.try_acquire()
+                skv.acquire()
+                skv.v_load(
+                    tile_offset=-1,
+                    kv_head_coord=kv_head_coord,
+                    batch_coord=batch_coord,
+                    cuseqlen_k=cuseqlen_k,
+                    kv_tile_start=kv_tile_start,
+                )
+                skv.commit()
+
+            # TAIL: flush the final V tile (loop_offset n-1) the loop skipped.
+            skv.try_acquire()
+            skv.acquire()
+            skv.v_load(
+                kv_head_coord=kv_head_coord,
+                batch_coord=batch_coord,
+                cuseqlen_k=cuseqlen_k,
+                kv_tile_start=kv_tile_start,
+            )
+            skv.commit()
+
+    def _load_body_lockstep(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        wq: WorkQueue | None,
+    ) -> None:
+        """Load paired Q instances and their directly addressed K/V tiles.
+
+        Lockstep fill order ``K0, V0, K1, V1, ...``: the MMA task's legacy
+        ``Pv0_Qk0_Pv1_Qk1`` schedule consumes ``Ki`` then ``Vi`` within the same
+        iteration off the single shared SmemKV FIFO, so K must not run ahead of
+        V. Emitting the K-ahead order here would leave that consumer's first
+        ``v_desc()`` reading the slot still holding ``K1`` -- an uncorrelated
+        (garbage) result. The interleaved schedule instead wants K one tile
+        ahead; see ``_load_body_k_ahead``.
+        """
         sq.init_load_state()
         skv.init_load_state()
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):  # noqa: SIM117
@@ -617,6 +734,25 @@ def create_load_task(
                     kv_tile_start=kv_tile_start,
                 )
                 skv.commit()
+
+    def load_schedule_body(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        wq: WorkQueue | None,
+    ) -> None:
+        """Dispatch the paired loader to the fill order the active MMA consumer
+        expects: K-ahead for the interleaved ``Qk0_Pv0_Qk1_Pv1`` schedule,
+        lockstep for the legacy ``Pv0_Qk0_Pv1_Qk1`` schedule. The SmemKV ring is
+        a single shared FIFO, so a fill order that does not match how the MMA
+        task calls ``k_desc()``/``v_desc()`` yields uncorrelated output. Gated on
+        the same ``uses_qk_pv_interleaved_paired_schedule`` predicate that selects
+        the MMA schedule in ``create_mma_task``.
+        """
+        if smem_q.cfg.uses_qk_pv_interleaved_paired_schedule:
+            _load_body_k_ahead(gqkv, sq, skv, wq)
+        else:
+            _load_body_lockstep(gqkv, sq, skv, wq)
 
     @schedule
     def load_schedule(
@@ -976,9 +1112,17 @@ def create_mma_task(
                 # its own tpi (softmax's P0/P1 store) so cross-alias writes
                 # on the shared physical columns cannot race the reads.
                 with domain_loop(loop_start, loop_end, loop_step):
-                    # Wait V_i then K_{i+1} up-front (FIFO w.r.t. load pipe).
-                    skv.wait()
-                    desc_v_base = skv.v_desc()
+                    # K-ahead FIFO: wait K_{i+1} (front) here, but DEFER the V_i
+                    # wait to just before PV0. The load fills K one tile ahead of
+                    # V (K0, K1, V0, K2, V1, ...), so K_{i+1} is the FIFO front and
+                    # V_i follows it. QK0 consumes only Q0 and K_{i+1} -- never V_i
+                    # -- so issuing it the instant K_{i+1} lands overlaps V_i's
+                    # in-flight TMA, and the MMA holds a single ring slot (K only)
+                    # across QK0 instead of two, leaving the load warp more
+                    # prefetch headroom. Matches the trtllm-gen reference, which
+                    # waits V only right before its first PV. desc_k_base is frozen
+                    # by k_desc() before the deferred wait, so QK0/QK1 still read
+                    # K_{i+1}; the wait/release order stays K_{i+1} then V_i.
                     skv.wait()
                     desc_k_base = skv.k_desc()
 
@@ -990,8 +1134,11 @@ def create_mma_task(
                         section=FmhaStage.Loop,
                     )
                     sp0.commit()
-                    # PV0(V_i): P0 * V_i -> O0. tp0 gates on softmax0's P0
-                    # store; release tp0 once the UMMA has consumed P0.
+                    # PV0(V_i): P0 * V_i -> O0. Wait V_i now (FIFO: it follows
+                    # K_{i+1}). tp0 gates on softmax0's P0 store; release tp0 once
+                    # the UMMA has consumed P0.
+                    skv.wait()
+                    desc_v_base = skv.v_desc()
                     to.acquire()
                     tp0.wait()
                     to.pv_mma(
@@ -1012,6 +1159,11 @@ def create_mma_task(
                         section=FmhaStage.Loop,
                     )
                     sp1.commit()
+                    # Release K_{i+1} now: QK0 and QK1 have both consumed it,
+                    # and it is the FIFO front (waited before V_i). Freeing it
+                    # here -- one PV MMA before PV1 -- lets the load warp
+                    # prefetch K_{i+2} earlier, the crux of the K-ahead speedup.
+                    skv.release()
                     # PV1(V_i): P1 * V_i -> O1 (same V window as PV0).
                     to.acquire()
                     tp1.wait()
@@ -1023,8 +1175,7 @@ def create_mma_task(
                     to.commit()
                     tp1.release()
 
-                    # FIFO release order: V_i first, then K_{i+1}.
-                    skv.release()
+                    # Release V_i (FIFO: follows K_{i+1}).
                     skv.release()
 
                 # TAIL: both PVs on V_{n-1} (no QK). Non-causal drains an empty
