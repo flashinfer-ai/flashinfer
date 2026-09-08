@@ -1,125 +1,124 @@
-# Updating the SM90 (Hopper) CuTeDSL MegaMoE kernel src
+# Updating the SM90 (Hopper) CuTeDSL MegaMoE kernel source
 
 ## Provenance
 
-This tree vendors the kernel team's **SM90 FP8 MegaMoE** drop — a fork of the
-same kernel repo that `kernel_src/cutedsl_megamoe` vendors (Bangyu's
-SM100 tree). The SM90 work (Vincent's `hopper_megamoe` branch) moved the
-shared runtime forward, so this tree duplicates `common/`, `src/`, and
-`moe_nvfp4_swapab/` at its own revision instead of sharing the SM100 copies.
-The two trees are **separate backends**:
+This tree vendors one atomic SM90 kernel snapshot supporting:
 
-- top-level module names collide (`common`, `src`, `moe_nvfp4_swapab`), so
-  only one tree can be active per process — `shim/_paths.bootstrap_paths`
-  raises if the sibling tree's modules are already imported. A process runs on
-  either Hopper or Blackwell, never both, so this is not a practical limit.
-- drops are updated independently; never "sync" shared files across the trees.
+- Hopper FP8 fused MegaMoE;
+- Humming MXFP4 x FP8 fused MegaMoE;
+- Humming MXFP4 x FP8 Green Context split MegaMoE.
 
-Current drop: kernel repo commit `c3e2c2a` ("Add token-based launch
-heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
-("Add Green Context execution", reverted by decision — no
-`green_context.py`, no `execution_phase` kwarg, no `split_*` workspace
-regions / token_comm bodies).  Re-exclude that commit's content when
-syncing future drops.
+It is a fork of the kernel repository also vendored by
+`kernel_src/cutedsl_megamoe` for SM100, but the two trees are independent.
+Their top-level module names (`common`, `src`, and `moe_nvfp4_swapab`) collide,
+so `shim/_paths.bootstrap_paths` rejects loading both trees in one process.
+Never synchronize individual files between the SM90 and SM100 trees.
 
-Local extensions pending upstream (re-apply when syncing a drop that has
-not picked them up):
+The current snapshot is a reviewed semantic merge formed in a dedicated clean
+kernel staging repository:
 
-- `moe_hopper_fp8/heuristic_config.py` carries a `token_back_mode` field
-  per bucket (2026-08-23 FI-layer epi-vs-reuse sweep winners).
-- Wire-level top-k dedup (`dedup_dispatch`, 2026-08-24, design in
-  `dedup_topk_design.md`): `src/token_comm.py` (carrier election in
-  `dispatch_prep`, carrier-table rendezvous in `dispatch_pull`,
-  `TokenCommArgs.carrier_row_table`) and
-  `moe_hopper_fp8/megamoe_kernel_fp8.py` (ctor knob + workspace region).
-- Combine dedup + quantized combine wire (`grouped_token_back` /
-  `combine_format`, 2026-08-27, design in `dedup_topk_design.md` §4):
-  `src/token_comm.py` (group table + `grouped_reduce_push` with the
-  in-reduction per-32 e8m0/fp8 encoder), `moe_hopper_fp8/
-  megamoe_kernel_fp8.py` (ctor knobs, group/mask/combine_sf regions,
-  rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
-  (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
-  rank-masked reduce -- keep NVFP4-compatible when re-syncing).
-- FC1 store offload + early fc1_done publish (2026-09-01/02):
-  `fc1_store_offload` / `fc1_early_done_publish` knobs in
-  `moe_hopper_fp8/kernel_fp8_glu_fc12{,_swapab}.py` +
-  `epilogue_fp8{,_swapab}.py` (mailbox FIFO + epi_aux-warp store server +
-  register fit, dual-FIFO on the 2-WG kernels).  Synced to the drop tree
-  on 2026-09-02 (5 `src/` files, commit-only diff).
-- `fold_producer_warps` (2026-09-02, default True): `_apply_mega_warp_layout()`
-  in `kernel_fp8_glu_fc12.py` (single source of truth, also called from
-  both kernels' `_setup_attributes`) folds TMA-A/TMA-B/sched into the idle
-  dispatch slots when `active_dispatch_warps == 1` and drops the producer
-  warpgroup; `fit_epi_registers()` returns the freed budget to the
-  epilogue; `megamoe_kernel_fp8.py` gates it and forces early-pub;
-  `heuristic_config.py` blockwise non-swap 512-32768 switched to cooperative
-  M64N256, per_tensor 8 to cooperative swap M256N16 and per_tensor 64 to
-  basic swap M128N64 on the strength of it.  New multirank tests
-  `test_..._fold_producer_warps` and `test_..._blockwise_coop_n256` (the test
-  helpers now take mma_tiler_mnk / pingpong / cluster_shape_mnk).
-  `benchmarks/bench_moe_ep_sm90_mega.py` `--pingpong on/off` now forwards
-  the bucket's full heuristic config (cga / accum / token-back) so the
-  override flips only ping-pong — earlier it leaked drop-driver manual
-  defaults — and `--epi-mode {basic,pingpong,cooperative}` forces every
-  bucket's epilogue mode for twin sweeps (basic: one WG, per-WG-size tile;
-  pingpong: two WGs, per-WG-size tiles alternating; cooperative: two WGs,
-  one doubled tile — the tile is derived from the bucket's entry).  The drop tree has none of this yet.
-- `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
-  (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
-  barrier / pull / reuse token-back all follow it; barrier and grid-sync
-  arrival counts scale with it, and the base kernels route the idle warps
-  straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
-  (dispatch-body gating) too; the drop tree still hardcodes 4.
+- latest PR4688 FlashInfer base:
+  `b1b6b399b7a9885cbe7d543459d0d9a6797b61b4`;
+- matching staged kernel baseline:
+  `9e9b873013756d8c67f79afcae5dd21b8391e149`;
+- previous MXFP4 fused checkpoint:
+  `1766988168658dbf73f3378467b4224f2fee9875`;
+- previous unified MXFP4 fused/split checkpoint:
+  `d0c99d67efb3a1600a9993377a849ff5f4ed14d8`;
+- current joint source identity: the four package tree IDs and content hashes
+  recorded in `VENDOR_PROVENANCE.md`.
+
+`VENDOR_PROVENANCE.md` records the package trees, aggregate hashes, merge
+contract, and recursive-copy evidence. The four packages under `src/` must
+remain byte-for-byte identical to those recorded package snapshots; all
+FlashInfer adaptation belongs outside them in `shim/` and the backend.
+
+The merged source retains the latest PR4688 FP8 features as well as MXFP4:
+
+- dispatch deduplication and grouped/quantized combine support;
+- `active_dispatch_warps`;
+- FC1 store offload and early-done publication;
+- producer-warp folding and its effective-layout rules;
+- invalid-route and stale-slot masking;
+- Humming packed weights and hybrid activation scaling;
+- Green Context K1/K2/K3 execution, counters, resets, and graph lifecycle.
+
+`moe_hopper_fp8/heuristic_config.py` remains the latest PR4688 FP8 heuristic
+source of truth. MXFP4 heuristic/candidate/cache policy is implemented in the
+FlashInfer shim and must not modify these vendored packages.
 
 ## Layout
 
-```
+```text
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
-│   ├── common/             ← shared constants/host utils (SM90-drop revision)
-│   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
-│   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,
-│   │                          fc1_fc2_fuse_sched, topk_reduce, custom_ext, moe_utils)
-│   └── moe_hopper_fp8/     ← SM90 FP8 kernel implementation
-│       (benchmark_data/ is excluded from the copy — data blobs only)
-├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
-├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
-│   ├── _paths.py           ← adds sibling src/ to sys.path + sibling-tree exclusivity guard
-│   ├── comm.py             ← dist/NVSHMEM bootstrap, sym heap, launch-cache state
-│   ├── hopper_fp8.py       ← SM90 FP8 frontend (config, symm buffer, compute entry)
-│   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
-├── SKILL.md                ← this file (drop-update workflow)
-└── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
-                              benchmark methodology, knob surface, next levers
+├── src/                       atomic staged kernel snapshot; do not edit here
+│   ├── common/                shared constants and host helpers
+│   ├── src/                   dispatch, token communication, symmetric buffers
+│   ├── moe_nvfp4_swapab/      scheduler, reduction, and runner utilities
+│   └── moe_hopper_fp8/        FP8 and Humming MXFP4 fused/split kernels
+│       (benchmark_data/ is intentionally excluded)
+├── __init__.py                public FlashInfer-facing API
+├── shim/                      all local adapters, tuning, and cache integration
+│   ├── _paths.py              import bootstrap and sibling-tree exclusion
+│   ├── comm.py                dist/NVSHMEM bootstrap and launch state
+│   ├── hopper_fp8.py          SM90 FP8 frontend
+│   ├── hopper_mxfp4.py        fused Humming MXFP4 frontend
+│   ├── hopper_mxfp4_split.py  Green Context split frontend
+│   └── kernel_helpers.py      lazy raw-kernel helper exports
+├── SKILL.md
+├── VENDOR_PROVENANCE.md
+└── TUNING.md
 ```
 
-The kernel classes are `Sm90MegaMoEFp8Kernel` and `Sm90MegaMoESwapABFp8Kernel`
-in `src/moe_hopper_fp8/megamoe_kernel_fp8.py` (FP8 E4M3/E5M2, per-tensor or
-blockwise scaling, native or swap-A/B layouts).
+The fused kernel classes are `Sm90MegaMoEFp8Kernel`,
+`Sm90MegaMoESwapABFp8Kernel`, and `Sm90MegaMoESwapABMxfp4Fp8Kernel` in
+`src/moe_hopper_fp8/megamoe_kernel_fp8.py`. The standalone MXFP4 FC12 class is
+`Sm90SwapABSwigluMxfp4Fp8Fc12Kernel`.
 
-Note: `src/moe_hopper_fp8/mega_runner.py` imports the kernel repo's `tester/`
-package (not vendored) at module scope — it is the drop's standalone test
-driver and must not be imported by shim code. It IS the authoritative template
-for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
+`src/moe_hopper_fp8/mega_runner.py` imports the non-vendored `tester` package
+at module scope. Do not import it from shim code; use it only as a signature
+reference.
 
-## When the kernel team drops a new version of src/
+## Updating the source snapshot
 
-Same workflow as `kernel_src/cutedsl_megamoe/SKILL.md`, with this tree's
-package set:
+1. Start from the exact current package snapshot or a verified upstream
+   baseline in a separate clean kernel repository.
+2. Form and review the complete joint version there. Do not hand-merge files
+   inside FlashInfer's `src/` directory.
+3. Copy `common/`, `src/`, `moe_nvfp4_swapab/`, and `moe_hopper_fp8/` as one
+   unit. Do not copy repository scaffolding, tests, scripts, generated Python
+   bytecode, or `moe_hopper_fp8/benchmark_data`.
+4. Recursively compare all four target packages to the staging tree and update
+   every tree/hash in `VENDOR_PROVENANCE.md`.
+5. Audit all fused and split constructor, launch, workspace, and reduction
+   signatures in the shim.
+6. Preserve complete identities for format, execution mode, requested and
+   effective tactics, graph variant, counter banks, Green generation, hardware,
+   world size, model shape, token bucket, clamp, and routing profile.
+7. Run FP8 no-regression plus MXFP4 standalone, fused/split 1/2/4-rank,
+   graph-replay, lifecycle, autotune, and cache tests before accepting the
+   snapshot.
 
-```bash
-rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/{common,src,moe_nvfp4_swapab,moe_hopper_fp8}
-cp -r <new_drop>/{common,src,moe_nvfp4_swapab,moe_hopper_fp8} \
-    flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/
-rm -rf flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/*/__pycache__ \
-    flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/benchmark_data
-```
+## Tuning and cache contract
 
-Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`,
-`scripts/`, `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`,
-`moe_mxfp8_glu/` — the SM90 backend doesn't use it).
+Shared score, synchronization, and persistent-cache machinery must be reused
+across FP8 and MXFP4. MXFP4-specific code owns only its packed-weight/layout
+rules and fused/split execution differences.
 
-Then audit the shim against the new drop: the highest-churn surface is the
-kernel construct/launch signature (`Sm90MegaMoEFp8Kernel.__init__` /
-`.__call__`) mirrored by the shim's compile/launch path, and the
-`moe_hopper_fp8/mega_runner.py` `run_kernel()` driver it was modeled on.
+- A complete explicit tactic bypasses cache and heuristic lookup.
+- `knobs="auto"` collectively times only the compact mode-specific candidate
+  union with rank-local medians followed by an all-rank maximum.
+- `knobs=None` performs the mode/hardware/routing-scoped cache lookup and then
+  falls back to that mode's per-token heuristic.
+- Fused MXFP4, split MXFP4, and ordinary FP8 identities must never match.
+- Split cache values contain the complete immutable Green session tactic:
+  K1/K2 tiles, clusters, group hints, stage counts, SM partition, counter-bank
+  count, graph variant, and IKET selection.
+- BF16-combine MXFP4 candidates keep `grouped_token_back=false` and
+  `combine_format="bf16"` until a separate numerical profile is certified.
+- Effective-layout deduplication must account for producer folding, active
+  dispatch warps, store offload, and early publication.
+
+See `TUNING.md` for legal knob combinations, correctness gates, and benchmark
+protocol. No external kernel-team approval is implied by this local provenance
+record.

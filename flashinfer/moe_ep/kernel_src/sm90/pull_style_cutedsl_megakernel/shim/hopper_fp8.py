@@ -487,10 +487,42 @@ class MegaMoEHopperFp8Frontend:
         *,
         num_tokens: Optional[int] = None,
     ) -> None:
+        self.prepare_launch(inputs, num_tokens=num_tokens)
+
+    def prepare_launch(
+        self,
+        inputs: MegaMoEHopperFp8Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+        validated: Optional[tuple[MegaMoEHopperFp8Inputs, tuple]] = None,
+    ) -> None:
+        """Compile and cache complete launch arguments without launching."""
+
+        if validated is None:
+            validated = self.validate_launch(inputs, num_tokens=num_tokens)
+        if validated is None:
+            return None
+        launch_inputs, key = validated
+        mega = self._ensure_mega_compiled(inputs)
+        if mega.launch_key == key:
+            return None
+        mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        mega.launch_key = key
+        mega.launch_output = launch_inputs.output_activation
+
+    def validate_launch(
+        self,
+        inputs: MegaMoEHopperFp8Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> Optional[tuple[MegaMoEHopperFp8Inputs, tuple]]:
+        """Validate fixed inputs and build their resource-free launch key."""
+
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
-        self._ensure_mega_compiled(inputs)
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
+        return launch_inputs, self._launch_cache_key(inputs, resolved)
 
     def run(
         self,
@@ -613,6 +645,12 @@ class MegaMoEHopperFp8Frontend:
 
     def _mega_compile_key(self) -> tuple:
         c = self.config
+        # This key describes the fully resolved constructor request after
+        # cache/heuristic/explicit-knob selection. The original selector
+        # (for example ``knobs=None`` versus an equivalent explicit dict) is
+        # intentionally not codegen identity. Vendor-internal self-gating may
+        # still make two distinct requests compile equivalently; retaining the
+        # requested values here safely avoids false cache hits.
         return (
             c.kind,
             c.fp8_scale_mode,
@@ -639,6 +677,13 @@ class MegaMoEHopperFp8Frontend:
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
             c.apply_topk_in_fc1,
+            c.dedup_dispatch,
+            c.grouped_token_back,
+            c.combine_format,
+            c.active_dispatch_warps,
+            c.fc1_store_offload,
+            c.fc1_early_done_publish,
+            c.fold_producer_warps,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -759,19 +804,26 @@ class MegaMoEHopperFp8Frontend:
             device="cuda",
         )
         shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
-
+        # Publish ownership immediately after the collective allocation. If
+        # peer-offset discovery or compilation fails on one rank, the shared
+        # autotuner can still release this tensor in all-rank order.
         mega = _CompiledMega(
             compiled=None,
             kernel=kernel,
             local_workspace=local_workspace,
             shared_workspace=shared_workspace,
-            symmetric_base=symmetric_base,
-            peer_offsets_list=peer_offsets_list,
+            symmetric_base=0,
+            peer_offsets_list=(),
         )
+        self._mega = mega
+        self._mega_key = None
+        symmetric_base, peer_offsets_list = _compute_peer_offsets(
+            shared_workspace,
+            c.world_size,
+        )
+
+        mega.symmetric_base = symmetric_base
+        mega.peer_offsets_list = tuple(peer_offsets_list)
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
         if c.enable_iket:
@@ -779,8 +831,7 @@ class MegaMoEHopperFp8Frontend:
 
         mega.compiled = cute.compile(kernel, **compile_kwargs)
         self._mega_key = key
-        self._mega = mega
-        return self._mega
+        return mega
 
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
@@ -1260,6 +1311,169 @@ class MegaMoEHopperFp8SymmBuffer:
         return cached
 
 
+def resolve_hopper_fp8_mega_moe_config(
+    num_total_experts: int,
+    num_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate: int,
+    rank: int,
+    world_size: int,
+    *,
+    kind: HopperFp8Kind = "fp8_e4m3",
+    fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
+    fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+    knobs: Optional[Any] = None,
+    swap_ab: Optional[bool] = None,
+    pingpong: Optional[bool] = None,
+    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
+    cluster_shape_mnk: Optional[Tuple[int, int, int]] = None,
+    gate_up_clamp: Optional[float] = None,
+    activation_clamp: Optional[float] = None,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_by_dispatch: bool = False,
+    token_back_mode: Optional[
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+    ] = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
+    fc1_store_offload: bool = True,
+    fc1_early_done_publish: bool = False,
+    fold_producer_warps: bool = True,
+    apply_topk_in_fc1: bool = True,
+    load_balance_mode: Literal["static", "atomic_counter"] = "static",
+    group_hint: Optional[int] = None,
+    clc_bundle_size: Optional[int] = None,
+    num_sched_stages: Optional[int] = None,
+    flag_batch: int = 1,
+    epi_flag_batch: Tuple[int, int] = (2, 4),
+) -> MegaMoEHopperFp8Config:
+    """Resolve the complete constructor config without GPU work or allocation."""
+    if hidden % 64 != 0 or intermediate % 64 != 0:
+        raise ValueError(
+            "MegaMoE requires hidden and intermediate to be multiples of 64."
+        )
+    if num_total_experts % world_size != 0:
+        raise ValueError("num_total_experts must be divisible by world_size.")
+
+    clamp = resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp,
+        activation_clamp=activation_clamp,
+    )
+
+    manual_geometry = any(
+        value is not None
+        for value in (swap_ab, pingpong, mma_tiler_mnk, cluster_shape_mnk)
+    )
+    knob_overrides: Dict[str, Any] = {}
+    if manual_geometry:
+        if knobs is not None:
+            raise ValueError(
+                "pass either explicit geometry arguments (swap_ab / pingpong "
+                "/ mma_tiler_mnk / cluster_shape_mnk) or knobs=, not both."
+            )
+        # Drop-driver recipe (mega_runner.py main()): manual mode fills the
+        # unset geometry knobs with the driver defaults.  heuristic_config
+        # imports without cutlass; bootstrap_paths already ran at package
+        # import.
+        from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
+
+        selection = resolve_hopper_fp8_config(
+            fp8_scale_mode,
+            num_max_tokens,
+            swap_ab=swap_ab,
+            pingpong=pingpong,
+            mma_tiler_mnk=mma_tiler_mnk,
+            cluster_shape_mnk=cluster_shape_mnk,
+            accum_mode=fp8_accum_mode,
+        )
+        launch = selection.config
+        swap_ab = launch.swap_ab
+        pingpong = launch.pingpong
+        mma_tiler_mnk = launch.mma_tiler_mnk
+        cluster_shape_mnk = launch.cluster_shape_mnk
+        fp8_accum_mode = launch.accum_mode
+    else:
+        # knobs=None (or "auto", which starts from the same resolution and
+        # re-tunes at the first compute): pure lookup — offline-tuned cache
+        # entry for this session key when present, else the kernel drop's
+        # token-bucket heuristic table.  An explicit knobs= dict overrides
+        # both entirely; geometry knobs the dict omits keep the table value.
+        from .knob_cache import resolve_knobs as _resolve_cached_knobs
+        from .tuner import GEOMETRY_KNOBS, default_knobs
+
+        if isinstance(knobs, dict):
+            resolved = dict(knobs)
+        else:
+            resolved, _ = _resolve_cached_knobs(
+                dtype=kind,
+                fp8_scale_mode=fp8_scale_mode,
+                world_size=world_size,
+                hidden=hidden,
+                intermediate=intermediate,
+                num_experts=num_total_experts,
+                topk=num_topk,
+                max_tokens=num_max_tokens,
+                gate_up_clamp=clamp,
+            )
+        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
+        geometry.update({k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved})
+        swap_ab = bool(geometry["swap_ab"])
+        pingpong = bool(geometry["pingpong"])
+        mma_tiler_mnk = tuple(geometry["mma_tiler_mnk"])
+        cluster_shape_mnk = tuple(geometry["cluster_shape_mnk"])
+        fp8_accum_mode = geometry["fp8_accum_mode"]
+        knob_overrides = {k: v for k, v in resolved.items() if k not in GEOMETRY_KNOBS}
+        # An explicit caller token-back choice wins over the heuristic
+        # table's / cache's per-bucket pick.
+        if token_back_mode is not None or token_back_by_dispatch:
+            knob_overrides.pop("token_back_mode", None)
+
+    cfg = MegaMoEHopperFp8Config(
+        rank=rank,
+        world_size=world_size,
+        num_tokens_per_rank=num_max_tokens,
+        num_topk=num_topk,
+        num_total_experts=num_total_experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        kind=kind,
+        fp8_scale_mode=fp8_scale_mode,
+        fp8_accum_mode=fp8_accum_mode,
+        swap_ab=swap_ab,
+        pingpong=pingpong,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
+        gate_up_clamp=clamp,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        token_back_by_dispatch=token_back_by_dispatch,
+        token_back_mode=token_back_mode,
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=grouped_token_back,
+        combine_format=combine_format,
+        active_dispatch_warps=active_dispatch_warps,
+        fc1_store_offload=fc1_store_offload,
+        fc1_early_done_publish=fc1_early_done_publish,
+        fold_producer_warps=fold_producer_warps,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        load_balance_mode=load_balance_mode,
+        group_hint=group_hint,
+        clc_bundle_size=clc_bundle_size,
+        num_sched_stages=num_sched_stages,
+        flag_batch=flag_batch,
+        epi_flag_batch=epi_flag_batch,
+    )
+    if knob_overrides:
+        # Non-geometry knobs from the cache/dict (token_back_mode,
+        # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
+        from .tuner import with_knobs
+
+        cfg = with_knobs(cfg, knob_overrides)
+    return cfg
+
+
 def get_symm_buffer_for_hopper_fp8_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -1331,101 +1545,24 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
     tuples to :func:`hopper_fp8_mega_moe` instead.
     """
-    if hidden % 64 != 0 or intermediate % 64 != 0:
-        raise ValueError(
-            "MegaMoE requires hidden and intermediate to be multiples of 64."
-        )
-    if num_total_experts % world_size != 0:
-        raise ValueError("num_total_experts must be divisible by world_size.")
-
-    clamp = resolve_gate_up_clamp(
-        gate_up_clamp=gate_up_clamp,
-        activation_clamp=activation_clamp,
-    )
-
-    manual_geometry = any(
-        value is not None
-        for value in (swap_ab, pingpong, mma_tiler_mnk, cluster_shape_mnk)
-    )
-    knob_overrides: Dict[str, Any] = {}
-    if manual_geometry:
-        if isinstance(knobs, dict) and knobs:
-            raise ValueError(
-                "pass either explicit geometry arguments (swap_ab / pingpong "
-                "/ mma_tiler_mnk / cluster_shape_mnk) or knobs=, not both."
-            )
-        # Drop-driver recipe (mega_runner.py main()): manual mode fills the
-        # unset geometry knobs with the driver defaults.  heuristic_config
-        # imports without cutlass; bootstrap_paths already ran at package
-        # import.
-        from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
-
-        selection = resolve_hopper_fp8_config(
-            fp8_scale_mode,
-            num_max_tokens,
-            swap_ab=swap_ab,
-            pingpong=pingpong,
-            mma_tiler_mnk=mma_tiler_mnk,
-            cluster_shape_mnk=cluster_shape_mnk,
-            accum_mode=fp8_accum_mode,
-        )
-        launch = selection.config
-        swap_ab = launch.swap_ab
-        pingpong = launch.pingpong
-        mma_tiler_mnk = launch.mma_tiler_mnk
-        cluster_shape_mnk = launch.cluster_shape_mnk
-        fp8_accum_mode = launch.accum_mode
-    else:
-        # knobs=None (or "auto", which starts from the same resolution and
-        # re-tunes at the first compute): pure lookup — offline-tuned cache
-        # entry for this session key when present, else the kernel drop's
-        # token-bucket heuristic table.  An explicit knobs= dict overrides
-        # both entirely; geometry knobs the dict omits keep the table value.
-        from .knob_cache import resolve_knobs as _resolve_cached_knobs
-        from .tuner import GEOMETRY_KNOBS, default_knobs
-
-        if isinstance(knobs, dict):
-            resolved = dict(knobs)
-        else:
-            resolved, _ = _resolve_cached_knobs(
-                dtype=kind,
-                fp8_scale_mode=fp8_scale_mode,
-                world_size=world_size,
-                hidden=hidden,
-                intermediate=intermediate,
-                num_experts=num_total_experts,
-                topk=num_topk,
-                max_tokens=num_max_tokens,
-            )
-        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
-        geometry.update({k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved})
-        swap_ab = bool(geometry["swap_ab"])
-        pingpong = bool(geometry["pingpong"])
-        mma_tiler_mnk = tuple(geometry["mma_tiler_mnk"])
-        cluster_shape_mnk = tuple(geometry["cluster_shape_mnk"])
-        fp8_accum_mode = geometry["fp8_accum_mode"]
-        knob_overrides = {k: v for k, v in resolved.items() if k not in GEOMETRY_KNOBS}
-        # An explicit caller token-back choice wins over the heuristic
-        # table's / cache's per-bucket pick.
-        if token_back_mode is not None or token_back_by_dispatch:
-            knob_overrides.pop("token_back_mode", None)
-
-    cfg = MegaMoEHopperFp8Config(
-        rank=rank,
-        world_size=world_size,
-        num_tokens_per_rank=num_max_tokens,
-        num_topk=num_topk,
-        num_total_experts=num_total_experts,
-        hidden=hidden,
-        intermediate=intermediate,
+    cfg = resolve_hopper_fp8_mega_moe_config(
+        num_total_experts,
+        num_max_tokens,
+        num_topk,
+        hidden,
+        intermediate,
+        rank,
+        world_size,
         kind=kind,
         fp8_scale_mode=fp8_scale_mode,
         fp8_accum_mode=fp8_accum_mode,
+        knobs=knobs,
         swap_ab=swap_ab,
         pingpong=pingpong,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mnk=cluster_shape_mnk,
-        gate_up_clamp=clamp,
+        gate_up_clamp=gate_up_clamp,
+        activation_clamp=activation_clamp,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
         token_back_mode=token_back_mode,
@@ -1444,15 +1581,23 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
     )
-    if knob_overrides:
-        # Non-geometry knobs from the cache/dict (token_back_mode,
-        # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
-        from .tuner import with_knobs
+    return _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(cfg)
 
-        cfg = with_knobs(cfg, knob_overrides)
+
+def _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
+    cfg: MegaMoEHopperFp8Config,
+) -> MegaMoEHopperFp8SymmBuffer:
+    """Allocate a workspace from one already-resolved immutable config."""
     frontend = MegaMoEHopperFp8Frontend(cfg)
 
     data_dtype = cfg.torch_ab_dtype
+    num_total_experts = cfg.num_total_experts
+    num_max_tokens = cfg.num_tokens_per_rank
+    num_topk = cfg.num_topk
+    hidden = cfg.hidden
+    intermediate = cfg.intermediate
+    rank = cfg.rank
+    world_size = cfg.world_size
 
     sym_roots: list[torch.Tensor] = []
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
@@ -1498,8 +1643,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         intermediate=intermediate,
         rank=rank,
         world_size=world_size,
-        kind=kind,
-        fp8_scale_mode=fp8_scale_mode,
+        kind=cfg.kind,
+        fp8_scale_mode=cfg.fp8_scale_mode,
         x=x,
         x_sf=x_sf,
         topk_idx=topk_idx,

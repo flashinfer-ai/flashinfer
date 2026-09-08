@@ -130,6 +130,84 @@ winner plus every geometry that wins some bucket of the table (16 today,
 derived programmatically) crossed with both validated token-back modes —
 32 candidates.
 
+### Humming MXFP4 tuning and cache
+
+MXFP4 reuses the same collective scorer and JSON cache implementation, but
+has separate fused and split tactic schemas. `knobs="auto"` runs three warmup
+launches and ten timed launches for each compatible candidate. Each rank takes
+its local median, the ranks reduce those medians with `MAX`, and the smallest
+reduced score wins. `knobs=None` performs no timing: it first looks in the
+persistent cache and then uses the routing-profile/token-bucket heuristic.
+
+The public weight input is `PrequantizedMoEWeights` with contiguous CUDA
+`uint8` tensors. For `E` local experts, hidden width `H`, and post-SwiGLU
+width `I`, the packed E2M1 payloads are `w13[E,2I,H/2]` and `w2[E,H,I/2]`;
+their raw K32 E8M0 scale planes are `w13_scale[E,2I,H/32]` and
+`w2_scale[E,H,I/32]`. Both `H` and `I` must be multiples of 128. Activation
+staging uses E4M3 plus one FP32 dequant scale per routed row (replicated into
+the four-column symmetric-memory wire). There is no BF16-weight fallback or
+persistent E4M3-weight conversion in this backend.
+
+The fused live union contains 17 deduplicated tactics: the eight current
+block-permutation winners, seven distinct published-exact winners, and two H20
+anchors. Both supported routing profiles time this same union. Split uses the
+eight winners for the selected routing profile because every tactic includes a
+132-SM K1/K2 partition; it must not be reused on a device with a different SM
+count.
+
+The shipped split tactics partition exactly 132 SMs and therefore require a
+standard 132-SM H200. Fused tactics do not encode an SM partition and include
+two H20-derived anchors, but cache rows still match device name, compute
+capability, and SM count exactly; a winner recorded on one device cannot be
+silently replayed on another.
+
+Offline tuning uses the normal CLI, for example:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+  --dtype sm90_mxfp4 --execution-mode fused \
+  --routing-profile block_permutation_v1 \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+  --max-tokens 8 32 64 128 256 512 1024 2048 \
+  --gate-up-clamp 10 --warmup-iters 3 --timed-iters 10 --seed 0
+```
+
+For MXFP4, omit `--live-tokens` to tune each listed capacity with the same
+number of live tokens. If supplied, it must equal every `--max-tokens` value.
+The persistent cache has no independent live-token axis, so the CLI rejects a
+smaller live workload that would otherwise replace the full-capacity winner
+under the same cache key. Existing dtype tuners retain their previous
+`--live-tokens` behavior.
+
+Omitting `--gate-up-clamp` selects the canonical MXFP4 value 10. Numeric
+overrides remain available, but this offline CLI does not add a separate
+unclamped spelling. A runtime config may still pass `gate_up_clamp=None` and
+use online `knobs="auto"`; its cache identity is distinct from clamp 10.
+
+Use `--execution-mode split` only on a compatible 132-SM device. At runtime,
+`knobs="auto"` performs the same bounded collective selection on the first
+forward and records the winner; a later construction with `knobs=None` only
+looks up that row and otherwise falls back to the embedded heuristic.
+
+The cache file remains schema version 1. Its ordinary exact-match fields are
+`device`, `dtype`, `fp8_scale_mode`, `world_size`, `hidden`, `intermediate`,
+`num_experts`, `topk`, and `gate_up_clamp`; `routing_profile` also matches
+exactly when present. MXFP4 additionally requires exact
+`compute_capability`, `sm_count`, and `tuning_provenance_sha256`. The dtype
+identity encodes fused versus split plus the packed MXFP4-weight/FP8-activation
+ABI. The provenance digest covers execution mode, normalized routing profile,
+the shipped tuning-manifest provenance, and the live candidate-union digest.
+An older MXFP4 entry missing any of these additional fields, or an entry whose
+candidate/provenance digest is stale, deliberately misses instead of being
+replayed. Ordinary FP8 v1 entries keep their existing matching behavior.
+
+`max_tokens` is resolved separately: exact bucket first, otherwise the
+smallest recorded bucket at or above the request, otherwise the largest below
+it. The cached `knobs` value is always the complete effective tactic. In
+particular, split stores both K1/K2 tiles, clusters, group hints, stage counts,
+SM counts, counter-bank count, graph variant, and IKET flag, so it cannot
+cross-match a fused or ordinary FP8 entry.
+
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
   `"blockwise"` (DeepGEMM-style 128-block fp32 scales; requires

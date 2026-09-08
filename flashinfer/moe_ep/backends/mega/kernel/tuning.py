@@ -79,6 +79,8 @@ def finish_sweep(
     l2,
     candidates: List[dict],
     tune_fn: Callable,
+    *,
+    tune_kwargs: dict[str, Any] | None = None,
 ) -> dict:
     """Common tail of a tuning sweep: optional skew restage, candidate
     truncation, the timed autotune call, and winner reporting."""
@@ -103,6 +105,7 @@ def finish_sweep(
             flush=True,
         )
 
+    tune_kwargs = {} if tune_kwargs is None else dict(tune_kwargs)
     winner = tune_fn(
         y,
         l1,
@@ -112,6 +115,7 @@ def finish_sweep(
         candidates=candidates,
         warmup_iters=args.warmup_iters,
         timed_iters=args.timed_iters,
+        **tune_kwargs,
     )
     if rank == 0:
         print(
@@ -135,7 +139,9 @@ def run_tuning(
     import torch
 
     if pkg is None:
-        from ....kernel_src import cutedsl_megamoe as pkg
+        from ....kernel_src import cutedsl_megamoe as default_pkg
+
+        pkg = default_pkg
 
     rank, world_size = pkg.init_dist()
     try:
