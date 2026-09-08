@@ -452,6 +452,166 @@ def test_batch_prefill_flash_sigmoid():
     torch.testing.assert_close(o_paged, o_ref, rtol=2e-2, atol=2e-2)
 
 
+def test_batch_prefill_flash_sigmoid_variable_length_sum():
+    """Exercise the split-KV variable-length sum accumulator.
+
+    Every output row below has five index sets, and the total number of
+    ``(row, head)`` pairs is large enough for the reducer's grid-stride loop
+    to process multiple rows per CTA. The no-split result is a control for the
+    split-KV reduction that uses ``PersistentVariableLengthAttentionSumKernel``.
+    """
+    torch.manual_seed(1000)
+    head_dim = 64
+    num_qo_heads = 4
+    num_kv_heads = 4
+    batch_size = 128
+    qo_len = 32
+    kv_len = 17
+    fixed_split_size = 4
+    page_size = 4
+    num_pages_per_request = math.ceil(kv_len / page_size)
+    logits_scale = 1.0 / math.sqrt(head_dim)
+    sigmoid_bias = 0.25
+
+    jit_args = (
+        "batch_prefill_flash_sigmoid_variable_length_sum",  # uri
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        torch.int32,  # idtype
+        head_dim,  # hidden_dim_qk
+        head_dim,  # hidden_dim_vo
+        [],  # additional_tensor_names
+        [],  # additional_tensor_dtypes
+        ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
+        ["double", "double"],  # additional_scalar_dtypes
+        "FlashSigmoid",
+        flash_sigmoid_sm80_decl,
+    )
+
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32) * kv_len
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    k = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    v = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    q_batched = q.view(batch_size, qo_len, num_qo_heads, head_dim).float()
+    k_batched = k.view(batch_size, kv_len, num_kv_heads, head_dim).float()
+    v_batched = v.view(batch_size, kv_len, num_kv_heads, head_dim).float()
+    weights = torch.sigmoid(
+        torch.einsum("bmhd,bnhd->bhmn", q_batched, k_batched) * logits_scale
+        + sigmoid_bias
+    )
+    o_ref = (
+        torch.einsum("bhmn,bnhd->bmhd", weights, v_batched)
+        .half()
+        .reshape(batch_size * qo_len, num_qo_heads, head_dim)
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+    ragged_split = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2", jit_args=jit_args
+    )
+    ragged_split.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=False,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        fixed_split_size=fixed_split_size,
+    )
+    assert bool(ragged_split._plan_info[-1])
+    o_ragged_split = ragged_split.run(q, k, v, logits_scale, sigmoid_bias)
+
+    ragged_nosplit = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2", jit_args=jit_args
+    )
+    ragged_nosplit.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=False,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        disable_split_kv=True,
+    )
+    o_ragged_nosplit = ragged_nosplit.run(q, k, v, logits_scale, sigmoid_bias)
+    torch.testing.assert_close(o_ragged_split, o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(o_ragged_nosplit, o_ref, rtol=2e-2, atol=2e-2)
+
+    paged_kv_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32) * num_pages_per_request
+    )
+    paged_kv_indices = torch.arange(
+        batch_size * num_pages_per_request, dtype=torch.int32
+    )
+    paged_kv_last_page_len = torch.full(
+        (batch_size,), kv_len % page_size, dtype=torch.int32
+    )
+    k_cache = torch.zeros(
+        batch_size,
+        num_pages_per_request * page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    k_cache[:, :kv_len].copy_(k_batched.half())
+    v_cache[:, :kv_len].copy_(v_batched.half())
+    k_cache = k_cache.view(
+        batch_size * num_pages_per_request,
+        page_size,
+        num_kv_heads,
+        head_dim,
+    )
+    v_cache = v_cache.view_as(k_cache)
+
+    paged_split = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2", jit_args=jit_args
+    )
+    paged_split.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        fixed_split_size=1,
+    )
+    assert bool(paged_split._plan_info[-1])
+    o_paged_split = paged_split.run(q, (k_cache, v_cache), logits_scale, sigmoid_bias)
+    torch.testing.assert_close(o_paged_split, o_ref, rtol=2e-2, atol=2e-2)
+
+
 variant_owned_window_decl = r"""
 struct WindowOwnedMask : AttentionVariantBase {
   static constexpr bool use_softmax = true;
@@ -1091,6 +1251,7 @@ if __name__ == "__main__":
     test_batch_decode_flash_sigmoid(False)
     test_batch_decode_flash_sigmoid(True)
     test_batch_prefill_flash_sigmoid()
+    test_batch_prefill_flash_sigmoid_variable_length_sum()
     test_batch_prefill_sm90_flash_sigmoid()
     test_batch_prefill_jit_wellknown_mask_buffers()
     test_batch_decode_jit_wellknown_alibi_buffer(False)
