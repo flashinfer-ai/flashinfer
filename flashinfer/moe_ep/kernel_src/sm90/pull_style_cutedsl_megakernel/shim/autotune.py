@@ -638,14 +638,15 @@ def autotune_hopper_mxfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     require_hopper_mxfp4_fused_tuning_device()
+    full_candidates = hopper_mxfp4_ordered_candidates(
+        cfg.num_tokens_per_rank,
+        execution_mode="fused",
+        hidden=cfg.hidden,
+        intermediate=cfg.intermediate,
+        routing_profile=cfg.routing_profile,
+    )
     if candidates is None:
-        candidates = hopper_mxfp4_ordered_candidates(
-            cfg.num_tokens_per_rank,
-            execution_mode="fused",
-            hidden=cfg.hidden,
-            intermediate=cfg.intermediate,
-            routing_profile=cfg.routing_profile,
-        )
+        candidates = full_candidates
     else:
         candidates = [
             validate_hopper_mxfp4_tactic(candidate, execution_mode="fused")
@@ -683,8 +684,13 @@ def autotune_hopper_mxfp4_mega_moe(
                 "no supplied MXFP4 fused autotune candidate supports "
                 f"hidden={cfg.hidden}, intermediate={cfg.intermediate}"
             )
+    persist_winner = candidates == full_candidates
 
     def _record(_winner: Dict[str, Any], p50_s: float) -> None:
+        # A subset is useful for smoke tests, but it does not justify a cache
+        # entry whose provenance identifies the complete production union.
+        if not persist_winner:
+            return
         effective_winner = symm_buffer._frontend.effective_tactic()
         if cfg.rank == 0:
             from .knob_cache import record_knobs

@@ -153,7 +153,16 @@ block-permutation winners, seven distinct published-exact winners, and two H20
 anchors. Both supported routing profiles time this same union. Split uses the
 eight winners for the selected routing profile because every tactic includes a
 132-SM K1/K2 partition; it must not be reused on a device with a different SM
-count.
+count. The block-permutation tables were promoted from the reviewed 2026-09-08
+formal aggregate whose `discovery_winners_and_unions.json` SHA-256 is
+`852cbb019a17a9e76991b4f82b5ae64fb3df3245f6e72ec43a20bb407cbbd477`.
+Its candidates use warmup 3 / timed 10 with
+`MAX_over_ranks(MEDIAN_over_iterations(latency))`; the final winner replays
+use three fresh processes with warmup 10 / timed 50. Only the complete
+canonical ordered candidate list may create a persistent cache entry.
+`--max-candidates` and programmatic subset or reordered lists still select and
+apply their measured winner, but do not persist it under the production-union
+provenance.
 
 The shipped split tactics partition exactly 132 SMs and therefore require a
 standard 132-SM H200. Fused tactics do not encode an SM partition and include

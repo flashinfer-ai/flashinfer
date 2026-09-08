@@ -200,14 +200,15 @@ def autotune_hopper_mxfp4_split_mega_moe(
     if process_group is None:
         process_group = symm_buffer.session._process_group
     n = cfg.num_tokens_per_rank if num_tokens is None else num_tokens
+    full_candidates = hopper_mxfp4_ordered_candidates(
+        cfg.num_tokens_per_rank,
+        execution_mode="split",
+        hidden=cfg.hidden,
+        intermediate=cfg.intermediate,
+        routing_profile=cfg.routing_profile,
+    )
     if candidates is None:
-        candidates = hopper_mxfp4_ordered_candidates(
-            cfg.num_tokens_per_rank,
-            execution_mode="split",
-            hidden=cfg.hidden,
-            intermediate=cfg.intermediate,
-            routing_profile=cfg.routing_profile,
-        )
+        candidates = full_candidates
     else:
         candidates = [
             validate_hopper_mxfp4_tactic(candidate, execution_mode="split")
@@ -245,6 +246,7 @@ def autotune_hopper_mxfp4_split_mega_moe(
                 "no supplied MXFP4 split autotune candidate supports "
                 f"hidden={cfg.hidden}, intermediate={cfg.intermediate}"
             )
+    persist_winner = candidates == full_candidates
 
     adapter = _SplitTacticAdapter(symm_buffer)
 
@@ -290,6 +292,10 @@ def autotune_hopper_mxfp4_split_mega_moe(
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # A subset is useful for smoke tests, but it does not justify a cache
+        # entry whose provenance identifies the complete production union.
+        if not persist_winner:
+            return
         # Resource commit/finalize has already succeeded on every EP rank.
         # Only rank zero mutates the shared persistent cache file.
         if cfg.rank == 0:

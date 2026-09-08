@@ -87,6 +87,39 @@ def test_shared_finish_sweep_forwards_optional_tune_kwargs() -> None:
     }
 
 
+def test_shared_finish_sweep_forwards_max_candidates_subset() -> None:
+    args = SimpleNamespace(
+        skew=None,
+        max_candidates=1,
+        dtype="sm90_mxfp4",
+        warmup_iters=3,
+        timed_iters=10,
+    )
+    captured = {}
+
+    def fake_tune(*positional, **kwargs):
+        captured["candidates"] = kwargs["candidates"]
+        return kwargs["candidates"][0]
+
+    candidates = [{"candidate": 1}, {"candidate": 2}]
+    assert (
+        shared_tuning.finish_sweep(
+            args,
+            1,
+            32,
+            8,
+            object(),
+            "y",
+            "l1",
+            "l2",
+            candidates,
+            fake_tune,
+        )
+        == candidates[0]
+    )
+    assert captured["candidates"] == candidates[:1]
+
+
 def test_mxfp4_defaults_select_fixed_format_and_fused_identity() -> None:
     args = tune._parse_args(_argv())
     runtime = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(

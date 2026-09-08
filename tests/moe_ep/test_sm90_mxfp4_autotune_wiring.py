@@ -26,6 +26,7 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
     hopper_mxfp4_cache_provenance_sha256,
     hopper_mxfp4_candidates,
     hopper_mxfp4_default_tactic,
+    hopper_mxfp4_ordered_candidates,
     hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_tuning_provenance,
 )
@@ -319,7 +320,7 @@ def test_split_backend_auto_calls_only_split_tuner_once(monkeypatch):
     assert split_launch.call_count == 2
 
 
-def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
+def test_fused_full_union_records_only_fused_identity_and_manifest(monkeypatch):
     cfg = SimpleNamespace(
         rank=0,
         world_size=4,
@@ -331,11 +332,14 @@ def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
         gate_up_clamp=10.0,
         routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
     )
-    candidate = hopper_mxfp4_default_tactic(
-        64,
+    candidates = hopper_mxfp4_ordered_candidates(
+        cfg.num_tokens_per_rank,
         execution_mode="fused",
+        hidden=cfg.hidden,
+        intermediate=cfg.intermediate,
         routing_profile=cfg.routing_profile,
     )
+    candidate = candidates[0]
     effective = {
         **candidate,
         "active_dispatch_warps": 2,
@@ -380,12 +384,13 @@ def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
     def fake_autotune(frontend, launch, candidates, **kwargs):
         assert kwargs["process_group"] is ep_group
         assert kwargs["expected_world_size"] == 4
-        assert candidates == [candidate]
+        assert candidates == candidates_expected
         kwargs["preflight"]()
         kwargs["prepare_candidate"]()
         kwargs["on_winner"](candidate, 0.00075)
         return candidate
 
+    candidates_expected = candidates
     monkeypatch.setattr(autotune_module, "autotune_knobs", fake_autotune)
     winner = autotune_module.autotune_hopper_mxfp4_mega_moe(
         output,
@@ -395,7 +400,7 @@ def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
         num_tokens=37,
         gate_up_clamp=10.0,
         process_group=ep_group,
-        candidates=[candidate],
+        candidates=candidates,
     )
 
     assert winner == candidate
@@ -433,7 +438,7 @@ def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
 
 def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
     cfg = SimpleNamespace(
-        rank=1,
+        rank=0,
         world_size=4,
         num_tokens_per_rank=64,
         num_topk=6,
@@ -458,9 +463,12 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         subset[1],
     ]
     captured = {}
+    record = mock.Mock()
+    monkeypatch.setattr(knob_cache, "record_knobs", record)
 
     def fake_autotune(frontend, launch, candidates, **kwargs):
         captured["candidates"] = candidates
+        kwargs["on_winner"](candidates[0], 0.0005)
         return candidates[0]
 
     monkeypatch.setattr(autotune_module, "autotune_knobs", fake_autotune)
@@ -471,6 +479,7 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         == subset[0]
     )
     assert captured["candidates"] == subset
+    record.assert_not_called()
 
     h20_anchor = next(
         candidate
@@ -486,6 +495,7 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         == h20_anchor
     )
     assert captured["candidates"] == [h20_anchor]
+    record.assert_not_called()
 
     outside = {**union[0], "group_hint": 999999}
     with pytest.raises(ValueError, match="outside the runtime candidate union"):

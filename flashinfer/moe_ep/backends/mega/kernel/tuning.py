@@ -119,7 +119,7 @@ def finish_sweep(
     )
     if rank == 0:
         print(
-            f"[moe_ep-tune] recorded winner for max_tokens={max_tokens}: "
+            f"[moe_ep-tune] selected winner for max_tokens={max_tokens}: "
             f"{json.dumps(winner, default=list)}",
             flush=True,
         )

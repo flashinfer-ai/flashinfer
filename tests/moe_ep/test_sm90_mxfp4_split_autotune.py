@@ -16,6 +16,7 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
     hopper_mxfp4_cache_provenance_sha256,
     hopper_mxfp4_candidates,
     hopper_mxfp4_default_tactic,
+    hopper_mxfp4_ordered_candidates,
     hopper_mxfp4_tuning_provenance,
 )
 from flashinfer.moe_ep.sm90_routing import (
@@ -204,7 +205,7 @@ def test_split_adapter_partial_prepare_waits_for_collective_discard(monkeypatch)
     assert candidate.destroy_calls == 1
 
 
-def test_split_autotune_uses_bucket_winner_first_and_split_cache(monkeypatch):
+def test_split_full_union_uses_bucket_winner_first_and_split_cache(monkeypatch):
     source = _Buffer(
         rank=0,
         token_bucket=64,
@@ -230,6 +231,13 @@ def test_split_autotune_uses_bucket_winner_first_and_split_cache(monkeypatch):
     record = mock.Mock(return_value="/tmp/cache.json")
     monkeypatch.setattr(knob_cache, "record_knobs", record)
     captured = {}
+    full_candidates = hopper_mxfp4_ordered_candidates(
+        source.session.config.num_tokens_per_rank,
+        execution_mode="split",
+        hidden=source.session.config.hidden,
+        intermediate=source.session.config.intermediate,
+        routing_profile=source.session.config.routing_profile,
+    )
 
     def fake_autotune(frontend, launch, candidates, **kwargs):
         captured["frontend"] = frontend
@@ -254,6 +262,7 @@ def test_split_autotune_uses_bucket_winner_first_and_split_cache(monkeypatch):
         transformed_l2,
         source,
         num_tokens=37,
+        candidates=full_candidates,
     )
 
     default = hopper_mxfp4_default_tactic(
@@ -353,7 +362,7 @@ def test_split_adapter_rollback_restores_source_before_discard(monkeypatch):
 
 
 def test_split_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
-    source = _Buffer(rank=1, token_bucket=64)
+    source = _Buffer(rank=0, token_bucket=64)
     adapter = mock.Mock()
     monkeypatch.setattr(
         split_autotune, "_SplitTacticAdapter", mock.Mock(return_value=adapter)
@@ -374,9 +383,12 @@ def test_split_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         subset[1],
     ]
     captured = {}
+    record = mock.Mock()
+    monkeypatch.setattr(knob_cache, "record_knobs", record)
 
     def fake_autotune(frontend, launch, candidates, **kwargs):
         captured["candidates"] = candidates
+        kwargs["on_winner"](candidates[0], 0.0005)
         return candidates[0]
 
     monkeypatch.setattr(split_autotune, "autotune_knobs", fake_autotune)
@@ -387,6 +399,7 @@ def test_split_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         == subset[0]
     )
     assert captured["candidates"] == subset
+    record.assert_not_called()
     adapter.close.assert_called_once_with()
 
     outside = {**union[0], "k1_group_hint": 999999}
