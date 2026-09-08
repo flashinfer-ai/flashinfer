@@ -727,6 +727,7 @@ __global__ __launch_bounds__(512) void k_out(
   // mask + decay-scale M, convert to fp16, store into the swb region
   // (raw b is dead after accM is formed; swb is likewise dead once the state
   // MMA consumed it)
+  __syncthreads();  // All final-state MMA reads must finish before swb is reused.
   fp16* sM = reinterpret_cast<fp16*>(swb);
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
@@ -788,7 +789,7 @@ __global__ __launch_bounds__(512) void k_out(
   for (int j = 0; j < 4; ++j) {
     int d_col = nh * 32 + j * 8 + tig * 2;
     float dv0, dv1;
-    if (d_has_hdim) {
+    if (d_has_hdim && dmat != nullptr) {
       dv0 = __bfloat162float(dmat[(size_t)h * HDIM + d_col]);
       dv1 = __bfloat162float(dmat[(size_t)h * HDIM + d_col + 1]);
     } else {
@@ -806,7 +807,7 @@ __global__ __launch_bounds__(512) void k_out(
         y0 = fmaf(dv0, x0, y0);
         y1 = fmaf(dv1, x1, y1);
       }
-      if (has_z) {
+      if (has_z && t < len) {
         size_t off0 = ((size_t)(t0 + t) * H + h) * HDIM + d_col;
         float z0, z1;
         if (z_is_f16) {
@@ -837,7 +838,7 @@ __global__ __launch_bounds__(512) void k_out(
     for (int idx = tid; idx < HDIM * (CHUNK / 8); idx += 512) {
       int d = idx >> 4, tg = (idx & 15) * 8;
       bf16* dst = obase + d * out_row_stride + toff + tg;
-      if (tg + 8 <= len) {
+      if (tg + 8 <= len && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
         uint32_t pk[4];
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
@@ -845,7 +846,7 @@ __global__ __launch_bounds__(512) void k_out(
           uint32_t hi = __bfloat16_as_ushort(sY[(tg + 2 * k + 1) * STRIDE_X + d]);
           pk[k] = (hi << 16) | lo;
         }
-        reinterpret_cast<uint4*>(dst)[0] = *reinterpret_cast<const uint4*>(pk);
+        reinterpret_cast<uint4*>(dst)[0] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
       } else {
         for (int k = 0; k < 8 && tg + k < len; ++k) dst[k] = sY[(tg + k) * STRIDE_X + d];
       }
@@ -875,33 +876,9 @@ cudaError_t LaunchVibeCudaSsdCombined(const void* x, const void* dt, const void*
   const fp16* z_hp = reinterpret_cast<const fp16*>(z);
 
   if (!all_single_host) {
-    static std::once_flag once;
-    std::call_once(once, [] {
-      cudaFuncSetAttribute((k_segstate<float, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<float, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<float, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<float, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<bf16, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<bf16, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<bf16, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<bf16, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<fp16, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<fp16, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<fp16, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-      cudaFuncSetAttribute((k_segstate<fp16, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
-    });
+    cudaError_t attribute_status = cudaFuncSetAttribute(
+        (k_segstate<DtT, IdxT, StateT>), cudaFuncAttributeMaxDynamicSharedMemorySize, KS_SMEM);
+    if (attribute_status != cudaSuccess) return attribute_status;
     dim3 grid(nseg, H);
     k_segstate<DtT, IdxT, StateT><<<grid, 256, KS_SMEM, stream>>>(
         xp, bp, reinterpret_cast<const DtT*>(dt), reinterpret_cast<const DtT*>(dt_bias),
@@ -911,33 +888,9 @@ cudaError_t LaunchVibeCudaSsdCombined(const void* x, const void* dt, const void*
   }
 
   {
-    static std::once_flag once3;
-    std::call_once(once3, [] {
-      cudaFuncSetAttribute((k_out<float, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<float, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<float, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<float, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<bf16, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<bf16, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<bf16, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<bf16, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<fp16, int32_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<fp16, int32_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<fp16, int64_t, bf16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-      cudaFuncSetAttribute((k_out<fp16, int64_t, fp16>),
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
-    });
+    cudaError_t attribute_status = cudaFuncSetAttribute(
+        (k_out<DtT, IdxT, StateT>), cudaFuncAttributeMaxDynamicSharedMemorySize, K3_SMEM);
+    if (attribute_status != cudaSuccess) return attribute_status;
     dim3 grid(nLCmax, H);
     const int64_t out_row_stride = (int64_t)L;              // nchunks * CHUNK
     const int64_t out_head_stride = out_row_stride * HDIM;  // D * nchunks * CHUNK

@@ -12,6 +12,8 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import functools
+
 import torch
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
@@ -1032,9 +1034,15 @@ def _triton_supports_current_arch() -> bool:
         major, minor = torch.cuda.get_device_capability()
 
         import triton
+        from triton.backends.nvidia import compiler
 
         troot = os.path.dirname(triton.__file__)
-        cands = glob.glob(os.path.join(troot, "backends", "nvidia", "bin", "ptxas"))
+        # Match Triton's actual compiler selection: newer releases ship a
+        # separate Blackwell assembler alongside the generic ptxas binary.
+        if hasattr(compiler, "get_ptxas"):
+            cands = [compiler.get_ptxas(major * 10 + minor).path]
+        else:
+            cands = glob.glob(os.path.join(troot, "backends", "nvidia", "bin", "ptxas"))
         if not cands:
             return True
         for gpu_name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
@@ -1052,7 +1060,8 @@ def _triton_supports_current_arch() -> bool:
         return True
 
 
-def _module_uses_triton(fspath) -> bool:
+@functools.cache
+def _module_uses_triton(path) -> bool:
     """Whether a test module ends up compiling Triton kernels.
 
     Matches tests that compile Triton reference kernels directly and tests
@@ -1062,7 +1071,7 @@ def _module_uses_triton(fspath) -> bool:
     try:
         from pathlib import Path
 
-        text = Path(str(fspath)).read_text(encoding="utf-8")
+        text = Path(path).read_text(encoding="utf-8")
     except OSError:
         # Err on the safe side: keep the skip for unreadable modules.
         return True
@@ -1082,7 +1091,7 @@ def pytest_collection_modifyitems(config, items):
             # Only tests that compile the Triton mamba reference kernels are
             # affected; pure nvcc/CuTe/TVM-FFI backends (cake/vibecuda SSD,
             # seq_chunk_cumsum, cake/selective_state_update) still run.
-            if not _module_uses_triton(item.fspath):
+            if not _module_uses_triton(item.path):
                 continue
             item.add_marker(skip_triton)
         return

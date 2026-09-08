@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One-command driver over the public PR-4576 SSDCombined route matrix.
 
-Runs every row of the authoritative 12-workload route matrix through
+Runs the 12 unit-test route workloads plus three additional public benchmark
+workloads from PR 4576 through
 ``bench_cake_mamba_ssd_combined.py --vibecuda`` semantics: live CAKE baseline
 as the speedup denominator, VibeCUDA candidate, CUPTI ``bench_gpu_time`` with
 5 dry-run + 100 repetitions and median aggregation, fp64 sequential
@@ -10,8 +11,8 @@ the caller-owned ``out``.
 
 Two execution modes:
 
-* default (in-process): import the row benchmark once and run all 12 rows in
-  this process.  Each row rebuilds its RNG (seed 7), inputs, and backend
+* default (in-process): import the row benchmark once and run all 15 rows in
+  this process. Each row rebuilds its RNG with the recorded seed, inputs, and backend
   runners, so per-row inputs and timed callables are identical to a
   standalone invocation; only the one-time interpreter/JIT warmup is shared.
 * ``--isolate``: spawn one subprocess per row for full process isolation
@@ -26,14 +27,12 @@ Per-row JSON artifacts are written to
 each row completes, and ``matrix_summary.json`` records every row's
 latencies, correctness checks, and the arithmetic/geometric mean speedups.
 The driver exits nonzero if any row is missing or fails a candidate-side
-check; rows whose built-in cake-vs-cute self-gate fails are tolerated as
-long as the candidate-side checks pass (cake and cute are bitwise-matched
-twins on this workload family, so that gate measures graph identity, not
-accuracy).
+check. The CAKE-versus-CuTe diagnostic is recorded independently; passing
+candidate checks does not establish that those two backends agree numerically.
 
 From a clean checkout with CUDA 13.0 or newer and Python 3.10 or newer:
 
-``pip install -v .``
+``python -m pip install -v . pytest 'cupti-python>=13'``
 
 Then run the complete direct comparison against the in-tree CAKE backend:
 
@@ -54,7 +53,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROW_BENCH = REPO_ROOT / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "vibecuda_ssd_combined"
-CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v1"
+CONTRACT_VERSION = "pr4576-route-and-public-benchmark-matrix-15-v2"
 
 # Exact rows from merged PR 4576 head edc312de23f81e8ca38cc0e05be87c654c4b438c,
 # tests/mamba/test_cake_ssd_combined.py::test_cake_ssd_combined_route_matrix.
@@ -288,6 +287,63 @@ MATRIX = [
             "--has-z",
         ],
     ),
+    # Additional public-API benchmark rows: https://github.com/flashinfer-ai/flashinfer/pull/4576
+    # Pinned at
+    # edc312de23f81e8ca38cc0e05be87c654c4b438c:
+    # benchmarks/bench_cake_mamba_ssd_combined.py. Preserve its seed 0,
+    # scalar D, random initial state, no z gate, and unbounded positive dt.
+    # The fourth public workload (packed H128/G8, zero state + z) is already
+    # represented above; its existing seed is retained for historical comparison.
+    (
+        "public_b_h128_g8_b1_c1",
+        [
+            "--batch",
+            "1",
+            "--nchunks",
+            "1",
+            "--nheads",
+            "128",
+            "--ngroups",
+            "8",
+            "--unbounded-dt",
+            "--seed",
+            "0",
+        ],
+    ),
+    (
+        "public_b_h8_g8_b1_c1",
+        [
+            "--batch",
+            "1",
+            "--nchunks",
+            "1",
+            "--nheads",
+            "8",
+            "--ngroups",
+            "8",
+            "--unbounded-dt",
+            "--seed",
+            "0",
+        ],
+    ),
+    (
+        "public_v_h8_g8_s4_c1",
+        [
+            "--mode",
+            "varlen",
+            "--num-seqs",
+            "4",
+            "--chunks-per-seq",
+            "1",
+            "--nheads",
+            "8",
+            "--ngroups",
+            "8",
+            "--unbounded-dt",
+            "--seed",
+            "0",
+        ],
+    ),
 ]
 
 
@@ -320,11 +376,11 @@ def _validate_row(report: dict | None) -> list[str]:
             f"({report.get('full_write', {}).get('unwritten_elements')} "
             "unwritten elements)"
         )
-    no_worse = report.get("candidate_no_worse_than_cake", {})
-    if not no_worse.get("out", False):
-        failures.append("candidate output error exceeds cake error")
-    if not no_worse.get("final_states", False):
-        failures.append("candidate final-state error exceeds cake error")
+    tighter = report.get("candidate_tighter_tolerance", {})
+    if not tighter.get("out", False):
+        failures.append("candidate output fails its tighter tolerance contract")
+    if not tighter.get("final_states", False):
+        failures.append("candidate final-state fails its tighter tolerance contract")
     if report.get("timing_backend") != "cupti":
         failures.append(f"unexpected timing backend {report.get('timing_backend')!r}")
     return failures
@@ -366,7 +422,7 @@ def _reused_row(results_dir: Path, name: str) -> dict | None:
         "speedup": report["vibecuda_speedup_vs_cake"],
         "truth_passed": True,
         "full_write_passed": True,
-        "candidate_no_worse_than_cake": report.get("candidate_no_worse_than_cake", {}),
+        "candidate_tighter_tolerance": report.get("candidate_tighter_tolerance", {}),
         "cake_cute_parity": artifact.get("cake_cute_parity", {}),
         "reused_from_artifact": True,
     }
@@ -546,7 +602,7 @@ def main() -> int:
                 "speedup": speedup,
                 "truth_passed": True,
                 "full_write_passed": True,
-                "candidate_no_worse_than_cake": report["candidate_no_worse_than_cake"],
+                "candidate_tighter_tolerance": report["candidate_tighter_tolerance"],
                 "cake_cute_parity": artifact["cake_cute_parity"],
             }
         )

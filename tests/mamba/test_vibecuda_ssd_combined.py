@@ -22,7 +22,7 @@ from flashinfer.mamba import SSDCombined
 
 # The vibecuda backend rounds passed-through states to bf16 and runs the
 # intra-chunk M@X matmul in fp16, so its parity target is looser than the
-# (bitwise-tight) cake vs cute comparison in test_cake_ssd_combined.py.
+# cake vs cute comparison in test_cake_ssd_combined.py.
 # Strictly tighter than the selected CAKE fast baseline's
 # allclose:6e-2,6e-2 contract against the mathematical reference.
 ATOL = RTOL = 5.9e-2
@@ -282,8 +282,9 @@ def test_vibecuda_ssd_combined_route_matrix(
     _assert_parity(actual, expected)
 
 
-def test_vibecuda_ssd_combined_varlen_multi_chunk():
-    constructor, tensors, arguments = _case(varlen=True, lengths=(128, 256, 384, 128))
+@pytest.mark.parametrize("lengths", [(128, 256, 384, 128), (97, 159), (127, 129)])
+def test_vibecuda_ssd_combined_varlen_multi_chunk(lengths):
+    constructor, tensors, arguments = _case(varlen=True, lengths=lengths)
     expected = _torch_reference(
         *tensors,
         D=arguments["D"],
@@ -417,3 +418,105 @@ def test_vibecuda_ssd_combined_rejects_unsupported_geometry():
             ngroups=8,
             backend="vibecuda",
         )
+
+
+@pytest.mark.parametrize("has_d", [False, True])
+def test_vibecuda_runtime_z_and_optional_d(has_d):
+    constructor, tensors, arguments = _case(has_d=has_d, d_has_hdim=True)
+    expected = _torch_reference(
+        *tensors,
+        D=arguments["D"],
+        z=arguments["z"],
+        dt_bias=arguments["dt_bias"],
+        dt_softplus=True,
+        dt_limit=arguments["dt_limit"],
+        d_has_hdim=True,
+        initial_states=arguments["initial_states"],
+        seq_idx=None,
+    )
+    constructor["has_z"] = False
+    actual = SSDCombined(**constructor, backend="vibecuda").run(*tensors, **arguments)
+    _assert_parity(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "operand", ["dt", "A", "B", "C", "z", "dt_bias", "initial_states", "out"]
+)
+@pytest.mark.parametrize("defect", ["shape", "dtype", "device"])
+def test_vibecuda_rejects_invalid_operands(operand, defect):
+    from flashinfer.mamba.ssd_vibecuda import VibeCUDASSDCombined
+
+    constructor, tensors, arguments = _case()
+    runner = VibeCUDASSDCombined(**constructor)
+    values = dict(zip(("x", "dt", "A", "B", "C"), tensors, strict=True))
+    values.update(arguments)
+    values["out"] = torch.empty((2, 8, 64, 1, 128), dtype=torch.bfloat16, device="cuda")
+    tensor = values[operand]
+    if defect == "shape":
+        values[operand] = tensor[..., :-1]
+    elif defect == "dtype":
+        values[operand] = tensor.to(torch.int8)
+    else:
+        values[operand] = tensor.cpu()
+    with pytest.raises(ValueError):
+        runner.run(**values)
+
+
+@pytest.mark.parametrize("operand", ["state_in", "out", "final_states", "seq_idx"])
+def test_vibecuda_ffi_rejects_unsupported_dtypes(operand):
+    from flashinfer.mamba.ssd_vibecuda import VibeCUDASSDCombined
+
+    constructor, tensors, arguments = _case(varlen=True)
+    runner = VibeCUDASSDCombined(**constructor)
+    x, dt, A, B, C = tensors
+    buffers = {
+        "state_in": torch.empty(4 * 8 * 64 * 128, dtype=torch.bfloat16, device="cuda"),
+        "out": torch.empty((1, 8, 64, 2, 128), dtype=torch.bfloat16, device="cuda"),
+        "final_states": torch.empty(
+            (2, 8, 64, 128), dtype=torch.bfloat16, device="cuda"
+        ),
+        "seq_idx": arguments["seq_idx"],
+    }
+    buffers[operand] = buffers[operand].to(torch.float32)
+    with pytest.raises(Exception, match=operand):
+        runner._module.vibecuda_ssd_combined_fwd(
+            x,
+            dt,
+            arguments["dt_bias"],
+            A,
+            B,
+            C,
+            arguments["D"],
+            arguments["z"],
+            arguments["initial_states"],
+            buffers["seq_idx"],
+            buffers["state_in"],
+            buffers["out"],
+            buffers["final_states"],
+            1,
+            0.001,
+            0.1,
+            1,
+            1,
+            0,
+        )
+
+
+@pytest.mark.parametrize("capacity", [49152, 101376])
+def test_vibecuda_rejects_insufficient_shared_memory(monkeypatch, capacity):
+    from types import SimpleNamespace
+
+    from flashinfer.mamba.ssd_vibecuda import VibeCUDASSDCombined
+
+    constructor, tensors, arguments = _case()
+    runner = VibeCUDASSDCombined(**constructor)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(
+            major=8,
+            shared_memory_per_block_optin=capacity,
+        ),
+    )
+    with pytest.raises(ValueError, match="shared memory"):
+        runner.run(*tensors, **arguments)

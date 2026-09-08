@@ -94,6 +94,12 @@ class VibeCUDASSDCombined:
                 "VibeCUDA SSDCombined requires state_dtype bfloat16 or float16, "
                 f"got {state_dtype}"
             )
+        if nheads <= 0 or ngroups <= 0 or nheads % ngroups:
+            raise ValueError(
+                "nheads and ngroups must be positive and nheads divisible by ngroups"
+            )
+        if seq_idx_dtype not in (torch.int32, torch.int64):
+            raise ValueError("seq_idx_dtype must be int32 or int64")
         self.chunk_size = chunk_size
         self.nheads = nheads
         self.headdim = headdim
@@ -145,7 +151,61 @@ class VibeCUDASSDCombined:
         return_final_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass; see ``SSDCombined.run``."""
+        if x.ndim != 4 or not x.is_cuda:
+            raise ValueError("x must be a four-dimensional CUDA tensor")
         batch, seqlen, nheads, headdim = x.shape
+        if batch <= 0 or seqlen <= 0 or seqlen % _CHUNK:
+            raise ValueError(
+                "batch must be positive and seqlen a positive multiple of 128"
+            )
+        if (nheads, headdim) != (self.nheads, self.headdim):
+            raise ValueError("x geometry must match the runner specialization")
+        properties = torch.cuda.get_device_properties(x.device)
+        if properties.major < 8 or properties.shared_memory_per_block_optin < 159824:
+            raise ValueError(
+                "VibeCUDA SSDCombined requires SM80+ and 159824 bytes of opt-in shared memory"
+            )
+
+        def check(name, tensor, shape, dtypes, *, contiguous=False):
+            if tensor is None:
+                return
+            if tensor.device != x.device or tuple(tensor.shape) != tuple(shape):
+                raise ValueError(f"{name} must have shape {shape} on {x.device}")
+            if tensor.dtype not in dtypes:
+                raise ValueError(f"{name} has unsupported dtype {tensor.dtype}")
+            if contiguous and not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+
+        check("x", x, x.shape, (torch.bfloat16,))
+        check(
+            "dt",
+            dt,
+            (batch, seqlen, nheads),
+            (torch.float32, torch.float16, torch.bfloat16),
+        )
+        check("A", A, (nheads,), (torch.float32,), contiguous=True)
+        check("B", B, (batch, seqlen, self.ngroups, _DSTATE), (torch.bfloat16,))
+        check("C", C, B.shape, (torch.bfloat16,))
+        check("z", z, x.shape, (torch.bfloat16,))
+        check("dt_bias", dt_bias, (nheads,), (dt.dtype,))
+        if D is not None and self._has_d:
+            if tuple(D.shape) not in ((nheads,), (nheads, _HEADDIM)):
+                raise ValueError("D must have shape (nheads,) or (nheads, headdim)")
+            check("D", D, D.shape, (torch.bfloat16,))
+        check("seq_idx", seq_idx, (batch, seqlen), (torch.int32, torch.int64))
+        if seq_idx is not None and batch != 1:
+            raise ValueError("packed varlen requires batch=1")
+        if any(
+            t is not None
+            for t in (
+                checkpoint_token_indices,
+                checkpoint_state_slots,
+                checkpoint_states,
+            )
+        ):
+            raise ValueError(
+                "selective checkpoint outputs are not supported by the vibecuda backend"
+            )
         nchunks = seqlen // _CHUNK
 
         has_varlen = seq_idx is not None
@@ -168,6 +228,44 @@ class VibeCUDASSDCombined:
                 "initial_states must be provided in varlen mode to determine num_seqs"
             )
         num_seqs = initial_states.shape[0] if initial_states is not None else batch
+        if num_seqs <= 0 or (not has_varlen and num_seqs != batch):
+            raise ValueError("initial_states sequence count must match the batch")
+        check(
+            "initial_states",
+            initial_states,
+            (num_seqs, nheads, _HEADDIM, _DSTATE),
+            (self._state_torch_dtype,),
+        )
+        check(
+            "out",
+            out,
+            (batch, nheads, _HEADDIM, nchunks, _CHUNK),
+            (torch.bfloat16,),
+            contiguous=True,
+        )
+        for name, tensor in (
+            ("chunk_indices", chunk_indices),
+            ("chunk_offsets", chunk_offsets),
+        ):
+            if tensor is not None:
+                if tensor.ndim != 1:
+                    raise ValueError(f"{name} must be one-dimensional")
+                check(name, tensor, tensor.shape, (torch.int32,), contiguous=True)
+        if (chunk_indices is None) != (chunk_offsets is None):
+            raise ValueError(
+                "chunk_indices and chunk_offsets must be supplied together"
+            )
+        if chunk_indices is not None and chunk_indices.shape != chunk_offsets.shape:
+            raise ValueError(
+                "chunk_indices and chunk_offsets must have matching shapes"
+            )
+        check(
+            "seq_chunk_cumsum",
+            seq_chunk_cumsum,
+            (num_seqs + 1,),
+            (torch.int32,),
+            contiguous=True,
+        )
 
         state_dtype = self._state_torch_dtype
         final_states = torch.empty(
@@ -196,7 +294,7 @@ class VibeCUDASSDCombined:
         dt_c = self._contiguous(dt)
         B_c = self._contiguous(B)
         C_c = self._contiguous(C)
-        z_c = self._contiguous(z) if self._has_z else None
+        z_c = self._contiguous(z) if z is not None else None
         d_c = self._contiguous(D) if self._has_d else None
         dt_bias_c = self._contiguous(dt_bias)
         initial_c = self._contiguous(initial_states) if self._has_init_states else None

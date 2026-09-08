@@ -109,9 +109,8 @@ def _fp64_reference(
 ):
     """Sequential fp64 ground truth for the bench workload.
 
-    The bench's cake-vs-cute diagnostic compares two implementations that
-    share one computation graph, so near-bitwise parity there is expected
-    and does not by itself prove accuracy.  This independent reference
+    Agreement between the cake and cute implementations does not by itself
+    prove accuracy. This independent reference
     evaluates the plain per-token recurrence in float64:
 
         delta    = clamp(softplus(dt + dt_bias), dt_lo, dt_hi)
@@ -433,9 +432,7 @@ def run_workload(args) -> dict:
     if args.vibecuda and not args.no_truth_check:
         # Independent accuracy proof: validate BOTH the cake denominator and
         # the vibecuda candidate against an fp64 sequential reference.  The
-        # cake-vs-cute diagnostic alone cannot show this, because cake and
-        # cute share one computation graph and agree near-bitwise regardless
-        # of their joint distance to the true result.
+        # cake-vs-cute diagnostic alone cannot establish absolute accuracy.
         y_ref, fs_ref = _fp64_reference(
             x,
             dt,
@@ -462,7 +459,7 @@ def run_workload(args) -> dict:
         report["vibecuda_truth_final_states"] = _diagnostic(
             outputs["vibecuda"][1], fs_ref, atol=5.9e-2, rtol=5.9e-2
         )
-        report["candidate_no_worse_than_cake"] = {
+        report["candidate_tighter_tolerance"] = {
             "baseline_contract": "allclose:6e-2,6e-2",
             "candidate_contract": "allclose:5.9e-2,5.9e-2",
             "out": report["vibecuda_truth_out"]["tolerance_passed"],
@@ -471,13 +468,11 @@ def run_workload(args) -> dict:
         # The candidate must independently beat the fixed fast-baseline
         # allclose:6e-2,6e-2 contract against ground truth. Cake's own truth
         # diagnostics are reported (not asserted):
-        # cake and cute are bitwise-matched twins whose joint rounding can
-        # exceed 1e-2 vs fp64 at these unbounded-dt magnitudes.
+        # This tests tighter tolerance parameters, not pointwise dominance
+        # over CAKE's observed errors, which are separately reported above.
         if not (
             report["vibecuda_truth_out"]["tolerance_passed"]
             and report["vibecuda_truth_final_states"]["tolerance_passed"]
-            and report["candidate_no_worse_than_cake"]["out"]
-            and report["candidate_no_worse_than_cake"]["final_states"]
         ):
             raise AssertionError(
                 "vibecuda failed fp64 ground-truth validation: "

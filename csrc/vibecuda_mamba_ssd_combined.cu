@@ -42,6 +42,22 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   CHECK_INPUT(state_in);
   CHECK_INPUT(out);
   CHECK_INPUT(final_states);
+  ffi::CUDADeviceGuard device_guard(x.device().device_id);
+  CHECK_DIM(4, x);
+  CHECK_DIM(4, b);
+  CHECK_DIM(4, final_states);
+  for (auto tensor : {dt, a, b, c, state_in, out, final_states}) {
+    CHECK_DEVICE(x, tensor);
+  }
+  for (auto tensor : {dt_bias, d, z, initial, seq_idx}) {
+    if (tensor.has_value()) {
+      CHECK_DEVICE(x, tensor.value());
+    }
+  }
+  TVM_FFI_ICHECK(final_states.dtype() == dl_bfloat16 || final_states.dtype() == dl_float16)
+      << "final_states must be bfloat16 or float16";
+  TVM_FFI_ICHECK_EQ(state_in.dtype(), dl_bfloat16) << "state_in must be bfloat16";
+  TVM_FFI_ICHECK_EQ(out.dtype(), dl_bfloat16) << "out must be bfloat16";
   TVM_FFI_ICHECK_EQ(a.dtype(), dl_float32) << "A must be float32";
   TVM_FFI_ICHECK_EQ(x.dtype(), dl_bfloat16) << "x must be bfloat16";
   TVM_FFI_ICHECK_EQ(b.dtype(), dl_bfloat16) << "b must be bfloat16";
@@ -82,6 +98,37 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   const int H = static_cast<int>(x_shape[2]);
   const int G = static_cast<int>(b.shape()[2]);
   const int nseg = static_cast<int>(final_states.shape()[0]);
+  TVM_FFI_ICHECK(Bsz > 0 && L > 0 && L % 128 == 0 && H > 0 && G > 0 && H % G == 0)
+      << "invalid batch, sequence length, or head/group geometry";
+  auto check_shape = [](TensorView tensor, std::initializer_list<int64_t> expected) {
+    TVM_FFI_ICHECK_EQ(tensor.ndim(), expected.size()) << "invalid tensor rank";
+    size_t dim = 0;
+    for (auto size : expected) {
+      TVM_FFI_ICHECK_EQ(tensor.shape()[dim], size) << "invalid tensor shape";
+      ++dim;
+    }
+  };
+  check_shape(x, {Bsz, L, H, 64});
+  check_shape(dt, {Bsz, L, H});
+  check_shape(a, {H});
+  check_shape(b, {Bsz, L, G, 128});
+  check_shape(c, {Bsz, L, G, 128});
+  check_shape(out, {Bsz, H, 64, L / 128, 128});
+  check_shape(final_states, {nseg, H, 64, 128});
+  TVM_FFI_ICHECK(nseg > 0 && (varlen ? Bsz == 1 : nseg == Bsz));
+  TVM_FFI_ICHECK_EQ(varlen != 0, seq_idx.has_value());
+  TVM_FFI_ICHECK_EQ(all_single_host != 0, !varlen && L == 128);
+  if (varlen) TVM_FFI_ICHECK(initial.has_value()) << "varlen requires initial_states";
+  if (dt_bias.has_value()) check_shape(dt_bias.value(), {H});
+  if (d.has_value()) {
+    if (d_has_hdim)
+      check_shape(d.value(), {H, 64});
+    else
+      check_shape(d.value(), {H});
+  }
+  if (z.has_value()) check_shape(z.value(), {Bsz, L, H, 64});
+  if (initial.has_value()) check_shape(initial.value(), {nseg, H, 64, 128});
+  if (seq_idx.has_value()) check_shape(seq_idx.value(), {Bsz, L});
   const int NT = Bsz * L;
   const int64_t nLCmax = static_cast<int64_t>(NT / 128) + nseg;
   if (!all_single_host) {
@@ -109,6 +156,8 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   int64_t sid_code = 0;
   if (seq_idx.has_value()) {
     CHECK_INPUT(seq_idx.value());
+    TVM_FFI_ICHECK(seq_idx.value().dtype() == dl_int32 || seq_idx.value().dtype() == dl_int64)
+        << "seq_idx must be int32 or int64";
     sid_ptr = seq_idx.value().data_ptr();
     sid_code = encode_dlpack_dtype(seq_idx.value().dtype());
   }

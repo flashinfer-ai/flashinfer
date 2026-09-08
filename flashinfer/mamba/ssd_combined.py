@@ -298,8 +298,8 @@ class SSDCombined:
         major, minor = get_compute_capability(torch.device("cuda"))
         if backend == "vibecuda":
             # The VibeCUDA kernels are plain CUDA + mma.sync m16n8k16 (bf16/f16,
-            # fp32 accumulators) with cp.async staging, available on every
-            # SM80+ part.
+            # fp32 accumulators) with cp.async staging. The backend also
+            # checks the device's opt-in shared-memory capacity before launch.
             if major < 8:
                 raise ValueError(
                     f"SSDCombined backend='vibecuda' requires SM80 or newer "
