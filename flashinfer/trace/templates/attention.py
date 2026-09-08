@@ -27,7 +27,7 @@ the backend column indicates which kernel the API wraps.
 | ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
-| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
+| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | BSR/bitmask + summaries | both    | PrimTS SM100a   |
 | ``prims_ts_paged_block_sparse`` | batched, fixed    | paged HND tuple/combined  | page table + BSR + bits | both    | PrimTS SM100a   |
 | ``mla_paged_decode``            | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
 | ``prims_ts_decode_mla``         | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
@@ -328,11 +328,15 @@ gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
 )
 
 
-# PrimTS block-sparse schema. Only the one-shot API can fully express its BSR
-# metadata and block geometry in a trace definition.
+# PrimTS block-sparse schemas. One-shot inputs carry block geometry directly;
+# reusable wrapper traces retain the same geometry as optional plan context.
 
 
-def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
+def _make_prims_ts_block_sparse_trace(
+    *, sparse_format: str = "bsr", use_proxy_routes: bool = False
+) -> TraceTemplate:
+    """Describe one contiguous route frontend and exact/proxy source mode."""
+
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Number of requests."),
         "seq_len_q": Var(description="Fixed query length per request."),
@@ -340,58 +344,157 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
-        "num_q_block_offsets": Var(
-            description="Number of BSR row offsets per batch and KV head."
-        ),
-        "num_block_indices": Var(
-            description="Capacity of the runtime KV-block ID tensor."
-        ),
         "num_kv_valid_words": Var(
             description="Number of optional token-validity words per batch."
         ),
         "q_block_size": Const(abbrev="qb"),
         "kv_block_size": Const(abbrev="kb"),
     }
+    if sparse_format == "bsr":
+        axes.update(
+            {
+                "num_q_block_offsets": Var(
+                    description="Number of BSR row offsets per batch and KV head."
+                ),
+                "num_block_indices": Var(
+                    description="Capacity of the runtime KV-block ID tensor."
+                ),
+            }
+        )
+    elif sparse_format == "bitmask":
+        axes.update(
+            {
+                "num_q_blocks": Var(description="Number of semantic query-block rows."),
+                "num_exact_block_words": Var(
+                    description="Packed exact-block words in each sparse row."
+                ),
+            }
+        )
+    else:
+        raise ValueError(f"unsupported sparse format {sparse_format!r}")
+    if use_proxy_routes:
+        axes["num_kv_blocks"] = Var(
+            description="Number of semantic K/V blocks represented by summaries."
+        )
+
     inputs: dict[str, Tensor | Scalar] = {
         "q": Tensor(["batch_size", "seq_len_q", "num_qo_heads", "head_dim"]),
         "k": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
         "v": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
-        "block_indptr": Tensor(
-            ["batch_size", "num_kv_heads", "num_q_block_offsets"],
-            dtype="int32",
-            description=(
-                "Absolute offsets into block_indices, consumed by the one-shot call."
-            ),
-        ),
-        "block_indices": Tensor(
-            ["num_block_indices"],
-            dtype="int32",
-            description=(
-                "Runtime KV-block ID capacity; only entries referenced by "
-                "block_indptr are live."
-            ),
-        ),
-        "kv_valid_bits": Tensor(
-            ["batch_size", "num_kv_valid_words"],
-            dtype="uint32",
-            optional=True,
-            description=(
-                "Batch-only token validity bits: token t uses bit t % 32 of "
-                "word t // 32 (LSB-first); one means valid. Padding bits "
-                "beyond Skv are ignored; consumed by the one-shot call."
-            ),
-        ),
-        "q_block_size": Scalar("int32"),
-        "kv_block_size": Scalar("int32"),
-        "mask_type": Scalar("string", optional=True),
-        "sm_scale": Scalar("float32", optional=True),
     }
+    if sparse_format == "bsr":
+        inputs.update(
+            {
+                "block_indptr": Tensor(
+                    ["batch_size", "num_kv_heads", "num_q_block_offsets"],
+                    dtype="int32",
+                    description=(
+                        "Absolute offsets into block_indices, consumed by the one-shot call."
+                    ),
+                ),
+                "block_indices": Tensor(
+                    ["num_block_indices"],
+                    dtype="int32",
+                    description=(
+                        "Runtime KV-block ID capacity; only entries referenced by "
+                        "block_indptr are live."
+                    ),
+                ),
+            }
+        )
+    else:
+        inputs["exact_block_bits"] = Tensor(
+            [
+                "batch_size",
+                "num_kv_heads",
+                "num_q_blocks",
+                "num_exact_block_words",
+            ],
+            dtype="uint32",
+            description=(
+                "LSB-first packed exact-block selections for every query-block row."
+            ),
+        )
+    if use_proxy_routes:
+        summary_shape = ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"]
+        inputs.update(
+            {
+                "k_summary": Tensor(
+                    summary_shape,
+                    description="Per-block mean K vectors for proxy routes.",
+                ),
+                "v_summary": Tensor(
+                    summary_shape,
+                    description="Per-block summed V vectors for proxy routes.",
+                ),
+            }
+        )
+    inputs.update(
+        {
+            "kv_valid_bits": Tensor(
+                ["batch_size", "num_kv_valid_words"],
+                dtype="uint32",
+                optional=True,
+                description=(
+                    "Batch-only token validity bits: token t uses bit t % 32 of "
+                    "word t // 32 (LSB-first); one means valid. Padding bits "
+                    "beyond Skv are ignored; the mask applies only to exact routes."
+                ),
+            ),
+            "q_block_size": Scalar("int32"),
+            "kv_block_size": Scalar("int32"),
+            "mask_type": Scalar("string", optional=True),
+            "sm_scale": Scalar("float32", optional=True),
+        }
+    )
+    route_name = "BSR" if sparse_format == "bsr" else "bitmask"
+    if use_proxy_routes:
+        route_name += " proxy"
+    name_suffix = "" if sparse_format == "bsr" and not use_proxy_routes else "_"
+    if name_suffix:
+        name_suffix += (
+            sparse_format if not use_proxy_routes else f"{sparse_format}_proxy"
+        )
+    constraints = [
+        "num_qo_heads % num_kv_heads == 0",
+        "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
+        "head_dim == 128",
+        "q_block_size > 0",
+        "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
+        (
+            "kv_block_size in (8, 16, 32) or "
+            "(kv_block_size > 0 and kv_block_size % 64 == 0)"
+        ),
+        "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    ]
+    if sparse_format == "bsr":
+        constraints.append(
+            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1"
+        )
+    else:
+        constraints.extend(
+            [
+                "num_q_blocks == (seq_len_q + q_block_size - 1) // q_block_size",
+                "num_exact_block_words == "
+                "(((seq_len_kv + kv_block_size - 1) // kv_block_size) + 31) // 32",
+            ]
+        )
+    if use_proxy_routes:
+        constraints.extend(
+            [
+                "num_kv_blocks == (seq_len_kv + kv_block_size - 1) // kv_block_size",
+                "mask_type is None or mask_type == 'dense'",
+            ]
+        )
+    else:
+        constraints.append("mask_type is None or mask_type in ('dense', 'causal')")
+
     return TraceTemplate(
         op_type="block_sparse",
-        name_prefix="prims_ts_block_sparse",
+        name_prefix=f"prims_ts_block_sparse{name_suffix}",
         description=(
             "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            "BSHD Q/K/V and per-KV-head BSR metadata."
+            f"BSHD Q/K/V and per-KV-head {route_name} metadata."
         ),
         axes=axes,
         inputs=inputs,
@@ -402,29 +505,39 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
                 param="out",
             )
         },
-        constraints=[
-            "num_qo_heads % num_kv_heads == 0",
-            "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
-            "head_dim == 128",
-            "q_block_size > 0",
-            "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
-            (
-                "kv_block_size in (8, 16, 32) or "
-                "(kv_block_size > 0 and kv_block_size % 64 == 0)"
-            ),
-            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
-            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
-            "mask_type is None or mask_type in ('dense', 'causal')",
-        ],
+        constraints=constraints,
         tags=[
             "backend:prims-ts",
             "sparse:block",
+            f"sparse-format:{sparse_format}",
+            "routes:proxy" if use_proxy_routes else "routes:exact",
             "status:experimental",
         ],
     )
 
 
-prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
+_PRIMS_TS_BLOCK_SPARSE_TRACES = {
+    (sparse_format, use_proxy_routes): _make_prims_ts_block_sparse_trace(
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
+    )
+    for sparse_format in ("bsr", "bitmask")
+    for use_proxy_routes in (False, True)
+}
+prims_ts_block_sparse_trace = _PRIMS_TS_BLOCK_SPARSE_TRACES[("bsr", False)]
+
+
+def prims_ts_block_sparse_trace_dispatch(**kwargs):
+    """Select a continuous one-shot schema from its explicit route mode."""
+
+    sparse_format = kwargs.get("sparse_format", "bsr")
+    use_proxy_routes = kwargs.get("use_proxy_routes", False)
+    return _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)]
+
+
+prims_ts_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
+)
 
 
 def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
@@ -610,11 +723,18 @@ def _make_block_sparse_wrapper_inputs(
     inputs = dict(one_shot.inputs)
     for name in plan_scalars:
         _copy_scalar_as_optional(inputs, name)
-    _copy_tensor_with_description(
-        inputs,
-        "block_indptr",
-        "Absolute offsets into live block_indices for this wrapper run.",
-    )
+    if "block_indptr" in inputs:
+        _copy_tensor_with_description(
+            inputs,
+            "block_indptr",
+            "Absolute offsets into live block_indices for this wrapper run.",
+        )
+    else:
+        _copy_tensor_with_description(
+            inputs,
+            "exact_block_bits",
+            "LSB-first packed exact-block selections for this wrapper run.",
+        )
     _copy_tensor_with_description(
         inputs,
         "kv_valid_bits",
@@ -627,10 +747,12 @@ def _make_block_sparse_wrapper_inputs(
     return inputs
 
 
-def _make_prims_ts_block_sparse_wrapper_trace() -> TraceTemplate:
+def _make_prims_ts_block_sparse_wrapper_trace(
+    *, sparse_format: str, use_proxy_routes: bool
+) -> TraceTemplate:
     """Describe ``BlockSparseTSWrapper.run`` and its plan-owned geometry."""
 
-    one_shot = _make_prims_ts_block_sparse_trace()
+    one_shot = _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)]
     axes = dict(one_shot.axes)
     # Unlike the one-shot API, run() does not receive these plan-owned values.
     # Keep them as optional schema context, matching the dense PrimTS wrapper
@@ -641,12 +763,15 @@ def _make_prims_ts_block_sparse_wrapper_trace() -> TraceTemplate:
     )
     return TraceTemplate(
         op_type=one_shot.op_type,
-        name_prefix="prims_ts_block_sparse_wrapper",
+        name_prefix=one_shot.name_prefix.replace(
+            "prims_ts_block_sparse", "prims_ts_block_sparse_wrapper", 1
+        ),
         description=(
             "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            "BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and "
-            "mask type are retained by plan() and represented as optional "
-            "trace context."
+            f"BSHD Q/K/V and live per-KV-head {sparse_format} metadata"
+            f"{' with proxy summaries' if use_proxy_routes else ''}. Block "
+            "geometry and mask type are retained by plan() and represented "
+            "as optional trace context."
         ),
         axes=axes,
         inputs=inputs,
@@ -656,12 +781,17 @@ def _make_prims_ts_block_sparse_wrapper_trace() -> TraceTemplate:
     )
 
 
-_PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE = _make_prims_ts_block_sparse_wrapper_trace()
+_PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
+    key: _make_prims_ts_block_sparse_wrapper_trace(
+        sparse_format=key[0], use_proxy_routes=key[1]
+    )
+    for key in _PRIMS_TS_BLOCK_SPARSE_TRACES
+}
 
 
 def _require_prims_ts_block_sparse_wrapper_state(
     kwargs: dict[str, object], wrapper_name: str
-) -> None:
+) -> object:
     """Require bound-method tracing after the reusable wrapper is planned."""
 
     wrapper = kwargs.get("self")
@@ -671,20 +801,26 @@ def _require_prims_ts_block_sparse_wrapper_state(
             "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    if getattr(wrapper, "_plan_state", None) is None:
+    state = getattr(wrapper, "_plan_state", None)
+    if state is None:
         raise RuntimeError("plan() must be called before run()")
+    return state
 
 
 def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
     """Trace a planned contiguous block-sparse wrapper run."""
 
-    _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
-    return _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE
+    state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    route_mode = (
+        state.sparse_format,  # type: ignore[attr-defined]
+        state.use_proxy_routes,  # type: ignore[attr-defined]
+    )
+    return _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode]
 
 
-prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE
-]
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
+)
 
 
 def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceTemplate:

@@ -101,6 +101,7 @@ CuTe-DSL block-sparse attention forward kernels.
     :toctree: ../generated
 
     bsa_attn_sm120_blk64_fwd
+    bsa_attn_sm120_blk64_sage_fwd
 
 HCA Decode
 ----------
@@ -139,3 +140,16 @@ Latency-sensitive callers must precompute with
 returned metadata through the explicit HCA arguments. Arbitrary TRTLLM-GEN
 token-row selections in the compressed segment cannot be represented by an HCA
 page table without repacking the compressed KV pool.
+
+Fused MoE
+---------
+
+.. currentmodule:: flashinfer.fused_moe.cute_dsl
+
+.. autosummary::
+    :toctree: ../generated
+
+    cute_dsl_fused_moe_bf16
+    cute_dsl_fused_moe_nvfp4
+    cute_dsl_fused_moe_mxfp8_mxfp4
+    b12x_fused_moe
