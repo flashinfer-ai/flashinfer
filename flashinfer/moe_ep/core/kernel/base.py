@@ -216,6 +216,23 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional init-time validation for user-supplied kernel-ready weights."""
 
+    def set_compile_tokens_per_rank(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Select an optional per-invocation graph/compile token bucket.
+
+        The workspace capacity remains fixed by ``FleetParams``. Backends that
+        specialize kernels for smaller graph buckets override this hook. A
+        caller may only provide a non-``None`` value when every EP rank uses
+        the same value for the invocation.
+        """
+        if compile_tokens_per_rank is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support compile token buckets"
+            )
+
     def stage_inputs(  # noqa: B027 - intentional no-op default
         self,
         t: "MoEEpTensors",
@@ -224,6 +241,17 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
+
+    def workspace_output(self, workspace: Any) -> "torch.Tensor":
+        """Return the stable output tensor owned by ``workspace``.
+
+        Backends that support zero-copy framework integration override this
+        method. Keeping the accessor on the backend avoids exposing private,
+        backend-specific workspace layouts to callers.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose a workspace output"
+        )
 
     @abstractmethod
     def compute(
