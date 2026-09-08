@@ -924,7 +924,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
         )
         self._kv_lens_buffer: Optional[torch.Tensor] = None
-        if backend in ("trtllm-gen", "cute-dsl", "prims-ts"):
+        if backend in ("trtllm-gen", "cute-dsl"):
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
@@ -1612,7 +1612,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self._backend == "prims-ts":
             # Host-only specialization and validation use int64 because PyTorch
             # CPU reductions do not support the documented uint32 dtype. The
-            # planned values are staged in the kernel's int32 device buffer.
+            # low-level plan owns the corresponding int32 device buffer.
             if kv_lens_arr_host.ndim != 1 or len(kv_lens_arr_host) != batch_size:
                 raise ValueError(
                     "prims-ts seq_lens must be a 1D tensor with exactly "
@@ -1778,19 +1778,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"got {q_data_type} and {kv_data_type}"
                 )
             self._max_kv_len = int(kv_lens_arr_host.max().item())
-            # Stage the caller's exact logical lengths in plan-owned device
-            # storage after the low-level plan succeeds. Subsequent run() calls
-            # reuse these values until the next successful plan().
-            assert self._kv_lens_buffer is not None
-            required_size = len(kv_lens_arr_host)
-            next_kv_lens_buffer = self._kv_lens_buffer
-            if required_size > self._kv_lens_buffer.shape[0]:
-                next_kv_lens_buffer = torch.empty(
-                    (required_size,), dtype=torch.int32, device=self.device
-                )
             from .attention.prims_ts.decode import (
                 _csr_to_block_tables,
-                _validate_block_table_metadata,
+                _validate_block_tables,
             )
 
             if next_block_tables is None:
@@ -1804,10 +1794,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     seq_len_values,
                     page_size=page_size,
                 )
-            _validate_block_table_metadata(
-                next_block_tables,
-                next_kv_lens_buffer[:required_size],
+            block_table_device, block_table_batch_size, _ = _validate_block_tables(
+                next_block_tables
             )
+            if block_table_device != self.device:
+                raise ValueError(
+                    "prims-ts block_tables must be on the wrapper device "
+                    f"{self.device}, got {block_table_device}"
+                )
+            if block_table_batch_size != batch_size:
+                raise ValueError(
+                    "prims-ts block_tables must have one row per request: "
+                    f"expected {batch_size}, got {block_table_batch_size}"
+                )
             required_page_capacity = max(
                 (int(seq_len) + page_size - 1) // page_size
                 for seq_len in kv_lens_arr_host
@@ -1836,10 +1835,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 seq_lens=kv_lens_arr_host,
                 workspace_buffer=self._float_workspace_buffer,
             )
-            next_kv_lens_buffer[:required_size].copy_(
-                kv_lens_arr_host, non_blocking=non_blocking
-            )
-            self._kv_lens_buffer = next_kv_lens_buffer
             self._block_tables = next_block_tables
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
@@ -2431,18 +2426,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "prims-ts decode backend requires contiguous q and out "
                         "when q_len_per_req > 1"
                     )
-            assert self._kv_lens_buffer is not None
             out = self._prims_ts_wrapper.run(
                 q,
                 (k_cache, v_cache),
-                self._kv_lens_buffer[:actual_batch_size],
+                None,
                 self._block_tables,
                 qo_indptr=(self._qo_indptr_buf if q_len_per_req > 1 else None),
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0 if v_scale is None else float(v_scale),
                 out=out,
-                # Validation reads planned metadata values on the host. During
-                # manual fixed-plan capture, trust the stable plan-owned bindings.
+                # Validation reads live page tables and packed-Q offsets on the
+                # host. During manual fixed-plan capture, trust those bindings.
                 validate=not torch.cuda.is_current_stream_capturing(),
             )
             return out

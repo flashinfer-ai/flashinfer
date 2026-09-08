@@ -1212,6 +1212,7 @@ def _make_prims_ts_decode_wrapper_trace(
     max_kv_len: int,
     kv_prefix_mode: str,
     kv_lengths_mode: str,
+    plan_owns_seq_lens: bool,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1250,6 +1251,14 @@ def _make_prims_ts_decode_wrapper_trace(
             value=int(kv_lengths_mode == "planned_uniform_max"),
             description="Whether plan() compiled uniform maximum K/V lengths.",
         ),
+        "plan_owns_seq_lens": Const(
+            abbrev="",
+            value=int(plan_owns_seq_lens),
+            description=(
+                "One when plan() owns the K/V length vector and zero when "
+                "run() supplies it."
+            ),
+        ),
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
@@ -1276,7 +1285,13 @@ def _make_prims_ts_decode_wrapper_trace(
             "seq_lens": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description="Required per-request KV lengths supplied to run().",
+                optional=plan_owns_seq_lens,
+                description=(
+                    "Plan-owned per-request K/V lengths; this is optional trace "
+                    "context and run() must receive seq_lens=None."
+                    if plan_owns_seq_lens
+                    else "Required per-request K/V lengths supplied to run()."
+                ),
             ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
@@ -1319,12 +1334,19 @@ def _make_prims_ts_decode_wrapper_trace(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}_{mask_type}"
+            f"{'_plan_seq_lens' if plan_owns_seq_lens else ''}"
         ),
         description=(
             "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, "
-            "static bounds, and exact batch size. Every run supplies a fixed "
-            "row-strided page table and K/V lengths; packed-Q runs also supply "
-            "Q offsets."
+            "static bounds, and exact batch size. "
+            + (
+                "The plan also owns the K/V length vector, so run() must omit "
+                "seq_lens. Every run supplies a fixed row-strided page table; "
+                "packed-Q runs also supply Q offsets."
+                if plan_owns_seq_lens
+                else "Every run supplies a fixed row-strided page table and K/V "
+                "lengths; packed-Q runs also supply Q offsets."
+            )
         ),
         axes=axes,
         inputs=inputs,
@@ -1344,6 +1366,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"mask:{mask_type}",
             f"kv-prefix-mode:{kv_prefix_mode}",
             f"kv-lengths-mode:{kv_lengths_mode}",
+            f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
 
@@ -1351,7 +1374,12 @@ def _make_prims_ts_decode_wrapper_trace(
 # Finite examples support trace discovery and schema-consistency tests. Bound
 # dispatch below synthesizes the exact template from the wrapper's plan state.
 _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
-    (combined, fp16_output, q_mode): _make_prims_ts_decode_wrapper_trace(
+    (
+        combined,
+        fp16_output,
+        q_mode,
+        plan_owns_seq_lens,
+    ): _make_prims_ts_decode_wrapper_trace(
         combined=combined,
         fp16_output=fp16_output,
         q_mode=q_mode,
@@ -1361,10 +1389,12 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
         max_kv_len=1,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
+        plan_owns_seq_lens=plan_owns_seq_lens,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for plan_owns_seq_lens in (False, True)
 }
 
 
@@ -1382,6 +1412,7 @@ def _get_prims_ts_decode_wrapper_trace(
     max_kv_len: int,
     kv_prefix_mode: str,
     kv_lengths_mode: str,
+    plan_owns_seq_lens: bool,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1395,6 +1426,7 @@ def _get_prims_ts_decode_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
+        plan_owns_seq_lens=plan_owns_seq_lens,
     )
 
 
@@ -1424,8 +1456,20 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     state = getattr(wrapper, "_plan_state", None)
     if state is None:
         raise RuntimeError("plan() must be called before run()")
+    plan_owns_seq_lens = getattr(state, "planned_seq_lens_device", None) is not None
+    run_seq_lens = kwargs.get("seq_lens")
+    if plan_owns_seq_lens:
+        if run_seq_lens is not None:
+            raise ValueError(
+                "Tracing BatchDecodePagedTSWrapper.run with plan-owned "
+                "sequence lengths requires seq_lens=None"
+            )
+    elif not isinstance(run_seq_lens, torch.Tensor):
+        raise ValueError(
+            "Tracing BatchDecodePagedTSWrapper.run without plan-owned "
+            "sequence lengths requires a per-run seq_lens tensor"
+        )
     required_metadata = (
-        "seq_lens",
         "block_tables",
         *(("qo_indptr",) if bool(state.use_packed_q) else ()),
     )
@@ -1456,6 +1500,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_prefix_mode=str(state.kv_prefix_mode),
         kv_lengths_mode=str(state.kv_lengths_mode),
+        plan_owns_seq_lens=plan_owns_seq_lens,
     )
 
 

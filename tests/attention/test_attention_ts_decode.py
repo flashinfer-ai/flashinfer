@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import inspect
 import math
-from typing import Optional, Sequence
+from typing import Optional, Sequence, cast
 import warnings
 
 import pytest
@@ -1111,12 +1111,6 @@ def _run_case(
     out=None,
     validate: bool = True,
 ):
-    if seq_lens is None:
-        seq_lens = _seq_lens_from_csr(
-            case.paged_kv_indptr,
-            case.paged_kv_last_page_len,
-            int(case.k_cache.shape[2]),
-        )
     return wrapper.run(
         case.q,
         case.paged_kv_cache,
@@ -1227,7 +1221,6 @@ def _exercise_public_paths(
     eager = _run_case(
         wrapper,
         case,
-        seq_lens=seq_lens,
         qo_indptr=qo_indptr,
     )
     _assert_case_correct(eager, case)
@@ -1250,7 +1243,6 @@ def _exercise_public_paths(
         captured = _run_case(
             wrapper,
             case,
-            seq_lens=seq_lens,
             qo_indptr=qo_indptr,
             out=graph_out,
             validate=False,
@@ -1926,11 +1918,11 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert run_parameters["validate"].default is True
 
     assert _DecodePlanState.__dataclass_params__.frozen is True
-    request_fields = {
-        "seq_lens",
-        "qo_indptr",
-        "block_tables",
-    }
+    assert {
+        "planned_seq_lens_host",
+        "planned_seq_lens_device",
+    }.issubset(_DecodePlanState.__dataclass_fields__)
+    request_fields = {"qo_indptr", "block_tables"}
     assert request_fields.isdisjoint(_DecodePlanState.__dataclass_fields__)
 
 
@@ -2064,6 +2056,8 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
             "max_kv_len": 64,
             "kv_prefix_mode": "dynamic",
             "kv_lengths_mode": "dynamic",
+            "planned_seq_lens_host": None,
+            "planned_seq_lens_device": None,
         },
     )()
     for required_name in (
@@ -2827,9 +2821,12 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "workspace": object(),
             "compiled_main": object(),
             "compiled_reducer": None,
+            "planned_seq_lens_host": None,
+            "planned_seq_lens_device": None,
         },
     )()
     runtime = object()
+    runtime_seq_lens = object()
     output = object()
 
     def fail_validation(*_args, **_kwargs):
@@ -2861,19 +2858,19 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_prepare_decode_runtime_unchecked",
         lambda *_args, **_kwargs: runtime,
     )
-    monkeypatch.setattr(
-        decode_module,
-        "_launch_decode",
-        lambda actual_runtime, **_kwargs: (
-            output if actual_runtime is runtime else fail_validation()
-        ),
-    )
+
+    def launch(actual_runtime, *, seq_lens, **_kwargs):
+        if actual_runtime is not runtime or seq_lens is not runtime_seq_lens:
+            fail_validation()
+        return output
+
+    monkeypatch.setattr(decode_module, "_launch_decode", launch)
 
     assert (
         wrapper.run(
             object(),
             object(),
-            object(),
+            runtime_seq_lens,
             object(),
             out=object(),
             validate=False,
@@ -2893,7 +2890,13 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
     wrapper._plan_state = type(
         "_DecodeQModePlanState",
         (),
-        {"use_packed_q": True, "device": torch.device("cuda:0"), "batch_size": 2},
+        {
+            "use_packed_q": True,
+            "device": torch.device("cuda:0"),
+            "batch_size": 2,
+            "planned_seq_lens_host": None,
+            "planned_seq_lens_device": None,
+        },
     )()
     args = (object(), object(), object(), object())
     with pytest.raises(TypeError, match="validate must be a bool"):
@@ -2910,7 +2913,13 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
     wrapper._plan_state = type(
         "_DecodeQModePlanState",
         (),
-        {"use_packed_q": False, "device": torch.device("cuda:0"), "batch_size": 2},
+        {
+            "use_packed_q": False,
+            "device": torch.device("cuda:0"),
+            "batch_size": 2,
+            "planned_seq_lens_host": None,
+            "planned_seq_lens_device": None,
+        },
     )()
     with pytest.raises(ValueError, match="qo_indptr cannot be used"):
         wrapper.run(*args, qo_indptr=object())
@@ -2924,7 +2933,15 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     from flashinfer.attention.prims_ts import decode as decode_module
 
     wrapper = BatchDecodePagedTSWrapper()
-    previous_state = object()
+    previous_seq_lens = object()
+    previous_state = type(
+        "_PreviousDecodePlanState",
+        (),
+        {
+            "planned_seq_lens_host": (128,),
+            "planned_seq_lens_device": previous_seq_lens,
+        },
+    )()
     wrapper._plan_state = previous_state
     fake_spec = type("_DecodeLaunchSpec", (), {"config": object()})()
     monkeypatch.setattr(
@@ -2951,104 +2968,223 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
         wrapper.plan(torch.device("cuda:0"), 1, 8, 1, 64, 16, 128)
     assert wrapper._plan_state is previous_state
-
-
-def _make_decode_specialization_validation_args(
-    *,
-    kv_prefix_mode: str,
-    kv_lengths_mode: str,
-):
-    state = type(
-        "_SpecializedDecodePlanState",
-        (),
-        {
-            "batch_size": 2,
-            "max_kv_len": 128,
-            "page_size": 16,
-            "use_packed_q": False,
-            "seq_len_q": 1,
-            "mask_type": "dense",
-            "kv_prefix_mode": kv_prefix_mode,
-            "kv_lengths_mode": kv_lengths_mode,
-            "config": object(),
-        },
-    )()
-    runtime = type(
-        "_SpecializedDecodeRuntime",
-        (),
-        {
-            "num_physical_pages": 16,
-            "q": torch.empty((2, 8, 64)),
-        },
-    )()
-    return (
-        state,
-        runtime,
-        torch.arange(16, dtype=torch.int32).view(2, 8),
-    )
-
-
-def test_attention_ts_decode_validated_run_rechecks_uniform_max_evidence() -> None:
-    """Per-run lengths must preserve a compiled uniform-maximum proof."""
-
-    state, runtime, block_tables = _make_decode_specialization_validation_args(
-        kv_prefix_mode="dynamic",
-        kv_lengths_mode="planned_uniform_max",
-    )
-    _validate_decode_run_metadata_values(
-        state,
-        runtime,
-        seq_lens=torch.tensor((128, 128), dtype=torch.int32),
-        block_tables=block_tables,
-        qo_indptr=None,
-    )
-    with pytest.raises(ValueError, match="uniform-maximum specialization evidence"):
-        _validate_decode_run_metadata_values(
-            state,
-            runtime,
-            seq_lens=torch.tensor((128, 127), dtype=torch.int32),
-            block_tables=block_tables,
-            qo_indptr=None,
-        )
-
-
-def test_attention_ts_decode_validated_run_rechecks_full_prefix_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Per-run lengths must independently satisfy a compiled split-prefix proof."""
-
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    state, runtime, block_tables = _make_decode_specialization_validation_args(
-        kv_prefix_mode="planned_full",
-        kv_lengths_mode="dynamic",
-    )
-    monkeypatch.setattr(
-        decode_module,
-        "_planned_full_split_prefix",
-        lambda _config, lengths, **_kwargs: lengths == (128, 128),
-    )
-    _validate_decode_run_metadata_values(
-        state,
-        runtime,
-        seq_lens=torch.tensor((128, 128), dtype=torch.int32),
-        block_tables=block_tables,
-        qo_indptr=None,
-    )
-    with pytest.raises(ValueError, match="full-split-prefix specialization evidence"):
-        _validate_decode_run_metadata_values(
-            state,
-            runtime,
-            seq_lens=torch.tensor((128, 127), dtype=torch.int32),
-            block_tables=block_tables,
-            qo_indptr=None,
-        )
+    assert wrapper._plan_state.planned_seq_lens_device is previous_seq_lens
 
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_plan_without_host_evidence_is_dynamic() -> None:
-    """Omitting plan-only lengths compiles both K/V decisions dynamically."""
+def test_attention_ts_decode_plan_snapshots_seq_lens_and_replan_replaces_them() -> None:
+    """Plan-owned GPU lengths are immutable snapshots of the host values."""
+
+    case = _make_decode_case(
+        kv_lens=(64, 128),
+        num_qo_heads=8,
+        num_kv_heads=1,
+        head_dim=64,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=torch.float16,
+        output_dtype=torch.float16,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=20260908,
+    )
+    plan_seq_lens = _seq_lens_from_csr(
+        case.paged_kv_indptr,
+        case.paged_kv_last_page_len,
+        int(case.k_cache.shape[2]),
+    ).cpu()
+    expected_first = plan_seq_lens.clone()
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        case.q.device,
+        2,
+        8,
+        1,
+        64,
+        32,
+        128,
+        seq_lens=plan_seq_lens,
+    )
+
+    first_state = wrapper._require_plan_state()
+    assert first_state.planned_seq_lens_host == (64, 128)
+    assert first_state.planned_seq_lens_device is not None
+    assert first_state.planned_seq_lens_device.dtype == torch.int32
+    assert first_state.planned_seq_lens_device.device == case.q.device
+    assert first_state.planned_seq_lens_device.is_contiguous()
+    torch.testing.assert_close(
+        first_state.planned_seq_lens_device.cpu(),
+        expected_first,
+        rtol=0,
+        atol=0,
+    )
+
+    plan_seq_lens.fill_(1)
+    torch.testing.assert_close(
+        first_state.planned_seq_lens_device.cpu(),
+        expected_first,
+        rtol=0,
+        atol=0,
+    )
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case)
+
+    replacement = torch.tensor((32, 96), dtype=torch.int64)
+    wrapper.plan(
+        case.q.device,
+        2,
+        8,
+        1,
+        64,
+        32,
+        128,
+        seq_lens=replacement,
+    )
+    second_state = wrapper._require_plan_state()
+    assert second_state is not first_state
+    assert second_state.planned_seq_lens_host == (32, 96)
+    assert second_state.planned_seq_lens_device is not None
+    assert second_state.planned_seq_lens_device.data_ptr() != (
+        first_state.planned_seq_lens_device.data_ptr()
+    )
+    assert second_state.planned_seq_lens_device.tolist() == [32, 96]
+    assert first_state.planned_seq_lens_device.tolist() == [64, 128]
+
+
+@pytest.mark.parametrize("validate", (True, False), ids=("validated", "trusted"))
+@pytest.mark.parametrize(
+    ("planned_seq_lens", "runtime_seq_lens", "message"),
+    (
+        (object(), object(), "seq_lens must be None when plan\\(\\) owns"),
+        (None, None, "seq_lens is required when plan\\(\\) does not own"),
+    ),
+    ids=("both-sources", "neither-source"),
+)
+def test_attention_ts_decode_run_requires_exactly_one_seq_lens_owner(
+    planned_seq_lens: object,
+    runtime_seq_lens: object,
+    message: str,
+    validate: bool,
+) -> None:
+    """Length ownership is unconditional, including on the trusted path."""
+
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._plan_state = type(
+        "_SeqLensOwnershipPlanState",
+        (),
+        {
+            "planned_seq_lens_host": ((128,) if planned_seq_lens is not None else None),
+            "planned_seq_lens_device": planned_seq_lens,
+            "kv_prefix_mode": "dynamic",
+            "kv_lengths_mode": (
+                "planned_uniform_max" if planned_seq_lens is not None else "dynamic"
+            ),
+        },
+    )()
+
+    with pytest.raises(ValueError, match=message):
+        wrapper.run(
+            object(),
+            object(),
+            runtime_seq_lens,
+            object(),
+            validate=validate,
+        )
+
+
+def test_attention_ts_decode_planned_full_dynamic_uses_owned_seq_lens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full-prefix plan owns lengths even when length handling is dynamic."""
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    planned_seq_lens = object()
+    runtime = object()
+    output = object()
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._plan_state = type(
+        "_PlannedFullDynamicDecodePlanState",
+        (),
+        {
+            "use_packed_q": False,
+            "workspace": object(),
+            "compiled_main": object(),
+            "compiled_reducer": None,
+            "planned_seq_lens_host": (128, 127),
+            "planned_seq_lens_device": planned_seq_lens,
+            "kv_prefix_mode": "planned_full",
+            "kv_lengths_mode": "dynamic",
+        },
+    )()
+    monkeypatch.setattr(
+        decode_module,
+        "_prepare_decode_runtime_unchecked",
+        lambda *_args, **_kwargs: runtime,
+    )
+
+    def launch(actual_runtime, *, seq_lens, **_kwargs):
+        assert actual_runtime is runtime
+        assert seq_lens is planned_seq_lens
+        return output
+
+    monkeypatch.setattr(decode_module, "_launch_decode", launch)
+
+    assert (
+        wrapper.run(
+            object(),
+            object(),
+            None,
+            object(),
+            validate=False,
+        )
+        is output
+    )
+
+
+def test_attention_ts_decode_plan_owned_validation_uses_host_seq_lens() -> None:
+    """Validated runs do not copy the plan-owned GPU lengths back to the host."""
+
+    class _NoDeviceReadback:
+        def tolist(self):
+            raise AssertionError("plan-owned seq_lens must not be read back")
+
+    state = type(
+        "_PlanOwnedDecodeState",
+        (),
+        {
+            "planned_seq_lens_host": (16,),
+            "max_kv_len": 16,
+            "page_size": 16,
+            "use_packed_q": False,
+            "seq_len_q": 1,
+            "batch_size": 1,
+            "mask_type": "dense",
+        },
+    )()
+    runtime = type(
+        "_PlanOwnedDecodeRuntime",
+        (),
+        {
+            "num_physical_pages": 1,
+            "q": torch.empty((1, 8, 64)),
+        },
+    )()
+    _validate_decode_run_metadata_values(
+        state,
+        runtime,
+        seq_lens=cast(torch.Tensor, _NoDeviceReadback()),
+        block_tables=torch.tensor(((0,),), dtype=torch.int32),
+        qo_indptr=None,
+    )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() -> None:
+    """Run-owned lengths may change values and identity across graph replays."""
 
     case = _make_decode_case(
         kv_lens=(128,),
@@ -3070,8 +3206,50 @@ def test_attention_ts_decode_plan_without_host_evidence_is_dynamic() -> None:
     assert policy["kv_prefix_mode"] == "dynamic"
     assert policy["kv_lengths_mode"] == "dynamic"
 
-    output = _run_case(wrapper, case)
+    seq_lens = _seq_lens_from_csr(
+        case.paged_kv_indptr,
+        case.paged_kv_last_page_len,
+        int(case.k_cache.shape[2]),
+    )
+    output = _run_case(wrapper, case, seq_lens=seq_lens)
     _assert_case_correct(output, case)
+
+    graph_out = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(
+            wrapper,
+            case,
+            seq_lens=seq_lens,
+            out=graph_out,
+            validate=False,
+        )
+    assert captured is graph_out
+
+    shorter_len = 64
+    shorter_page_count = shorter_len // int(case.k_cache.shape[2])
+    shorter_case = replace(
+        case,
+        paged_kv_indptr=torch.tensor(
+            (0, shorter_page_count), dtype=torch.int32, device=case.q.device
+        ),
+        paged_kv_indices=case.paged_kv_indices[:shorter_page_count],
+        paged_kv_last_page_len=torch.tensor(
+            (int(case.k_cache.shape[2]),),
+            dtype=torch.int32,
+            device=case.q.device,
+        ),
+    )
+    shorter_case = _with_reference(shorter_case)
+    seq_lens.fill_(shorter_len)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(graph_out, shorter_case)
+
+    rebound_seq_lens = seq_lens.clone()
+    assert rebound_seq_lens.data_ptr() != seq_lens.data_ptr()
+    rebound = _run_case(wrapper, case, seq_lens=rebound_seq_lens)
+    _assert_case_correct(rebound, shorter_case)
 
 
 @pytest.mark.arch_blackwell
@@ -4108,14 +4286,9 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
         device="cuda",
         seed=31100,
     )
-    seq_lens = _seq_lens_from_csr(
-        case.paged_kv_indptr,
-        case.paged_kv_last_page_len,
-        int(case.k_cache.shape[2]),
-    )
     with pytest.raises(
         ValueError,
-        match=r"specialization evidence values must be within \[1, 256\]",
+        match=r"plan seq_lens values must be within \[1, 256\]",
     ):
         _plan_case(case, max_kv_len=256)
 
@@ -4124,7 +4297,7 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
     assert policy["use_persistent_scheduler"] is True
     assert policy["kv_lengths_mode"] == "dynamic"
 
-    eager = _run_case(wrapper, case, seq_lens=seq_lens).clone()
+    eager = _run_case(wrapper, case).clone()
     _assert_case_correct(eager, case)
 
     graph_out = torch.full_like(eager, float("nan"))
@@ -4133,7 +4306,6 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
         captured = _run_case(
             wrapper,
             case,
-            seq_lens=seq_lens,
             out=graph_out,
             validate=False,
         )

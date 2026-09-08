@@ -1182,7 +1182,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             result = backend_wrappers[backend].run(
                 runtime_q,
                 kv_cache,
-                actual_seq_lens_kv.flatten(),
+                None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
@@ -1274,7 +1274,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             lambda: backend_wrappers["prims-ts"].run(
                 prims_ts_runtime_q,
                 prims_ts_kv_cache,
-                actual_seq_lens_kv.flatten(),
+                None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,

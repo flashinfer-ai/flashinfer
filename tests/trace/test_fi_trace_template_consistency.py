@@ -401,7 +401,7 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.decode",
         "BatchDecodePagedTSWrapper.run",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.mla_decode",
         "batch_mla_decode_with_paged_kv_cache",
@@ -503,6 +503,13 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             )
             assert "min(seq_lens) >= 1" in template.constraints
             assert f"max(seq_lens) <= {static_bound}" in template.constraints
+    for template in prims_ts_decode_wrapper_trace_dispatch.templates:
+        plan_owns_seq_lens = bool(template.axes["plan_owns_seq_lens"].value)
+        assert template.inputs["seq_lens"].optional is plan_owns_seq_lens
+        assert (
+            f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}"
+            in template.tags
+        )
     for template in attention_ts_decode_trace_dispatch.templates:
         assert {"block_tables", "seq_lens_kv"} <= template.inputs.keys()
         assert {
@@ -776,6 +783,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         max_kv_len=seq_len_k,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
     )
     fmha_definitions = (
         batch_decode_with_paged_kv_cache.fi_trace(**fmha_kwargs),
@@ -913,6 +921,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
         max_kv_len=page_size,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
     )
     definition = fi_trace(
         wrapper.run,
@@ -930,7 +939,7 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
 
 
 def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
-    """An incomplete redesigned run call must not emit unknown trace inputs."""
+    """Bound traces enforce required metadata for each length owner."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
@@ -951,6 +960,7 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
         max_kv_len=2 * page_size,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
     )
     fmha_kwargs = {
         "q": torch.empty(total_q, 8, 128, dtype=torch.bfloat16),
@@ -972,6 +982,26 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
         with pytest.raises(ValueError, match=missing_name):
             fi_trace(fmha_wrapper.run, **incomplete_kwargs)
     fmha_definition = fi_trace(fmha_wrapper.run, **fmha_kwargs)
+
+    fmha_wrapper._plan_state = SimpleNamespace(
+        **{
+            **vars(fmha_wrapper._plan_state),
+            "planned_seq_lens_device": seq_lens,
+        }
+    )
+    plan_owned_kwargs = {**fmha_kwargs, "seq_lens": None}
+    with pytest.raises(ValueError, match=r"plan-owned.*seq_lens=None"):
+        fi_trace(fmha_wrapper.run, **fmha_kwargs)
+    for missing_name in ("block_tables", "qo_indptr"):
+        incomplete_kwargs = dict(plan_owned_kwargs)
+        incomplete_kwargs.pop(missing_name)
+        with pytest.raises(ValueError, match=missing_name):
+            fi_trace(fmha_wrapper.run, **incomplete_kwargs)
+    plan_owned_definition = fi_trace(fmha_wrapper.run, **plan_owned_kwargs)
+    assert plan_owned_definition["inputs"]["seq_lens"]["optional"] is True
+    assert plan_owned_definition["inputs"]["seq_lens"]["dtype"] == "int32"
+    assert "seq-lens-source:plan" in plan_owned_definition["tags"]
+    assert "_plan_seq_lens_" in plan_owned_definition["name"]
 
     mla_wrapper = BatchMLADecodePagedTSWrapper()
     mla_wrapper._plan_state = SimpleNamespace(
@@ -996,7 +1026,7 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
             fi_trace(mla_wrapper.run, **incomplete_kwargs)
     mla_definition = fi_trace(mla_wrapper.run, **mla_kwargs)
 
-    for definition in (fmha_definition, mla_definition):
+    for definition in (fmha_definition, plan_owned_definition, mla_definition):
         assert "unknown" not in str(definition["inputs"])
 
 
@@ -1030,21 +1060,42 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         "max_kv_len": 2 * page_size,
         "kv_prefix_mode": "dynamic",
         "kv_lengths_mode": "dynamic",
+        "planned_seq_lens_device": None,
     }
     fmha_variants = (
-        fmha_base,
-        {**fmha_base, "mask_type": "causal"},
-        {**fmha_base, "seq_len_q": 8},
-        {**fmha_base, "max_kv_len": 4 * page_size},
-        {**fmha_base, "kv_prefix_mode": "planned_full"},
-        {**fmha_base, "kv_lengths_mode": "planned_uniform_max"},
-        {**fmha_base, "mask_type": "causal", "window_left": 16},
+        (fmha_base, seq_lens),
+        ({**fmha_base, "mask_type": "causal"}, seq_lens),
+        ({**fmha_base, "seq_len_q": 8}, seq_lens),
+        ({**fmha_base, "max_kv_len": 4 * page_size}, seq_lens),
+        ({**fmha_base, "planned_seq_lens_device": seq_lens}, None),
+        (
+            {
+                **fmha_base,
+                "kv_prefix_mode": "planned_full",
+                "planned_seq_lens_device": seq_lens,
+            },
+            None,
+        ),
+        (
+            {
+                **fmha_base,
+                "kv_lengths_mode": "planned_uniform_max",
+                "planned_seq_lens_device": seq_lens,
+            },
+            None,
+        ),
+        ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
     )
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []
-    for state in fmha_variants:
+    for state, run_seq_lens in fmha_variants:
         fmha_wrapper._plan_state = SimpleNamespace(**state)
-        fmha_definitions.append(fi_trace(fmha_wrapper.run, **fmha_kwargs))
+        fmha_definitions.append(
+            fi_trace(
+                fmha_wrapper.run,
+                **{**fmha_kwargs, "seq_lens": run_seq_lens},
+            )
+        )
     assert len({definition["name"] for definition in fmha_definitions}) == len(
         fmha_definitions
     )
@@ -1057,6 +1108,8 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     ] == [64, 64, 64, 128]
     assert "mask:dense" in fmha_definitions[0]["tags"]
     assert "mask:causal" in fmha_definitions[1]["tags"]
+    assert "seq-lens-source:run" in fmha_definitions[0]["tags"]
+    assert "seq-lens-source:plan" in fmha_definitions[4]["tags"]
 
     mla_kwargs = {
         "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),

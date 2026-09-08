@@ -66,9 +66,10 @@ on ``plan()`` state, pass the live bound method to the module-level helper:
         q=q_tensor, paged_kv_cache=(k_cache, v_cache)
     )
 
-    # BatchDecodePagedTSWrapper retains packed-query mode and output dtype in
-    # its frozen plan state, so its live instance is required. Runtime request
-    # metadata remains explicit and required by both run() and fi_trace().
+    # BatchDecodePagedTSWrapper retains packed-query mode, output dtype, and
+    # sequence-length ownership in its frozen plan state, so its live instance
+    # is required. This example uses run-owned lengths. If plan() received
+    # seq_lens, pass seq_lens=None here and to run() instead.
     defn = fi_trace(
         ts_wrapper.run,
         q=q_tensor,

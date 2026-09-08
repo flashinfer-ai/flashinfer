@@ -9,7 +9,8 @@
     "status:experimental",
     "mask:causal",
     "kv-prefix-mode:dynamic",
-    "kv-lengths-mode:dynamic"
+    "kv-lengths-mode:dynamic",
+    "seq-lens-source:run"
   ],
   "axes": {
     "batch_size": {
@@ -50,6 +51,11 @@
       "type": "const",
       "value": 0,
       "description": "Whether plan() compiled uniform maximum K/V lengths."
+    },
+    "plan_owns_seq_lens": {
+      "type": "const",
+      "value": 0,
+      "description": "One when plan() owns the K/V length vector and zero when run() supplies it."
     },
     "num_qo_heads": {
       "type": "const",

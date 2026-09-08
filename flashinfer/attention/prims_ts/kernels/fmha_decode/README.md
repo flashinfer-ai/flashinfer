@@ -23,37 +23,45 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
+| `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
-carry the wrapper's plan-owned query mode and output dtype.
+carry the wrapper's plan-owned query mode, output dtype, and length ownership.
+Pass the same length argument as `run()`: a CUDA tensor for a run-owned plan or
+`None` for a plan-owned vector. Trace names and tags distinguish the two
+lifecycles even when both compiled K/V modes are dynamic.
 
 Prefer the reusable wrapper when static attention geometry and capacity are
 used repeatedly.
 `plan()` receives the device, exact batch and head geometry, page size, static
 Q and K/V bounds, dtypes, mask, and window. It compiles the specialization and
 either binds an optional caller-owned workspace or allocates private scratch;
-it does not retain request metadata. Every `run()` supplies the current query,
-cache, K/V lengths, and a fixed row-strided page table, plus query offsets for
-packed Q. Validation is enabled by default. `validate=False` skips explicit
-wrapper checks and host metadata reads for a previously validated steady state
-or CUDA Graph launch; the caller then owns every value, bounds, aliasing, and
-lifetime precondition.
+it also copies optional host `seq_lens` into plan-owned CUDA storage. Every
+`run()` supplies the current query, cache, and a fixed row-strided page table,
+plus query offsets for packed Q. Exactly one lifecycle owns K/V lengths:
 
-An optional host sequence-length list or CPU tensor passed to `plan()` is
-specialization evidence, not run-time metadata. It may prove that every row is
-exactly `max_kv_len` or that the full configured split-CTA fanout is active for
-every batch/Q group. Every subsequent run must preserve whichever predicate was
-selected. Default run validation rechecks that predicate; with
-`validate=False`, preserving it is the caller's responsibility. Omit plan-time
-`seq_lens` when those properties are not stable.
-Sliding-window plans retain run-time K/V lengths because leading-tile skips
-change the effective domain; persistent Q-dependent causal plans do the same
-while recycling the task graph. These are automatic implementation choices.
+- If `plan()` receives a host list or CPU tensor, every `run()` must pass
+  `seq_lens=None` and uses the plan-owned CUDA copy.
+- If `plan()` receives `seq_lens=None`, every `run()` must pass a CUDA
+  `seq_lens` tensor. The compiled K/V-prefix and K/V-length modes are dynamic.
+
+Supplying lengths to both calls or neither call is rejected regardless of
+`validate`. Plan-owned lengths may prove that every row is exactly
+`max_kv_len` or that the full configured split-CTA fanout is active for every
+batch/Q group. They are frozen until the next successful `plan()` call; omit
+plan-time `seq_lens` when lengths must change between runs or graph replays.
+Validation is enabled by default. `validate=False` skips explicit wrapper
+checks and host metadata reads for a previously validated steady state or CUDA
+Graph launch; the caller then owns every remaining value, bounds, aliasing, and
+lifetime precondition.
+Sliding-window plans retain dynamic K/V-length handling because leading-tile
+skips change the effective domain; persistent Q-dependent causal plans do the
+same while recycling the task graph. This kernel mode is independent of
+whether the plan or run owns the length vector.
 
 ## Supported contract
 
@@ -106,7 +114,9 @@ have padded storage.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`.
 - Wrapper, standalone, and one-shot metadata use contiguous logical K/V
-  lengths plus `block_tables[B, C]`. The table has unit inner stride and a
+  lengths plus `block_tables[B, C]`. Wrapper lengths are either copied into
+  plan-owned CUDA storage or supplied to each run; the other APIs always take
+  them at launch. The table has unit inner stride and a
   non-overlapping row stride of at least `C`; padding between rows is
   supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
   The one-shot argument is named `seq_lens_kv`; wrapper and standalone entry
@@ -145,13 +155,12 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-K/V lengths, fixed-table page IDs, and packed-Q offsets are per-run bindings.
-Page IDs and packed-Q offsets are loaded on every run and graph replay. K/V
-lengths are also loaded unless uniform-max plan evidence makes them a
-compile-time constant. Their storage and values may change between completed
-launches without recompiling while the selected plan predicate remains
-satisfied. CUDA Graph replay additionally requires stable captured addresses
-and shapes.
+Fixed-table page IDs and packed-Q offsets are per-run bindings and are loaded
+on every run and graph replay. K/V lengths come from exactly one source. A
+plan-owned vector has stable storage and values until replan and may enable
+full-prefix or uniform-maximum specialization. A run-owned vector may change
+between completed launches without recompiling; CUDA Graph replay additionally
+requires its captured address and shape to remain stable.
 
 | Source | Responsibility |
 | --- | --- |
@@ -204,10 +213,10 @@ wrapper.plan(
     kv_data_type=kv.dtype,
     o_data_type=q.dtype,
     mask_type="causal",
-    # Optional stable evidence enables a fixed-length specialization.
+    # Optional fixed lengths enable a plan-owned specialization.
     seq_lens=[max_seq_len] * B,
 )
-out = wrapper.run(q, kv, seq_lens, block_tables)
+out = wrapper.run(q, kv, None, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
@@ -235,20 +244,21 @@ standalone_out = prims_ts_batch_decode_with_kv_cache(
 assert standalone_out.shape == q.shape
 ```
 
-The wrapper owns its compiled specialization and plan-bound workspace, but not
-request metadata. If no `workspace_buffer` is passed to `plan()`, the wrapper
-allocates private scratch. A workspace is mutable and supports only one
-in-flight run or captured-graph replay; use separate wrappers and workspaces
-for concurrent execution. Caller-owned scratch must remain alive and must not
-overlap Q, K/V cache, metadata, or output storage.
+The wrapper owns its compiled specialization, plan-bound workspace, and any
+sequence lengths supplied to `plan()`. If no `workspace_buffer` is passed to
+`plan()`, the wrapper allocates private scratch. A workspace is mutable and
+supports only one in-flight run or captured-graph replay; use separate wrappers
+and workspaces for concurrent execution. Caller-owned scratch must remain alive
+and must not overlap Q, K/V cache, metadata, or output storage.
 
-With default `validate=True`, each wrapper run checks the per-run fixed table,
-K/V lengths, packed offsets when present, tensors, output, and any selected
-sequence-length specialization. Once the caller has established those
-conditions, `validate=False` avoids the explicit checks and host metadata
-reads. Invalid per-run lengths, page IDs, offsets, aliases, or specialization
-predicates in that mode may cause incorrect results or out-of-bounds access.
-Do not mutate metadata concurrently with a launch or replay that reads it.
+With default `validate=True`, each wrapper run checks the fixed table, effective
+K/V lengths, packed offsets when present, tensors, and output. Plan-owned
+lengths and their specialization predicates were validated by `plan()` and are
+not revalidated against a second length vector. Once the caller has established
+the remaining conditions, `validate=False` avoids explicit checks and host
+metadata reads. Invalid run-owned lengths, page IDs, offsets, or aliases in that
+mode may cause incorrect results or out-of-bounds access. Do not mutate
+run-owned metadata concurrently with a launch or replay that reads it.
 
 For the standalone workflow, call
 `get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
@@ -271,8 +281,9 @@ out-of-bounds access.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, retain all
-run-time metadata and workspace storage at stable addresses, and pass a
-preallocated compact, 16-byte-aligned `out` tensor.
+run-owned metadata and workspace storage at stable addresses, and pass a
+preallocated compact, 16-byte-aligned `out` tensor. A successful replan changes
+plan-owned length storage and requires graph recapture.
 
 ## Limitations
 
@@ -280,7 +291,8 @@ preallocated compact, 16-byte-aligned `out` tensor.
   this API.
 - Attention sinks and custom masks are not exposed.
 - Q, K, and V cannot use mixed dtypes.
-- Runtime K lengths must be positive and no greater than the static plan bound.
+- Effective K/V lengths must be positive and no greater than the static plan
+  bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks
   them; `validate=False` and the standalone hot path trust them to preserve a
   synchronization-free launch. Live causal metadata must preserve

@@ -195,7 +195,7 @@ def test_uses_explicit_seq_lens_instead_of_page_derived_lengths():
     torch.testing.assert_close(
         delegate.plan.call_args.kwargs["seq_lens"], seq_lens.cpu().to(torch.int64)
     )
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], seq_lens)
+    assert wrapper._kv_lens_buffer is None
     assert wrapper._block_tables.tolist() == [[0, 1, -1], [2, 3, 4]]
 
 
@@ -268,12 +268,12 @@ def test_run_forwards_fixed_table_to_native_delegate():
 
     native_args = delegate.run.call_args.args
     assert len(native_args) == 4
-    assert native_args[2].data_ptr() == wrapper._kv_lens_buffer.data_ptr()
+    assert native_args[2] is None
     assert native_args[3] is wrapper._block_tables
 
 
 @requires_cuda
-def test_normalizes_uint32_seq_lens_for_plan_evidence():
+def test_normalizes_uint32_seq_lens_for_plan_owned_lengths():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
@@ -289,10 +289,7 @@ def test_normalizes_uint32_seq_lens_for_plan_evidence():
     assert plan_seq_lens.device.type == "cpu"
     assert plan_seq_lens.dtype == torch.int64
     torch.testing.assert_close(plan_seq_lens, seq_lens.cpu().to(torch.int64))
-    assert wrapper._kv_lens_buffer.dtype == torch.int32
-    torch.testing.assert_close(
-        wrapper._kv_lens_buffer[:2], seq_lens.to(dtype=torch.int32)
-    )
+    assert wrapper._kv_lens_buffer is None
 
 
 @requires_cuda
@@ -302,8 +299,6 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
     wrapper._prims_ts_wrapper = delegate
-    wrapper._kv_lens_buffer[:2].fill_(7)
-    previous_seq_lens = wrapper._kv_lens_buffer[:2].clone()
     seq_lens = torch.tensor(
         [32, _DECODE_MAX_KV_LEN + 1], dtype=torch.uint32, device="cuda"
     )
@@ -316,26 +311,29 @@ def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
         )
 
     delegate.plan.assert_not_called()
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], previous_seq_lens)
+    assert wrapper._kv_lens_buffer is None
 
 
 @requires_cuda
-def test_failed_low_level_replan_preserves_previous_seq_lens():
+def test_failed_low_level_replan_preserves_previous_block_tables():
     wrapper = _make_wrapper("prims-ts")
     delegate = Mock()
-    delegate.plan.side_effect = RuntimeError("compile failed")
     wrapper._prims_ts_wrapper = delegate
-    wrapper._kv_lens_buffer[:2].fill_(7)
-    previous_seq_lens = wrapper._kv_lens_buffer[:2].clone()
+    wrapper.plan(
+        *_plan_args([32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+    )
+    previous_block_tables = wrapper._block_tables
+    delegate.plan.side_effect = RuntimeError("compile failed")
 
     with pytest.raises(RuntimeError, match="compile failed"):
         wrapper.plan(
-            *_plan_args([32, 48], "cuda"),
+            *_plan_args([16, 16], "cuda"),
             q_data_type=torch.bfloat16,
-            seq_lens=torch.tensor([32, 40], dtype=torch.uint32, device="cuda"),
         )
 
-    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], previous_seq_lens)
+    assert wrapper._block_tables is previous_block_tables
+    assert wrapper._kv_lens_buffer is None
 
 
 def test_plan_trace_captures_explicit_causal_mode():
