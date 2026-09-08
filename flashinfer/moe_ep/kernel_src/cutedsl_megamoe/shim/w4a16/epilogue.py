@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """W4A16 adaptation of the current swapped MegaMoE epilogue.
 
-Only FC1 changes: internal gate16/up16 accumulators receive FP32 expert
+FC1 changes: internal gate16/up16 accumulators receive FP32 expert
 alphas and SwiGLU, then store BF16 directly. Canonical prepared weights keep
 gate32/up32; the established W4A16 producer row composition converts that
 ordering while decoding packed weights and scales into operand-A TMEM.
-The current FC2 device helper,
-BF16 return router, and phase-aware completion tracker are reused unchanged.
+The current FC2 process pipeline, BF16 return router, and phase-aware
+completion tracker are reused. Its non-overlap subtiles are statically unrolled.
 No activation quantization, scale-factor output, or epilogue SMEM is used.
 """
 
@@ -151,7 +151,7 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
             fc1_done_counter,
             optional_epi_args,
         )
-        fc2_epi = SwapABFc2Epilogue(
+        fc2_epi = W4A16Fc2Epilogue(
             self, tidx, epi_smem_storage, fc2_output, token_comm_args, optional_epi_args
         )
 
@@ -227,6 +227,101 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
                 )
         # Tail flush
         flag_tracker.fire()
+
+
+class W4A16Fc2Epilogue(SwapABFc2Epilogue):
+    """Static BF16 subtiles with inherited routing, stores and completion."""
+
+    @cute.jit
+    def __call__(
+        self,
+        work_tile_info,
+        tmem_acc_tensor,
+        acc_pipeline,
+        acc_consumer_state,
+        is_odd_turn,
+    ):
+        if cutlass.const_expr(self.optional_epi_args.fc2_alpha is not None):
+            alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
+        else:
+            alpha_val = None
+        acc_ready = False
+        if not work_tile_info.peek_ready:
+            acc_ready = True
+            acc_pipeline.consumer_wait(acc_consumer_state)
+        fc2_output_router = self._make_output_router(work_tile_info)
+        tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
+            tmem_acc_tensor,
+            (self._EpilogueFc2HiddenTileSize, self._EpilogueTokenTileSize),
+        )[None, None, 0, None]
+        acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
+        iket.range_push("fc2_epi")
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+
+        # W4A16 rejects overlapping accumulators. Static subtiles make the
+        # inherited STG router indices constants (four issues per subtile),
+        # allowing its prefetched pointer/valid arrays to stay in registers.
+        for i in cutlass.range_constexpr(self.subtile_cnt):
+            subtile_idx = cutlass.Int32(i)
+            if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
+                if cutlass.const_expr(i == self.subtile_cnt - 1):
+                    self._run_last_subtile(
+                        subtile_idx=subtile_idx,
+                        tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
+                            None, None, subtile_idx
+                        ],
+                        fc2_output_router=fc2_output_router,
+                        alpha_val=alpha_val,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+                else:
+                    self.run_subtile(
+                        subtile_idx=subtile_idx,
+                        tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
+                            None, None, subtile_idx
+                        ],
+                        preload_acc=None,
+                        fc2_output_router=fc2_output_router,
+                        alpha_val=alpha_val,
+                        release_after_ldtm=False,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                    )
+            elif cutlass.const_expr(i == self.subtile_cnt - 1):
+                # Includes zero tokens and N128 tiles with only the first
+                # subtile valid. This is the existing valid guard's else arm.
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
+
+    @cute.jit
+    def _run_last_subtile(
+        self,
+        subtile_idx,
+        tmem_subtile_tensor,
+        fc2_output_router,
+        alpha_val,
+        acc_pipeline,
+        acc_consumer_state,
+    ):
+        # Unlike raw LDTM, post-reorder's return ends all accumulator-TMEM
+        # scratch use. Its result is RMEM; only register packing and STG remain.
+        process_pipeline = self.process_pipeline
+        loaded = process_pipeline.tmem_acc_load(
+            tmem_subtile_tensor=tmem_subtile_tensor, epi=self
+        )
+        casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val)
+        pre_store = process_pipeline.post_f2fp_reorder(
+            casted=casted, tmem_subtile_view=tmem_subtile_tensor
+        )
+        cute.arch.fence_view_async_tmem_load()
+        acc_pipeline.consumer_release(acc_consumer_state)
+        process_pipeline.store_function(
+            epi=self,
+            subtile=pre_store,
+            subtile_idx=subtile_idx,
+            fc2_output_router=fc2_output_router,
+        )
 
 
 class W4A16Fc1Epilogue(SwapABFc1Epilogue):

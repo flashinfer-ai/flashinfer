@@ -34,7 +34,7 @@ import math
 import statistics
 import time
 import warnings
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 import torch
 
@@ -173,13 +173,123 @@ def autotune_knobs(
     COLLECTIVE: every EP rank must call this in the same iteration with the
     same ``candidates`` (order included).  Returns the winning knob dict.
     """
+
+    def sample_seconds(count: int) -> Sequence[float]:
+        samples = []
+        for _ in range(count):
+            start = time.perf_counter()
+            launch()  # The exported contract is a synchronized forward.
+            samples.append(time.perf_counter() - start)
+        return samples
+
+    return _autotune_knobs_impl(
+        frontend,
+        launch,
+        sample_seconds,
+        candidates,
+        label=label,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=on_winner,
+    )
+
+
+class _KnobFrontend(Protocol):
+    def apply_knobs(self, knobs: Dict[str, Any]) -> None: ...
+
+
+class _CollectiveGraphTimingError(RuntimeError):
+    """A private graph timing failure that must stop the collective sweep."""
+
+
+def _sample_graph_seconds(
+    launch: Callable[[], None], timed_iters: int
+) -> Sequence[float]:
+    """Own one full-forward graph until all replay work and reset complete."""
+    import torch.distributed as dist
+
+    from flashinfer.testing.utils import bench_gpu_time_with_cuda_event
+
+    collective = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if collective else 0
+    graph: Optional[torch.cuda.CUDAGraph] = None
+    capture_error: Optional[Exception] = None
+    try:
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+        except Exception as exc:
+            capture_error = exc
+
+        # Capture records the collective but does not execute it. All ranks
+        # must finish capture successfully before any rank starts replaying.
+        ready = capture_error is None
+        if collective:
+            status = torch.tensor(int(ready), dtype=torch.int32, device="cuda")
+            dist.all_reduce(status, op=dist.ReduceOp.MIN)
+            ready = bool(status.item())
+        if not ready:
+            raise _CollectiveGraphTimingError(
+                "W4A16 autotune graph capture failed on an EP rank."
+            ) from capture_error
+        assert graph is not None
+
+        def select_own_rank(values: Sequence[float]) -> float:
+            # Keep local samples: the sweep takes MAX of rank medians. The
+            # event utility's default per-iteration MAX changes that metric.
+            return values[rank]
+
+        milliseconds = bench_gpu_time_with_cuda_event(
+            graph.replay,
+            dry_run_iters=0,
+            repeat_iters=timed_iters,
+            cold_l2_cache=False,
+            sleep_after_run=False,
+            input_args=(),
+            input_kwargs={},
+            aggregate_op=select_own_rank,
+        )
+        return [sample / 1000.0 for sample in milliseconds]
+    except _CollectiveGraphTimingError:
+        raise
+    except Exception as exc:
+        raise _CollectiveGraphTimingError(
+            "W4A16 autotune graph timing failed; stop the collective sweep."
+        ) from exc
+    finally:
+        if graph is not None:
+            try:
+                # apply_knobs frees the symmetric workspace. Even exception
+                # tracebacks must not retain a graph referencing freed storage.
+                torch.cuda.synchronize()
+                graph.reset()
+            except Exception as exc:
+                raise _CollectiveGraphTimingError(
+                    "W4A16 autotune graph cleanup failed; "
+                    "stop tuning before applying another candidate."
+                ) from exc
+
+
+def _autotune_knobs_impl(
+    frontend: _KnobFrontend,
+    warmup_launch: Callable[[], None],
+    sample_seconds: Callable[[int], Sequence[float]],
+    candidates: List[Dict[str, Any]],
+    *,
+    label: str,
+    warmup_iters: int,
+    timed_iters: int,
+    on_winner: Optional[Callable[[Dict[str, Any], float], None]],
+) -> Dict[str, Any]:
+    """Shared sweep; sample_seconds returns local seconds with no live graph."""
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
 
     from .comm import ensure_not_capturing
 
-    # The sweep barriers, compiles per candidate, wall-clock times with
-    # internal syncs, and all_reduces -- none of it can run mid-capture.
+    # The sweep owns host-side compile, allocation, timing and collectives;
+    # it must finish before the caller captures its serving graph.
     ensure_not_capturing("knobs='auto' collective autotune sweep")
 
     import torch.distributed as dist
@@ -200,14 +310,13 @@ def autotune_knobs(
             frontend.apply_knobs(knobs)
             _barrier()
             for _ in range(warmup_iters):  # first launch compiles
-                launch()
+                warmup_launch()
             _barrier()
-            iters: List[float] = []
-            for _ in range(timed_iters):  # launch() syncs internally
-                t0 = time.perf_counter()
-                launch()
-                iters.append(time.perf_counter() - t0)
-            scores.append(statistics.median(iters))
+            scores.append(statistics.median(sample_seconds(timed_iters)))
+        except _CollectiveGraphTimingError:
+            # A peer may already be waiting in a captured collective. Never
+            # advance to a different candidate after graph timing fails.
+            raise
         except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
             warnings.warn(
                 f"[cutedsl-autotune] {label}: candidate {knobs} failed: {exc}",
@@ -441,13 +550,16 @@ def autotune_w4a16_mega_moe(
 ) -> Dict[str, Any]:
     """Collectively tune W4A16 on staged BF16 inputs and prepared NVFP4 weights.
 
-    The full synchronized wrapper includes the post-FC2 routing reduction.
-    Its output overwrites ``y``. See :func:`autotune_knobs` for rank ordering
-    and timing semantics; call outside graph capture on every EP rank.
+    Time the asynchronous full wrapper, including post-FC2 routing reduction,
+    with one forward per private CUDA graph. The score is the maximum of
+    each rank's median GPU-event time on the same hot, staged inputs.
+    Output overwrites ``y``. Every EP rank must call outside graph capture.
+    At least one eager preparation forward runs before each capture, even
+    when ``warmup_iters=0``, to compile the fused kernel and reducer.
     """
     from .w4a16 import w4a16_mega_moe
 
-    def launch() -> None:
+    def launch(*, sync: bool) -> None:
         w4a16_mega_moe(
             y,
             transformed_l1,
@@ -456,8 +568,17 @@ def autotune_w4a16_mega_moe(
             num_tokens=num_tokens,
             gate_up_clamp=gate_up_clamp,
             activation_clamp=activation_clamp,
-            sync=True,
+            sync=sync,
         )
+
+    def warmup_launch() -> None:
+        launch(sync=True)
+
+    def launch_async() -> None:
+        launch(sync=False)
+
+    def sample_seconds(count: int) -> Sequence[float]:
+        return _sample_graph_seconds(launch_async, count)
 
     cfg = symm_buffer._frontend.config
 
@@ -476,15 +597,16 @@ def autotune_w4a16_mega_moe(
                 max_tokens=cfg.num_tokens_per_rank,
                 combine_dtype="bf16",
                 p50_us=p50_s * 1e6,
-                source="autotune",
+                source="autotune_graph_events",
             )
 
-    return autotune_knobs(
+    return _autotune_knobs_impl(
         symm_buffer._frontend,
-        launch,
+        warmup_launch,
+        sample_seconds,
         w4a16_candidates() if candidates is None else candidates,
         label="w4a16_mega",
-        warmup_iters=warmup_iters,
+        warmup_iters=max(1, warmup_iters),
         timed_iters=timed_iters,
         on_winner=_record,
     )
