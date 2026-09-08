@@ -97,7 +97,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from cutlass.cutlass_dsl import (
     Int32,
-    Integer,
     Int64,
     Uint8,
     Uint64,
@@ -265,23 +264,14 @@ def store_global_f32x8_as_bf16(
 
 @cute.jit
 def _compact_static_get_single_m_tile_work(
-    row_counts,
     active_expert_count,
     *,
-    tile_m,
     num_tiles_n,
     cluster_shape_mn,
     current_work_linear_idx,
-    current_local_expert_idx,
-    accum_tile_m,
     cta_id_in_cluster,
 ):
-    """O(1) scheduler for compact experts whose routed rows fit one M tile.
-
-    The retained2 35B small-row path has two N-pair tasks per compact expert
-    and at most one M tile.  Keeping the generic signature makes this helper a
-    drop-in experiment while eliminating repeated row-count scans.
-    """
+    """Map compact work in O(1); each virtual expert fits one M tile."""
     num_active_experts = active_expert_count[Int32(0)]
     local_expert_idx = current_work_linear_idx // num_tiles_n
     is_valid = local_expert_idx < num_active_experts
@@ -291,7 +281,28 @@ def _compact_static_get_single_m_tile_work(
         + cta_id_in_cluster[1],
         local_expert_idx,
     )
-    return cur_tile_coord, is_valid, local_expert_idx, local_expert_idx
+    return cur_tile_coord, is_valid
+
+
+@dsl_user_op
+def _prefetch_l2_bulk(addr, num_bytes, *, loc=None, ip=None):
+    """Asynchronously prefetch ``num_bytes`` (multiple of 16) at global address
+    ``addr`` into L2.  A pure hint: nothing is written to shared memory and no
+    completion is tracked, so it is safe to issue speculatively."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(num_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -350,6 +361,19 @@ def _ld_shared_f32(addr, *, loc=None, ip=None):
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+    )
+
+
+@dsl_user_op
+def _st_shared_u64(addr, val, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Uint64(val).ir_value(loc=loc, ip=ip)],
+        "st.shared.b64 [$0], $1;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -451,6 +475,17 @@ def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     )
 
 
+def _align_up_128(value):
+    """Round a (static or dynamic) extent up to the 128-element SF atom grid."""
+    return ((value + 127) // 128) * 128
+
+
+# Marker the finalize kernel publishes in route_state[0] once it has restored the
+# clean routing-counter state; the static kernel's prologue skips its cooperative
+# clear (and the resident-grid barrier behind it) when it finds the marker.
+_ROUTE_STATE_CLEAN = 0x0C1EA4
+
+
 class MoEStaticKernel:
     """Compact retained static MoE kernel for both SM12x FP4 formats."""
 
@@ -466,6 +501,9 @@ class MoEStaticKernel:
         swiglu_alpha: float = 1.702,
         swiglu_beta: float = 1.0,
         swiglu_limit: float | None = None,
+        merged_groups: bool = False,
+        deferred_init: bool = False,
+        source_scales: bool = False,
     ):
         if sf_vec_size not in (16, 32):
             raise ValueError(f"unsupported FP4 scale vector size {sf_vec_size}")
@@ -495,6 +533,52 @@ class MoEStaticKernel:
         self.sfb_tile_shape_nk = (max(128, mma_tiler_mn[1]), tile_k)
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.output_tile_count_n = output_tile_count_n
+        # Merged groups (retained-three): one task per expert runs FC1 for every N128 slice,
+        # keeps each quantized FC1 slice in the otherwise unused upper 64-row
+        # half of one A/SFA pipeline stage (this compact kernel schedules a
+        # single M tile, so the packed-A ring only ever fills rows 0..63), runs
+        # FC2 over all slices once and writes the route scratch as [route, K].
+        # The retained2 schedule (two slices per task, [route, 2, K]) stays the
+        # default; the dispatch selects the mode and keys the artifact by it.
+        self.merged_groups = bool(merged_groups)
+        # Deferred initialisation: the finalize kernel restores the clean routing
+        # counter state after every launch, so the next launch's prologue starts
+        # routing at once instead of clearing the counters behind a grid barrier.
+        self.deferred_init = bool(deferred_init)
+        # Source scale layout: the w13 scales stay in the caller's per-expert
+        # 128-row atoms over 2*I rows (gate branch from row I, half an atom in)
+        # and the down scales keep their true K extent; the gate scale tile is
+        # assembled by the DMA warp with plain 8-byte loads / shared stores (TMA
+        # cannot address a half atom) and published to the MMA warps through the
+        # stage's TMA full barrier, which counts the DMA warp's arrival after its
+        # fenced stores as a second producer arrival (two arrivals + the
+        # transaction bytes complete the phase).
+        self.source_scales = bool(source_scales)
+        # scale atoms per pipeline stage along K (tile_k / 64) and the stage's bytes
+        self.sf_k_atoms_per_stage = self.sfb_tile_shape_nk[1] // 64
+        self.sf_stage_bytes = 512 * self.sf_k_atoms_per_stage
+        if self.source_scales and self.sf_k_atoms_per_stage != 2:
+            raise ValueError(
+                "source_scales carries the gate scale halves of the next stage in four "
+                "registers (two 64-column K atoms per 128-wide K tile)"
+            )
+        if self.source_scales and (not self.is_gated or sf_vec_size != 16):
+            raise ValueError(
+                "the source scale layout is supported for gated NVFP4 only"
+            )
+        self.retained_slices = output_tile_count_n if self.merged_groups else 2
+        self.scheduler_tiles_n = (
+            1 if self.merged_groups else (output_tile_count_n + 1) // 2
+        )
+        if self.merged_groups:
+            if output_tile_count_n < 2:
+                raise ValueError("merged_groups needs at least two N128 slices")
+            if self.sa_tiles_per_block < 2 or self.sfa_tiles_per_block < 2:
+                raise ValueError(
+                    "merged_groups keeps the retained slices in the upper half of the A/SFA stages (M128 stages, M64 tiles)"
+                )
+            if self.sfb_tiles_per_block != 1:
+                raise ValueError("merged_groups assumes one N128 slice per SFB stage")
         self.cluster_shape_mnk = (1, 1, 1)
         self.cluster_shape_mn = (1, 1)
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
@@ -550,8 +634,13 @@ class MoEStaticKernel:
         sfa_stage_elements: Int32,
         q1_stage_idx: Int32,
         epi_rest_m,
+        q1_row_base: Int32,
     ):
-        """Quantize one retained FC1 slice for the FC2 A operand."""
+        """Quantize one retained FC1 slice for the FC2 A operand.
+
+        ``q1_row_base`` selects the destination rows inside the M128 stage: 0
+        for the retained2 slots (rows 0..63), ``tile_m`` for the merged-groups
+        slots in the upper half (rows 64..127)."""
         sA_u8 = cute.recast_tensor(sA[None, None, q1_stage_idx], cutlass.Uint8)
         packed_cols = Int32(self.tile_shape_mnk[2] // 2)
         sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // self.sf_vec_size)
@@ -578,6 +667,7 @@ class MoEStaticKernel:
                 while quant_idx < epi_rows * sf_blocks_per_row:
                     local_row = quant_idx // sf_blocks_per_row
                     row = rows_offset + local_row
+                    drow = row + q1_row_base
                     sf_block = quant_idx - local_row * sf_blocks_per_row
                     block_start = sf_block * Int32(self.sf_vec_size)
 
@@ -622,9 +712,9 @@ class MoEStaticKernel:
                             )
 
                     packed_base = sf_block * Int32(self.sf_vec_size // 2)
-                    dst_pcol = row & Int32(63)
+                    dst_pcol = drow & Int32(63)
                     xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
-                    row_high = row >> Int32(6)
+                    row_high = drow >> Int32(6)
                     for byte_idx in cutlass.range_constexpr(self.sf_vec_size // 2):
                         src_pcol = packed_base + Int32(byte_idx)
                         dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
@@ -639,8 +729,8 @@ class MoEStaticKernel:
                             )
                         sA_u8[dst_flat] = byte_val
 
-                    outer_m_idx = row % Int32(32)
-                    inner_m_idx = row // Int32(32)
+                    outer_m_idx = drow % Int32(32)
+                    inner_m_idx = drow // Int32(32)
                     inner_k_idx = sf_block % Int32(4)
                     k_tile_idx = sf_block // Int32(4)
                     sf_raw_idx = (
@@ -931,6 +1021,11 @@ class MoEStaticKernel:
             ):
                 break
             self.ab_stage -= 1
+        if self.merged_groups and self.retained_slices > self.ab_stage:
+            raise ValueError(
+                f"merged_groups keeps {self.retained_slices} retained slices but only "
+                f"{self.ab_stage} A/SFA stages fit in shared memory"
+            )
 
     @cute.jit
     def _resident_grid_barrier(
@@ -967,8 +1062,9 @@ class MoEStaticKernel:
         scale_storage: cute.Tensor,  # flat uint8 backing sfa_ptr
         barrier_count: cute.Tensor,  # [1] int32 (host-zeroed)
         barrier_epoch: cute.Tensor,  # [1] int32 (host-zeroed)
-        b_w13: cute.Tensor,  # [2*I_tp, K, E] — concatenated gate+up
-        sfb_w13_ptr: cute.Pointer,  # scale factors for concatenated w13
+        route_state: cute.Tensor,  # [8] int32: [0] clean marker published by the finalize
+        b_w13: cute.Tensor,  # gated: [I_tp, K, 2*E] branch-major (up=2e, gate=2e+1); non-gated: [I_tp, K, E]
+        sfb_w13_ptr: cute.Pointer,  # w13 scale factors, same batch order
         b_down: cute.Tensor,  # [K, I_tp, E]
         sfb_down_ptr: cute.Pointer,
         row_counts: cute.Tensor,  # [state_E] routed rows per local expert
@@ -1002,11 +1098,35 @@ class MoEStaticKernel:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # Single SF tensor for concatenated w13 (gate+up scale factors)
-        sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13.shape, self.sf_vec_size
-        )
+        # The weight scale factors are stored on the 128-row x 128-col SF atom
+        # grid (the dispatch pads odd intermediate sizes to 128 before this
+        # kernel), while the FP4 operands keep their true extent.  Build the
+        # SF layouts over the aligned grid so atom strides match the storage:
+        # one 128-row-aligned branch per w13 batch index, and a 128-aligned
+        # reduction extent for down.
+        if cutlass.const_expr(self.source_scales):
+            # Caller's layout: one batch per expert over 2*I rows (up rows
+            # 0..I-1, gate rows I..2I-1) on the 128-row atom grid.
+            sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                (
+                    2 * b_w13.shape[0],
+                    b_w13.shape[1],
+                    b_w13.shape[2] // 2,
+                ),
+                self.sf_vec_size,
+            )
+        else:
+            sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                (
+                    _align_up_128(b_w13.shape[0]),
+                    b_w13.shape[1],
+                    b_w13.shape[2],
+                ),
+                self.sf_vec_size,
+            )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
+        # 64-row half of the SF smem atom: rows (i, j') at 16*i + 4*j'; the two
+        # halves of a stage are this layout at the atom base and at base + 8.
 
         # TMA descriptors
         tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
@@ -1022,8 +1142,11 @@ class MoEStaticKernel:
             1,
             internal_type=cutlass.Int16,
         )
-        # Single TMA descriptor over concatenated w13 [2*I_tp, K, E].
-        # Up tiles at N=0..I_tp/tile_N-1, gate tiles at N=I_tp/tile_N..2*I_tp/tile_N-1.
+        # Single TMA descriptor over branch-major w13 [I_tp, K, 2*E]: batch
+        # index 2e is weight expert e's up branch, 2e+1 its gate branch, and
+        # N spans one branch.  When I_tp is not a tile multiple the last N
+        # tile runs past the extent; TMA zero-fills those rows without any
+        # global read, so no physically padded weights are streamed.
         tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
             b_w13,
             self.b_smem_layout_staged,
@@ -1039,7 +1162,14 @@ class MoEStaticKernel:
         )
         # B_down TMA
         sfb_down_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_down.shape, self.sf_vec_size
+            (
+                b_down.shape[0],
+                b_down.shape[1]
+                if self.source_scales
+                else _align_up_128(b_down.shape[1]),
+                b_down.shape[2],
+            ),
+            self.sf_vec_size,
         )
         sfb_down_tensor = cute.make_tensor(sfb_down_ptr, sfb_down_layout)
         tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
@@ -1067,6 +1197,7 @@ class MoEStaticKernel:
             scale_storage,
             barrier_count,
             barrier_epoch,
+            route_state,
             tma_a,
             gA,
             tma_sfa,
@@ -1099,6 +1230,10 @@ class MoEStaticKernel:
             scatter_output,
             token_map,
             token_weights,
+            b_w13,
+            sfb_w13_tensor,
+            b_down,
+            sfb_down_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1111,13 +1246,14 @@ class MoEStaticKernel:
 
         # The first kernel's completion on this stream is the global handoff;
         # no resident-grid spin barrier is needed for finalization.
-        # w13 rows cover both branches only for gated activations; the
-        # non-gated FC1 slice count is the full w13 tile count.  This must
-        # match the device-side gate_tile_cnt/retained_group_count, or the
-        # finalize sums the wrong route-scratch slots.
-        fc1_branch_rows = b_w13.shape[0] // 2 if self.is_gated else b_w13.shape[0]
-        gate_tile_count = fc1_branch_rows // self.tile_shape_mnk[1]
-        retained_group_count = (gate_tile_count + 1) // 2
+        # w13's N extent is one branch for both layouts (gated pairs share
+        # the N index and differ in batch index), so the FC1 slice count is
+        # that extent in tiles, rounded up for a partial tail tile.  This
+        # must match the device-side gate_tile_cnt/retained_group_count, or
+        # the finalize sums the wrong route-scratch slots.
+        tile_n = self.tile_shape_mnk[1]
+        gate_tile_count = (b_w13.shape[0] + tile_n - 1) // tile_n
+        retained_group_count = 1 if self.merged_groups else (gate_tile_count + 1) // 2
         final_vec_count = (a_input.shape[0] * hidden_size) // 8
         final_grid_z = (final_vec_count + 255) // 256
         final_grid = (1, 1, final_grid_z)
@@ -1126,6 +1262,12 @@ class MoEStaticKernel:
             scatter_output,
             topk_ids,
             retained_group_count,
+            route_state,
+            row_counts,
+            active_expert_count,
+            global_to_local_expert,
+            virt_route_scratch,
+            self.deferred_init,
         ).launch(
             grid=final_grid,
             block=[256, 1, 1],
@@ -1133,6 +1275,57 @@ class MoEStaticKernel:
             cooperative=False,
             stream=stream,
         )
+
+    @cute.jit
+    def _load_gate_sf_halves(
+        self,
+        sf_w13_base: Int64,
+        sf_gate_row: Int32,
+        k_atom: Int32,
+        lane_id: Int32,
+        has_a,
+        has_b,
+        sf_k_atoms_total: Int32,
+    ):
+        """The two 8-byte halves of 16-byte chunk ``lane_id`` of the gate scale tile's
+        K atom ``k_atom`` in the caller's layout: the upper half of chunk i of source
+        atom (I//128 + t) and the lower half of chunk i of the next atom; zero when the
+        atom lies past the expert's atoms (last real tile, phantom slice)."""
+        src_a = (
+            sf_w13_base
+            + Int64(sf_gate_row + k_atom) * Int64(512)
+            + Int64(lane_id) * Int64(16)
+        )
+        half_a = Uint64(0)
+        half_b = Uint64(0)
+        if has_a:
+            half_a = _ld_global_u64(src_a + Int64(8))
+        if has_b:
+            half_b = _ld_global_u64(src_a + Int64(sf_k_atoms_total) * Int64(512))
+        return half_a, half_b
+
+    @cute.jit
+    def _prefetch_batch(
+        self,
+        base: Int64,
+        batch: Int32,
+        batch_bytes: Int32,
+        lane_id: Int32,
+        chunk: Int32,
+    ):
+        """Spread one batch's L2 prefetch over the 32 lanes in ``chunk`` pieces
+        (sizes rounded down to the 16-byte bulk granularity)."""
+        off = lane_id * chunk
+        while off < batch_bytes:
+            n = batch_bytes - off
+            if n > chunk:
+                n = chunk
+            n = n & Int32(-16)
+            if n > Int32(0):
+                _prefetch_l2_bulk(
+                    base + Int64(batch) * Int64(batch_bytes) + Int64(off), n
+                )
+            off += chunk * Int32(32)
 
     @cute.kernel
     def kernel(
@@ -1145,6 +1338,7 @@ class MoEStaticKernel:
         scale_storage: cute.Tensor,
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
+        route_state: cute.Tensor,
         tma_a: cute.CopyAtom,
         mA: cute.Tensor,
         tma_sfa: cute.CopyAtom,
@@ -1177,6 +1371,10 @@ class MoEStaticKernel:
         scatter_output: cute.Tensor,
         token_map: cute.Tensor,
         token_weights: cute.Tensor,
+        b_w13_gmem: cute.Tensor,
+        sfb_w13_gmem: cute.Tensor,
+        b_down_gmem: cute.Tensor,
+        sfb_down_gmem: cute.Tensor,
     ):
         """Kernel entry point."""
         from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -1197,6 +1395,115 @@ class MoEStaticKernel:
             cpasync.prefetch_descriptor(tma_b_down)
             cpasync.prefetch_descriptor(tma_sfb_down)
 
+        # Prologue overlap: the routing / packing phase leaves DRAM idle (about
+        # 8 us + 8 ns per routed pair).  The DMA warp of CTA z speculatively
+        # prefetches weight expert z into L2, as much as that idle window can
+        # stream.  Compact expert ids are assigned by the racing route warps, so
+        # which weight experts the first wave touches is not fixed: the guess is
+        # non-semantic and its value was established by measurement only (gated
+        # to the routed-pair band where it won).  A pure L2 hint: wrong guesses
+        # cost only otherwise idle bandwidth, nothing is handed across CTAs
+        # through shared memory.
+        # Geometry comes from the raw global tensors (the TMA coordinate
+        # tensors carry no address): FP4 packs two elements per byte and the
+        # scale-factor layouts are dense per batch at the 128-aligned extent.
+        if warp_idx == self.tma_load_warp_id:
+            total_pairs_pf = Int32(topk_ids.shape[0])
+            weight_expert_count = Int32(cute.size(b_down_gmem, mode=[2]))
+            w13_batch_bytes = Int32(
+                cute.size(b_w13_gmem, mode=[0]) * cute.size(b_w13_gmem, mode=[1]) // 2
+            )
+            down_batch_bytes = Int32(
+                cute.size(b_down_gmem, mode=[0]) * cute.size(b_down_gmem, mode=[1]) // 2
+            )
+            sfb_w13_batch_bytes = Int32(
+                cute.size(sfb_w13_gmem, mode=[0])
+                * cute.size(sfb_w13_gmem, mode=[1])
+                // self.sf_vec_size
+            )
+            sfb_down_batch_bytes = Int32(
+                cute.size(sfb_down_gmem, mode=[0])
+                * cute.size(sfb_down_gmem, mode=[1])
+                // self.sf_vec_size
+            )
+            branches = Int32(cute.size(b_w13_gmem, mode=[2])) // weight_expert_count
+            sf_branches = Int32(1) if self.source_scales else branches
+            expert_bytes = (
+                branches * w13_batch_bytes
+                + sf_branches * sfb_w13_batch_bytes
+                + down_batch_bytes
+                + sfb_down_batch_bytes
+            )
+            # idle window in ns ~ 8000 + 8 * pairs (clamped to 64 us so the byte
+            # budget stays inside Int32); DRAM ~1100 bytes/ns -> budget bytes
+            window_ns = Int32(8000) + total_pairs_pf * Int32(8)
+            if window_ns > Int32(64000):
+                window_ns = Int32(64000)
+            budget_bytes = window_ns * Int32(1100)
+            prefetch_experts = budget_bytes // expert_bytes
+            # Beyond ~24 experts (34 MB at E512 / I320) the prefetch stream outlives
+            # the prologue and collides with the first wave's own loads (measured
+            # +1-2 % at M512-M819 with a 40-expert cap); with mostly inactive
+            # guessed experts the wasted bandwidth delays the latency-bound
+            # small-M forward (measured +8 % at M8 without a lower gate).
+            if prefetch_experts > Int32(24):
+                prefetch_experts = Int32(24)
+            if prefetch_experts > weight_expert_count:
+                prefetch_experts = weight_expert_count
+            # Below ~7/8 routed pairs per expert (expected active fraction under
+            # 60 %) too many guessed experts are inactive: measured +3 % at
+            # Qwen3.5-397B TP8 M32 (320 pairs, E512) with a pairs >= E/2 gate.
+            if total_pairs_pf * Int32(8) < weight_expert_count * Int32(7):
+                prefetch_experts = Int32(0)
+            # With 256 experts the first wave covers most of the active experts
+            # and the guessed stream only competes with it: measured +5.2 % at
+            # Qwen3.5-122B TP4 M32 (256 pairs), +4 % at M48, +3.4 % at M64 and
+            # +2.6 % at Qwen3.5-35B TP1 M32 against the pre-prefetch revision,
+            # while the 512-expert shapes gain 1-3.5 % (Qwen3.8 TP2 M32-M256).
+            # The prefetch therefore needs at least 512 weight experts.
+            if weight_expert_count < Int32(512):
+                prefetch_experts = Int32(0)
+            # Above ~8 routed rows per expert the prologue writes tens of MB of
+            # packed rows that the first wave re-reads from L2; the prefetch
+            # stream evicts them (measured +0.4-1.4 % at M512-M819), so it is
+            # limited to the band where the weights dominate the L2 working set.
+            if total_pairs_pf > weight_expert_count * Int32(8):
+                prefetch_experts = Int32(0)
+            expert_pf = Int32(bidz)
+            if expert_pf < prefetch_experts:
+                w13_base = Int64(b_w13_gmem.iterator.toint())
+                down_base = Int64(b_down_gmem.iterator.toint())
+                sfb_w13_base = Int64(sfb_w13_gmem.iterator.toint())
+                sfb_down_base = Int64(sfb_down_gmem.iterator.toint())
+                chunk = Int32(16384)
+                # FP4 uses branch batches; source scales contain both branches
+                # in one expert batch and must be prefetched only once.
+                branch = Int32(0)
+                while branch < branches:
+                    batch = expert_pf * branches + branch
+                    self._prefetch_batch(
+                        w13_base, batch, w13_batch_bytes, lane_id, chunk
+                    )
+                    if cutlass.const_expr(self.source_scales):
+                        if branch == Int32(0):
+                            self._prefetch_batch(
+                                sfb_w13_base,
+                                expert_pf,
+                                sfb_w13_batch_bytes,
+                                lane_id,
+                                chunk,
+                            )
+                    else:
+                        self._prefetch_batch(
+                            sfb_w13_base, batch, sfb_w13_batch_bytes, lane_id, chunk
+                        )
+                    branch += Int32(1)
+                self._prefetch_batch(
+                    down_base, expert_pf, down_batch_bytes, lane_id, chunk
+                )
+                self._prefetch_batch(
+                    sfb_down_base, expert_pf, sfb_down_batch_bytes, lane_id, chunk
+                )
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord = cta_layout_mnk.get_flat_coord(cta_rank)
 
@@ -1211,6 +1518,9 @@ class MoEStaticKernel:
             tma_copy_bytes += cute.size_in_bytes(
                 self.b_dtype, b_smem_one
             ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+        if cutlass.const_expr(self.source_scales):
+            # the gate scale tile arrives through plain stores, not TMA
+            tma_copy_bytes -= cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
         phase2_tma_copy_bytes = cute.size_in_bytes(
             self.b_dtype, b_smem_one
         ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
@@ -1219,7 +1529,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageGated:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 8]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 6]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
@@ -1258,7 +1568,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageRelu2:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 8]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 6]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
@@ -1290,13 +1600,24 @@ class MoEStaticKernel:
         storage = smem.allocate(StorageGated if self.is_gated else StorageRelu2)
 
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # Source scale layout: the w13 full barrier also counts the DMA warp's
+        # arrival after its manual gate-scale stores (two arrivals per stage: the
+        # elected TMA arrive with the transaction count and the manual arrive), so
+        # the consumers' single wait covers the TMA bytes and the manual bytes.
+        # A separate paired barrier that the consumers wait on after the full
+        # barrier costs 5-7 % at M8-M32 (measured); this protocol costs nothing.
+        w13_prod_group = (
+            pipeline.CooperativeGroup(pipeline.Agent.Thread, 2)
+            if self.source_scales
+            else prod_group
+        )
         cons_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.num_mma_warps
         )
         cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
         ml_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stage,
-            producer_group=prod_group,
+            producer_group=w13_prod_group,
             consumer_group=cons_group,
             tx_count=tma_copy_bytes,
             barrier_storage=storage.pipeline_array.data_ptr(),
@@ -1310,7 +1631,6 @@ class MoEStaticKernel:
             barrier_storage=storage.phase2_pipeline_array.data_ptr(),
             cta_layout_vmnk=cta_layout_vmnk,
         )
-
         cute.arch.sync_threads()
 
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
@@ -1355,47 +1675,66 @@ class MoEStaticKernel:
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
-        # Phase 0: cooperative init.  The finalizer overwrites every output
-        # element, so unlike REDG scatter this path needs no output clear.
-        i = flat_tid
-        while i < num_experts:
-            row_counts[i] = Int32(0)
-            i += flat_stride
-        i = flat_tid
-        while i < num_global_experts:
-            global_to_local_expert[i] = Int32(-1)
-            i += flat_stride
+        # Phase 0: clear the routing counters.  The finalizer overwrites every
+        # output element, so unlike REDG scatter this path needs no output clear.
         # virt_route_scratch layout:
         #   [row allocator: weight_E][chunk->local map: weight_E*max_chunks]
         #   [work-claim counter + pad: 8]
+        # The work-claim counter counts from zero; the first two waves stay
+        # statically assigned (CTA b takes linear idx b and b+gdim_z) and the
+        # claim code offsets every atomically claimed task by 2*gdim_z.  Early
+        # waves are inherently balanced, so claiming them only adds an atomic
+        # round-trip on the fetch path — measurable at tiny M (M16 +2.9us).
         virt_scratch_total = Int32(virt_route_scratch.shape[0])
         claim_slot = virt_scratch_total - Int32(8)
         max_chunks = claim_slot // num_global_experts - Int32(1)
-        i = flat_tid
-        while i < virt_scratch_total:
-            scratch_init = Int32(-1)
-            if i < num_global_experts:
-                scratch_init = Int32(0)
-            if i >= claim_slot:
-                scratch_init = Int32(0)
-            if i == claim_slot:
-                # The first two waves stay statically assigned (CTA b takes
-                # linear idx b and b+gdim_z); the counter hands out every
-                # task after that. Early waves are inherently balanced, so
-                # claiming them only adds an atomic round-trip on the fetch
-                # path — measurable at tiny M (M16 +2.9us).
-                scratch_init = Int32(2) * Int32(gdim_z)
-            virt_route_scratch[i] = scratch_init
-            i += flat_stride
-        if flat_tid == Int32(0):
-            active_expert_count[Int32(0)] = Int32(0)
+        # With deferred initialisation the previous launch's finalize kernel
+        # restored the clean state and published the marker; the cooperative
+        # clear and the resident-grid barrier behind it run only when the
+        # marker is absent (fresh workspace, or one last used by another path).
+        # Nothing writes the marker while this kernel runs, so every CTA reads
+        # the same value and the barrier below stays grid-uniform.
+        needs_clear = Int32(1)
+        if cutlass.const_expr(self.deferred_init):
+            marker = _ld_global_acquire_i32(get_ptr_as_int64(route_state, Int32(0)))
+            needs_clear = Int32(marker != Int32(_ROUTE_STATE_CLEAN))
+        if needs_clear > Int32(0):
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                i += flat_stride
+            i = flat_tid
+            while i < num_global_experts:
+                global_to_local_expert[i] = Int32(-1)
+                i += flat_stride
+            i = flat_tid
+            while i < virt_scratch_total:
+                scratch_init = Int32(-1)
+                if i < num_global_experts:
+                    scratch_init = Int32(0)
+                if i >= claim_slot:
+                    scratch_init = Int32(0)
+                virt_route_scratch[i] = scratch_init
+                i += flat_stride
+            if flat_tid == Int32(0):
+                active_expert_count[Int32(0)] = Int32(0)
+                # A launch that clears in its prologue dirties the counters and
+                # only a deferred-mode finalize restores them: withdraw the
+                # marker so the next deferred launch on this workspace clears
+                # again instead of trusting stale state (kernels of both modes
+                # may share one workspace across token counts).
+                route_state[Int32(0)] = Int32(0)
+        # The CTA-level sync stays on both paths: the shared-memory state set
+        # up above must be visible to every warp before routing starts.  Only
+        # the cooperative clear and the grid barrier behind it are deferred.
         cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count,
-            barrier_epoch,
-            Int32(gdim_z),
-            is_cta_leader,
-        )
+        if needs_clear > Int32(0):
+            self._resident_grid_barrier(
+                barrier_count,
+                barrier_epoch,
+                Int32(gdim_z),
+                is_cta_leader,
+            )
 
         pair_idx = Int32(bidz) * Int32(self.num_frontend_warps) + warp_idx
         while pair_idx < total_pairs:
@@ -1548,10 +1887,9 @@ class MoEStaticKernel:
         )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
-        # Single tiled view over concatenated w13 [2*I_tp, K, E].
-        # W13 is packed as [up, gate] across the concatenated N dimension.
-        # Up tiles: N-indices 0..gate_tile_cnt-1
-        # Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
+        # Single tiled view over branch-major w13 [I_tp, K, 2*E]: N tiles
+        # 0..gate_tile_cnt-1 cover one branch, the batch index selects the
+        # branch (up = 2*expert, gate = 2*expert + 1).
         gB_w13_tiled = cute.local_tile(
             mB_w13,
             cute.slice_(self.tile_shape_mnk, (0, None, None)),
@@ -1585,7 +1923,7 @@ class MoEStaticKernel:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # Single w13 TMA partition (gate+up concatenated)
+        # Single w13 TMA partition (gate/up differ only in batch index)
         tBsB_w13, tBgB_w13 = cpasync.tma_partition(
             tma_b_w13,
             b_cta_crd,
@@ -1678,16 +2016,14 @@ class MoEStaticKernel:
 
         k_tile_cnt = cute.size(gA, mode=[3])
         fc1_k_tile_cnt = k_tile_cnt
-        # Gated: w13 has 2*I_tp/tile_N N-tiles. Gate = second half, up = first half.
-        # ReLU2: w13 has I_tp/tile_N N-tiles. Single FC1 pass, no split.
-        intermediate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
-        gate_tile_cnt = (
-            intermediate_tile_cnt // Int32(2)
-            if self.is_gated
-            else intermediate_tile_cnt
-        )
+        # w13's N extent is one branch in both layouts (gated branches sit
+        # at different batch indices), so the FC1 slice count is the N tile
+        # count itself; a partial tail tile rounds up.
+        gate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
         output_tile_cnt = cute.size(gB_down, mode=[2])
         retained_group_count = (gate_tile_cnt + Int32(1)) // Int32(2)
+        if cutlass.const_expr(self.merged_groups):
+            retained_group_count = Int32(1)
         prod_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.ab_stage
         )
@@ -1773,21 +2109,13 @@ class MoEStaticKernel:
                 Int32(0),
             )
             current_work_linear_idx = Int32(bidz)
-            current_local_expert_idx = Int32(0)
-            accum_tile_m = Int32(0)
             published_work_linear_idx = Int32(bidz)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                _compact_static_get_single_m_tile_work(
-                    row_counts,
-                    active_expert_count,
-                    tile_m=Int32(self.tile_shape_mnk[0]),
-                    num_tiles_n=Int32((self.output_tile_count_n + 1) // 2),
-                    cluster_shape_mn=cluster_shape_mn,
-                    current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
-                    cta_id_in_cluster=cta_id_in_cluster,
-                )
+            tile_coord, is_valid_tile = _compact_static_get_single_m_tile_work(
+                active_expert_count,
+                num_tiles_n=Int32(self.scheduler_tiles_n),
+                cluster_shape_mn=cluster_shape_mn,
+                current_work_linear_idx=current_work_linear_idx,
+                cta_id_in_cluster=cta_id_in_cluster,
             )
 
             while is_valid_tile:
@@ -1835,6 +2163,27 @@ class MoEStaticKernel:
                     csSFA_tile = csSFA_full
                     tCrSFA_tile = tCrSFA_full
                     crSFA_tile = crSFA_full
+                # Retained FC1 slots for FC2: the pipeline stages themselves
+                # (retained2) or their upper 64-row halves (merged groups), which
+                # the packed-A ring never touches.
+                q1_row_base = Int32(0)
+                if cutlass.const_expr(self.merged_groups):
+                    q1_row_base = Int32(self.tile_shape_mnk[0])
+                    sA_q1 = cute.local_tile(
+                        sA,
+                        cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (1, 0, None),
+                    )
+                    csA_q1 = thr_ld_A.partition_S(sA_q1)
+                    sSFA_q1 = cute.local_tile(
+                        sSFA,
+                        cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (1, 0, None),
+                    )
+                    csSFA_q1 = thr_ld_SFA.partition_S(sSFA_q1)
+                else:
+                    csA_q1 = csA_tile
+                    csSFA_q1 = csSFA_tile
                 sfb_tile_offset = intermediate_slice % self.sfb_tiles_per_block
                 if cutlass.const_expr(self.sfb_tiles_per_block > 1):
                     sSFB_tile = cute.local_tile(
@@ -1933,7 +2282,7 @@ class MoEStaticKernel:
                 # PHASE A: FC1 for this slice (gate + up)
                 # ============================================================
 
-                for retained_slice_idx in cutlass.range_constexpr(2):
+                for retained_slice_idx in cutlass.range_constexpr(self.retained_slices):
                     # Paired Gate/Up GEMM.  One A/SFA load feeds both branches;
                     # independent B/SFB register fragments keep the two branch
                     # operands live across the back-to-back MMA cadence.
@@ -2182,13 +2531,14 @@ class MoEStaticKernel:
                                         up_acc[None, _mt, _nt],
                                     )
 
-                    # After the second FC1 has drained, the DMA warp may reuse the
+                    # After the last FC1 has drained, the DMA warp may reuse the
                     # Gate B/SFB stages for FC2 while math warps materialize Q1.
-                    if retained_slice_idx == 1:
+                    if retained_slice_idx == self.retained_slices - 1:
                         self.pass_sync_barrier.arrive_and_wait()
-
-                        # sC still holds the first slice.  FC1 no longer needs the
-                        # two A/SFA pipeline stages, so quantize it into Stage0.
+                    if retained_slice_idx >= 1:
+                        # sC still holds the previous slice.  Quantize it into its
+                        # retained slot (retained2: the pipeline stage itself, free
+                        # once FC1 drained; merged: the stage's upper half).
                         self.quantize_q1_sC_to_sA_sSFA(
                             tidx,
                             valid_tile_rows,
@@ -2199,8 +2549,9 @@ class MoEStaticKernel:
                             tRS_sD,
                             sfa_base_addr,
                             sfa_stage_elements,
-                            Int32(0),
+                            Int32(retained_slice_idx - 1),
                             epi_rest_m,
+                            q1_row_base,
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
@@ -2260,7 +2611,7 @@ class MoEStaticKernel:
                             cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
 
-                    if retained_slice_idx == 1:
+                    if retained_slice_idx == self.retained_slices - 1:
                         self.quantize_q1_sC_to_sA_sSFA(
                             tidx,
                             valid_tile_rows,
@@ -2271,8 +2622,9 @@ class MoEStaticKernel:
                             tRS_sD,
                             sfa_base_addr,
                             sfa_stage_elements,
-                            Int32(1),
+                            Int32(retained_slice_idx),
                             epi_rest_m,
+                            q1_row_base,
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
@@ -2317,7 +2669,9 @@ class MoEStaticKernel:
                         tCrSFB_phase2 = tCrSFB_full
                         crSFB_phase2 = crSFB_full
                     down_acc.fill(0.0)
-                    for retained_slice_idx in cutlass.range_constexpr(2):
+                    for retained_slice_idx in cutlass.range_constexpr(
+                        self.retained_slices
+                    ):
                         # Each retained slice occupies one of the two former
                         # FC1 A/SFA pipeline stages.  Reload its fragments, then
                         # accumulate the matching FC2 B tile into one down_acc.
@@ -2325,7 +2679,7 @@ class MoEStaticKernel:
                             num_k_blocks,
                             Int32(retained_slice_idx),
                             Int32(retained_slice_idx),
-                            (csA_tile, csSFA_tile),
+                            (csA_q1, csSFA_q1),
                             (crA_tile, crSFA_tile),
                             (smem_copy_A, smem_copy_SFA),
                         )
@@ -2505,8 +2859,6 @@ class MoEStaticKernel:
                     _ld_shared_i32(ctrl_base_addr + Int32(16)),
                     _ld_shared_i32(ctrl_base_addr + Int32(20)),
                 )
-                current_local_expert_idx = _ld_shared_i32(ctrl_base_addr + Int32(24))
-                accum_tile_m = _ld_shared_i32(ctrl_base_addr + Int32(28))
 
         # ===================================================================
         # DMA WARP (warp 4)
@@ -2525,21 +2877,19 @@ class MoEStaticKernel:
                 Int32(0),
             )
             current_work_linear_idx = Int32(bidz)
-            current_local_expert_idx = Int32(0)
-            accum_tile_m = Int32(0)
+            # Source scale layout geometry: rows 2*I per expert in 128-row atoms,
+            # K in 64-column atoms of 512 bytes; gate rows begin at atom I//128.
+            sf_w13_base = Int64(sfb_w13_gmem.iterator.toint())
+            sf_mn_atoms = Int32(cute.size(sfb_w13_gmem, mode=[0]) // 128)
+            sf_k_atoms_total = Int32(cute.size(sfb_w13_gmem, mode=[1]) // 64)
+            gate_sf_atom0 = Int32(cute.size(mB_w13, mode=[0]) // 128)
             published_work_linear_idx = Int32(bidz)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                _compact_static_get_single_m_tile_work(
-                    row_counts,
-                    active_expert_count,
-                    tile_m=Int32(self.tile_shape_mnk[0]),
-                    num_tiles_n=Int32((self.output_tile_count_n + 1) // 2),
-                    cluster_shape_mn=cluster_shape_mn,
-                    current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
-                    cta_id_in_cluster=cta_id_in_cluster,
-                )
+            tile_coord, is_valid_tile = _compact_static_get_single_m_tile_work(
+                active_expert_count,
+                num_tiles_n=Int32(self.scheduler_tiles_n),
+                cluster_shape_mn=cluster_shape_mn,
+                current_work_linear_idx=current_work_linear_idx,
+                cta_id_in_cluster=cta_id_in_cluster,
             )
 
             while is_valid_tile:
@@ -2551,29 +2901,70 @@ class MoEStaticKernel:
                 # Publish two adjacent N128 FC1 slices through the same paired
                 # Gate/Up pipeline.  Consumer releases make Stage0/1 reusable;
                 # no extra shared storage is needed.
-                for retained_slice_idx in cutlass.range_constexpr(2):
+                # Branch-major w13: batch index 2e is the up branch and 2e+1
+                # the gate branch; non-gated w13 has one branch at index e.
+                up_batch_idx = (
+                    weight_expert_idx * Int32(2) if self.is_gated else weight_expert_idx
+                )
+                # Source scale layout: one batch per expert; the up scales are
+                # its first N tiles, the gate scales start half an atom in.
+                sf_up_batch_idx = (
+                    weight_expert_idx if self.source_scales else up_batch_idx
+                )
+                gate_batch_idx = (
+                    weight_expert_idx * Int32(2) + Int32(1)
+                    if self.is_gated
+                    else weight_expert_idx
+                )
+                for retained_slice_idx in cutlass.range_constexpr(self.retained_slices):
                     current_slice = intermediate_slice + Int32(retained_slice_idx)
-                    tBgB_w13_up_nk = tBgB_w13[
-                        (None, current_slice, None, weight_expert_idx)
-                    ]
-                    sfb_up_tile_coord = current_slice // self.sfb_tiles_per_block
+                    sfb_tile_coord = current_slice // self.sfb_tiles_per_block
+                    tBgB_w13_up_nk = tBgB_w13[(None, current_slice, None, up_batch_idx)]
                     tBgSFB_w13_up_nk = tBgSFB_w13[
-                        (None, sfb_up_tile_coord, None, weight_expert_idx)
+                        (None, sfb_tile_coord, None, sf_up_batch_idx)
                     ]
-                    gate_slice = (
-                        current_slice + gate_tile_cnt
-                        if self.is_gated
-                        else current_slice
-                    )
                     tBgB_w13_gate_nk = tBgB_w13[
-                        (None, gate_slice, None, weight_expert_idx)
+                        (None, current_slice, None, gate_batch_idx)
                     ]
-                    sfb_gate_tile_coord = gate_slice // self.sfb_tiles_per_block
                     tBgSFB_w13_gate_nk = tBgSFB_w13[
-                        (None, sfb_gate_tile_coord, None, weight_expert_idx)
+                        (None, sfb_tile_coord, None, gate_batch_idx)
                     ]
 
                     prod_state.reset_count()
+                    # Source scale layout: the gate scale halves of a stage are
+                    # loaded one stage ahead (four registers per lane: two 64-column
+                    # K atoms x two halves) so their global-load latency overlaps
+                    # the previous stage's TMA instead of sitting on the DMA warp's
+                    # critical path (measured +5-7 % at M8-M32 without it).
+                    sf_gate_row = (
+                        weight_expert_idx * sf_mn_atoms + gate_sf_atom0 + sfb_tile_coord
+                    ) * sf_k_atoms_total
+                    sf_has_a = gate_sf_atom0 + sfb_tile_coord < sf_mn_atoms
+                    sf_has_b = gate_sf_atom0 + sfb_tile_coord + Int32(1) < sf_mn_atoms
+                    sf_pa0 = Uint64(0)
+                    sf_pb0 = Uint64(0)
+                    sf_pa1 = Uint64(0)
+                    sf_pb1 = Uint64(0)
+                    if cutlass.const_expr(self.source_scales):
+                        if fc1_k_tile_cnt > Int32(0):
+                            sf_pa0, sf_pb0 = self._load_gate_sf_halves(
+                                sf_w13_base,
+                                sf_gate_row,
+                                Int32(0),
+                                lane_id,
+                                sf_has_a,
+                                sf_has_b,
+                                sf_k_atoms_total,
+                            )
+                            sf_pa1, sf_pb1 = self._load_gate_sf_halves(
+                                sf_w13_base,
+                                sf_gate_row,
+                                Int32(1),
+                                lane_id,
+                                sf_has_a,
+                                sf_has_b,
+                                sf_k_atoms_total,
+                            )
                     for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):  # type: ignore[call-overload]
                         ml_pipeline.producer_acquire(prod_state)
                         cute.copy(
@@ -2582,12 +2973,60 @@ class MoEStaticKernel:
                             tBsB_w13[(None, prod_state.index)],
                             tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                         )
-                        cute.copy(
-                            tma_sfb_w13,
-                            tBgSFB_w13_gate_nk[(None, k_tile)],
-                            tBsSFB_w13[(None, prod_state.index)],
-                            tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
-                        )
+                        if cutlass.const_expr(self.source_scales):
+                            # Gate scale tile from the caller's layout: gate rows
+                            # start half an atom in (I % 128 == 64), so every
+                            # 16-byte smem chunk i is the upper 8 bytes of chunk i
+                            # of source atom (I//128 + t) followed by the lower 8
+                            # bytes of chunk i of the next atom.  Halves past the
+                            # expert's atoms are zero: the last real tile's second
+                            # half, and both halves of the phantom slice that the
+                            # paired N128 publication issues beyond an odd slice
+                            # count (its FP4 rows are zero-filled by TMA anyway).
+                            # The halves were loaded one stage ahead; store them
+                            # and load the next stage's.
+                            dst = get_smem_ptr_as_int32(
+                                sSFB,
+                                Int32(prod_state.index) * Int32(self.sf_stage_bytes)
+                                + lane_id * Int32(16),
+                            )
+                            _st_shared_u64(dst, sf_pa0)
+                            _st_shared_u64(dst + Int32(8), sf_pb0)
+                            _st_shared_u64(dst + Int32(512), sf_pa1)
+                            _st_shared_u64(dst + Int32(520), sf_pb1)
+                            sf_pa0 = Uint64(0)
+                            sf_pb0 = Uint64(0)
+                            sf_pa1 = Uint64(0)
+                            sf_pb1 = Uint64(0)
+                            if k_tile + Int32(1) < fc1_k_tile_cnt:
+                                k_atom_next = (k_tile + Int32(1)) * Int32(2)
+                                sf_pa0, sf_pb0 = self._load_gate_sf_halves(
+                                    sf_w13_base,
+                                    sf_gate_row,
+                                    k_atom_next,
+                                    lane_id,
+                                    sf_has_a,
+                                    sf_has_b,
+                                    sf_k_atoms_total,
+                                )
+                                sf_pa1, sf_pb1 = self._load_gate_sf_halves(
+                                    sf_w13_base,
+                                    sf_gate_row,
+                                    k_atom_next + Int32(1),
+                                    lane_id,
+                                    sf_has_a,
+                                    sf_has_b,
+                                    sf_k_atoms_total,
+                                )
+                        else:
+                            cute.copy(
+                                tma_sfb_w13,
+                                tBgSFB_w13_gate_nk[(None, k_tile)],
+                                tBsSFB_w13[(None, prod_state.index)],
+                                tma_bar_ptr=ml_pipeline.producer_get_barrier(
+                                    prod_state
+                                ),
+                            )
                         if cutlass.const_expr(self.is_gated):
                             cute.copy(
                                 tma_b_w13,
@@ -2605,6 +3044,23 @@ class MoEStaticKernel:
                                     prod_state
                                 ),
                             )
+                        if cutlass.const_expr(self.source_scales):
+                            # Publish the gate-scale tile: each lane orders its
+                            # generic shared stores before any async-proxy reader
+                            # (fence.proxy.async), the warp syncs so every lane's
+                            # stores precede the leader's release-arrive on the
+                            # stage's full barrier - its second producer arrival
+                            # (the first is the elected TMA arrive that set the
+                            # transaction count), so the phase the consumers wait
+                            # on completes only after the TMA bytes and these
+                            # stores.  producer_commit of the TMA pipeline is a
+                            # no-op (TMA completes the transaction itself).
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cute.arch.sync_warp()
+                            if lane_id == Int32(0):
+                                cute.arch.mbarrier_arrive(
+                                    ml_pipeline.producer_get_barrier(prod_state)
+                                )
                         ml_pipeline.producer_commit(prod_state)
                         prod_state.advance()
 
@@ -2621,7 +3077,9 @@ class MoEStaticKernel:
                 # the gate staging buffers.
                 phase2_prod_state.reset_count()
                 for output_tile_idx in range(0, output_tile_cnt, 1, unroll=4):  # type: ignore[call-overload]
-                    for retained_slice_idx in cutlass.range_constexpr(2):
+                    for retained_slice_idx in cutlass.range_constexpr(
+                        self.retained_slices
+                    ):
                         current_slice = intermediate_slice + Int32(retained_slice_idx)
                         phase2_pipeline.producer_acquire(phase2_prod_state)
                         cute.copy(
@@ -2671,25 +3129,24 @@ class MoEStaticKernel:
                             published_work_linear_idx + num_persistent_clusters
                         )
                     else:
-                        next_work_linear_idx = atomic_add_global_i32(
-                            get_ptr_as_int64(virt_route_scratch, claim_slot),
-                            Int32(1),
+                        # The counter counts claimed tasks from zero; the two
+                        # statically assigned waves precede them.
+                        next_work_linear_idx = (
+                            atomic_add_global_i32(
+                                get_ptr_as_int64(virt_route_scratch, claim_slot),
+                                Int32(1),
+                            )
+                            + Int32(2) * num_persistent_clusters
                         )
                     published_work_linear_idx = next_work_linear_idx
                     (
                         next_tile_coord,
                         next_is_valid_tile,
-                        next_local_expert_idx,
-                        next_accum_tile_m,
                     ) = _compact_static_get_single_m_tile_work(
-                        row_counts,
                         active_expert_count,
-                        tile_m=Int32(self.tile_shape_mnk[0]),
-                        num_tiles_n=Int32((self.output_tile_count_n + 1) // 2),
+                        num_tiles_n=Int32(self.scheduler_tiles_n),
                         cluster_shape_mn=cluster_shape_mn,
                         current_work_linear_idx=next_work_linear_idx,
-                        current_local_expert_idx=current_local_expert_idx,
-                        accum_tile_m=accum_tile_m,
                         cta_id_in_cluster=cta_id_in_cluster,
                     )
                     _st_shared_i32(ctrl_base_addr + Int32(8), Int32(next_is_valid_tile))
@@ -2702,8 +3159,6 @@ class MoEStaticKernel:
                     _st_shared_i32(
                         ctrl_base_addr + Int32(20), Int32(next_tile_coord[2])
                     )
-                    _st_shared_i32(ctrl_base_addr + Int32(24), next_local_expert_idx)
-                    _st_shared_i32(ctrl_base_addr + Int32(28), next_accum_tile_m)
 
                 # Final pass_sync: match MMA warps' barrier after FC2 sweep.
                 # Ensures MMA warps finish scatter before DMA starts next task's FC1.
@@ -2716,8 +3171,6 @@ class MoEStaticKernel:
                     _ld_shared_i32(ctrl_base_addr + Int32(16)),
                     _ld_shared_i32(ctrl_base_addr + Int32(20)),
                 )
-                current_local_expert_idx = _ld_shared_i32(ctrl_base_addr + Int32(24))
-                accum_tile_m = _ld_shared_i32(ctrl_base_addr + Int32(28))
 
             ml_pipeline.producer_tail(prod_state)
             phase2_pipeline.producer_tail(phase2_prod_state)
@@ -2733,6 +3186,12 @@ class MoEStaticKernel:
         scatter_output: cute.Tensor,
         topk_ids: cute.Tensor,
         retained_group_count: cutlass.Constexpr,
+        route_state: cute.Tensor,
+        row_counts: cute.Tensor,
+        active_expert_count: cute.Tensor,
+        global_to_local_expert: cute.Tensor,
+        virt_route_scratch: cute.Tensor,
+        deferred_init: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         _, _, bidz = cute.arch.block_idx()
@@ -2746,6 +3205,41 @@ class MoEStaticKernel:
         num_topk = total_pairs // num_tokens
         vecs_per_token = cols // Int32(8)
         final_vec_count = num_tokens * vecs_per_token
+        if cutlass.const_expr(deferred_init):
+            # Restore the clean routing-counter state for the next static
+            # launch.  Only the experts and chunks this launch touched need a
+            # write (untouched entries kept their clean value); the row
+            # allocators say which, and each touched chunk slot names the local
+            # expert whose row count goes back to zero.  Nothing in this kernel
+            # reads the counters after the reduction, and the next launch is
+            # stream-ordered behind this one, so no intra-kernel ordering is
+            # needed: one CTA resets the shared scalars and publishes the marker.
+            # The restore is issued before the reduction so its memory latency
+            # overlaps the reduction instead of extending the kernel's tail.
+            num_global_experts = Int32(global_to_local_expert.shape[0])
+            virt_scratch_total = Int32(virt_route_scratch.shape[0])
+            claim_slot = virt_scratch_total - Int32(8)
+            max_chunks = claim_slot // num_global_experts - Int32(1)
+            expert = flat_tid
+            while expert < num_global_experts:
+                allocated = virt_route_scratch[expert]
+                if allocated > Int32(0):
+                    touched_chunks = (allocated + Int32(31)) >> Int32(5)
+                    chunk = Int32(0)
+                    while chunk < touched_chunks:
+                        slot = num_global_experts + expert * max_chunks + chunk
+                        local_expert = virt_route_scratch[slot]
+                        if local_expert >= Int32(0):
+                            row_counts[local_expert] = Int32(0)
+                        virt_route_scratch[slot] = Int32(-1)
+                        chunk += Int32(1)
+                    virt_route_scratch[expert] = Int32(0)
+                    global_to_local_expert[expert] = Int32(-1)
+                expert += flat_stride
+            if flat_tid == Int32(0):
+                active_expert_count[Int32(0)] = Int32(0)
+                virt_route_scratch[claim_slot] = Int32(0)
+                route_state[Int32(0)] = Int32(_ROUTE_STATE_CLEAN)
         final_vec_idx = flat_tid
         while final_vec_idx < final_vec_count:
             final_token = final_vec_idx // vecs_per_token
@@ -2789,55 +3283,8 @@ class MoEStaticKernel:
                 final_acc[7],
             )
             final_vec_idx += flat_stride
+
         return
-
-
-@cute.jit
-def _compact_static_get_work_tile(
-    row_counts: cute.Tensor,
-    active_expert_count: cute.Tensor,
-    *,
-    tile_m: Int32,
-    num_tiles_n: Int32,
-    cluster_shape_mn: Tuple[Int32, Int32],
-    current_work_linear_idx: Int32,
-    current_local_expert_idx: Int32,
-    accum_tile_m: Int32,
-    cta_id_in_cluster: cute.Coord,
-) -> Tuple[Tuple[Int32, Int32, Int32], Integer, Int32, Int32]:
-    num_active_experts = active_expert_count[Int32(0)]
-    scan_local_expert_idx = current_local_expert_idx
-    tile_m_minus_one = tile_m - Int32(1)
-
-    while scan_local_expert_idx < num_active_experts:
-        batch_rows = row_counts[scan_local_expert_idx]
-        batch_m_tiles = (batch_rows + tile_m_minus_one) // tile_m
-        if (accum_tile_m + batch_m_tiles) * num_tiles_n > current_work_linear_idx:
-            current_local_expert_idx = scan_local_expert_idx
-            scan_local_expert_idx = num_active_experts
-        else:
-            accum_tile_m += batch_m_tiles
-            scan_local_expert_idx += Int32(1)
-            current_local_expert_idx = scan_local_expert_idx
-
-    is_valid = current_local_expert_idx < num_active_experts
-    if is_valid:
-        batch_rows = row_counts[current_local_expert_idx]
-        is_valid = (
-            accum_tile_m + (batch_rows + tile_m_minus_one) // tile_m
-        ) * num_tiles_n > current_work_linear_idx
-
-    cur_cluster_coord = (
-        current_work_linear_idx // num_tiles_n - accum_tile_m,
-        current_work_linear_idx % num_tiles_n,
-        current_local_expert_idx,
-    )
-    cur_tile_coord = (
-        Int32(cur_cluster_coord[0]) * cluster_shape_mn[0] + cta_id_in_cluster[0],
-        Int32(cur_cluster_coord[1]) * cluster_shape_mn[1] + cta_id_in_cluster[1],
-        Int32(cur_cluster_coord[2]),
-    )
-    return cur_tile_coord, is_valid, current_local_expert_idx, accum_tile_m
 
 
 __all__ = ["MoEStaticKernel"]

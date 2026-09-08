@@ -2156,15 +2156,13 @@ class MoEMicroKernel:
                             tRS_sD[(None, None, None, epi_buffer)],
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        # No cross-warp barrier needed before scatter:
-                        # StMatrix is warp-local, and each warp only reads
-                        # its own 64x64 quadrant of sC below.
+                        # The retiled stores and row-major scatter use different
+                        # warp ownership; finish all stores before any reads.
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
-                        # Per-warp scatter: each warp scatters its own quadrant
-                        # of sC (64 M-rows x 64 N-cols). No cross-warp read
-                        # dependencies, so no pre-scatter barrier is needed.
+                        # Each scatter warp reads a 64-row by 64-column region.
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
                         )

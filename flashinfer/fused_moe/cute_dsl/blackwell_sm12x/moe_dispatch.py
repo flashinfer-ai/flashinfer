@@ -11,7 +11,7 @@ import hashlib
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -36,6 +36,7 @@ from .moe_dynamic_kernel import (
     _MAX_SHARED_INPUT_TOPK,
     _TASK_SLICE_CHUNK,
     MoEDynamicKernel,
+    _can_use_gated_optimized_kernel,
 )
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
@@ -62,7 +63,16 @@ _NVFP4_BLOCK_SIZE = 16
 _MXFP4_BLOCK_SIZE = 32
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
+# Virtual experts hold at most 32 rows; M128 would double padded MMA work.
+_COMPACT_MMA_TILER_MN = (64, 128)
 _STATIC_RETAINED_GROUP_N = 2 * _LEVEL_TILE_N
+# Rows stored per compact (virtual) expert slot in the static workspace.  The
+# static route kernel splits every expert into 32-row chunks (chunk =
+# alloc_row >> 5), each with its own slot, so no slot ever holds more rows;
+# the kernels read the slot stride from token_map.shape[1].  Sizing slots at
+# 32 rows instead of the routed-row capacity keeps the packed-activation
+# planes at a few MB for any capacity (E=512, 2560 rows: 2.2 GB -> ~40 MB).
+_STATIC_SLOT_ROWS = 32
 # Must equal the kernel's task materialization granularity or the task
 # queue is mis-sized.
 _DYNAMIC_SLICE_CHUNK = _TASK_SLICE_CHUNK
@@ -93,8 +103,80 @@ _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 # The retained NVFP4 path uses the tile64 schedule through 1024 routed pairs.
 # MXFP4 keeps the generic 640-pair compact boundary.
 _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT = 1024
+# The static/dynamic crossover sits at a routed-row density (rows per weight
+# expert), so the NVFP4 band scales with E above the 1024-pair floor.  These
+# two densities are the legacy fallback for keys without a measured
+# registry entry (below): 8 rows per expert when the intermediate extent is a
+# 128 multiple, 16 otherwise (the padded extents keep a wider band because
+# their static path streams the true extent while the generic dynamic path
+# still consumes 128-padded weights; the branch-major gated dynamic kernel
+# streams the true extent on branch-major views, so the 16-row band is a measured legacy
+# of the shapes it was derived on, not a byte argument). Eligible merged-three
+# schedules use the separately calibrated density below.
+_STATIC_COMPACT_CUTOVER_ROWS_PER_EXPERT = 8
+_STATIC_COMPACT_CUTOVER_ROWS_PER_EXPERT_PADDED = 16
+
+
+# Measured static/dynamic cutover registry.  Key =
+# (quant_mode, activation, E, H, I_true, top_k, sm_count, wrapper capacity in
+# tokens); value = routed-pair cutover (static while routed pairs <= value).
+# Match every key part: measurements do not transfer to another geometry,
+# device SM count, or wrapper capacity. Unknown keys use the density rule.
+def _static_cutover_capacity_key(capacity_tokens: int | None) -> int | None:
+    """Capacity part of the cutover key: the wrapper's token capacity itself
+    (None when the caller does not know it, which disqualifies the registry)."""
+    if capacity_tokens is None:
+        return None
+    capacity_tokens = int(capacity_tokens)
+    return capacity_tokens if capacity_tokens > 0 else None
+
+
+_STATIC_CUTOVER_REGISTRY: Dict[Tuple[str, str, int, int, int, int, int, int], int] = {
+    # Seven rows/expert balances random and skewed routes; eight regresses Zipf.
+    ("nvfp4", "silu", 256, 2048, 512, 8, 110, 8192): 1792,
+}
+
+
+def _static_cutover_registry_lookup(
+    quant_mode: str | None,
+    activation: str | None,
+    num_experts: int | None,
+    hidden_size: int | None,
+    intermediate_size: int | None,
+    num_topk: int | None,
+    sm_count: int | None,
+    capacity_tokens: int | None,
+) -> int | None:
+    """Registry cutover for a fully specified key; None when any key part
+    (including the wrapper capacity) is missing or the key is unmeasured (the
+    caller then applies the density rule)."""
+    capacity_key = _static_cutover_capacity_key(capacity_tokens)
+    if None in (
+        quant_mode,
+        activation,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        num_topk,
+        sm_count,
+        capacity_key,
+    ):
+        return None
+    key = (
+        str(quant_mode),
+        str(activation),
+        int(num_experts),
+        int(hidden_size),
+        int(intermediate_size),
+        int(num_topk),
+        int(sm_count),
+        int(capacity_key),
+    )
+    return _STATIC_CUTOVER_REGISTRY.get(key)
+
+
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
+_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[Tuple, int] = {}
 
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
 # Each entry is (max_routed_rows, optimal_mac).
@@ -138,6 +220,43 @@ def _lookup_mac_ladder(
 
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _static_retained_groups(n: int) -> int:
+    """Retained2 groups for intermediate size ``n``: pairs of N128 slices,
+    rounded up.  An odd slice count keeps a phantom partner slice that TMA
+    zero-fills; the finalize sums exactly this many route-scratch slots."""
+    return max(1, _align_up(n, _STATIC_RETAINED_GROUP_N) // _STATIC_RETAINED_GROUP_N)
+
+
+# Below this measured floor, merging tasks underfills the resident grid.
+_STATIC_MERGED_GROUPS_MIN_PAIRS = 1920
+# Three retained slices remove the phantom fourth slice and one FC2
+# epilogue. Boundary A/B supports a conservative 17 rows/expert for this
+# schedule; 20 helped random routes but regressed skewed routes. This is a
+# calibrated heuristic, not a universal optimum across routing distributions.
+_STATIC_MERGED_CUTOVER_ROWS_PER_EXPERT = 17
+
+
+def _static_merged_groups(n: int, routed_pairs: int) -> bool:
+    """Merged-groups dispatch rule: run the static kernel's merged schedule (one task
+    per expert, every N128 slice retained, FC2 once, route scratch ``[route, K]``)
+    for the three-slice intermediate extents (256 < n <= 384, the retained-three
+    specialization) at or above the calibrated routed-pair floor.  Two-slice
+    extents already form one group and keep the retained2 schedule; four or more
+    slices do not fit the three A/SFA stages.  The selected schedule is part of
+    the static cache key and artifact name."""
+    slices = max(1, _align_up(n, _LEVEL_TILE_N) // _LEVEL_TILE_N)
+    return slices == 3 and routed_pairs >= _STATIC_MERGED_GROUPS_MIN_PAIRS
+
+
+# Amortize finalize's counter restore before removing the prologue clear.
+_STATIC_DEFERRED_INIT_MIN_PAIRS = 256
+
+
+def _static_deferred_init(routed_pairs: int) -> bool:
+    """Defer counter clearing when the launch amortizes the finalize restore."""
+    return int(routed_pairs) >= _STATIC_DEFERRED_INIT_MIN_PAIRS
 
 
 # The kernels index the packed activation and scale planes with 32-bit
@@ -276,12 +395,60 @@ def _select_dynamic_tile_m(
 def _get_static_compact_cutover_pairs(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
+    num_experts: int | None = None,
+    intermediate_size: int | None = None,
+    *,
+    hidden_size: int | None = None,
+    activation: str | None = None,
+    num_topk: int | None = None,
+    capacity_tokens: int | None = None,
+    sm_count: int | None = None,
 ) -> int:
+    """Routed-pair cutover of the static band: environment override, else the
+    measured registry entry of the full key (quant mode, activation, E, H,
+    I_true, top-k, SM count, wrapper capacity), else the density rule."""
     activation_precision = _normalize_activation_precision(activation_precision)
+    if sm_count is None and None not in (
+        hidden_size,
+        activation,
+        num_topk,
+        num_experts,
+        intermediate_size,
+    ):
+        sm_count = (
+            get_num_sm(torch.device("cuda")) if torch.cuda.is_available() else None
+        )
+    capacity_key = _static_cutover_capacity_key(capacity_tokens)
+    registry_key_known = None not in (
+        quant_mode,
+        activation,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        num_topk,
+        sm_count,
+        capacity_key,
+    )
+    padded_intermediate = (
+        intermediate_size is not None and int(intermediate_size) % _LEVEL_TILE_N != 0
+    )
+    # A single N128 slice makes the static family stream a 256-aligned
+    # extent (twice the true weights), so it keeps the flat boundary instead
+    # of the density-widened band.
+    single_slice = intermediate_size is not None and static_needs_256_extent(
+        int(intermediate_size)
+    )
+    # Partial keys also affect the fallback's activation/top-k/slice policy.
     cache_key = (
-        f"{activation_precision}:{quant_mode}"
-        if quant_mode is not None
-        else activation_precision
+        activation_precision,
+        quant_mode,
+        num_experts,
+        intermediate_size,
+        hidden_size,
+        activation,
+        num_topk,
+        sm_count,
+        capacity_key,
     )
     cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(cache_key)
     if cached is not None:
@@ -294,56 +461,53 @@ def _get_static_compact_cutover_pairs(
         "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
     )
     cutover = _first_env(*cutover_names)
-    if cutover is None:
+    registry_pairs = (
+        _static_cutover_registry_lookup(
+            quant_mode,
+            activation,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_topk,
+            sm_count,
+            capacity_tokens,
+        )
+        if registry_key_known
+        else None
+    )
+    if cutover is None and registry_pairs is not None:
+        cached = int(registry_pairs)
+    elif cutover is None:
         # Only the retained NVFP4 implementation earns the wider band; the
         # generic implementation (MXFP4, or unspecified quant mode) keeps
         # the original boundary.
-        cached = (
-            _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
-            if quant_mode == "nvfp4"
-            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-        )
+        if quant_mode == "nvfp4":
+            cached = _STATIC_COMPACT_CUTOVER_PAIRS_NVFP4_DEFAULT
+            if num_experts is not None and not single_slice:
+                rows_per_expert = (
+                    _STATIC_COMPACT_CUTOVER_ROWS_PER_EXPERT_PADDED
+                    if padded_intermediate
+                    else _STATIC_COMPACT_CUTOVER_ROWS_PER_EXPERT
+                )
+                if (
+                    activation is not None
+                    and is_gated_activation(activation)
+                    and num_topk is not None
+                    and num_topk > 1
+                    and intermediate_size is not None
+                    and 256 < intermediate_size <= 384
+                    and _static_merged_groups(
+                        intermediate_size, rows_per_expert * int(num_experts)
+                    )
+                ):
+                    rows_per_expert = _STATIC_MERGED_CUTOVER_ROWS_PER_EXPERT
+                cached = max(cached, rows_per_expert * int(num_experts))
+        else:
+            cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
     else:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[cache_key] = cached
     return cached
-
-
-def _select_moe_mma_tiler_mn(
-    routed_rows: int,
-    n: int,
-    *,
-    resident_clusters: int | None = None,
-) -> Tuple[int, int]:
-    """Select optimal MoE tile shape based on routed rows and N dimension.
-
-    Uses narrower 64x128 tiles when routed_rows <= 128 and default 128x128
-    would leave SMs idle.
-    """
-    sm_count = get_num_sm(torch.device("cuda"))
-    coarse_tile = (128, 128)
-    if routed_rows <= 32 and n <= 256:
-        return (64, 128)
-    # The retained2 static path uses narrow tiles throughout the compact band.
-    # The 32-row virtual-expert split bounds each scheduled tile to at most 32
-    # valid rows, so tile64 remains valid regardless of physical expert skew.
-    # 1024 covers the NVFP4 static band; MXFP4's static band ends at its
-    # 640-pair cutover, below which both thresholds pick the same tile.
-    if routed_rows <= 1024:
-        return (64, 128)
-    if resident_clusters is not None and resident_clusters < sm_count:
-        return coarse_tile
-    coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
-        (n + coarse_tile[1] - 1) // coarse_tile[1]
-    )
-    # Single-token decode often lands exactly on the "half the machine"
-    # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
-    # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
-    if routed_rows <= 64 or (
-        routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2)
-    ):
-        return (64, 128)
-    return (128, 128)
 
 
 def _as_grouped_scale_view(
@@ -379,10 +543,10 @@ class Sm120StaticMoEWorkspace:
 
     # Buffers
     row_counts: torch.Tensor  # [state_E] int32
-    token_map: torch.Tensor  # [state_E, max_rows] int32
-    token_weights: torch.Tensor  # [state_E, max_rows] float32
-    packed_input: torch.Tensor  # [state_E, max_rows, k//2] uint8
-    packed_input_scale: torch.Tensor  # [state_E, rows_pad_k, cols_pad_k] uint8
+    token_map: torch.Tensor  # [virt_E, _STATIC_SLOT_ROWS] int32
+    token_weights: torch.Tensor  # [virt_E, _STATIC_SLOT_ROWS] float32
+    packed_input: torch.Tensor  # [virt_E, _STATIC_SLOT_ROWS, k//2] uint8
+    packed_input_scale: torch.Tensor  # [virt_E, 128, cols_pad_k] uint8
     barrier_count: torch.Tensor  # [1] int32
     barrier_epoch: torch.Tensor  # [1] int32
     active_expert_count: torch.Tensor  # [1] int32
@@ -391,8 +555,15 @@ class Sm120StaticMoEWorkspace:
     compact_topk_ids: torch.Tensor  # [state_E] int32, for micro kernel pre-pass
     # 32-row virtual-expert split scratch: [weight_E] monotone row allocators
     # followed by [weight_E, max_chunks] chunk -> local expert id map. The
-    # static route kernel re-initializes it every launch (graph-replay safe).
+    # static kernel clears it when the workspace carries no clean marker and
+    # its finalize kernel restores the clean state afterwards (graph-replay safe).
     virt_route_scratch: torch.Tensor  # [weight_E*(1+max_chunks)] int32
+    # [0] clean marker published by the static kernel's finalize (rest reserved).
+    route_state: torch.Tensor  # [8] int32
+    # The tiny-decode micro kernel keeps private copies of the two counters it
+    # shares with the static kernel, so it can never disturb the clean state.
+    micro_row_counts: torch.Tensor  # [state_E] int32
+    micro_active_expert_count: torch.Tensor  # [1] int32
     route_output_scratch: torch.Tensor  # [max_rows, ceil(n/256), k] bf16
 
     # Views (set after allocation)
@@ -430,7 +601,7 @@ def allocate_sm120_static_workspace(
     quant_mode: str = "nvfp4",
 ) -> Sm120StaticMoEWorkspace:
     """Allocate workspace buffers for the SM120 static MoE kernel."""
-    n = _align_up(n, _STATIC_RETAINED_GROUP_N)
+    n = _align_up(n, _LEVEL_TILE_N)
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -440,19 +611,22 @@ def allocate_sm120_static_workspace(
 
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
-    rows_pad_k = _align_up(max_rows, 128)
+    # Per-slot activation planes: 32 routed rows (the chunk size) and one
+    # 128-row block-scale atom.  max_rows stays the routed-row capacity.
+    slot_rows = _STATIC_SLOT_ROWS
+    rows_pad_k = _align_up(slot_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
     # The 32-row virtual-expert split may open extra compact expert slots for
     # experts with >32 routed rows. Sum(ceil(rows_e/32)) <= actives +
     # total_rows/32, so ceil(max_rows/32) extra slots always suffice.
     max_chunks = (max_rows + 31) // 32
     virt_E = state_E + max_chunks
-    retained_groups = max(1, n // _STATIC_RETAINED_GROUP_N)
-    _check_memref_limit("static packed_input", virt_E * max_rows * (k // 2))
+    retained_groups = _static_retained_groups(n)
+    _check_memref_limit("static packed_input", virt_E * slot_rows * (k // 2))
     _check_memref_limit("static packed_input_scale", virt_E * rows_pad_k * cols_pad_k)
     _check_memref_limit("static route_output_scratch", max_rows * retained_groups * k)
     packed_input = torch.empty(
-        virt_E, max_rows, k // 2, dtype=torch.uint8, device=device
+        virt_E, slot_rows, k // 2, dtype=torch.uint8, device=device
     )
 
     workspace = Sm120StaticMoEWorkspace(
@@ -466,8 +640,10 @@ def allocate_sm120_static_workspace(
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         row_counts=torch.zeros(virt_E, dtype=torch.int32, device=device),
-        token_map=torch.zeros(virt_E, max_rows, dtype=torch.int32, device=device),
-        token_weights=torch.zeros(virt_E, max_rows, dtype=torch.float32, device=device),
+        token_map=torch.zeros(virt_E, slot_rows, dtype=torch.int32, device=device),
+        token_weights=torch.zeros(
+            virt_E, slot_rows, dtype=torch.float32, device=device
+        ),
         packed_input=packed_input,
         packed_input_scale=torch.empty(
             virt_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device
@@ -487,6 +663,9 @@ def allocate_sm120_static_workspace(
             dtype=torch.int32,
             device=device,
         ),
+        route_state=torch.zeros(8, dtype=torch.int32, device=device),
+        micro_row_counts=torch.zeros(virt_E, dtype=torch.int32, device=device),
+        micro_active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         route_output_scratch=torch.empty(
             max_rows,
             retained_groups,
@@ -559,6 +738,88 @@ class _WeightViews:
     w2_scale_storage: torch.Tensor | None = None
     _w13_sf_storage: torch.Tensor | None = None
     _down_sf_storage: torch.Tensor | None = None
+    # Static-kernel views at the true intermediate extent: gated w13 as
+    # [n, k//2, 2E] with the up branch at batch 2e and gate at 2e+1, down as
+    # [k, n//2, E].  TMA zero-fills past the extent, so a non-tile-multiple
+    # intermediate size costs no padded-weight traffic.
+    static_w13_fp4: object = None
+    static_down_fp4: object = None
+    intermediate_size: int | None = None
+    # Extent the static views span and, for single-slice shapes, the static
+    # kernel's own 256-aligned scale storages (see _get_weight_views).
+    static_intermediate_size: int | None = None
+    static_w13_sf_storage: torch.Tensor | None = None
+    static_down_sf_storage: torch.Tensor | None = None
+    # Branch-major views for the gated dynamic kernel at ``intermediate_size``
+    # (the static views may span a larger extent, see static_override).
+    branch_major_w13_fp4: object = None
+    branch_major_down_fp4: object = None
+    # Single-slice shapes: the whole static family (static, MMA micro, direct
+    # micro) consumes the 256-aligned copies; keep their backing storages.
+    static_family_w1_storage: torch.Tensor | None = None
+    static_family_w2_storage: torch.Tensor | None = None
+    # Lazy legacy views: when the caller hands over unpadded weights, the
+    # tile-padded [2n, k//2, E] / [k, n//2, E] copies the dynamic and micro
+    # kernels consume are built by this callable on first use only.
+    _legacy_builder: Optional[Callable[[], Tuple[torch.Tensor, torch.Tensor]]] = None
+    # Source scale layout for the static kernel: the scale storages above are the
+    # caller's own (no copy); the tile-padded scales the dynamic / micro kernels
+    # index are built by this callable on their first use only.
+    source_scales: bool = False
+    _padded_scale_builder: Optional[Callable[[], Tuple[torch.Tensor, torch.Tensor]]] = (
+        None
+    )
+    _padded_w13_sf_storage: torch.Tensor | None = None
+    _padded_down_sf_storage: torch.Tensor | None = None
+
+    def padded_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The tile-padded block-scale storages (dynamic / micro / direct-micro
+        operands).  Without the source-scale mode these are the storages the
+        static kernel uses too; with it they are materialized on first use and
+        refused during CUDA graph capture (run one eager call on that backend)."""
+        if not self.source_scales:
+            return self._w13_sf_storage, self._down_sf_storage
+        if self._padded_w13_sf_storage is None:
+            if self._padded_scale_builder is None:
+                raise ValueError(
+                    "source-scale weight views carry no padded-scale builder"
+                )
+            _refuse_during_capture(
+                "the tile-padded block scales (dynamic / micro kernels)"
+            )
+            self._padded_w13_sf_storage, self._padded_down_sf_storage = (
+                self._padded_scale_builder()
+            )
+        return self._padded_w13_sf_storage, self._padded_down_sf_storage
+
+    @property
+    def legacy_materialized(self) -> bool:
+        return self.w13_fp4 is not None and self.down_fp4 is not None
+
+    def ensure_legacy(self) -> None:
+        """Materialize the tile-padded legacy weight views on first dynamic /
+        micro use.  Static-only callers never reach this.  Refused during CUDA
+        graph capture: run one eager call that selects the dynamic or micro
+        backend (the natural warm-up) before capturing.
+        """
+        if self.legacy_materialized:
+            return
+        if self._legacy_builder is None:
+            raise ValueError(
+                "weight views carry neither tile-padded legacy views nor a builder"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "the tile-padded legacy weight views (dynamic / micro kernels) are "
+                "materialized on first use and cannot be created during CUDA graph "
+                "capture; run one eager warm-up call that selects the dynamic or "
+                "micro backend before capturing the graph"
+            )
+        w1_padded, w2_padded = self._legacy_builder()
+        self.w13_fp4 = w1_padded.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+        self.down_fp4 = w2_padded.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+        self.w1_storage = w1_padded
+        self.w2_storage = w2_padded
 
 
 def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
@@ -573,6 +834,183 @@ def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
 
 
+def _refuse_during_capture(what: str) -> None:
+    """Every first-use preparation (padded scale / FP4 copies, converted scale
+    views, static-family operands, kernel compilation, workspace allocation)
+    allocates or compiles.  Inside a CUDA-graph capture that would be a silent
+    allocation, so it is refused: run one eager warm-up call on the same
+    wrapper / workspace with the same shapes and backend before capturing.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{what} cannot be prepared during CUDA graph capture; run one eager "
+            "warm-up call (same wrapper, shapes and backend) before capturing the graph"
+        )
+
+
+# The retained2 static kernel pairs two N128 slices per group; a shape with a
+# single slice (intermediate size <= 128) must present it a 256-aligned
+# extent (the earlier padded static family padded to 256 for the same reason).
+_STATIC_MIN_EXTENT = 256
+# TMA needs 16-byte global strides: a true-extent down view [K, I, E] packs
+# I/2 bytes per row, so the true-extent views need I % 32 == 0.
+_TRUE_EXTENT_ALIGN = 32
+
+
+def static_needs_256_extent(intermediate_size: int) -> bool:
+    """Whether the static family must see the 256-aligned extent (one N128 slice only)."""
+    return _align_up(int(intermediate_size), _LEVEL_TILE_N) < _STATIC_MIN_EXTENT
+
+
+def static_source_scales(
+    intermediate_size: int, is_gated: bool, quant_mode: str = "nvfp4"
+) -> bool:
+    """Whether the static kernel reads the block scales in the source (modelopt) layout.
+
+    The source stores each expert's w13 scales as 128-row atoms over the 2*I rows
+    (up branch first, gate branch from row I).  When I is a multiple of 64 with
+    I % 128 == 64 the gate branch starts half an atom in: every gate N128 tile is
+    the upper half of one source atom followed by the lower half of the next,
+    which the kernel's DMA warp assembles with plain 8-byte loads and shared
+    stores (TMA cannot address a half atom), and the down scales already hold
+    complete K atoms.  Such a wrapper never materializes padded scale copies
+    for the static kernel (the dynamic / micro kernels pad lazily on first use).
+    """
+    n = int(intermediate_size)
+    return (
+        bool(is_gated)
+        and _normalize_quant_mode(quant_mode) == "nvfp4"
+        and n > 128
+        and n % 64 == 0
+        and n % 128 == 64
+        and true_extent_views_supported(n)
+    )
+
+
+def true_extent_views_supported(intermediate_size: int) -> bool:
+    """Whether TMA views at the true intermediate extent are legal for this size."""
+    return int(intermediate_size) % _TRUE_EXTENT_ALIGN == 0
+
+
+def _validate_w4a4_dimensions(k: int, n: int, quant_mode: str) -> None:
+    if quant_mode not in ("nvfp4", "mxfp4"):
+        return
+    # Q0/A staging and the FC2 epilogue require full hidden-dimension tiles.
+    # Intermediate tails are supported separately by the operand views.
+    if k <= 0 or k % _LEVEL_TILE_N:
+        raise ValueError(
+            f"{quant_mode.upper()} b12x hidden_size ({k}) must be a multiple of 128 "
+            "and positive; hidden-dimension tails are not supported."
+        )
+    sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
+    if n <= 0 or n % sf_vec_size:
+        raise ValueError(
+            f"{quant_mode.upper()} b12x intermediate_size ({n}) must be a positive "
+            f"multiple of the quantization block size ({sf_vec_size})."
+        )
+
+
+def _prepare_weight_views(
+    *,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    n: int,
+    k: int,
+    quant_mode: str,
+    activation: str,
+) -> _WeightViews:
+    """Shared wrapper/functional preparation from logical, unpadded operands.
+
+    Per-expert activation scales are runtime inputs, not channel data: they
+    never participate in intermediate padding or its weight-only caches.
+    """
+    is_gated = is_gated_activation(activation)
+    n_pad = _align_up(n, _LEVEL_TILE_N)
+    weight_E = w1_fp4.shape[0]
+    pad_args = (w1_fp4, w1_blockscale, w2_fp4, w2_blockscale, None)
+    static_override = None
+    if static_needs_256_extent(n):
+        padded = _pad_intermediate_to_tile(
+            *pad_args, n, _STATIC_MIN_EXTENT, k, weight_E, is_gated, quant_mode
+        )
+        static_override = (padded[0], padded[1], padded[2], padded[3], padded[5])
+
+    source_scales = static_source_scales(n, is_gated, quant_mode)
+    legacy_builder = padded_scale_builder = None
+    if n_pad != n:
+
+        def legacy_builder():
+            padded = _pad_intermediate_to_tile(
+                *pad_args, n, _LEVEL_TILE_N, k, weight_E, is_gated, quant_mode
+            )
+            return padded[0], padded[2]
+
+        if source_scales:
+
+            def padded_scale_builder():
+                padded = _pad_intermediate_to_tile(
+                    *pad_args,
+                    n,
+                    _LEVEL_TILE_N,
+                    k,
+                    weight_E,
+                    is_gated,
+                    quant_mode,
+                    pad_fp4=False,
+                )
+                sf_vec, _ = _sf_params_for_quant_mode(quant_mode)
+                return (
+                    convert_sf_from_mma_layout(
+                        padded[1],
+                        m=2 * n_pad,
+                        k=k,
+                        num_groups=weight_E,
+                        sf_vec_size=sf_vec,
+                    ).contiguous(),
+                    convert_sf_from_mma_layout(
+                        padded[3],
+                        m=k,
+                        k=n_pad,
+                        num_groups=weight_E,
+                        sf_vec_size=sf_vec,
+                    ).contiguous(),
+                )
+        else:
+            padded = _pad_intermediate_to_tile(
+                *pad_args,
+                n,
+                _LEVEL_TILE_N,
+                k,
+                weight_E,
+                is_gated,
+                quant_mode,
+                pad_fp4=False,
+            )
+            w1_blockscale, w2_blockscale = padded[1], padded[3]
+
+    return _get_weight_views(
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w1_alphas=w1_alphas,
+        w2_alphas=w2_alphas,
+        n=n_pad,
+        k=k,
+        quant_mode=quant_mode,
+        intermediate_size=n,
+        branches=2 if is_gated else 1,
+        legacy_builder=legacy_builder,
+        static_override=static_override,
+        source_scales=source_scales,
+        padded_scale_builder=padded_scale_builder,
+    )
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -584,11 +1022,42 @@ def _get_weight_views(
     k: int,
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    intermediate_size: int | None = None,
+    branches: int | None = None,
+    legacy_builder=None,
+    static_override: Tuple | None = None,
+    source_scales: bool = False,
+    padded_scale_builder: Optional[
+        Callable[[], Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
 ) -> _WeightViews:
-    """Create permuted weight views for the static kernel.
+    """Create permuted weight views for the MoE kernels.
 
-    The kernel expects concatenated w13 data with shape [2*n, k//2, E]
-    via a single TMA descriptor.
+    ``w1_fp4`` / ``w2_fp4`` may be the tile-padded copies (legacy views built
+    eagerly, as before) or the unpadded weights: then ``branches`` (2 for gated
+    activations, 1 otherwise) fixes the padded row count the block scales
+    describe and ``legacy_builder`` produces the padded copies lazily
+    (``_WeightViews.ensure_legacy``), so a static-only caller never pins them.
+
+    ``n`` is the tile-aligned intermediate size that ``w1_fp4``/``w2_fp4``
+    carry ([2*n, k//2, E] concatenated w13 for dynamic/micro).  The static
+    kernel also gets branch-major views ([n_true, k//2, 2E] gated w13,
+    [k, n_true//2, E] down) built from the unpadded weights when the true
+    ``intermediate_size`` differs, so TMA zero-fills a partial tail tile
+    instead of streaming physically padded zeros.
+
+    Two shape classes cannot use the true-extent views and fall back to
+    padded operands for the static kernel (the dynamic branch-major extent
+    follows ``intermediate_size``):
+
+    * ``intermediate_size % 32 != 0``: the packed down row is not a 16-byte
+      TMA stride, so the static and dynamic branch-major views are built from
+      the 128-padded legacy copies (materialized here) at the aligned extent.
+    * a single N128 slice (``intermediate_size <= 128``): the retained2 static
+      kernel needs two slices, so the caller passes ``static_override`` =
+      ``(w1_fp4_256, w1_sf_256, w2_fp4_256, w2_sf_256, 256)`` (the 256-padded
+      copies from ``_pad_intermediate_to_tile``) and the static kernel gets its
+      own scale storages; dynamic and micro keep the 128-aligned operands.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
@@ -611,11 +1080,29 @@ def _get_weight_views(
         w2_fp4.data_ptr(),
         w2_blockscale.data_ptr(),
         w2_alphas.data_ptr(),
+        bool(source_scales),
     )
+    n_true = n if intermediate_size is None else int(intermediate_size)
+    if branches is None:
+        branches = w1_fp4.shape[1] // (n if w1_fp4.shape[1] % n == 0 else n_true)
+    if branches not in (1, 2):
+        raise ValueError(f"w13 must carry one or two branches, got {branches}")
+    padded_fp4_present = w1_fp4.shape[1] == branches * n and w2_fp4.shape[2] == n // 2
+    if not padded_fp4_present and n != n_true and legacy_builder is None:
+        raise ValueError(
+            "unpadded w13/down weights need a legacy_builder for the tile-padded "
+            "views the dynamic and micro kernels consume"
+        )
     cached = _WEIGHT_CACHE.get(key)
     if cached is None:
+        _refuse_during_capture("the converted block-scale views")
         # Cache the fresh buffers (scale factors + fp32 alphas).
-        w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
+        # Rows / reduction extent the scale layout describes: the padded n (2*n
+        # gated, n otherwise), or the true extent when the static kernel reads
+        # the source layout (the 6D MMA view is a permutation of the caller's
+        # 2D storage, so this is a view, not a copy).
+        scale_n = n_true if source_scales else n
+        w1_rows = branches * scale_n
         cached = (
             convert_sf_from_mma_layout(
                 w1_blockscale,
@@ -627,7 +1114,7 @@ def _get_weight_views(
             convert_sf_from_mma_layout(
                 w2_blockscale,
                 m=k,
-                k=n,
+                k=scale_n,
                 num_groups=w2_fp4.shape[0],
                 sf_vec_size=sf_vec_size,
             ).contiguous(),
@@ -648,11 +1135,109 @@ def _get_weight_views(
     w13_sf_contiguous, down_sf_contiguous, w1_alpha, w2_alpha = cached
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy).
-    w13 = w1_fp4.permute(1, 2, 0)
-    down = w2_fp4.permute(1, 2, 0)
+    if padded_fp4_present:
+        w13 = w1_fp4.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+        down = w2_fp4.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+    else:
+        w13 = down = None
+    # Static kernel: one branch per batch index at the true extent (views).
+    if w1_fp4.shape[1] != branches * n_true or w2_fp4.shape[2] != n_true // 2:
+        raise ValueError(
+            "intermediate_size does not match the unpadded weights: "
+            f"n_true={n_true}, w1 rows={w1_fp4.shape[1]}, "
+            f"w2 packed cols={w2_fp4.shape[2]}"
+        )
+    static_w13 = w1_fp4.reshape(
+        w1_fp4.shape[0] * branches, n_true, w1_fp4.shape[2]
+    ).permute(1, 2, 0)
+    static_down = w2_fp4.permute(1, 2, 0)
+    static_sf: Tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
+    family: Tuple = (None, None)
+    # Branch-major views for the gated dynamic kernel (and the static kernel
+    # unless overridden): true extent when TMA-legal, else the 128-padded
+    # copies at the aligned extent (I % 32 != 0 -> non-16-byte down stride).
+    if not true_extent_views_supported(n_true):
+        if w13 is None:
+            if legacy_builder is None:
+                raise ValueError(
+                    f"intermediate_size {n_true} is not a multiple of "
+                    f"{_TRUE_EXTENT_ALIGN}; the tile-padded weights are required"
+                )
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError(
+                    "the tile-padded weight copies are materialized on first "
+                    "use and cannot be created during CUDA graph capture; run "
+                    "one eager warm-up call before capturing the graph"
+                )
+            w1_p, w2_p = legacy_builder()
+            w13 = w1_p.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+            down = w2_p.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+            w1_fp4, w2_fp4 = w1_p, w2_p
+            padded_fp4_present = True
+        static_w13 = w1_fp4.reshape(
+            w1_fp4.shape[0] * branches, n, w1_fp4.shape[2]
+        ).permute(1, 2, 0)
+        static_down = w2_fp4.permute(1, 2, 0)
+        n_true = n
+    branch_major_w13, branch_major_down = static_w13, static_down
+    static_extent = n_true
+    if static_override is not None:
+        # Single-slice shape: 256-aligned copies for the whole static family.
+        w1_s, w1_sf_s, w2_s, w2_sf_s, n_s = static_override
+        static_w13 = w1_s.reshape(
+            w1_s.shape[0] * branches, int(n_s), w1_s.shape[2]
+        ).permute(1, 2, 0)
+        static_down = w2_s.permute(1, 2, 0)
+        static_extent = int(n_s)
+        sf_key = (
+            "static_sf",
+            key,
+            w1_sf_s.data_ptr(),
+            w2_sf_s.data_ptr(),
+            static_extent,
+        )
+        cached_sf = _WEIGHT_CACHE.get(sf_key)
+        if cached_sf is None:
+            _refuse_during_capture("the static family's 256-aligned scale views")
+            cached_sf = (
+                convert_sf_from_mma_layout(
+                    w1_sf_s,
+                    m=branches * static_extent,
+                    k=k,
+                    num_groups=w1_s.shape[0],
+                    sf_vec_size=sf_vec_size,
+                ).contiguous(),
+                convert_sf_from_mma_layout(
+                    w2_sf_s,
+                    m=k,
+                    k=static_extent,
+                    num_groups=w2_s.shape[0],
+                    sf_vec_size=sf_vec_size,
+                ).contiguous(),
+            )
+            _WEIGHT_CACHE[sf_key] = cached_sf
+            _register_cache_eviction(_WEIGHT_CACHE, sf_key, w1_sf_s, w2_sf_s)
+        static_sf = cached_sf
+        family = (w1_s, w2_s)
+    elif static_needs_256_extent(n_true):
+        raise ValueError(
+            f"intermediate_size {n_true} spans a single N128 slice; the static "
+            "kernel needs the 256-aligned operands (static_override)"
+        )
     return _WeightViews(
-        w13_fp4=w13.view(torch.float4_e2m1fn_x2),
-        down_fp4=down.view(torch.float4_e2m1fn_x2),
+        w13_fp4=w13,
+        down_fp4=down,
+        _legacy_builder=None if padded_fp4_present else legacy_builder,
+        static_w13_fp4=static_w13.view(torch.float4_e2m1fn_x2),
+        static_down_fp4=static_down.view(torch.float4_e2m1fn_x2),
+        intermediate_size=n_true,
+        static_intermediate_size=static_extent,
+        static_w13_sf_storage=static_sf[0],
+        static_down_sf_storage=static_sf[1],
+        branch_major_w13_fp4=branch_major_w13.view(torch.float4_e2m1fn_x2),
+        branch_major_down_fp4=branch_major_down.view(torch.float4_e2m1fn_x2),
+        static_family_w1_storage=family[0],
+        static_family_w2_storage=family[1],
         sfb_w13_ptr=make_ptr(
             sf_dtype,
             w13_sf_contiguous.data_ptr(),
@@ -673,6 +1258,8 @@ def _get_weight_views(
         w2_scale_storage=down_sf_contiguous,
         _w13_sf_storage=w13_sf_contiguous,
         _down_sf_storage=down_sf_contiguous,
+        source_scales=bool(source_scales),
+        _padded_scale_builder=padded_scale_builder,
     )
 
 
@@ -748,6 +1335,8 @@ def _static_kernel_cache_key(
     m: int,
     k: int,
     n: int,
+    weight_n: int,
+    route_rows: int,
     num_topk: int,
     max_rows: int,
     mac: int,
@@ -759,6 +1348,9 @@ def _static_kernel_cache_key(
     swiglu_alpha: float,
     swiglu_beta: float,
     swiglu_limit: float | None,
+    merged_groups: bool = False,
+    deferred_init: bool = False,
+    source_scales: bool = False,
 ) -> Tuple:
     """The static kernel's cache key: every parameter affecting its codegen.
 
@@ -774,6 +1366,8 @@ def _static_kernel_cache_key(
         m,
         k,
         n,
+        weight_n,
+        route_rows,
         num_topk,
         max_rows,
         mac,
@@ -785,6 +1379,9 @@ def _static_kernel_cache_key(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        merged_groups,
+        deferred_init,
+        source_scales,
     )
 
 
@@ -855,8 +1452,13 @@ def _dynamic_kernel_cache_key(
     swiglu_beta: float,
     swiglu_limit: float | None,
     share_input_across_experts: bool,
+    branch_major_extent: int | None = None,
 ) -> Tuple:
     """The dynamic kernel's cache key (see :func:`_static_kernel_cache_key`).
+
+    ``branch_major_extent`` is the true intermediate extent when the
+    branch-paired gated kernel streams the branch-major weight views (its
+    artifact differs from the legacy concatenated one), else ``None``.
 
     Deliberately free of ``m`` / ``max_rows``: the dynamic kernel takes its
     runtime-shaped operands as pointers, so one artifact serves every batch
@@ -880,6 +1482,7 @@ def _dynamic_kernel_cache_key(
         swiglu_beta,
         swiglu_limit,
         share_input_across_experts,
+        branch_major_extent,
     )
 
 
@@ -905,8 +1508,21 @@ def _get_static_kernel(
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    weight_n: int | None = None,
+    route_rows: int | None = None,
+    merged_groups: bool = False,
+    deferred_init: bool = False,
+    source_scales: bool = False,
 ):
-    """Compile (or retrieve cached) the SM120 static MoE kernel."""
+    """Compile (or retrieve cached) the SM120 static MoE kernel.
+
+    ``n`` is the tile-aligned intermediate size (scratch geometry, tile
+    counts); ``weight_n`` is the true weight extent the branch-major TMA
+    views carry (defaults to ``n``).  ``max_rows`` is the per-slot row stride
+    of the packed activation planes (token_map.shape[1]); ``route_rows`` is
+    the routed-row capacity that sizes the route-output scratch (defaults to
+    ``max_rows``).
+    """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -921,11 +1537,12 @@ def _get_static_kernel(
         else min(get_max_active_clusters(1), sm_count)
     )
 
-    # Select tile size based on actual routed rows
-    routed_rows = m * num_topk
+    weight_n = n if weight_n is None else int(weight_n)
+    route_rows = max_rows if route_rows is None else int(route_rows)
+
     mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
+        mma_tiler_mn = _COMPACT_MMA_TILER_MN
 
     cache_key = _static_kernel_cache_key(
         activation_precision=activation_precision,
@@ -935,6 +1552,8 @@ def _get_static_kernel(
         m=m,
         k=k,
         n=n,
+        weight_n=weight_n,
+        route_rows=route_rows,
         num_topk=num_topk,
         max_rows=max_rows,
         mac=mac,
@@ -946,10 +1565,14 @@ def _get_static_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        merged_groups=merged_groups,
+        deferred_init=deferred_init,
+        source_scales=source_scales,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    _refuse_during_capture("the static MoE kernel (compile / load)")
 
     ab_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
@@ -967,10 +1590,15 @@ def _get_static_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
+        merged_groups=merged_groups,
+        deferred_init=deferred_init,
+        source_scales=source_scales,
     )
 
     is_gated = is_gated_activation(activation)
-    w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
+    # Branch-major weights: N spans one branch at the true extent and the
+    # batch index spans (branches * E).
+    w13_batch = (2 if is_gated else 1) * weight_E
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
@@ -1010,7 +1638,7 @@ def _get_static_kernel(
     )
     route_output_scratch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
-        (max_rows * max(1, n // _STATIC_RETAINED_GROUP_N) * k,),
+        (route_rows * (1 if merged_groups else _static_retained_groups(n)) * k,),
         assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
@@ -1028,16 +1656,21 @@ def _get_static_kernel(
         (1,),
         assumed_align=4,
     )
+    route_state_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (8,),
+        assumed_align=4,
+    )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_rows, k, weight_E),
+        (weight_n, k, w13_batch),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (k, n, weight_E),
+        (k, weight_n, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -1100,15 +1733,21 @@ def _get_static_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
+    # Chunk map + claim counter scale with the routed-row capacity, not the
+    # per-slot stride.
     virt_route_scratch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (weight_E * (1 + (max_rows + 31) // 32) + 8,),
+        (weight_E * (1 + (route_rows + 31) // 32) + 8,),
         assumed_align=4,
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        _disk_kernel_name(f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        _disk_kernel_name(
+            f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}_c{route_rows}"
+            f"{'_mg' if merged_groups else ''}{'_di' if deferred_init else ''}{'_ss' if source_scales else ''}",
+            cache_key,
+        ),
         lambda: cute.compile(
             kernel,
             a_input_fake,
@@ -1121,6 +1760,7 @@ def _get_static_kernel(
             scale_storage_fake,
             barrier_count_fake,
             barrier_epoch_fake,
+            route_state_fake,
             b_w13_fake,
             sfb_w13_fake,
             b_down_fake,
@@ -1184,9 +1824,7 @@ def _get_micro_kernel(
         else min(get_max_active_clusters(1), sm_count)
     )
 
-    # Micro always selects tile from routed rows (not just for multi-topk)
-    routed_rows = m * num_topk
-    mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+    mma_tiler_mn = _COMPACT_MMA_TILER_MN
 
     cache_key = _micro_kernel_cache_key(
         quant_mode=quant_mode,
@@ -1213,6 +1851,7 @@ def _get_micro_kernel(
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    _refuse_during_capture("the micro MoE kernel (compile / load)")
 
     ab_dtype = cutlass.Float4E2M1FN
     a_dtype = cutlass.BFloat16
@@ -1455,6 +2094,7 @@ def _get_direct_micro_kernel(
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
         return cached
+    _refuse_during_capture("the direct micro MoE kernel (compile / load)")
     kernel = build_direct_micro_kernel(
         weight_E,
         m,
@@ -1499,6 +2139,10 @@ def _expand_to_experts(t: torch.Tensor, num_experts: int) -> torch.Tensor:
     """
     if t.numel() == 1:
         return t.to(torch.float32).expand(num_experts).contiguous()
+    if t.ndim != 1 or t.numel() != num_experts:
+        raise ValueError(
+            f"per-expert scale must be scalar or [{num_experts}], got {tuple(t.shape)}"
+        )
     return t.contiguous().to(torch.float32)
 
 
@@ -1569,6 +2213,13 @@ def launch_sm120_static_moe(
         activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
     )
 
+    # Single-slice shapes: the static kernel and the direct CUDA-core micro
+    # kernel consume the 256-aligned copies (_get_weight_views static_override);
+    # the MMA micro kernel is correct and faster on the 128-aligned operands
+    # and keeps them.
+    family_n = n
+    if weights.static_family_w1_storage is not None:
+        family_n = int(weights.static_intermediate_size or n)
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
     use_direct_micro = (
@@ -1578,8 +2229,10 @@ def launch_sm120_static_moe(
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
         and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
-        and n <= _DIRECT_MICRO_MAX_N
-        and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
+        and family_n <= _DIRECT_MICRO_MAX_N
+        and MoEDirectMicroKernel.is_supported(
+            num_tokens, k, family_n, top_k, num_experts
+        )
     )
     if _FORCED_BACKEND is not None:
         if _FORCED_BACKEND == "direct_micro":
@@ -1588,11 +2241,13 @@ def launch_sm120_static_moe(
                     "forced direct_micro backend only supports quant_mode=nvfp4"
                 )
             if workspace.dm_barrier_count is None or not (
-                MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
+                MoEDirectMicroKernel.is_supported(
+                    num_tokens, k, family_n, top_k, num_experts
+                )
             ):
                 raise ValueError(
                     "forced direct_micro backend cannot run this shape "
-                    f"(m={num_tokens}, k={k}, n={n}, top_k={top_k})"
+                    f"(m={num_tokens}, k={k}, n={family_n}, top_k={top_k})"
                 )
             if workspace.dm_barrier_count.numel() < routed_rows + num_tokens * 16:
                 raise ValueError(
@@ -1608,7 +2263,7 @@ def launch_sm120_static_moe(
             num_experts,
             num_tokens,
             k,
-            n,
+            family_n,
             top_k,
             topk_ids_dtype=flat_ids.dtype,
             fast_math=fast_math,
@@ -1642,17 +2297,33 @@ def launch_sm120_static_moe(
         else:
             launch_gs = input_gs
             launch_down = down_input_scale
+        # The direct CUDA-core micro kernel indexes the tile-padded weight
+        # storages (n aligned to the tile): materialize the legacy copies, or
+        # take the static family's 256-aligned copies for single-slice shapes.
+        if weights.static_family_w1_storage is not None:
+            dm_w1, dm_w1_sf = (
+                weights.static_family_w1_storage,
+                weights.static_w13_sf_storage,
+            )
+            dm_w2, dm_w2_sf = (
+                weights.static_family_w2_storage,
+                weights.static_down_sf_storage,
+            )
+        else:
+            weights.ensure_legacy()
+            dm_w1_sf, dm_w2_sf = weights.padded_scales()
+            dm_w1, dm_w2 = weights.w1_storage, weights.w2_storage
         MoEDirectMicroKernel.launch(
             compiled,
             x=a,
-            w1_fp4=weights.w1_storage,
-            w1_blockscale=weights.w1_scale_storage,
+            w1_fp4=dm_w1,
+            w1_blockscale=dm_w1_sf,
             w1_alphas=weights.w1_alpha,
             a1_gscale=launch_gs,
             a2_gscale=launch_down,
             inter_fp32=workspace.dm_intermediate,
-            w2_fp4=weights.w2_storage,
-            w2_blockscale=weights.w2_scale_storage,
+            w2_fp4=dm_w2,
+            w2_blockscale=dm_w2_sf,
             w2_alphas=weights.w2_alpha,
             topk_ids=flat_ids,
             topk_weights=flat_weights,
@@ -1721,7 +2392,7 @@ def launch_sm120_static_moe(
             workspace.weight_expert_ids[: flat_ids.numel()].copy_(
                 flat_ids.to(torch.int32)
             )
-            workspace.active_expert_count.fill_(flat_ids.numel())
+            workspace.micro_active_expert_count.fill_(flat_ids.numel())
             launch_ids = compact_ids
         else:
             compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
@@ -1731,7 +2402,7 @@ def launch_sm120_static_moe(
                 flat_ids,
                 compact_ids,
                 workspace.weight_expert_ids,
-                workspace.active_expert_count,
+                workspace.micro_active_expert_count,
             )
             launch_ids = compact_ids
         # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
@@ -1747,7 +2418,9 @@ def launch_sm120_static_moe(
             k,
             n,
             top_k,
-            workspace.max_rows,
+            # Kernels take the per-slot row stride (token_map.shape[1]), not
+            # the routed-row capacity.
+            int(workspace.token_map.shape[1]),
             topk_ids_dtype=launch_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
@@ -1764,14 +2437,22 @@ def launch_sm120_static_moe(
         route_output_scratch_args: Tuple[Any, ...] = ()
         virt_scratch_args: Tuple[Any, ...] = ()
     else:
+        static_n = weights.static_intermediate_size or weights.intermediate_size or n
+        static_n = max(n, _align_up(int(static_n), _LEVEL_TILE_N))
+        # top-k=1 uses M128 in _get_static_kernel: no unused A/SFA half
+        # remains for the retained slices. Only the M64 path can merge.
+        merged_groups = top_k > 1 and _static_merged_groups(
+            static_n, num_tokens * top_k
+        )
+        deferred_init = _static_deferred_init(num_tokens * top_k)
         compiled, mac = _get_static_kernel(
             int(workspace.row_counts.shape[0]),
             num_experts,
             num_tokens,
             k,
-            n,
+            static_n,
             top_k,
-            workspace.max_rows,
+            int(workspace.token_map.shape[1]),
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
@@ -1782,9 +2463,19 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
             quant_mode=quant_mode,
+            weight_n=weights.static_intermediate_size or weights.intermediate_size,
+            route_rows=workspace.max_rows,
+            merged_groups=merged_groups,
+            deferred_init=deferred_init,
+            source_scales=bool(weights.source_scales),
         )
         launch_ids = flat_ids
-        route_output_scratch_args = (workspace.route_output_scratch.view(-1),)
+        route_scratch_flat = workspace.route_output_scratch.view(-1)
+        if merged_groups:
+            # The merged schedule writes one [route, K] slot per route; the
+            # workspace keeps the retained2 [route, groups, K] allocation.
+            route_scratch_flat = route_scratch_flat[: workspace.max_rows * k]
+        route_output_scratch_args = (route_scratch_flat,)
         virt_scratch_args = (workspace.virt_route_scratch,)
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
@@ -1792,6 +2483,19 @@ def launch_sm120_static_moe(
     # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
     # the caller's current stream and the parameter is absent from the
     # compiled signature.
+    # Micro kernels index the tile-aligned [2n, k//2, E] view; the static
+    # kernel streams the branch-major views at the true intermediate extent.
+    w13_sf_arg, down_sf_arg = weights._w13_sf_storage, weights._down_sf_storage
+    if use_micro:
+        w13_sf_arg, down_sf_arg = weights.padded_scales()
+    if use_micro or weights.static_w13_fp4 is None:
+        weights.ensure_legacy()
+        w13_arg, down_arg = weights.w13_fp4, weights.down_fp4
+    else:
+        w13_arg, down_arg = weights.static_w13_fp4, weights.static_down_fp4
+        if weights.static_w13_sf_storage is not None:
+            w13_sf_arg = weights.static_w13_sf_storage
+            down_sf_arg = weights.static_down_sf_storage
     runtime_args: Tuple[Any, ...] = (
         a,
         launch_ids,
@@ -1803,12 +2507,17 @@ def launch_sm120_static_moe(
         workspace.scale_flat,
         workspace.barrier_count,
         workspace.barrier_epoch,
-        weights.w13_fp4,
-        weights._w13_sf_storage.data_ptr(),
-        weights.down_fp4,
-        weights._down_sf_storage.data_ptr(),
-        workspace.row_counts,
-        workspace.active_expert_count,
+        # The static kernel and its finalize share the clean-state marker; the
+        # micro kernel keeps its own counter copies (its signature has no marker).
+        *(() if use_micro else (workspace.route_state,)),
+        w13_arg,
+        w13_sf_arg.data_ptr(),
+        down_arg,
+        down_sf_arg.data_ptr(),
+        workspace.micro_row_counts if use_micro else workspace.row_counts,
+        workspace.micro_active_expert_count
+        if use_micro
+        else workspace.active_expert_count,
         workspace.weight_expert_ids,
         workspace.global_to_local_expert,
         *virt_scratch_args,
@@ -1836,8 +2545,14 @@ def select_sm120_moe_backend(
     num_topk: int,
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
+    num_experts: int | None = None,
+    intermediate_size: int | None = None,
+    hidden_size: int | None = None,
+    activation: str | None = None,
+    capacity_tokens: int | None = None,
 ) -> str:
-    """Pick static or dynamic backend based on routed-pair count."""
+    """Pick static or dynamic backend based on routed-pair count (the cutover
+    comes from the measured registry when the full key is known)."""
     mode = _normalize_quant_mode(quant_mode, activation_precision)
     if mode == "w4a16":
         return "w4a16"
@@ -1847,7 +2562,16 @@ def select_sm120_moe_backend(
         # Both micro variants launch through the static workspace path.
         return "static"
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _get_static_compact_cutover_pairs("fp4", quant_mode=mode):
+    if routed_rows <= _get_static_compact_cutover_pairs(
+        "fp4",
+        quant_mode=mode,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        activation=activation,
+        num_topk=num_topk,
+        capacity_tokens=capacity_tokens,
+    ):
         return "static"
     return "dynamic"
 
@@ -2160,6 +2884,47 @@ class _DynamicMoELaunch:
 _DYNAMIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
+def _dynamic_branch_major_extent(
+    *,
+    activation: str,
+    activation_precision: str,
+    quant_mode: str,
+    tile_m: int,
+    k: int,
+    intermediate_size: int | None,
+    num_topk: int,
+    share_input_across_experts: bool,
+) -> int | None:
+    """True intermediate extent when the dynamic launch streams the
+    branch-major weight views (``_WeightViews.static_*``): only the
+    branch-paired gated NVFP4 kernel consumes them (up at batch 2e, gate at
+    2e+1, N and the FC2 reduction at the true extent).  The generic dynamic
+    kernel (relu2, MXFP4, oversize shapes) keeps the tile-padded concatenated
+    legacy views, so ``None`` is returned for it.  Mirrors the eligibility
+    decision of :class:`MoEDynamicKernel` exactly.
+    """
+    if intermediate_size is None:
+        return None
+    activation_precision = _normalize_activation_precision(activation_precision)
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
+    share_input_across_experts = bool(
+        share_input_across_experts
+        and activation_precision == "fp4"
+        and num_topk <= _MAX_SHARED_INPUT_TOPK
+    )
+    eligible = _can_use_gated_optimized_kernel(
+        activation=activation,
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=(tile_m, _level_tile_n(activation_precision)),
+        hidden_size=k,
+        intermediate_size=int(intermediate_size),
+        num_topk=num_topk,
+        share_input_across_experts=share_input_across_experts,
+    )
+    return int(intermediate_size) if eligible else None
+
+
 def _get_dynamic_kernel(
     E: int,
     m: int,
@@ -2179,8 +2944,14 @@ def _get_dynamic_kernel(
     share_input_across_experts: bool = False,
     tile_m: int = _LEVEL_TILE_M,
     quant_mode: str = "nvfp4",
+    intermediate_size: int | None = None,
 ):
-    """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
+    """Compile (or retrieve cached) the SM120 dynamic MoE kernel.
+
+    ``intermediate_size`` is the true (unpadded) intermediate extent; when the
+    branch-paired gated kernel applies, the artifact is compiled against the
+    branch-major ``[I_true, K, 2E]`` / ``[K, I_true, E]`` weight views.
+    """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -2203,6 +2974,17 @@ def _get_dynamic_kernel(
     # tile_m comes from the workspace's shared selection so the kernel's task
     # and scale indexing matches the allocated scratch geometry.
     mma_tiler_mn = (tile_m, _level_tile_n(activation_precision))
+    n_true = n if intermediate_size is None else int(intermediate_size)
+    branch_major_extent = _dynamic_branch_major_extent(
+        activation=activation,
+        activation_precision=activation_precision,
+        quant_mode=quant_mode,
+        tile_m=tile_m,
+        k=k,
+        intermediate_size=n_true,
+        num_topk=num_topk,
+        share_input_across_experts=share_input_across_experts,
+    )
 
     cache_key = _dynamic_kernel_cache_key(
         activation_precision=activation_precision,
@@ -2221,10 +3003,12 @@ def _get_dynamic_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
+        branch_major_extent=branch_major_extent,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    _refuse_during_capture("the dynamic MoE kernel (compile / load)")
 
     is_gated = is_gated_activation(activation)
     w1_rows = (2 if is_gated else 1) * n
@@ -2245,7 +3029,7 @@ def _get_dynamic_kernel(
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
         hidden_size=k,
-        intermediate_size=n,
+        intermediate_size=n_true,
         num_topk=num_topk,
     )
     launch = _DynamicMoELaunch(
@@ -2306,16 +3090,25 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
 
+    if branch_major_extent is not None:
+        # Branch-paired gated kernel: branch-major views at the true extent
+        # (up at batch 2e, gate at 2e+1; FC2 reduces over I_true).
+        w13_fake_shape = (branch_major_extent, k, 2 * E)
+        down_fake_shape = (k, branch_major_extent, E)
+    else:
+        # Generic kernel: tile-padded concatenated legacy views.
+        w13_fake_shape = (w1_rows, k, E)
+        down_fake_shape = (k, n, E)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_rows, k, E),
+        w13_fake_shape,
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (k, n, E),
+        down_fake_shape,
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -2350,7 +3143,11 @@ def _get_dynamic_kernel(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        _disk_kernel_name(f"dynamic_e{E}_k{k}_n{n}_t{num_topk}", cache_key),
+        _disk_kernel_name(
+            f"dynamic_e{E}_k{k}_n{n}_t{num_topk}"
+            + ("" if branch_major_extent is None else f"_i{branch_major_extent}"),
+            cache_key,
+        ),
         lambda: cute.compile(
             launch,
             a_input_fake,
@@ -2458,11 +3255,31 @@ def launch_sm120_dynamic_moe(
         share_input_across_experts=input_gs_is_shared,
         tile_m=workspace.tile_m,
         quant_mode=quant_mode,
+        intermediate_size=weights.intermediate_size,
+    )
+    branch_major_extent = _dynamic_branch_major_extent(
+        activation=activation,
+        activation_precision=activation_precision,
+        quant_mode=quant_mode,
+        tile_m=workspace.tile_m,
+        k=k,
+        intermediate_size=weights.intermediate_size,
+        num_topk=top_k,
+        share_input_across_experts=input_gs_is_shared,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
     # fixed-shape args are Tensor (pass torch tensor directly).  No stream
     # argument -- see the note in launch_sm120_static_moe.
+    # The branch-paired gated kernel streams the branch-major views at the
+    # true intermediate extent (no padded FP4 copies); the generic kernel
+    # indexes the tile-padded concatenated legacy views.
+    if branch_major_extent is not None and weights.branch_major_w13_fp4 is not None:
+        w13_arg, down_arg = weights.branch_major_w13_fp4, weights.branch_major_down_fp4
+    else:
+        weights.ensure_legacy()
+        w13_arg, down_arg = weights.w13_fp4, weights.down_fp4
+    dynamic_w13_sf, dynamic_down_sf = weights.padded_scales()
     runtime_args: Tuple[Any, ...] = (
         a.data_ptr(),
         flat_ids.data_ptr(),
@@ -2478,10 +3295,10 @@ def launch_sm120_dynamic_moe(
         workspace.task_tail,
         workspace.task_expert.data_ptr(),
         workspace.task_valid_rows.data_ptr(),
-        weights.w13_fp4,
-        weights._w13_sf_storage.data_ptr(),
-        weights.down_fp4,
-        weights._down_sf_storage.data_ptr(),
+        w13_arg,
+        dynamic_w13_sf.data_ptr(),
+        down_arg,
+        dynamic_down_sf.data_ptr(),
         workspace.row_counts,
         workspace.expert_write_rows,
         workspace.expert_tile_base,
@@ -2920,7 +3737,8 @@ def clear_sm120_moe_caches() -> None:
     _WORKSPACE_CACHE.clear()
     _WEIGHT_CACHE.clear()
     _W4A16_WEIGHT_CACHE.clear()
-    _PADDED_WEIGHT_CACHE.clear()
+    _PADDED_SCALE_CACHE.clear()
+    _PADDED_FP4_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _DIRECT_MICRO_LAUNCH_CACHE.clear()
@@ -2966,6 +3784,7 @@ def allocate_sm120_moe_workspace(
         )
 
     activation_precision = "fp4"
+    _validate_w4a4_dimensions(k, n, mode)
     if backend is None:
         backend = select_sm120_moe_backend(
             num_tokens=max(
@@ -2974,6 +3793,13 @@ def allocate_sm120_moe_workspace(
             num_topk=int(num_topk),
             activation_precision=activation_precision,
             quant_mode=mode,
+            num_experts=weight_E,
+            intermediate_size=n,
+            hidden_size=k,
+            activation=activation,
+            capacity_tokens=max(
+                1, (capacity_rows + max(1, int(num_topk)) - 1) // max(1, int(num_topk))
+            ),
         )
     if backend == "dynamic":
         return allocate_sm120_dynamic_workspace(
@@ -3067,6 +3893,7 @@ def _get_cached_workspace(
             "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
             "functional path before capture."
         )
+    _refuse_during_capture("a per-call MoE workspace")
     workspace = allocate_sm120_moe_workspace(
         state_E=state_E,
         weight_E=weight_E,
@@ -3088,7 +3915,10 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
-_PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
+# Tile-padded block scales (needed by every W4A4 kernel for I % 128 != 0) and tile-padded FP4 copies (dynamic /
+# micro kernels only, built lazily) are cached separately: one scale bundle per weight set, never duplicated.
+_PADDED_SCALE_CACHE: Dict[Tuple, Tuple] = {}
+_PADDED_FP4_CACHE: Dict[Tuple, Tuple] = {}
 
 
 def _pad_intermediate_to_tile(
@@ -3103,10 +3933,16 @@ def _pad_intermediate_to_tile(
     num_experts,
     is_gated,
     quant_mode="nvfp4",
+    pad_fp4=True,
 ):
     """Zero-pad W4A4 weights + scale factors so the intermediate size is a
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
     zero, so the result is numerically identical.
+
+    With ``pad_fp4=False`` only the block-scale tensors are padded: the static kernel streams the FP4 weights at
+    the true extent through TMA views and needs just the 128-aligned scale
+    layout, so a static-only caller never materializes the padded FP4 copies
+    (the returned FP4 tensors are the originals).
     """
     quant_mode = _normalize_quant_mode(quant_mode)
     sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
@@ -3114,23 +3950,6 @@ def _pad_intermediate_to_tile(
     if n_pad == n:
         return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
     E = int(num_experts)
-    fc2_input_scale_src = fc2_input_scale
-    key = (
-        n,
-        tile,
-        h,
-        E,
-        bool(is_gated),
-        quant_mode,
-        w1_weight.data_ptr(),
-        w1_weight_sf.data_ptr(),
-        w2_weight.data_ptr(),
-        w2_weight_sf.data_ptr(),
-        fc2_input_scale_src.data_ptr() if fc2_input_scale_src is not None else 0,
-    )
-    cached = _PADDED_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
 
     def mma_to_logical(sf, m, k):
         sw = convert_sf_from_mma_layout(
@@ -3181,43 +4000,70 @@ def _pad_intermediate_to_tile(
         shp[dim] = new - old
         return torch.cat([t, t.new_zeros(shp)], dim=dim)
 
-    if is_gated:
-        # w1 packs [up(0:n), gate(n:2n)] rows; pad each half so the split stays
-        # tile-aligned, then re-concat.
-        up, gate = w1_weight[:, :n, :], w1_weight[:, n : 2 * n, :]
-        w1p = torch.cat([pad_dim(up, 1, n, n_pad), pad_dim(gate, 1, n, n_pad)], dim=1)
-        log1 = mma_to_logical(w1_weight_sf, m=2 * n, k=h)
-        up_sf, gate_sf = log1[:, :n, :], log1[:, n : 2 * n, :]
-        log1p = torch.cat(
-            [pad_dim(up_sf, 1, n, n_pad), pad_dim(gate_sf, 1, n, n_pad)], dim=1
-        )
-        w1_sf_p = logical_to_mma(log1p, m=2 * n_pad, k=h)
-    else:
-        w1p = pad_dim(w1_weight, 1, n, n_pad)
-        log1 = mma_to_logical(w1_weight_sf, m=n, k=h)
-        w1_sf_p = logical_to_mma(pad_dim(log1, 1, n, n_pad), m=n_pad, k=h)
-
-    # w2 reduces over the intermediate dim: pad its packed columns + SF columns.
-    w2p = pad_dim(w2_weight, 2, n // 2, n_pad // 2)
-    log2 = mma_to_logical(w2_weight_sf, m=h, k=n)
-    cb_n = (n + sf_vec_size - 1) // sf_vec_size
-    cb_np = (n_pad + sf_vec_size - 1) // sf_vec_size
-    w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
-
-    if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
-        fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
-    result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
-    _PADDED_WEIGHT_CACHE[key] = result
-    _register_cache_eviction(
-        _PADDED_WEIGHT_CACHE,
-        key,
-        w1_weight,
-        w1_weight_sf,
-        w2_weight,
-        w2_weight_sf,
-        fc2_input_scale_src,
+    # The block scales are padded once per weight set (the static kernel needs the 128-aligned per-branch scale
+    # layout on its first call); the FP4 copies are a separate, later cache entry so a static-only caller never
+    # holds them and a dynamic / micro caller never pads the scales twice.
+    scale_key = (
+        n,
+        tile,
+        h,
+        E,
+        bool(is_gated),
+        quant_mode,
+        w1_weight_sf.data_ptr(),
+        w2_weight_sf.data_ptr(),
     )
-    return result
+    scales = _PADDED_SCALE_CACHE.get(scale_key)
+    if scales is None:
+        _refuse_during_capture("the tile-padded block scales")
+        if is_gated:
+            log1 = mma_to_logical(w1_weight_sf, m=2 * n, k=h)
+            up_sf, gate_sf = log1[:, :n, :], log1[:, n : 2 * n, :]
+            log1p = torch.cat(
+                [pad_dim(up_sf, 1, n, n_pad), pad_dim(gate_sf, 1, n, n_pad)], dim=1
+            )
+            w1_sf_p = logical_to_mma(log1p, m=2 * n_pad, k=h)
+        else:
+            log1 = mma_to_logical(w1_weight_sf, m=n, k=h)
+            w1_sf_p = logical_to_mma(pad_dim(log1, 1, n, n_pad), m=n_pad, k=h)
+        log2 = mma_to_logical(w2_weight_sf, m=h, k=n)
+        cb_n = (n + sf_vec_size - 1) // sf_vec_size
+        cb_np = (n_pad + sf_vec_size - 1) // sf_vec_size
+        w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
+        scales = (w1_sf_p, w2_sf_p)
+        _PADDED_SCALE_CACHE[scale_key] = scales
+        _register_cache_eviction(
+            _PADDED_SCALE_CACHE,
+            scale_key,
+            w1_weight_sf,
+            w2_weight_sf,
+        )
+    w1_sf_p, w2_sf_p = scales
+    # The scale is scalar/[E], not [I]. Return the caller's live tensor even
+    # on a weight-cache hit so in-place updates and graph replay stay valid.
+    if not pad_fp4:
+        return w1_weight, w1_sf_p, w2_weight, w2_sf_p, fc2_input_scale, n_pad
+
+    fp4_key = (n, tile, E, bool(is_gated), w1_weight.data_ptr(), w2_weight.data_ptr())
+    fp4 = _PADDED_FP4_CACHE.get(fp4_key)
+    if fp4 is None:
+        _refuse_during_capture("the tile-padded FP4 weight copies")
+        if is_gated:
+            # w1 packs [up(0:n), gate(n:2n)] rows; pad each half so the split stays
+            # tile-aligned, then re-concat.
+            up, gate = w1_weight[:, :n, :], w1_weight[:, n : 2 * n, :]
+            w1p = torch.cat(
+                [pad_dim(up, 1, n, n_pad), pad_dim(gate, 1, n, n_pad)], dim=1
+            )
+        else:
+            w1p = pad_dim(w1_weight, 1, n, n_pad)
+        # w2 reduces over the intermediate dim: pad its packed columns.
+        w2p = pad_dim(w2_weight, 2, n // 2, n_pad // 2)
+        fp4 = (w1p, w2p)
+        _PADDED_FP4_CACHE[fp4_key] = fp4
+        _register_cache_eviction(_PADDED_FP4_CACHE, fp4_key, w1_weight, w2_weight)
+    w1p, w2p = fp4
+    return w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad
 
 
 def _validate_static_workspace_for_launch(
@@ -3276,14 +4122,15 @@ def _validate_static_workspace_for_launch(
     max_chunks = (max_rows + 31) // 32
     virt_E = state_E + max_chunks
     sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
-    rows_pad_k = _align_up(max_rows, 128)
+    slot_rows = _STATIC_SLOT_ROWS
+    rows_pad_k = _align_up(slot_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
-    retained_groups = max(1, n // _STATIC_RETAINED_GROUP_N)
+    retained_groups = _static_retained_groups(n)
     tensors = {
         "row_counts": ((virt_E,), torch.int32),
-        "token_map": ((virt_E, max_rows), torch.int32),
-        "token_weights": ((virt_E, max_rows), torch.float32),
-        "packed_input": ((virt_E, max_rows, k // 2), torch.uint8),
+        "token_map": ((virt_E, slot_rows), torch.int32),
+        "token_weights": ((virt_E, slot_rows), torch.float32),
+        "packed_input": ((virt_E, slot_rows, k // 2), torch.uint8),
         "packed_input_scale": (
             (virt_E, rows_pad_k, cols_pad_k),
             torch.uint8,
@@ -3294,6 +4141,9 @@ def _validate_static_workspace_for_launch(
         "weight_expert_ids": ((virt_E,), torch.int32),
         "global_to_local_expert": ((weight_E,), torch.int32),
         "compact_topk_ids": ((max(state_E, max_rows),), torch.int32),
+        "route_state": ((8,), torch.int32),
+        "micro_row_counts": ((virt_E,), torch.int32),
+        "micro_active_expert_count": ((1,), torch.int32),
         "virt_route_scratch": (
             (weight_E * (1 + max_chunks) + 8,),
             torch.int32,
@@ -3303,10 +4153,10 @@ def _validate_static_workspace_for_launch(
             torch.bfloat16,
         ),
         "packed_a_view": (
-            (max_rows, k // 2, virt_E),
+            (slot_rows, k // 2, virt_E),
             torch.float4_e2m1fn_x2,
         ),
-        "packed_a_flat": ((virt_E * max_rows * (k // 2),), torch.uint8),
+        "packed_a_flat": ((virt_E * slot_rows * (k // 2),), torch.uint8),
         "scale_flat": (
             (virt_E * rows_pad_k * cols_pad_k,),
             torch.uint8,
@@ -3426,31 +4276,10 @@ def launch_sm120_moe(
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
-    if quant_mode == "mxfp4" and k % 128 != 0:
-        raise ValueError(f"MXFP4 b12x hidden_size ({k}) must be a multiple of 128.")
-
-    # W4A4 kernels need a tile-aligned gate/up split.
-    if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
-        (
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-        ) = _pad_intermediate_to_tile(
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-            _LEVEL_TILE_N,
-            k,
-            w1_weight.size(0),
-            is_gated,
-            quant_mode,
-        )
+    _validate_w4a4_dimensions(k, n, quant_mode)
+    n_unpadded = n
+    if quant_mode != "w4a16":
+        n = _align_up(n, _LEVEL_TILE_N)
 
     routed_rows = num_tokens * top_k
 
@@ -3523,6 +4352,11 @@ def launch_sm120_moe(
             num_topk=top_k,
             activation_precision=activation_precision,
             quant_mode=quant_mode,
+            num_experts=num_experts,
+            intermediate_size=n_unpadded,
+            hidden_size=k,
+            activation=activation,
+            capacity_tokens=num_tokens,
         )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
@@ -3531,32 +4365,9 @@ def launch_sm120_moe(
         if backend == "dynamic" and num_local_experts != num_experts:
             backend = "static"
 
-    # retained2 always consumes two adjacent N128 slices. Keep that physical
-    # padding inside the static dispatch path; the wrapper remains unaware of
-    # the schedule and dynamic keeps its native N128 geometry.
+    # retained2 consumes two adjacent N128 slices; an odd slice count keeps a
+    # phantom partner that TMA zero-fills, so no 256-aligned padding is needed.
     weight_views = _weight_views
-    if backend == "static" and n % _STATIC_RETAINED_GROUP_N != 0:
-        (
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-        ) = _pad_intermediate_to_tile(
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-            _STATIC_RETAINED_GROUP_N,
-            k,
-            w1_weight.size(0),
-            is_gated,
-            quant_mode,
-        )
-        weight_views = None
 
     if fc2_input_scale is None:
         if quant_mode == "nvfp4":
@@ -3570,17 +4381,17 @@ def launch_sm120_moe(
     weights = (
         weight_views
         if weight_views is not None
-        else _get_weight_views(
+        else _prepare_weight_views(
             w1_fp4=w1_weight,
             w1_blockscale=w1_weight_sf,
             w2_fp4=w2_weight,
             w2_blockscale=w2_weight_sf,
             w1_alphas=w1_alpha,
             w2_alphas=w2_alpha,
-            n=n,
+            n=n_unpadded,
             k=k,
-            activation_precision=activation_precision,
             quant_mode=quant_mode,
+            activation=activation,
         )
     )
 
