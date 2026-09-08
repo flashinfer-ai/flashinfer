@@ -75,7 +75,7 @@ import functools
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -127,9 +127,13 @@ from ._sparse_mla_sm120_cpb import (  # noqa: E402
     calibrate_sparse_mla_sm120,  # noqa: F401  (lazy re-export)
 )
 
+if TYPE_CHECKING:
+    from ._sparse_mla_nvfp4_sm120_plan import NVFP4PlannedCall
+
 logger = logging.getLogger(__name__)
 
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+_KV_CACHE_FORMATS = frozenset({"fp8", "nvfp4"})
 
 # Page block size the decode kernels are instantiated for (same constant for
 # both families; every instantiated kernel is pbs=64).
@@ -143,12 +147,10 @@ class SparseMLASm120DecodeConfig:
 
     Decode-form calls (``num_tokens <= max_num_tokens``) prefer a standalone
     decode kernel when their shape matches one of the instantiations
-    described here; decode-eligible is not required, since the prefill
-    orchestrator serves any remaining decode-form shape at
-    ``num_tokens >= 1`` (and crossover calibration may route even eligible
-    shapes to prefill past a measured ``num_tokens`` threshold). Larger calls
-    go through the prefill orchestrator, which has its own separately
-    instantiated shape envelope; this config describes decode only.
+    described here. For FP8, the prefill orchestrator can serve remaining
+    decode-form shapes in its own envelope; NVFP4 currently uses the same
+    exact head/top-k envelope for both kernels. Crossover calibration may
+    route an eligible shape to prefill. This config describes decode only.
 
     Attributes
     ----------
@@ -161,18 +163,29 @@ class SparseMLASm120DecodeConfig:
     max_num_tokens : int
         Largest ``num_tokens`` routed to the decode kernels (inclusive).
     topks : frozenset[int]
-        The calibrated top-k values (the crossover sweep points). Decode
-        serves ANY ``topk >= min_topk`` — topk is a runtime kernel argument —
-        so this set is documentation of what has measured crossover data,
-        not the eligibility boundary.
+        The calibrated top-k values (the crossover sweep points). When
+        ``topk_is_runtime`` is true, this documents measured values rather
+        than the eligibility boundary; otherwise it is the exact set.
     min_topk : int
         Smallest legal ``topk`` (the indices-row width). ``513`` for the
         sliding-window family (the window must fit the buffer); ``1``
         elsewhere.
     max_num_heads : int
-        Every ``num_heads`` in ``[1, max_num_heads]`` is served: dedicated
-        instantiations at ``{8, 16, 32, 64, 128}`` plus one
-        runtime-head-count instantiation covering any other count.
+        Upper bound of the head-count envelope.
+    kv_cache_format : str
+        Packed cache format described by this entry (``"fp8"`` or
+        ``"nvfp4"``).
+    bytes_per_token : int
+        Logical packed-cache bytes per token.
+    head_counts : Optional[frozenset[int]]
+        Exact instantiated head counts when the kernel has no runtime-head
+        fallback. ``None`` means every count in ``[1, max_num_heads]``.
+    topk_is_runtime : bool
+        Whether every ``topk >= min_topk`` is accepted. When false, only
+        values in ``topks`` are instantiated.
+    extra_page_block_sizes : frozenset[int]
+        Exact page sizes accepted by the optional secondary cache when the
+        family has a finite set exposed here. Empty means unspecified.
     """
 
     d_qk: int
@@ -181,17 +194,29 @@ class SparseMLASm120DecodeConfig:
     topks: frozenset[int]
     min_topk: int
     max_num_heads: int
+    kv_cache_format: str = "fp8"
+    bytes_per_token: int = 0
+    head_counts: Optional[frozenset[int]] = None
+    topk_is_runtime: bool = True
+    extra_page_block_sizes: frozenset[int] = frozenset()
 
     def supported_num_heads(self) -> tuple[int, ...]:
-        """Every head count from 1 through ``max_num_heads`` (runtime-H)."""
+        """Sorted instantiated head counts, including any runtime-H envelope."""
+        if self.head_counts is not None:
+            return tuple(sorted(self.head_counts))
         return tuple(range(1, self.max_num_heads + 1))
 
     def supported_topk(self, num_heads: Optional[int] = None) -> tuple[int, ...]:
         """Sorted calibrated top-k values for ``num_heads`` (or any head count).
 
-        Decode serves any ``topk >= min_topk``; these are the values with
-        measured crossover data."""
-        if num_heads is None or 1 <= num_heads <= self.max_num_heads:
+        For a runtime-top-k family these are the values with measured
+        crossover data; otherwise this is the exact instantiated set."""
+        head_supported = num_heads is None or (
+            num_heads in self.head_counts
+            if self.head_counts is not None
+            else 1 <= num_heads <= self.max_num_heads
+        )
+        if head_supported:
             return tuple(sorted(self.topks))
         return ()
 
@@ -205,37 +230,49 @@ class SparseMLASm120DecodeConfig:
     ) -> bool:
         """True iff a decode-form call with this shape is decode-instantiated.
 
-        Decode-instantiated shapes may still route to prefill past the
-        calibrated crossover, and non-instantiated decode-form shapes are
-        served by prefill; this predicate describes the decode envelope only.
+        Decode-instantiated shapes may still route to prefill according to
+        calibration. This predicate describes the decode envelope only.
         """
         if page_block_size is None:
             page_block_size = self.page_block_size
+        head_supported = (
+            num_heads in self.head_counts
+            if self.head_counts is not None
+            else 1 <= num_heads <= self.max_num_heads
+        )
+        topk_supported = (
+            topk >= self.min_topk if self.topk_is_runtime else topk in self.topks
+        )
         return (
             num_tokens <= self.max_num_tokens
             and page_block_size == self.page_block_size
-            and 1 <= num_heads <= self.max_num_heads
-            and topk >= self.min_topk
+            and head_supported
+            and topk_supported
         )
 
 
 @flashinfer_api
-def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig]:
+def supported_sparse_mla_sm120_configs(
+    *, kv_cache_format: str = "fp8"
+) -> dict[str, SparseMLASm120DecodeConfig]:
     """Enumerate the instantiated SM120 sparse-MLA decode kernel configurations.
 
     Lets callers validate a serving configuration at initialization time
     instead of discovering an uninstantiated ``(num_heads, topk)`` pair on the
     first decode-form request.
 
+    Parameters
+    ----------
+    kv_cache_format : {"fp8", "nvfp4"}
+        Storage format whose independently calibrated kernel envelope is
+        requested. Defaults to ``"fp8"`` for backward compatibility.
+
     Returns
     -------
     dict[str, SparseMLASm120DecodeConfig]
-        Mapping from kernel family to its instantiated decode set, keyed by
-        ``"dsv4"`` (``d_qk=512``), ``"dsv3_2"`` (``d_qk=576``, power-of-2
-        FP32 scales), ``"glm_nsa"`` (``d_qk=576``, arbitrary FP32 scales;
-        shares the DSv3.2 decode instantiations), ``"glm53_nope"``
-        (GLM-5.3 native NoPE, ``d_qk=512``, arbitrary FP32 scales), and
-        ``"dots3_swa"`` (sliding-window family, ``d_qk=1088``, UE8M0 scales).
+        Mapping from kernel family to its instantiated decode set. FP8 returns
+        DSv4, DSv3.2, GLM-NSA, GLM53_NOPE, and DOTS3_SWA entries. NVFP4
+        currently returns the independently calibrated DSv4 entry.
 
     Examples
     --------
@@ -243,7 +280,33 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
     >>> configs = flashinfer.mla.supported_sparse_mla_sm120_configs()
     >>> configs["dsv4"].supports_decode(num_heads=64, topk=256)
     True
+    >>> nvfp4 = flashinfer.mla.supported_sparse_mla_sm120_configs(
+    ...     kv_cache_format="nvfp4"
+    ... )
+    >>> nvfp4["dsv4"].bytes_per_token
+    384
     """
+    if kv_cache_format not in _KV_CACHE_FORMATS:
+        raise ValueError(
+            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
+        )
+    if kv_cache_format == "nvfp4":
+        return {
+            "dsv4": SparseMLASm120DecodeConfig(
+                d_qk=512,
+                page_block_size=64,
+                max_num_tokens=64,
+                topks=frozenset({128, 512}),
+                min_topk=128,
+                max_num_heads=128,
+                kv_cache_format="nvfp4",
+                bytes_per_token=384,
+                head_counts=frozenset({16, 32, 64, 128}),
+                topk_is_runtime=False,
+                extra_page_block_sizes=frozenset({2, 64}),
+            )
+        }
+
     dsv3_2 = SparseMLASm120DecodeConfig(
         d_qk=576,
         page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
@@ -251,6 +314,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
         topks=_DECODE_DSV3_2_TOPKS,
         min_topk=1,
         max_num_heads=_DECODE_MAX_HEADS,
+        bytes_per_token=_BPT_DSV3_2,
     )
     return {
         "dsv4": SparseMLASm120DecodeConfig(
@@ -260,6 +324,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             topks=_DECODE_DSV4_TOPKS,
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
+            bytes_per_token=_BPT_DSV4,
         ),
         "dsv3_2": dsv3_2,
         "glm_nsa": dsv3_2,
@@ -270,6 +335,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
+            bytes_per_token=_BPT_DSV3_2,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
             d_qk=1088,
@@ -278,6 +344,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             topks=frozenset({_DECODE_DOTS3_SWA_TOPK}),
             min_topk=513,
             max_num_heads=_DECODE_MAX_HEADS,
+            bytes_per_token=_BPT_DOTS3_SWA,
         ),
     }
 
@@ -388,6 +455,23 @@ def _normalize_kv_scale_format(kv_scale_format: str) -> str:
     return fmt
 
 
+def _normalize_nvfp4_indices(indices: torch.Tensor, name: str) -> torch.Tensor:
+    """Flatten the singleton query axis accepted by the shared FP8 API."""
+    if indices.ndim == 3:
+        if indices.shape[1] != 1:
+            raise ValueError(
+                f"NVFP4 {name} must have shape [T, 1, topk] when 3-D, got "
+                f"{tuple(indices.shape)}"
+            )
+        indices = indices.squeeze(1)
+    if indices.ndim != 2:
+        raise ValueError(
+            f"NVFP4 {name} must have shape [T, topk] or [T, 1, topk], got "
+            f"{tuple(indices.shape)}"
+        )
+    return indices
+
+
 def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
     fmt = _normalize_kv_scale_format(kv_scale_format)
     if d_qk == 576:
@@ -480,14 +564,17 @@ def _decode_scratch_views(
     num_heads: int,
     num_splits: int,
     d_v: int,
+    *,
+    scratch_heads: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Resolve caller-supplied scratch buffers for split-K decode kernels.
 
-    The scratch head dim is the true ``num_heads`` for the dedicated
-    ``num_heads=8`` instantiation and HPB(16)-aligned otherwise (the runtime-H
-    kernel writes both halves of its head tile unconditionally).
+    By default, the scratch head dim is the true ``num_heads`` for the
+    dedicated ``num_heads=8`` instantiation and HPB(16)-aligned otherwise.
+    ``scratch_heads`` overrides that policy for kernels with an exact-H ABI.
     """
-    scratch_heads = _decode_scratch_heads(num_heads)
+    if scratch_heads is None:
+        scratch_heads = _decode_scratch_heads(num_heads)
     if mid_out is None or mid_lse is None:
         raise ValueError(
             "SM120 sparse-MLA decode requires caller-supplied mid_out and "
@@ -852,12 +939,15 @@ class _SparseMLAPagedAttentionRunner:
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
         DSV4.
+    kv_cache_format : {"fp8", "nvfp4"}
+        Packed cache format. Both formats reuse this wrapper and its ``run``
+        signature; each format keeps its own planner and internal kernels.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
     Example
     -------
-    >>> runner = _SparseMLAPagedAttentionRunner()
+    >>> runner = flashinfer.mla.SparseMLASm120Wrapper()
     >>> runner.run(q, kv_cache, indices, output, sm_scale=...)
     """
 
@@ -869,6 +959,7 @@ class _SparseMLAPagedAttentionRunner:
         *,
         d_v: int = _D_V,
         kv_scale_format: str = "auto",
+        kv_cache_format: str = "fp8",
         device: Optional[torch.device] = None,
     ) -> None:
         if (max_num_tokens is None) != (max_num_heads is None):
@@ -881,6 +972,20 @@ class _SparseMLAPagedAttentionRunner:
             raise ValueError(f"max_num_heads must be in (0, 128], got {max_num_heads}")
         _require_supported_d_v(d_v)
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
+        if kv_cache_format not in _KV_CACHE_FORMATS:
+            raise ValueError(
+                "kv_cache_format must be either 'fp8' or 'nvfp4', got "
+                f"{kv_cache_format!r}"
+            )
+        if kv_cache_format == "nvfp4":
+            if d_v != 512:
+                raise ValueError("NVFP4 sparse MLA requires d_v=512")
+            if self._kv_scale_format != "auto":
+                raise ValueError(
+                    "kv_scale_format applies to FP8 caches and must remain 'auto' "
+                    "when kv_cache_format='nvfp4'"
+                )
+        self._kv_cache_format = kv_cache_format
 
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -945,6 +1050,61 @@ class _SparseMLAPagedAttentionRunner:
             )
         return self._out_lse[:num_tokens, :num_heads]
 
+    def _plan_nvfp4_call(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        attn_sink: Optional[torch.Tensor],
+        extra_kv_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_length: Optional[torch.Tensor],
+        prefill_impl: Optional[str],
+    ) -> "NVFP4PlannedCall":
+        if prefill_impl not in (None, "auto", "mg"):
+            raise ValueError(
+                "NVFP4 sparse MLA supports prefill_impl=None, 'auto', or 'mg'"
+            )
+        if q.ndim != 3 or q.shape[-1] != 512:
+            raise ValueError(f"NVFP4 q must be [T, H, 512], got {tuple(q.shape)}")
+        if (extra_kv_cache is None) != (extra_indices is None):
+            raise ValueError(
+                "extra_kv_cache and extra_indices must be provided together"
+            )
+        if extra_topk_length is not None and extra_indices is None:
+            raise ValueError(
+                "extra_topk_length requires extra_kv_cache and extra_indices"
+            )
+
+        from ._sparse_mla_nvfp4_sm120 import _cache_shape
+        from ._sparse_mla_nvfp4_sm120_plan import plan_nvfp4_sparse_mla_sm120
+
+        _, page_size, _ = _cache_shape(kv_cache)
+        extra_page_size = 0
+        if extra_kv_cache is not None:
+            _, extra_page_size, _ = _cache_shape(extra_kv_cache)
+        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+        planned = plan_nvfp4_sparse_mla_sm120(
+            q.shape[0],
+            q.shape[1],
+            indices.shape[-1],
+            page_size,
+            q.device,
+            extra_topk=extra_topk,
+            extra_page_size=extra_page_size,
+            has_topk_length=topk_length is not None,
+            has_extra_topk_length=extra_topk_length is not None,
+            has_attn_sink=attn_sink is not None,
+        )
+        if planned is None:
+            raise ValueError(
+                "no NVFP4 sparse MLA prefill or decode kernel serves "
+                f"T={q.shape[0]}, H={q.shape[1]}, topk={indices.shape[-1]}, "
+                f"extra_topk={extra_topk}"
+            )
+        return planned
+
     def _maybe_allocate_decode_scratch(
         self,
         q: torch.Tensor,
@@ -955,10 +1115,11 @@ class _SparseMLAPagedAttentionRunner:
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
         prefill_impl: Optional[str],
+        nvfp4_planned: Optional["NVFP4PlannedCall"] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if (mid_out is None) != (mid_lse is None):
             raise ValueError("mid_out and mid_lse must be passed together")
-        if mid_out is not None:
+        if mid_out is not None and self._kv_cache_format == "fp8":
             return mid_out, mid_lse
 
         num_tokens, num_heads, d_qk = q.shape
@@ -966,32 +1127,53 @@ class _SparseMLAPagedAttentionRunner:
             # The op no-ops on empty requests before planning, and prefill-form
             # calls never route to decode — skip the plan() lookup on both.
             return None, None
-        model_type = _resolve_model_type(d_qk, self._kv_scale_format)
         topk = indices.shape[-1]
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        # Route with the same memoized plan() the op makes; only a
-        # decode-routed call consumes split-K scratch. A dispatch miss
-        # (None) falls through so the op reports it.
-        planned = plan(
-            num_tokens,
-            num_heads,
-            topk,
-            model_type,
-            _packed_kv_page_block_size(
-                kv_cache, model_type=model_type, name="kv_cache"
-            ),
-            extra_kv_cache is not None,
-            _normalize_prefill_impl(prefill_impl),
-            q.device,
-            extra_topk=extra_topk,
-        )
-        if planned is None or planned.variant is not KernelVariant.DECODE_SPLITK:
-            return None, None
+        if self._kv_cache_format == "nvfp4":
+            from ._sparse_mla_nvfp4_sm120_plan import NVFP4KernelVariant
 
-        num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
+            if (
+                nvfp4_planned is None
+                or nvfp4_planned.variant is not NVFP4KernelVariant.DECODE_SPLITK
+            ):
+                return None, None
+            num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
+            scratch_heads = num_heads
+        else:
+            model_type = _resolve_model_type(d_qk, self._kv_scale_format)
+            # Route with the same memoized plan() the op makes; only a
+            # decode-routed call consumes split-K scratch. A dispatch miss
+            # (None) falls through so the op reports it.
+            planned = plan(
+                num_tokens,
+                num_heads,
+                topk,
+                model_type,
+                _packed_kv_page_block_size(
+                    kv_cache, model_type=model_type, name="kv_cache"
+                ),
+                extra_kv_cache is not None,
+                _normalize_prefill_impl(prefill_impl),
+                q.device,
+                extra_topk=extra_topk,
+            )
+            if planned is None or planned.variant is not KernelVariant.DECODE_SPLITK:
+                return None, None
+            num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
+            scratch_heads = _decode_scratch_heads(num_heads)
+        if mid_out is not None:
+            return _decode_scratch_views(
+                mid_out,
+                mid_lse,
+                num_tokens,
+                num_heads,
+                num_splits,
+                self._d_v,
+                scratch_heads=scratch_heads,
+            )
         need_out: tuple[int, ...] = (
             num_tokens,
-            _decode_scratch_heads(num_heads),
+            scratch_heads,
             num_splits,
             self._d_v,
         )
@@ -1008,6 +1190,16 @@ class _SparseMLAPagedAttentionRunner:
             self._mid_out = torch.empty(need_out, dtype=torch.bfloat16, device=q.device)
             self._mid_lse = torch.empty(
                 need_out[:3], dtype=torch.float32, device=q.device
+            )
+        if self._kv_cache_format == "nvfp4":
+            return _decode_scratch_views(
+                self._mid_out,
+                self._mid_lse,
+                num_tokens,
+                num_heads,
+                num_splits,
+                self._d_v,
+                scratch_heads=scratch_heads,
             )
         return self._mid_out, self._mid_lse
 
@@ -1051,7 +1243,11 @@ class _SparseMLAPagedAttentionRunner:
         ``"swapab"`` raises ``ValueError`` on shapes outside its envelope
         (DSV3_2 family, single cache, whole-tile ``topk``, ``num_heads`` in
         {64, 128}) and is a no-op distinction for DSV4, where only the
-        non-swapAB path exists.
+        non-swapAB path exists. NVFP4 accepts ``None``, ``"auto"``, or
+        ``"mg"`` and uses its separately calibrated streaming/split-K planner.
+        NVFP4 also accepts ``indices``/``extra_indices`` as either
+        ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
+        query axis is normalized before planning and launch.
         """
         if q.dim() == 4:
             if q.size(1) != 1:
@@ -1066,6 +1262,10 @@ class _SparseMLAPagedAttentionRunner:
                     f"output.shape={tuple(output.shape)}"
                 )
             output = output.squeeze(1)
+        if self._kv_cache_format == "nvfp4":
+            indices = _normalize_nvfp4_indices(indices, "indices")
+            if extra_indices is not None:
+                extra_indices = _normalize_nvfp4_indices(extra_indices, "extra_indices")
         num_tokens, num_heads, _ = q.shape
         if self._max_num_tokens is not None and num_tokens > self._max_num_tokens:
             raise ValueError(
@@ -1075,6 +1275,23 @@ class _SparseMLAPagedAttentionRunner:
         if self._max_num_heads is not None and num_heads > self._max_num_heads:
             raise ValueError(
                 f"num_heads ({num_heads}) exceeds max_num_heads ({self._max_num_heads})"
+            )
+        if num_tokens == 0:
+            out_lse_view = self._get_out_lse(num_tokens, num_heads, out_lse)
+            return out_lse_view if return_lse else None
+
+        nvfp4_planned = None
+        if self._kv_cache_format == "nvfp4":
+            nvfp4_planned = self._plan_nvfp4_call(
+                q,
+                kv_cache,
+                indices,
+                topk_length,
+                attn_sink,
+                extra_kv_cache,
+                extra_indices,
+                extra_topk_length,
+                prefill_impl,
             )
 
         mid_out, mid_lse = self._maybe_allocate_decode_scratch(
@@ -1086,9 +1303,37 @@ class _SparseMLAPagedAttentionRunner:
             mid_out,
             mid_lse,
             prefill_impl,
+            nvfp4_planned,
         )
 
         out_lse_view = self._get_out_lse(num_tokens, num_heads, out_lse)
+        if self._kv_cache_format == "nvfp4":
+            from ._sparse_mla_nvfp4_sm120 import (
+                _sparse_mla_nvfp4_sm120_paged_attention,
+            )
+            from ._sparse_mla_nvfp4_sm120_plan import NVFP4KernelVariant
+
+            _sparse_mla_nvfp4_sm120_paged_attention(
+                q,
+                kv_cache,
+                indices,
+                output,
+                out_lse_view,
+                sm_scale,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                use_prefill=(
+                    nvfp4_planned.variant is NVFP4KernelVariant.PREFILL_STREAMING
+                ),
+                chunks_per_block_override=nvfp4_planned.cpb,
+            )
+            return out_lse_view if return_lse else None
+
         _sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
@@ -1122,7 +1367,8 @@ class _SparseMLAPagedAttentionRunner:
 #   calls then allocate nothing.
 # - ``run()`` is the single entry point. There is no separate plan stage;
 #   dispatch decisions are made internally per call and memoized.
-# - ``d_v`` and ``kv_scale_format`` are fixed at construction and select the
+# - ``d_v``, ``kv_scale_format``, and ``kv_cache_format`` are fixed at
+#   construction and select the
 #   model-type semantics applied to every ``run()`` call (512 for
 #   DSV3_2 / DSV4 / GLM variants, 1024 for DOTS3_SWA; scale semantics per
 #   ``kv_scale_format``).

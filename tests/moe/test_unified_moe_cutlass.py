@@ -2501,6 +2501,8 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_scale = CutlassFp8PerTensorConfig.prepare_activations(x)
+    assert x_q.dtype is torch.float8_e4m3fn
+    assert x_scale.dtype is torch.float32 and x_scale.ndim == 0
     view = CutlassFp8PerTensorConfig.prepare_weights(
         w1,
         w2,
@@ -2524,6 +2526,10 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_per_tensor", view)
     layer = MoELayer(config)
+    # Keep the public ``prepare_activations`` contract coupled to the actual
+    # runner boundary, rather than only checking the numerical launch below.
+    packed_inputs = layer.runners[0].pack_inputs(act, weights)
+    assert packed_inputs[-1] is x_scale
     _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
     flat = _run_flat_cutlass_independently(
@@ -2721,6 +2727,26 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
         x_sf.cpu().view(torch.uint8).reshape(-1),
         True,
     ).to(device=device, dtype=torch.bfloat16)
+    w1_dq = torch.stack(
+        [
+            mxfp8_dequantize_host(
+                view["fc1_expert_weights"][i].cpu().view(torch.uint8),
+                view["fc1_expert_scales"][i].cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+            for i in range(num_experts)
+        ]
+    ).to(device=device, dtype=torch.bfloat16)
+    w2_dq = torch.stack(
+        [
+            mxfp8_dequantize_host(
+                view["fc2_expert_weights"][i].cpu().view(torch.uint8),
+                view["fc2_expert_scales"][i].cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+            for i in range(num_experts)
+        ]
+    ).to(device=device, dtype=torch.bfloat16)
     config = _config(
         quant=QuantConfig(variant=QuantVariant.MxFp8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
@@ -2739,8 +2765,8 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     )
     expected = _reference(
         MoEActivationPack(x_dq, None, topk_ids, topk_weights),
-        w1,
-        w2,
+        w1_dq,
+        w2_dq,
         activation,
     )
     assert layer.winner_backend == "cutlass_mxfp8"
