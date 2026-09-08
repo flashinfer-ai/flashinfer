@@ -180,6 +180,11 @@ class SparseMLASm120DecodeConfig:
     compact_bytes_per_token : Optional[int]
         Optional smaller lossless row layout for explicitly shaped 3-D or
         4-D caches. GLM53_NOPE can omit its 128 unused RoPE padding bytes.
+    glm53_nope_contract_version : int
+        GLM53_NOPE integration contract. Version 1 guarantees zero-padded
+        masked candidate reads and an eight-head decode kernel compatible
+        with eight-head scratch buffers. Zero does not advertise this
+        contract. Compact row support is advertised separately.
     head_counts : Optional[frozenset[int]]
         Exact instantiated head counts when the kernel has no runtime-head
         fallback. ``None`` means every count in ``[1, max_num_heads]``.
@@ -203,6 +208,7 @@ class SparseMLASm120DecodeConfig:
     topk_is_runtime: bool = True
     extra_page_block_sizes: frozenset[int] = frozenset()
     compact_bytes_per_token: Optional[int] = None
+    glm53_nope_contract_version: int = 0
 
     def supported_num_heads(self) -> tuple[int, ...]:
         """Sorted instantiated head counts, including any runtime-H envelope."""
@@ -341,6 +347,7 @@ def supported_sparse_mla_sm120_configs(
             max_num_heads=_DECODE_MAX_HEADS,
             bytes_per_token=_BPT_DSV3_2,
             compact_bytes_per_token=528,
+            glm53_nope_contract_version=1,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
             d_qk=1088,
