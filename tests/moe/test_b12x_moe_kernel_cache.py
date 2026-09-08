@@ -55,8 +55,13 @@ from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (  # noqa
 # * ``mac_override`` selects the max-active-clusters value, and the resulting
 #   ``mac`` is part of every key;
 # * ``tile_m`` (dynamic kernel) becomes ``mma_tiler_mn[0]``, and
-#   ``mma_tiler_mn`` is part of every key.
-NON_CODEGEN_PARAMS = {"mac_override", "tile_m"}
+#   ``mma_tiler_mn`` is part of every key;
+# * ``intermediate_size`` (dynamic kernel) selects the branch-major operand
+#   extent: when the gated kernel can stream the true intermediate extent it
+#   becomes the keyed ``branch_major_extent`` (and the compile fakes' N), and
+#   when it cannot the kernel indexes the tile-padded views whose extent is the
+#   keyed ``n`` - both outcomes reach codegen only through keyed fields.
+NON_CODEGEN_PARAMS = {"mac_override", "tile_m", "intermediate_size"}
 
 STATIC_BASELINE = {
     "activation_precision": "fp4",
@@ -77,6 +82,12 @@ STATIC_BASELINE = {
     "swiglu_alpha": 1.702,
     "swiglu_beta": 1.0,
     "swiglu_limit": None,
+    # true weight extent, static workspace rows, merged-groups schedule, deferred init
+    "weight_n": 1024,
+    "route_rows": 256,
+    "merged_groups": False,
+    "deferred_init": False,
+    "source_scales": False,
 }
 STATIC_PERTURBED = {
     "activation_precision": "w4a16",
@@ -97,16 +108,32 @@ STATIC_PERTURBED = {
     "swiglu_alpha": -1.702,  # sign flip: sanitized text alone would collide
     "swiglu_beta": 2.0,
     "swiglu_limit": 7.0,
+    "weight_n": 320,  # padded n 2048 above vs a true extent below it
+    "route_rows": 8192,
+    "merged_groups": True,
+    "deferred_init": True,
+    "source_scales": True,
+}
+
+# Fields of the static key that the micro kernel does not specialize on (it
+# indexes the tile-padded views, sizes no workspace and has one schedule).
+STATIC_ONLY_FIELDS = {
+    "activation_precision",
+    "weight_n",
+    "route_rows",
+    "merged_groups",
+    "deferred_init",
+    "source_scales",
 }
 
 MICRO_BASELINE = {
-    k: v for k, v in STATIC_BASELINE.items() if k != "activation_precision"
+    k: v for k, v in STATIC_BASELINE.items() if k not in STATIC_ONLY_FIELDS
 }
 MICRO_BASELINE.update(
     share_input_across_experts=False, share_expert_scales=False, single_token=False
 )
 MICRO_PERTURBED = {
-    k: v for k, v in STATIC_PERTURBED.items() if k != "activation_precision"
+    k: v for k, v in STATIC_PERTURBED.items() if k not in STATIC_ONLY_FIELDS
 }
 MICRO_PERTURBED.update(
     share_input_across_experts=True, share_expert_scales=True, single_token=True
