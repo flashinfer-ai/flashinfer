@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm12x_supported
 
 try:
     from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE, recurrent_kda
@@ -33,8 +33,11 @@ except ImportError:
 def _require_recurrent_kda():
     if not torch.cuda.is_available():
         pytest.skip("Recurrent KDA requires CUDA")
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Recurrent KDA requires SM100a (Blackwell)")
+    if not (
+        is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
+    ):
+        pytest.skip("Recurrent KDA requires SM100a or SM12x (Blackwell)")
     if not _has_recurrent_kda:
         pytest.skip("recurrent_kda kernel not available (missing cutlass DSL deps)")
 
