@@ -1,3 +1,4 @@
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -5,8 +6,6 @@ typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
@@ -532,7 +531,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, CakeTensorMap const* k, CakeTensorMap const* v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ bsr_indices, int mb, int nb, int selected_blocks, int total_tiles, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ bsr_indices, int mb, int nb, int selected_blocks, int total_tiles, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -544,13 +543,6 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(k)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(v)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     __nv_bfloat16* q0_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -1191,7 +1183,7 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1199,30 +1191,38 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136381584;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output0), "r"(_mma_b_lo_2), "r"(tmem_scores0 + 64), "r"(((first_pv0) ? 0 : 1)));
                             first_pv0 = 0;
@@ -1236,7 +1236,7 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1244,30 +1244,38 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136381584;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_3), "r"(tmem_scores1 + 64), "r"(((first_pv1) ? 0 : 1)));
                             first_pv1 = 0;
@@ -1439,7 +1447,7 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                 int num_n_blocks_2 = nb;
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(q_full_addr, 32768);
-                    tma_4d_gmem2smem(q0_smem_addr, q, 0, query_base_2, q_head_2, 0, q_full_addr);
+                    tma_4d_gmem2smem(q0_smem_addr, (&q), 0, query_base_2, q_head_2, 0, q_full_addr);
                 }
                 int q_block = query_base_2 / 128;
                 if (lane < 6) {
@@ -1460,10 +1468,10 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                         mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, 32768);
                         int token0 = first_token;
                         int token1 = first_token + 64;
-                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768, k, 0, token0, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 8192, k, 0, token1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 16384, k, 0, token0, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 24576, k, 0, token1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768, (&k), 0, token0, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 8192, (&k), 0, token1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 16384, (&k), 0, token0, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 24576, (&k), 0, token1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
                     }
                     kv_stage_1 += 1;
                     if (kv_stage_1 == 3) { kv_stage_1 = 0; _phase_kv_empty ^= 1; }
@@ -1480,10 +1488,10 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                             mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, 32768);
                             int token0_1 = token_base;
                             int token1_1 = token_base + 64;
-                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768, v, 0, token0_1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 8192, v, 0, token1_1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 16384, v, 0, token0_1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 24576, v, 0, token1_1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768, (&v), 0, token0_1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 8192, (&v), 0, token1_1, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 16384, (&v), 0, token0_1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + kv_stage_1 * 32768 + 24576, (&v), 0, token1_1, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
                         }
                         kv_stage_1 += 1;
                         if (kv_stage_1 == 3) { kv_stage_1 = 0; _phase_kv_empty ^= 1; }
@@ -1496,10 +1504,10 @@ kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100(CakeTensorMap const* q, Ca
                                 mbarrier_arrive_expect_tx(kv_full_addr + (kv_stage_1) * 8, 32768);
                                 int token0_2 = next_token;
                                 int token1_2 = next_token + 64;
-                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768, k, 0, token0_2, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 8192, k, 0, token1_2, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 16384, k, 0, token0_2, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 24576, k, 0, token1_2, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768, (&k), 0, token0_2, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 8192, (&k), 0, token1_2, 0, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 16384, (&k), 0, token0_2, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + kv_stage_1 * 32768 + 24576, (&k), 0, token1_2, 1, kv_head_2, kv_full_addr + (kv_stage_1) * 8);
                             }
                             kv_stage_1 += 1;
                             if (kv_stage_1 == 3) { kv_stage_1 = 0; _phase_kv_empty ^= 1; }

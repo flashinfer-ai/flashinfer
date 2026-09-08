@@ -113,18 +113,22 @@ def materialize_fused_moe_weights(
             pack.prepare_for("trtllm_fp4_routed", view)
             return pack
 
-        if variant in (QuantVariant.NVFP4, QuantVariant.W4A16) and isinstance(
-            backend_cfg, CuteDslConfig
-        ):
+        if variant in (
+            QuantVariant.NVFP4,
+            QuantVariant.MXFP4,
+            QuantVariant.W4A16,
+        ) and isinstance(backend_cfg, CuteDslConfig):
             view = CuteDslConfig.prepare_weights(
                 weights.w13,
                 weights.w2,
+                variant=variant,
                 num_local_experts=num_local,
                 hidden_size=hidden,
                 intermediate_size=intermediate,
+                activation=moe_config.activation,
                 device=weights.w13.device,
             )
-            pack.prepare_for("cute_dsl_nvfp4", view)
+            pack.prepare_for("cute_dsl", view)
             return pack
 
     raise ValueError(

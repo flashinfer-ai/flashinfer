@@ -88,7 +88,7 @@ __global__ __launch_bounds__(128) void kernel_flashkda_refine_forgetting_horizon
   int cut = work_items[previous_base + 3];
   int bos = work_items[previous_base + 6];
   int eos = work_items[previous_base + 7];
-  int num_chunks = (eos - bos) / 16;
+  int num_chunks = (eos - bos + 16 - 1) / 16;
   int channel = tid;
   float _expf_0 = __expf(A_log[head]);
   float gate_rate = _expf_0;
@@ -108,15 +108,17 @@ __global__ __launch_bounds__(128) void kernel_flashkda_refine_forgetting_horizon
 #pragma unroll
         for (int sample = 0; sample < 4; sample++) {
           int left_token = bos + left_chunk * 16 + sample * 4;
-          long long left_index =
-              ((long long)left_token * (long long)num_heads + (long long)head) * 128 +
-              (long long)channel;
-          float _tanh_approx_0;
-          asm volatile("tanh.approx.f32 %0, %1;"
-                       : "=f"(_tanh_approx_0)
-                       : "f"(gate_rate * ((float)g[left_index] + gate_bias) * 0.5f));
-          float left_sigmoid = _tanh_approx_0 * 0.5f + 0.5f;
-          left_sum += lower_bound * 1.4426950408889634f * left_sigmoid;
+          if (left_token < eos) {
+            long long left_index =
+                ((long long)left_token * (long long)num_heads + (long long)head) * 128 +
+                (long long)channel;
+            float _tanh_approx_0;
+            asm volatile("tanh.approx.f32 %0, %1;"
+                         : "=f"(_tanh_approx_0)
+                         : "f"(gate_rate * ((float)g[left_index] + gate_bias) * 0.5f));
+            float left_sigmoid = _tanh_approx_0 * 0.5f + 0.5f;
+            left_sum += lower_bound * 1.4426950408889634f * left_sigmoid;
+          }
         }
       }
     }
@@ -126,15 +128,17 @@ __global__ __launch_bounds__(128) void kernel_flashkda_refine_forgetting_horizon
 #pragma unroll
         for (int sample_1 = 0; sample_1 < 4; sample_1++) {
           int right_token = bos + right_chunk * 16 + sample_1 * 4;
-          long long right_index =
-              ((long long)right_token * (long long)num_heads + (long long)head) * 128 +
-              (long long)channel;
-          float _tanh_approx_1;
-          asm volatile("tanh.approx.f32 %0, %1;"
-                       : "=f"(_tanh_approx_1)
-                       : "f"(gate_rate * ((float)g[right_index] + gate_bias) * 0.5f));
-          float right_sigmoid = _tanh_approx_1 * 0.5f + 0.5f;
-          right_sum += lower_bound * 1.4426950408889634f * right_sigmoid;
+          if (right_token < eos) {
+            long long right_index =
+                ((long long)right_token * (long long)num_heads + (long long)head) * 128 +
+                (long long)channel;
+            float _tanh_approx_1;
+            asm volatile("tanh.approx.f32 %0, %1;"
+                         : "=f"(_tanh_approx_1)
+                         : "f"(gate_rate * ((float)g[right_index] + gate_bias) * 0.5f));
+            float right_sigmoid = _tanh_approx_1 * 0.5f + 0.5f;
+            right_sum += lower_bound * 1.4426950408889634f * right_sigmoid;
+          }
         }
       }
     }
@@ -328,26 +332,10 @@ __global__ __launch_bounds__(128) void kernel_flashkda_backward_param_reduce_c16
       dgate_frag[0 + 2] = _v4.z;
       dgate_frag[0 + 3] = _v4.w;
     }
-    if (token % 16 == 0) {
-      long long boundary_index =
-          ((long long)token / 16 * (long long)num_heads + (long long)head) * 128 + (long long)dim0;
-      {
-        float4 _v4 = *reinterpret_cast<const float4*>(dlog_boundary + boundary_index);
-        dgate_frag[0 + 0] = _v4.x;
-        dgate_frag[0 + 1] = _v4.y;
-        dgate_frag[0 + 2] = _v4.z;
-        dgate_frag[0 + 3] = _v4.w;
-      }
-      {
-        float4 _v4 =
-            make_float4(dgate_frag[0 + 0], dgate_frag[0 + 1], dgate_frag[0 + 2], dgate_frag[0 + 3]);
-        *reinterpret_cast<float4*>(dlog_decay + gate_index) = _v4;
-      }
-    }
     {
-      uint2 _vld_2;
-      _vld_2 = *reinterpret_cast<const uint2*>(g + gate_index);
-      uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
+      uint2 _vld_1;
+      _vld_1 = *reinterpret_cast<const uint2*>(g + gate_index);
+      uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
 #pragma unroll
       for (int _pair = 0; _pair < 2; _pair++) {
         asm volatile(
@@ -356,7 +344,7 @@ __global__ __launch_bounds__(128) void kernel_flashkda_backward_param_reduce_c16
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
             : "=f"((&gate_frag[0 + _pair * 2])[0]), "=f"((&gate_frag[0 + _pair * 2])[1])
-            : "r"(_vpairs_2[_pair]));
+            : "r"(_vpairs_1[_pair]));
       }
     }
 #pragma unroll
@@ -449,9 +437,7 @@ __global__ __launch_bounds__(128) void kernel_flashkda_backward_param_reduce_c16
     float p3dt = dt8[6] + dt8[7];
     float col_a = p0a + p1a + (p2a + p3a);
     float col_dt = p0dt + p1dt + (p2dt + p3dt);
-    __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(col_dt);
-    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_2);
-    ddt_bias[head * 128 + dim_1] = _cvt_f32_1;
+    ddt_bias[head * 128 + dim_1] = col_dt;
     float _warp_reduce_0 = col_a;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -1046,7 +1046,7 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
     op_type="quantization",
     name_prefix="mxfp8_grouped_quantize",
     description=(
-        "Grouped MXFP8 quantization (cuTile, SM100+): [B, M, K] bf16/fp16 -> "
+        "Grouped MXFP8 quantization (SM100+): [B, M, K] bf16/fp16 -> "
         "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
         "grouped GEMM. K is padded up to a multiple of 128 for the kernel."
     ),

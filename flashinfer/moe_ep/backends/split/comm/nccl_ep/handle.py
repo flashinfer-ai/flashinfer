@@ -115,6 +115,9 @@ class NcclEpHandle(Handle):
             topk_idx = topk_idx.to(torch.int64)
         self._topk_idx = topk_idx
         self._num_tokens_in = topk_idx.shape[0]
+        # Buffers are sized for the creating shape; update() may only
+        # rebind a token count at or below it.
+        self._max_num_tokens_in = topk_idx.shape[0]
         self._top_k = topk_idx.shape[1]
         self._topk_idx_t = self._wrap(topk_idx)
 
@@ -175,13 +178,41 @@ class NcclEpHandle(Handle):
             self._topk_idx_t,
             layout_info=create_layout_info,  # HT recv-count opt-in; None otherwise
             config=None,
+            # Creation is host-side allocation and must happen OUTSIDE any
+            # capture (nccl_ep.h:422), so it stays on the handle's own stream.
             stream=self._stream,
         )
         _t = _hp("hinit.create_handle_c", _t)
 
+        # InitHandle ran on self._stream. Every later op issued on that same
+        # stream is therefore ordered after it for free. A captured op is not:
+        # the capture stream is a different stream (see _op_stream), and the
+        # dependency cannot be created from inside the capture -- see the
+        # guard in update() for why, and for what the caller must do instead.
+        self._ran_outside_capture = False
+
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    def _op_stream(self) -> int:
+        """Stream to issue transport work on.
+
+        Normally the handle's own stream: the ``HandleAlgoKnobUserStream``
+        value, else the fleet's. Under CUDA-graph capture that is the wrong
+        one. A handle that outlives a capture is created *before* it begins
+        (see ``update``), so its creation-time stream is not the stream being
+        captured, and work issued there lands outside the graph entirely --
+        the capture records nothing and the replay is a no-op.
+
+        Outside capture this returns exactly what it always did, so non-graph
+        behaviour (including an explicit UserStream) is unchanged.
+        """
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return torch.cuda.current_stream().cuda_stream
+        return self._stream
 
     # Only memoize wrappers of SMALL tensors: the wrapper keeps the torch tensor
     # alive, so caching wraps of large activations (e.g. 8k-token prefill inputs,
@@ -215,8 +246,114 @@ class NcclEpHandle(Handle):
             hot[key] = w
         return w
 
+    def update(self, params) -> None:
+        """Rebind to a new step's routing via ``ncclEpUpdateHandle``.
+
+        This is the per-step half of the split that makes CUDA-graph capture
+        possible: ``ncclEpInitHandle`` (done in ``__init__``, via
+        ``create_handle``) allocates and must stay outside the capture, while
+        this call only recomputes routing metadata and is safe to record
+        inside it. Without it a handle is created and destroyed per forward,
+        so a captured graph replays against freed device memory.
+
+        The routing SHAPE is fixed at creation: ``top_k`` because LL passes
+        ``num_topk`` to InitHandle, and the token count because the per-token
+        weights supplied via ``HandleAlgoKnobTopKWeights`` are bound then and
+        are not re-bindable here -- a shorter ``topk_ids`` would leave combine
+        reading weights for rows that no longer exist. Only the routing VALUES
+        may change. That is also all a CUDA graph can express, since it bakes
+        shapes at capture.
+
+        Capture contract: ``InitHandle`` must have completed before
+        ``cudaStreamBeginCapture``, because nothing inside the capture can
+        order the recorded work after it. ``torch.cuda.graph()`` satisfies
+        this -- it synchronizes the device in ``__enter__``. A caller driving
+        the raw capture API must synchronize itself. This method rejects the
+        one case it can see, a first update that is already captured.
+        """
+        import torch
+
+        topk_idx = params.topk_ids
+        if topk_idx.dtype != torch.int64:
+            topk_idx = topk_idx.to(torch.int64)
+        if topk_idx.shape[1] != self._top_k:
+            raise ValueError(
+                f"Handle.update cannot change top_k: handle was created with "
+                f"top_k={self._top_k}, got {topk_idx.shape[1]}. Create a new "
+                "handle instead."
+            )
+        if topk_idx.shape[0] != self._num_tokens_in:
+            raise ValueError(
+                f"Handle.update cannot change the token count: handle was "
+                f"created with {self._num_tokens_in} tokens, got "
+                f"{topk_idx.shape[0]}. The topk_weights bound at creation "
+                "(HandleAlgoKnobTopKWeights) still describe the original "
+                "rows, so a different count would desynchronize combine. "
+                "Create a new handle instead."
+            )
+        if not topk_idx.is_cuda:
+            raise ValueError(
+                f"Handle.update: topk_ids must be on the GPU, got {topk_idx.device}."
+            )
+        if self._topk_idx.is_cuda and topk_idx.device != self._topk_idx.device:
+            raise ValueError(
+                f"Handle.update: topk_ids moved device, {self._topk_idx.device}"
+                f" -> {topk_idx.device}."
+            )
+        if not topk_idx.is_contiguous():
+            raise ValueError("Handle.update: topk_ids must be contiguous.")
+
+        # Ordering against InitHandle. Ops issued on self._stream are ordered
+        # after it by the stream itself, which covers every non-captured call
+        # (_op_stream returns self._stream whenever we are not capturing).
+        #
+        # A captured call is not covered, and cannot be fixed from here: the
+        # capture stream may not wait on an event recorded before the capture
+        # began, and cudaEventSynchronize during capture invalidates it
+        # outright (cudaErrorStreamCaptureInvalidated). The dependency has to
+        # exist before cudaStreamBeginCapture, which is the caller's job --
+        # torch.cuda.graph() does it, synchronizing the device in __enter__.
+        #
+        # So this cannot verify the ordering, only that the documented recipe
+        # was followed: one update outside the capture before the captured
+        # one. That is a cheap, loud stand-in for a race that is otherwise
+        # silent until replay.
+        op_stream = self._op_stream()
+        if op_stream == self._stream:
+            self._ran_outside_capture = True
+        elif not self._ran_outside_capture:
+            raise RuntimeError(
+                "Handle.update: the first update on this handle cannot be "
+                "the captured one -- nothing inside a capture can order it "
+                "after InitHandle. Run one update outside the capture first "
+                "(the standard warmup does this), having synchronized before "
+                "capture began (torch.cuda.graph does this for you)."
+            )
+
+        self._topk_idx = topk_idx
+        self._num_tokens_in = topk_idx.shape[0]
+        self._topk_idx_t = self._wrap(topk_idx)
+        # layout_info is the HT recv-count opt-in and None for LL, which is
+        # exactly what ncclEpUpdateHandle requires of each mode. See
+        # _op_stream() for why this is not simply self._stream.
+        self._handle.update(
+            self._topk_idx_t,
+            layout_info=self._create_layout_info,
+            stream=op_stream,
+        )
+
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         x = params.x[0]
+        # The activation count must match the routing the handle currently
+        # holds. A mismatch passes the per-path capacity guards and reaches
+        # NCCL-EP, which indexes routing by row.
+        if x.shape[0] != self._num_tokens_in:
+            raise MoEEpConfigError(
+                f"dispatch received {x.shape[0]} activation rows but the "
+                f"handle's routing has {self._num_tokens_in}. Pass the same "
+                "token count as the topk_ids this handle was created with or "
+                "last updated to."
+            )
         if self._is_ht:
             return self._dispatch_ht(x)
         if self._is_rank_major:
@@ -235,6 +372,19 @@ class NcclEpHandle(Handle):
         # MXFP8 payload + scale bytes as uint8) within the transport's
         # token_hidden_size * dtype_bytes byte budget.
         hidden = x.shape[1]
+
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
 
         # Fleet-cached recv buffer (a fresh Handle is created every forward, so
         # per-handle caching never hits; the fleet persists).
@@ -285,10 +435,10 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
         _t = _hp("ll_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ll_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -314,6 +464,19 @@ class NcclEpHandle(Handle):
         max_per_rank = self._fleet.params.max_tokens_per_rank
         # Recv row mirrors the sent row; see _dispatch_ll.
         hidden = x.shape[1]
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
+
         m = max_per_rank * world_size
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
@@ -354,9 +517,9 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
 
         self._dispatch_inputs = inputs
         self._dispatch_outputs = outputs
@@ -449,10 +612,14 @@ class NcclEpHandle(Handle):
         _t = _hp("ht_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
-            inputs, outputs, layout_info=None, config=config, stream=self._stream
+            inputs,
+            outputs,
+            layout_info=None,
+            config=config,
+            stream=self._op_stream(),
         )
         _t = _hp("ht_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ht_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -497,8 +664,10 @@ class NcclEpHandle(Handle):
                 self._hot[ck] = config
             outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
             inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
-            self._handle.complete(stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
+            self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             self._combine_x2d = x2d
@@ -508,9 +677,11 @@ class NcclEpHandle(Handle):
             inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
             outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
             config = self._ep.CombineConfig(send_only=int(self._staged))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
             if self._staged:
-                self._handle.complete(stream=self._stream)
+                self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             return CombineOutput(x=out_t)
@@ -541,9 +712,9 @@ class NcclEpHandle(Handle):
             topk_weights=weights_t,
         )
 
-        self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+        self._handle.combine(inputs, outputs, config=config, stream=self._op_stream())
         if self._staged:
-            self._handle.complete(stream=self._stream)
+            self._handle.complete(stream=self._op_stream())
 
         self._combine_inputs = inputs
         self._combine_outputs = outputs
