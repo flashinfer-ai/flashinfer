@@ -131,13 +131,21 @@ def replayssm_materialize(
         ``src_slots[:, b]`` before writing ``dst_slots[:, b]``. Zero performs
         an exact state/scale copy. For a shared source-state/ring snapshot, it
         must not exceed checkpointing SSU's ``prev_num_accepted_tokens`` for
-        that request; this operation does not receive or validate that tracker.
+        that request. For every request selected by
+        ``active_request_indices``, ``ring_start`` must be in
+        ``[0, ring_buffer_len)`` and ``replay_prefix_len`` must be in
+        ``[0, max_window]``. This operation does not receive or validate the
+        checkpointing tracker.
     active_request_indices : torch.Tensor
-        CUDA int32 tensor of shape ``(B,)``. Its prefix contains the indices in the batch (B dim above)
-        for every request whose replay prefix length is non-negative, exactly
-        once and in any order; remaining entries are ``-1``. The kernel stops
-        at the first ``-1``. Tensor contents are not checked for consistency
-        with ``replay_prefix_len``.
+        CUDA int32 tensor of shape ``(B,)``. Its prefix contains the selected
+        physical batch indices, each exactly once and in any order; remaining
+        entries are ``-1``. The kernel stops at the first ``-1``. Each selected
+        index must be in ``[0, B)`` and refer to metadata satisfying the
+        ``ring_start`` and ``replay_prefix_len`` requirements above.
+
+        The contents of these metadata tensors are GPU-resident and are not
+        checked. Violating their value requirements is invalid input and has
+        undefined behavior.
     state_dtype : torch.dtype
         JIT state-storage dtype. One-byte state requires ``dim=64`` and
         ``dstate=128``.

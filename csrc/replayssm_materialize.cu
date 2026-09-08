@@ -117,7 +117,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     }
     int64_t const table = int64_t(layer) * p.batch + physical_request;
     int const src_slot = p.src_slots[table], dst_slot = p.dst_slots[table];
-    if (src_slot == p.pad_slot_id || dst_slot == p.pad_slot_id || count > MAX_WINDOW) {
+    if (src_slot == p.pad_slot_id || dst_slot == p.pad_slot_id) {
       advance_persistent_coordinates(work, virtual_request, layer, head, work_stride,
                                      virtual_request_delta, layer_delta, head_delta, p.layers,
                                      p.heads);

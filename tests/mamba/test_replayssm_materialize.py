@@ -226,8 +226,8 @@ def test_replayssm_materialize_persistent_grid_stride_zero_copy() -> None:
     assert torch.equal(state[1:], source.expand_as(state[1:]))
 
 
-def test_replayssm_materialize_negative_prefix_len_is_noop() -> None:
-    """A negative replay prefix length does not touch source or destination state."""
+def test_replayssm_materialize_no_active_requests_is_noop() -> None:
+    """An empty active-request prefix does not touch source or destination state."""
     torch.manual_seed(1)
     ring_buffer_len = 12
     state = [torch.randn(2, 1, 64, 64, dtype=torch.bfloat16, device="cuda")]
@@ -242,7 +242,7 @@ def test_replayssm_materialize_negative_prefix_len_is_noop() -> None:
     src_slots = torch.tensor([[0]], dtype=torch.int32, device="cuda")
     dst_slots = torch.tensor([[1]], dtype=torch.int32, device="cuda")
     ring_start = torch.tensor([0], dtype=torch.int32, device="cuda")
-    replay_prefix_len = torch.tensor([-1], dtype=torch.int32, device="cuda")
+    replay_prefix_len = torch.zeros(1, dtype=torch.int32, device="cuda")
     before = state[0].clone()
 
     _materialize(
@@ -256,7 +256,7 @@ def test_replayssm_materialize_negative_prefix_len_is_noop() -> None:
         ring_start,
         replay_prefix_len,
         ring_buffer_len,
-        active_request_indices=_active_request_indices(replay_prefix_len),
+        active_request_indices=torch.full((1,), -1, dtype=torch.int32, device="cuda"),
     )
     torch.cuda.synchronize()
     assert torch.equal(state[0], before)
