@@ -132,6 +132,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    max_seqlen: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -237,6 +238,15 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
+    max_seqlen : int, optional
+        Maximum logical sequence length. The CP kernels use this host-side hint
+        to bound their per-sequence launch grids without reading ``cu_seqlens``
+        back from the GPU. Pass the exact maximum for variable-length or
+        imbalanced batches. When omitted, CP assumes a balanced batch and uses
+        ``ceil(total_seq_len / num_seqs)``. That fallback can under-launch an
+        imbalanced batch, so callers allowing unequal sequence lengths must
+        provide this argument whenever ``use_cp=True`` or ``use_cp="auto"`` may
+        select the CP path.
 
     Returns
     -------
@@ -457,6 +467,11 @@ def chunk_gated_delta_rule(
                 if _arch_major in (9, 10, 12)
                 else {}
             )
+            cp_max_seqlen = (
+                max_seqlen
+                if max_seqlen is not None
+                else (total_seq_len + num_seqs - 1) // num_seqs
+            )
             cp_delta_rule_dsl(
                 output,
                 output_state,
@@ -468,7 +483,7 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                max_seqlen=total_seq_len,
+                max_seqlen=cp_max_seqlen,
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,

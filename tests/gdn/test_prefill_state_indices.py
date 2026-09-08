@@ -108,6 +108,7 @@ def _run(
         output_state=output_state,
         state_indices=state_indices,
         use_cp=use_cp,
+        max_seqlen=total,
     )
     return output, final
 
@@ -372,6 +373,7 @@ def test_prefill_state_indices_without_final_state(use_cp):
         output_final_state=False,
         cu_seqlens=cu_seqlens,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     slots = [3, 0]
@@ -388,6 +390,7 @@ def test_prefill_state_indices_without_final_state(use_cp):
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 

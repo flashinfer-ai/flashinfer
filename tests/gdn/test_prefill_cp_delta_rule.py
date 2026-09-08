@@ -981,7 +981,18 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     beta = _make_gates(total_seqlen, num_heads, 0.99, device)
 
     our_o, our_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=True
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seqlens,
+        True,
+        use_cp=True,
+        max_seqlen=max(seq_lens),
     )
     ref_o, ref_state = chunk_gated_delta_rule(
         q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=False
@@ -1042,6 +1053,7 @@ def test_cp_delta_rule_external_state_dtype(
         output=our_o,
         output_state=our_state,
         use_cp=True,
+        max_seqlen=max(seq_lens),
     )
     chunk_gated_delta_rule(
         q,
