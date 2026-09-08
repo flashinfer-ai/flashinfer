@@ -23,6 +23,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
+from flashinfer.tllm_enums import SfLayout
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -724,6 +725,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             do_finalize=True,
             enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
+            hidden_states_scale_layout=SfLayout.layout_linear,
         )
 
     backend = "trtllm"

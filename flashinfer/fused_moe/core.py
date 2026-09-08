@@ -1843,7 +1843,7 @@ _IMPLICIT_ACT_SF_LAYOUT_DEPRECATION = (
 
 
 def _resolve_moe_act_sf_layout(
-    hidden_states_scale_layout: Optional[SfLayout],
+    hidden_states_scale_layout: Optional[Union[int, SfLayout]],
 ) -> SfLayout:
     """Resolve the activation scale-factor layout for a trtllm-gen MoE call.
 
@@ -2117,7 +2117,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs: "MoeRunnerInputs",
             tune_max_num_tokens: int = 8192,
             routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
-            hidden_states_scale_layout: Optional[SfLayout] = None,
+            hidden_states_scale_layout: Optional[Union[int, SfLayout]] = None,
             **kwargs,
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
@@ -2204,10 +2204,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 # Hoisted: this runs on every op call (_make_tuning_config is not
                 # memoized), so avoid repeating the numel() FFI hop three times.
                 _sf_numel = scale.numel()
-                assert num_tokens > 0 and _sf_numel % num_tokens == 0, (
-                    f"flat hidden_states_scale numel {_sf_numel} is not a "
-                    f"multiple of num_tokens={num_tokens}"
-                )
+                if num_tokens <= 0 or _sf_numel % num_tokens != 0:
+                    # Not an assert: these validate caller input, and `python -O`
+                    # strips asserts -- which would let a malformed flat scale
+                    # through and let the floor division below derive an
+                    # undersized profiling extent.
+                    raise ValueError(
+                        f"flat hidden_states_scale numel {_sf_numel} is not a "
+                        f"multiple of num_tokens={num_tokens}"
+                    )
                 # Validate the buffer against the DECLARED layout.
                 # ``act_sf_layout`` is linear here — the caller either said so or
                 # the deprecated implicit path inferred it, and
@@ -2235,20 +2240,21 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 # either trips this assert or over-sizes the buffer, which is
                 # safe.
                 _sf_per_token = _sf_numel // num_tokens
-                assert (
+                if not (
                     _sf_per_token > 0
                     and self.hidden_size % _sf_per_token == 0
                     and self.hidden_size // _sf_per_token in (16, 32)
-                ), (
-                    f"flat hidden_states_scale numel {_sf_numel} implies "
-                    f"{_sf_per_token} scales/token for hidden_size="
-                    f"{self.hidden_size}, i.e. an SF vector size of "
-                    f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
-                    "which is not a supported SF vector size (16 for NvFp4, 32 "
-                    f"for Mx*). {act_sf_layout!r} expects "
-                    "num_tokens * hidden_size // sf_vec_size elements, e.g. from "
-                    "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
-                )
+                ):
+                    raise ValueError(
+                        f"flat hidden_states_scale numel {_sf_numel} implies "
+                        f"{_sf_per_token} scales/token for hidden_size="
+                        f"{self.hidden_size}, i.e. an SF vector size of "
+                        f"{self.hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
+                        "which is not a supported SF vector size (16 for NvFp4, 32 "
+                        f"for Mx*). {act_sf_layout!r} expects "
+                        "num_tokens * hidden_size // sf_vec_size elements, e.g. from "
+                        "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
+                    )
                 constraint_specs = (
                     ConstraintSpec(
                         MoeRunnerInputs.idx("hidden_states_scale"),
@@ -2472,12 +2478,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     # Flat linear layout, i.e. mxfp8_quantize(...,
                     # is_sf_swizzled_layout=False): one
                     # contiguous run of sf_per_token scales per token.
-                    assert (
-                        num_tokens > 0 and hidden_states_scale.numel() % num_tokens == 0
-                    ), (
-                        f"flat hidden_states_scale numel {hidden_states_scale.numel()} "
-                        f"is not a multiple of num_tokens={num_tokens}"
-                    )
+                    if num_tokens <= 0 or hidden_states_scale.numel() % num_tokens != 0:
+                        # Not an assert: `python -O` strips those, and this
+                        # validates caller input rather than an internal invariant.
+                        raise ValueError(
+                            f"flat hidden_states_scale numel "
+                            f"{hidden_states_scale.numel()} is not a multiple of "
+                            f"num_tokens={num_tokens}"
+                        )
                 else:
                     assert (
                         hidden_states_scale.dim() == 2
