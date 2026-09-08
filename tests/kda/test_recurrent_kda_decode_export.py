@@ -2001,17 +2001,19 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_when_cake_cannot_serve(
     # The negative contract this test exists for: Cake is not servable here, so
     # "auto" must reach CuTe rather than raise.
     assert frozen_calls == []
+    # Bit-exact, not approximate: after the fallback both spellings launch the
+    # same kernel on the same inputs, so any drift is a convention mismatch.
     torch.testing.assert_close(
-        actual_state_result.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
     )
     torch.testing.assert_close(
-        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
     )
     torch.testing.assert_close(
         actual_state[state_indices].float(),
         baseline_state[state_indices].float(),
-        atol=1e-2,
-        rtol=1e-2,
+        atol=0,
+        rtol=0,
     )
     untouched = torch.ones(state_slots, dtype=torch.bool, device=flash_kda_device)
     untouched[state_indices.to(torch.long)] = False
@@ -2029,6 +2031,132 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_when_cake_cannot_serve(
             ),
             backend="cake",
         )
+
+
+def _unbounded_softplus_cake_ineligible_case(device, *, num_sequences, num_heads, seed):
+    """A T=1 unbounded-softplus decode case the Cake selector always rejects."""
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    case = _make_case(
+        device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=seed,
+    )
+    case.update(
+        beta_is_logit=True,
+        A_log=torch.rand(
+            num_heads, dtype=torch.float32, device=device, generator=generator
+        )
+        - 1.5,
+        dt_bias=torch.randn(
+            num_heads * _D, dtype=torch.float32, device=device, generator=generator
+        ),
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        use_qk_l2norm_in_kernel=False,
+    )
+    return case
+
+
+@pytest.mark.parametrize("num_sequences", [2, 4])
+def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
+    flash_kda_device, num_sequences
+):
+    """The fallback's own edge branches must not diverge from "cute-dsl".
+
+    Straddles the one-warp threshold at 32 heads: 2 sequences is multi-warp,
+    4 is one-warp.
+    """
+
+    num_heads = 32
+    slots = 2 * num_sequences + 1
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+
+    # No state pool at all: the gate seeds zeros, so there is nothing to restore
+    # and the indices must not be applied to a missing tensor.
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4936
+    )
+    case.update(ssm_state_indices=state_indices, initial_state=None)
+    expected = recurrent_kda(
+        **_call_kwargs(dict(case), output=torch.empty_like(case["output"])),
+        backend="cute-dsl",
+    )
+    actual = recurrent_kda(
+        **_call_kwargs(dict(case), output=torch.empty_like(case["output"])),
+        backend="auto",
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_value.float(), expected_value.float(), atol=0, rtol=0
+        )
+
+    # A non-contiguous pool without indices cannot be updated in place, because
+    # the wrapper has to copy it. "auto" must report that rather than silently
+    # dropping the update, exactly as "cute-dsl" does.
+    strided_state, _ = _padded_slot_state(
+        num_sequences, num_heads, flash_kda_device, seed=4936
+    )
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4937
+    )
+    case.update(ssm_state_indices=None)
+    for backend in ("cute-dsl", "auto"):
+        with pytest.raises(ValueError, match="non-contiguous initial_state"):
+            recurrent_kda(
+                **_call_kwargs(
+                    dict(case),
+                    state=strided_state,
+                    output=torch.empty_like(case["output"]),
+                ),
+                backend=backend,
+            )
+
+    # With indices the pool is gathered rather than copied, so a non-contiguous
+    # pool stays supported on the fallback and untouched slots stay untouched.
+    # "cute-dsl" rejects this layout outright, so the oracle is the same "auto"
+    # call over a dense pool holding the same values.
+    strided_pool, _ = _padded_slot_state(slots, num_heads, flash_kda_device, seed=4938)
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4939
+    )
+    case.update(ssm_state_indices=state_indices)
+    baseline_pool = strided_pool.contiguous().clone()
+    expected = recurrent_kda(
+        **_call_kwargs(
+            dict(case),
+            state=baseline_pool,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="auto",
+    )
+    before = strided_pool.clone()
+    actual = recurrent_kda(
+        **_call_kwargs(
+            dict(case), state=strided_pool, output=torch.empty_like(case["output"])
+        ),
+        backend="auto",
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_value.float(), expected_value.float(), atol=0, rtol=0
+        )
+    torch.testing.assert_close(
+        strided_pool[state_indices].float(),
+        baseline_pool[state_indices].float(),
+        atol=0,
+        rtol=0,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        strided_pool[untouched], before[untouched], atol=0, rtol=0
+    )
 
 
 def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_dsl(

@@ -2161,7 +2161,12 @@ def run_recurrent_kda(
             initial_state is not None
             and not initial_state.is_contiguous()
             and backend != "cake"
-            and not auto_unbounded_softplus_candidate
+            # Only the indexed Cake convention tolerates a non-contiguous pool: it
+            # passes the pool through and gathers via ``ssi``. Without indices it
+            # would copy, so the check still applies to the "auto" candidate.
+            and not (
+                auto_unbounded_softplus_candidate and ssm_state_indices is not None
+            )
         ):
             raise ValueError(
                 "non-contiguous initial_state requires cu_seqlens: without cu_seqlens "
@@ -2368,7 +2373,11 @@ def run_recurrent_kda(
             raise ValueError(
                 "the requested Cake recurrent_kda decode contract is unsupported"
             )
-        if auto_unbounded_softplus and cu_seqlens_i32 is None:
+        if (
+            auto_unbounded_softplus
+            and cu_seqlens_i32 is None
+            and initial_state is not None
+        ):
             # The state convention above was chosen before the variant was known.
             # Cake was not selected after all, so restore CuTe's convention before
             # falling through to it.
@@ -2376,7 +2385,7 @@ def run_recurrent_kda(
                 state = initial_state[ssm_state_indices].contiguous()
                 copy_back_indices = ssm_state_indices
                 ssi = None
-            elif initial_state is not None:
+            else:
                 state = initial_state.contiguous()
     if flash_kda_decode_variant is not None:
         _run_flash_kda_decode(
