@@ -884,9 +884,7 @@ def chunk_gated_delta_rule(
     if backend != "flashinfer":
         if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
             if backend == "cake_gdn":
-                raise RuntimeError(
-                    "the source-only Cake GDN backend is not installed"
-                )
+                raise RuntimeError("the source-only Cake GDN backend is not installed")
         else:
             try:
                 return _run_cake_gdn_prefill(

@@ -155,9 +155,7 @@ def _run_cake_gdn_decode_pretranspose(
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
         raise RuntimeError("the source-only Cake GDN backend is not installed")
     if q.device.type != "cuda":
-        raise _cake_gdn.CakeGDNUnsupportedError(
-            "Cake GDN requires CUDA tensors"
-        )
+        raise _cake_gdn.CakeGDNUnsupportedError("Cake GDN requires CUDA tensors")
     if q.dtype != torch.bfloat16:
         raise _cake_gdn.CakeGDNUnsupportedError("GDN non-CP decode requires BF16 I/O")
     if (
@@ -656,9 +654,7 @@ def gated_delta_rule_decode_pretranspose(
     if backend != "flashinfer":
         if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
             if backend == "cake_gdn":
-                raise RuntimeError(
-                    "the source-only Cake GDN backend is not installed"
-                )
+                raise RuntimeError("the source-only Cake GDN backend is not installed")
         elif not use_pool:
             if backend == "cake_gdn":
                 raise _cake_gdn.CakeGDNUnsupportedError(
@@ -1024,9 +1020,7 @@ def gated_delta_rule_decode(
     if backend != "flashinfer":
         if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
             if backend == "cake_gdn":
-                raise RuntimeError(
-                    "the source-only Cake GDN backend is not installed"
-                )
+                raise RuntimeError("the source-only Cake GDN backend is not installed")
         else:
             try:
                 cake_gdn_output = _run_cake_gdn_decode_nontranspose(

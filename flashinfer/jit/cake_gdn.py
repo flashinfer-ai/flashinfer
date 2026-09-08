@@ -105,8 +105,7 @@ def _source_dir() -> Path:
     if checkout.exists():
         return checkout
     raise FileNotFoundError(
-        "frozen Cake GDN sources were not found; checked "
-        f"{installed} and {checkout}"
+        f"frozen Cake GDN sources were not found; checked {installed} and {checkout}"
     )
 
 
@@ -224,9 +223,7 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
     """Compile and load one checksum-verified Cake GDN host entrypoint."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
-        raise CakeGDNUnsupportedError(
-            f"unsupported Cake GDN architecture: {arch!r}"
-        )
+        raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
     host = record["host_binding"]
