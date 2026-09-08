@@ -57,6 +57,13 @@ It requires an NCU version supporting ``--communicator=shmem`` and an exact
 collective kernel filter supplied with ``--ncu-megamoe-kernel``. Isolated
 single-rank kernel replay is not valid for this backend.
 
+If NVSHMEM allocations prevent kernel-replay context save, use
+``--ncu-megamoe-replay application``. This starts one NCU instance per rank
+under torchrun and coordinates application replay over TCP. It requires at
+least one input token on every rank because the synchronized MegaMoE NVTX
+range includes rank-local staging and final reduction. Use CUPTI for latency;
+profiler synchronization can substantially distort collective kernel duration.
+
 The workload stages remain available as NVTX ranges. Kernel attribution uses
 those ranges rather than matching kernel names.
 """
@@ -187,6 +194,7 @@ def _profile_worker_arguments(args, num_tokens):
         arguments.append("--verbose")
     if args.ncu_megamoe_kernel:
         arguments.extend(("--ncu-megamoe-kernel", args.ncu_megamoe_kernel))
+    arguments.extend(("--ncu-megamoe-replay", args.ncu_megamoe_replay))
     return arguments
 
 
@@ -454,9 +462,10 @@ def _run_ncu_profiles(args, token_counts):
         help_text = subprocess.run(
             [ncu, "--help"], check=True, capture_output=True, text=True
         ).stdout
-        if "communicator-shmem-num-peers" not in help_text:
+        communicator = "tcp" if args.ncu_megamoe_replay == "application" else "shmem"
+        if f"communicator-{communicator}-num-peers" not in help_text:
             raise RuntimeError(
-                "MegaMoE profiling requires an NCU version with the shmem "
+                f"MegaMoE profiling requires an NCU version with the {communicator} "
                 "multi-process communicator; isolated-rank replay would hang"
             )
         if shutil.which("torchrun") is None:
@@ -479,6 +488,11 @@ def _run_ncu_profiles(args, token_counts):
         env[_PROFILE_CASE_ENV] = profile_label
         env["CUTE_DSL_CACHE_DIR"] = str(lineinfo_cache)
         env["CUTE_DSL_LINEINFO"] = "1"
+        outer_launcher = []
+        export_output = str(output)
+        application_replay = (
+            variant.use_megamoe and args.ncu_megamoe_replay == "application"
+        )
         if variant.use_megamoe:
             # NVIDIA's mandatory-concurrent-kernel workflow coordinates all
             # participating ranks. Profiling only the fused collective avoids
@@ -495,6 +509,30 @@ def _run_ncu_profiles(args, token_counts):
                 shutil.which("torchrun"),
                 *_profile_torchrun_arguments(args.num_gpus),
             ]
+            if application_replay:
+                # Every rank owns an NCU process so application replay restarts
+                # workers without restarting the parent rendezvous service.
+                with socket.socket() as communicator_socket:
+                    communicator_socket.bind(("127.0.0.1", 0))
+                    communicator_port = communicator_socket.getsockname()[1]
+                replay_arguments = [
+                    "--communicator=tcp",
+                    f"--communicator-tcp-num-peers={args.num_gpus}",
+                    "--communicator-tcp-hostname=127.0.0.1",
+                    f"--communicator-tcp-port={communicator_port}",
+                    "--replay-mode=application",
+                    "--app-replay-mode=strict",
+                    "--app-replay-match=grid",
+                    "--nvtx",
+                    "--lockstep-kernel-launch",
+                    "--lockstep-nvtx-include=stage::MegaMoE/",
+                    "--kernel-name-base=demangled",
+                    f"--kernel-name={args.ncu_megamoe_kernel}",
+                ]
+                outer_launcher = [*launcher, "--no-python"]
+                launcher = [sys.executable]
+                # NCU's documented environment macro avoids report collisions.
+                export_output += ".rank%q{RANK}"
             description = "coordinated EP collective kernels"
         else:
             replay_arguments = [
@@ -509,6 +547,7 @@ def _run_ncu_profiles(args, token_counts):
             launcher = [sys.executable]
             description = "simulated post-communication kernels"
         command = [
+            *outer_launcher,
             ncu,
             *(
                 [f"--metrics={args.ncu_metrics}"]
@@ -522,8 +561,8 @@ def _run_ncu_profiles(args, token_counts):
             f"--source-folders={source_root}",
             "--print-summary=per-kernel",
             "--force-overwrite",
-            f"--log-file={log_file}",
-            f"--export={output}",
+            f"--log-file={'stdout' if application_replay else log_file}",
+            f"--export={export_output}",
             *launcher,
             str(script),
             *_profile_worker_arguments(args, num_tokens),
@@ -535,7 +574,14 @@ def _run_ncu_profiles(args, token_counts):
             flush=True,
         )
         _verbose_print(args, "Command:", " ".join(command))
-        subprocess.run(command, check=True, env=env)
+        if application_replay:
+            # All ranks share this parent-owned log; reports remain per rank.
+            with log_file.open("w") as log:
+                subprocess.run(
+                    command, check=True, env=env, stdout=log, stderr=subprocess.STDOUT
+                )
+        else:
+            subprocess.run(command, check=True, env=env)
 
         reports = sorted(output_dir.glob(f"{output.name}*.ncu-rep"))
         if not reports:
@@ -1852,6 +1898,15 @@ def main():
         help="Comma-separated NCU metrics; default captures the full metric set.",
     )
     parser.add_argument(
+        "--ncu-megamoe-replay",
+        choices=("kernel", "application"),
+        default="kernel",
+        help=(
+            "MegaMoE NCU replay: kernel uses one shmem communicator; application "
+            "uses one profiler per rank over TCP and requires nonempty source ranks."
+        ),
+    )
+    parser.add_argument(
         "--ncu-megamoe-kernel",
         default=None,
         help=(
@@ -1919,6 +1974,13 @@ def main():
         tokens = DISTRIBUTED_TOKEN_COUNTS
     if not tokens or any(value < 1 for value in tokens):
         parser.error("--num-tokens must contain positive global token counts")
+    if (
+        args.mode == "profile_ncu"
+        and "w4a16_megamoe" in variant_names
+        and args.ncu_megamoe_replay == "application"
+        and any(value < args.num_gpus for value in tokens)
+    ):
+        parser.error("MegaMoE NCU application replay requires nonempty source ranks")
 
     if args.mode == "benchmark" and args.timing == "cupti":
         try:
