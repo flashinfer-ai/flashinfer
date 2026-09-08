@@ -70,15 +70,6 @@ __device__ __forceinline__ void advance_persistent_coordinates(
   virtual_request += virtual_request_delta;
 }
 
-// Derive a per-layer Philox key with the SplitMix64 finalizer (Stafford mix13).
-// The golden-ratio increment and avalanche multipliers are SplitMix64 constants.
-__device__ __forceinline__ int64_t layer_philox_seed(int64_t base_seed, int layer) {
-  uint64_t z = static_cast<uint64_t>(base_seed) ^ (0x9E3779B97F4A7C15ULL * (uint64_t(layer) + 1));
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return static_cast<int64_t>(z ^ (z >> 31));
-}
-
 // Reuse checkpointing_ssu's force-inlined tensor-core recurrence while a fixed
 // CTA pool grid-strides over the logical (virtual request, layer, head) work.
 template <typename T>
@@ -181,7 +172,8 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     __pipeline_commit();
     __pipeline_wait_prior(0);
     __syncthreads();
-    int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? layer_philox_seed(*p.rand_seed, layer) : 0;
+    int64_t const rand_seed =
+        (PHILOX_ROUNDS > 0) ? conversion::layer_philox_seed(*p.rand_seed, layer) : 0;
     if constexpr (sizeof(T) == 1) {
       // view's state and scale are used below only for the
       // destination.  state is already in smem, source_scale is
