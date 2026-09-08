@@ -86,10 +86,12 @@ def test_mixed_knobs_and_candidates():
     }
 
     assert all(c["in_kernel_fc2_reduce"] is False for c in candidates)
-    assert all(
-        c["in_kernel_fc2_reduce"] is True
-        for c in bf16_mxfp8_candidates(enable_in_kernel_fc2_reduce=True)
-    )
+    # Permitting ikr adds it as a sweep axis: the deterministic half stays,
+    # and stays first so --max-candidates truncates to it.
+    permitted = bf16_mxfp8_candidates(enable_in_kernel_fc2_reduce=True)
+    assert len(permitted) == 36
+    assert permitted[:18] == candidates
+    assert all(c["in_kernel_fc2_reduce"] is True for c in permitted[18:])
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     frontend.apply_knobs(knobs)
@@ -175,19 +177,27 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
         128,
         0,
         1,
-        in_kernel_fc2_reduce=True,
-        knobs={"flag_batch": 4, "token_back_mode": "reuse_dispatch_warps"},
+        enable_in_kernel_fc2_reduce=True,
+        knobs={
+            "flag_batch": 4,
+            "token_back_mode": "reuse_dispatch_warps",
+            "in_kernel_fc2_reduce": True,
+        },
     )
     try:
         config = buf._frontend.config
         assert config.in_kernel_fc2_reduce is True
         assert config.token_back_mode == "reuse_dispatch_warps"
         assert config.flag_batch == 4
+        # Both destinations exist either way, so the knob can flip later.
+        assert buf.combine_output.shape == (8, 2, 128)
+        assert buf.reduced_output.shape == (8, 1, 128)
+        assert buf.kernel_combine_output is buf.reduced_output
     finally:
         buf.destroy()
 
 
-def test_mixed_factory_rejects_pinned_ikr_mismatch(monkeypatch):
+def test_mixed_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
@@ -211,13 +221,16 @@ def test_mixed_factory_rejects_pinned_ikr_mismatch(monkeypatch):
         )
 
 
-def test_mixed_frontend_rejects_ikr_changing_knobs():
-    frontend = MegaMoEBf16Mxfp8Frontend(_config())
+def test_mixed_frontend_rejects_unpermitted_ikr_knobs():
     with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
-        frontend.apply_knobs({"in_kernel_fc2_reduce": True})
+        MegaMoEBf16Mxfp8Frontend(_config()).apply_knobs({"in_kernel_fc2_reduce": True})
+
+    permitted = MegaMoEBf16Mxfp8Frontend(_config(enable_in_kernel_fc2_reduce=True))
+    permitted.apply_knobs({"in_kernel_fc2_reduce": True})
+    assert permitted.config.in_kernel_fc2_reduce is True
 
 
-def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
+def test_mixed_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
@@ -228,7 +241,9 @@ def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
         lambda _frontend, _launch, candidates, **_kwargs: candidates,
     )
     buffer = SimpleNamespace(_frontend=frontend)
-    with pytest.warns(RuntimeWarning, match="in_kernel_fc2_reduce=True contradicts"):
+    with pytest.warns(
+        RuntimeWarning, match="in_kernel_fc2_reduce=True is not permitted"
+    ):
         assert autotune.autotune_bf16_mxfp8_mega_moe(
             None,
             None,
@@ -244,7 +259,7 @@ def test_mixed_autotune_filters_ikr_changing_candidates(monkeypatch):
             buffer,
             candidates=[{**valid, "in_kernel_fc2_reduce": True}],
         )
-    assert "in_kernel_fc2_reduce=True contradicts" in str(excinfo.value)
+    assert "in_kernel_fc2_reduce=True is not permitted" in str(excinfo.value)
 
 
 def test_mixed_backend_is_registered():

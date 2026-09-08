@@ -6,11 +6,8 @@ input creation, candidate enumeration, knob resolution, the autotune entry
 point) live here, next to the backend that consumes the recorded winners; the
 sweep loop and shared helpers come from ``backends/mega/kernel/tuning.py``.
 
-``in_kernel_fc2_reduce`` is a session axis here, not a sweep axis: it sizes
-the ``combine_output`` buffer, so the knob cache keeps one entry per mode and
-matches it exactly.  ``--allow-nondeterministic`` therefore runs a SECOND
-sweep for the ikr session rather than widening one candidate list, leaving
-both entries populated (at twice the compile cost of the 18-candidate list).
+``--allow-nondeterministic`` widens the 18-candidate list to 36 by adding the
+``in_kernel_fc2_reduce`` half, at twice the compile cost.
 """
 
 from __future__ import annotations
@@ -20,14 +17,7 @@ from typing import Any
 from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidates
 
 
-def _tune_session(
-    args,
-    rank: int,
-    world_size: int,
-    max_tokens: int,
-    *,
-    in_kernel_fc2_reduce: bool,
-) -> dict:
+def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     from ......kernel_src.cutedsl_megamoe import (
         autotune_bf16_mxfp8_mega_moe,
         bf16_mxfp8_candidates,
@@ -51,11 +41,11 @@ def _tune_session(
             args.intermediate,
             kind=args.dtype,
             gate_up_clamp=args.gate_up_clamp,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
             seed=args.seed,
         )
         candidates = bf16_mxfp8_candidates(
-            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
         )
 
         if args.sweep == "schedule":
@@ -76,7 +66,7 @@ def _tune_session(
                     topk=args.topk,
                     max_tokens=max_tokens,
                     combine_dtype=args.combine_dtype,
-                    enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
@@ -97,17 +87,6 @@ def _tune_session(
     finally:
         if symm_buffer is not None:
             symm_buffer.destroy()
-
-
-def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    winner = _tune_session(
-        args, rank, world_size, max_tokens, in_kernel_fc2_reduce=False
-    )
-    if args.allow_nondeterministic:
-        winner = _tune_session(
-            args, rank, world_size, max_tokens, in_kernel_fc2_reduce=True
-        )
-    return winner
 
 
 def run_tuning(args) -> int:

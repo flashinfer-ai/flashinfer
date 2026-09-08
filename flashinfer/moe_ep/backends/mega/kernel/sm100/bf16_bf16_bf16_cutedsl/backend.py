@@ -39,6 +39,8 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
     "sm100_bf16_bf16_bf16_cutedsl", deprecated_aliases=("bf16_cutedsl",)
 )
 class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_bf16_bf16_cutedsl"
@@ -47,9 +49,6 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
         self._autotune_pending = config.knobs == "auto"
-        # Only the in-kernel reduce leaves a finished (T, hidden) slice in the
-        # workspace; the explicit path's top-k sum needs its own destination.
-        self.supports_output_view = config.enable_in_kernel_fc2_reduce
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
@@ -110,7 +109,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
-            in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
