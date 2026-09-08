@@ -460,6 +460,9 @@ constexpr uint32_t kMaxThreadsPerBlock = 1024;
 
 template <uint32_t head_dim, uint32_t GROUP>
 __host__ __device__ constexpr uint32_t grouped_tokens_per_iter() {
+  static_assert(head_dim % 8 == 0, "head_dim must be a whole number of 8-element packs");
+  static_assert(kMaxThreadsPerBlock % (head_dim / 8) == 0,
+                "head_dim / 8 must divide the CTA thread cap, or the tile would not fill it");
   constexpr uint32_t threads_per_token = head_dim / 8;
   return GROUP * threads_per_token <= kMaxThreadsPerBlock ? GROUP
                                                           : kMaxThreadsPerBlock / threads_per_token;
@@ -467,11 +470,24 @@ __host__ __device__ constexpr uint32_t grouped_tokens_per_iter() {
 
 template <uint32_t head_dim, uint32_t GROUP>
 __host__ __device__ constexpr uint32_t grouped_block_threads() {
+  // The invariant this whole helper family exists to keep.  Checking it here
+  // means an oversized launch is a compile error at the launch site rather
+  // than a cudaErrorInvalidValue nobody sees until the kernel is reached on
+  // hardware -- which is how GROUP = 128 shipped at 2048 threads.
+  static_assert(grouped_tokens_per_iter<head_dim, GROUP>() * (head_dim / 8) <=
+                    kMaxThreadsPerBlock,
+                "grouped kernel block would exceed the 1024-thread CTA limit");
   return grouped_tokens_per_iter<head_dim, GROUP>() * (head_dim / 8);
 }
 
 template <uint32_t head_dim, uint32_t GROUP>
 __host__ __device__ constexpr uint32_t grouped_iters() {
+  // Integer division: a GROUP that is not a whole number of tiles would
+  // truncate here and the kernel would silently quantize only part of the
+  // group.  All four instantiated widths (16/32/64/128 at head_dim 128)
+  // divide exactly; this rejects a fifth that does not.
+  static_assert(GROUP % grouped_tokens_per_iter<head_dim, GROUP>() == 0,
+                "GROUP must be a whole multiple of the per-iteration tile");
   return GROUP / grouped_tokens_per_iter<head_dim, GROUP>();
 }
 
