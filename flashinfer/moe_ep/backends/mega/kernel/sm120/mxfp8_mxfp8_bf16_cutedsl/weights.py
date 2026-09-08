@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, Tuple
 
-from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ......weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+    validate_global_scale_support,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -137,6 +141,9 @@ def preprocess_mega_weights(
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
     """bf16 (or pre-quantized) weights → SM120 K-major MXFP8 + swizzled-SF layout."""
+    validate_global_scale_support(
+        weights, "preprocess_sm120_mxfp8_cutedsl_mega_weights"
+    )
     import torch
 
     # Backend talks only to the swapab_cutedsl_megakernel shim (never src/);

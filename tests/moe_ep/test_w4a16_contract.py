@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
+import flashinfer.moe_ep as moe_ep
 from flashinfer.moe_ep import (
     BootstrapConfig,
     FleetParams,
@@ -142,6 +143,64 @@ def test_existing_backends_reject_global_scales(mode):
     )
     with pytest.raises(ValueError, match="does not support global weight scales"):
         _construct(pack, backend)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "preprocess_mega_weights",
+        "preprocess_bf16_cutedsl_mega_weights",
+        "preprocess_nvfp4_cutedsl_mega_weights",
+        "preprocess_mxfp8_cutedsl_mega_weights",
+        "preprocess_sm120_mxfp8_cutedsl_mega_weights",
+    ),
+)
+@pytest.mark.parametrize("field", ("w13_global_scale", "w2_global_scale"))
+def test_public_preprocessing_rejects_unsupported_global_scales(name, field):
+    # A caller can prepare weights before constructing a layer, then pass only
+    # transformed_weights. Reject here, before imports or transforms can lose
+    # the original pack's global scales and bypass the layer's validation.
+    pack = dataclasses.replace(
+        _pack(), **{field: torch.tensor([1.00390625, 0.71013], dtype=torch.float32)}
+    )
+    with pytest.raises(
+        ValueError, match=f"{name} does not support global weight scales"
+    ):
+        getattr(moe_ep, name)(pack, intermediate_size=_I, hidden_size=_H)
+
+
+def test_workspace_pool_accepts_list_tuning_values():
+    group = object()
+    with (
+        mock.patch("torch.cuda.current_device", return_value=0),
+        mock.patch.object(
+            W4A16CutedslMegaKernelBackend,
+            "ep_rank",
+            new_callable=mock.PropertyMock,
+            return_value=0,
+        ),
+        mock.patch.object(
+            W4A16CutedslMegaKernelBackend,
+            "ep_world_size",
+            new_callable=mock.PropertyMock,
+            return_value=1,
+        ),
+        mock.patch.object(
+            W4A16CutedslMegaKernelBackend,
+            "ep_comm_group",
+            new_callable=mock.PropertyMock,
+            return_value=group,
+        ),
+    ):
+        keys = [
+            W4A16CutedslMegaKernelBackend(
+                dataclasses.replace(_config(), knobs={"epi_flag_batch": batch})
+            )._workspace_pool_key(_fleet())
+            for batch in ([1, 1], (1, 1))
+        ]
+    # JSON-loaded tuning values must share a hashable key with tuple values.
+    pool = {keys[0]: group}
+    assert pool[keys[1]] is group
 
 
 def test_preparation_preserves_packed_weights_and_separate_fp32_globals():

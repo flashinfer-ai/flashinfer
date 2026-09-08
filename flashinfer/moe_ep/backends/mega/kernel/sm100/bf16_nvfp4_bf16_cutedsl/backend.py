@@ -9,6 +9,7 @@ import torch
 from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
+from ......core.kernel.workspace_pool import knobs_pool_key
 from ......core.runtime import bf16_cutedsl_runtime_requirements
 from ......core.validation.common import (
     MoEEpArchError,
@@ -121,7 +122,7 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.gate_up_clamp,
-            tuple(sorted((config.knobs or {}).items())),
+            knobs_pool_key(config.knobs),
         )
 
     def validate_forward(

@@ -164,13 +164,12 @@ class PrequantizedMoEWeights(MoEWeightPack):
 
 
 def validate_global_scale_support(weights: MoEWeightPack, backend: object) -> None:
-    """Reject unsupported global scales before they can be silently dropped."""
+    """Reject unsupported global scales; ``backend`` may name a public helper."""
     if (
         weights.w13_global_scale is not None or weights.w2_global_scale is not None
     ) and not getattr(backend, "supports_global_weight_scales", False):
-        raise ValueError(
-            f"{type(backend).__name__} does not support global weight scales"
-        )
+        name = backend if isinstance(backend, str) else type(backend).__name__
+        raise ValueError(f"{name} does not support global weight scales")
 
 
 def dummy_moe_weights(

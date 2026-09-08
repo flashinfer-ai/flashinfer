@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ......weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+    validate_global_scale_support,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -108,6 +112,7 @@ def preprocess_mega_weights(
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
     """bf16 (or pre-quantized) weights → NVFP4 + swizzled-SF mega layout."""
+    validate_global_scale_support(weights, "preprocess_nvfp4_cutedsl_mega_weights")
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
