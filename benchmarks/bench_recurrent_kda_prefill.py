@@ -244,6 +244,36 @@ def _resolve_recorded_cake_route(
     )
 
 
+def _resolve_recorded_generated_cake_route(
+    routes: list[tuple[str, str, str, str]],
+) -> tuple[str, str, list[str]]:
+    """Normalize metadata-selected Cake modules observed during warmup."""
+
+    if not routes:
+        raise RuntimeError("expected at least one generated Cake module")
+    logical_route, _, target, _ = routes[0]
+    if any(route != logical_route for route, _, _, _ in routes):
+        raise RuntimeError(
+            f"expected one generated Cake logical route during warmup, got {routes}"
+        )
+    if any(route_target != target for _, _, route_target, _ in routes):
+        raise RuntimeError(
+            f"expected one generated Cake target during warmup, got {routes}"
+        )
+    roles = [role for _, role, _, _ in routes]
+    expected_roles = (
+        ["bt16_prepare", "main"]
+        if logical_route == "bt16_prepare_chain_m64"
+        else ["main"]
+    )
+    if roles != expected_roles:
+        raise RuntimeError(
+            "expected one generated Cake main module or one ordered BT16 "
+            f"prepare/chain pair during warmup, got {routes}"
+        )
+    return logical_route, target, [variant_id for _, _, _, variant_id in routes]
+
+
 def _default_state_rotations(case: Case) -> int:
     base = (
         DEFAULT_H12_STATE_ROTATIONS
@@ -625,14 +655,32 @@ def _make_case(
     kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
     small_bh_module = import_module("flashinfer.kda_prefill_cute_small_bh")
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
+    original_get_generated_module = kda_prefill_module._get_flash_kda_generated_module
     original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
     original_small_bh_run = small_bh_module._run_kda_prefill_cute_small_bh
-    resolved_cake_routes = []
-    resolved_backends = []
+    resolved_cake_routes: list[tuple[str, str]] = []
+    resolved_generated_cake_routes: list[tuple[str, str, str, str]] = []
+    resolved_backends: list[str] = []
 
     def recording_get_module(variant, target):
         resolved_cake_routes.append((variant, target))
         return original_get_module(variant, target)
+
+    def recording_get_generated_module(selector_key):
+        metadata, module = original_get_generated_module(selector_key)
+        route = selector_key.get("route")
+        role = selector_key.get("route_role")
+        target = metadata.target
+        variant_id = metadata.variant_id
+        if not all(
+            isinstance(value, str) and value
+            for value in (route, role, target, variant_id)
+        ):
+            raise RuntimeError(
+                "generated Cake route metadata is incomplete during warmup"
+            )
+        resolved_generated_cake_routes.append((route, role, target, variant_id))
+        return metadata, module
 
     def recording_cute_run(**kwargs):
         resolved_backends.append("cute-dsl")
@@ -643,6 +691,7 @@ def _make_case(
         return original_small_bh_run(**kwargs)
 
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
+    kda_prefill_module._get_flash_kda_generated_module = recording_get_generated_module
     kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
     small_bh_module._run_kda_prefill_cute_small_bh = recording_small_bh_run
     try:
@@ -650,10 +699,14 @@ def _make_case(
         torch.cuda.synchronize()
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
+        kda_prefill_module._get_flash_kda_generated_module = (
+            original_get_generated_module
+        )
         kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
         small_bh_module._run_kda_prefill_cute_small_bh = original_small_bh_run
         reset_state_pools()
-    if resolved_backends == ["small-bh"] and not resolved_cake_routes:
+    has_cake_routes = bool(resolved_cake_routes or resolved_generated_cake_routes)
+    if resolved_backends == ["small-bh"] and not has_cake_routes:
         if candidate_workspace is None:
             candidate_workspace = RecurrentKDAPrefillWorkspace(q.device)
         resolved_backend = "small-bh"
@@ -661,10 +714,11 @@ def _make_case(
         resolved_target = "bt16"
         resolved_physical_variants = ["k1", "k2"]
     elif resolved_backends:
-        if resolved_backends != ["cute-dsl"] or resolved_cake_routes:
+        if resolved_backends != ["cute-dsl"] or has_cake_routes:
             raise RuntimeError(
                 "expected exactly one CuTe DSL route during warmup, got "
-                f"backends={resolved_backends}, cake={resolved_cake_routes}"
+                f"backends={resolved_backends}, cake={resolved_cake_routes}, "
+                f"generated_cake={resolved_generated_cake_routes}"
             )
         resolved_backend = "cute-dsl"
         decomp_ctas = len(case.seq_lens) * case.num_heads * 2
@@ -672,6 +726,19 @@ def _make_case(
         resolved_variant = "decomp" if decomp_ctas <= sm_count else "engine"
         resolved_target = "bt16"
         resolved_physical_variants = [resolved_variant]
+    elif resolved_generated_cake_routes:
+        if resolved_cake_routes:
+            raise RuntimeError(
+                "expected one Cake loader family during warmup, got "
+                f"legacy={resolved_cake_routes}, "
+                f"generated={resolved_generated_cake_routes}"
+            )
+        resolved_backend = "cake"
+        (
+            resolved_variant,
+            resolved_target,
+            resolved_physical_variants,
+        ) = _resolve_recorded_generated_cake_route(resolved_generated_cake_routes)
     elif resolved_cake_routes:
         resolved_backend = "cake"
         (
@@ -682,7 +749,8 @@ def _make_case(
     else:
         raise RuntimeError(
             "expected one recurrent-KDA prefill route during warmup, got "
-            f"backends={resolved_backends}, cake={resolved_cake_routes}"
+            f"backends={resolved_backends}, cake={resolved_cake_routes}, "
+            f"generated_cake={resolved_generated_cake_routes}"
         )
     if cuda_graph and resolved_backend == "cute-dsl" and case.packed:
         assert cu_seqlens is not None
