@@ -517,6 +517,15 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
     }
 
     if constexpr (LayoutD == Layout::RowMajor) {
+      // Finite-sanitize the accumulator before the bf16 store. A non-finite lane can
+      // originate from cross-boundary padding rows and, via the reused shared-memory
+      // staging buffer (smem_c), bleed a NaN into a valid row's output. Valid rows are
+      // always finite, so zeroing non-finite lanes leaves every real output unchanged.
+      // Mirrors the same guard applied in the deep_gemm fp8_gemm_impl.cuh epilogue.
+#pragma unroll
+      for (int _q = 0; _q < NUM_ACCUMS; ++_q) {
+        if (!isfinite(final_accum[_q])) final_accum[_q] = 0.f;
+      }
       __syncthreads();
       ElementD* smem_c = reinterpret_cast<ElementD*>(smem_buffer);
       constexpr int SMEM_C_PADDING = 8;
