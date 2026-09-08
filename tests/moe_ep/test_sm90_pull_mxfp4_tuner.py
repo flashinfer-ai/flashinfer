@@ -43,27 +43,27 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
 
 _EXPECTED_BLOCK_PROVENANCE = {
     "fused": {
-        "artifact_manifest_sha256": "afc2ce271c401815a11b7572ad3afb5b4c0306bce1b42c6bad84676c2bdfc9eb",
-        "candidate_union_sha256": "61eeedd983d879fdb328f4a1356277df0899dbf59e1910f73d8a2f728ae7ab8a",
+        "artifact_manifest_sha256": "852cbb019a17a9e76991b4f82b5ae64fb3df3245f6e72ec43a20bb407cbbd477",
+        "candidate_union_sha256": "dce1c6e5f22ac482928ebc2b07ba682665a41464ae44f367c306d2065c3b1926",
         "domain_sha256": "bff57fb6a658b968e40a8f0c0ec7b4d3e52392070905dae574de808cdeccc6ba",
         "external_schema_version": 1,
         "input_recipe_sha256": "ca6258b91b1b64a7953d9c4e1376f6503085df0af856845b0844f6e4a7829de8",
-        "policy_sha256": "a6c5b46d651a63b0b03369a3b681657260c67422574c140e82b93aebd5348a2b",
+        "policy_sha256": "d3349c7ca1976b02ab076dcd87617de7552164d640481d7d614256d70da9a4cf",
         "routing_identity_sha256": "bedd230fa8afa768cc841438a91c0156de8fa6954f1af4ebbcb471478805190b",
-        "runtime_manifest_sha256": "d1b5c856569e192cfb98d1922630e8b045c196ac8c2afff334a9bf4086a59917",
-        "source_manifest_sha256": "f3c23eb7fda299da1c27980a7d358e07df925377e5adc05252661387372b6ed7",
+        "runtime_manifest_sha256": "94ae92677c24630f28192d5df57704ff3ca7d6d94e9a24ebf46b761c198d9bf8",
+        "source_manifest_sha256": "1081ba172754b107a9ab2360a6fac8d2e854fd5c1fc45305b571c935885d5277",
         "workload_recipe_sha256": "f4381c345df95b7da21bbe27766427aa5723aefa64f842c04c95fafae7f53352",
     },
     "split": {
-        "artifact_manifest_sha256": "b1443f9e91c2d6b590634a32576793a3c72574bc051fc74a4e80350315e09152",
-        "candidate_union_sha256": "0b21228410f04d07427e983ac3fbee0211cc16f202c97e0c4b1a5fb86cf4bba3",
+        "artifact_manifest_sha256": "852cbb019a17a9e76991b4f82b5ae64fb3df3245f6e72ec43a20bb407cbbd477",
+        "candidate_union_sha256": "c673529405013fb4d763190527bd8c27a8911cb4e6efb68a3e0fce25df38f690",
         "domain_sha256": "bff57fb6a658b968e40a8f0c0ec7b4d3e52392070905dae574de808cdeccc6ba",
         "external_schema_version": 1,
         "input_recipe_sha256": "ca6258b91b1b64a7953d9c4e1376f6503085df0af856845b0844f6e4a7829de8",
-        "policy_sha256": "a6c5b46d651a63b0b03369a3b681657260c67422574c140e82b93aebd5348a2b",
+        "policy_sha256": "d3349c7ca1976b02ab076dcd87617de7552164d640481d7d614256d70da9a4cf",
         "routing_identity_sha256": "bedd230fa8afa768cc841438a91c0156de8fa6954f1af4ebbcb471478805190b",
-        "runtime_manifest_sha256": "8eddd6c76f588164f85507d29b1502caba91b6985208eac75df6bcc82d08012b",
-        "source_manifest_sha256": "f3c23eb7fda299da1c27980a7d358e07df925377e5adc05252661387372b6ed7",
+        "runtime_manifest_sha256": "2f7d34abaaae8cdb3a1f8b8cc9f7f2c25c09e4b3afa50bd9b906a0e4455bf5ed",
+        "source_manifest_sha256": "1081ba172754b107a9ab2360a6fac8d2e854fd5c1fc45305b571c935885d5277",
         "workload_recipe_sha256": "f4381c345df95b7da21bbe27766427aa5723aefa64f842c04c95fafae7f53352",
     },
 }
@@ -79,24 +79,24 @@ _EXPECTED_BLOCK_CANDIDATE_UNION_SHA256 = {
 
 _EXPECTED_WINNER_IDS = {
     "fused": {
-        1024: "c099f07d617c03d86ed6f2ccb4600cebc7730c8778a2678571370156b817ea22",
-        128: "4438af53f28959d895bd1f940ec3b4d4123ee3ec4992e82d584c7cdd7cda067a",
-        2048: "d22b11b33850233223f4de0d5991a753da9642fe5b71c2f8987f9dfbef01c3cb",
-        256: "2be24c69949d07d49969003065de721a414c6a9df04a56f7cc2da04b2e9956ac",
-        32: "825d3b94a222ab92411face2a75a5f771b102c79afe9daba316342b4e7d2afb3",
-        512: "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
-        64: "ec7439eb60ab2f2a61684de25e27e3c1e99317d5a05cdaec35ab15bf98bdc724",
-        8: "81bc1d7a297f413377d6c68139cca3443c0c51e43254c4fff84786fe9cdb9bb7",
+        8: "e66dbeaf780401025f44e6543492740a0a0471a0edea7548ada45b7f42a06420",
+        32: "f3f218e0009b41b3f0a2aef60cde244c1faf1d1988e6cd71e7d56020006ca50e",
+        64: "c8ce6c465c70a34b5c1f5923319d07753efb199bdd164e352239bf53925c61a7",
+        128: "0a635083f8a826f49f3bc5bbdcbcab108d93e880ffc86335d7d490668d01d8e8",
+        256: "0fc1560a23803ffe743e1a6e3f0ecbe5dad93f544066cbe74e4a81b5d21e730a",
+        512: "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
+        1024: "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
+        2048: "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
     },
     "split": {
-        1024: "7a5a4dd52fcd58302627f11c684805f31adc4919e79c41c7f0f1e0acad738b4b",
-        128: "dd423a9514cd09ccfc5f2d654ecaff46461aff8cfd6e9154425dac2df8875eb8",
-        2048: "334c802f8f46ae273e1f266589d8021e2d69099f033172e34ee32faf285cffbe",
-        256: "27be572d1a7922957e20322422ff110dd8b325740315448c97bf9e70074da143",
-        32: "5f63938822a1b32d8072b2c1ba5abf38f85362a27c789228b59191f663353f5e",
+        8: "ce1da82f795a4c8f4f61200037bc4b94a36d7a16de2dc6ad7e9aca3c999508bb",
+        32: "5e2563323984c3bf2f9686029a5809d7240a8e1dc56cbd9ead4975481b1695ef",
+        64: "7b623d13c42368a6ab0ba227dc29b0eef0858fcfc81db6b54fbd08742e306ab8",
+        128: "60faf6bafe1c0f21ca79b241f3dbb82e328cca3769749f1061a513a1cf7f9c1b",
+        256: "47727d195a5a8068aabc1e638bdcc47ad1ea9bcfe1a469c3c41e539181a45ee7",
         512: "748ef68a8b715647dbf20cb8e9055bfde13170ef24981c4b22d0deca6e727efe",
-        64: "ae61ce870a47537c25f29f360f40c4a97847af58db3b2b0bdf63c69eacdff0e0",
-        8: "f2c1371a49be70076fb7b04007e3db0c6272e12344369af9146a77e99047de5e",
+        1024: "49b828034913e102790cf5bbe9768e6b17661ea26af15ef0ff6f051b2a36e8c6",
+        2048: "3a66b96690ddd716e259e4a2db988755cfc25a3e057d0bb7a78ba18c62f112a2",
     },
 }
 _EXPECTED_BLOCK_CANDIDATE_IDS = {
@@ -105,28 +105,28 @@ _EXPECTED_BLOCK_CANDIDATE_IDS = {
 }
 
 _EXPECTED_FUSED_RUNTIME_CANDIDATE_IDS = (
+    "0a635083f8a826f49f3bc5bbdcbcab108d93e880ffc86335d7d490668d01d8e8",
+    "0fc1560a23803ffe743e1a6e3f0ecbe5dad93f544066cbe74e4a81b5d21e730a",
     "1630f29e2346f2d817477c82aa520672961445712ec504cd8591581169e5c626",
     "170e811b97e04d5e5a2795335891fd647a404a6e8bc24f1cf4b5c701e293c8aa",
-    "2be24c69949d07d49969003065de721a414c6a9df04a56f7cc2da04b2e9956ac",
     "38265fb512a81b2b69d9ca7b156601a3e5363b2e15ba237615a9f4d3900813d6",
     "3df511dac7954f726e9002cb3cbbe86ce5b5479ca43e243a0d890cc48f6921d2",
-    "4438af53f28959d895bd1f940ec3b4d4123ee3ec4992e82d584c7cdd7cda067a",
     "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
     "78a5836d443416669b66535372b920ffe1dfe252903d350afdc12699f7b5046e",
-    "81bc1d7a297f413377d6c68139cca3443c0c51e43254c4fff84786fe9cdb9bb7",
-    "825d3b94a222ab92411face2a75a5f771b102c79afe9daba316342b4e7d2afb3",
+    "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
     "89927bf6af211d5047bc8a2e6be10ae892c65c85d2848ade50c742a47df3ee56",
     "b66df770384bc5c406d13b0d71d6f701aec6879498ed9d9e2edc209db6522c2f",
-    "c099f07d617c03d86ed6f2ccb4600cebc7730c8778a2678571370156b817ea22",
-    "d22b11b33850233223f4de0d5991a753da9642fe5b71c2f8987f9dfbef01c3cb",
+    "c8ce6c465c70a34b5c1f5923319d07753efb199bdd164e352239bf53925c61a7",
     "e2c39aa656b37beeb8dbc5a1533ede68a09fe7fb1101581bfab210a63c207b1f",
-    "ec7439eb60ab2f2a61684de25e27e3c1e99317d5a05cdaec35ab15bf98bdc724",
+    "e66dbeaf780401025f44e6543492740a0a0471a0edea7548ada45b7f42a06420",
+    "f3f218e0009b41b3f0a2aef60cde244c1faf1d1988e6cd71e7d56020006ca50e",
+    "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
     "f9e97da647c04c0999bb38fe7a5c26c30e74060e856b037c90a1bd661136c341",
 )
 _FOLDED_FUSED_CANDIDATE_IDS = {
+    "851b0aa827a934c5e94fee613460b35b2ff19c38c0edf6884ef0f1ba9aa63eb7",
+    "f573e32fe8c9c8d94754fd7002be6544925c063e77e461290d83505dad8d9c8b",
     "7140a7c4d125b7c36e1ce588f94f33af5de68d371baa072b5cc33f9386b2870e",
-    "c099f07d617c03d86ed6f2ccb4600cebc7730c8778a2678571370156b817ea22",
-    "d22b11b33850233223f4de0d5991a753da9642fe5b71c2f8987f9dfbef01c3cb",
 }
 
 _EXPECTED_EXACT_ARTIFACT_SHA256 = {
@@ -189,7 +189,7 @@ _H20_FUSED_RUNTIME_ANCHOR_IDS = {
     "89927bf6af211d5047bc8a2e6be10ae892c65c85d2848ade50c742a47df3ee56",
 }
 _EXPECTED_FUSED_RUNTIME_CANDIDATE_UNION_SHA256 = (
-    "3d458e8530fec250635bb3e9ead61ed3fa9b8243f85590d6827d5f22c1d809e5"
+    "103cb31f7cbcc44ced8264689d66735386c7ee0df717898d514321d9fb735526"
 )
 _FUSED_LAYOUT_FIELDS = {
     "dedup_dispatch",
@@ -603,19 +603,21 @@ def test_candidate_union_is_legal_sorted_deduplicated_and_complete(mode: str) ->
         assert is_valid_hopper_mxfp4_tactic(tactic, execution_mode=mode)
 
 
-def test_h128_fused_uses_cross_profile_runtime_fallback() -> None:
-    with pytest.raises(ValueError, match="no manifest-derived MXFP4 fused tactic"):
-        hopper_mxfp4_candidates_for_shape(
-            execution_mode="fused", hidden=128, intermediate=128
-        )
-
-    legal = hopper_mxfp4_runtime_candidates_for_shape(
+def test_h128_fused_uses_all_legal_cross_profile_candidates() -> None:
+    profile_legal = hopper_mxfp4_candidates_for_shape(
         execution_mode="fused", hidden=128, intermediate=128
     )
-    assert legal
-    assert {tactic["mma_tiler_mnk"][2] for tactic in legal} == {128}
+    assert len(profile_legal) == 1
+    assert profile_legal[0]["mma_tiler_mnk"][2] == 128
+
+    runtime_legal = hopper_mxfp4_runtime_candidates_for_shape(
+        execution_mode="fused", hidden=128, intermediate=128
+    )
+    assert len(runtime_legal) > len(profile_legal)
+    assert profile_legal[0] in runtime_legal
+    assert {tactic["mma_tiler_mnk"][2] for tactic in runtime_legal} == {128}
     default = hopper_mxfp4_default_tactic(512, execution_mode="fused")
-    assert default not in legal
+    assert default not in runtime_legal
     assert (
         hopper_mxfp4_ordered_candidates(
             512,
@@ -623,7 +625,7 @@ def test_h128_fused_uses_cross_profile_runtime_fallback() -> None:
             hidden=128,
             intermediate=128,
         )
-        == legal
+        == runtime_legal
     )
 
 

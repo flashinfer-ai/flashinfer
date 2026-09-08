@@ -23,11 +23,11 @@ package tree IDs, and content hashes.
 | Previous unified fused/split checkpoint | `d0c99d67efb3a1600a9993377a849ff5f4ed14d8` | Green Context split semantics |
 | Current joint source | package tree IDs and aggregate SHA-256 below | Latest PR4688 FP8 plus MXFP4 fused/split with fixed production codegen policy |
 
-The current joint source remains uncommitted until the complete FlashInfer diff
-and GPU results are reviewed. No durable staging commit or fetchable joint-tree
-reference is claimed here; the package tree IDs and content hashes below identify
-the exact files under review. Once accepted, the atomic FlashInfer vendor commit
-will make those package trees reachable from the draft PR.
+The current joint source is committed atomically in this FlashInfer branch. No
+durable staging commit or independently fetchable joint-tree reference is
+claimed here; the package tree IDs and content hashes below identify the exact
+files under review, and the FlashInfer vendor commit makes those package trees
+reachable from the draft PR.
 
 The staging baseline and the two `phase-*` checkpoints above are local staging
 objects/refs; this document does not claim that those object IDs are currently
