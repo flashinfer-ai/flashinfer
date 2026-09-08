@@ -96,18 +96,31 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
   int64_t const virtual_request_layer_delta = work_stride / p.heads;
   int const layer_delta = virtual_request_layer_delta % p.layers;
   int const virtual_request_delta = virtual_request_layer_delta / p.layers;
+  // State and scale storage may overlap between source and destination slots.
+  // All other direct inputs are independent of those writable allocations.
+  auto const* __restrict__ state_slot_strides = p.state_slot_strides;
+  auto const* __restrict__ x_slot_strides = p.x_slot_strides;
+  auto const* __restrict__ b_slot_strides = p.b_slot_strides;
+  auto const* __restrict__ dt_slot_strides = p.dt_slot_strides;
+  auto const* __restrict__ scale_slot_strides = p.scale_slot_strides;
+  auto const* __restrict__ src_slots = p.src_slots;
+  auto const* __restrict__ dst_slots = p.dst_slots;
+  auto const* __restrict__ ring_start = p.ring_start;
+  auto const* __restrict__ replay_prefix_len = p.replay_prefix_len;
+  auto const* __restrict__ active_request_indices = p.active_request_indices;
+  auto const* __restrict__ rand_seed_ptr = p.rand_seed;
   // Virtual requests index active_request_indices; physical requests index
   // the other batch-sized inputs.
   int last_virtual_request = -1, physical_request = -1, count = -1;
   while (work < work_items) {
     if (virtual_request != last_virtual_request) {
-      physical_request = p.active_request_indices[virtual_request];
+      physical_request = active_request_indices[virtual_request];
       if (physical_request < 0) break;
-      count = p.replay_prefix_len[physical_request];
+      count = replay_prefix_len[physical_request];
       last_virtual_request = virtual_request;
     }
     int64_t const table = int64_t(layer) * p.batch + physical_request;
-    int const src_slot = p.src_slots[table], dst_slot = p.dst_slots[table];
+    int const src_slot = src_slots[table], dst_slot = dst_slots[table];
     if (src_slot == p.pad_slot_id || dst_slot == p.pad_slot_id) {
       advance_persistent_coordinates(work, virtual_request, layer, head, work_stride,
                                      virtual_request_delta, layer_delta, head_delta, p.layers,
@@ -118,9 +131,9 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     auto const* state = reinterpret_cast<T const*>(p.state_ptrs[layer]);
     auto* state_dst = reinterpret_cast<T*>(p.state_ptrs[layer]);
     int64_t const state_src_base =
-        int64_t(src_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
+        int64_t(src_slot) * state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
     int64_t const state_dst_base =
-        int64_t(dst_slot) * p.state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
+        int64_t(dst_slot) * state_slot_strides[layer] + int64_t(head) * DIM * DSTATE;
     if (count == 0) {
       for (int i = tid; i < DIM * DSTATE; i += blockDim.x * blockDim.y)
         state_dst[state_dst_base + i] = state[state_src_base + i];
@@ -128,9 +141,9 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
         auto const* scales = reinterpret_cast<float const*>(p.scale_ptrs[layer]);
         auto* dst_scales = reinterpret_cast<float*>(p.scale_ptrs[layer]);
         int64_t const scale_src =
-            int64_t(src_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
+            int64_t(src_slot) * scale_slot_strides[layer] + int64_t(head) * DIM;
         int64_t const scale_dst =
-            int64_t(dst_slot) * p.scale_slot_strides[layer] + int64_t(head) * DIM;
+            int64_t(dst_slot) * scale_slot_strides[layer] + int64_t(head) * DIM;
         dst_scales[scale_dst + tid] = scales[scale_src + tid];
       }
       advance_persistent_coordinates(work, virtual_request, layer, head, work_stride,
@@ -139,13 +152,13 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
       continue;
     }
     load_state_per_warp<T, DIM, DSTATE, NUM_WARPS>(smem, state, state_src_base, warp, lane);
-    auto const* x = reinterpret_cast<input_t const*>(p.x_ptrs[layer]);
-    auto const* b = reinterpret_cast<input_t const*>(p.b_ptrs[layer]);
-    auto const* dt = reinterpret_cast<float const*>(p.dt_ptrs[layer]);
-    int const start = p.ring_start[physical_request];
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(p.x_ptrs[layer]);
+    auto const* __restrict__ b = reinterpret_cast<input_t const*>(p.b_ptrs[layer]);
+    auto const* __restrict__ dt = reinterpret_cast<float const*>(p.dt_ptrs[layer]);
+    int const start = ring_start[physical_request];
     CheckpointingSsuParams view{};
     view.dt_cache = const_cast<float*>(dt);
-    view.dt_cache_stride_seq = p.dt_slot_strides[layer];
+    view.dt_cache_stride_seq = dt_slot_strides[layer];
     view.dt_cache_stride_head = p.ring_buffer_len;
     view.ring_buffer_len = p.ring_buffer_len;
     using XShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DIM>>;
@@ -155,16 +168,17 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     if (warp == 0) {
       load_ring_tile_async<XShape, MAX_WINDOW>(
           smem.old_x,
-          x + int64_t(src_slot) * p.x_slot_strides[layer] + int64_t(head) * p.ring_buffer_len * DIM,
+          x + int64_t(src_slot) * x_slot_strides[layer] + int64_t(head) * p.ring_buffer_len * DIM,
           DIM, lane, start, p.ring_buffer_len, count);
     }
     if (warp == 1) {
       load_ring_tile_async<BShape, MAX_WINDOW>(smem.old_B,
-                                               b + int64_t(src_slot) * p.b_slot_strides[layer] +
+                                               b + int64_t(src_slot) * b_slot_strides[layer] +
                                                    int64_t(group) * p.ring_buffer_len * DSTATE,
                                                DSTATE, lane, start, p.ring_buffer_len, count);
     }
-    float const a = reinterpret_cast<matrixA_t const*>(p.a_ptrs[layer])[head];
+    auto const* __restrict__ a_ptr = reinterpret_cast<matrixA_t const*>(p.a_ptrs[layer]);
+    float const a = a_ptr[head];
     // Scan dt then multiply by A, matching checkpointing_ssu's recurrence.
     if (warp == 2) {
       load_old_dt_cumAdt(view, lane, src_slot, start, head, count, a, smem.old_dt, smem.old_cumAdt);
@@ -173,15 +187,15 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     __pipeline_wait_prior(0);
     __syncthreads();
     int64_t const rand_seed =
-        (PHILOX_ROUNDS > 0) ? conversion::layer_philox_seed(*p.rand_seed, layer) : 0;
+        (PHILOX_ROUNDS > 0) ? conversion::layer_philox_seed(*rand_seed_ptr, layer) : 0;
     if constexpr (sizeof(T) == 1) {
       // view's state and scale are used below only for the
       // destination.  state is already in smem, source_scale is
       // loaded directly into registers below.
       view.state = state_dst;
-      view.state_stride_seq = p.state_slot_strides[layer];
+      view.state_stride_seq = state_slot_strides[layer];
       view.state_scale = reinterpret_cast<void*>(p.scale_ptrs[layer]);
-      view.state_scale_stride_seq = p.scale_slot_strides[layer];
+      view.state_scale_stride_seq = scale_slot_strides[layer];
       auto tiled_mma_chain =
           cute::make_tiled_mma(cute::MMA_Atom<cute::MMA_Traits<checkpointing::MMA_prop::AtomK16>>{},
                                cute::Layout<cute::Shape<cute::_4, cute::_1>>{});
@@ -199,7 +213,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
       float encode_scale_per_row[2];
       float total_scale[2];
       auto const* source_scale = reinterpret_cast<float const*>(p.scale_ptrs[layer]) +
-                                 int64_t(src_slot) * p.scale_slot_strides[layer] +
+                                 int64_t(src_slot) * scale_slot_strides[layer] +
                                  int64_t(head) * DIM;
       replay_state_mma_8bit_chain<input_t, T, DIM, DIM, DSTATE, SmemT, decltype(frag_y_dxt), true>(
           smem, view, warp, lane, count, /*d_tile=*/0, dst_slot, head,
@@ -219,7 +233,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
       __syncthreads();
       if constexpr (!(PHILOX_ROUNDS > 0 && std::is_same_v<T, __half>)) {
         view.state = state_dst;
-        view.state_stride_seq = p.state_slot_strides[layer];
+        view.state_stride_seq = state_slot_strides[layer];
         store_state<T, DIM, DIM, DSTATE, NUM_WARPS>(smem, view, warp, lane, /*d_tile=*/0, head,
                                                     dst_slot);
       }
