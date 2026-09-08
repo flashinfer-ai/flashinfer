@@ -59,7 +59,9 @@ single-rank kernel replay is not valid for this backend.
 
 If NVSHMEM allocations prevent kernel-replay context save, use
 ``--ncu-megamoe-replay application``. This starts one NCU instance per rank
-under torchrun and coordinates application replay over TCP. It requires at
+under torchrun and coordinates application replay over TCP. Each worker replay
+uses fresh process-group keys in the persistent torchrun store and bounds warp
+sampling to one pass so ranks cannot request different replay counts. It requires at
 least one input token on every rank because the synchronized MegaMoE NVTX
 range includes rank-local staging and final reduction. Use CUPTI for latency;
 profiler synchronization can substantially distort collective kernel duration.
@@ -523,6 +525,9 @@ def _run_ncu_profiles(args, token_counts):
                     "--replay-mode=application",
                     "--app-replay-mode=strict",
                     "--app-replay-match=grid",
+                    # Adaptive sampling may request an extra pass on one rank
+                    # after its collective peers have finished their reports.
+                    "--warp-sampling-max-passes=1",
                     "--nvtx",
                     "--lockstep-kernel-launch",
                     "--lockstep-nvtx-include=stage::MegaMoE/",
@@ -1716,6 +1721,17 @@ def _run_parallel_mode(
         torch.cuda.empty_cache()
 
 
+def _ncu_application_replay_rendezvous():
+    """Give each relaunched rank fresh process-group keys in the agent store."""
+    import torch.distributed as dist
+
+    store, rank, world_size = next(dist.rendezvous("env://"))
+    # torchrun's TCPStore survives NCU application replay. Each rank advances
+    # once per worker incarnation; all ranks replay the same application.
+    epoch = store.add(f"flashinfer_ncu_replay_epoch_rank_{rank}", 1)
+    return dist.PrefixStore(f"flashinfer_ncu_replay_{epoch}", store), rank, world_size
+
+
 def _run_distributed_benchmark(args, token_counts):
     import torch.distributed as dist
 
@@ -1727,7 +1743,13 @@ def _run_distributed_benchmark(args, token_counts):
         args,
         f"[local rank {local_rank}] NCCL process-group initialization: start",
     )
-    dist.init_process_group("nccl", device_id=device)
+    if args.mode == "profile_ncu" and args.ncu_megamoe_replay == "application":
+        store, rank, world_size = _ncu_application_replay_rendezvous()
+        dist.init_process_group(
+            "nccl", store=store, rank=rank, world_size=world_size, device_id=device
+        )
+    else:
+        dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     _verbose_print(
