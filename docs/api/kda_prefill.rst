@@ -156,11 +156,11 @@ records the same two kernels and preserves the workspace contract below.
 For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
 caches a stable decreasing-length order on the host. CuTe DSL decomp retains
 the original sequence order because its CTA grid fits in one wave.
-``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
-needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
-decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address buffers. The
-decomp prep kernel binary-searches this compact prefix instead of carrying a
-dense chunk-to-sequence tensor. The number of sequences, total tokens, and
+``flashinfer.RecurrentKDAPrefillWrapper`` (experimental) provides the explicit
+planned path needed for packed engine CUDA Graph capture: ``plan`` builds the
+order and the decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address
+buffers. The decomp prep kernel binary-searches this compact prefix instead of
+carrying a dense chunk-to-sequence tensor. The number of sequences, total tokens, and
 total BT=16 chunks are fixed by the first plan so the metadata and launch
 geometry remain valid across CUDA Graph replays.
 

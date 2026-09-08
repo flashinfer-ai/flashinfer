@@ -33,7 +33,7 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .jit import flash_kda_indexed as _flash_kda_indexed
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .kda_backward import (
     RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
 )
@@ -665,6 +665,13 @@ def recurrent_kda(
 class RecurrentKDAPrefillWrapper:
     """Plan-and-run wrapper for packed recurrent-KDA prefill.
 
+    .. warning::
+        ``RecurrentKDAPrefillWrapper`` is experimental: it provides no
+        compatibility guarantees and may change or be removed without
+        deprecation.  It has not appeared in a release; the plan-and-run shape
+        is expected to change as the ``recurrent_kda`` surface is unified
+        (see `#4936 <https://github.com/flashinfer-ai/flashinfer/issues/4936>`_).
+
     Compute capability 10.0 and 10.3 only.  ``run`` forces ``backend="cute-dsl"``
     and always passes the ``seq_order`` it planned, and the CC 12.0 backend
     supports neither, so a CC 12.0 caller should use
@@ -705,6 +712,7 @@ class RecurrentKDAPrefillWrapper:
         self._total_chunks: Optional[int] = None
         self._lock = threading.Lock()
 
+    @flashinfer_experimental_api
     def plan(
         self,
         cu_seqlens: torch.Tensor,
@@ -807,6 +815,7 @@ class RecurrentKDAPrefillWrapper:
             self._workspace.__dict__["_cute_dsl_total_chunks"] = total_chunks
             self._total_tokens = offsets[-1]
 
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
