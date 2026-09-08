@@ -316,7 +316,7 @@ def supports_fault_tolerance(backend: str) -> bool:
 
     Rank masking needs more than the backend being present:
 
-    * ``nccl_ep`` also needs an nccl4py whose ``GroupConfig`` carries
+    * ``nccl_ep`` also needs an nccl-extensions whose ``GroupConfig`` carries
       ``enable_mask`` and a libnccl exporting the ``ncclEpMask*`` symbols.
       Both are feature-detected, never version-pinned.
     * ``nixl_ep``'s mask buffer is allocated unconditionally by
