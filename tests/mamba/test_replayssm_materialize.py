@@ -47,6 +47,8 @@ def _materialize(
     state_dtype: torch.dtype = torch.bfloat16,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 0,
+    dependency_inputs: list[torch.Tensor] | None = None,
+    dependency_outputs: list[torch.Tensor] | None = None,
 ) -> None:
     layers = len(state)
     zero_table = torch.zeros(layers, dtype=torch.int64, device="cuda")
@@ -81,6 +83,8 @@ def _materialize(
         pad_slot_id=pad_slot_id,
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
+        dependency_inputs=dependency_inputs,
+        dependency_outputs=dependency_outputs,
     )
 
 
@@ -150,6 +154,8 @@ def test_replayssm_materialize_bf16_replay_and_copy() -> None:
         active_request_indices=torch.tensor(
             [1, 0, -1, -1], dtype=torch.int32, device="cuda"
         ),
+        dependency_inputs=[*x_cache, *b_cache, *dt_cache, *a],
+        dependency_outputs=state,
     )
     torch.cuda.synchronize()
 

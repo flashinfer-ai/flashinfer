@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 from ..api_logging import flashinfer_api
 from ..jit.mamba.replayssm_materialize import gen_replayssm_materialize_module
+from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
@@ -42,6 +43,121 @@ def _module(
         max_window,
         philox_rounds,
     ).build_and_load()
+
+
+@register_custom_op(
+    "flashinfer::replayssm_materialize",
+    mutates_args=("dependency_outputs",),
+)
+def _replayssm_materialize(
+    state_ptrs: torch.Tensor,
+    state_slot_strides: torch.Tensor,
+    x_cache_ptrs: torch.Tensor,
+    x_cache_slot_strides: torch.Tensor,
+    B_cache_ptrs: torch.Tensor,
+    B_cache_slot_strides: torch.Tensor,
+    dt_cache_ptrs: torch.Tensor,
+    dt_cache_slot_strides: torch.Tensor,
+    A_ptrs: torch.Tensor,
+    state_scale_ptrs: torch.Tensor,
+    state_scale_slot_strides: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+    ring_start: torch.Tensor,
+    replay_prefix_len: torch.Tensor,
+    active_request_indices: torch.Tensor,
+    dependency_inputs: list[torch.Tensor],
+    dependency_outputs: list[torch.Tensor],
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    num_layers: int,
+    num_heads: int,
+    heads_per_group: int,
+    max_window: int,
+    ring_buffer_len: int,
+    pad_slot_id: int,
+    rand_seed: Optional[torch.Tensor],
+    philox_rounds: int,
+) -> None:
+    """Internal torch.library wrapper for ReplaySSM materialization.
+
+    The JIT kernel dereferences the pointer tables directly. ``dependency_inputs``
+    and ``dependency_outputs`` expose their backing allocations to PyTorch's
+    dependency analysis; only the latter are mutated.
+    """
+    _module(
+        state_dtype,
+        input_dtype,
+        matrixA_dtype,
+        dim,
+        dstate,
+        heads_per_group,
+        max_window,
+        philox_rounds,
+    ).replayssm_materialize(
+        state_ptrs,
+        state_slot_strides,
+        x_cache_ptrs,
+        x_cache_slot_strides,
+        B_cache_ptrs,
+        B_cache_slot_strides,
+        dt_cache_ptrs,
+        dt_cache_slot_strides,
+        A_ptrs,
+        state_scale_ptrs,
+        state_scale_slot_strides,
+        src_slots,
+        dst_slots,
+        ring_start,
+        replay_prefix_len,
+        active_request_indices,
+        num_layers,
+        num_heads,
+        ring_buffer_len,
+        pad_slot_id,
+        rand_seed,
+    )
+
+
+@register_fake_op("flashinfer::replayssm_materialize")
+def _replayssm_materialize_fake(
+    state_ptrs: torch.Tensor,
+    state_slot_strides: torch.Tensor,
+    x_cache_ptrs: torch.Tensor,
+    x_cache_slot_strides: torch.Tensor,
+    B_cache_ptrs: torch.Tensor,
+    B_cache_slot_strides: torch.Tensor,
+    dt_cache_ptrs: torch.Tensor,
+    dt_cache_slot_strides: torch.Tensor,
+    A_ptrs: torch.Tensor,
+    state_scale_ptrs: torch.Tensor,
+    state_scale_slot_strides: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+    ring_start: torch.Tensor,
+    replay_prefix_len: torch.Tensor,
+    active_request_indices: torch.Tensor,
+    dependency_inputs: list[torch.Tensor],
+    dependency_outputs: list[torch.Tensor],
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    num_layers: int,
+    num_heads: int,
+    heads_per_group: int,
+    max_window: int,
+    ring_buffer_len: int,
+    pad_slot_id: int,
+    rand_seed: Optional[torch.Tensor],
+    philox_rounds: int,
+) -> None:
+    """Fake implementation for torch.compile() metadata propagation."""
+    pass
 
 
 @flashinfer_api
@@ -75,6 +191,8 @@ def replayssm_materialize(
     pad_slot_id: int = -1,
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 0,
+    dependency_inputs: Optional[list[torch.Tensor]] = None,
+    dependency_outputs: Optional[list[torch.Tensor]] = None,
 ) -> None:
     """Materialize an SSM state at a selected token, from an older state and a
     ReplaySSM ring buffer.
@@ -177,6 +295,21 @@ def replayssm_materialize(
     philox_rounds : int
         JIT number of Philox stochastic-rounding rounds. Zero disables
         stochastic rounding.
+    dependency_inputs : Optional[list[torch.Tensor]]
+        Backing CUDA tensors read indirectly through pointer tables: typically
+        the source state and scale storage selected by ``src_slots`` through
+        ``state_ptrs`` and ``state_scale_ptrs``, together with storage
+        represented by ``x_cache_ptrs``, ``B_cache_ptrs``, ``dt_cache_ptrs``,
+        and ``A_ptrs``. These tensors are dependency anchors for
+        ``torch.compile`` and are not passed to the JIT kernel. Do not repeat a
+        state or scale backing tensor here when it is also an output anchor.
+    dependency_outputs : Optional[list[torch.Tensor]]
+        Backing CUDA tensors written to the destination slots selected by
+        ``dst_slots`` through ``state_ptrs`` and, for quantized state,
+        ``state_scale_ptrs``. These tensors are mutable dependency anchors for
+        ``torch.compile`` and are not passed to the JIT kernel. Callers using
+        ``torch.compile`` must include every backing allocation whose contents
+        they need PyTorch to order around this call.
 
     Notes
     -----
@@ -248,25 +381,36 @@ def replayssm_materialize(
         or active_request_indices.numel() != batch
     ):
         raise ValueError("slot and metadata shapes are inconsistent")
-    _module(
-        state_dtype,
-        input_dtype,
-        matrixA_dtype,
-        dim,
-        dstate,
-        heads_per_group,
-        max_window,
-        philox_rounds,
-    ).replayssm_materialize(
+    if dependency_inputs is not None and not all(
+        isinstance(tensor, torch.Tensor) and tensor.is_cuda
+        for tensor in dependency_inputs
+    ):
+        raise ValueError("dependency_inputs must be CUDA tensors")
+    if dependency_outputs is not None and not all(
+        isinstance(tensor, torch.Tensor) and tensor.is_cuda
+        for tensor in dependency_outputs
+    ):
+        raise ValueError("dependency_outputs must be CUDA tensors")
+    _replayssm_materialize(
         *tables,
         src_slots,
         dst_slots,
         ring_start,
         replay_prefix_len,
         active_request_indices,
+        dependency_inputs if dependency_inputs is not None else [],
+        dependency_outputs if dependency_outputs is not None else [],
+        state_dtype,
+        input_dtype,
+        matrixA_dtype,
+        dim,
+        dstate,
         layers,
         num_heads,
+        heads_per_group,
+        max_window,
         ring_buffer_len,
         pad_slot_id,
         rand_seed,
+        philox_rounds,
     )
